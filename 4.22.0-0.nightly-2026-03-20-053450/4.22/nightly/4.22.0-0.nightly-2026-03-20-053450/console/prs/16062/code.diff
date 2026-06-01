@@ -1,0 +1,1337 @@
+diff --git a/frontend/packages/console-shared/src/components/dropdown/ResourceDropdown.tsx b/frontend/packages/console-shared/src/components/dropdown/ResourceDropdown.tsx
+index 52312388707..56bb59e78ec 100644
+--- a/frontend/packages/console-shared/src/components/dropdown/ResourceDropdown.tsx
++++ b/frontend/packages/console-shared/src/components/dropdown/ResourceDropdown.tsx
+@@ -1,9 +1,8 @@
+-import type { FC } from 'react';
+-import { Component } from 'react';
++import type { FC, ReactNode } from 'react';
++import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
+ import * as fuzzy from 'fuzzysearch';
+-import type { TFunction } from 'i18next';
+ import * as _ from 'lodash';
+-import { withTranslation } from 'react-i18next';
++import { useTranslation } from 'react-i18next';
+ import type { ConsoleSelectProps } from '@console/internal/components/utils/console-select';
+ import { ConsoleSelect } from '@console/internal/components/utils/console-select';
+ import { ResourceIcon } from '@console/internal/components/utils/resource-icon';
+@@ -30,12 +29,6 @@ const DropdownItem: FC<DropdownItemProps> = ({ model, name }) => (
+ 
+ export type ResourceDropdownItems = ConsoleSelectProps['items'];
+ 
+-interface State {
+-  resources: {};
+-  items: ResourceDropdownItems;
+-  title: ConsoleSelectProps['title'];
+-}
+-
+ export interface ResourceDropdownProps {
+   actionItems?: ConsoleSelectProps['actionItems'];
+   ariaLabel?: ConsoleSelectProps['ariaLabel'];
+@@ -51,7 +44,7 @@ export interface ResourceDropdownProps {
+   storageKey?: ConsoleSelectProps['storageKey'];
+   title?: ConsoleSelectProps['title'];
+   titlePrefix?: ConsoleSelectProps['titlePrefix'];
+-  userSettingsPrefix?: ConsoleSelectProps['userSettingsPrefix'];
++  userPreferencePrefix?: ConsoleSelectProps['userSettingsPrefix'];
+ 
+   allSelectorItem?: {
+     allSelectorKey?: string;
+@@ -64,142 +57,122 @@ export interface ResourceDropdownProps {
+   dataSelector: string[] | number[] | symbol[];
+   transformLabel?: Function;
+   loaded?: boolean;
+-  loadError?: string;
++  loadError?: unknown;
+   resources?: FirehoseResult[];
+   autoSelect?: boolean;
+   resourceFilter?: (resource: K8sResourceKind) => boolean;
+-  onChange?: (key: string, name?: string | object, selectedResource?: K8sResourceKind) => void;
++  onChange?: (
++    key: string,
++    name?: ResourceDropdownItems[keyof ResourceDropdownItems],
++    selectedResource?: K8sResourceKind,
++  ) => void;
+   onLoad?: (items: ResourceDropdownItems) => void;
+   showBadge?: boolean;
+   customResourceKey?: (key: string, resource: K8sResourceKind) => string;
+   appendItems?: ResourceDropdownItems;
+ }
+ 
+-class ResourceDropdownInternal extends Component<ResourceDropdownProps & { t: TFunction }, State> {
+-  constructor(props) {
+-    super(props);
+-    this.state = {
+-      resources: this.props.loaded ? this.getResourceList(props) : {},
+-      items: this.props.loaded ? this.getDropdownList(props, false) : {},
+-      title: this.props.loaded ? (
+-        <span className="btn-dropdown__item--placeholder">{this.props.placeholder}</span>
+-      ) : (
+-        <LoadingInline />
+-      ),
+-    };
++const craftResourceKey = (
++  resource: K8sResourceKind,
++  dataSelector: ResourceDropdownProps['dataSelector'],
++  resourceFilter: ResourceDropdownProps['resourceFilter'],
++  customResourceKey: ResourceDropdownProps['customResourceKey'],
++): { customKey: string; key: string } => {
++  let key;
++  if (resourceFilter && resourceFilter(resource)) {
++    key = _.get(resource, dataSelector);
++  } else if (!resourceFilter) {
++    key = _.get(resource, dataSelector);
+   }
++  return {
++    customKey: customResourceKey ? customResourceKey(key, resource) : key,
++    key,
++  };
++};
+ 
+-  // eslint-disable-next-line @typescript-eslint/naming-convention
+-  UNSAFE_componentWillReceiveProps(nextProps: ResourceDropdownProps) {
+-    const {
+-      loaded,
+-      loadError,
+-      autoSelect,
+-      selectedKey,
+-      placeholder,
+-      onLoad,
+-      title,
+-      actionItems,
+-    } = nextProps;
+-    if (!loaded && !loadError) {
+-      this.setState({ title: <LoadingInline /> });
+-      return;
+-    }
+-
+-    // If autoSelect is true only then have an item pre-selected based on selectedKey.
+-    if (!this.props.loadError && !autoSelect && (!this.props.loaded || !selectedKey)) {
+-      this.setState({
+-        title: <span className="btn-dropdown__item--placeholder">{placeholder}</span>,
+-      });
+-    }
+-
+-    if (loadError) {
+-      this.setState({
+-        title: (
+-          <span className="cos-error-title">
+-            {this.props.t('console-shared~Error loading - {{placeholder}}', { placeholder })}
+-          </span>
+-        ),
+-      });
+-      return;
+-    }
+-
+-    const resourceList = this.getDropdownList({ ...this.props, ...nextProps }, true);
+-    // set placeholder as title if resourceList is empty no actionItems are there
+-    if (loaded && !loadError && _.isEmpty(resourceList) && !actionItems && placeholder && !title) {
+-      this.setState({
+-        title: <span className="btn-dropdown__item--placeholder">{placeholder}</span>,
+-      });
+-    }
+-    this.setState({ items: resourceList });
+-    if (nextProps.loaded && onLoad) {
+-      onLoad(resourceList);
+-    }
+-    this.setState({ resources: this.getResourceList(nextProps) });
+-  }
++export const ResourceDropdown: FC<ResourceDropdownProps> = ({
++  actionItems,
++  allSelectorItem,
++  appendItems,
++  ariaLabel,
++  autocompleteFilter,
++  autoSelect,
++  buttonClassName,
++  className,
++  customResourceKey,
++  dataSelector,
++  disabled,
++  id,
++  isFullWidth,
++  loaded,
++  loadError,
++  menuClassName,
++  noneSelectorItem,
++  onChange,
++  onLoad,
++  placeholder,
++  resourceFilter,
++  resources,
++  selectedKey,
++  showBadge = false,
++  storageKey,
++  title: titleProp,
++  titlePrefix,
++  transformLabel,
++  userPreferencePrefix,
++}) => {
++  const { t } = useTranslation();
++  const [selectedTitle, setSelectedTitle] = useState<ReactNode>(null);
++  const onChangeRef = useRef(onChange);
++  onChangeRef.current = onChange;
++  const onLoadRef = useRef(onLoad);
++  onLoadRef.current = onLoad;
+ 
+-  shouldComponentUpdate(nextProps, nextState) {
+-    if (_.isEqual(this.state, nextState) && _.isEqual(this.props, nextProps)) {
+-      return false;
+-    }
+-    return true;
+-  }
++  // Track mount state and previous selectedKey to match class component behavior:
++  // the class constructor never auto-selects, and componentWillReceiveProps
++  // compares against the previous selectedKey (this.props) for onChange calls.
++  const mountedRef = useRef(false);
++  const prevSelectedKeyRef = useRef(selectedKey);
+ 
+-  private craftResourceKey = (
+-    resource: K8sResourceKind,
+-    props: ResourceDropdownProps,
+-  ): { customKey: string; key: string } => {
+-    const { customResourceKey, resourceFilter, dataSelector } = props;
+-    let key;
+-    if (resourceFilter && resourceFilter(resource)) {
+-      key = _.get(resource, dataSelector);
+-    } else if (!resourceFilter) {
+-      key = _.get(resource, dataSelector);
++  // Compute resource map: key -> K8sResourceKind
++  const resourceMap = useMemo(() => {
++    if (!loaded) {
++      return {};
+     }
+-    return {
+-      customKey: customResourceKey ? customResourceKey(key, resource) : key,
+-      key,
+-    };
+-  };
+-
+-  private getResourceList = (nextProps: ResourceDropdownProps) => {
+-    const { resources } = nextProps;
+-    const resourceList = {};
++    const map: Record<string, K8sResourceKind> = {};
+     _.each(resources, ({ data }) => {
+-      _.each(data, (resource) => {
+-        const { customKey, key } = this.craftResourceKey(resource, nextProps);
++      _.each(data, (resource: K8sResourceKind) => {
++        const { customKey, key } = craftResourceKey(
++          resource,
++          dataSelector,
++          resourceFilter,
++          customResourceKey,
++        );
+         const indexKey = customKey || key;
+         if (indexKey) {
+-          resourceList[indexKey] = resource;
++          map[indexKey] = resource;
+         }
+       });
+     });
+-    return resourceList;
+-  };
++    return map;
++  }, [loaded, resources, dataSelector, resourceFilter, customResourceKey]);
+ 
+-  private getDropdownList = (
+-    props: ResourceDropdownProps,
+-    updateSelection: boolean,
+-  ): ResourceDropdownItems => {
+-    const {
+-      loaded,
+-      actionItems,
+-      autoSelect,
+-      selectedKey,
+-      resources,
+-      transformLabel,
+-      allSelectorItem,
+-      noneSelectorItem,
+-      showBadge = false,
+-      appendItems,
+-    } = props;
+-
+-    const unsortedList = { ...appendItems };
++  // Compute sorted dropdown items
++  const items = useMemo<ResourceDropdownItems>(() => {
++    if (!loaded || loadError) {
++      return {};
++    }
++    const unsortedList: ResourceDropdownItems = { ...appendItems };
+     _.each(resources, ({ data, kind }) => {
+       _.reduce(
+         data,
+-        (acc, resource) => {
+-          const { customKey, key: name } = this.craftResourceKey(resource, props);
++        (acc, resource: K8sResourceKind) => {
++          const { customKey, key: name } = craftResourceKey(
++            resource,
++            dataSelector,
++            resourceFilter,
++            customResourceKey,
++          );
+           const dataValue = customKey || name;
+           if (dataValue) {
+             if (showBadge) {
+@@ -218,80 +191,150 @@ class ResourceDropdownInternal extends Component<ResourceDropdownProps & { t: TF
+         unsortedList,
+       );
+     });
+-    const sortedList = {};
+ 
++    const sortedList: ResourceDropdownItems = {};
+     if (allSelectorItem && !_.isEmpty(unsortedList)) {
+       sortedList[allSelectorItem.allSelectorKey] = allSelectorItem.allSelectorTitle;
+     }
+     if (noneSelectorItem && !_.isEmpty(unsortedList)) {
+       sortedList[noneSelectorItem.noneSelectorKey] = noneSelectorItem.noneSelectorTitle;
+     }
+-
+     _.keys(unsortedList)
+       .sort()
+       .forEach((key) => {
+         sortedList[key] = unsortedList[key];
+       });
+ 
+-    if (updateSelection) {
+-      let selectedItem = selectedKey;
+-      if (
+-        (_.isEmpty(sortedList) || !sortedList[selectedKey]) &&
+-        allSelectorItem &&
+-        allSelectorItem.allSelectorKey !== selectedKey
+-      ) {
+-        selectedItem = allSelectorItem.allSelectorKey;
+-      } else if (autoSelect && !selectedKey) {
+-        selectedItem =
+-          loaded && _.isEmpty(sortedList) && actionItems
+-            ? actionItems[0].actionKey
+-            : _.get(_.keys(sortedList), 0);
+-      }
+-      selectedItem && this.handleChange(selectedItem, sortedList);
+-    }
+     return sortedList;
+-  };
++  }, [
++    loaded,
++    loadError,
++    resources,
++    dataSelector,
++    resourceFilter,
++    customResourceKey,
++    appendItems,
++    showBadge,
++    transformLabel,
++    allSelectorItem,
++    noneSelectorItem,
++  ]);
+ 
+-  private handleChange = (key, items) => {
+-    const name = items[key];
+-    const { actionItems, onChange, selectedKey } = this.props;
+-    const selectedActionItem = actionItems && actionItems.find((ai) => key === ai.actionKey);
+-    const title = selectedActionItem ? selectedActionItem.actionTitle : name;
+-    if (title !== this.state.title) {
+-      this.setState({ title });
++  // Auto-selection and title sync when items or selection changes.
++  // Skip the initial mount to match class component behavior (constructor never auto-selects).
++  useEffect(() => {
++    if (!mountedRef.current) {
++      mountedRef.current = true;
++      prevSelectedKeyRef.current = selectedKey;
++      return;
+     }
+-    if (key !== selectedKey) {
+-      onChange && onChange(key, name, this.state.resources[key]);
++
++    if (!loaded || loadError) {
++      prevSelectedKeyRef.current = selectedKey;
++      return;
+     }
+-  };
+ 
+-  private onChange = (key: string) => {
+-    this.handleChange(key, this.state.items);
+-  };
++    let selectedItem = selectedKey;
++    if (
++      (_.isEmpty(items) || !items[selectedKey]) &&
++      allSelectorItem &&
++      allSelectorItem.allSelectorKey !== selectedKey
++    ) {
++      selectedItem = allSelectorItem.allSelectorKey;
++    } else if (autoSelect && !selectedKey) {
++      selectedItem =
++        loaded && _.isEmpty(items) && actionItems
++          ? actionItems[0].actionKey
++          : _.get(_.keys(items), 0);
++    }
+ 
+-  render() {
+-    return (
+-      <ConsoleSelect
+-        id={this.props.id}
+-        ariaLabel={this.props.ariaLabel}
+-        className={this.props.className}
+-        menuClassName={this.props.menuClassName}
+-        buttonClassName={this.props.buttonClassName}
+-        titlePrefix={this.props.titlePrefix}
+-        isFullWidth={this.props.isFullWidth}
+-        autocompleteFilter={this.props.autocompleteFilter || fuzzy}
+-        actionItems={this.props.actionItems}
+-        items={this.state.items}
+-        onChange={this.onChange}
+-        selectedKey={this.props.selectedKey}
+-        title={this.props.title || this.state.title}
+-        autocompletePlaceholder={this.props.placeholder}
+-        userSettingsPrefix={this.props.userSettingsPrefix}
+-        storageKey={this.props.storageKey}
+-        disabled={this.props.disabled}
+-      />
+-    );
+-  }
+-}
++    if (selectedItem) {
++      const name = items[selectedItem];
++      const selectedActionItem =
++        actionItems && actionItems.find((ai) => selectedItem === ai.actionKey);
++      const title = selectedActionItem ? selectedActionItem.actionTitle : name;
++      setSelectedTitle(title);
++      if (selectedItem !== prevSelectedKeyRef.current) {
++        onChangeRef.current?.(selectedItem, name, resourceMap[selectedItem]);
++      }
++    }
++
++    prevSelectedKeyRef.current = selectedKey;
++  }, [
++    loaded,
++    loadError,
++    items,
++    selectedKey,
++    autoSelect,
++    allSelectorItem,
++    actionItems,
++    resourceMap,
++  ]);
+ 
+-export const ResourceDropdown = withTranslation()(ResourceDropdownInternal);
++  // Notify parent when resources finish loading (loaded transitions to true).
++  // The old class component only called onLoad in UNSAFE_componentWillReceiveProps
++  // when loaded first became true, not on every items change.
++  const prevLoadedRef = useRef(loaded);
++  useEffect(() => {
++    if (loaded && !prevLoadedRef.current && onLoadRef.current) {
++      onLoadRef.current(items);
++    }
++    prevLoadedRef.current = loaded;
++  }, [loaded, items]);
++
++  // Compute display title
++  const displayTitle = useMemo<ReactNode>(() => {
++    if (!loaded && !loadError) {
++      return <LoadingInline />;
++    }
++    if (loadError) {
++      return (
++        <span className="pf-v6-u-text-color-status-danger">
++          {t('console-shared~Error loading - {{placeholder}}', { placeholder })}
++        </span>
++      );
++    }
++    if (titleProp) {
++      return titleProp;
++    }
++    if (selectedTitle) {
++      return selectedTitle;
++    }
++    return <span className="btn-dropdown__item--placeholder">{placeholder}</span>;
++  }, [loaded, loadError, titleProp, selectedTitle, placeholder, t]);
++
++  const handleChange = useCallback<ConsoleSelectProps['onChange']>(
++    (key) => {
++      const name = items[key];
++      const selectedActionItem = actionItems && actionItems.find((ai) => key === ai.actionKey);
++      const title = selectedActionItem ? selectedActionItem.actionTitle : name;
++      setSelectedTitle(title);
++      if (key !== selectedKey) {
++        onChangeRef.current?.(key, name, resourceMap[key]);
++      }
++    },
++    [items, actionItems, selectedKey, resourceMap],
++  );
++
++  return (
++    <ConsoleSelect
++      id={id}
++      ariaLabel={ariaLabel}
++      className={className}
++      menuClassName={menuClassName}
++      buttonClassName={buttonClassName}
++      titlePrefix={titlePrefix}
++      isFullWidth={isFullWidth}
++      autocompleteFilter={autocompleteFilter || fuzzy}
++      actionItems={actionItems}
++      items={items}
++      onChange={handleChange}
++      selectedKey={selectedKey}
++      title={displayTitle}
++      autocompletePlaceholder={placeholder}
++      userSettingsPrefix={userPreferencePrefix}
++      storageKey={storageKey}
++      disabled={disabled}
++    />
++  );
++};
+diff --git a/frontend/packages/console-shared/src/components/formik-fields/ResourceDropdownField.tsx b/frontend/packages/console-shared/src/components/formik-fields/ResourceDropdownField.tsx
+index d71d0c681f2..6eb73a19826 100644
+--- a/frontend/packages/console-shared/src/components/formik-fields/ResourceDropdownField.tsx
++++ b/frontend/packages/console-shared/src/components/formik-fields/ResourceDropdownField.tsx
+@@ -4,30 +4,26 @@ import { FormGroup, FormHelperText, HelperText, HelperTextItem } from '@patternf
+ import type { FormikValues } from 'formik';
+ import { useField, useFormikContext } from 'formik';
+ import type { FirehoseResult } from '@console/internal/components/utils/types';
+-import type { K8sResourceKind } from '@console/internal/module/k8s';
+ import { useFormikValidationFix } from '../../hooks/useFormikValidationFix';
+-import type { ResourceDropdownItems } from '../dropdown/ResourceDropdown';
++import type { ResourceDropdownProps } from '../dropdown/ResourceDropdown';
+ import { ResourceDropdown } from '../dropdown/ResourceDropdown';
+ import type { DropdownFieldProps } from './field-types';
+ import { getFieldId } from './field-utils';
+ 
+ export interface ResourceDropdownFieldProps extends DropdownFieldProps {
+-  dataSelector: string[] | number[] | symbol[];
++  dataSelector: ResourceDropdownProps['dataSelector'];
+   resources: FirehoseResult[];
+-  showBadge?: boolean;
+-  onLoad?: (items: ResourceDropdownItems) => void;
+-  onChange?: (key: string, name?: string | object, resource?: K8sResourceKind) => void;
+-  resourceFilter?: (resource: K8sResourceKind) => boolean;
+-  autoSelect?: boolean;
++  showBadge?: ResourceDropdownProps['showBadge'];
++  onLoad?: ResourceDropdownProps['onLoad'];
++  onChange?: ResourceDropdownProps['onChange'];
++  resourceFilter?: ResourceDropdownProps['resourceFilter'];
++  autoSelect?: ResourceDropdownProps['autoSelect'];
+   placeholder?: string;
+-  actionItems?: {
+-    actionTitle: string;
+-    actionKey: string;
+-  }[];
+-  appendItems?: ResourceDropdownItems;
+-  customResourceKey?: (key: string, resource: K8sResourceKind) => string;
++  actionItems?: ResourceDropdownProps['actionItems'];
++  appendItems?: ResourceDropdownProps['appendItems'];
++  customResourceKey?: ResourceDropdownProps['customResourceKey'];
+   dataTest?: string;
+-  menuClassName?: string;
++  menuClassName?: ResourceDropdownProps['menuClassName'];
+ }
+ 
+ const ResourceDropdownField: FC<ResourceDropdownFieldProps> = ({
+@@ -80,7 +76,7 @@ const ResourceDropdownField: FC<ResourceDropdownFieldProps> = ({
+         resources={resources}
+         loaded={loaded}
+         loadError={loadError}
+-        onChange={(value: string, name: string | object, resource: K8sResourceKind) => {
++        onChange={(value, name, resource) => {
+           props.onChange && props.onChange(value, name, resource);
+           setFieldValue(props.name, value);
+           setFieldTouched(props.name, true);
+diff --git a/frontend/packages/console-shared/src/utils/storage-utils.ts b/frontend/packages/console-shared/src/utils/storage-utils.ts
+index 8b44278c7f3..41d132c9dce 100644
+--- a/frontend/packages/console-shared/src/utils/storage-utils.ts
++++ b/frontend/packages/console-shared/src/utils/storage-utils.ts
+@@ -1,4 +1,4 @@
+-import type { StorageClass } from '@console/internal/components/storage-class-form';
++import type { StorageClassResourceKind } from '@console/internal/module/k8s/types';
+ 
+ export const cephStorageProvisioners = [
+   'ceph.rook.io/block',
+@@ -12,5 +12,5 @@ const objectStorageProvisioners = ['noobaa.io/obc', 'ceph.rook.io/bucket'];
+ export const isCephProvisioner = (scProvisioner: string): boolean =>
+   cephStorageProvisioners.some((provisioner: string) => scProvisioner?.includes(provisioner));
+ 
+-export const isObjectSC = (sc: StorageClass) =>
++export const isObjectSC = (sc: StorageClassResourceKind) =>
+   objectStorageProvisioners.some((provisioner: string) => sc.provisioner?.includes(provisioner));
+diff --git a/frontend/packages/topology/src/components/dropdowns/NamespaceBarApplicationSelector.tsx b/frontend/packages/topology/src/components/dropdowns/NamespaceBarApplicationSelector.tsx
+index a3d30023cba..c3875f9a13e 100644
+--- a/frontend/packages/topology/src/components/dropdowns/NamespaceBarApplicationSelector.tsx
++++ b/frontend/packages/topology/src/components/dropdowns/NamespaceBarApplicationSelector.tsx
+@@ -74,7 +74,7 @@ const NamespaceBarApplicationSelector: FC<Props> = ({
+       }}
+       selectedKey={application || ALL_APPLICATIONS_KEY}
+       onChange={onApplicationChange}
+-      userSettingsPrefix={APPLICATION_USERSETTINGS_PREFIX}
++      userPreferencePrefix={APPLICATION_USERSETTINGS_PREFIX}
+       storageKey={APPLICATION_LOCAL_STORAGE_KEY}
+       disabled={disabled}
+     />
+diff --git a/frontend/public/components/graphs/health.jsx b/frontend/public/components/graphs/health.jsx
+deleted file mode 100644
+index ee9b3afd3fc..00000000000
+--- a/frontend/public/components/graphs/health.jsx
++++ /dev/null
+@@ -1,85 +0,0 @@
+-import { connect } from 'react-redux';
+-
+-import { Status, errorStatus } from './';
+-import { coFetch, coFetchJSON } from '../../co-fetch';
+-import { featureReducerName } from '../../reducers/features';
+-import { FLAGS } from '@console/shared';
+-import { k8sBasePath } from '../../module/k8s';
+-import { Grid, GridItem } from '@patternfly/react-core';
+-
+-// Use the shorter 'OpenShift Console' instead of 'OpenShift Container Platform Console' since the title appears in the chart.
+-const consoleName = window.SERVER_FLAGS.branding === 'okd' ? 'OKD Console' : 'OpenShift Console';
+-
+-const fetchHealth = () =>
+-  coFetch(`${k8sBasePath}/healthz`)
+-    .then((response) => response.text())
+-    .then((body) => {
+-      if (body === 'ok') {
+-        return { short: 'UP', long: 'All good', status: 'OK' };
+-      }
+-      return { short: 'ERROR', long: body, status: 'ERROR' };
+-    })
+-    .catch(errorStatus);
+-
+-const fetchConsoleHealth = () =>
+-  coFetchJSON('health')
+-    .then(() => ({ short: 'UP', long: 'All good', status: 'OK' }))
+-    .catch(() => ({
+-      short: 'ERROR',
+-      long: 'The console service cannot be reached',
+-      status: 'ERROR',
+-    }));
+-
+-export const KubernetesHealth = () => <Status title="Kubernetes API" fetch={fetchHealth} />;
+-
+-export const ConsoleHealth = () => <Status title={consoleName} fetch={fetchConsoleHealth} />;
+-
+-const alertsFiringStateToProps = (state) => ({
+-  canAccessMonitoring: !!state[featureReducerName].get(FLAGS.CAN_GET_NS),
+-});
+-
+-const AlertsFiring_ = ({ canAccessMonitoring, namespace }) => {
+-  const toProp =
+-    canAccessMonitoring && !!window.SERVER_FLAGS.prometheusBaseURL ? { to: '/monitoring' } : {};
+-  return (
+-    <Status
+-      {...toProp}
+-      title="Alerts Firing"
+-      name="Alerts"
+-      namespace={namespace}
+-      query={`sum(ALERTS{alertstate="firing", alertname!="Watchdog" ${
+-        namespace ? `, namespace="${namespace}"` : ''
+-      }})`}
+-    />
+-  );
+-};
+-const AlertsFiring = connect(alertsFiringStateToProps)(AlertsFiring_);
+-
+-const CrashloopingPods = ({ namespace }) => (
+-  <Status
+-    title="Crashlooping Pods"
+-    name="Pods"
+-    namespace={namespace}
+-    query={`count(increase(kube_pod_container_status_restarts_total${
+-      namespace ? `{namespace="${namespace}"}` : ''
+-    }[1h]) > 5 )`}
+-    to={`/k8s/${namespace ? `ns/${namespace}` : 'all-namespaces'}/pods?status=CrashLoopBackOff`}
+-  />
+-);
+-
+-export const Health = ({ namespace }) => (
+-  <Grid hasGutter>
+-    <GridItem md={3} sm={6}>
+-      <KubernetesHealth />
+-    </GridItem>
+-    <GridItem md={3} sm={6}>
+-      <ConsoleHealth />
+-    </GridItem>
+-    <GridItem md={3} sm={6}>
+-      <AlertsFiring namespace={namespace} />
+-    </GridItem>
+-    <GridItem md={3} sm={6}>
+-      <CrashloopingPods namespace={namespace} />
+-    </GridItem>
+-  </Grid>
+-);
+diff --git a/frontend/public/components/graphs/index.tsx b/frontend/public/components/graphs/index.tsx
+index af8e1e20e6a..a791e858c74 100644
+--- a/frontend/public/components/graphs/index.tsx
++++ b/frontend/public/components/graphs/index.tsx
+@@ -13,7 +13,6 @@ export {
+ } from './consts';
+ 
+ // Components
+-export { errorStatus, Status } from './status';
+ export const Area = (props) => (
+   <AsyncComponent loader={() => import('./graph-loader').then((c) => c.Area)} {...props} />
+ );
+diff --git a/frontend/public/components/graphs/status.jsx b/frontend/public/components/graphs/status.jsx
+deleted file mode 100644
+index a257428c4e7..00000000000
+--- a/frontend/public/components/graphs/status.jsx
++++ /dev/null
+@@ -1,137 +0,0 @@
+-/* eslint-disable tsdoc/syntax */
+-import * as _ from 'lodash';
+-import { Component } from 'react';
+-import { css } from '@patternfly/react-styles';
+-import { Link } from 'react-router';
+-import { Title } from '@patternfly/react-core';
+-
+-import { coFetchJSON } from '../../co-fetch';
+-import { PROMETHEUS_BASE_PATH, PROMETHEUS_TENANCY_BASE_PATH } from './consts';
+-
+-export const errorStatus = (err) => {
+-  if (_.get(err.response, 'ok') === false) {
+-    return {
+-      short: '?',
+-      status: '', // Gray
+-      long: err.message,
+-    };
+-  }
+-  // Generic network error handling.
+-  return {
+-    short: 'ERROR',
+-    long: err.message,
+-    status: 'ERROR',
+-  };
+-};
+-
+-const fetchQuery = (q, long, namespace) => {
+-  const nsParam = namespace ? `&namespace=${encodeURIComponent(namespace)}` : '';
+-  const basePath = namespace ? PROMETHEUS_TENANCY_BASE_PATH : PROMETHEUS_BASE_PATH;
+-  return coFetchJSON(`${basePath}/api/v1/query?query=${encodeURIComponent(q)}${nsParam}`)
+-    .then((res) => {
+-      const short = parseInt(_.get(res, 'data.result[0].value[1]'), 10) || 0;
+-      return {
+-        short,
+-        long,
+-        status: short === 0 ? 'OK' : 'WARN',
+-      };
+-    })
+-    .catch(errorStatus);
+-};
+-
+-/** @augments {React.Component<{fetch?: () => Promise<any>, query?: string, title: string, href?: string, rel?: string, target?: string}}>} */
+-export class Status extends Component {
+-  constructor(props) {
+-    super(props);
+-    this.interval = null;
+-    this.state = {
+-      status: '...',
+-    };
+-    this.clock = 0;
+-  }
+-
+-  fetch(props = this.props) {
+-    const clock = this.clock;
+-    const promise = props.query
+-      ? fetchQuery(props.query, props.name, props.namespace)
+-      : props.fetch();
+-
+-    const ignorePromise = (cb) => (...args) => {
+-      if (clock !== this.clock) {
+-        return;
+-      }
+-      cb(...args);
+-    };
+-    promise
+-      .then(ignorePromise(({ short, long, status }) => this.setState({ short, long, status })))
+-      .catch(ignorePromise(() => this.setState({ short: 'BAD', long: 'Error', status: 'ERROR' })))
+-      .then(
+-        ignorePromise(
+-          () =>
+-            (this.interval = setTimeout(() => {
+-              if (this.isMounted_) {
+-                this.fetch();
+-              }
+-            }, 30000)),
+-        ),
+-      );
+-  }
+-
+-  UNSAFE_componentWillReceiveProps(nextProps) {
+-    if (_.isEqual(nextProps, this.props)) {
+-      return;
+-    }
+-    this.clock += 1;
+-    // Don't show stale data if we changed the query.
+-    this.setState({
+-      status: '...',
+-      short: undefined,
+-      long: undefined,
+-    });
+-    this.fetch(nextProps);
+-  }
+-
+-  UNSAFE_componentWillMount() {
+-    clearInterval(this.interval);
+-    this.fetch();
+-  }
+-
+-  componentWillUnmount() {
+-    clearInterval(this.interval);
+-  }
+-
+-  render() {
+-    const title = this.props.title;
+-    const { short, long, status } = this.state;
+-    const shortStatusClassName = css('graph-status__short', {
+-      'graph-status__short--ok': status === 'OK',
+-      'graph-status__short--warn': status === 'WARN',
+-      'graph-status__short--error': status === 'ERROR',
+-    });
+-
+-    const statusElem = (
+-      <div className="graph-wrapper graph-wrapper--title-center graph-wrapper--status">
+-        {title && (
+-          <Title headingLevel="h5" className="graph-title">
+-            {title}
+-          </Title>
+-        )}
+-        <div className="graph-status">
+-          <Title headingLevel="h1" className={shortStatusClassName}>
+-            {short}
+-          </Title>
+-          <div className="graph-status--long">{long}</div>
+-        </div>
+-      </div>
+-    );
+-    const linkProps = _.pick(this.props, ['rel', 'target', 'to']);
+-    if (_.isEmpty(linkProps)) {
+-      return statusElem;
+-    }
+-    return (
+-      <Link {...linkProps} className="graph-status__link">
+-        {statusElem}
+-      </Link>
+-    );
+-  }
+-}
+diff --git a/frontend/public/components/storage/create-pvc.tsx b/frontend/public/components/storage/create-pvc.tsx
+index a4db5c71937..8984d9fbdc9 100644
+--- a/frontend/public/components/storage/create-pvc.tsx
++++ b/frontend/public/components/storage/create-pvc.tsx
+@@ -11,7 +11,12 @@ import { AccessModeSelector } from '@console/app/src/components/access-modes/acc
+ import { VolumeModeSelector } from '@console/app/src/components/volume-modes/volume-mode';
+ import PaneBody from '@console/shared/src/components/layout/PaneBody';
+ import { LinkTo } from '@console/shared/src/components/links/LinkTo';
+-import { k8sCreate, K8sResourceKind, referenceFor } from '../../module/k8s';
++import {
++  k8sCreate,
++  K8sResourceKind,
++  referenceFor,
++  StorageClassResourceKind,
++} from '../../module/k8s';
+ import { PageHeading } from '@console/shared/src/components/heading/PageHeading';
+ import { AsyncComponent } from '../utils/async';
+ import { ButtonBar } from '../utils/button-bar';
+@@ -21,7 +26,6 @@ import { StorageClassDropdown } from '../utils/storage-class-dropdown';
+ import { VolumeAttributesClassDropdown } from '../utils/volume-attributes-class-dropdown';
+ import { Checkbox } from '../checkbox';
+ import { PersistentVolumeClaimModel } from '../../models';
+-import { StorageClass } from '../storage-class-form';
+ import { getProvisionerModeMapping, initialAccessModes, dropdownUnits } from './shared';
+ 
+ const NameValueEditorComponent = (props) => (
+@@ -150,7 +154,7 @@ export const CreatePVCForm: FC<CreatePVCFormProps> = (props) => {
+     setPvcName(event.currentTarget.value.trim());
+   };
+ 
+-  const onlyPvcSCs = useCallback((sc: StorageClass) => !isObjectSC(sc), []);
++  const onlyPvcSCs = useCallback((sc: StorageClassResourceKind) => !isObjectSC(sc), []);
+ 
+   return (
+     <div>
+@@ -161,7 +165,6 @@ export const CreatePVCForm: FC<CreatePVCFormProps> = (props) => {
+           data-test="storageclass-dropdown"
+           describedBy="storageclass-dropdown-help"
+           required={false}
+-          name="storageClass"
+           filter={onlyPvcSCs}
+         />
+       </div>
+diff --git a/frontend/public/components/utils/storage-class-dropdown.tsx b/frontend/public/components/utils/storage-class-dropdown.tsx
+index 689ca958d4e..b82a870d7fb 100644
+--- a/frontend/public/components/utils/storage-class-dropdown.tsx
++++ b/frontend/public/components/utils/storage-class-dropdown.tsx
+@@ -1,61 +1,127 @@
+-/* eslint-disable @typescript-eslint/no-use-before-define */
+ import * as _ from 'lodash';
+-import type { ReactNode } from 'react';
+-import { Component } from 'react';
++import type { FC, ReactNode } from 'react';
++import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
+ import * as fuzzy from 'fuzzysearch';
+-/* eslint-disable import/named */
+-import { WithTranslation, withTranslation } from 'react-i18next';
+-
++import { useTranslation } from 'react-i18next';
++import { css } from '@patternfly/react-styles';
+ import { ConsoleSelect } from '@console/internal/components/utils/console-select';
+-import { Firehose } from './firehose';
+ import { LoadingInline } from './status-box';
++import { useK8sWatchResource } from '@console/internal/components/utils/k8s-watch-hook';
+ import { ResourceName, ResourceIcon } from './resource-icon';
+ import { isDefaultClass } from '../storage-class';
+-import { css } from '@patternfly/react-styles';
++import { StorageClassResourceKind } from '@console/internal/module/k8s';
++import { StorageClassModel } from '@console/internal/models';
++
++export type StorageClassDropdownProps = {
++  id?: string;
++  onChange: (obj: StorageClassResourceKind) => void;
++  describedBy?: string;
++  desc?: string;
++  required?: boolean;
++  hideClassName?: string;
++  filter?: (param: StorageClassResourceKind) => boolean;
++  selectedKey?: string;
++  'data-test'?: string;
++};
+ 
+-/* Component StorageClassDropdown - creates a dropdown list of storage classes */
++type StorageClassItem =
++  | {
++      kindLabel: 'StorageClass';
++      name: string;
++      description: StorageClassResourceKind['metadata']['annotations']['description'];
++      default: boolean;
++      accessMode: StorageClassResourceKind['metadata']['annotations']['storage.alpha.openshift.io/access-mode'];
++      provisioner: StorageClassResourceKind['provisioner'];
++      type: StorageClassResourceKind['parameters']['type'];
++      zone: StorageClassResourceKind['parameters']['zone'];
++      parameters: StorageClassResourceKind['parameters'];
++      resource: StorageClassResourceKind;
++    }
++  | {
++      kindLabel: '';
++      name: string;
++    };
+ 
+-export class StorageClassDropdownInnerWithTranslation extends Component<
+-  StorageClassDropdownInnerProps,
+-  StorageClassDropdownInnerState
+-> {
+-  readonly state: StorageClassDropdownInnerState = {
+-    items: {},
+-    name: this.props.name,
+-    selectedKey: this.props.selectedKey,
+-    title: <LoadingInline />,
+-    defaultClass: this.props.defaultClass,
+-  };
++const getTitle = (storageClass: { kindLabel: string; name: string }): ReactNode => {
++  return storageClass.kindLabel ? (
++    <ResourceName kind="StorageClass" name={storageClass.name} />
++  ) : (
++    <span>{storageClass.name}</span>
++  );
++};
+ 
+-  UNSAFE_componentWillMount() {
+-    this.UNSAFE_componentWillReceiveProps(this.props);
+-  }
++const StorageClassDropdownEntry = (props) => {
++  const storageClassProperties = [
++    props.default ? ' (default)' : '',
++    props.description,
++    props.accessMode,
++    props.provisioner,
++    props.type,
++    props.zone,
++  ];
++  const storageClassDescriptionLine = _.compact(storageClassProperties).join(' | ');
++  return (
++    <span className="co-resource-item">
++      <ResourceIcon kind={props.kindLabel} />
++      <span className="co-resource-item__resource-name">
++        {props.name}
++        <div className="pf-v6-u-font-size-xs pf-v6-u-text-color-subtle">
++          {' '}
++          {storageClassDescriptionLine}
++        </div>
++      </span>
++    </span>
++  );
++};
+ 
+-  UNSAFE_componentWillReceiveProps(nextProps) {
+-    const { loaded, loadError, resources, t } = nextProps;
++const StorageClassDropdownNoStorageClassOption: FC<{ name: string }> = ({ name }) => {
++  return (
++    <span className="co-resource-item">
++      <span className="co-resource-item__resource-name">{name}</span>
++    </span>
++  );
++};
+ 
+-    if (loadError) {
+-      this.setState({
+-        title: (
+-          <div className="cos-error-title">
+-            {t('public~Error loading {{desc}}', { desc: nextProps.desc })}
+-          </div>
+-        ),
+-      });
+-      return;
+-    }
+-    if (!loaded) {
+-      return;
++/* Creates a dropdown list of storage classes */
++export const StorageClassDropdown: FC<StorageClassDropdownProps> = ({
++  id,
++  onChange: onChangeProp,
++  describedBy,
++  desc = StorageClassModel.labelPlural,
++  required,
++  hideClassName,
++  filter,
++  selectedKey: selectedKeyProp,
++  'data-test': dataTest,
++}) => {
++  const { t } = useTranslation('public');
++  const [data, loaded, loadError] = useK8sWatchResource({
++    kind: 'StorageClass',
++    isList: true,
++  });
++
++  const [selectedKey, setSelectedKey] = useState<string | undefined>(selectedKeyProp);
++
++  useEffect(() => {
++    setSelectedKey(selectedKeyProp);
++  }, [selectedKeyProp]);
++
++  const onChangeRef = useRef(onChangeProp);
++  onChangeRef.current = onChangeProp;
++
++  // Process resources into sorted items and find default storage class
++  const { items, defaultClass } = useMemo<{
++    items: Record<string, StorageClassItem>;
++    defaultClass: string;
++  }>(() => {
++    if (!loaded || loadError) {
++      return { items: {}, defaultClass: '' };
+     }
+ 
+-    const state = {
+-      items: {},
+-      title: undefined,
+-      defaultClass: '',
+-    };
+-    let unorderedItems = {};
+-    const noStorageClass = t('public~No default StorageClass');
+-    _.map(resources.StorageClass.data, (resource) => {
++    const noStorageClass = t('No default StorageClass');
++    let unorderedItems: Record<string, StorageClassItem> = {};
++
++    _.map(data, (resource: StorageClassResourceKind) => {
+       unorderedItems[resource.metadata.name] = {
+         kindLabel: 'StorageClass',
+         name: resource.metadata.name,
+@@ -74,203 +140,112 @@ export class StorageClassDropdownInnerWithTranslation extends Component<
+       };
+     });
+ 
+-    //Filter if user provides a custom function
+-    if (nextProps.filter) {
++    if (filter) {
+       unorderedItems = Object.keys(unorderedItems)
+-        .filter((sc) => nextProps.filter(unorderedItems[sc]))
+-        .reduce((acc, key) => {
++        .filter((sc) => {
++          const item = unorderedItems[sc];
++          return item && 'resource' in item && filter(item.resource);
++        })
++        .reduce<Record<string, StorageClassItem>>((acc, key) => {
+           acc[key] = unorderedItems[key];
+           return acc;
+         }, {});
+     }
+ 
+-    // Determine if there is a default storage class
+-    state.defaultClass = _.findKey(unorderedItems, 'default');
+-    const { selectedKey } = this.state;
+-    if (!state.defaultClass) {
+-      // Add No Storage Class option if there is not a default storage class
++    const foundDefault = _.findKey(unorderedItems, 'default') || '';
++    if (!foundDefault) {
+       unorderedItems[''] = { kindLabel: '', name: noStorageClass };
+     }
+ 
+-    if (!this.props.loaded || !selectedKey || !unorderedItems[selectedKey || state.defaultClass]) {
+-      state.title = (
+-        <span className="pf-v6-u-text-color-subtle">{t('public~Select StorageClass')}</span>
+-      );
+-    }
+-
+-    const selectedItem = unorderedItems[selectedKey || state.defaultClass];
+-    if (selectedItem) {
+-      state.title = this.getTitle(selectedItem);
+-    }
+-
++    const sortedItems: Record<string, StorageClassItem> = {};
+     Object.keys(unorderedItems)
+       .sort()
+       .forEach((key) => {
+-        state.items[key] = unorderedItems[key];
++        sortedItems[key] = unorderedItems[key];
+       });
+-    this.setState(state);
+-  }
+ 
+-  componentDidMount() {
+-    const { defaultClass } = this.state;
+-    if (defaultClass) {
+-      this.onChange(defaultClass);
+-    }
+-  }
+-
+-  componentDidUpdate() {
+-    const { defaultClass, selectedKey } = this.state;
+-    if (selectedKey) {
+-      this.onChange(selectedKey);
+-    } else if (defaultClass) {
+-      this.onChange(defaultClass);
+-    }
+-  }
+-
+-  shouldComponentUpdate(nextProps, nextState) {
+-    return !_.isEqual(this.state, nextState);
+-  }
++    return { items: sortedItems, defaultClass: foundDefault };
++  }, [loaded, loadError, data, filter, t]);
+ 
+-  autocompleteFilter = (text, item) => fuzzy(text, item.props.name);
++  const effectiveKey = selectedKey ?? defaultClass;
+ 
+-  getTitle = (storageClass) => {
+-    return storageClass.kindLabel ? (
+-      <ResourceName kind="StorageClass" name={storageClass.name} />
+-    ) : (
+-      <span>{storageClass.name}</span>
+-    );
+-  };
+-
+-  onChange = (key) => {
+-    const storageClass = _.get(this.state, ['items', key], {});
+-    this.setState(
+-      {
+-        selectedKey: key,
+-        title: this.getTitle(storageClass),
+-      },
+-      () => this.props.onChange(storageClass.resource),
+-    );
+-  };
++  // Notify parent when selection or items change
++  useEffect(() => {
++    if (!loaded || loadError) {
++      return;
++    }
++    const selectedItem = items[effectiveKey];
++    if (selectedItem && 'resource' in selectedItem) {
++      onChangeRef.current(selectedItem.resource);
++    }
++  }, [loaded, loadError, effectiveKey, items]);
++
++  // Build dropdown item elements
++  const dropdownItems = useMemo(() => {
++    const result: Record<string, ReactNode> = {};
++    _.each(items, (props, key) => {
++      result[key] = key ? (
++        <StorageClassDropdownEntry {...props} />
++      ) : (
++        <StorageClassDropdownNoStorageClassOption {...props} />
++      );
++    });
++    return result;
++  }, [items]);
+ 
+-  render() {
+-    const { id, loaded, describedBy, t } = this.props;
+-    const items = {};
+-    _.each(
+-      this.state.items,
+-      (props, key) =>
+-        (items[key] = key ? (
+-          <StorageClassDropdownEntry {...props} />
+-        ) : (
+-          <StorageClassDropdownNoStorageClassOption {...props} />
+-        )),
+-    );
++  const itemsAvailableToShow = defaultClass || _.size(dropdownItems) > 1;
+ 
+-    const { selectedKey, defaultClass } = this.state;
++  // Compute display title
++  const displayTitle = useMemo<ReactNode>(() => {
++    if (loadError) {
++      return (
++        <span className="pf-v6-u-text-color-status-danger">
++          {t('Error loading {{desc}}', { desc })}
++        </span>
++      );
++    }
++    if (!loaded) {
++      return <LoadingInline />;
++    }
++    const selectedItem = items[effectiveKey];
++    if (itemsAvailableToShow && selectedItem) {
++      return getTitle(selectedItem);
++    }
++    return <span className="pf-v6-u-text-color-subtle">{t('Select StorageClass')}</span>;
++  }, [loadError, itemsAvailableToShow, loaded, items, effectiveKey, desc, t]);
+ 
+-    // Only show the dropdown if 'no storage class' is not the only option which depends on defaultClass
+-    const itemsAvailableToShow = defaultClass || _.size(items) > 1;
+-    return (
+-      <>
+-        {loaded && itemsAvailableToShow && (
+-          <div>
+-            <label
+-              className={css(this.props.hideClassName, {
+-                'co-required': this.props.required,
+-              })}
+-              htmlFor={id}
+-            >
+-              {t('public~StorageClass')}
+-            </label>
+-            <ConsoleSelect
+-              className="co-storage-class-dropdown"
+-              isFullWidth
+-              autocompleteFilter={this.autocompleteFilter}
+-              autocompletePlaceholder={t('public~Select StorageClass')}
+-              items={items}
+-              selectedKey={selectedKey}
+-              title={this.state.title}
+-              alwaysShowTitle
+-              onChange={this.onChange}
+-              id={id}
+-              dataTest={this.props?.['data-test']}
+-              menuClassName="dropdown-menu--text-wrap"
+-            />
+-            {describedBy && (
+-              <p className="help-block" id={describedBy}>
+-                {t('public~StorageClass for the new claim')}
+-              </p>
+-            )}
+-          </div>
+-        )}
+-      </>
+-    );
+-  }
+-}
++  const handleChange = useCallback((key: string) => {
++    setSelectedKey(key);
++  }, []);
+ 
+-export const StorageClassDropdownInner = withTranslation()(
+-  StorageClassDropdownInnerWithTranslation,
+-);
++  const autocompleteFilter = useCallback((text, item) => fuzzy(text, item.props.name), []);
+ 
+-export const StorageClassDropdown = (props) => {
+   return (
+-    <Firehose resources={[{ kind: 'StorageClass', prop: 'StorageClass', isList: true }]}>
+-      <StorageClassDropdownInner {...props} />
+-    </Firehose>
++    <div>
++      <label className={css(hideClassName, { 'co-required': required })} htmlFor={id}>
++        {t('StorageClass')}
++      </label>
++      <ConsoleSelect
++        className="co-storage-class-dropdown"
++        isFullWidth
++        autocompleteFilter={autocompleteFilter}
++        autocompletePlaceholder={t('Select StorageClass')}
++        items={dropdownItems}
++        selectedKey={effectiveKey}
++        title={displayTitle}
++        disabled={!loaded || loadError}
++        alwaysShowTitle
++        onChange={handleChange}
++        describedBy={describedBy}
++        id={id}
++        dataTest={dataTest}
++        menuClassName="dropdown-menu--text-wrap"
++      />
++      {describedBy ? (
++        <p className="help-block" id={describedBy}>
++          {t('StorageClass for the new claim')}
++        </p>
++      ) : null}
++    </div>
+   );
+ };
+-
+-const StorageClassDropdownEntry = (props) => {
+-  const storageClassProperties = [
+-    props.default ? ' (default)' : '',
+-    props.description,
+-    props.accessMode,
+-    props.provisioner,
+-    props.type,
+-    props.zone,
+-  ];
+-  const storageClassDescriptionLine = _.compact(storageClassProperties).join(' | ');
+-  return (
+-    <span className="co-resource-item">
+-      <ResourceIcon kind={props.kindLabel} />
+-      <span className="co-resource-item__resource-name">
+-        {props.name}
+-        <div className="pf-v6-u-font-size-xs pf-v6-u-text-color-subtle">
+-          {' '}
+-          {storageClassDescriptionLine}
+-        </div>
+-      </span>
+-    </span>
+-  );
+-};
+-
+-const StorageClassDropdownNoStorageClassOption = (props) => {
+-  return (
+-    <span className="co-resource-item">
+-      <span className="co-resource-item__resource-name">{props.name}</span>
+-    </span>
+-  );
+-};
+-
+-export type StorageClassDropdownInnerState = {
+-  items: any;
+-  name: string;
+-  selectedKey: string;
+-  title: ReactNode;
+-  defaultClass: string;
+-};
+-
+-export type StorageClassDropdownInnerProps = WithTranslation & {
+-  id?: string;
+-  loaded?: boolean;
+-  loadError?: any;
+-  resources?: any;
+-  name: string;
+-  onChange: (object) => void;
+-  describedBy: string;
+-  desc?: string;
+-  defaultClass: string;
+-  required?: boolean;
+-  hideClassName?: string;
+-  filter?: (param) => boolean;
+-  selectedKey?: string;
+-};
+diff --git a/frontend/public/module/k8s/types.ts b/frontend/public/module/k8s/types.ts
+index ff97ea5d7d6..9c12abaa65a 100644
+--- a/frontend/public/module/k8s/types.ts
++++ b/frontend/public/module/k8s/types.ts
+@@ -476,7 +476,9 @@ export type HorizontalPodAutoscalerKind = K8sResourceCommon & {
+ 
+ export type StorageClassResourceKind = {
+   provisioner: string;
+-  reclaimPolicy: string;
++  reclaimPolicy?: string;
++  volumeBindingMode?: string;
++  allowVolumeExpansion?: boolean;
+   parameters?: {
+     [key: string]: string;
+   };

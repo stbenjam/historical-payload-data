@@ -1,0 +1,153 @@
+diff --git a/go-controller/pkg/clustermanager/userdefinednetwork/controller.go b/go-controller/pkg/clustermanager/userdefinednetwork/controller.go
+index 10a1fee9dd..f007812b92 100644
+--- a/go-controller/pkg/clustermanager/userdefinednetwork/controller.go
++++ b/go-controller/pkg/clustermanager/userdefinednetwork/controller.go
+@@ -263,14 +263,14 @@ func (c *Controller) ReconcileNetAttachDef(key string) error {
+ // ReconcileNamespace enqueue relevant Cluster UDN CR requests following namespace events.
+ func (c *Controller) ReconcileNamespace(key string) error {
+ 	namespace, err := c.namespaceInformer.Lister().Get(key)
+-	if err != nil {
+-		// Ignore removed namespaces
+-		if apierrors.IsNotFound(err) {
+-			return nil
+-		}
++	if err != nil && !apierrors.IsNotFound(err) {
+ 		return fmt.Errorf("failed to get namespace %q from cache: %w", key, err)
+ 	}
+-	namespaceLabels := labels.Set(namespace.Labels)
++
++	var namespaceLabels labels.Set
++	if namespace != nil {
++		namespaceLabels = namespace.Labels
++	}
+ 
+ 	c.namespaceTrackerLock.RLock()
+ 	defer c.namespaceTrackerLock.RUnlock()
+@@ -278,8 +278,16 @@ func (c *Controller) ReconcileNamespace(key string) error {
+ 	for cudnName, affectedNamespaces := range c.namespaceTracker {
+ 		affectedNamespace := affectedNamespaces.Has(key)
+ 
+-		selectedNamespace := false
++		// For deleted namespaces, only reconcile if tracked
++		if namespace == nil {
++			if affectedNamespace {
++				klog.Errorf("BUG: namespace %q was deleted but still tracked by ClusterUDN %q, forcing reconcile to cleanup", key, cudnName)
++				c.cudnController.Reconcile(cudnName)
++			}
++			continue
++		}
+ 
++		selectedNamespace := false
+ 		if !affectedNamespace {
+ 			cudn, err := c.cudnLister.Get(cudnName)
+ 			if err != nil {
+@@ -656,6 +664,10 @@ func (c *Controller) getSelectedNamespaces(sel metav1.LabelSelector) (sets.Set[s
+ 		return nil, fmt.Errorf("failed to list namespaces: %w", err)
+ 	}
+ 	for _, selectedNs := range selectedNamespacesList {
++		if !selectedNs.DeletionTimestamp.IsZero() {
++			klog.V(5).Infof("Namespace %s is being deleted, skipping", selectedNs.Name)
++			continue
++		}
+ 		selectedNamespaces.Insert(selectedNs.Name)
+ 	}
+ 	return selectedNamespaces, nil
+diff --git a/go-controller/pkg/clustermanager/userdefinednetwork/controller_test.go b/go-controller/pkg/clustermanager/userdefinednetwork/controller_test.go
+index 08791e9bf4..ddde9b7ed8 100644
+--- a/go-controller/pkg/clustermanager/userdefinednetwork/controller_test.go
++++ b/go-controller/pkg/clustermanager/userdefinednetwork/controller_test.go
+@@ -1202,6 +1202,32 @@ var _ = Describe("User Defined Network Controller", func() {
+ 			Expect(err).To(MatchError(expectedErr))
+ 		})
+ 
++		It("when namespace without pods is being deleted, should delete NAD in that namespace", func() {
++			const cudnName = "test-network"
++			testNs := testNamespace("blue")
++			cudn := testClusterUDN(cudnName, testNs.Name)
++			expectedNAD := testClusterUdnNAD(cudnName, testNs.Name)
++			c := newTestController(renderNadStub(expectedNAD), cudn, testNs)
++			Expect(c.Run()).To(Succeed())
++
++			By("verify NAD is created in namespace")
++			Eventually(func() error {
++				_, err := cs.NetworkAttchDefClient.K8sCniCncfIoV1().NetworkAttachmentDefinitions(testNs.Name).Get(context.Background(), cudnName, metav1.GetOptions{})
++				return err
++			}).Should(Succeed())
++
++			By("mark namespace as terminating")
++			testNs.DeletionTimestamp = &metav1.Time{Time: time.Now()}
++			_, err := cs.KubeClient.CoreV1().Namespaces().Update(context.Background(), testNs, metav1.UpdateOptions{})
++			Expect(err).ToNot(HaveOccurred())
++
++			By("verify NAD is deleted")
++			Eventually(func() bool {
++				_, err := cs.NetworkAttchDefClient.K8sCniCncfIoV1().NetworkAttachmentDefinitions(testNs.Name).Get(context.Background(), cudnName, metav1.GetOptions{})
++				return apierrors.IsNotFound(err)
++			}).Should(BeTrue(), "NAD should be deleted when namespace is terminating")
++		})
++
+ 		It("when CR is deleted, CR has no finalizer, should succeed", func() {
+ 			deletedCUDN := testClusterUDN("test", "blue")
+ 			deletedCUDN.Finalizers = []string{}
+diff --git a/go-controller/pkg/clustermanager/userdefinednetwork/notifier/namespace.go b/go-controller/pkg/clustermanager/userdefinednetwork/notifier/namespace.go
+index 90ff81befc..d6dbf634f2 100644
+--- a/go-controller/pkg/clustermanager/userdefinednetwork/notifier/namespace.go
++++ b/go-controller/pkg/clustermanager/userdefinednetwork/notifier/namespace.go
+@@ -46,10 +46,11 @@ func NewNamespaceNotifier(nsInformer corev1informer.NamespaceInformer, subscribe
+ func (c *NamespaceNotifier) needUpdate(old, new *corev1.Namespace) bool {
+ 	nsCreated := old == nil && new != nil
+ 	nsDeleted := old != nil && new == nil
++	nsDeleting := new != nil && !new.DeletionTimestamp.IsZero()
+ 	nsLabelsChanged := old != nil && new != nil &&
+ 		!reflect.DeepEqual(old.Labels, new.Labels)
+ 
+-	return nsCreated || nsDeleted || nsLabelsChanged
++	return nsCreated || nsDeleted || nsDeleting || nsLabelsChanged
+ }
+ 
+ // reconcile notify subscribers with the request namespace key following namespace events.
+diff --git a/test/e2e/network_segmentation.go b/test/e2e/network_segmentation.go
+index d1591e4781..9f9e91f584 100644
+--- a/test/e2e/network_segmentation.go
++++ b/test/e2e/network_segmentation.go
+@@ -1315,6 +1315,40 @@ spec:
+ 			}
+ 		})
+ 
++		It("should delete NAD when target namespace is terminating", func() {
++			testTerminatingNs := f.Namespace.Name + "terminating"
++
++			By("add new target namespace to CR namespace-selector")
++			patch := fmt.Sprintf(`[{"op": "add", "path": "./spec/namespaceSelector/matchExpressions/0/values/-", "value": "%s"}]`, testTerminatingNs)
++			_, err := e2ekubectl.RunKubectl("", "patch", clusterUserDefinedNetworkResource, testClusterUdnName, "--type=json", "-p="+patch)
++			Expect(err).NotTo(HaveOccurred())
++
++			By("create the target namespace")
++			_, err = cs.CoreV1().Namespaces().Create(context.Background(), &v1.Namespace{
++				ObjectMeta: metav1.ObjectMeta{
++					Name:   testTerminatingNs,
++					Labels: map[string]string{RequiredUDNNamespaceLabel: ""},
++				}}, metav1.CreateOptions{})
++			Expect(err).NotTo(HaveOccurred())
++
++			By("verify NAD is created in the namespace")
++			Eventually(func() error {
++				_, err := nadClient.NetworkAttachmentDefinitions(testTerminatingNs).Get(context.Background(), testClusterUdnName, metav1.GetOptions{})
++				return err
++			}, time.Second*15, time.Second*1).Should(Succeed(), "NAD should be created in target namespace")
++
++			By("delete the namespace to trigger termination")
++			err = cs.CoreV1().Namespaces().Delete(context.Background(), testTerminatingNs, metav1.DeleteOptions{})
++			Expect(err).NotTo(HaveOccurred())
++
++			By("verify NAD is deleted from the terminating namespace")
++			Eventually(func() bool {
++				_, err := nadClient.NetworkAttachmentDefinitions(testTerminatingNs).Get(context.Background(), testClusterUdnName, metav1.GetOptions{})
++				return err != nil && kerrors.IsNotFound(err)
++			}, time.Second*30, time.Second*1).Should(BeTrue(),
++				"NAD should be deleted when namespace is terminating")
++		})
++
+ 		It("should create NAD in new created namespaces that apply to namespace-selector", func() {
+ 			testNewNs := f.Namespace.Name + "green"
+ 

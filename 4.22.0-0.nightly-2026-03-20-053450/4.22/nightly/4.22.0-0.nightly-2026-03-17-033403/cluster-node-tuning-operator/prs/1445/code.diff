@@ -1,0 +1,457 @@
+diff --git a/pkg/apis/performanceprofile/v2/performanceprofile_types.go b/pkg/apis/performanceprofile/v2/performanceprofile_types.go
+index 5c06cf2099..f877fcdcdb 100644
+--- a/pkg/apis/performanceprofile/v2/performanceprofile_types.go
++++ b/pkg/apis/performanceprofile/v2/performanceprofile_types.go
+@@ -45,6 +45,11 @@ const (
+ 	PerformanceProfileExecCPUAffinityDisable    = "disable"
+ )
+ 
++// PerformanceProfileDRAResourceManagementAnnotation signal the operator to disable KubeletConfig
++// topology managers (CPU Manager, Memory Manager) configurations
++// that conflict with the DRA feature, and enforce the disablement as long as the annotation is present.
++const PerformanceProfileDRAResourceManagementAnnotation = "performance.openshift.io/dra-resource-management"
++
+ // PerformanceProfileSpec defines the desired state of PerformanceProfile.
+ type PerformanceProfileSpec struct {
+ 	// CPU defines a set of CPU related parameters.
+diff --git a/pkg/performanceprofile/controller/performanceprofile/components/components.go b/pkg/performanceprofile/controller/performanceprofile/components/components.go
+index c4243b209e..0ec412e998 100644
+--- a/pkg/performanceprofile/controller/performanceprofile/components/components.go
++++ b/pkg/performanceprofile/controller/performanceprofile/components/components.go
+@@ -38,6 +38,7 @@ type Options struct {
+ 	ProfileMCP                  *mcov1.MachineConfigPool
+ 	MachineConfig               MachineConfigOptions
+ 	MixedCPUsFeatureGateEnabled bool
++	DRAResourceManagement       bool
+ }
+ 
+ type MachineConfigOptions struct {
+@@ -48,4 +49,5 @@ type MachineConfigOptions struct {
+ type KubeletConfigOptions struct {
+ 	MachineConfigPoolSelector map[string]string
+ 	MixedCPUsEnabled          bool
++	DRAResourceManagement     bool
+ }
+diff --git a/pkg/performanceprofile/controller/performanceprofile/components/handler/handler.go b/pkg/performanceprofile/controller/performanceprofile/components/handler/handler.go
+index 75df6b6ee2..870db949df 100644
+--- a/pkg/performanceprofile/controller/performanceprofile/components/handler/handler.go
++++ b/pkg/performanceprofile/controller/performanceprofile/components/handler/handler.go
+@@ -44,6 +44,7 @@ func (h *handler) Apply(ctx context.Context, obj client.Object, recorder record.
+ 	}
+ 	// set missing options
+ 	opts.MachineConfig.MixedCPUsEnabled = opts.MixedCPUsFeatureGateEnabled && profileutil.IsMixedCPUsEnabled(profile)
++	opts.DRAResourceManagement = profileutil.IsDRAManaged(profile)
+ 
+ 	components, err := manifestset.GetNewComponents(profile, opts)
+ 	if err != nil {
+diff --git a/pkg/performanceprofile/controller/performanceprofile/components/kubeletconfig/kubeletconfig.go b/pkg/performanceprofile/controller/performanceprofile/components/kubeletconfig/kubeletconfig.go
+index e93704dd27..a78be62ae3 100644
+--- a/pkg/performanceprofile/controller/performanceprofile/components/kubeletconfig/kubeletconfig.go
++++ b/pkg/performanceprofile/controller/performanceprofile/components/kubeletconfig/kubeletconfig.go
+@@ -2,6 +2,7 @@ package kubeletconfig
+ 
+ import (
+ 	"encoding/json"
++	"fmt"
+ 	"time"
+ 
+ 	corev1 "k8s.io/api/core/v1"
+@@ -43,8 +44,12 @@ const (
+ 	evictionHardNodefsInodesFree                 = "nodefs.inodesFree"
+ )
+ 
+-// New returns new KubeletConfig object for performance sensetive workflows
++// New returns new KubeletConfig object for performance sensitive workflows
+ func New(profile *performancev2.PerformanceProfile, opts *components.KubeletConfigOptions) (*machineconfigv1.KubeletConfig, error) {
++	if err := validateOptions(opts); err != nil {
++		return nil, fmt.Errorf("KubeletConfig options validation failed: %w", err)
++	}
++
+ 	name := components.GetComponentName(profile.Name, components.ComponentNamePrefix)
+ 	kubeletConfig := &kubeletconfigv1beta1.KubeletConfiguration{}
+ 	if v, ok := profile.Annotations[experimentalKubeletSnippetAnnotation]; ok {
+@@ -58,6 +63,61 @@ func New(profile *performancev2.PerformanceProfile, opts *components.KubeletConf
+ 		Kind:       "KubeletConfiguration",
+ 	}
+ 
++	// when DRA resource management is enabled, all kubeletconfig settings should be disabled.
++	// this is because the DRA plugin will manage the resource allocation.
++	// if the kubeletconfig CPU and Memory Manager settings are not disabled, it will conflict with the DRA.
++	if opts.DRAResourceManagement {
++		if err := setKubeletConfigForDRAManagement(kubeletConfig, opts); err != nil {
++			return nil, err
++		}
++	} else {
++		if err := setKubeletConfigForCPUAndMemoryManagers(profile, kubeletConfig, opts); err != nil {
++			return nil, err
++		}
++	}
++
++	raw, err := json.Marshal(kubeletConfig)
++	if err != nil {
++		return nil, err
++	}
++
++	return &machineconfigv1.KubeletConfig{
++		TypeMeta: metav1.TypeMeta{
++			APIVersion: machineconfigv1.GroupVersion.String(),
++			Kind:       "KubeletConfig",
++		},
++		ObjectMeta: metav1.ObjectMeta{
++			Name: name,
++		},
++		Spec: machineconfigv1.KubeletConfigSpec{
++			MachineConfigPoolSelector: &metav1.LabelSelector{
++				MatchLabels: opts.MachineConfigPoolSelector,
++			},
++			KubeletConfig: &runtime.RawExtension{
++				Raw: raw,
++			},
++		},
++	}, nil
++}
++
++func addStringToQuantity(q *resource.Quantity, value string) error {
++	v, err := resource.ParseQuantity(value)
++	if err != nil {
++		return err
++	}
++	q.Add(v)
++	return nil
++}
++
++func setKubeletConfigForDRAManagement(kubeletConfig *kubeletconfigv1beta1.KubeletConfiguration, opts *components.KubeletConfigOptions) error {
++	kubeletConfig.CPUManagerPolicy = "none"
++	kubeletConfig.CPUManagerPolicyOptions = map[string]string{}
++	kubeletConfig.TopologyManagerPolicy = kubeletconfigv1beta1.NoneTopologyManagerPolicy
++	kubeletConfig.MemoryManagerPolicy = kubeletconfigv1beta1.NoneMemoryManagerPolicy
++	return nil
++}
++
++func setKubeletConfigForCPUAndMemoryManagers(profile *performancev2.PerformanceProfile, kubeletConfig *kubeletconfigv1beta1.KubeletConfiguration, opts *components.KubeletConfigOptions) error {
+ 	kubeletConfig.CPUManagerPolicy = cpuManagerPolicyStatic
+ 	kubeletConfig.CPUManagerReconcilePeriod = metav1.Duration{Duration: 5 * time.Second}
+ 	kubeletConfig.TopologyManagerPolicy = kubeletconfigv1beta1.BestEffortTopologyManagerPolicy
+@@ -102,11 +162,11 @@ func New(profile *performancev2.PerformanceProfile, opts *components.KubeletConf
+ 	if opts.MixedCPUsEnabled {
+ 		sharedCPUs, err := cpuset.Parse(string(*profile.Spec.CPU.Shared))
+ 		if err != nil {
+-			return nil, err
++			return err
+ 		}
+ 		reservedCPUs, err := cpuset.Parse(string(*profile.Spec.CPU.Reserved))
+ 		if err != nil {
+-			return nil, err
++			return err
+ 		}
+ 		kubeletConfig.ReservedSystemCPUs = reservedCPUs.Union(sharedCPUs).String()
+ 	}
+@@ -125,13 +185,13 @@ func New(profile *performancev2.PerformanceProfile, opts *components.KubeletConf
+ 				if kubeletConfig.ReservedMemory == nil {
+ 					reservedMemory := resource.NewQuantity(0, resource.DecimalSI)
+ 					if err := addStringToQuantity(reservedMemory, kubeletConfig.KubeReserved[string(corev1.ResourceMemory)]); err != nil {
+-						return nil, err
++						return err
+ 					}
+ 					if err := addStringToQuantity(reservedMemory, kubeletConfig.SystemReserved[string(corev1.ResourceMemory)]); err != nil {
+-						return nil, err
++						return err
+ 					}
+ 					if err := addStringToQuantity(reservedMemory, kubeletConfig.EvictionHard[evictionHardMemoryAvailable]); err != nil {
+-						return nil, err
++						return err
+ 					}
+ 
+ 					kubeletConfig.ReservedMemory = []kubeletconfigv1beta1.MemoryReservation{
+@@ -159,37 +219,16 @@ func New(profile *performancev2.PerformanceProfile, opts *components.KubeletConf
+ 			}
+ 		}
+ 	}
+-
+-	raw, err := json.Marshal(kubeletConfig)
+-	if err != nil {
+-		return nil, err
+-	}
+-
+-	return &machineconfigv1.KubeletConfig{
+-		TypeMeta: metav1.TypeMeta{
+-			APIVersion: machineconfigv1.GroupVersion.String(),
+-			Kind:       "KubeletConfig",
+-		},
+-		ObjectMeta: metav1.ObjectMeta{
+-			Name: name,
+-		},
+-		Spec: machineconfigv1.KubeletConfigSpec{
+-			MachineConfigPoolSelector: &metav1.LabelSelector{
+-				MatchLabels: opts.MachineConfigPoolSelector,
+-			},
+-			KubeletConfig: &runtime.RawExtension{
+-				Raw: raw,
+-			},
+-		},
+-	}, nil
++	return nil
+ }
++func validateOptions(opts *components.KubeletConfigOptions) error {
++	if opts == nil {
++		return nil
++	}
+ 
+-func addStringToQuantity(q *resource.Quantity, value string) error {
+-	v, err := resource.ParseQuantity(value)
+-	if err != nil {
+-		return err
++	if opts.MixedCPUsEnabled && opts.DRAResourceManagement {
++		return fmt.Errorf("invalid configuration: mixed CPUs mode and DRA resource management features are mutually exclusive. please disable one of the features before continuing")
+ 	}
+-	q.Add(v)
+ 
+ 	return nil
+ }
+diff --git a/pkg/performanceprofile/controller/performanceprofile/components/kubeletconfig/kubeletconfig_test.go b/pkg/performanceprofile/controller/performanceprofile/components/kubeletconfig/kubeletconfig_test.go
+index aac2c798ab..3646034123 100644
+--- a/pkg/performanceprofile/controller/performanceprofile/components/kubeletconfig/kubeletconfig_test.go
++++ b/pkg/performanceprofile/controller/performanceprofile/components/kubeletconfig/kubeletconfig_test.go
+@@ -206,4 +206,18 @@ var _ = Describe("Kubelet Config", func() {
+ 		})
+ 
+ 	})
++
++	Context("with mutually exclusive options", func() {
++		It("should return an error when both MixedCPUs and DRA resource management are enabled", func() {
++			profile := testutils.NewPerformanceProfile("test")
++			selectorKey, selectorValue := components.GetFirstKeyAndValue(profile.Spec.MachineConfigPoolSelector)
++			_, err := New(profile, &components.KubeletConfigOptions{
++				MachineConfigPoolSelector: map[string]string{selectorKey: selectorValue},
++				MixedCPUsEnabled:          true,
++				DRAResourceManagement:     true,
++			})
++			Expect(err).To(HaveOccurred())
++			Expect(err.Error()).To(ContainSubstring("mixed CPUs mode and DRA resource management features are mutually exclusive"))
++		})
++	})
+ })
+diff --git a/pkg/performanceprofile/controller/performanceprofile/components/manifestset/manifestset.go b/pkg/performanceprofile/controller/performanceprofile/components/manifestset/manifestset.go
+index 6942c5c389..a7937313e0 100644
+--- a/pkg/performanceprofile/controller/performanceprofile/components/manifestset/manifestset.go
++++ b/pkg/performanceprofile/controller/performanceprofile/components/manifestset/manifestset.go
+@@ -62,6 +62,7 @@ func GetNewComponents(profile *performancev2.PerformanceProfile, opts *component
+ 		&components.KubeletConfigOptions{
+ 			MachineConfigPoolSelector: machineConfigPoolSelector,
+ 			MixedCPUsEnabled:          opts.MachineConfig.MixedCPUsEnabled,
++			DRAResourceManagement:     opts.DRAResourceManagement,
+ 		})
+ 	if err != nil {
+ 		return nil, err
+diff --git a/pkg/performanceprofile/controller/performanceprofile/components/profile/profile.go b/pkg/performanceprofile/controller/performanceprofile/components/profile/profile.go
+index c5a7166da2..7026bd1f14 100644
+--- a/pkg/performanceprofile/controller/performanceprofile/components/profile/profile.go
++++ b/pkg/performanceprofile/controller/performanceprofile/components/profile/profile.go
+@@ -1,6 +1,10 @@
+ package profile
+ 
+ import (
++	"strconv"
++
++	"k8s.io/klog/v2"
++
+ 	performancev2 "github.com/openshift/cluster-node-tuning-operator/pkg/apis/performanceprofile/v2"
+ 	"github.com/openshift/cluster-node-tuning-operator/pkg/performanceprofile/controller/performanceprofile/components"
+ 
+@@ -108,3 +112,21 @@ func IsExecCPUAffinityEnabled(profile *performancev2.PerformanceProfile) bool {
+ 	// The default behavior is to enable exec-cpu-affinity whenever profile is applied
+ 	return true
+ }
++
++func IsDRAManaged(profile *performancev2.PerformanceProfile) bool {
++	if profile.Annotations == nil {
++		return false
++	}
++
++	v, ok := profile.Annotations[performancev2.PerformanceProfileDRAResourceManagementAnnotation]
++	if !ok {
++		return false
++	}
++
++	parsed, err := strconv.ParseBool(v)
++	if err != nil {
++		klog.ErrorS(err, "failed to parse annotation as bool", "annotation", performancev2.PerformanceProfileDRAResourceManagementAnnotation)
++		return false
++	}
++	return parsed
++}
+diff --git a/pkg/performanceprofile/controller/performanceprofile/components/profile/profile_test.go b/pkg/performanceprofile/controller/performanceprofile/components/profile/profile_test.go
+index 33a5e38a31..86a90e7734 100644
+--- a/pkg/performanceprofile/controller/performanceprofile/components/profile/profile_test.go
++++ b/pkg/performanceprofile/controller/performanceprofile/components/profile/profile_test.go
+@@ -108,6 +108,46 @@ var _ = Describe("PerformanceProfile", func() {
+ 			})
+ 		})
+ 	})
++
++	Describe("DRA Resource Management", func() {
++		Context("IsDRAManaged", func() {
++			It("should return false when annotations are nil", func() {
++				profile.Annotations = nil
++				result := IsDRAManaged(profile)
++				Expect(result).To(BeFalse())
++			})
++
++			It("should return false when annotation is not present", func() {
++				profile.Annotations = map[string]string{}
++				result := IsDRAManaged(profile)
++				Expect(result).To(BeFalse())
++			})
++
++			It("should return true when annotation is 'true'", func() {
++				profile.Annotations = map[string]string{
++					performancev2.PerformanceProfileDRAResourceManagementAnnotation: "true",
++				}
++				result := IsDRAManaged(profile)
++				Expect(result).To(BeTrue())
++			})
++
++			It("should return false when annotation is 'false'", func() {
++				profile.Annotations = map[string]string{
++					performancev2.PerformanceProfileDRAResourceManagementAnnotation: "false",
++				}
++				result := IsDRAManaged(profile)
++				Expect(result).To(BeFalse())
++			})
++
++			It("should return false when annotation has invalid value", func() {
++				profile.Annotations = map[string]string{
++					performancev2.PerformanceProfileDRAResourceManagementAnnotation: "invalid",
++				}
++				result := IsDRAManaged(profile)
++				Expect(result).To(BeFalse())
++			})
++		})
++	})
+ })
+ 
+ func setValidNodeSelector(profile *performancev2.PerformanceProfile) {
+diff --git a/pkg/performanceprofile/controller/performanceprofile/hypershift/components/handler.go b/pkg/performanceprofile/controller/performanceprofile/hypershift/components/handler.go
+index 1137d9e8e2..702d6df0ea 100644
+--- a/pkg/performanceprofile/controller/performanceprofile/hypershift/components/handler.go
++++ b/pkg/performanceprofile/controller/performanceprofile/hypershift/components/handler.go
+@@ -93,6 +93,7 @@ func (h *handler) Apply(ctx context.Context, obj client.Object, recorder record.
+ 	}
+ 	// set missing options
+ 	options.MachineConfig.MixedCPUsEnabled = options.MixedCPUsFeatureGateEnabled && profileutil.IsMixedCPUsEnabled(profile)
++	options.DRAResourceManagement = profileutil.IsDRAManaged(profile)
+ 
+ 	mfs, err := manifestset.GetNewComponents(profile, options)
+ 	if err != nil {
+diff --git a/test/e2e/performanceprofile/functests/1_performance/topology_manager.go b/test/e2e/performanceprofile/functests/1_performance/topology_manager.go
+index 76a3565898..2cde8d6033 100644
+--- a/test/e2e/performanceprofile/functests/1_performance/topology_manager.go
++++ b/test/e2e/performanceprofile/functests/1_performance/topology_manager.go
+@@ -2,6 +2,8 @@ package __performance
+ 
+ import (
+ 	"context"
++	"fmt"
++
+ 	. "github.com/onsi/ginkgo/v2"
+ 	. "github.com/onsi/gomega"
+ 
+@@ -9,7 +11,9 @@ import (
+ 	testutils "github.com/openshift/cluster-node-tuning-operator/test/e2e/performanceprofile/functests/utils"
+ 	"github.com/openshift/cluster-node-tuning-operator/test/e2e/performanceprofile/functests/utils/discovery"
+ 	"github.com/openshift/cluster-node-tuning-operator/test/e2e/performanceprofile/functests/utils/nodes"
++	"github.com/openshift/cluster-node-tuning-operator/test/e2e/performanceprofile/functests/utils/poolname"
+ 	"github.com/openshift/cluster-node-tuning-operator/test/e2e/performanceprofile/functests/utils/profiles"
++	"github.com/openshift/cluster-node-tuning-operator/test/e2e/performanceprofile/functests/utils/profilesupdate"
+ 
+ 	corev1 "k8s.io/api/core/v1"
+ 	kubeletconfigv1beta1 "k8s.io/kubelet/config/v1beta1"
+@@ -45,4 +49,88 @@ var _ = Describe("[rfe_id:27350][performance]Topology Manager", Ordered, func()
+ 			Expect(kubeletConfig.TopologyManagerPolicy).To(Equal(kubeletconfigv1beta1.BestEffortTopologyManagerPolicy), "Topology Manager policy mismatch got %q expected %q", kubeletconfigv1beta1.BestEffortTopologyManagerPolicy)
+ 		}
+ 	})
++
++	Context("Deactivating topology and resource managers", func() {
++		var initialProfile *performancev2.PerformanceProfile
++		var targetNode *corev1.Node
++
++		BeforeEach(func() {
++			var err error
++			profile, err = profiles.GetByNodeLabels(testutils.NodeSelectorLabels)
++			Expect(err).ToNot(HaveOccurred())
++
++			workerRTNodes, err := nodes.GetByLabels(testutils.NodeSelectorLabels)
++			Expect(err).ToNot(HaveOccurred())
++
++			workerRTNodes, err = nodes.MatchingOptionalSelector(workerRTNodes)
++			Expect(err).ToNot(HaveOccurred(), "Error looking for the optional selector: %v", err)
++			Expect(workerRTNodes).ToNot(BeEmpty(), "No RT worker node found!")
++			targetNode = &workerRTNodes[0]
++
++			initialProfile = profile.DeepCopy()
++
++			By("Adding the DRA resource management annotation to the profile")
++			if profile.Annotations == nil {
++				profile.Annotations = make(map[string]string)
++			}
++			profile.Annotations[performancev2.PerformanceProfileDRAResourceManagementAnnotation] = "true"
++
++			By("Updating the performance profile")
++			profiles.UpdateWithRetry(profile)
++
++			poolName := poolname.GetByProfile(context.TODO(), profile)
++			By(fmt.Sprintf("Applying changes in performance profile and waiting until %s will start updating", poolName))
++			profilesupdate.WaitForTuningUpdating(context.TODO(), profile)
++
++			By(fmt.Sprintf("Waiting when %s finishes updates", poolName))
++			profilesupdate.WaitForTuningUpdated(context.TODO(), profile)
++
++			DeferCleanup(func() {
++				By("Reverting the performance profile")
++				profiles.UpdateWithRetry(initialProfile)
++
++				poolName := poolname.GetByProfile(context.TODO(), initialProfile)
++				By(fmt.Sprintf("Applying changes in performance profile and waiting until %s will start updating", poolName))
++				profilesupdate.WaitForTuningUpdating(context.TODO(), initialProfile)
++
++				By(fmt.Sprintf("Waiting when %s finishes updates", poolName))
++				profilesupdate.WaitForTuningUpdated(context.TODO(), initialProfile)
++
++				By("Verifying managers are restored to their original configuration")
++				kubeletConfig, err := nodes.GetKubeletConfig(context.TODO(), targetNode)
++				Expect(err).ToNot(HaveOccurred())
++
++				By("Verifying CPU manager policy is restored to static")
++				Expect(kubeletConfig.CPUManagerPolicy).To(Equal("static"), "CPUManagerPolicy should be 'static' after revert, got %q", kubeletConfig.CPUManagerPolicy)
++
++				By("Verifying Topology manager policy is restored")
++				expectedTopologyPolicy := kubeletconfigv1beta1.BestEffortTopologyManagerPolicy
++				if initialProfile.Spec.NUMA != nil && initialProfile.Spec.NUMA.TopologyPolicy != nil {
++					expectedTopologyPolicy = *initialProfile.Spec.NUMA.TopologyPolicy
++				}
++				Expect(kubeletConfig.TopologyManagerPolicy).To(Equal(expectedTopologyPolicy), "TopologyManagerPolicy should be %q after revert, got %q", expectedTopologyPolicy, kubeletConfig.TopologyManagerPolicy)
++
++				By("Verifying Memory manager policy is restored")
++				// Memory manager is set to Static only for restricted or single-numa-node topology policies
++				if expectedTopologyPolicy == kubeletconfigv1beta1.RestrictedTopologyManagerPolicy ||
++					expectedTopologyPolicy == kubeletconfigv1beta1.SingleNumaNodeTopologyManagerPolicy {
++					Expect(kubeletConfig.MemoryManagerPolicy).To(Equal("Static"), "MemoryManagerPolicy should be 'Static' after revert, got %q", kubeletConfig.MemoryManagerPolicy)
++				}
++			})
++		})
++
++		It("should disable CPU, Memory, and Topology managers when DRA annotation is set", func() {
++			kubeletConfig, err := nodes.GetKubeletConfig(context.TODO(), targetNode)
++			Expect(err).ToNot(HaveOccurred())
++
++			By("Verifying CPU manager policy is set to none")
++			Expect(kubeletConfig.CPUManagerPolicy).To(Equal("none"), "CPUManagerPolicy should be 'none' when DRA is enabled, got %q", kubeletConfig.CPUManagerPolicy)
++
++			By("Verifying Topology manager policy is set to none")
++			Expect(kubeletConfig.TopologyManagerPolicy).To(Equal(kubeletconfigv1beta1.NoneTopologyManagerPolicy), "TopologyManagerPolicy should be 'none' when DRA is enabled, got %q", kubeletConfig.TopologyManagerPolicy)
++
++			By("Verifying Memory manager policy is set to None")
++			Expect(kubeletConfig.MemoryManagerPolicy).To(Equal(kubeletconfigv1beta1.NoneMemoryManagerPolicy), "MemoryManagerPolicy should be 'None' when DRA is enabled, got %q", kubeletConfig.MemoryManagerPolicy)
++		})
++	})
+ })

@@ -1,0 +1,80 @@
+diff --git a/pkg/controller/common/constants.go b/pkg/controller/common/constants.go
+index 31ba8b1040..1f890d0eb8 100644
+--- a/pkg/controller/common/constants.go
++++ b/pkg/controller/common/constants.go
+@@ -160,6 +160,11 @@ const (
+ 	// Note: Update units in status_test.go when the following are bumped
+ 	RHCOSVersionBootImageSkewLimit = "9.2"
+ 	OCPVersionBootImageSkewLimit   = "4.13.0"
++
++	// MaxMachineConfigSize is the maximum size for a MachineConfig object in bytes.
++	// This matches etcd's default request size limit of 1.5MB (1572864 bytes).
++	// Reference: https://issues.redhat.com/browse/OCPBUGS-62619
++	MaxMachineConfigSize = 1572864
+ )
+ 
+ // Commonly-used MCO ConfigMap names
+diff --git a/pkg/controller/common/helpers.go b/pkg/controller/common/helpers.go
+index 54bb1a4305..8bd49484f5 100644
+--- a/pkg/controller/common/helpers.go
++++ b/pkg/controller/common/helpers.go
+@@ -468,6 +468,43 @@ func ValidateMachineConfig(cfg mcfgv1.MachineConfigSpec) error {
+ 	return nil
+ }
+ 
++// ValidateMachineConfigSize checks if the MachineConfig size exceeds etcd limits.
++// etcd has a default request size limit of 1.5MB. This function validates that the
++// rendered MachineConfig does not exceed this limit to prevent "etcdserver: request
++// is too large" errors.
++func ValidateMachineConfigSize(mc *mcfgv1.MachineConfig) error {
++	// Marshal the MachineConfig to JSON to get its actual size as it will be sent to etcd
++	data, err := json.Marshal(mc)
++	if err != nil {
++		return fmt.Errorf("failed to marshal MachineConfig: %w", err)
++	}
++
++	size := len(data)
++
++	// Check if size exceeds the limit
++	if size > MaxMachineConfigSize {
++		return fmt.Errorf("rendered MachineConfig %s is too large (%d bytes, max %d bytes). "+
++			"This will exceed etcd's size limit. Consider reducing the number or size of MachineConfigs, "+
++			"particularly large registry mirror configurations (ImageDigestMirrorSet/ImageContentSourcePolicy)",
++			mc.Name, size, MaxMachineConfigSize)
++	}
++
++	// Log size information at debug level
++	percentUsed := float64(size) / float64(MaxMachineConfigSize) * 100
++	klog.V(4).Infof("MachineConfig %s size: %d bytes (%.2f%% of %d byte limit)",
++		mc.Name, size, percentUsed, MaxMachineConfigSize)
++
++	// Warn if approaching the limit (> 80%)
++	warningThreshold := (MaxMachineConfigSize * 4) / 5
++	if size > warningThreshold {
++		klog.Warningf("MachineConfig %s is approaching size limit: %d bytes (%.2f%% of %d byte limit). "+
++			"Consider reducing MachineConfig size to avoid hitting the limit.",
++			mc.Name, size, percentUsed, MaxMachineConfigSize)
++	}
++
++	return nil
++}
++
+ // Validates that a given MachineConfig's extensions are supported.
+ func ValidateMachineConfigExtensions(cfg mcfgv1.MachineConfigSpec) error {
+ 	return validateExtensions(cfg.Extensions)
+diff --git a/pkg/controller/render/render_controller.go b/pkg/controller/render/render_controller.go
+index 1d78e369ea..440ccabaa2 100644
+--- a/pkg/controller/render/render_controller.go
++++ b/pkg/controller/render/render_controller.go
+@@ -602,6 +602,11 @@ func (ctrl *Controller) syncGeneratedMachineConfig(pool *mcfgv1.MachineConfigPoo
+ 		return fmt.Errorf("could not generate rendered MachineConfig: %w", err)
+ 	}
+ 
++	// Validate that the generated MachineConfig does not exceed etcd size limits
++	if err := ctrlcommon.ValidateMachineConfigSize(generated); err != nil {
++		return fmt.Errorf("size validation failed: %w", err)
++	}
++
+ 	// Collect metric when OSImageURL was overridden
+ 	var isOSImageURLOverridden bool
+ 	if generated.Spec.OSImageURL != ctrlcommon.GetBaseImageContainer(&cc.Spec, osImageStreamSet) {

@@ -1,0 +1,143 @@
+diff --git a/frontend/public/components/__tests__/probe.spec.ts b/frontend/public/components/__tests__/probe.spec.ts
+index e43b6fe89c3..c4a1d78d31f 100644
+--- a/frontend/public/components/__tests__/probe.spec.ts
++++ b/frontend/public/components/__tests__/probe.spec.ts
+@@ -53,6 +53,20 @@ describe('k8sProbe', () => {
+         });
+       });
+     });
++
++    describe('for grpc', () => {
++      it('returns port and service', () => {
++        expect(parseCmd('grpc', '5000:my-service')).toEqual({ port: 5000, service: 'my-service' });
++      });
++
++      it('returns port only when no service specified', () => {
++        expect(parseCmd('grpc', '5000')).toEqual({ port: 5000 });
++      });
++
++      it('returns null for empty string', () => {
++        expect(parseCmd('grpc', '')).toBeNull();
++      });
++    });
+   });
+ 
+   describe('#flattenCmd', () => {
+@@ -61,5 +75,21 @@ describe('k8sProbe', () => {
+         expect(flattenCmd('tcpSocket', { port: 8080 })).toEqual('8080');
+       });
+     });
++
++    describe('for grpc', () => {
++      it('returns port as string', () => {
++        expect(flattenCmd('grpc', { port: 5000 })).toEqual('5000');
++      });
++
++      it('returns port with service when service is specified', () => {
++        expect(flattenCmd('grpc', { port: 5000, service: 'my-service' })).toEqual(
++          '5000 (my-service)',
++        );
++      });
++
++      it('returns empty string when port is missing', () => {
++        expect(flattenCmd('grpc', {})).toEqual('');
++      });
++    });
+   });
+ });
+diff --git a/frontend/public/locales/en/public.json b/frontend/public/locales/en/public.json
+index 95e2c82db35..ac5f81cc156 100644
+--- a/frontend/public/locales/en/public.json
++++ b/frontend/public/locales/en/public.json
+@@ -1734,6 +1734,7 @@
+   "Exec command": "Exec command",
+   "HTTP GET": "HTTP GET",
+   "TCP socket (port)": "TCP socket (port)",
++  "gRPC": "gRPC",
+   "Delete {{label}} subject?": "Delete {{label}} subject?",
+   "Are you sure you want to delete subject {{name}} of type {{kind}}?": "Are you sure you want to delete subject {{name}} of type {{kind}}?",
+   "Impersonate {{kind}} \"{{name}}\"": "Impersonate {{kind}} \"{{name}}\"",
+diff --git a/frontend/public/module/k8s/probe.ts b/frontend/public/module/k8s/probe.ts
+index d87a450807a..6e183096a3c 100644
+--- a/frontend/public/module/k8s/probe.ts
++++ b/frontend/public/module/k8s/probe.ts
+@@ -6,6 +6,7 @@ import {
+   ContainerLifecycleStage,
+   ContainerProbe,
+   ExecProbe,
++  GRPCProbe,
+   Handler,
+   HTTPGetProbe,
+   TCPSocketProbe,
+@@ -60,6 +61,22 @@ const parsers = {
+       port: /^\d+$/.test(str) ? +str : str,
+     };
+   },
++
++  grpc: function (str: string) {
++    if (!str) {
++      return null;
++    }
++    const parts = str.split(':');
++    const port = parseInt(parts[0], 10);
++    if (isNaN(port)) {
++      return null;
++    }
++    const result: { port: number; service?: string } = { port };
++    if (parts[1]) {
++      result.service = parts[1];
++    }
++    return result;
++  },
+ };
+ 
+ const flatteners = {
+@@ -97,6 +114,16 @@ const flatteners = {
+     }
+     return `${cmd.port}`;
+   },
++
++  grpc: function (cmd: GRPCProbe): string {
++    if (!cmd || !cmd.port) {
++      return '';
++    }
++    if (cmd.service) {
++      return `${cmd.port} (${cmd.service})`;
++    }
++    return `${cmd.port}`;
++  },
+ };
+ 
+ function inferAction(obj: Handler) {
+@@ -113,6 +140,10 @@ function inferAction(obj: Handler) {
+       id: 'tcpSocket',
+       label: i18next.t('public~TCP socket (port)'),
+     },
++    grpc: {
++      id: 'grpc',
++      label: i18next.t('public~gRPC'),
++    },
+   });
+ 
+   if (_.isEmpty(obj)) {
+diff --git a/frontend/public/module/k8s/types.ts b/frontend/public/module/k8s/types.ts
+index b845c323d07..61dc7ef0786 100644
+--- a/frontend/public/module/k8s/types.ts
++++ b/frontend/public/module/k8s/types.ts
+@@ -85,10 +85,16 @@ export type TCPSocketProbe = {
+   host?: string;
+ };
+ 
++export type GRPCProbe = {
++  port: number;
++  service?: string;
++};
++
+ export type Handler = {
+   exec?: ExecProbe;
+   httpGet?: HTTPGetProbe;
+   tcpSocket?: TCPSocketProbe;
++  grpc?: GRPCProbe;
+ };
+ 
+ export type ContainerProbe = {

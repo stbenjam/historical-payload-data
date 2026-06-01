@@ -1,0 +1,300 @@
+diff --git a/provisioning/baremetal_crypto_test.go b/provisioning/baremetal_crypto_test.go
+index bdd9b430d..7c0604cd9 100644
+--- a/provisioning/baremetal_crypto_test.go
++++ b/provisioning/baremetal_crypto_test.go
+@@ -269,3 +269,74 @@ func TestTlsCertificateSANsMismatchRemovedHost(t *testing.T) {
+ 	require.NoError(t, err)
+ 	assert.False(t, match, "SANs should not match when hosts are removed")
+ }
++
++func TestGenerateTlsCertificateWithIPv6(t *testing.T) {
++	hosts := sets.New(
++		"metal3-state.openshift-machine-api.svc",
++		"metal3-state.openshift-machine-api.svc.cluster.local",
++		"fd2e:6f44:5dd8:b856::2",
++	)
++
++	tlsCert, err := generateTlsCertificate(hosts)
++	require.NoError(t, err)
++
++	certs, err := cert.ParseCertsPEM(tlsCert.certificate)
++	require.NoError(t, err)
++	require.NotEmpty(t, certs)
++
++	serverCert := certs[0]
++
++	assert.Contains(t, serverCert.DNSNames, "metal3-state.openshift-machine-api.svc",
++		"certificate should contain short service hostname")
++	assert.Contains(t, serverCert.DNSNames, "metal3-state.openshift-machine-api.svc.cluster.local",
++		"certificate should contain FQDN service hostname")
++	assert.True(t, containsIP(serverCert.IPAddresses, "fd2e:6f44:5dd8:b856::2"),
++		"certificate should contain IPv6 provisioning IP")
++}
++
++func TestGenerateTlsCertificateDualStack(t *testing.T) {
++	hosts := sets.New(
++		"metal3-state.openshift-machine-api.svc",
++		"metal3-state.openshift-machine-api.svc.cluster.local",
++		"172.22.0.3",
++		"fd2e:6f44:5dd8:b856::2",
++		"10.0.0.5",
++		"fd00::100",
++	)
++
++	tlsCert, err := generateTlsCertificate(hosts)
++	require.NoError(t, err)
++
++	certs, err := cert.ParseCertsPEM(tlsCert.certificate)
++	require.NoError(t, err)
++	require.NotEmpty(t, certs)
++
++	serverCert := certs[0]
++
++	assert.Contains(t, serverCert.DNSNames, "metal3-state.openshift-machine-api.svc")
++	assert.Contains(t, serverCert.DNSNames, "metal3-state.openshift-machine-api.svc.cluster.local")
++
++	assert.True(t, containsIP(serverCert.IPAddresses, "172.22.0.3"),
++		"certificate should contain IPv4 provisioning IP")
++	assert.True(t, containsIP(serverCert.IPAddresses, "fd2e:6f44:5dd8:b856::2"),
++		"certificate should contain IPv6 provisioning IP")
++	assert.True(t, containsIP(serverCert.IPAddresses, "10.0.0.5"),
++		"certificate should contain IPv4 external IP")
++	assert.True(t, containsIP(serverCert.IPAddresses, "fd00::100"),
++		"certificate should contain IPv6 API VIP")
++}
++
++func TestTlsCertificateSANsMatchIPv6Canonical(t *testing.T) {
++	hosts := sets.New(
++		"metal3-state.openshift-machine-api.svc",
++		"fd2e:6f44:5dd8:b856::2",
++		"172.22.0.3",
++	)
++
++	tlsCert, err := generateTlsCertificate(hosts)
++	require.NoError(t, err)
++
++	match, err := tlsCertificateSANsMatch(tlsCert.certificate, hosts)
++	require.NoError(t, err)
++	assert.True(t, match, "SANs should match with IPv6 addresses in canonical form")
++}
+diff --git a/provisioning/baremetal_secrets.go b/provisioning/baremetal_secrets.go
+index ffcb38639..10e961bf0 100644
+--- a/provisioning/baremetal_secrets.go
++++ b/provisioning/baremetal_secrets.go
+@@ -4,6 +4,8 @@ import (
+ 	"context"
+ 	"encoding/base64"
+ 	"fmt"
++	"net"
++	"strings"
+ 
+ 	"github.com/pkg/errors"
+ 	"golang.org/x/crypto/bcrypt"
+@@ -181,6 +183,29 @@ func DeleteAllSecrets(info *ProvisioningInfo) error {
+ // defaultClusterDomain is the default Kubernetes cluster domain suffix.
+ const defaultClusterDomain = "cluster.local"
+ 
++// normalizeHost normalizes an IP address for consistent SAN handling.
++// It strips brackets from IPv6 literals (e.g., "[fd00::1]" -> "fd00::1")
++// and converts IP addresses to their canonical form (e.g., "FD00:0000::1" -> "fd00::1").
++// Non-IP strings (hostnames) are returned unchanged.
++func normalizeHost(host string) string {
++	h := strings.TrimSpace(host)
++	if h == "" {
++		return h
++	}
++
++	// Strip brackets from IPv6 literals like [fd00::1]
++	if after, found := strings.CutPrefix(h, "["); found {
++		if trimmed, found := strings.CutSuffix(after, "]"); found {
++			h = trimmed
++		}
++	}
++
++	if ip := net.ParseIP(h); ip != nil {
++		return ip.String()
++	}
++	return h
++}
++
+ // buildTlsHosts builds the complete set of Subject Alternative Names (SANs)
+ // for the Ironic TLS certificate based on the cluster topology.
+ func buildTlsHosts(info *ProvisioningInfo) (sets.Set[string], error) {
+@@ -192,13 +217,13 @@ func buildTlsHosts(info *ProvisioningInfo) (sets.Set[string], error) {
+ 
+ 	// Provisioning IP
+ 	if info.ProvConfig.Spec.ProvisioningIP != "" {
+-		hosts.Insert(info.ProvConfig.Spec.ProvisioningIP)
++		hosts.Insert(normalizeHost(info.ProvConfig.Spec.ProvisioningIP))
+ 	}
+ 
+ 	// External IPs for external access
+ 	for _, ip := range info.ProvConfig.Spec.ExternalIPs {
+ 		if ip != "" {
+-			hosts.Insert(ip)
++			hosts.Insert(normalizeHost(ip))
+ 		}
+ 	}
+ 
+@@ -213,7 +238,7 @@ func buildTlsHosts(info *ProvisioningInfo) (sets.Set[string], error) {
+ 				return nil, fmt.Errorf("failed to get API server internal IPs for TLS SANs: %w", err)
+ 			}
+ 			for _, ip := range apiVIPs {
+-				hosts.Insert(ip)
++				hosts.Insert(normalizeHost(ip))
+ 			}
+ 		}
+ 	}
+diff --git a/provisioning/baremetal_secrets_test.go b/provisioning/baremetal_secrets_test.go
+index 9afabaf79..89d20d3b9 100644
+--- a/provisioning/baremetal_secrets_test.go
++++ b/provisioning/baremetal_secrets_test.go
+@@ -623,6 +623,119 @@ func TestBuildTlsHosts(t *testing.T) {
+ 				"metal3-state.custom-namespace.svc.cluster.local",
+ 			},
+ 		},
++		{
++			name: "ipv6-provisioning-ip",
++			info: &ProvisioningInfo{
++				Namespace: "openshift-machine-api",
++				ProvConfig: &metal3iov1alpha1.Provisioning{
++					Spec: metal3iov1alpha1.ProvisioningSpec{
++						ProvisioningIP:      "fd2e:6f44:5dd8:b856::2",
++						ProvisioningNetwork: metal3iov1alpha1.ProvisioningNetworkManaged,
++					},
++				},
++			},
++			expectedHosts: []string{
++				"metal3-state.openshift-machine-api.svc",
++				"metal3-state.openshift-machine-api.svc.cluster.local",
++				"fd2e:6f44:5dd8:b856::2",
++			},
++		},
++		{
++			name: "dual-stack-external-ips",
++			info: &ProvisioningInfo{
++				Namespace: "openshift-machine-api",
++				ProvConfig: &metal3iov1alpha1.Provisioning{
++					Spec: metal3iov1alpha1.ProvisioningSpec{
++						ProvisioningIP:      "172.22.0.3",
++						ProvisioningNetwork: metal3iov1alpha1.ProvisioningNetworkManaged,
++						ExternalIPs:         []string{"10.0.0.5", "fd00::100"},
++					},
++				},
++			},
++			expectedHosts: []string{
++				"metal3-state.openshift-machine-api.svc",
++				"metal3-state.openshift-machine-api.svc.cluster.local",
++				"172.22.0.3",
++				"10.0.0.5",
++				"fd00::100",
++			},
++		},
++		{
++			name: "bracketed-ipv6-normalized",
++			info: &ProvisioningInfo{
++				Namespace: "openshift-machine-api",
++				ProvConfig: &metal3iov1alpha1.Provisioning{
++					Spec: metal3iov1alpha1.ProvisioningSpec{
++						ProvisioningIP:      "[fd2e:6f44:5dd8:b856::2]",
++						ProvisioningNetwork: metal3iov1alpha1.ProvisioningNetworkManaged,
++						ExternalIPs:         []string{"[fd00::100]"},
++					},
++				},
++			},
++			expectedHosts: []string{
++				"metal3-state.openshift-machine-api.svc",
++				"metal3-state.openshift-machine-api.svc.cluster.local",
++				"fd2e:6f44:5dd8:b856::2",
++				"fd00::100",
++			},
++		},
++		{
++			name: "non-canonical-ipv6-normalized",
++			info: &ProvisioningInfo{
++				Namespace: "openshift-machine-api",
++				ProvConfig: &metal3iov1alpha1.Provisioning{
++					Spec: metal3iov1alpha1.ProvisioningSpec{
++						ProvisioningIP:      "FD2E:6F44:5DD8:B856:0000:0000:0000:0002",
++						ProvisioningNetwork: metal3iov1alpha1.ProvisioningNetworkManaged,
++					},
++				},
++			},
++			expectedHosts: []string{
++				"metal3-state.openshift-machine-api.svc",
++				"metal3-state.openshift-machine-api.svc.cluster.local",
++				"fd2e:6f44:5dd8:b856::2",
++			},
++		},
++		{
++			name: "dual-stack-api-vips",
++			info: &ProvisioningInfo{
++				Namespace: "openshift-machine-api",
++				ProvConfig: &metal3iov1alpha1.Provisioning{
++					Spec: metal3iov1alpha1.ProvisioningSpec{
++						ProvisioningIP:      "172.22.0.3",
++						ProvisioningNetwork: metal3iov1alpha1.ProvisioningNetworkDisabled,
++					},
++				},
++				OSClient: fakeconfigclientset.NewSimpleClientset(
++					&osconfigv1.Infrastructure{
++						TypeMeta: metav1.TypeMeta{
++							Kind:       "Infrastructure",
++							APIVersion: "config.openshift.io/v1",
++						},
++						ObjectMeta: metav1.ObjectMeta{
++							Name: "cluster",
++						},
++						Status: osconfigv1.InfrastructureStatus{
++							PlatformStatus: &osconfigv1.PlatformStatus{
++								Type: osconfigv1.BareMetalPlatformType,
++								BareMetal: &osconfigv1.BareMetalPlatformStatus{
++									APIServerInternalIPs: []string{"192.168.1.100", "fd00::100"},
++								},
++							},
++						},
++					},
++				),
++			},
++			expectedHosts: []string{
++				"metal3-state.openshift-machine-api.svc",
++				"metal3-state.openshift-machine-api.svc.cluster.local",
++				"ironic-proxy.openshift-machine-api.svc",
++				"ironic-proxy.openshift-machine-api.svc.cluster.local",
++				"172.22.0.3",
++				"192.168.1.100",
++				"fd00::100",
++			},
++		},
+ 	}
+ 
+ 	for _, tc := range cases {
+@@ -642,3 +755,28 @@ func TestBuildTlsHosts(t *testing.T) {
+ 		})
+ 	}
+ }
++
++func TestNormalizeHost(t *testing.T) {
++	cases := []struct {
++		name     string
++		input    string
++		expected string
++	}{
++		{name: "ipv4-passthrough", input: "172.22.0.3", expected: "172.22.0.3"},
++		{name: "ipv6-canonical", input: "fd2e:6f44:5dd8:b856::2", expected: "fd2e:6f44:5dd8:b856::2"},
++		{name: "ipv6-bracketed", input: "[fd2e:6f44:5dd8:b856::2]", expected: "fd2e:6f44:5dd8:b856::2"},
++		{name: "ipv6-uppercase", input: "FD2E:6F44:5DD8:B856::2", expected: "fd2e:6f44:5dd8:b856::2"},
++		{name: "ipv6-expanded", input: "fd2e:6f44:5dd8:b856:0000:0000:0000:0002", expected: "fd2e:6f44:5dd8:b856::2"},
++		{name: "ipv6-loopback", input: "::1", expected: "::1"},
++		{name: "ipv6-bracketed-loopback", input: "[::1]", expected: "::1"},
++		{name: "hostname-passthrough", input: "metal3-state.openshift-machine-api.svc", expected: "metal3-state.openshift-machine-api.svc"},
++		{name: "empty-string", input: "", expected: ""},
++		{name: "whitespace-trimmed", input: "  172.22.0.3  ", expected: "172.22.0.3"},
++	}
++
++	for _, tc := range cases {
++		t.Run(tc.name, func(t *testing.T) {
++			assert.Equal(t, tc.expected, normalizeHost(tc.input))
++		})
++	}
++}

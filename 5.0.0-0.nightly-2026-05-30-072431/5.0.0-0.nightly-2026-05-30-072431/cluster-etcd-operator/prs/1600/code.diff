@@ -1,0 +1,1421 @@
+diff --git a/bindata/tnfdeployment/clusterrole.yaml b/bindata/tnfdeployment/clusterrole.yaml
+index 30fb8fa532..9fcff98df1 100644
+--- a/bindata/tnfdeployment/clusterrole.yaml
++++ b/bindata/tnfdeployment/clusterrole.yaml
+@@ -13,6 +13,7 @@ rules:
+       - get
+       - list
+       - watch
++      - patch
+   - apiGroups:
+       - operator.openshift.io
+     resources:
+@@ -64,3 +65,4 @@ rules:
+       - securitycontextconstraints
+     verbs:
+       - use
++
+diff --git a/pkg/tnf/auth/runner.go b/pkg/tnf/auth/runner.go
+index 81339de0ed..e583fb7f3d 100644
+--- a/pkg/tnf/auth/runner.go
++++ b/pkg/tnf/auth/runner.go
+@@ -2,6 +2,7 @@ package auth
+ 
+ import (
+ 	"context"
++	"os"
+ 
+ 	configversionedclient "github.com/openshift/client-go/config/clientset/versioned"
+ 	"k8s.io/apiserver/pkg/server"
+@@ -11,6 +12,7 @@ import (
+ 
+ 	"github.com/openshift/cluster-etcd-operator/pkg/tnf/pkg/config"
+ 	"github.com/openshift/cluster-etcd-operator/pkg/tnf/pkg/pcs"
++	"github.com/openshift/cluster-etcd-operator/pkg/tnf/pkg/tools"
+ )
+ 
+ func RunTnfAuth() error {
+@@ -61,6 +63,14 @@ func RunTnfAuth() error {
+ 		return err
+ 	}
+ 
++	// Annotate this node with its MAC addresses for fencing secret resolution
++	nodeName := os.Getenv("MY_NODE_NAME")
++	if nodeName != "" {
++		if err := tools.AnnotateNodeMACs(ctx, kubeClient, nodeName); err != nil {
++			klog.Warningf("Failed to annotate node %s with MAC addresses: %v", nodeName, err)
++		}
++	}
++
+ 	klog.Info("TNF auth done")
+ 
+ 	return nil
+diff --git a/pkg/tnf/pkg/pcs/fencing.go b/pkg/tnf/pkg/pcs/fencing.go
+index 0b7c056344..377162c656 100644
+--- a/pkg/tnf/pkg/pcs/fencing.go
++++ b/pkg/tnf/pkg/pcs/fencing.go
+@@ -68,22 +68,22 @@ func ConfigureFencing(ctx context.Context, kubeClient kubernetes.Interface, node
+ 	klog.Info("Getting fencing configs from secrets")
+ 	fencingConfigs := []fencingConfig{}
+ 
++	secretMap, err := tools.GetFencingSecrets(ctx, kubeClient, nodeNames)
++	if err != nil {
++		klog.Errorf("Failed to get fencing secrets: %v", err)
++		return fmt.Errorf("failed to get fencing secrets: %v", err)
++	}
++
+ 	for i, nodeName := range nodeNames {
+ 		if nodeName == "" {
+ 			continue
+ 		}
+-		secret, err := tools.GetFencingSecret(ctx, kubeClient, nodeName)
+-		if err != nil {
+-			klog.Errorf("Failed to get fencing secret for node %s: %v", nodeName, err)
+-			return fmt.Errorf("failed to get fencing secret for node %s: %v", nodeName, err)
+-		}
++		secret := secretMap[nodeName]
+ 		fc, err := getFencingConfig(nodeName, secret)
+ 		if err != nil {
+ 			klog.Errorf("Failed to get fencing config for node %s: %v", nodeName, err)
+ 			return fmt.Errorf("failed to get fencing config for node %s: %v", nodeName, err)
+ 		}
+-		// Add pcmk_delay_base to both devices but with different values.
+-		// This prevents fencing races and device update issues.
+ 		if i == 0 {
+ 			fc.FencingDeviceOptions[PcmkDelayBase] = firstPcmkDelayBase
+ 		} else {
+diff --git a/pkg/tnf/pkg/tools/mac.go b/pkg/tnf/pkg/tools/mac.go
+new file mode 100644
+index 0000000000..393b78c587
+--- /dev/null
++++ b/pkg/tnf/pkg/tools/mac.go
+@@ -0,0 +1,105 @@
++package tools
++
++import (
++	"bytes"
++	"context"
++	"crypto/sha256"
++	"encoding/hex"
++	"encoding/json"
++	"fmt"
++	"net"
++	"os/exec"
++	"strings"
++
++	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
++	"k8s.io/apimachinery/pkg/types"
++	"k8s.io/client-go/kubernetes"
++	"k8s.io/klog/v2"
++)
++
++const (
++	MACAnnotationKey = "tnf.openshift.io/mac-addresses"
++)
++
++type macReader func(ctx context.Context) ([]string, error)
++
++var defaultMACReader macReader = readHostMACs
++
++func AnnotateNodeMACs(ctx context.Context, kubeClient kubernetes.Interface, nodeName string) error {
++	macs, err := defaultMACReader(ctx)
++	if err != nil {
++		return fmt.Errorf("failed to read host MAC addresses: %w", err)
++	}
++	if len(macs) == 0 {
++		return fmt.Errorf("no MAC addresses found on host")
++	}
++
++	annotation := strings.Join(macs, ",")
++	patch := map[string]interface{}{
++		"metadata": map[string]interface{}{
++			"annotations": map[string]string{
++				MACAnnotationKey: annotation,
++			},
++		},
++	}
++	patchBytes, err := json.Marshal(patch)
++	if err != nil {
++		return fmt.Errorf("failed to marshal patch: %w", err)
++	}
++
++	_, err = kubeClient.CoreV1().Nodes().Patch(ctx, nodeName, types.MergePatchType, patchBytes, metav1.PatchOptions{})
++	if err != nil {
++		return fmt.Errorf("failed to patch node %s: %w", nodeName, err)
++	}
++
++	klog.Infof("Annotated node %s with MAC addresses: %s", nodeName, annotation)
++	return nil
++}
++
++// readHostMACs reads all non-loopback MAC addresses from the host
++// network interfaces via nsenter.
++func readHostMACs(ctx context.Context) ([]string, error) {
++	shellCmd := `for iface in /sys/class/net/*; do name=$(basename "$iface"); [ "$name" = "lo" ] && continue; cat "$iface/address" 2>/dev/null; done`
++	cmd := exec.CommandContext(ctx, "/usr/bin/nsenter", "-a", "-t", "1", "/bin/bash", "-c", shellCmd)
++	var stdoutBuf, stderrBuf bytes.Buffer
++	cmd.Stdout = &stdoutBuf
++	cmd.Stderr = &stderrBuf
++	if err := cmd.Run(); err != nil {
++		return nil, fmt.Errorf("failed to read MACs: %w (stderr: %s)", err, stderrBuf.String())
++	}
++	stdout := stdoutBuf.String()
++
++	seen := make(map[string]bool)
++	var macs []string
++	for _, line := range strings.Split(strings.TrimSpace(stdout), "\n") {
++		mac := strings.TrimSpace(line)
++		if mac == "" || mac == "00:00:00:00:00:00" {
++			continue
++		}
++		parsed, err := net.ParseMAC(mac)
++		if err != nil {
++			continue
++		}
++		normalized := parsed.String()
++		if seen[normalized] {
++			continue
++		}
++		seen[normalized] = true
++		macs = append(macs, mac)
++	}
++
++	return macs, nil
++}
++
++// hashMAC normalizes a MAC address and returns its SHA256 hash (hex-encoded).
++// This matches the algorithm used by openshift/installer to generate fencing
++// secret names from MAC addresses.
++func hashMAC(macAddress string) (string, error) {
++	parsed, err := net.ParseMAC(macAddress)
++	if err != nil {
++		return "", fmt.Errorf("invalid MAC address %q: %w", macAddress, err)
++	}
++	normalized := strings.ReplaceAll(strings.ToLower(parsed.String()), ":", "")
++	hash := sha256.Sum256([]byte(normalized))
++	return hex.EncodeToString(hash[:]), nil
++}
+diff --git a/pkg/tnf/pkg/tools/mac_test.go b/pkg/tnf/pkg/tools/mac_test.go
+new file mode 100644
+index 0000000000..2fe6e297ef
+--- /dev/null
++++ b/pkg/tnf/pkg/tools/mac_test.go
+@@ -0,0 +1,147 @@
++package tools
++
++import (
++	"context"
++	"fmt"
++	"testing"
++
++	corev1 "k8s.io/api/core/v1"
++	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
++	"k8s.io/client-go/kubernetes/fake"
++)
++
++func TestHashMAC(t *testing.T) {
++	tests := []struct {
++		name    string
++		mac     string
++		wantErr bool
++	}{
++		{
++			name: "standard colon-separated MAC",
++			mac:  "aa:bb:cc:dd:ee:ff",
++		},
++		{
++			name: "uppercase MAC produces same hash as lowercase",
++			mac:  "AA:BB:CC:DD:EE:FF",
++		},
++		{
++			name: "dash-separated MAC",
++			mac:  "aa-bb-cc-dd-ee-ff",
++		},
++		{
++			name:    "invalid MAC",
++			mac:     "not-a-mac",
++			wantErr: true,
++		},
++		{
++			name:    "empty string",
++			mac:     "",
++			wantErr: true,
++		},
++	}
++
++	for _, tt := range tests {
++		t.Run(tt.name, func(t *testing.T) {
++			hash, err := hashMAC(tt.mac)
++			if (err != nil) != tt.wantErr {
++				t.Fatalf("hashMAC(%q) error = %v, wantErr %v", tt.mac, err, tt.wantErr)
++			}
++			if tt.wantErr {
++				return
++			}
++			if hash == "" {
++				t.Fatal("hashMAC() returned empty hash")
++			}
++			if len(hash) != 64 {
++				t.Errorf("hashMAC() hash length = %d, want 64 (SHA256 hex)", len(hash))
++			}
++		})
++	}
++
++	hash1, _ := hashMAC("aa:bb:cc:dd:ee:ff")
++	hash2, _ := hashMAC("AA:BB:CC:DD:EE:FF")
++	hash3, _ := hashMAC("aa-bb-cc-dd-ee-ff")
++	if hash1 != hash2 {
++		t.Errorf("lowercase and uppercase MACs should produce the same hash: %s != %s", hash1, hash2)
++	}
++	if hash1 != hash3 {
++		t.Errorf("colon and dash separated MACs should produce the same hash: %s != %s", hash1, hash3)
++	}
++}
++
++func TestAnnotateNodeMACs(t *testing.T) {
++	tests := []struct {
++		name      string
++		nodeName  string
++		mockMACs  []string
++		mockErr   error
++		wantErr   bool
++		wantAnnot string
++	}{
++		{
++			name:      "annotate existing node with discovered MACs",
++			nodeName:  "master-0",
++			mockMACs:  []string{"aa:bb:cc:dd:ee:01", "aa:bb:cc:dd:ee:02"},
++			wantAnnot: "aa:bb:cc:dd:ee:01,aa:bb:cc:dd:ee:02",
++		},
++		{
++			name:      "single MAC",
++			nodeName:  "master-0",
++			mockMACs:  []string{"aa:bb:cc:dd:ee:01"},
++			wantAnnot: "aa:bb:cc:dd:ee:01",
++		},
++		{
++			name:     "node not found",
++			nodeName: "nonexistent-node",
++			mockMACs: []string{"aa:bb:cc:dd:ee:01"},
++			wantErr:  true,
++		},
++		{
++			name:     "no MACs found",
++			nodeName: "master-0",
++			mockMACs: nil,
++			wantErr:  true,
++		},
++		{
++			name:     "MAC reader error",
++			nodeName: "master-0",
++			mockErr:  fmt.Errorf("nsenter failed"),
++			wantErr:  true,
++		},
++	}
++
++	for _, tt := range tests {
++		t.Run(tt.name, func(t *testing.T) {
++			origReader := defaultMACReader
++			defaultMACReader = func(ctx context.Context) ([]string, error) {
++				if tt.mockErr != nil {
++					return nil, tt.mockErr
++				}
++				return tt.mockMACs, nil
++			}
++			t.Cleanup(func() { defaultMACReader = origReader })
++
++			node := &corev1.Node{
++				ObjectMeta: metav1.ObjectMeta{Name: "master-0"},
++			}
++			kubeClient := fake.NewSimpleClientset(node)
++
++			err := AnnotateNodeMACs(context.Background(), kubeClient, tt.nodeName)
++			if (err != nil) != tt.wantErr {
++				t.Fatalf("AnnotateNodeMACs() error = %v, wantErr %v", err, tt.wantErr)
++			}
++			if tt.wantErr {
++				return
++			}
++
++			updated, err := kubeClient.CoreV1().Nodes().Get(context.Background(), tt.nodeName, metav1.GetOptions{})
++			if err != nil {
++				t.Fatalf("Failed to get node: %v", err)
++			}
++			got := updated.Annotations[MACAnnotationKey]
++			if got != tt.wantAnnot {
++				t.Errorf("Node annotation = %q, want %q", got, tt.wantAnnot)
++			}
++		})
++	}
++}
+diff --git a/pkg/tnf/pkg/tools/redfish.go b/pkg/tnf/pkg/tools/redfish.go
+new file mode 100644
+index 0000000000..8d4e5a9d4a
+--- /dev/null
++++ b/pkg/tnf/pkg/tools/redfish.go
+@@ -0,0 +1,82 @@
++package tools
++
++import (
++	"context"
++	"crypto/tls"
++	"encoding/json"
++	"fmt"
++	"io"
++	"net/http"
++	"strings"
++	"time"
++)
++
++type redfishUUIDGetter func(ctx context.Context, address, username, password string, insecure bool) (string, error)
++
++var defaultRedfishUUIDGetter redfishUUIDGetter = getRedfishSystemUUID
++
++type redfishSystemResponse struct {
++	UUID string `json:"UUID"`
++}
++
++func getRedfishSystemUUID(ctx context.Context, address, username, password string, insecure bool) (string, error) {
++	transport := &http.Transport{}
++	if insecure {
++		transport.TLSClientConfig = &tls.Config{InsecureSkipVerify: true} //nolint:gosec
++	}
++	client := &http.Client{
++		Timeout:   30 * time.Second,
++		Transport: transport,
++	}
++
++	req, err := http.NewRequestWithContext(ctx, http.MethodGet, address, nil)
++	if err != nil {
++		return "", fmt.Errorf("failed to create request for %s: %w", address, err)
++	}
++	req.SetBasicAuth(username, password)
++
++	resp, err := client.Do(req)
++	if err != nil {
++		return "", fmt.Errorf("failed to query Redfish at %s: %w", address, err)
++	}
++	defer resp.Body.Close()
++
++	if resp.StatusCode != http.StatusOK {
++		return "", fmt.Errorf("Redfish at %s returned status %d", address, resp.StatusCode)
++	}
++
++	body, err := io.ReadAll(resp.Body)
++	if err != nil {
++		return "", fmt.Errorf("failed to read Redfish response from %s: %w", address, err)
++	}
++
++	var system redfishSystemResponse
++	if err := json.Unmarshal(body, &system); err != nil {
++		return "", fmt.Errorf("failed to parse Redfish response from %s: %w", address, err)
++	}
++
++	if system.UUID == "" {
++		return "", fmt.Errorf("Redfish at %s returned empty UUID", address)
++	}
++
++	return system.UUID, nil
++}
++
++// parseRedfishURL strips the "redfish+" prefix from a fencing secret address
++// and returns the clean URL for direct HTTP access.
++func parseRedfishURL(address string) (string, error) {
++	idx := strings.Index(address, "://")
++	if idx == -1 {
++		return "", fmt.Errorf("invalid Redfish address %q: no scheme found", address)
++	}
++	scheme := address[:idx]
++	rest := address[idx:]
++
++	if strings.HasPrefix(scheme, "redfish+") {
++		return strings.TrimPrefix(scheme, "redfish+") + rest, nil
++	}
++	if scheme == "https" || scheme == "http" {
++		return address, nil
++	}
++	return "", fmt.Errorf("unsupported scheme in Redfish address %q", address)
++}
+diff --git a/pkg/tnf/pkg/tools/redfish_test.go b/pkg/tnf/pkg/tools/redfish_test.go
+new file mode 100644
+index 0000000000..ca3ce41be8
+--- /dev/null
++++ b/pkg/tnf/pkg/tools/redfish_test.go
+@@ -0,0 +1,161 @@
++package tools
++
++import (
++	"context"
++	"encoding/json"
++	"net/http"
++	"net/http/httptest"
++	"testing"
++)
++
++func TestGetRedfishSystemUUID(t *testing.T) {
++	tests := []struct {
++		name      string
++		handler   http.HandlerFunc
++		wantUUID  string
++		wantErr   bool
++		checkAuth bool
++		wantUser  string
++		wantPass  string
++	}{
++		{
++			name: "valid UUID",
++			handler: func(w http.ResponseWriter, r *http.Request) {
++				json.NewEncoder(w).Encode(redfishSystemResponse{UUID: "a944436f-3d48-4139-8f3c-b0d397947966"})
++			},
++			wantUUID: "a944436f-3d48-4139-8f3c-b0d397947966",
++		},
++		{
++			name: "basic auth is sent",
++			handler: func(w http.ResponseWriter, r *http.Request) {
++				user, pass, ok := r.BasicAuth()
++				if !ok || user != "admin" || pass != "secret" {
++					http.Error(w, "unauthorized", http.StatusUnauthorized)
++					return
++				}
++				json.NewEncoder(w).Encode(redfishSystemResponse{UUID: "test-uuid"})
++			},
++			checkAuth: true,
++			wantUser:  "admin",
++			wantPass:  "secret",
++			wantUUID:  "test-uuid",
++		},
++		{
++			name: "server error",
++			handler: func(w http.ResponseWriter, r *http.Request) {
++				http.Error(w, "internal error", http.StatusInternalServerError)
++			},
++			wantErr: true,
++		},
++		{
++			name: "malformed JSON",
++			handler: func(w http.ResponseWriter, r *http.Request) {
++				w.Write([]byte("not json"))
++			},
++			wantErr: true,
++		},
++		{
++			name: "empty UUID",
++			handler: func(w http.ResponseWriter, r *http.Request) {
++				json.NewEncoder(w).Encode(redfishSystemResponse{UUID: ""})
++			},
++			wantErr: true,
++		},
++		{
++			name: "missing UUID field",
++			handler: func(w http.ResponseWriter, r *http.Request) {
++				w.Write([]byte(`{"Name": "System", "Status": "OK"}`))
++			},
++			wantErr: true,
++		},
++	}
++
++	for _, tt := range tests {
++		t.Run(tt.name, func(t *testing.T) {
++			server := httptest.NewServer(tt.handler)
++			defer server.Close()
++
++			user := "admin"
++			pass := "password"
++			if tt.checkAuth {
++				user = tt.wantUser
++				pass = tt.wantPass
++			}
++
++			got, err := getRedfishSystemUUID(context.Background(), server.URL, user, pass, false)
++			if (err != nil) != tt.wantErr {
++				t.Fatalf("getRedfishSystemUUID() error = %v, wantErr %v", err, tt.wantErr)
++			}
++			if !tt.wantErr && got != tt.wantUUID {
++				t.Errorf("getRedfishSystemUUID() = %q, want %q", got, tt.wantUUID)
++			}
++		})
++	}
++}
++
++func TestGetRedfishSystemUUIDContextCancelled(t *testing.T) {
++	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
++		json.NewEncoder(w).Encode(redfishSystemResponse{UUID: "test"})
++	}))
++	defer server.Close()
++
++	ctx, cancel := context.WithCancel(context.Background())
++	cancel()
++
++	_, err := getRedfishSystemUUID(ctx, server.URL, "admin", "pass", false)
++	if err == nil {
++		t.Fatal("expected error for cancelled context")
++	}
++}
++
++func TestParseRedfishURL(t *testing.T) {
++	tests := []struct {
++		name    string
++		address string
++		want    string
++		wantErr bool
++	}{
++		{
++			name:    "redfish+https",
++			address: "redfish+https://192.168.111.1:8000/redfish/v1/Systems/abc",
++			want:    "https://192.168.111.1:8000/redfish/v1/Systems/abc",
++		},
++		{
++			name:    "redfish+http",
++			address: "redfish+http://host/path",
++			want:    "http://host/path",
++		},
++		{
++			name:    "plain https",
++			address: "https://192.168.1.1:443/redfish/v1/Systems/1",
++			want:    "https://192.168.1.1:443/redfish/v1/Systems/1",
++		},
++		{
++			name:    "plain http",
++			address: "http://host/path",
++			want:    "http://host/path",
++		},
++		{
++			name:    "no scheme",
++			address: "192.168.1.1:8000/path",
++			wantErr: true,
++		},
++		{
++			name:    "unsupported scheme",
++			address: "ftp://host/path",
++			wantErr: true,
++		},
++	}
++
++	for _, tt := range tests {
++		t.Run(tt.name, func(t *testing.T) {
++			got, err := parseRedfishURL(tt.address)
++			if (err != nil) != tt.wantErr {
++				t.Fatalf("parseRedfishURL(%q) error = %v, wantErr %v", tt.address, err, tt.wantErr)
++			}
++			if !tt.wantErr && got != tt.want {
++				t.Errorf("parseRedfishURL(%q) = %q, want %q", tt.address, got, tt.want)
++			}
++		})
++	}
++}
+diff --git a/pkg/tnf/pkg/tools/secrets.go b/pkg/tnf/pkg/tools/secrets.go
+index 19b5323e77..f998ece35f 100644
+--- a/pkg/tnf/pkg/tools/secrets.go
++++ b/pkg/tnf/pkg/tools/secrets.go
+@@ -6,6 +6,7 @@ import (
+ 	"strings"
+ 
+ 	corev1 "k8s.io/api/core/v1"
++	"k8s.io/apimachinery/pkg/api/errors"
+ 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+ 	"k8s.io/client-go/kubernetes"
+ 	"k8s.io/klog/v2"
+@@ -13,20 +14,200 @@ import (
+ 
+ const (
+ 	fencingSecretNamePrefix = "fencing-credentials-"
++	fencingNamespace        = "openshift-etcd"
+ )
+ 
+-var (
+-	fencingSecretNamePattern = fmt.Sprintf("%s%s", fencingSecretNamePrefix, "%s")
+-)
++var fencingSecretNamePattern = fmt.Sprintf("%s%s", fencingSecretNamePrefix, "%s")
++
++// GetFencingSecrets resolves fencing secrets for each node:
++//  1. Hostname: try fencing-credentials-{nodeName} directly
++//  2. MAC hash: read MAC addresses from node annotation, hash each,
++//     try fencing-credentials-{hash} by name.
++//  3. Redfish UUID: query each unclaimed fencing secret's Redfish endpoint
++//     for the system UUID, match against node status.nodeInfo.systemUUID.
++func GetFencingSecrets(ctx context.Context, kubeClient kubernetes.Interface, nodeNames []string) (map[string]*corev1.Secret, error) {
++	result := make(map[string]*corev1.Secret, len(nodeNames))
++	var unresolved []string
++
++	// Phase 1: hostname-based lookup
++	for _, nodeName := range nodeNames {
++		if nodeName == "" {
++			continue
++		}
++		secretName := fmt.Sprintf(fencingSecretNamePattern, nodeName)
++		secret, err := kubeClient.CoreV1().Secrets(fencingNamespace).Get(ctx, secretName, metav1.GetOptions{})
++		if err == nil {
++			klog.Infof("Found fencing secret %s for node %s by hostname", secretName, nodeName)
++			result[nodeName] = secret
++			continue
++		}
++		if !errors.IsNotFound(err) {
++			return nil, fmt.Errorf("failed to get secret %s: %w", secretName, err)
++		}
++		klog.Infof("Fencing secret %s not found for node %s, deferring to MAC hash lookup", secretName, nodeName)
++		unresolved = append(unresolved, nodeName)
++	}
++
++	if len(unresolved) == 0 {
++		return result, nil
++	}
++
++	// Phase 2: MAC hash from node annotation
++	err := matchMACHashToSecrets(ctx, kubeClient, unresolved, result)
++	if err != nil {
++		return nil, err
++	}
++
++	// Recompute unresolved after Phase 2
++	var stillUnresolved []string
++	for _, nodeName := range unresolved {
++		if _, ok := result[nodeName]; !ok {
++			stillUnresolved = append(stillUnresolved, nodeName)
++		}
++	}
++
++	if len(stillUnresolved) == 0 {
++		return result, nil
++	}
+ 
+-func GetFencingSecret(ctx context.Context, kubeClient kubernetes.Interface, nodeName string) (*corev1.Secret, error) {
+-	secretName := fmt.Sprintf(fencingSecretNamePattern, nodeName)
+-	secret, err := kubeClient.CoreV1().Secrets("openshift-etcd").Get(ctx, secretName, metav1.GetOptions{})
++	// Phase 3: Redfish UUID matching
++	alreadyAssigned := make(map[string]bool, len(result))
++	for _, secret := range result {
++		alreadyAssigned[secret.Name] = true
++	}
++	err = matchRedfishUUIDsToSecrets(ctx, kubeClient, stillUnresolved, result, alreadyAssigned, defaultRedfishUUIDGetter)
+ 	if err != nil {
+-		klog.Errorf("Failed to get secret %s: %v", secretName, err)
+ 		return nil, err
+ 	}
+-	return secret, nil
++
++	for _, nodeName := range unresolved {
++		if _, ok := result[nodeName]; !ok {
++			return nil, fmt.Errorf("no fencing secret found for node %s", nodeName)
++		}
++	}
++
++	return result, nil
++}
++
++// matchMACHashToSecrets reads MAC addresses from node annotations,
++// hashes each one, and tries to find a matching fencing secret by name.
++func matchMACHashToSecrets(ctx context.Context, kubeClient kubernetes.Interface, unresolvedNodes []string, result map[string]*corev1.Secret) error {
++	for _, nodeName := range unresolvedNodes {
++		if _, ok := result[nodeName]; ok {
++			continue
++		}
++
++		node, err := kubeClient.CoreV1().Nodes().Get(ctx, nodeName, metav1.GetOptions{})
++		if err != nil {
++			klog.Warningf("Could not get node %s for MAC hash lookup: %v", nodeName, err)
++			continue
++		}
++
++		macAnnotation := node.Annotations[MACAnnotationKey]
++		if macAnnotation == "" {
++			klog.Infof("Node %s has no MAC address annotation, skipping MAC hash lookup", nodeName)
++			continue
++		}
++
++		macs := strings.Split(macAnnotation, ",")
++		for _, mac := range macs {
++			mac = strings.TrimSpace(mac)
++			if mac == "" {
++				continue
++			}
++			hash, err := hashMAC(mac)
++			if err != nil {
++				klog.Warningf("Skipping invalid MAC %s on node %s: %v", mac, nodeName, err)
++				continue
++			}
++			secretName := fmt.Sprintf(fencingSecretNamePattern, hash)
++			secret, err := kubeClient.CoreV1().Secrets(fencingNamespace).Get(ctx, secretName, metav1.GetOptions{})
++			if err == nil {
++				klog.Infof("Matched fencing secret %s to node %s via MAC hash (MAC %s)", secretName, nodeName, mac)
++				result[nodeName] = secret
++				break
++			}
++			if !errors.IsNotFound(err) {
++				return fmt.Errorf("failed to get secret %s: %w", secretName, err)
++			}
++		}
++	}
++
++	return nil
++}
++
++// matchRedfishUUIDsToSecrets queries unclaimed fencing secrets' Redfish endpoints
++// for the system UUID and matches against node status.nodeInfo.systemUUID.
++func matchRedfishUUIDsToSecrets(ctx context.Context, kubeClient kubernetes.Interface, unresolvedNodes []string, result map[string]*corev1.Secret, alreadyAssigned map[string]bool, uuidGetter redfishUUIDGetter) error {
++	secretList, err := kubeClient.CoreV1().Secrets(fencingNamespace).List(ctx, metav1.ListOptions{})
++	if err != nil {
++		return fmt.Errorf("failed to list secrets in %s: %w", fencingNamespace, err)
++	}
++
++	type candidate struct {
++		secret *corev1.Secret
++		uuid   string
++	}
++	var candidates []candidate
++
++	for i := range secretList.Items {
++		s := &secretList.Items[i]
++		if !IsFencingSecret(s.Name) || alreadyAssigned[s.Name] {
++			continue
++		}
++
++		address := string(s.Data["address"])
++		if address == "" {
++			continue
++		}
++		redfishURL, err := parseRedfishURL(address)
++		if err != nil {
++			klog.Warningf("Skipping secret %s: %v", s.Name, err)
++			continue
++		}
++
++		username := string(s.Data["username"])
++		password := string(s.Data["password"])
++		insecure := string(s.Data["certificateVerification"]) == "Disabled"
++
++		uuid, err := uuidGetter(ctx, redfishURL, username, password, insecure)
++		if err != nil {
++			klog.Warningf("Could not get Redfish UUID from secret %s: %v", s.Name, err)
++			continue
++		}
++
++		candidates = append(candidates, candidate{secret: s, uuid: uuid})
++	}
++
++	if len(candidates) == 0 {
++		return nil
++	}
++
++	for _, nodeName := range unresolvedNodes {
++		if _, ok := result[nodeName]; ok {
++			continue
++		}
++		node, err := kubeClient.CoreV1().Nodes().Get(ctx, nodeName, metav1.GetOptions{})
++		if err != nil {
++			klog.Warningf("Could not get node %s for UUID matching: %v", nodeName, err)
++			continue
++		}
++		nodeUUID := node.Status.NodeInfo.SystemUUID
++		if nodeUUID == "" {
++			klog.Warningf("Node %s has empty systemUUID, skipping Redfish UUID matching", nodeName)
++			continue
++		}
++
++		for _, c := range candidates {
++			if strings.EqualFold(c.uuid, nodeUUID) {
++				klog.Infof("Matched fencing secret %s to node %s via Redfish UUID %s", c.secret.Name, nodeName, c.uuid)
++				result[nodeName] = c.secret
++				break
++			}
++		}
++	}
++
++	return nil
+ }
+ 
+ func IsFencingSecret(secretName string) bool {
+diff --git a/pkg/tnf/pkg/tools/secrets_test.go b/pkg/tnf/pkg/tools/secrets_test.go
+new file mode 100644
+index 0000000000..34c0b539a7
+--- /dev/null
++++ b/pkg/tnf/pkg/tools/secrets_test.go
+@@ -0,0 +1,589 @@
++package tools
++
++import (
++	"context"
++	"fmt"
++	"strings"
++	"testing"
++
++	corev1 "k8s.io/api/core/v1"
++	"k8s.io/apimachinery/pkg/api/errors"
++	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
++	"k8s.io/apimachinery/pkg/runtime"
++	"k8s.io/apimachinery/pkg/runtime/schema"
++	k8stesting "k8s.io/client-go/testing"
++
++	"k8s.io/client-go/kubernetes/fake"
++)
++
++func newFencingSecret(name string) *corev1.Secret {
++	return newFencingSecretWithAddress(name, "redfish+https://192.168.1.1:8000/redfish/v1/Systems/1")
++}
++
++func newFencingSecretWithAddress(name, address string) *corev1.Secret {
++	return &corev1.Secret{
++		ObjectMeta: metav1.ObjectMeta{
++			Name:      name,
++			Namespace: fencingNamespace,
++		},
++		Data: map[string][]byte{
++			"address":                 []byte(address),
++			"username":                []byte("admin"),
++			"password":                []byte("password"),
++			"certificateVerification": []byte("Disabled"),
++		},
++	}
++}
++
++func newNodeWithSystemUUID(name, uuid string) *corev1.Node {
++	return &corev1.Node{
++		ObjectMeta: metav1.ObjectMeta{Name: name},
++		Status: corev1.NodeStatus{
++			NodeInfo: corev1.NodeSystemInfo{
++				SystemUUID: uuid,
++			},
++		},
++	}
++}
++
++func newNodeWithMACs(name, macs string) *corev1.Node {
++	return &corev1.Node{
++		ObjectMeta: metav1.ObjectMeta{
++			Name: name,
++			Annotations: map[string]string{
++				MACAnnotationKey: macs,
++			},
++		},
++	}
++}
++
++func newNodeWithMACsAndUUID(name, macs, uuid string) *corev1.Node {
++	return &corev1.Node{
++		ObjectMeta: metav1.ObjectMeta{
++			Name: name,
++			Annotations: map[string]string{
++				MACAnnotationKey: macs,
++			},
++		},
++		Status: corev1.NodeStatus{
++			NodeInfo: corev1.NodeSystemInfo{
++				SystemUUID: uuid,
++			},
++		},
++	}
++}
++
++func TestGetFencingSecrets(t *testing.T) {
++	const (
++		uuid0    = "a944436f-3d48-4139-8f3c-b0d397947966"
++		uuid1    = "b055547g-4d59-5240-9g4d-c1e408058077"
++		macHash0 = "261dddd03aae841c2149ad8897e00961b9d429edc07213cbcfd840802d53e43b"
++		macHash1 = "73b6d39a7211d7573527aed4a201b5fa7e8801249a7e316ab217fa7532a0cdb5"
++	)
++
++	tests := []struct {
++		name       string
++		nodeNames  []string
++		nodes      []*corev1.Node
++		secrets    []*corev1.Secret
++		mockGetter redfishUUIDGetter
++		wantMap    map[string]string
++		wantErr    bool
++		errContain string
++	}{
++		{
++			name:      "both nodes found by hostname",
++			nodeNames: []string{"master-0", "master-1"},
++			secrets: []*corev1.Secret{
++				newFencingSecret("fencing-credentials-master-0"),
++				newFencingSecret("fencing-credentials-master-1"),
++			},
++			wantMap: map[string]string{
++				"master-0": "fencing-credentials-master-0",
++				"master-1": "fencing-credentials-master-1",
++			},
++		},
++		{
++			name:      "both nodes matched via Redfish UUID",
++			nodeNames: []string{"master-0", "master-1"},
++			nodes: []*corev1.Node{
++				newNodeWithSystemUUID("master-0", uuid0),
++				newNodeWithSystemUUID("master-1", uuid1),
++			},
++			secrets: []*corev1.Secret{
++				newFencingSecretWithAddress("fencing-credentials-secret-0", "redfish+https://192.168.1.1:8000/redfish/v1/Systems/1"),
++				newFencingSecretWithAddress("fencing-credentials-secret-1", "redfish+https://192.168.1.2:8000/redfish/v1/Systems/2"),
++			},
++			mockGetter: func(ctx context.Context, address, username, password string, insecure bool) (string, error) {
++				if strings.Contains(address, "192.168.1.1") {
++					return uuid0, nil
++				}
++				return uuid1, nil
++			},
++			wantMap: map[string]string{
++				"master-0": "fencing-credentials-secret-0",
++				"master-1": "fencing-credentials-secret-1",
++			},
++		},
++		{
++			name:      "one by hostname, one by Redfish UUID",
++			nodeNames: []string{"master-0", "master-1"},
++			nodes: []*corev1.Node{
++				newNodeWithSystemUUID("master-1", uuid1),
++			},
++			secrets: []*corev1.Secret{
++				newFencingSecret("fencing-credentials-master-0"),
++				newFencingSecretWithAddress("fencing-credentials-secret-1", "redfish+https://192.168.1.2:8000/redfish/v1/Systems/2"),
++			},
++			mockGetter: func(ctx context.Context, address, username, password string, insecure bool) (string, error) {
++				return uuid1, nil
++			},
++			wantMap: map[string]string{
++				"master-0": "fencing-credentials-master-0",
++				"master-1": "fencing-credentials-secret-1",
++			},
++		},
++		{
++			name:      "both nodes matched via MAC hash annotation",
++			nodeNames: []string{"master-0", "master-1"},
++			nodes: []*corev1.Node{
++				newNodeWithMACs("master-0", "aa:bb:cc:dd:ee:01"),
++				newNodeWithMACs("master-1", "aa:bb:cc:dd:ee:02"),
++			},
++			secrets: []*corev1.Secret{
++				newFencingSecret("fencing-credentials-" + macHash0),
++				newFencingSecret("fencing-credentials-" + macHash1),
++			},
++			wantMap: map[string]string{
++				"master-0": "fencing-credentials-" + macHash0,
++				"master-1": "fencing-credentials-" + macHash1,
++			},
++		},
++		{
++			name:      "one by hostname, one by MAC hash",
++			nodeNames: []string{"master-0", "master-1"},
++			nodes: []*corev1.Node{
++				newNodeWithMACs("master-1", "aa:bb:cc:dd:ee:02"),
++			},
++			secrets: []*corev1.Secret{
++				newFencingSecret("fencing-credentials-master-0"),
++				newFencingSecret("fencing-credentials-" + macHash1),
++			},
++			wantMap: map[string]string{
++				"master-0": "fencing-credentials-master-0",
++				"master-1": "fencing-credentials-" + macHash1,
++			},
++		},
++		{
++			name:      "MAC hash fallback to Redfish UUID",
++			nodeNames: []string{"master-0"},
++			nodes: []*corev1.Node{
++				newNodeWithMACsAndUUID("master-0", "ff:ff:ff:ff:ff:ff", uuid0),
++			},
++			secrets: []*corev1.Secret{
++				newFencingSecretWithAddress("fencing-credentials-secret-0", "redfish+https://192.168.1.1:8000/redfish/v1/Systems/1"),
++			},
++			mockGetter: func(ctx context.Context, address, username, password string, insecure bool) (string, error) {
++				return uuid0, nil
++			},
++			wantMap: map[string]string{
++				"master-0": "fencing-credentials-secret-0",
++			},
++		},
++		{
++			name:      "node without MAC annotation falls through to Redfish",
++			nodeNames: []string{"master-0"},
++			nodes: []*corev1.Node{
++				newNodeWithSystemUUID("master-0", uuid0),
++			},
++			secrets: []*corev1.Secret{
++				newFencingSecretWithAddress("fencing-credentials-secret-0", "redfish+https://192.168.1.1:8000/redfish/v1/Systems/1"),
++			},
++			mockGetter: func(ctx context.Context, address, username, password string, insecure bool) (string, error) {
++				return uuid0, nil
++			},
++			wantMap: map[string]string{
++				"master-0": "fencing-credentials-secret-0",
++			},
++		},
++		{
++			name:      "no matching secret",
++			nodeNames: []string{"master-0"},
++			nodes: []*corev1.Node{
++				newNodeWithSystemUUID("master-0", uuid0),
++			},
++			secrets: []*corev1.Secret{
++				newFencingSecretWithAddress("fencing-credentials-unrelated", "redfish+https://192.168.1.1:8000/redfish/v1/Systems/1"),
++			},
++			mockGetter: func(ctx context.Context, address, username, password string, insecure bool) (string, error) {
++				return "different-uuid", nil
++			},
++			wantErr:    true,
++			errContain: "no fencing secret found for node",
++		},
++		{
++			name:      "empty node names are skipped",
++			nodeNames: []string{"master-0", ""},
++			secrets: []*corev1.Secret{
++				newFencingSecret("fencing-credentials-master-0"),
++			},
++			wantMap: map[string]string{
++				"master-0": "fencing-credentials-master-0",
++			},
++		},
++	}
++
++	for _, tt := range tests {
++		t.Run(tt.name, func(t *testing.T) {
++			// Override the default Redfish getter
++			origGetter := defaultRedfishUUIDGetter
++			if tt.mockGetter != nil {
++				defaultRedfishUUIDGetter = tt.mockGetter
++			} else {
++				defaultRedfishUUIDGetter = func(ctx context.Context, address, username, password string, insecure bool) (string, error) {
++					return "", fmt.Errorf("no Redfish endpoint available in test")
++				}
++			}
++			t.Cleanup(func() { defaultRedfishUUIDGetter = origGetter })
++
++			var kubeObjects []runtime.Object
++			for _, s := range tt.secrets {
++				kubeObjects = append(kubeObjects, s)
++			}
++			for _, n := range tt.nodes {
++				kubeObjects = append(kubeObjects, n)
++			}
++			kubeClient := fake.NewSimpleClientset(kubeObjects...)
++
++			result, err := GetFencingSecrets(context.Background(), kubeClient, tt.nodeNames)
++			if (err != nil) != tt.wantErr {
++				t.Fatalf("GetFencingSecrets() error = %v, wantErr %v", err, tt.wantErr)
++			}
++			if tt.wantErr {
++				if err != nil && tt.errContain != "" && !strings.Contains(err.Error(), tt.errContain) {
++					t.Errorf("GetFencingSecrets() error = %v, want error containing %q", err, tt.errContain)
++				}
++				return
++			}
++			for nodeName, wantSecretName := range tt.wantMap {
++				got, ok := result[nodeName]
++				if !ok {
++					t.Errorf("GetFencingSecrets() missing result for node %s", nodeName)
++					continue
++				}
++				if got.Name != wantSecretName {
++					t.Errorf("GetFencingSecrets()[%s] = %q, want %q", nodeName, got.Name, wantSecretName)
++				}
++			}
++		})
++	}
++}
++
++func TestMatchMACHashToSecrets(t *testing.T) {
++	const (
++		macHash0 = "261dddd03aae841c2149ad8897e00961b9d429edc07213cbcfd840802d53e43b"
++		macHash1 = "73b6d39a7211d7573527aed4a201b5fa7e8801249a7e316ab217fa7532a0cdb5"
++	)
++
++	tests := []struct {
++		name            string
++		unresolvedNodes []string
++		nodes           []*corev1.Node
++		secrets         []*corev1.Secret
++		wantMatched     map[string]string
++	}{
++		{
++			name:            "both nodes matched by MAC hash",
++			unresolvedNodes: []string{"master-0", "master-1"},
++			nodes: []*corev1.Node{
++				newNodeWithMACs("master-0", "aa:bb:cc:dd:ee:01"),
++				newNodeWithMACs("master-1", "aa:bb:cc:dd:ee:02"),
++			},
++			secrets: []*corev1.Secret{
++				newFencingSecret("fencing-credentials-" + macHash0),
++				newFencingSecret("fencing-credentials-" + macHash1),
++			},
++			wantMatched: map[string]string{
++				"master-0": "fencing-credentials-" + macHash0,
++				"master-1": "fencing-credentials-" + macHash1,
++			},
++		},
++		{
++			name:            "node with multiple MACs matches on second",
++			unresolvedNodes: []string{"master-0"},
++			nodes: []*corev1.Node{
++				newNodeWithMACs("master-0", "ff:ff:ff:ff:ff:ff,aa:bb:cc:dd:ee:01"),
++			},
++			secrets: []*corev1.Secret{
++				newFencingSecret("fencing-credentials-" + macHash0),
++			},
++			wantMatched: map[string]string{
++				"master-0": "fencing-credentials-" + macHash0,
++			},
++		},
++		{
++			name:            "no MAC annotation skips node",
++			unresolvedNodes: []string{"master-0"},
++			nodes: []*corev1.Node{
++				{ObjectMeta: metav1.ObjectMeta{Name: "master-0"}},
++			},
++			secrets: []*corev1.Secret{
++				newFencingSecret("fencing-credentials-" + macHash0),
++			},
++			wantMatched: map[string]string{},
++		},
++		{
++			name:            "no matching secret for any MAC",
++			unresolvedNodes: []string{"master-0"},
++			nodes: []*corev1.Node{
++				newNodeWithMACs("master-0", "ff:ff:ff:ff:ff:01"),
++			},
++			secrets: []*corev1.Secret{
++				newFencingSecret("fencing-credentials-" + macHash0),
++			},
++			wantMatched: map[string]string{},
++		},
++		{
++			name:            "already resolved node is skipped",
++			unresolvedNodes: []string{"master-0"},
++			nodes: []*corev1.Node{
++				newNodeWithMACs("master-0", "aa:bb:cc:dd:ee:01"),
++			},
++			secrets: []*corev1.Secret{
++				newFencingSecret("fencing-credentials-" + macHash0),
++			},
++			wantMatched: map[string]string{
++				"master-0": "fencing-credentials-preexisting",
++			},
++		},
++	}
++
++	for _, tt := range tests {
++		t.Run(tt.name, func(t *testing.T) {
++			var kubeObjects []runtime.Object
++			for _, s := range tt.secrets {
++				kubeObjects = append(kubeObjects, s)
++			}
++			for _, n := range tt.nodes {
++				kubeObjects = append(kubeObjects, n)
++			}
++			kubeClient := fake.NewSimpleClientset(kubeObjects...)
++
++			result := make(map[string]*corev1.Secret)
++			if tt.name == "already resolved node is skipped" {
++				result["master-0"] = &corev1.Secret{
++					ObjectMeta: metav1.ObjectMeta{Name: "fencing-credentials-preexisting"},
++				}
++			}
++
++			err := matchMACHashToSecrets(context.Background(), kubeClient, tt.unresolvedNodes, result)
++			if err != nil {
++				t.Fatalf("matchMACHashToSecrets() unexpected error: %v", err)
++			}
++
++			if len(result) != len(tt.wantMatched) {
++				t.Fatalf("matchMACHashToSecrets() matched %d nodes, want %d", len(result), len(tt.wantMatched))
++			}
++			for nodeName, wantSecretName := range tt.wantMatched {
++				got, ok := result[nodeName]
++				if !ok {
++					t.Errorf("matchMACHashToSecrets() missing result for node %s", nodeName)
++					continue
++				}
++				if got.Name != wantSecretName {
++					t.Errorf("matchMACHashToSecrets()[%s] = %q, want %q", nodeName, got.Name, wantSecretName)
++				}
++			}
++		})
++	}
++}
++
++func TestMatchRedfishUUIDsToSecrets(t *testing.T) {
++	const (
++		uuid0 = "a944436f-3d48-4139-8f3c-b0d397947966"
++		uuid1 = "b055547g-4d59-5240-9g4d-c1e408058077"
++	)
++
++	tests := []struct {
++		name            string
++		unresolvedNodes []string
++		nodes           []*corev1.Node
++		secrets         []*corev1.Secret
++		alreadyAssigned map[string]bool
++		mockGetter      redfishUUIDGetter
++		wantMatched     map[string]string
++	}{
++		{
++			name:            "both nodes matched by UUID",
++			unresolvedNodes: []string{"master-0", "master-1"},
++			nodes: []*corev1.Node{
++				newNodeWithSystemUUID("master-0", uuid0),
++				newNodeWithSystemUUID("master-1", uuid1),
++			},
++			secrets: []*corev1.Secret{
++				newFencingSecretWithAddress("fencing-credentials-secret-0", "redfish+https://192.168.1.1:8000/redfish/v1/Systems/1"),
++				newFencingSecretWithAddress("fencing-credentials-secret-1", "redfish+https://192.168.1.2:8000/redfish/v1/Systems/2"),
++			},
++			alreadyAssigned: map[string]bool{},
++			mockGetter: func(ctx context.Context, address, username, password string, insecure bool) (string, error) {
++				if strings.Contains(address, "192.168.1.1") {
++					return uuid0, nil
++				}
++				return uuid1, nil
++			},
++			wantMatched: map[string]string{
++				"master-0": "fencing-credentials-secret-0",
++				"master-1": "fencing-credentials-secret-1",
++			},
++		},
++		{
++			name:            "case-insensitive UUID matching",
++			unresolvedNodes: []string{"master-0"},
++			nodes: []*corev1.Node{
++				newNodeWithSystemUUID("master-0", "A944436F-3D48-4139-8F3C-B0D397947966"),
++			},
++			secrets: []*corev1.Secret{
++				newFencingSecretWithAddress("fencing-credentials-secret-0", "redfish+https://192.168.1.1:8000/redfish/v1/Systems/1"),
++			},
++			alreadyAssigned: map[string]bool{},
++			mockGetter: func(ctx context.Context, address, username, password string, insecure bool) (string, error) {
++				return "a944436f-3d48-4139-8f3c-b0d397947966", nil
++			},
++			wantMatched: map[string]string{
++				"master-0": "fencing-credentials-secret-0",
++			},
++		},
++		{
++			name:            "redfish unreachable skips secret",
++			unresolvedNodes: []string{"master-0"},
++			nodes: []*corev1.Node{
++				newNodeWithSystemUUID("master-0", uuid0),
++			},
++			secrets: []*corev1.Secret{
++				newFencingSecretWithAddress("fencing-credentials-secret-0", "redfish+https://192.168.1.1:8000/redfish/v1/Systems/1"),
++			},
++			alreadyAssigned: map[string]bool{},
++			mockGetter: func(ctx context.Context, address, username, password string, insecure bool) (string, error) {
++				return "", fmt.Errorf("connection refused")
++			},
++			wantMatched: map[string]string{},
++		},
++		{
++			name:            "already assigned secrets are excluded",
++			unresolvedNodes: []string{"master-0"},
++			nodes: []*corev1.Node{
++				newNodeWithSystemUUID("master-0", uuid0),
++			},
++			secrets: []*corev1.Secret{
++				newFencingSecretWithAddress("fencing-credentials-secret-0", "redfish+https://192.168.1.1:8000/redfish/v1/Systems/1"),
++			},
++			alreadyAssigned: map[string]bool{"fencing-credentials-secret-0": true},
++			mockGetter: func(ctx context.Context, address, username, password string, insecure bool) (string, error) {
++				return uuid0, nil
++			},
++			wantMatched: map[string]string{},
++		},
++		{
++			name:            "node with empty systemUUID is skipped",
++			unresolvedNodes: []string{"master-0"},
++			nodes: []*corev1.Node{
++				newNodeWithSystemUUID("master-0", ""),
++			},
++			secrets: []*corev1.Secret{
++				newFencingSecretWithAddress("fencing-credentials-secret-0", "redfish+https://192.168.1.1:8000/redfish/v1/Systems/1"),
++			},
++			alreadyAssigned: map[string]bool{},
++			mockGetter: func(ctx context.Context, address, username, password string, insecure bool) (string, error) {
++				return uuid0, nil
++			},
++			wantMatched: map[string]string{},
++		},
++	}
++
++	for _, tt := range tests {
++		t.Run(tt.name, func(t *testing.T) {
++			var kubeObjects []runtime.Object
++			for _, s := range tt.secrets {
++				kubeObjects = append(kubeObjects, s)
++			}
++			for _, n := range tt.nodes {
++				kubeObjects = append(kubeObjects, n)
++			}
++			kubeClient := fake.NewSimpleClientset(kubeObjects...)
++			result := make(map[string]*corev1.Secret)
++
++			err := matchRedfishUUIDsToSecrets(context.Background(), kubeClient, tt.unresolvedNodes, result, tt.alreadyAssigned, tt.mockGetter)
++			if err != nil {
++				t.Fatalf("matchRedfishUUIDsToSecrets() unexpected error: %v", err)
++			}
++
++			if len(result) != len(tt.wantMatched) {
++				t.Fatalf("matchRedfishUUIDsToSecrets() matched %d nodes, want %d", len(result), len(tt.wantMatched))
++			}
++			for nodeName, wantSecretName := range tt.wantMatched {
++				got, ok := result[nodeName]
++				if !ok {
++					t.Errorf("matchRedfishUUIDsToSecrets() missing result for node %s", nodeName)
++					continue
++				}
++				if got.Name != wantSecretName {
++					t.Errorf("matchRedfishUUIDsToSecrets()[%s] = %q, want %q", nodeName, got.Name, wantSecretName)
++				}
++			}
++		})
++	}
++}
++
++func TestGetFencingSecrets_Phase1APIError(t *testing.T) {
++	origGetter := defaultRedfishUUIDGetter
++	defaultRedfishUUIDGetter = func(ctx context.Context, address, username, password string, insecure bool) (string, error) {
++		return "", fmt.Errorf("should not be called")
++	}
++	t.Cleanup(func() { defaultRedfishUUIDGetter = origGetter })
++
++	kubeClient := fake.NewSimpleClientset()
++	kubeClient.PrependReactor("get", "secrets", func(action k8stesting.Action) (bool, runtime.Object, error) {
++		return true, nil, errors.NewForbidden(
++			schema.GroupResource{Resource: "secrets"}, "fencing-credentials-master-0", fmt.Errorf("access denied"))
++	})
++
++	_, err := GetFencingSecrets(context.Background(), kubeClient, []string{"master-0"})
++	if err == nil {
++		t.Fatal("expected error from Phase 1 API failure, got nil")
++	}
++	if !strings.Contains(err.Error(), "failed to get secret") {
++		t.Errorf("expected 'failed to get secret' error, got: %v", err)
++	}
++}
++
++func TestGetFencingSecrets_Phase2APIError(t *testing.T) {
++	const macHash0 = "261dddd03aae841c2149ad8897e00961b9d429edc07213cbcfd840802d53e43b"
++
++	origGetter := defaultRedfishUUIDGetter
++	defaultRedfishUUIDGetter = func(ctx context.Context, address, username, password string, insecure bool) (string, error) {
++		return "", fmt.Errorf("should not be called")
++	}
++	t.Cleanup(func() { defaultRedfishUUIDGetter = origGetter })
++
++	node := newNodeWithMACs("master-0", "aa:bb:cc:dd:ee:01")
++	kubeClient := fake.NewSimpleClientset(node)
++	kubeClient.PrependReactor("get", "secrets", func(action k8stesting.Action) (bool, runtime.Object, error) {
++		getAction := action.(k8stesting.GetAction)
++		if getAction.GetName() == "fencing-credentials-master-0" {
++			return true, nil, errors.NewNotFound(schema.GroupResource{Resource: "secrets"}, getAction.GetName())
++		}
++		if getAction.GetName() == "fencing-credentials-"+macHash0 {
++			return true, nil, errors.NewForbidden(
++				schema.GroupResource{Resource: "secrets"}, getAction.GetName(), fmt.Errorf("access denied"))
++		}
++		return false, nil, nil
++	})
++
++	_, err := GetFencingSecrets(context.Background(), kubeClient, []string{"master-0"})
++	if err == nil {
++		t.Fatal("expected error from Phase 2 API failure, got nil")
++	}
++	if !strings.Contains(err.Error(), "failed to get secret") {
++		t.Errorf("expected 'failed to get secret' error, got: %v", err)
++	}
++}

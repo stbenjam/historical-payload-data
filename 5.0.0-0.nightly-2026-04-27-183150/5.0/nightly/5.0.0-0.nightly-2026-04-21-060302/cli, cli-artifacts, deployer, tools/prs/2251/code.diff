@@ -1,0 +1,160 @@
+diff --git a/.claude/agents/learn-history.md b/.claude/agents/learn-history.md
+new file mode 100644
+index 0000000000..446c32d978
+--- /dev/null
++++ b/.claude/agents/learn-history.md
+@@ -0,0 +1,40 @@
++---
++name: learn-history
++description: "Analyze all past sessions for this project and extract knowledge worth persisting to AGENTS.md or .claude/agents/. One-shot deep analysis of full session history."
++tools: Read, Grep, Glob, Bash
++model: opus
++maxTurns: 30
++---
++
++You are analyzing the full session history for this project to extract knowledge worth persisting.
++
++## Session logs location
++
++Session logs are JSONL files at the project config path. Find them with:
++
++```bash
++ls -lhS ~/.claude/projects/$(echo "$PWD" | tr '/' '-')/*.jsonl
++```
++
++Each line is a JSON object with a `type` field (`user` for user messages, others for assistant responses). User messages have `.message.content` with the prompt text.
++
++## Process
++
++1. Read the current state of AGENTS.md, .claude/agents/*.md, and the memory index for this project at `~/.claude/projects/$(echo "$PWD" | tr '/' '-')/memory/MEMORY.md` (skip if absent)
++2. List all session files, sorted by size (larger sessions have more content worth mining)
++3. For each session, extract user messages and assistant text responses (skip tool results — they're too large). Focus on:
++   - User corrections and redirections
++   - Patterns that were discovered after expensive exploration
++   - Knowledge that was needed repeatedly across sessions
++4. Cross-reference findings against what's already documented to avoid duplicates
++5. Group findings by destination:
++   - **AGENTS.md** — brief conventions/rules (1-2 lines each)
++   - **.claude/agents/*.md** — agent-specific knowledge
++   - **Memory** — user preferences, project context, feedback
++   - **Nowhere** — already documented or too specific to recur
++6. Present a summary of all proposed changes for approval. Do NOT write anything until approved.
++
++## Guidelines
++
++- Prioritize findings that recur across multiple sessions — those have the highest ROI
++- Keep AGENTS.md entries concise. If something needs more than 2 lines, it probably doesn't belong there.
+diff --git a/.claude/agents/learn-session.md b/.claude/agents/learn-session.md
+new file mode 100644
+index 0000000000..158b19bae4
+--- /dev/null
++++ b/.claude/agents/learn-session.md
+@@ -0,0 +1,34 @@
++---
++name: learn-session
++description: "Review the current session and extract knowledge worth persisting to AGENTS.md or .claude/agents/. Use at the end of a session to capture what was learned."
++tools: Read, Grep, Glob, Bash
++model: opus
++maxTurns: 15
++---
++
++You are reviewing a session transcript to extract knowledge worth persisting for future sessions.
++
++## What to look for
++
++1. **User corrections** — where the user redirected the approach, rejected a suggestion, or clarified a preference
++2. **Discovered patterns** — implementation patterns, conventions, or architectural knowledge that was hard to find and would save time next session
++3. **Agent/tooling gaps** — things the tester or code-reviewer agents should know but don't
++
++## What NOT to persist
++
++- Things already documented in AGENTS.md or .claude/agents/
++- Code-level details derivable by reading the source
++- One-off debugging context that won't recur
++- Verbose implementation guides — keep entries brief (1-2 lines for AGENTS.md)
++
++## Process
++
++1. Read the current state of AGENTS.md and .claude/agents/*.md
++2. Read the memory index for this project at `~/.claude/projects/$(echo "$PWD" | tr '/' '-')/memory/MEMORY.md` (skip if absent)
++3. Summarize the session: what was the task, what was learned, what corrections were made
++4. For each finding, determine where it belongs:
++   - **AGENTS.md** — brief convention or rule that applies to all sessions (1-2 lines max)
++   - **.claude/agents/*.md** — specific to the tester or code-reviewer agent
++   - **Memory** — user preferences, project context, feedback (not code patterns)
++   - **Nowhere** — already documented or too specific to recur
++5. Present the proposed changes for approval. Do NOT write anything until approved.
+diff --git a/AGENTS.md b/AGENTS.md
+index 52402c1b76..ccdb87df45 100644
+--- a/AGENTS.md
++++ b/AGENTS.md
+@@ -24,10 +24,10 @@ kubectl is a subset of oc — every kubectl command is available in oc. The rela
+ ## Build and Test
+ 
+ ```bash
+-make oc                              # Fast build (strips debug symbols by default)
+-make build                           # Full build (includes oc-tests-ext)
+-make test                            # Unit tests
+-make verify                          # Formatting, linting, CLI convention checks
++make oc                              # Fast build, ~5-10s (strips debug symbols by default)
++make build                           # Full build (includes oc-tests-ext, tools)
++make test                            # Unit tests (~2-5 min for full suite)
++make verify                          # Formatting, linting, CLI convention checks (~30-60s)
+ make verify-cli-conventions          # CLI structure validation via tools/clicheck
+ make update-generated-completions    # Regenerate shell completions
+ make verify-generated-completions    # Verify completions are up-to-date
+@@ -35,7 +35,15 @@ make verify-generated-completions    # Verify completions are up-to-date
+ 
+ Go version: see `go.mod` for the required version.
+ 
+-Build tags (Linux): `include_gcs include_oss containers_image_openpgp gssapi`. macOS and Windows omit `gssapi`.
++### Running Tests for a Single Package
++
++```bash
++# Linux
++go test -tags 'include_gcs include_oss containers_image_openpgp gssapi' ./pkg/cli/admin/policy/...
++
++# macOS / Windows (omit gssapi)
++go test -tags 'include_gcs include_oss containers_image_openpgp' ./pkg/cli/admin/policy/...
++```
+ 
+ System dependencies for building:
+ - Fedora/CentOS/RHEL: `krb5-devel` (GSSAPI/Kerberos), `gpgme-devel`, `libassuan-devel`
+@@ -123,6 +131,8 @@ Key dependencies: `spf13/cobra`, `k8s.io/client-go`, `k8s.io/kubectl`, `openshif
+ 
+ - **Unit tests:** co-located `*_test.go` files, table-driven tests, standard `testing.T`
+ - **E2E tests:** `test/e2e/` using Ginkgo v2 + Gomega
+-- **Assertions:** `google/go-cmp` for comparisons
++- **Assertions:** assemble the expected object and compare with the actual using `google/go-cmp`, rather than checking individual fields with if statements
++- **Test fixtures:** use typed API struct builders (e.g. `rbacv1.ClusterRole{...}`), not raw YAML strings
++- **Fake clients:** use `fake.NewClientset()` with action recording to verify API call options
+ - **OTE framework:** `oc-tests-ext` binary for test suite execution (`make build` then `./oc-tests-ext run-suite openshift/oc/all`)
+ - **CLI conventions:** `make verify-cli-conventions` validates command structure via `tools/clicheck`
+diff --git a/README.md b/README.md
+index 5c4d6a8f45..3bd6966ca3 100644
+--- a/README.md
++++ b/README.md
+@@ -95,6 +95,23 @@ make build
+ 
+ The test extension binary is included in the production image for CI/CD integration.
+ 
++
++# Claude Code
++
++This repository is set up for use with [Claude Code](https://docs.anthropic.com/en/docs/claude-code).
++Project-specific instructions live in `AGENTS.md`. When making changes, keep Claude's knowledge up to date —
++update `AGENTS.md` or the relevant agent definition in `.claude/agents/` if you discover conventions, patterns,
++or gotchas that would save time in future sessions. Keep these changes in a separate commit.
++
++Available agents in `.claude/agents/`:
++
++| Agent | Purpose |
++|-------|---------|
++| `code-reviewer` | PR code review — builds, verifies, reviews for Go style, breaking changes, and oc-specific concerns |
++| `tester` | Build, lint, and test runner — validates changes compile and pass tests |
++| `learn-session` | End-of-session knowledge extraction — reviews the conversation and proposes updates to docs |
++| `learn-history` | One-shot analysis of all past sessions to extract recurring patterns worth documenting |
++
+ # License
+ 
+ oc is licensed under the [Apache License, Version 2.0](http://www.apache.org/licenses/).

@@ -1,0 +1,36 @@
+diff --git a/pkg/tnf/pkg/pcs/cluster.go b/pkg/tnf/pkg/pcs/cluster.go
+index ae37a6411b..abcdca22ee 100644
+--- a/pkg/tnf/pkg/pcs/cluster.go
++++ b/pkg/tnf/pkg/pcs/cluster.go
+@@ -30,9 +30,13 @@ func ConfigureCluster(ctx context.Context, cfg config.ClusterConfig) (bool, erro
+ 	commands := []string{
+ 		fmt.Sprintf("/usr/sbin/pcs cluster setup TNF %s addr=%s %s addr=%s --debug --force", cfg.NodeName1, cfg.NodeIP1, cfg.NodeName2, cfg.NodeIP2),
+ 		"/usr/sbin/pcs cluster start --all",
++		"/usr/sbin/pcs property set start-failure-is-fatal=false",
+ 		// Note: the kubelet service needs to be disabled when using systemd agent
+ 		// Done by after-setup jobs on both nodes
+-		"/usr/sbin/pcs resource create kubelet systemd:kubelet clone meta interleave=true",
++		// Note: `migration-threshold=60` caps Pacemaker start failures before the resource is treated as blocked (60 retries).
++		// Note: `op start start-delay=15s` waits 15s before each start attempt so dependencies (e.g. resolv prepender) can settle; fast-fail ExecConditions still return quickly.
++		// Note: `op start timeout=180s` bounds how long a single start may run; it does not add delay between retries (that is start-delay).
++		"/usr/sbin/pcs resource create kubelet systemd:kubelet op start timeout=180s start-delay=15s clone meta interleave=true migration-threshold=60",
+ 		"/usr/sbin/pcs cluster enable --all",
+ 		"/usr/sbin/pcs cluster sync",
+ 		"/usr/sbin/pcs cluster reload corosync",
+diff --git a/pkg/tnf/pkg/pcs/etcd.go b/pkg/tnf/pkg/pcs/etcd.go
+index 2e2ebe3f87..d9b08755a6 100644
+--- a/pkg/tnf/pkg/pcs/etcd.go
++++ b/pkg/tnf/pkg/pcs/etcd.go
+@@ -22,7 +22,11 @@ func ConfigureEtcd(ctx context.Context, cfg config.ClusterConfig) error {
+ 	}
+ 	if !strings.Contains(stdOut, "etcd") {
+ 		klog.Info("Creating etcd resource")
+-		cmd := fmt.Sprintf("/usr/sbin/pcs resource create etcd ocf:heartbeat:podman-etcd node_ip_map=\"%s:%s;%s:%s\" drop_in_dependency=true clone interleave=true notify=true",
++		// migration-threshold=60 caps how many failed start operations Pacemaker allows before the etcd clone is treated as blocked.
++		// We raise this from the previous low value so that, together with a planned podman-etcd change to pace retries on
++		// missing-precondition / fast-fail starts (e.g. ~15s between failed attempts), the cluster has on the order of
++		// 60 × 15s ≈ 15 minutes of start attempts before etcd is considered blocked—not a few seconds of burst failures.
++		cmd := fmt.Sprintf("/usr/sbin/pcs resource create etcd ocf:heartbeat:podman-etcd node_ip_map=\"%s:%s;%s:%s\" drop_in_dependency=true clone interleave=true notify=true meta migration-threshold=60",
+ 			cfg.NodeName1, cfg.NodeIP1, cfg.NodeName2, cfg.NodeIP2)
+ 		stdOut, stdErr, err = exec.Execute(ctx, cmd)
+ 		if err != nil || len(stdErr) > 0 {

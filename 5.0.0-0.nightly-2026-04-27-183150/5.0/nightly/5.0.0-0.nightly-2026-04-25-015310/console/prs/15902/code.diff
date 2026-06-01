@@ -1,0 +1,880 @@
+diff --git a/cmd/bridge/main.go b/cmd/bridge/main.go
+index 1fd27be5a1b..3e32e2219ab 100644
+--- a/cmd/bridge/main.go
++++ b/cmd/bridge/main.go
+@@ -13,7 +13,6 @@ import (
+ 	"syscall"
+ 	"time"
+ 
+-	"io/ioutil"
+ 	"net/http"
+ 	"net/url"
+ 	"os"
+@@ -398,7 +397,7 @@ func main() {
+ 	case "in-cluster":
+ 		k8sEndpoint = &url.URL{Scheme: "https", Host: "kubernetes.default.svc"}
+ 		var err error
+-		k8sCertPEM, err = ioutil.ReadFile(k8sInClusterCA)
++		k8sCertPEM, err = os.ReadFile(k8sInClusterCA)
+ 		if err != nil {
+ 			klog.Fatalf("Error inferring Kubernetes config from environment: %v", err)
+ 		}
+@@ -426,7 +425,7 @@ func main() {
+ 
+ 		// If running in an OpenShift cluster, set up a proxy to the prometheus-k8s service running in the openshift-monitoring namespace.
+ 		if *fServiceCAFile != "" {
+-			serviceCertPEM, err := ioutil.ReadFile(*fServiceCAFile)
++			serviceCertPEM, err := os.ReadFile(*fServiceCAFile)
+ 			if err != nil {
+ 				klog.Fatalf("failed to read service-ca.crt file: %v", err)
+ 			}
+diff --git a/pkg/devfile/sample_test.go b/pkg/devfile/sample_test.go
+index eefe9dfe8dc..06053ec1f16 100644
+--- a/pkg/devfile/sample_test.go
++++ b/pkg/devfile/sample_test.go
+@@ -4,9 +4,9 @@ import (
+ 	"encoding/json"
+ 	"errors"
+ 	"fmt"
+-	"io/ioutil"
+ 	"net/http"
+ 	"net/http/httptest"
++	"os"
+ 	"path"
+ 	"strings"
+ 	"testing"
+@@ -138,7 +138,7 @@ func TestGetRegistrySamples(t *testing.T) {
+ 				registryServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+ 					// fmt.Printf("Mock registry server handles %s\n", r.URL.Path)
+ 					if r.URL.Path == "/index/sample" {
+-						samples, loadErr := ioutil.ReadFile(path.Join(test.registryFolder, "sample.json"))
++						samples, loadErr := os.ReadFile(path.Join(test.registryFolder, "sample.json"))
+ 						if loadErr != nil {
+ 							t.Errorf("Could not read samples: %v", loadErr)
+ 							w.WriteHeader(http.StatusInternalServerError)
+diff --git a/pkg/graphql/resolver/k8s.go b/pkg/graphql/resolver/k8s.go
+index 08a225810a4..ee664176e65 100644
+--- a/pkg/graphql/resolver/k8s.go
++++ b/pkg/graphql/resolver/k8s.go
+@@ -4,7 +4,7 @@ import (
+ 	"bytes"
+ 	"context"
+ 	"encoding/json"
+-	"io/ioutil"
++	"io"
+ 	"net/http"
+ 	"net/http/httptest"
+ 
+@@ -29,7 +29,7 @@ func (r *K8sResolver) FetchURL(ctx context.Context, args struct{ URL string }) (
+ 	r.K8sProxy.ServeHTTP(rr, request)
+ 	result := rr.Result()
+ 	defer result.Body.Close()
+-	body, err := ioutil.ReadAll(result.Body)
++	body, err := io.ReadAll(result.Body)
+ 	if err != nil {
+ 		return nil, err
+ 	}
+@@ -98,7 +98,7 @@ func (r *K8sResolver) SelfSubjectReview(ctx context.Context) (*SelfSubjectReview
+ 	result := rr.Result()
+ 	defer result.Body.Close()
+ 	if result.StatusCode < 200 || result.StatusCode > 299 {
+-		body, err := ioutil.ReadAll(result.Body)
++		body, err := io.ReadAll(result.Body)
+ 		if err != nil {
+ 			return nil, err
+ 		}
+@@ -143,7 +143,7 @@ func (r *K8sResolver) SelfSubjectAccessReview(ctx context.Context, args SSARArgs
+ 	result := rr.Result()
+ 	defer result.Body.Close()
+ 	if result.StatusCode < 200 || result.StatusCode > 299 {
+-		body, err := ioutil.ReadAll(result.Body)
++		body, err := io.ReadAll(result.Body)
+ 		if err != nil {
+ 			return nil, err
+ 		}
+diff --git a/pkg/helm/actions/auth_test.go b/pkg/helm/actions/auth_test.go
+index 405dd5c9485..d53d6613a40 100644
+--- a/pkg/helm/actions/auth_test.go
++++ b/pkg/helm/actions/auth_test.go
+@@ -1,7 +1,7 @@
+ package actions
+ 
+ import (
+-	"io/ioutil"
++	"os"
+ 	"testing"
+ 
+ 	configv1 "github.com/openshift/api/config/v1"
+@@ -69,8 +69,8 @@ func TestAuthenticationDoesNotSetRepoURL(t *testing.T) {
+ 			}
+ 
+ 			if tt.hasTLS {
+-				cert, _ := ioutil.ReadFile("./server.crt")
+-				key, _ := ioutil.ReadFile("./server.key")
++				cert, _ := os.ReadFile("./server.crt")
++				key, _ := os.ReadFile("./server.key")
+ 				tlsSecret := &v1.Secret{
+ 					Data: map[string][]byte{
+ 						tlsSecretCertKey: cert,
+diff --git a/pkg/helm/actions/get_chart_test.go b/pkg/helm/actions/get_chart_test.go
+index 1dd994d5674..743905125a3 100644
+--- a/pkg/helm/actions/get_chart_test.go
++++ b/pkg/helm/actions/get_chart_test.go
+@@ -1,7 +1,8 @@
+ package actions
+ 
+ import (
+-	"io/ioutil"
++	"io"
++	"os"
+ 	"testing"
+ 
+ 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+@@ -89,7 +90,7 @@ func TestGetChartWithoutTls(t *testing.T) {
+ 	actionConfig := &action.Configuration{
+ 		RESTClientGetter: FakeConfig{},
+ 		Releases:         store,
+-		KubeClient:       &kubefake.PrintingKubeClient{Out: ioutil.Discard},
++		KubeClient:       &kubefake.PrintingKubeClient{Out: io.Discard},
+ 		Capabilities:     chartutil.DefaultCapabilities,
+ 		Log:              func(format string, v ...interface{}) {},
+ 	}
+@@ -202,7 +203,7 @@ func TestGetChartWithTlsData(t *testing.T) {
+ 	actionConfig := &action.Configuration{
+ 		RESTClientGetter: FakeConfig{},
+ 		Releases:         store,
+-		KubeClient:       &kubefake.PrintingKubeClient{Out: ioutil.Discard},
++		KubeClient:       &kubefake.PrintingKubeClient{Out: io.Discard},
+ 		Capabilities:     chartutil.DefaultCapabilities,
+ 		Log:              func(format string, v ...interface{}) {},
+ 	}
+@@ -216,9 +217,9 @@ func TestGetChartWithTlsData(t *testing.T) {
+ 			}
+ 			// create a secret in required namespace
+ 			if test.createSecret {
+-				certificate, errCert := ioutil.ReadFile("./server.crt")
++				certificate, errCert := os.ReadFile("./server.crt")
+ 				require.NoError(t, errCert)
+-				key, errKey := ioutil.ReadFile("./server.key")
++				key, errKey := os.ReadFile("./server.key")
+ 				require.NoError(t, errKey)
+ 				data := map[string][]byte{
+ 					tlsSecretKey:     key,
+@@ -229,7 +230,7 @@ func TestGetChartWithTlsData(t *testing.T) {
+ 			}
+ 			//create a configMap in openshift-config namespace
+ 			if test.createConfigMap {
+-				caCert, err := ioutil.ReadFile("./cacert.pem")
++				caCert, err := os.ReadFile("./cacert.pem")
+ 				require.NoError(t, err)
+ 				data := map[string]string{
+ 					caBundleKey: string(caCert),
+@@ -336,7 +337,7 @@ func TestGetChartBasicAuth(t *testing.T) {
+ 	actionConfig := &action.Configuration{
+ 		RESTClientGetter: FakeConfig{},
+ 		Releases:         store,
+-		KubeClient:       &kubefake.PrintingKubeClient{Out: ioutil.Discard},
++		KubeClient:       &kubefake.PrintingKubeClient{Out: io.Discard},
+ 		Capabilities:     chartutil.DefaultCapabilities,
+ 		Log:              func(format string, v ...interface{}) {},
+ 	}
+diff --git a/pkg/helm/actions/get_release_test.go b/pkg/helm/actions/get_release_test.go
+index cbc6353ead1..6e11ff3b05f 100644
+--- a/pkg/helm/actions/get_release_test.go
++++ b/pkg/helm/actions/get_release_test.go
+@@ -2,7 +2,8 @@ package actions
+ 
+ import (
+ 	"fmt"
+-	"io/ioutil"
++	"io"
++	"os"
+ 	"testing"
+ 
+ 	"github.com/stretchr/testify/require"
+@@ -70,7 +71,7 @@ func TestGetRelease(t *testing.T) {
+ 			actionConfig := &action.Configuration{
+ 				RESTClientGetter: FakeConfig{},
+ 				Releases:         store,
+-				KubeClient:       &kubefake.PrintingKubeClient{Out: ioutil.Discard},
++				KubeClient:       &kubefake.PrintingKubeClient{Out: io.Discard},
+ 				Capabilities:     chartutil.DefaultCapabilities,
+ 				Log:              func(format string, v ...interface{}) {},
+ 			}
+@@ -155,7 +156,7 @@ func TestGetReleaseWithTlsData(t *testing.T) {
+ 			actionConfig := &action.Configuration{
+ 				RESTClientGetter: FakeConfig{},
+ 				Releases:         store,
+-				KubeClient:       &kubefake.PrintingKubeClient{Out: ioutil.Discard},
++				KubeClient:       &kubefake.PrintingKubeClient{Out: io.Discard},
+ 				Capabilities:     chartutil.DefaultCapabilities,
+ 				Log:              func(format string, v ...interface{}) {},
+ 			}
+@@ -166,9 +167,9 @@ func TestGetReleaseWithTlsData(t *testing.T) {
+ 			}
+ 			// create a secret in required namespace
+ 			if tt.createSecret {
+-				certificate, errCert := ioutil.ReadFile("./server.crt")
++				certificate, errCert := os.ReadFile("./server.crt")
+ 				require.NoError(t, errCert)
+-				key, errKey := ioutil.ReadFile("./server.key")
++				key, errKey := os.ReadFile("./server.key")
+ 				require.NoError(t, errKey)
+ 				data := map[string][]byte{
+ 					tlsSecretKey:     key,
+@@ -179,7 +180,7 @@ func TestGetReleaseWithTlsData(t *testing.T) {
+ 			}
+ 			//create a configMap in openshift-config namespace
+ 			if tt.createConfigMap {
+-				caCert, err := ioutil.ReadFile("./cacert.pem")
++				caCert, err := os.ReadFile("./cacert.pem")
+ 				require.NoError(t, err)
+ 				data := map[string]string{
+ 					caBundleKey: string(caCert),
+diff --git a/pkg/helm/actions/install_chart_test.go b/pkg/helm/actions/install_chart_test.go
+index dffe9f9b5eb..fe85cf1f9e9 100644
+--- a/pkg/helm/actions/install_chart_test.go
++++ b/pkg/helm/actions/install_chart_test.go
+@@ -2,7 +2,8 @@ package actions
+ 
+ import (
+ 	"fmt"
+-	"io/ioutil"
++	"io"
++	"os"
+ 	"testing"
+ 	"time"
+ 
+@@ -94,7 +95,7 @@ func TestInstallChart(t *testing.T) {
+ 			actionConfig := &action.Configuration{
+ 				RESTClientGetter: FakeConfig{},
+ 				Releases:         store,
+-				KubeClient:       &kubefake.PrintingKubeClient{Out: ioutil.Discard},
++				KubeClient:       &kubefake.PrintingKubeClient{Out: io.Discard},
+ 				Capabilities:     chartutil.DefaultCapabilities,
+ 				Log:              func(format string, v ...interface{}) {},
+ 			}
+@@ -173,7 +174,7 @@ func TestInstallChartWithTlsData(t *testing.T) {
+ 			actionConfig := &action.Configuration{
+ 				RESTClientGetter: FakeConfig{},
+ 				Releases:         store,
+-				KubeClient:       &kubefake.PrintingKubeClient{Out: ioutil.Discard},
++				KubeClient:       &kubefake.PrintingKubeClient{Out: io.Discard},
+ 				Capabilities:     chartutil.DefaultCapabilities,
+ 				Log:              func(format string, v ...interface{}) {},
+ 			}
+@@ -184,9 +185,9 @@ func TestInstallChartWithTlsData(t *testing.T) {
+ 			}
+ 			// create a secret in required namespace
+ 			if tt.createSecret {
+-				certificate, errCert := ioutil.ReadFile("./server.crt")
++				certificate, errCert := os.ReadFile("./server.crt")
+ 				require.NoError(t, errCert)
+-				key, errKey := ioutil.ReadFile("./server.key")
++				key, errKey := os.ReadFile("./server.key")
+ 				require.NoError(t, errKey)
+ 				data := map[string][]byte{
+ 					tlsSecretKey:     key,
+@@ -197,7 +198,7 @@ func TestInstallChartWithTlsData(t *testing.T) {
+ 			}
+ 			//create a configMap in openshift-config namespace
+ 			if tt.createConfigMap {
+-				caCert, err := ioutil.ReadFile("./cacert.pem")
++				caCert, err := os.ReadFile("./cacert.pem")
+ 				require.NoError(t, err)
+ 				data := map[string]string{
+ 					caBundleKey: string(caCert),
+@@ -270,7 +271,7 @@ func TestInstallChartBasicAuth(t *testing.T) {
+ 			actionConfig := &action.Configuration{
+ 				RESTClientGetter: FakeConfig{},
+ 				Releases:         store,
+-				KubeClient:       &kubefake.PrintingKubeClient{Out: ioutil.Discard},
++				KubeClient:       &kubefake.PrintingKubeClient{Out: io.Discard},
+ 				Capabilities:     chartutil.DefaultCapabilities,
+ 				Log:              func(format string, v ...interface{}) {},
+ 			}
+@@ -293,7 +294,7 @@ func TestInstallChartBasicAuth(t *testing.T) {
+ 			}
+ 			//create a configMap in openshift-config namespace
+ 			if tt.createConfigMap {
+-				caCert, err := ioutil.ReadFile("./cacert.pem")
++				caCert, err := os.ReadFile("./cacert.pem")
+ 				require.NoError(t, err)
+ 				data := map[string]string{
+ 					caBundleKey: string(caCert),
+@@ -357,7 +358,7 @@ func TestInstallChartAsync(t *testing.T) {
+ 			actionConfig := &action.Configuration{
+ 				RESTClientGetter: FakeConfig{},
+ 				Releases:         store,
+-				KubeClient:       &kubefake.PrintingKubeClient{Out: ioutil.Discard},
++				KubeClient:       &kubefake.PrintingKubeClient{Out: io.Discard},
+ 				Capabilities:     chartutil.DefaultCapabilities,
+ 				Log:              func(format string, v ...interface{}) {},
+ 			}
+@@ -451,7 +452,7 @@ func TestInstallChartFromURL(t *testing.T) {
+ 			actionConfig := &action.Configuration{
+ 				RESTClientGetter: FakeConfig{},
+ 				Releases:         store,
+-				KubeClient:       &kubefake.PrintingKubeClient{Out: ioutil.Discard},
++				KubeClient:       &kubefake.PrintingKubeClient{Out: io.Discard},
+ 				Capabilities:     chartutil.DefaultCapabilities,
+ 				Log:              func(format string, v ...interface{}) {},
+ 			}
+diff --git a/pkg/helm/actions/list_releases_test.go b/pkg/helm/actions/list_releases_test.go
+index babf0023135..c351baa40d3 100644
+--- a/pkg/helm/actions/list_releases_test.go
++++ b/pkg/helm/actions/list_releases_test.go
+@@ -1,7 +1,7 @@
+ package actions
+ 
+ import (
+-	"io/ioutil"
++	"io"
+ 	"testing"
+ 
+ 	"helm.sh/helm/v3/pkg/action"
+@@ -44,7 +44,7 @@ func TestListReleases(t *testing.T) {
+ 			err := store.Create(&tt.release)
+ 			actionConfig := &action.Configuration{
+ 				Releases:     store,
+-				KubeClient:   &kubefake.PrintingKubeClient{Out: ioutil.Discard},
++				KubeClient:   &kubefake.PrintingKubeClient{Out: io.Discard},
+ 				Capabilities: chartutil.DefaultCapabilities,
+ 				Log:          func(format string, v ...interface{}) {},
+ 			}
+diff --git a/pkg/helm/actions/release_history_test.go b/pkg/helm/actions/release_history_test.go
+index 51a3940c23f..a77e0e17998 100644
+--- a/pkg/helm/actions/release_history_test.go
++++ b/pkg/helm/actions/release_history_test.go
+@@ -2,7 +2,7 @@ package actions
+ 
+ import (
+ 	"fmt"
+-	"io/ioutil"
++	"io"
+ 	"testing"
+ 
+ 	"helm.sh/helm/v3/pkg/action"
+@@ -40,7 +40,7 @@ func TestGetReleaseHistory(t *testing.T) {
+ 			store := storage.Init(driver.NewMemory())
+ 			actionConfig := &action.Configuration{
+ 				Releases:     store,
+-				KubeClient:   &kubefake.PrintingKubeClient{Out: ioutil.Discard},
++				KubeClient:   &kubefake.PrintingKubeClient{Out: io.Discard},
+ 				Capabilities: chartutil.DefaultCapabilities,
+ 				Log:          func(format string, v ...interface{}) {},
+ 			}
+@@ -96,7 +96,7 @@ func TestNonExistGetReleaseHistory(t *testing.T) {
+ 			store := storage.Init(driver.NewMemory())
+ 			actionConfig := &action.Configuration{
+ 				Releases:     store,
+-				KubeClient:   &kubefake.PrintingKubeClient{Out: ioutil.Discard},
++				KubeClient:   &kubefake.PrintingKubeClient{Out: io.Discard},
+ 				Capabilities: chartutil.DefaultCapabilities,
+ 				Log:          func(format string, v ...interface{}) {},
+ 			}
+diff --git a/pkg/helm/actions/rollback_release_test.go b/pkg/helm/actions/rollback_release_test.go
+index 0017057e263..f34e9a2f66a 100644
+--- a/pkg/helm/actions/rollback_release_test.go
++++ b/pkg/helm/actions/rollback_release_test.go
+@@ -3,7 +3,7 @@ package actions
+ import (
+ 	"errors"
+ 	"fmt"
+-	"io/ioutil"
++	"io"
+ 	"testing"
+ 
+ 	"helm.sh/helm/v3/pkg/action"
+@@ -52,7 +52,7 @@ func TestRollbackRelease(t *testing.T) {
+ 			// create fake release
+ 			actionConfig := &action.Configuration{
+ 				Releases:     store,
+-				KubeClient:   &kubefake.PrintingKubeClient{Out: ioutil.Discard},
++				KubeClient:   &kubefake.PrintingKubeClient{Out: io.Discard},
+ 				Capabilities: chartutil.DefaultCapabilities,
+ 				Log:          func(format string, v ...interface{}) {},
+ 			}
+@@ -97,7 +97,7 @@ func TestRollbackNonExistRelease(t *testing.T) {
+ 		t.Run(tt.name, func(t *testing.T) {
+ 			actionConfig := &action.Configuration{
+ 				Releases:     store,
+-				KubeClient:   &kubefake.PrintingKubeClient{Out: ioutil.Discard},
++				KubeClient:   &kubefake.PrintingKubeClient{Out: io.Discard},
+ 				Capabilities: chartutil.DefaultCapabilities,
+ 				Log:          func(format string, v ...interface{}) {},
+ 			}
+diff --git a/pkg/helm/actions/setup_test.go b/pkg/helm/actions/setup_test.go
+index 2fd9f16bcc7..d196d8b76aa 100644
+--- a/pkg/helm/actions/setup_test.go
++++ b/pkg/helm/actions/setup_test.go
+@@ -2,7 +2,7 @@ package actions
+ 
+ import (
+ 	"fmt"
+-	"io/ioutil"
++	"io"
+ 	"os"
+ 	"os/exec"
+ 	"regexp"
+@@ -26,7 +26,7 @@ func setSettings(settings *cli.EnvSettings) {
+ // Test binaries often have no build info (see https://go.dev/issue/33976), so we parse go.mod instead.
+ func helmVersionFromGoMod() string {
+ 	for _, path := range []string{"go.mod", "../go.mod", "../../go.mod", "../../../go.mod"} {
+-		data, err := ioutil.ReadFile(path)
++		data, err := os.ReadFile(path)
+ 		if err != nil {
+ 			continue
+ 		}
+@@ -174,13 +174,13 @@ func ExecuteScript(filepath string, waitForCompletion bool, args ...string) erro
+ 	tlsCmd.Stderr = os.Stderr
+ 	err := tlsCmd.Start()
+ 	if err != nil {
+-		bytes, _ := ioutil.ReadAll(os.Stderr)
++		bytes, _ := io.ReadAll(os.Stderr)
+ 		return fmt.Errorf("Error starting program :%s:%s:%w", filepath, string(bytes), err)
+ 	}
+ 	if waitForCompletion {
+ 		err = tlsCmd.Wait()
+ 		if err != nil {
+-			bytes, _ := ioutil.ReadAll(os.Stderr)
++			bytes, _ := io.ReadAll(os.Stderr)
+ 			return fmt.Errorf("Error waiting program :%s:%s:%w", filepath, string(bytes), err)
+ 		}
+ 	}
+diff --git a/pkg/helm/actions/template_test.go b/pkg/helm/actions/template_test.go
+index 78f7c8e9ec8..ed1cd94847d 100644
+--- a/pkg/helm/actions/template_test.go
++++ b/pkg/helm/actions/template_test.go
+@@ -2,7 +2,7 @@ package actions
+ 
+ import (
+ 	"encoding/json"
+-	"io/ioutil"
++	"io"
+ 	"testing"
+ 
+ 	"github.com/stretchr/testify/require"
+@@ -96,7 +96,7 @@ func TestRenderManifests(t *testing.T) {
+ 			actionConfig := &action.Configuration{
+ 				RESTClientGetter: FakeConfig{},
+ 				Releases:         store,
+-				KubeClient:       &kubefake.PrintingKubeClient{Out: ioutil.Discard},
++				KubeClient:       &kubefake.PrintingKubeClient{Out: io.Discard},
+ 				Capabilities:     chartutil.DefaultCapabilities,
+ 				Log:              func(format string, v ...interface{}) {},
+ 			}
+@@ -182,7 +182,7 @@ func TestRenderManifestsBasicAuth(t *testing.T) {
+ 			actionConfig := &action.Configuration{
+ 				RESTClientGetter: FakeConfig{},
+ 				Releases:         store,
+-				KubeClient:       &kubefake.PrintingKubeClient{Out: ioutil.Discard},
++				KubeClient:       &kubefake.PrintingKubeClient{Out: io.Discard},
+ 				Capabilities:     chartutil.DefaultCapabilities,
+ 				Log:              func(format string, v ...interface{}) {},
+ 			}
+diff --git a/pkg/helm/actions/uninstall_release_test.go b/pkg/helm/actions/uninstall_release_test.go
+index 7471952ce59..aa1ed542e25 100644
+--- a/pkg/helm/actions/uninstall_release_test.go
++++ b/pkg/helm/actions/uninstall_release_test.go
+@@ -3,7 +3,7 @@ package actions
+ import (
+ 	"errors"
+ 	"fmt"
+-	"io/ioutil"
++	"io"
+ 	"testing"
+ 	"time"
+ 
+@@ -38,7 +38,7 @@ func TestUninstallRelease(t *testing.T) {
+ 		t.Run(tt.name, func(t *testing.T) {
+ 			actionConfig := &action.Configuration{
+ 				Releases:     store,
+-				KubeClient:   &kubefake.PrintingKubeClient{Out: ioutil.Discard},
++				KubeClient:   &kubefake.PrintingKubeClient{Out: io.Discard},
+ 				Capabilities: chartutil.DefaultCapabilities,
+ 				Log:          func(format string, v ...interface{}) {},
+ 			}
+@@ -75,7 +75,7 @@ func TestUninstallInvalidRelease(t *testing.T) {
+ 		t.Run(tt.name, func(t *testing.T) {
+ 			actionConfig := &action.Configuration{
+ 				Releases:     store,
+-				KubeClient:   &kubefake.PrintingKubeClient{Out: ioutil.Discard},
++				KubeClient:   &kubefake.PrintingKubeClient{Out: io.Discard},
+ 				Capabilities: chartutil.DefaultCapabilities,
+ 				Log:          func(format string, v ...interface{}) {},
+ 			}
+@@ -121,7 +121,7 @@ func TestUninstallReleaseAsync(t *testing.T) {
+ 		t.Run(tt.name, func(t *testing.T) {
+ 			actionConfig := &action.Configuration{
+ 				Releases:     store,
+-				KubeClient:   &kubefake.PrintingKubeClient{Out: ioutil.Discard},
++				KubeClient:   &kubefake.PrintingKubeClient{Out: io.Discard},
+ 				Capabilities: chartutil.DefaultCapabilities,
+ 				Log:          func(format string, v ...interface{}) {},
+ 			}
+@@ -171,7 +171,7 @@ func TestUninstallInvalidReleaseAsync(t *testing.T) {
+ 		t.Run(tt.name, func(t *testing.T) {
+ 			actionConfig := &action.Configuration{
+ 				Releases:     store,
+-				KubeClient:   &kubefake.PrintingKubeClient{Out: ioutil.Discard},
++				KubeClient:   &kubefake.PrintingKubeClient{Out: io.Discard},
+ 				Capabilities: chartutil.DefaultCapabilities,
+ 				Log:          func(format string, v ...interface{}) {},
+ 			}
+diff --git a/pkg/helm/actions/upgrade_release_test.go b/pkg/helm/actions/upgrade_release_test.go
+index a6e24c4a63f..ebe73d652c5 100644
+--- a/pkg/helm/actions/upgrade_release_test.go
++++ b/pkg/helm/actions/upgrade_release_test.go
+@@ -2,7 +2,8 @@ package actions
+ 
+ import (
+ 	"fmt"
+-	"io/ioutil"
++	"io"
++	"os"
+ 	"strings"
+ 	"testing"
+ 	"time"
+@@ -103,7 +104,7 @@ func TestUpgradeReleaseWithoutDependencies(t *testing.T) {
+ 			actionConfig := &action.Configuration{
+ 				RESTClientGetter: FakeConfig{},
+ 				Releases:         store,
+-				KubeClient:       &kubefake.PrintingKubeClient{Out: ioutil.Discard},
++				KubeClient:       &kubefake.PrintingKubeClient{Out: io.Discard},
+ 				Capabilities:     chartutil.DefaultCapabilities,
+ 				Log:              func(format string, v ...interface{}) {},
+ 			}
+@@ -132,9 +133,9 @@ func TestUpgradeReleaseWithoutDependencies(t *testing.T) {
+ 			store.Create(&r)
+ 
+ 			if tt.createSecret {
+-				certificate, errCert := ioutil.ReadFile("./server.crt")
++				certificate, errCert := os.ReadFile("./server.crt")
+ 				require.NoError(t, errCert)
+-				key, errKey := ioutil.ReadFile("./server.key")
++				key, errKey := os.ReadFile("./server.key")
+ 				require.NoError(t, errKey)
+ 				data := map[string][]byte{
+ 					tlsSecretKey:     key,
+@@ -210,7 +211,7 @@ func TestUpgradeReleaseWithDependencies(t *testing.T) {
+ 			actionConfig := &action.Configuration{
+ 				RESTClientGetter: FakeConfig{},
+ 				Releases:         store,
+-				KubeClient:       &kubefake.PrintingKubeClient{Out: ioutil.Discard},
++				KubeClient:       &kubefake.PrintingKubeClient{Out: io.Discard},
+ 				Capabilities:     chartutil.DefaultCapabilities,
+ 				Log:              func(format string, v ...interface{}) {},
+ 			}
+@@ -278,7 +279,7 @@ func TestUpgradeNonExistRelease(t *testing.T) {
+ 			actionConfig := &action.Configuration{
+ 				RESTClientGetter: FakeConfig{},
+ 				Releases:         store,
+-				KubeClient:       &kubefake.PrintingKubeClient{Out: ioutil.Discard},
++				KubeClient:       &kubefake.PrintingKubeClient{Out: io.Discard},
+ 				Capabilities:     chartutil.DefaultCapabilities,
+ 				Log:              func(format string, v ...interface{}) {},
+ 			}
+@@ -340,7 +341,7 @@ func TestUpgradeReleaseWithCustomValues(t *testing.T) {
+ 			actionConfig := &action.Configuration{
+ 				RESTClientGetter: FakeConfig{},
+ 				Releases:         store,
+-				KubeClient:       &kubefake.PrintingKubeClient{Out: ioutil.Discard},
++				KubeClient:       &kubefake.PrintingKubeClient{Out: io.Discard},
+ 				Capabilities:     chartutil.DefaultCapabilities,
+ 				Log:              func(format string, v ...interface{}) {},
+ 			}
+@@ -452,7 +453,7 @@ func TestUpgradeReleaseWithoutDependenciesAsync(t *testing.T) {
+ 			actionConfig := &action.Configuration{
+ 				RESTClientGetter: FakeConfig{},
+ 				Releases:         store,
+-				KubeClient:       &kubefake.PrintingKubeClient{Out: ioutil.Discard},
++				KubeClient:       &kubefake.PrintingKubeClient{Out: io.Discard},
+ 				Capabilities:     chartutil.DefaultCapabilities,
+ 				Log:              func(format string, v ...interface{}) {},
+ 			}
+@@ -481,9 +482,9 @@ func TestUpgradeReleaseWithoutDependenciesAsync(t *testing.T) {
+ 			store.Create(&r)
+ 
+ 			if tt.createSecret {
+-				certificate, errCert := ioutil.ReadFile("./server.crt")
++				certificate, errCert := os.ReadFile("./server.crt")
+ 				require.NoError(t, errCert)
+-				key, errKey := ioutil.ReadFile("./server.key")
++				key, errKey := os.ReadFile("./server.key")
+ 				require.NoError(t, errKey)
+ 				data := map[string][]byte{
+ 					tlsSecretKey:     key,
+@@ -571,7 +572,7 @@ func TestUpgradeReleaseWithDependenciesAsync(t *testing.T) {
+ 			actionConfig := &action.Configuration{
+ 				RESTClientGetter: FakeConfig{},
+ 				Releases:         store,
+-				KubeClient:       &kubefake.PrintingKubeClient{Out: ioutil.Discard},
++				KubeClient:       &kubefake.PrintingKubeClient{Out: io.Discard},
+ 				Capabilities:     chartutil.DefaultCapabilities,
+ 				Log:              func(format string, v ...interface{}) {},
+ 			}
+@@ -663,7 +664,7 @@ func TestUpgradeReleaseWithCustomValuesAsync(t *testing.T) {
+ 			actionConfig := &action.Configuration{
+ 				RESTClientGetter: FakeConfig{},
+ 				Releases:         store,
+-				KubeClient:       &kubefake.PrintingKubeClient{Out: ioutil.Discard},
++				KubeClient:       &kubefake.PrintingKubeClient{Out: io.Discard},
+ 				Capabilities:     chartutil.DefaultCapabilities,
+ 				Log:              func(format string, v ...interface{}) {},
+ 			}
+diff --git a/pkg/helm/chartproxy/proxy_test.go b/pkg/helm/chartproxy/proxy_test.go
+index acc05819db2..869bbd523fa 100644
+--- a/pkg/helm/chartproxy/proxy_test.go
++++ b/pkg/helm/chartproxy/proxy_test.go
+@@ -1,7 +1,7 @@
+ package chartproxy
+ 
+ import (
+-	"io/ioutil"
++	"os"
+ 	"reflect"
+ 	"testing"
+ 
+@@ -121,7 +121,7 @@ func TestProxy_IndexFile(t *testing.T) {
+ 		t.Run(tt.name, func(t *testing.T) {
+ 			var indexFileContents []string
+ 			for _, f := range tt.indexFiles {
+-				content, err := ioutil.ReadFile(f)
++				content, err := os.ReadFile(f)
+ 				if err != nil {
+ 					t.Error(err)
+ 				}
+@@ -161,7 +161,7 @@ func TestProxy_IndexFile(t *testing.T) {
+ 				t.Error(err)
+ 			}
+ 			if tt.mergedFile != "" {
+-				data, err := ioutil.ReadFile(tt.mergedFile)
++				data, err := os.ReadFile(tt.mergedFile)
+ 				if err != nil {
+ 					t.Error(err)
+ 				}
+diff --git a/pkg/helm/chartproxy/repos.go b/pkg/helm/chartproxy/repos.go
+index 246e0667688..ef902adfc92 100644
+--- a/pkg/helm/chartproxy/repos.go
++++ b/pkg/helm/chartproxy/repos.go
+@@ -6,7 +6,7 @@ import (
+ 	"crypto/x509"
+ 	"errors"
+ 	"fmt"
+-	"io/ioutil"
++	"io"
+ 	"net/http"
+ 	"net/url"
+ 	"strings"
+@@ -87,7 +87,7 @@ func (hr helmRepo) IndexFile() (*repo.IndexFile, error) {
+ 	if resp.StatusCode != 200 {
+ 		return nil, errors.New(fmt.Sprintf("Response for %v returned %v with status code %v", indexURL, resp, resp.StatusCode))
+ 	}
+-	body, err := ioutil.ReadAll(resp.Body)
++	body, err := io.ReadAll(resp.Body)
+ 	if err != nil {
+ 		return nil, err
+ 	}
+diff --git a/pkg/helm/chartproxy/repos_test.go b/pkg/helm/chartproxy/repos_test.go
+index 14b5df88521..9bc19d52bf0 100644
+--- a/pkg/helm/chartproxy/repos_test.go
++++ b/pkg/helm/chartproxy/repos_test.go
+@@ -3,7 +3,7 @@ package chartproxy
+ import (
+ 	"errors"
+ 	"fmt"
+-	"io/ioutil"
++	"io"
+ 	"net/http"
+ 	"os"
+ 	"os/exec"
+@@ -375,7 +375,7 @@ func TestHelmRepo_IndexFile(t *testing.T) {
+ 								if err != nil {
+ 									t.Error(err)
+ 								}
+-								resp.Body = ioutil.NopCloser(r)
++								resp.Body = io.NopCloser(r)
+ 							}
+ 							return resp
+ 						}),
+@@ -392,7 +392,7 @@ func TestHelmRepo_IndexFile(t *testing.T) {
+ 				if tt.expectedIndexFile != "" {
+ 					expectedIndexPath = tt.expectedIndexFile
+ 				}
+-				data, err := ioutil.ReadFile(expectedIndexPath)
++				data, err := os.ReadFile(expectedIndexPath)
+ 				if err != nil {
+ 					t.Error(err)
+ 				}
+@@ -595,9 +595,9 @@ func TestHelmRepoGetter_unmarshallConfig(t *testing.T) {
+ 			}
+ 			// create a secret in required namespace
+ 			if tt.createSecret {
+-				certificate, errCert := ioutil.ReadFile("./server.crt")
++				certificate, errCert := os.ReadFile("./server.crt")
+ 				require.NoError(t, errCert)
+-				key, errKey := ioutil.ReadFile("./server.key")
++				key, errKey := os.ReadFile("./server.key")
+ 				require.NoError(t, errKey)
+ 				data := map[string][]byte{
+ 					"tls.key": key,
+@@ -630,13 +630,13 @@ func ExecuteScript(filepath string, waitForCompletion bool) error {
+ 	tlsCmd.Stderr = os.Stderr
+ 	err := tlsCmd.Start()
+ 	if err != nil {
+-		bytes, _ := ioutil.ReadAll(os.Stderr)
++		bytes, _ := io.ReadAll(os.Stderr)
+ 		return fmt.Errorf("Error starting command :%s:%s:%w", filepath, string(bytes), err)
+ 	}
+ 	if waitForCompletion {
+ 		err = tlsCmd.Wait()
+ 		if err != nil {
+-			bytes, _ := ioutil.ReadAll(os.Stderr)
++			bytes, _ := io.ReadAll(os.Stderr)
+ 			return fmt.Errorf("Error waiting command :%s:%s:%w", filepath, string(bytes), err)
+ 		}
+ 	}
+diff --git a/pkg/helm/chartverifier/chart_verifier_test.go b/pkg/helm/chartverifier/chart_verifier_test.go
+index 4d49af8ef2e..be018e751f7 100644
+--- a/pkg/helm/chartverifier/chart_verifier_test.go
++++ b/pkg/helm/chartverifier/chart_verifier_test.go
+@@ -2,7 +2,7 @@ package chartverifier
+ 
+ import (
+ 	"fmt"
+-	"io/ioutil"
++	"io"
+ 	"testing"
+ 
+ 	"github.com/stretchr/testify/require"
+@@ -28,7 +28,7 @@ func TestVerifyApi(t *testing.T) {
+ 	actionConfig := &action.Configuration{
+ 		RESTClientGetter: FakeConfig{},
+ 		Releases:         store,
+-		KubeClient:       &kubefake.PrintingKubeClient{Out: ioutil.Discard},
++		KubeClient:       &kubefake.PrintingKubeClient{Out: io.Discard},
+ 		Capabilities:     chartutil.DefaultCapabilities,
+ 		Log:              func(format string, v ...interface{}) {},
+ 	}
+@@ -45,7 +45,7 @@ func TestVerifyApiChartUrlNotPresent(t *testing.T) {
+ 	actionConfig := &action.Configuration{
+ 		RESTClientGetter: FakeConfig{},
+ 		Releases:         store,
+-		KubeClient:       &kubefake.PrintingKubeClient{Out: ioutil.Discard},
++		KubeClient:       &kubefake.PrintingKubeClient{Out: io.Discard},
+ 		Capabilities:     chartutil.DefaultCapabilities,
+ 		Log:              func(format string, v ...interface{}) {},
+ 	}
+diff --git a/pkg/helm/metrics/metrics_test.go b/pkg/helm/metrics/metrics_test.go
+index 451d0e17855..ef0609b06a6 100644
+--- a/pkg/helm/metrics/metrics_test.go
++++ b/pkg/helm/metrics/metrics_test.go
+@@ -3,7 +3,7 @@ package metrics
+ import (
+ 	"bufio"
+ 	"fmt"
+-	"io/ioutil"
++	"io"
+ 	"net/http"
+ 	"net/http/httptest"
+ 	"strconv"
+@@ -152,7 +152,7 @@ func countMetric(t *testing.T, ts *httptest.Server, metric string, labels ...str
+ 	res := getMetrics(t, ts)
+ 	defer res.Body.Close()
+ 
+-	bytes, err := ioutil.ReadAll(res.Body)
++	bytes, err := io.ReadAll(res.Body)
+ 	if err != nil {
+ 		t.Fatalf("read error: %s", err)
+ 	}
+diff --git a/pkg/proxy/proxy_test.go b/pkg/proxy/proxy_test.go
+index f6bcbe89e72..d1e836fcb54 100644
+--- a/pkg/proxy/proxy_test.go
++++ b/pkg/proxy/proxy_test.go
+@@ -1,7 +1,7 @@
+ package proxy
+ 
+ import (
+-	"io/ioutil"
++	"io"
+ 	"net/http"
+ 	"net/http/httptest"
+ 	"net/url"
+@@ -53,7 +53,7 @@ func TestProxyHTTP(t *testing.T) {
+ 	if err != nil {
+ 		t.Fatalf("err GETting from /proxy/static: %v", err)
+ 	}
+-	body, err := ioutil.ReadAll(res.Body)
++	body, err := io.ReadAll(res.Body)
+ 	if err != nil {
+ 		t.Fatalf("err reading res.Body: %v", err)
+ 	}
+diff --git a/pkg/server/certs.go b/pkg/server/certs.go
+index 190797dbb3f..469bce61fad 100644
+--- a/pkg/server/certs.go
++++ b/pkg/server/certs.go
+@@ -4,11 +4,11 @@ import (
+ 	"crypto/x509"
+ 	"encoding/pem"
+ 	"fmt"
+-	"io/ioutil"
++	"os"
+ )
+ 
+ func readCert(file string) ([]byte, error) {
+-	b, err := ioutil.ReadFile(file)
++	b, err := os.ReadFile(file)
+ 	if err != nil {
+ 		return nil, fmt.Errorf("Could not open CA cert file: %v", err)
+ 	}
+diff --git a/pkg/serverconfig/config.go b/pkg/serverconfig/config.go
+index c8cd6be0b80..6e5f34c9fa5 100644
+--- a/pkg/serverconfig/config.go
++++ b/pkg/serverconfig/config.go
+@@ -5,7 +5,7 @@ import (
+ 	"errors"
+ 	"flag"
+ 	"fmt"
+-	"io/ioutil"
++	"os"
+ 	"sort"
+ 	"strconv"
+ 	"strings"
+@@ -136,7 +136,7 @@ func Parse(fs *flag.FlagSet, args []string, envPrefix string) (*Config, error) {
+ 
+ // SetFlagsFromConfigFile sets flag values based on a YAML config file.
+ func SetFlagsFromConfigFile(fs *flag.FlagSet, filename string) (*Config, error) {
+-	content, err := ioutil.ReadFile(filename)
++	content, err := os.ReadFile(filename)
+ 	if err != nil {
+ 		return nil, err
+ 	}
+diff --git a/pkg/terminal/proxy.go b/pkg/terminal/proxy.go
+index bac4878f051..b1bbafb1644 100644
+--- a/pkg/terminal/proxy.go
++++ b/pkg/terminal/proxy.go
+@@ -6,7 +6,6 @@ import (
+ 	"crypto/tls"
+ 	"errors"
+ 	"io"
+-	"io/ioutil"
+ 	"net/http"
+ 	"net/url"
+ 	"strings"
+@@ -238,13 +237,13 @@ func (p *Proxy) HandleTerminalInstalledNamespace(w http.ResponseWriter, r *http.
+ }
+ 
+ func (p *Proxy) handleExecInit(host *url.URL, token string, r *http.Request, w http.ResponseWriter) {
+-	body, err := ioutil.ReadAll(r.Body)
++	body, err := io.ReadAll(r.Body)
+ 	if err != nil {
+ 		http.Error(w, "Failed to read body of request: "+err.Error(), http.StatusInternalServerError)
+ 		return
+ 	}
+ 
+-	wkspReq, err := http.NewRequest(http.MethodPost, host.String(), ioutil.NopCloser(bytes.NewReader(body)))
++	wkspReq, err := http.NewRequest(http.MethodPost, host.String(), io.NopCloser(bytes.NewReader(body)))
+ 	if err != nil {
+ 		http.Error(w, err.Error(), http.StatusInternalServerError)
+ 		return

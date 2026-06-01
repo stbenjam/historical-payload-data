@@ -1,0 +1,136 @@
+diff --git a/libs/ui-lib/lib/ocm/components/clusterWizard/ClusterDetailsForm.tsx b/libs/ui-lib/lib/ocm/components/clusterWizard/ClusterDetailsForm.tsx
+index 228e74614d..39b54303e4 100644
+--- a/libs/ui-lib/lib/ocm/components/clusterWizard/ClusterDetailsForm.tsx
++++ b/libs/ui-lib/lib/ocm/components/clusterWizard/ClusterDetailsForm.tsx
+@@ -81,14 +81,19 @@ const ClusterDetailsForm = (props: ClusterDetailsFormProps) => {
+         ) {
+           resetPlatform = 'baremetal';
+         }
+-        const params = ClusterDetailsService.getClusterUpdateParams(values, resetPlatform);
++        const params = ClusterDetailsService.getClusterUpdateParams(
++          values,
++          resetPlatform,
++          cluster,
++          infraEnv,
++        );
+         await handleClusterUpdate(cluster.id, params);
+       } else {
+-        const params = ClusterDetailsService.getClusterCreateParams(values);
++        const params = ClusterDetailsService.getClusterCreateParams(values, infraEnv);
+         await handleClusterCreate(params);
+       }
+     },
+-    [cluster, handleClusterCreate, handleClusterUpdate],
++    [cluster, infraEnv, handleClusterCreate, handleClusterUpdate],
+   );
+ 
+   const handleOnNext = React.useCallback(
+diff --git a/libs/ui-lib/lib/ocm/components/clusterWizard/NewClusterWizard.tsx b/libs/ui-lib/lib/ocm/components/clusterWizard/NewClusterWizard.tsx
+index 7891e2edc5..6afd5539e5 100644
+--- a/libs/ui-lib/lib/ocm/components/clusterWizard/NewClusterWizard.tsx
++++ b/libs/ui-lib/lib/ocm/components/clusterWizard/NewClusterWizard.tsx
+@@ -8,8 +8,12 @@ import OptionalConfigurationsStep from './disconnected/OptionalConfigurationsSte
+ import DisconnectedStaticIp from './disconnected/DisconnectedStaticIp';
+ import { ClusterWizardStepsType } from './wizardTransition';
+ import { ModalDialogsContextProvider } from '../hosts/ModalDialogsContext';
++import useInfraEnv from '../../hooks/useInfraEnv';
++import { CpuArchitecture } from '../../../common';
++import { useParams } from 'react-router-dom-v5-compat';
++import { InfraEnv } from '@openshift-assisted/types/assisted-installer-service';
+ 
+-const getCurrentStep = (currentStepId: ClusterWizardStepsType) => {
++const getCurrentStep = (currentStepId: ClusterWizardStepsType, infraEnv?: InfraEnv) => {
+   switch (currentStepId) {
+     case 'disconnected-review':
+       return <ReviewStep />;
+@@ -22,16 +26,19 @@ const getCurrentStep = (currentStepId: ClusterWizardStepsType) => {
+     case 'static-ip-host-configurations':
+       return <DisconnectedStaticIp />;
+     default:
+-      return <ClusterDetails />;
++      return <ClusterDetails infraEnv={infraEnv} />;
+   }
+ };
+ 
+ const NewClusterWizard: React.FC = () => {
+   const { currentStepId } = useClusterWizardContext();
++  const { clusterId } = useParams() as { clusterId: string };
++  const { infraEnv } = useInfraEnv(clusterId, CpuArchitecture.USE_DAY1_ARCHITECTURE);
++
+   return (
+     <ModalDialogsContextProvider>
+       <div className={classNames('pf-v6-c-wizard', 'cluster-wizard')}>
+-        {getCurrentStep(currentStepId)}
++        {getCurrentStep(currentStepId, infraEnv)}
+       </div>
+     </ModalDialogsContextProvider>
+   );
+diff --git a/libs/ui-lib/lib/ocm/services/ClusterDetailsService.ts b/libs/ui-lib/lib/ocm/services/ClusterDetailsService.ts
+index 255cd23215..dcef56f025 100644
+--- a/libs/ui-lib/lib/ocm/services/ClusterDetailsService.ts
++++ b/libs/ui-lib/lib/ocm/services/ClusterDetailsService.ts
+@@ -33,8 +33,18 @@ const getExistingClusterCpuArchitecture = (infraEnv: InfraEnv) => {
+   return infraEnv.cpuArchitecture || getDefaultCpuArchitecture();
+ };
+ 
++const ntpSourceForCluster = (cluster?: Cluster, infraEnv?: InfraEnv): string | undefined => {
++  const fromCluster = cluster?.additionalNtpSource?.trim();
++  const fromInfra = infraEnv?.additionalNtpSources?.trim();
++  const merged = fromCluster || fromInfra;
++  return merged || undefined;
++};
++
+ const ClusterDetailsService = {
+-  getClusterCreateParams(values: OcmClusterDetailsValues): ClusterCreateParamsWithStaticNetworking {
++  getClusterCreateParams(
++    values: OcmClusterDetailsValues,
++    infraEnv?: InfraEnv,
++  ): ClusterCreateParamsWithStaticNetworking {
+     const params: ClusterCreateParamsWithStaticNetworking = {
+       name: values.name,
+       controlPlaneCount: toNumber(values.controlPlaneCount),
+@@ -72,12 +82,19 @@ const ClusterDetailsService = {
+       delete params.platform;
+     }
+ 
++    const ntp = ntpSourceForCluster(undefined, infraEnv);
++    if (ntp) {
++      params.additionalNtpSource = ntp;
++    }
++
+     return params;
+   },
+ 
+   getClusterUpdateParams(
+     values: OcmClusterDetailsValues,
+     platform: PlatformType,
++    cluster?: Cluster,
++    infraEnv?: InfraEnv,
+   ): ClusterDetailsUpdateParams {
+     const params: ClusterDetailsUpdateParams = {
+       name: values.name,
+@@ -98,6 +115,11 @@ const ClusterDetailsService = {
+           : { type: platform };
+     }
+ 
++    const ntp = ntpSourceForCluster(cluster, infraEnv);
++    if (ntp) {
++      params.additionalNtpSource = ntp;
++    }
++
+     return params;
+   },
+ 
+diff --git a/libs/ui-lib/lib/ocm/services/types.ts b/libs/ui-lib/lib/ocm/services/types.ts
+index a3ff67d96e..741350e13f 100644
+--- a/libs/ui-lib/lib/ocm/services/types.ts
++++ b/libs/ui-lib/lib/ocm/services/types.ts
+@@ -7,7 +7,7 @@ import {
+ 
+ export type ClusterDetailsUpdateParams = Pick<
+   V2ClusterUpdateParams,
+-  'name' | 'baseDnsDomain' | 'pullSecret' | 'platform'
++  'name' | 'baseDnsDomain' | 'pullSecret' | 'platform' | 'additionalNtpSource'
+ >;
+ 
+ export type ClusterCreateParamsWithStaticNetworking = ClusterCreateParams & {

@@ -1,0 +1,189 @@
+diff --git a/features.md b/features.md
+index 0b1c7eed732..aea0d6e2207 100644
+--- a/features.md
++++ b/features.md
+@@ -22,6 +22,7 @@
+ | NewOLMPreflightPermissionChecks| | | | <span style="background-color: #519450">Enabled</span> | | | | <span style="background-color: #519450">Enabled</span>  |
+ | NoRegistryClusterInstall| | | | <span style="background-color: #519450">Enabled</span> | | | | <span style="background-color: #519450">Enabled</span>  |
+ | ProvisioningRequestAvailable| | | <span style="background-color: #519450">Enabled</span> | <span style="background-color: #519450">Enabled</span> | | | |  |
++| VSphereMultiVCenterDay2| | | <span style="background-color: #519450">Enabled</span> | <span style="background-color: #519450">Enabled</span> | | | |  |
+ | AWSClusterHostedDNS| | | <span style="background-color: #519450">Enabled</span> | <span style="background-color: #519450">Enabled</span> | | | <span style="background-color: #519450">Enabled</span> | <span style="background-color: #519450">Enabled</span>  |
+ | AWSClusterHostedDNSInstall| | | <span style="background-color: #519450">Enabled</span> | <span style="background-color: #519450">Enabled</span> | | | <span style="background-color: #519450">Enabled</span> | <span style="background-color: #519450">Enabled</span>  |
+ | AWSDedicatedHosts| | | <span style="background-color: #519450">Enabled</span> | <span style="background-color: #519450">Enabled</span> | | | <span style="background-color: #519450">Enabled</span> | <span style="background-color: #519450">Enabled</span>  |
+diff --git a/features/features.go b/features/features.go
+index 6f3e0464228..fb532c14969 100644
+--- a/features/features.go
++++ b/features/features.go
+@@ -808,6 +808,14 @@ var (
+ 					enable(inTechPreviewNoUpgrade(), inDevPreviewNoUpgrade()).
+ 					mustRegister()
+ 
++	FeatureGateVSphereMultiVCenterDay2 = newFeatureGate("VSphereMultiVCenterDay2").
++						reportProblemsToJiraComponent("splat").
++						contactPerson("vr4manta").
++						productScope(ocpSpecific).
++						enhancementPR("https://github.com/openshift/enhancements/pull/1961").
++						enable(inDevPreviewNoUpgrade()).
++						mustRegister()
++
+ 	FeatureGateAWSServiceLBNetworkSecurityGroup = newFeatureGate("AWSServiceLBNetworkSecurityGroup").
+ 							reportProblemsToJiraComponent("Cloud Compute / Cloud Controller Manager").
+ 							contactPerson("mtulio").
+diff --git a/openapi/openapi.json b/openapi/openapi.json
+index 63d154a28c9..3f53ca99ad4 100644
+--- a/openapi/openapi.json
++++ b/openapi/openapi.json
+@@ -15967,7 +15967,7 @@
+       "type": "object",
+       "properties": {
+         "privateZoneIAMRole": {
+-          "description": "privateZoneIAMRole contains the ARN of an IAM role that should be assumed when performing operations on the cluster's private hosted zone specified in the cluster DNS config. When left empty, no role should be assumed.",
++          "description": "privateZoneIAMRole contains the ARN of an IAM role that should be assumed when performing operations on the cluster's private hosted zone specified in the cluster DNS config. When left empty, no role should be assumed.\n\nThe ARN must follow the format: arn:<partition>:iam::<account-id>:role/<role-name>, where: <partition> is the AWS partition (aws, aws-cn, aws-us-gov, or aws-eusc), <account-id> is a 12-digit numeric identifier for the AWS account, <role-name> is the IAM role name.",
+           "type": "string",
+           "default": ""
+         }
+@@ -19814,7 +19814,7 @@
+           "default": ""
+         },
+         "controlPlaneTopology": {
+-          "description": "controlPlaneTopology expresses the expectations for operands that normally run on control nodes. The default is 'HighlyAvailable', which represents the behavior operators have in a \"normal\" cluster. The 'SingleReplica' mode will be used in single-node deployments and the operators should not configure the operand for highly-available operation The 'External' mode indicates that the control plane is hosted externally to the cluster and that its components are not visible within the cluster.",
++          "description": "controlPlaneTopology expresses the expectations for operands that normally run on control nodes. The default is 'HighlyAvailable', which represents the behavior operators have in a \"normal\" cluster. The 'SingleReplica' mode will be used in single-node deployments and the operators should not configure the operand for highly-available operation The 'External' mode indicates that the control plane is hosted externally to the cluster and that its components are not visible within the cluster. The 'HighlyAvailableArbiter' mode indicates that the control plane will consist of 2 control-plane nodes that run conventional services and 1 smaller sized arbiter node that runs a bare minimum of services to maintain quorum.",
+           "type": "string",
+           "default": ""
+         },
+@@ -40686,7 +40686,7 @@
+           "$ref": "#/definitions/com.github.openshift.api.operator.v1.AWSEFSVolumeMetrics"
+         },
+         "kmsKeyARN": {
+-          "description": "kmsKeyARN sets the cluster default storage class to encrypt volumes with a user-defined KMS key, rather than the default KMS key used by AWS. The value may be either the ARN or Alias ARN of a KMS key.",
++          "description": "kmsKeyARN sets the cluster default storage class to encrypt volumes with a user-defined KMS key, rather than the default KMS key used by AWS. The value may be either the ARN or Alias ARN of a KMS key.\n\nThe ARN must follow the format: arn:<partition>:kms:<region>:<account-id>:(key|alias)/<key-id-or-alias>, where: <partition> is the AWS partition (aws, aws-cn, aws-us-gov, aws-iso, aws-iso-b, aws-iso-e, aws-iso-f, or aws-eusc), <region> is the AWS region, <account-id> is a 12-digit numeric identifier for the AWS account, <key-id-or-alias> is the KMS key ID or alias name.",
+           "type": "string"
+         }
+       }
+@@ -43835,6 +43835,14 @@
+           "description": "clientTimeout defines how long a connection will be held open while waiting for a client response.\n\nIf unset, the default timeout is 30s",
+           "$ref": "#/definitions/Duration.v1.meta.apis.pkg.apimachinery.k8s.io"
+         },
++        "configurationManagement": {
++          "description": "configurationManagement specifies how OpenShift router should update the HAProxy configuration.  The following values are valid for this field:\n\n* \"ForkAndReload\". * \"Dynamic\".\n\nOmitting this field means that the user has no opinion and the platform may choose a reasonable default. This default is subject to change over time.  The current default is \"ForkAndReload\".\n\n\"ForkAndReload\" means that OpenShift router should rewrite the HAProxy configuration file and instruct HAProxy to fork and reload. This is OpenShift router's traditional approach.\n\n\"Dynamic\" means that OpenShift router may use HAProxy's control socket for some configuration updates and fall back to fork and reload for other configuration updates.  This is a newer approach, which may be less mature than ForkAndReload.  This setting can improve load-balancing fairness and metrics accuracy and reduce CPU and memory usage if HAProxy has frequent configuration updates for route and endpoints updates.\n\nNote: The \"Dynamic\" option is currently experimental and should not be enabled on production clusters.\n\n\nPossible enum values:\n - `\"Dynamic\"`\n - `\"ForkAndReload\"`",
++          "type": "string",
++          "enum": [
++            "Dynamic",
++            "ForkAndReload"
++          ]
++        },
+         "connectTimeout": {
+           "description": "connectTimeout defines the maximum time to wait for a connection attempt to a server/backend to succeed.\n\nThis field expects an unsigned duration string of decimal numbers, each with optional fraction and a unit suffix, e.g. \"300ms\", \"1.5h\" or \"2h45m\". Valid time units are \"ns\", \"us\" (or \"µs\" U+00B5 or \"μs\" U+03BC), \"ms\", \"s\", \"m\", \"h\".\n\nWhen omitted, this means the user has no opinion and the platform is left to choose a reasonable default. This default is subject to change over time. The current default is 5s.",
+           "$ref": "#/definitions/Duration.v1.meta.apis.pkg.apimachinery.k8s.io"
+diff --git a/payload-manifests/featuregates/featureGate-4-10-Hypershift-Default.yaml b/payload-manifests/featuregates/featureGate-4-10-Hypershift-Default.yaml
+index fbb635365c4..7a5a007c719 100644
+--- a/payload-manifests/featuregates/featureGate-4-10-Hypershift-Default.yaml
++++ b/payload-manifests/featuregates/featureGate-4-10-Hypershift-Default.yaml
+@@ -284,6 +284,9 @@
+                     {
+                         "name": "VSphereMixedNodeEnv"
+                     },
++                    {
++                        "name": "VSphereMultiVCenterDay2"
++                    },
+                     {
+                         "name": "VolumeGroupSnapshot"
+                     }
+diff --git a/payload-manifests/featuregates/featureGate-4-10-Hypershift-DevPreviewNoUpgrade.yaml b/payload-manifests/featuregates/featureGate-4-10-Hypershift-DevPreviewNoUpgrade.yaml
+index 99f5e10fb87..e5f2421bd66 100644
+--- a/payload-manifests/featuregates/featureGate-4-10-Hypershift-DevPreviewNoUpgrade.yaml
++++ b/payload-manifests/featuregates/featureGate-4-10-Hypershift-DevPreviewNoUpgrade.yaml
+@@ -369,6 +369,9 @@
+                     {
+                         "name": "VSphereMultiNetworks"
+                     },
++                    {
++                        "name": "VSphereMultiVCenterDay2"
++                    },
+                     {
+                         "name": "VolumeGroupSnapshot"
+                     }
+diff --git a/payload-manifests/featuregates/featureGate-4-10-Hypershift-OKD.yaml b/payload-manifests/featuregates/featureGate-4-10-Hypershift-OKD.yaml
+index 26e897457ec..c65b5c4f925 100644
+--- a/payload-manifests/featuregates/featureGate-4-10-Hypershift-OKD.yaml
++++ b/payload-manifests/featuregates/featureGate-4-10-Hypershift-OKD.yaml
+@@ -286,6 +286,9 @@
+                     {
+                         "name": "VSphereMixedNodeEnv"
+                     },
++                    {
++                        "name": "VSphereMultiVCenterDay2"
++                    },
+                     {
+                         "name": "VolumeGroupSnapshot"
+                     }
+diff --git a/payload-manifests/featuregates/featureGate-4-10-Hypershift-TechPreviewNoUpgrade.yaml b/payload-manifests/featuregates/featureGate-4-10-Hypershift-TechPreviewNoUpgrade.yaml
+index 79d25e00733..f508f132898 100644
+--- a/payload-manifests/featuregates/featureGate-4-10-Hypershift-TechPreviewNoUpgrade.yaml
++++ b/payload-manifests/featuregates/featureGate-4-10-Hypershift-TechPreviewNoUpgrade.yaml
+@@ -87,6 +87,9 @@
+                     },
+                     {
+                         "name": "ShortCertRotation"
++                    },
++                    {
++                        "name": "VSphereMultiVCenterDay2"
+                     }
+                 ],
+                 "enabled": [
+diff --git a/payload-manifests/featuregates/featureGate-4-10-SelfManagedHA-Default.yaml b/payload-manifests/featuregates/featureGate-4-10-SelfManagedHA-Default.yaml
+index 396f9c95089..c73424671b3 100644
+--- a/payload-manifests/featuregates/featureGate-4-10-SelfManagedHA-Default.yaml
++++ b/payload-manifests/featuregates/featureGate-4-10-SelfManagedHA-Default.yaml
+@@ -278,6 +278,9 @@
+                     {
+                         "name": "VSphereMixedNodeEnv"
+                     },
++                    {
++                        "name": "VSphereMultiVCenterDay2"
++                    },
+                     {
+                         "name": "VolumeGroupSnapshot"
+                     }
+diff --git a/payload-manifests/featuregates/featureGate-4-10-SelfManagedHA-DevPreviewNoUpgrade.yaml b/payload-manifests/featuregates/featureGate-4-10-SelfManagedHA-DevPreviewNoUpgrade.yaml
+index 18a93944a57..d5fb09ca3a3 100644
+--- a/payload-manifests/featuregates/featureGate-4-10-SelfManagedHA-DevPreviewNoUpgrade.yaml
++++ b/payload-manifests/featuregates/featureGate-4-10-SelfManagedHA-DevPreviewNoUpgrade.yaml
+@@ -369,6 +369,9 @@
+                     {
+                         "name": "VSphereMultiNetworks"
+                     },
++                    {
++                        "name": "VSphereMultiVCenterDay2"
++                    },
+                     {
+                         "name": "VolumeGroupSnapshot"
+                     }
+diff --git a/payload-manifests/featuregates/featureGate-4-10-SelfManagedHA-OKD.yaml b/payload-manifests/featuregates/featureGate-4-10-SelfManagedHA-OKD.yaml
+index f545a8a49a0..b2566e467b0 100644
+--- a/payload-manifests/featuregates/featureGate-4-10-SelfManagedHA-OKD.yaml
++++ b/payload-manifests/featuregates/featureGate-4-10-SelfManagedHA-OKD.yaml
+@@ -280,6 +280,9 @@
+                     {
+                         "name": "VSphereMixedNodeEnv"
+                     },
++                    {
++                        "name": "VSphereMultiVCenterDay2"
++                    },
+                     {
+                         "name": "VolumeGroupSnapshot"
+                     }
+diff --git a/payload-manifests/featuregates/featureGate-4-10-SelfManagedHA-TechPreviewNoUpgrade.yaml b/payload-manifests/featuregates/featureGate-4-10-SelfManagedHA-TechPreviewNoUpgrade.yaml
+index 76078c6161c..5e32040c9ce 100644
+--- a/payload-manifests/featuregates/featureGate-4-10-SelfManagedHA-TechPreviewNoUpgrade.yaml
++++ b/payload-manifests/featuregates/featureGate-4-10-SelfManagedHA-TechPreviewNoUpgrade.yaml
+@@ -66,6 +66,9 @@
+                     },
+                     {
+                         "name": "ShortCertRotation"
++                    },
++                    {
++                        "name": "VSphereMultiVCenterDay2"
+                     }
+                 ],
+                 "enabled": [

@@ -1,0 +1,739 @@
+diff --git a/test/extended-priv/machineconfigpool.go b/test/extended-priv/machineconfigpool.go
+index 5eeaf3e281..0425f540fa 100644
+--- a/test/extended-priv/machineconfigpool.go
++++ b/test/extended-priv/machineconfigpool.go
+@@ -1155,21 +1155,6 @@ func GetCompactCompatiblePool(oc *exutil.CLI) *MachineConfigPool {
+ 	return nil
+ }
+ 
+-// GetCoreOsCompatiblePool returns worker pool if it has CoreOs nodes. If there is no CoreOs node in the worker pool, then it returns master pool.
+-func GetCoreOsCompatiblePool(oc *exutil.CLI) *MachineConfigPool {
+-	var (
+-		wMcp = NewMachineConfigPool(oc.AsAdmin(), MachineConfigPoolWorker)
+-		mMcp = NewMachineConfigPool(oc.AsAdmin(), MachineConfigPoolMaster)
+-	)
+-
+-	if len(wMcp.GetCoreOsNodesOrFail()) == 0 {
+-		logger.Infof("No CoreOs nodes in the worker pool. Using master pool for testing")
+-		return mMcp
+-	}
+-
+-	return wMcp
+-}
+-
+ // GetCompactCompatibleOrCustomPool returns compact compatible pool or creates custom pool that will use the same stream as the worker pool
+ func GetCompactCompatibleOrCustomPool(oc *exutil.CLI, numNodes int) (*MachineConfigPool, func() error, error) {
+ 	osstream, err := GetEffectiveOsImageStream(NewMachineConfigPool(oc.AsAdmin(), MachineConfigPoolWorker))
+@@ -1196,6 +1181,21 @@ func GetCompactCompatibleOrCustomPool(oc *exutil.CLI, numNodes int) (*MachineCon
+ 	return customMcp, cleanup, err
+ }
+ 
++// GetCoreOsCompatiblePool returns worker pool if it has CoreOs nodes. If there is no CoreOs node in the worker pool, then it returns master pool.
++func GetCoreOsCompatiblePool(oc *exutil.CLI) *MachineConfigPool {
++	var (
++		wMcp = NewMachineConfigPool(oc.AsAdmin(), MachineConfigPoolWorker)
++		mMcp = NewMachineConfigPool(oc.AsAdmin(), MachineConfigPoolMaster)
++	)
++
++	if len(wMcp.GetCoreOsNodesOrFail()) == 0 {
++		logger.Infof("No CoreOs nodes in the worker pool. Using master pool for testing")
++		return mMcp
++	}
++
++	return wMcp
++}
++
+ // CreateCustomMCPWithStreamByLabel Creates a new custom MCP using the nodes in the worker pool with the given label. If numNodes < 0, we will add all existing nodes to the custom pool
+ // If numNodes == 0, no node will be added to the new custom pool.
+ func CreateCustomMCPWithStreamByLabel(oc *exutil.CLI, name, label, osstream string, numNodes int) (*MachineConfigPool, error) {
+@@ -1491,3 +1491,60 @@ func FilterExtensions(extensions map[string][]string, hasARM64, fips bool, osIma
+ 
+ 	return filteredExtensions, extensionNames, packages
+ }
++
++func (mcp *MachineConfigPool) GetNodesWithoutArchitecture(arch architecture.Architecture, archs ...architecture.Architecture) ([]*Node, error) {
++	archsList := arch.String()
++	for _, itemArch := range archs {
++		archsList = archsList + "," + itemArch.String()
++	}
++	return mcp.GetNodesByLabel(fmt.Sprintf(`%s notin (%s)`, architecture.NodeArchitectureLabel, archsList))
++}
++
++// GetNodesWithoutArchitectureOrFail returns a list of nodes that belong to this pool and do NOT use the given architectures. It fails the test if any error happens
++func (mcp *MachineConfigPool) GetNodesWithoutArchitectureOrFail(arch architecture.Architecture, archs ...architecture.Architecture) []*Node {
++	nodes, err := mcp.GetNodesWithoutArchitecture(arch, archs...)
++	o.ExpectWithOffset(1, err).NotTo(o.HaveOccurred(), "In MCP %s. Cannot get the nodes NOT using architectures %s", mcp.GetName(), append(archs, arch))
++	return nodes
++}
++
++func (mcp *MachineConfigPool) IsRealTimeKernel() (bool, error) {
++	nodes, err := mcp.GetNodes()
++	if err != nil {
++		logger.Errorf("Error getting the nodes in pool %s", mcp.GetName())
++		return false, err
++	}
++
++	return nodes[0].IsRealTimeKernel()
++}
++
++// GetPoolWithArchDifferentFromOrFail returns an existing pool that has nodes with different architecture than the provided one
++func GetPoolWithArchDifferentFromOrFail(oc *exutil.CLI, arch architecture.Architecture) *MachineConfigPool {
++	var (
++		mcpList = NewMachineConfigPoolList(oc.AsAdmin())
++		mMcp    = NewMachineConfigPool(oc, MachineConfigPoolMaster)
++	)
++
++	mcpList.PrintDebugCommand()
++
++	// we check if there is an already existing pool with all its nodes using the requested architecture
++	for _, pool := range mcpList.GetAllOrFail() {
++		if pool.IsMaster() {
++			continue
++		}
++
++		// If there isn't a node with the requested architecture in the worker pool,
++		// but there is a custom pool where all nodes have this architecture
++		if !pool.IsEmpty() && len(pool.GetNodesWithoutArchitectureOrFail(arch)) > 0 {
++			logger.Infof("Using pool %s", pool.GetName())
++			return pool
++		}
++	}
++
++	// It includes compact and SNO
++	if len(mMcp.GetNodesWithoutArchitectureOrFail(arch)) > 0 {
++		return mMcp
++	}
++
++	e2e.Failf("Something went wrong. There is no suitable pool to execute the test case. There is no pool with nodes using  an architecture different from %s", arch)
++	return nil
++}
+diff --git a/test/extended-priv/mco.go b/test/extended-priv/mco.go
+index b9475e463d..d50522ae4f 100644
+--- a/test/extended-priv/mco.go
++++ b/test/extended-priv/mco.go
+@@ -122,3 +122,33 @@ func verifyRenderedMcs(oc *exutil.CLI, renderSuffix string, allRes []ResourceInt
+ 
+ 	return allMcs
+ }
++
++func createMcAndVerifyMCValue(oc *exutil.CLI, stepText, mcName string, node *Node, textToVerify TextToVerify, cmd ...string) {
++	exutil.By(fmt.Sprintf("Create new MC to add the %s", stepText))
++	mcTemplate := mcName + ".yaml"
++	mc := NewMachineConfig(oc.AsAdmin(), mcName, node.GetPrimaryPoolOrFail().GetName()).SetMCOTemplate(mcTemplate)
++	defer mc.DeleteWithWait()
++	// TODO: When we extract the "mcp.waitForComplete" from the "create" method, we need to take into account that if
++	// we are configuring a rt-kernel we need to wait longer. Same for extensions, we need to wait longer if an extension is configured.
++	mc.create()
++	logger.Infof("Machine config is created successfully!")
++
++	exutil.By(fmt.Sprintf("Check %s in the created machine config", stepText))
++	mcOut, err := getMachineConfigDetails(oc, mc.name)
++	o.Expect(err).NotTo(o.HaveOccurred())
++	o.Expect(mcOut).Should(o.MatchRegexp(textToVerify.textToVerifyForMC))
++	logger.Infof("%s is verified in the created machine config!", stepText)
++
++	exutil.By(fmt.Sprintf("Check %s in the machine config daemon", stepText))
++	var podOut string
++	if textToVerify.needBash { // nolint:all
++		podOut, err = exutil.RemoteShPodWithBash(oc, MachineConfigNamespace, node.GetMachineConfigDaemon(), cmd...)
++	} else if textToVerify.needChroot {
++		podOut, err = exutil.RemoteShPodWithChroot(oc, MachineConfigNamespace, node.GetMachineConfigDaemon(), cmd...)
++	} else {
++		podOut, err = exutil.RemoteShPod(oc, MachineConfigNamespace, node.GetMachineConfigDaemon(), cmd...)
++	}
++	o.Expect(err).NotTo(o.HaveOccurred())
++	o.Expect(podOut).Should(o.MatchRegexp(textToVerify.textToVerifyForNode))
++	logger.Infof("%s is verified in the machine config daemon!", stepText)
++}
+diff --git a/test/extended-priv/mco_kernel.go b/test/extended-priv/mco_kernel.go
+new file mode 100644
+index 0000000000..72ad49a47b
+--- /dev/null
++++ b/test/extended-priv/mco_kernel.go
+@@ -0,0 +1,338 @@
++package extended
++
++import (
++	"fmt"
++	"regexp"
++
++	g "github.com/onsi/ginkgo/v2"
++	o "github.com/onsi/gomega"
++	exutil "github.com/openshift/machine-config-operator/test/extended-priv/util"
++	"github.com/openshift/machine-config-operator/test/extended-priv/util/architecture"
++	logger "github.com/openshift/machine-config-operator/test/extended-priv/util/logext"
++)
++
++var _ = g.Describe("[sig-mco][Suite:openshift/machine-config-operator/longduration][Serial][Disruptive] MCO kernel", func() {
++	defer g.GinkgoRecover()
++
++	var oc = exutil.NewCLI("mco-kernel", exutil.KubeConfigPath())
++
++	g.JustBeforeEach(func() {
++		PreChecks(oc)
++	})
++
++	g.It("[PolarionID:42365][OTP] add real time kernel argument [Disruptive]", g.Label("Platform:aws", "Platform:gce"), func() {
++		architecture.SkipNonAmd64SingleArch(oc)
++		skipTestIfSupportedPlatformNotMatched(oc, AWSPlatform, GCPPlatform)
++		mcp := GetCompactCompatiblePool(oc.AsAdmin())
++
++		node := mcp.GetSortedNodesOrFail()[0]
++		textToVerify := TextToVerify{
++			textToVerifyForMC:   "realtime",
++			textToVerifyForNode: "PREEMPT_RT",
++			needBash:            true,
++		}
++
++		createMcAndVerifyMCValue(oc, "realtime kernel", "set-realtime-kernel", node, textToVerify, "uname -a")
++	})
++
++	g.It("[PolarionID:67787][OTP] switch kernel type to 64k-pages for clusters with arm64 nodes [Disruptive]", g.Label("Platform:aws"), func() {
++		architecture.SkipIfNoNodeWithArchitectures(oc.AsAdmin(), architecture.ARM64)
++		skipTestIfNotSupportedPlatform(oc.AsAdmin(), GCPPlatform)
++
++		// If arm64 Compact/SNO we use master
++		// Else if possible we create a custom MCP if there are arm64 nodes in the worker pool
++		// Else if possible we use the first exsisting custom MCP with all its nodes using arm64
++		// Else master is arm64 we use master
++		// Else we fail the test
++		createdCustomPoolName := fmt.Sprintf("mco-test-%s", architecture.ARM64)
++		defer DeleteCustomMCP(oc.AsAdmin(), createdCustomPoolName)
++
++		mcp, nodes := GetPoolAndNodesForArchitectureOrFail(oc.AsAdmin(), createdCustomPoolName, architecture.ARM64, 1)
++		node := nodes[0]
++		logger.Infof("Using node %s from pool %s", node.GetName(), mcp.GetName())
++
++		textToVerify := TextToVerify{
++			textToVerifyForMC:   "64k-pages",
++			textToVerifyForNode: `\+64k\n65536`,
++			needBash:            true,
++		}
++		createMcAndVerifyMCValue(oc, "64k pages kernel", "set-64k-pages-kernel", node, textToVerify, "uname -r; getconf PAGESIZE")
++	})
++
++	g.It("[PolarionID:42364][OTP] add selinux kernel argument [Disruptive]", func() {
++		var (
++			coreOSMcp    = GetCoreOsCompatiblePool(oc)
++			node         = coreOSMcp.GetCoreOsNodesOrFail()[0]
++			textToVerify = TextToVerify{
++				textToVerifyForMC:   "enforcing=0",
++				textToVerifyForNode: "enforcing=0",
++			}
++		)
++
++		createMcAndVerifyMCValue(oc, "Kernel argument", "change-worker-kernel-selinux", node, textToVerify, "cat", "/rootfs/proc/cmdline")
++	})
++
++	g.It("[PolarionID:67825][OTP] Use duplicated kernel arguments [Disruptive]", func() {
++		workerNode := skipTestIfOsIsNotCoreOs(oc)
++		textToVerify := TextToVerify{
++			textToVerifyForMC:   "(?s)y=0.*z=4.*y=1.*z=4",
++			textToVerifyForNode: "y=0 z=4 y=1 z=4",
++		}
++		createMcAndVerifyMCValue(oc, "Duplicated kernel argument", "change-worker-duplicated-kernel-argument", workerNode, textToVerify, "cat", "/rootfs/proc/cmdline")
++	})
++
++	g.It("[PolarionID:53668][OTP] when FIPS and realtime kernel are both enabled node should NOT be degraded [Disruptive]", g.Label("Platform:aws", "Platform:gce"), func() {
++		// skip if arm64. realtime kernel is not supported.
++		architecture.SkipNonAmd64SingleArch(oc)
++		// skip the test if fips is not enabled
++		skipTestIfFIPSIsNotEnabled(oc)
++		// skip the test if platform is not aws or gcp. realtime kargs currently supported on these platforms
++		skipTestIfSupportedPlatformNotMatched(oc, AWSPlatform, GCPPlatform)
++
++		exutil.By("create machine config to enable fips ")
++		fipsMcName := "50-fips-bz-poc"
++		fipsMcTemplate := "bz2096496-dummy-mc-for-fips.yaml"
++		fipsMc := NewMachineConfig(oc.AsAdmin(), fipsMcName, MachineConfigPoolMaster).SetMCOTemplate(fipsMcTemplate)
++
++		defer fipsMc.DeleteWithWait()
++		fipsMc.create()
++
++		exutil.By("create machine config to enable RT kernel")
++		rtMcName := "50-realtime-kernel"
++		rtMcTemplate := "set-realtime-kernel.yaml"
++		rtMc := NewMachineConfig(oc.AsAdmin(), rtMcName, MachineConfigPoolMaster).SetMCOTemplate(rtMcTemplate)
++		// TODO: When we extract the "mcp.waitForComplete" from the "create" and "delete" methods, we need to take into account that if
++		// we are configuring a rt-kernel we need to wait longer.
++		defer rtMc.DeleteWithWait()
++		rtMc.create()
++
++		masterNode := NewNodeList(oc.AsAdmin()).GetAllMasterNodesOrFail()[0]
++
++		exutil.By("check whether fips is enabled")
++		fipsEnabled, fipsErr := masterNode.IsFIPSEnabled()
++		o.Expect(fipsErr).NotTo(o.HaveOccurred())
++		o.Expect(fipsEnabled).Should(o.BeTrue(), "fips is not enabled on node %s", masterNode.GetName())
++
++		exutil.By("check whether fips related kernel arg is enabled")
++		fipsKarg := "trigger-fips-issue=1"
++		fipsKargEnabled, fipsKargErr := masterNode.IsKernelArgEnabled(fipsKarg)
++		o.Expect(fipsKargErr).NotTo(o.HaveOccurred())
++		o.Expect(fipsKargEnabled).Should(o.BeTrue(), "fips related kernel arg %s is not enabled on node %s", fipsKarg, masterNode.GetName())
++
++		exutil.By("check whether RT kernel is enabled")
++		rtEnabled, rtErr := masterNode.IsKernelArgEnabled("PREEMPT_RT")
++		o.Expect(rtErr).NotTo(o.HaveOccurred())
++		o.Expect(rtEnabled).Should(o.BeTrue(), "RT kernel is not enabled on node %s", masterNode.GetName())
++	})
++
++	g.It("[PolarionID:54922][OTP] daemon: add check before updating kernelArgs [Disruptive]", g.Label("Platform:aws", "Platform:gce"), func() {
++		var (
++			mcNameArg1         = "tc-54922-kernel-args-1"
++			mcNameArg2         = "tc-54922-kernel-args-2"
++			mcNameExt          = "tc-54922-extension"
++			kernelArg1         = "test1"
++			kernelArg2         = "test2"
++			usbguardMCTemplate = "change-worker-extension-usbguard.yaml"
++
++			expectedLogArg1Regex = regexp.QuoteMeta("Running rpm-ostree [kargs") + ".*" + regexp.QuoteMeta(fmt.Sprintf("--append=%s", kernelArg1)) +
++				".*" + regexp.QuoteMeta("]")
++			expectedLogArg2Regex = regexp.QuoteMeta("Running rpm-ostree [kargs") + ".*" + regexp.QuoteMeta(fmt.Sprintf("--delete=%s", kernelArg1)) +
++				".*" + regexp.QuoteMeta(fmt.Sprintf("--append=%s", kernelArg1)) +
++				".*" + regexp.QuoteMeta(fmt.Sprintf("--append=%s", kernelArg2)) +
++				".*" + regexp.QuoteMeta("]")
++
++			// Expr: "kargs .*--append|kargs .*--delete"
++			// We need to scape the "--" characters
++			expectedNotLogExtensionRegex = "kargs .*" + regexp.QuoteMeta("--") + "append|kargs .*" + regexp.QuoteMeta("--") + "delete"
++
++			mcp = NewMachineConfigPool(oc.AsAdmin(), MachineConfigPoolWorker)
++		)
++
++		skipTestIfSupportedPlatformNotMatched(oc, AWSPlatform, GCPPlatform)
++		workerNode := skipTestIfOsIsNotCoreOs(oc)
++
++		mcp.SetWaitingTimeForExtensionsChange()
++
++		// Create MC to add kernel arg 'test1'
++		exutil.By(fmt.Sprintf("Create a MC to add a kernel arg: %s", kernelArg1))
++		mcArgs1 := NewMachineConfig(oc.AsAdmin(), mcNameArg1, MachineConfigPoolWorker)
++		mcArgs1.parameters = []string{fmt.Sprintf(`KERNEL_ARGS=["%s"]`, kernelArg1)}
++		mcArgs1.skipWaitForMcp = true
++
++		defer mcArgs1.DeleteWithWait()
++		mcArgs1.create()
++		logger.Infof("OK!\n")
++
++		exutil.By("Check that the MCD logs are tracing the new kernel argument")
++		// We don't know if the selected node will be updated first or last, so we have to wait
++		// the same time we would wait for the mcp to be updated. Aprox.
++		timeToWait := mcp.estimateWaitDuration()
++		logger.Infof("waiting time: %s", timeToWait.String())
++		o.Expect(workerNode.CaptureMCDaemonLogsUntilRestartWithTimeout(timeToWait.String())).To(
++			o.MatchRegexp(expectedLogArg1Regex),
++			"A log line reporting new kernel arguments should be present in the MCD logs when we add a kernel argument via MC")
++		logger.Infof("OK!\n")
++
++		exutil.By("Wait for worker pool to be updated")
++		mcp.waitForComplete()
++		logger.Infof("OK!\n")
++
++		exutil.By("Check that the new kernel argument was added")
++		o.Expect(workerNode.IsKernelArgEnabled(kernelArg1)).To(o.BeTrue(),
++			"Kernel argument %s was not enabled in the node %s", kernelArg1, workerNode.GetName())
++		logger.Infof("OK!\n")
++
++		// Create MC to add kernel arg 'test2'
++		exutil.By(fmt.Sprintf("Create a MC to add a kernel arg: %s", kernelArg2))
++		mcArgs2 := NewMachineConfig(oc.AsAdmin(), mcNameArg2, MachineConfigPoolWorker)
++		mcArgs2.parameters = []string{fmt.Sprintf(`KERNEL_ARGS=["%s"]`, kernelArg2)}
++		mcArgs2.skipWaitForMcp = true
++
++		defer mcArgs2.DeleteWithWait()
++		mcArgs2.create()
++		logger.Infof("OK!\n")
++
++		exutil.By("Check that the MCD logs are tracing both kernel arguments")
++		// We don't know if the selected node will be updated first or last, so we have to wait
++		// the same time we would wait for the mcp to be updated. Aprox.
++		logger.Infof("waiting time: %s", timeToWait.String())
++		o.Expect(workerNode.CaptureMCDaemonLogsUntilRestartWithTimeout(timeToWait.String())).To(
++			o.MatchRegexp(expectedLogArg2Regex),
++			"A log line reporting the new kernel arguments configuration should be present in MCD logs")
++		logger.Infof("OK!\n")
++
++		exutil.By("Wait for worker pool to be updated")
++		mcp.waitForComplete()
++		logger.Infof("OK!\n")
++
++		exutil.By("Check that the both kernel arguments were added")
++		o.Expect(workerNode.IsKernelArgEnabled(kernelArg1)).To(o.BeTrue(),
++			"Kernel argument %s was not enabled in the node %s", kernelArg1, workerNode.GetName())
++		o.Expect(workerNode.IsKernelArgEnabled(kernelArg2)).To(o.BeTrue(),
++			"Kernel argument %s was not enabled in the node %s", kernelArg2, workerNode.GetName())
++		logger.Infof("OK!\n")
++
++		// Create MC to deploy an usbguard extension
++		exutil.By("Create MC to add usbguard extension")
++		mcUsb := NewMachineConfig(oc.AsAdmin(), mcNameExt, MachineConfigPoolWorker).SetMCOTemplate(usbguardMCTemplate)
++		mcUsb.skipWaitForMcp = true
++
++		defer mcUsb.DeleteWithWait()
++		mcUsb.create()
++		logger.Infof("OK!\n")
++
++		exutil.By("Check that the MCD logs do not make any reference to add or delete kargs")
++		o.Expect(workerNode.CaptureMCDaemonLogsUntilRestartWithTimeout(timeToWait.String())).NotTo(
++			o.MatchRegexp(expectedNotLogExtensionRegex),
++			"MCD logs should not make any reference to kernel arguments addition/deletion when no new kernel arg is added/deleted")
++
++		logger.Infof("OK!\n")
++
++		exutil.By("Wait for worker pool to be updated")
++		mcp.waitForComplete()
++		logger.Infof("OK!\n")
++
++		exutil.By("Check that the usbguard extension was added")
++		o.Expect(workerNode.RpmIsInstalled("usbguard")).To(
++			o.BeTrue(),
++			"usbguard rpm should be installed in node %s", workerNode.GetName())
++		logger.Infof("OK!\n")
++	})
++
++	g.It("[PolarionID:72136][OTP] Reject MCs with ignition containing kernelArguments [Disruptive]", func() {
++		var (
++			mcName = "mco-tc-66376-reject-ignition-kernel-arguments"
++			mcp    = GetCompactCompatiblePool(oc.AsAdmin())
++			// quotemeta to scape regex characters in the file path
++			expectedRDMessage = regexp.QuoteMeta(`ignition kargs section contains changes`)
++			expectedRDReason  = ""
++		)
++
++		exutil.By("Create a MC with an ignition section that declares kernel arguments")
++
++		mc := NewMachineConfig(oc.AsAdmin(), mcName, mcp.GetName()).SetMCOTemplate("add-ignition-kernel-arguments.yaml")
++		mc.skipWaitForMcp = true
++
++		validateMcpRenderDegraded(mc, mcp, expectedRDMessage, expectedRDReason)
++
++	})
++
++	g.It("[PolarionID:67788][OTP] kernel type 64k-pages is not supported on non-arm64 nodes [Disruptive]", func() {
++		var (
++			mcName = "mco-tc-67788-invalid-64k-pages-kernel"
++
++			expectedNDMessage = `64k-pages is only supported for aarch64 architecture"`
++			expectedNDReason  = "1 nodes are reporting degraded status on sync"
++		)
++
++		architecture.SkipArchitectures(oc.AsAdmin(), architecture.ARM64)
++		mcp := GetPoolWithArchDifferentFromOrFail(oc.AsAdmin(), architecture.ARM64)
++
++		exutil.By("Create a MC with invalid 64k-pages kernel")
++		mc := NewMachineConfig(oc.AsAdmin(), mcName, mcp.GetName()).SetMCOTemplate("set-64k-pages-kernel.yaml")
++		mc.skipWaitForMcp = true
++
++		validateMcpNodeDegraded(mc, mcp, expectedNDMessage, expectedNDReason, false)
++	})
++
++	g.It("[PolarionID:67790][OTP] create MC with extensions, 64k-pages kernel type and kernel argument [Disruptive]", g.Label("Platform:aws"), func() {
++
++		architecture.SkipIfNoNodeWithArchitectures(oc.AsAdmin(), architecture.ARM64)
++		skipTestIfNotSupportedPlatform(oc.AsAdmin(), GCPPlatform)
++
++		// If arm64 Compact/SNO we use master
++		// Else if possible we create a custom MCP if there are arm64 nodes in the worker pool
++		// Else if possible we use the first exsisting custom MCP with all its nodes using arm64
++		// Else master is arm64 we use master
++		// Else we fail the test
++		createdCustomPoolName := fmt.Sprintf("mco-test-%s", architecture.ARM64)
++		defer DeleteCustomMCP(oc.AsAdmin(), createdCustomPoolName)
++
++		mcp, nodes := GetPoolAndNodesForArchitectureOrFail(oc.AsAdmin(), createdCustomPoolName, architecture.ARM64, 1)
++		node := nodes[0]
++		logger.Infof("Using node %s from pool %s", node.GetName(), mcp.GetName())
++
++		exutil.By("Create new MC to add the kernel arguments, kernel type and extension")
++		mcName := "change-worker-karg-ktype-extension"
++		mcTemplate := mcName + ".yaml"
++		mc := NewMachineConfig(oc.AsAdmin(), mcName, mcp.GetName()).SetMCOTemplate(mcTemplate)
++		mc.parameters = []string{"KERNELTYPE=64k-pages"}
++		defer mc.DeleteWithWait()
++		mc.create()
++
++		exutil.By("Check kernel arguments, kernel type and extension on the created machine config")
++		o.Expect(
++			getMachineConfigDetails(oc, mc.name),
++		).Should(
++			o.And(
++				o.ContainSubstring("usbguard"),
++				o.ContainSubstring("z=10"),
++				o.ContainSubstring("64k-pages"),
++			),
++			"The new MC is not using the expected configuration")
++		logger.Infof("OK!\n")
++
++		exutil.By("Check kernel type")
++		o.Expect(node.Is64kPagesKernel()).To(o.BeTrue(),
++			"The installed kernel is not the expected one")
++
++		o.Expect(
++			node.RpmIsInstalled("kernel-64k-core", "kernel-64k-modules-core", "kernel-64k-modules-extra", "kernel-64k-modules"),
++		).Should(o.BeTrue(),
++			"The installed kernel rpm packages are not the expected ones")
++		logger.Infof("OK!\n")
++
++		exutil.By("Check installed extensions")
++		o.Expect(
++			node.RpmIsInstalled("usbguard"),
++		).Should(
++			o.BeTrue(),
++			"The usbguard extension rpm is not installed")
++		logger.Infof("OK!\n")
++
++		exutil.By("Check kernel arguments")
++		o.Expect(node.IsKernelArgEnabled("z=10")).To(o.BeTrue(),
++			"The kernel arguments are not the expected ones")
++		logger.Infof("OK!\n")
++	})
++})
+diff --git a/test/extended-priv/testdata/files/add-ignition-kernel-arguments.yaml b/test/extended-priv/testdata/files/add-ignition-kernel-arguments.yaml
+new file mode 100644
+index 0000000000..4c936c1040
+--- /dev/null
++++ b/test/extended-priv/testdata/files/add-ignition-kernel-arguments.yaml
+@@ -0,0 +1,21 @@
++apiVersion: template.openshift.io/v1
++kind: Template
++metadata:
++  name: add-ignition-kernel-arguments
++objects:
++- apiVersion: machineconfiguration.openshift.io/v1
++  kind: MachineConfig
++  metadata:
++    labels:
++      machineconfiguration.openshift.io/role: "${POOL}"
++    name: "${NAME}"
++  spec:
++    config:
++      ignition:
++        version: 3.4.0
++      kernelArguments:
++        shouldExist:
++        - enforcing=0
++parameters:
++  - name: NAME
++  - name: POOL
+diff --git a/test/extended-priv/testdata/files/bz2096496-dummy-mc-for-fips.yaml b/test/extended-priv/testdata/files/bz2096496-dummy-mc-for-fips.yaml
+new file mode 100644
+index 0000000000..2e48e7c746
+--- /dev/null
++++ b/test/extended-priv/testdata/files/bz2096496-dummy-mc-for-fips.yaml
+@@ -0,0 +1,20 @@
++apiVersion: template.openshift.io/v1
++kind: Template
++metadata:
++  name: dummy-mc-for-fips
++objects:
++  - kind: MachineConfig
++    apiVersion: machineconfiguration.openshift.io/v1
++    metadata:
++      labels:
++        machineconfiguration.openshift.io/role: "${POOL}"
++      name: "${NAME}"
++    spec:
++      config:
++        ignition:
++          version: 3.2.0
++      kernelArguments:
++      - trigger-fips-issue=1
++parameters:
++  - name: NAME
++  - name: POOL
+diff --git a/test/extended-priv/testdata/files/change-worker-duplicated-kernel-argument.yaml b/test/extended-priv/testdata/files/change-worker-duplicated-kernel-argument.yaml
+new file mode 100644
+index 0000000000..a396deb371
+--- /dev/null
++++ b/test/extended-priv/testdata/files/change-worker-duplicated-kernel-argument.yaml
+@@ -0,0 +1,23 @@
++apiVersion: template.openshift.io/v1
++kind: Template
++metadata:
++  name: duplicated-kernel-argument
++objects:
++  - kind: MachineConfig
++    apiVersion: machineconfiguration.openshift.io/v1
++    metadata:
++      labels:
++        machineconfiguration.openshift.io/role: "${POOL}"
++      name: "${NAME}"
++    spec:
++      config:
++        ignition:
++          version: 3.2.0
++      kernelArguments:
++        - y=0
++        - z=4
++        - y=1
++        - z=4
++parameters:
++  - name: NAME
++  - name: POOL
+diff --git a/test/extended-priv/testdata/files/change-worker-extension-usbguard.yaml b/test/extended-priv/testdata/files/change-worker-extension-usbguard.yaml
+new file mode 100644
+index 0000000000..ce77df5894
+--- /dev/null
++++ b/test/extended-priv/testdata/files/change-worker-extension-usbguard.yaml
+@@ -0,0 +1,21 @@
++apiVersion: template.openshift.io/v1
++kind: Template
++metadata:
++  name: usb-extension
++objects:
++  - kind: MachineConfig
++    apiVersion: machineconfiguration.openshift.io/v1
++    metadata:
++      labels:
++        machineconfiguration.openshift.io/role: "${POOL}"
++      name: "${NAME}"
++    spec:
++      config:
++        ignition:
++          version: 3.2.0
++      extensions:
++        - usbguard
++parameters:
++  - name: NAME
++  - name: POOL
++
+diff --git a/test/extended-priv/testdata/files/change-worker-karg-ktype-extension.yaml b/test/extended-priv/testdata/files/change-worker-karg-ktype-extension.yaml
+new file mode 100644
+index 0000000000..04c6e37a16
+--- /dev/null
++++ b/test/extended-priv/testdata/files/change-worker-karg-ktype-extension.yaml
+@@ -0,0 +1,25 @@
++apiVersion: template.openshift.io/v1
++kind: Template
++metadata:
++  name: usb-extension
++objects:
++  - kind: MachineConfig
++    apiVersion: machineconfiguration.openshift.io/v1
++    metadata:
++      labels:
++        machineconfiguration.openshift.io/role: "${POOL}"
++      name: "${NAME}"
++    spec:
++      config:
++        ignition:
++          version: 3.2.0
++      extensions:
++        - usbguard
++      kernelType: "${KERNELTYPE}"
++      kernelArguments:
++        - 'z=10'
++parameters:
++  - name: NAME
++  - name: POOL
++  - name: KERNELTYPE
++    value: realtime 
+diff --git a/test/extended-priv/testdata/files/change-worker-kernel-selinux.yaml b/test/extended-priv/testdata/files/change-worker-kernel-selinux.yaml
+new file mode 100644
+index 0000000000..77bc131776
+--- /dev/null
++++ b/test/extended-priv/testdata/files/change-worker-kernel-selinux.yaml
+@@ -0,0 +1,20 @@
++apiVersion: template.openshift.io/v1
++kind: Template
++metadata:
++  name: kernel-argument-selinux
++objects:
++  - kind: MachineConfig
++    apiVersion: machineconfiguration.openshift.io/v1
++    metadata:
++      labels:
++        machineconfiguration.openshift.io/role: "${POOL}"
++      name: "${NAME}"
++    spec:
++      config:
++        ignition:
++          version: 3.2.0
++      kernelArguments:
++        - enforcing=0
++parameters:
++  - name: NAME
++  - name: POOL
+diff --git a/test/extended-priv/util.go b/test/extended-priv/util.go
+index ddfff55cff..ed097856b4 100644
+--- a/test/extended-priv/util.go
++++ b/test/extended-priv/util.go
+@@ -1181,7 +1181,7 @@ func validateMcpNodeDegraded(mc *MachineConfig, mcp *MachineConfigPool, expected
+ }
+ 
+ // validate that the machine config 'mc' degrades machineconfigpool 'mcp', due to RenderDegraded error matching expectedNDMessage, expectedNDReason
+-func validateMcpRenderDegraded(mc *MachineConfig, mcp *MachineConfigPool, expectedRDMessage, expectedRDReason string) {
++func validateMcpRenderDegraded(mc *MachineConfig, mcp *MachineConfigPool, expectedRDMessage, expectedRDReason string) { //nolint:unparam
+ 	defer o.Eventually(mcp, "5m", "20s").ShouldNot(BeDegraded(), "The MCP was not recovered from Degraded status after deleting the offending MC")
+ 	defer o.Eventually(mc.Delete).Should(o.Succeed(), "Could not delete the offending MC")
+ 	mc.create()
+@@ -1242,3 +1242,28 @@ func getAlertsByName(oc *exutil.CLI, alertName string) ([]map[string]interface{}
+ 
+ 	return filteredAlerts, nil
+ }
++
++// skipTestIfRTKernel skips the current test if the cluster is using real time kernel
++func skipTestIfRTKernel(oc *exutil.CLI) {
++	wMcp := NewMachineConfigPool(oc.AsAdmin(), MachineConfigPoolWorker)
++	mMcp := NewMachineConfigPool(oc.AsAdmin(), MachineConfigPoolMaster)
++
++	isWorkerRT, err := wMcp.IsRealTimeKernel()
++	o.ExpectWithOffset(1, err).NotTo(o.HaveOccurred(), "Error trying to know if realtime kernel is active worker pool")
++
++	isMasterRT, err := mMcp.IsRealTimeKernel()
++	o.ExpectWithOffset(1, err).NotTo(o.HaveOccurred(), "Error trying to know if realtime kernel is active master pool")
++
++	if isWorkerRT || isMasterRT {
++		g.Skip("Pools are using real time kernel configuration. This test cannot be executed if the cluster is using RT kernel.")
++	}
++}
++
++// skipTestIfOsIsNotCoreOs it will either skip the test case in case of worker node is not CoreOS or will return the CoreOS worker node
++func skipTestIfOsIsNotCoreOs(oc *exutil.CLI) *Node {
++	allCoreOs := NewNodeList(oc.AsAdmin()).GetAllCoreOsWokerNodesOrFail()
++	if len(allCoreOs) == 0 {
++		g.Skip("CoreOs is required to execute this test case!")
++	}
++	return allCoreOs[0]
++}
+diff --git a/test/extended-priv/util/architecture/architecture.go b/test/extended-priv/util/architecture/architecture.go
+index 027f6803bd..c3fc4d3566 100644
+--- a/test/extended-priv/util/architecture/architecture.go
++++ b/test/extended-priv/util/architecture/architecture.go
+@@ -153,3 +153,14 @@ func SkipIfNoNodeWithArchitectures(oc *exutil.CLI, architectures ...Architecture
+ 	}
+ 	g.Skip(fmt.Sprintf("Skip for no nodes with requested architectures"))
+ }
++
++// SkipArchitectures skip the test if the cluster is one of the given architectures
++func SkipArchitectures(oc *exutil.CLI, architectures ...Architecture) (architecture Architecture) {
++	architecture = ClusterArchitecture(oc)
++	for _, arch := range architectures {
++		if arch == architecture {
++			g.Skip(fmt.Sprintf("Skip for cluster architecture: %s", arch.String()))
++		}
++	}
++	return
++}
+diff --git a/test/extended-priv/util/pods.go b/test/extended-priv/util/pods.go
+index 5eae814cf7..00ef4950eb 100644
+--- a/test/extended-priv/util/pods.go
++++ b/test/extended-priv/util/pods.go
+@@ -160,6 +160,16 @@ func RemoteShPod(oc *CLI, namespace, podName string, cmd ...string) (string, err
+ 	return remoteShPod(oc, namespace, podName, false, false, "", cmd...)
+ }
+ 
++// RemoteShPodWithChroot creates a remote shell of the pod with chroot
++func RemoteShPodWithChroot(oc *CLI, namespace, podName string, cmd ...string) (string, error) {
++	return remoteShPod(oc, namespace, podName, false, true, "", cmd...)
++}
++
++// RemoteShPodWithBash creates a remote shell of the pod with bash
++func RemoteShPodWithBash(oc *CLI, namespace, podName string, cmd ...string) (string, error) {
++	return remoteShPod(oc, namespace, podName, true, false, "", cmd...)
++}
++
+ // RemoteShContainer creates a remote shell of the given container inside the pod
+ func RemoteShContainer(oc *CLI, namespace, podName, container string, cmd ...string) (string, error) {
+ 	return remoteShPod(oc, namespace, podName, false, false, container, cmd...)

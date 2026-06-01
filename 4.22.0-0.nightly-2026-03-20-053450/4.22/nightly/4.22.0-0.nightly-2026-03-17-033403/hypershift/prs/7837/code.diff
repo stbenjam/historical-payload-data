@@ -1,0 +1,794 @@
+diff --git a/Dockerfile.e2e b/Dockerfile.e2e
+index 6a97f969244..7080ab57b98 100644
+--- a/Dockerfile.e2e
++++ b/Dockerfile.e2e
+@@ -16,7 +16,7 @@ RUN mkdir -p /hypershift/bin /hypershift/hack
+ COPY --from=builder /hypershift/bin/test-e2e /hypershift/bin/test-e2e
+ COPY --from=builder /hypershift/bin/test-e2e-v2 /hypershift/bin/test-e2e-v2
+ COPY --from=builder /hypershift/bin/test-backuprestore /hypershift/bin/test-backuprestore
+-COPY --from=builder /hypershift/bin/test-setup /hypershift//bin/test-setup
++COPY --from=builder /hypershift/bin/test-setup /hypershift/bin/test-setup
+ COPY --from=builder /hypershift/bin/test-reqserving /hypershift/bin/test-reqserving
+ COPY --from=builder /hypershift/hack/ci-test-e2e.sh /hypershift/hack/ci-test-e2e.sh
+ COPY --from=builder /hypershift/hack/run-reqserving-e2e.sh /hypershift/hack/run-reqserving-e2e.sh
+diff --git a/cmd/fix/dr_oidc_iam.go b/cmd/fix/dr_oidc_iam.go
+index b0fdad2a188..12077d986e7 100644
+--- a/cmd/fix/dr_oidc_iam.go
++++ b/cmd/fix/dr_oidc_iam.go
+@@ -614,16 +614,17 @@ func (o *DrOidcIamOptions) updateHostedClusterRestartAnnotation(ctx context.Cont
+ 		return fmt.Errorf("failed to get HostedCluster %s/%s: %w", o.HostedClusterNamespace, o.HostedClusterName, err)
+ 	}
+ 
++	restartTime := time.Now().UTC().Add(o.RestartDelay).Format(time.RFC3339)
++	fmt.Printf("  - Scheduled rolling restart at %s UTC (in %s)\n", restartTime, o.RestartDelay)
++
++	patch := client.MergeFrom(hc.DeepCopy())
+ 	if hc.Annotations == nil {
+ 		hc.Annotations = make(map[string]string)
+ 	}
+-
+-	restartTime := time.Now().UTC().Add(o.RestartDelay).Format(time.RFC3339)
+ 	hc.Annotations[restartDateAnnotation] = restartTime
+-	fmt.Printf("  - Scheduled rolling restart at %s UTC (in %s)\n", restartTime, o.RestartDelay)
+ 
+-	if err := k8sClient.Update(ctx, hc); err != nil {
+-		return fmt.Errorf("failed to update HostedCluster with restart annotation: %w", err)
++	if err := k8sClient.Patch(ctx, hc, patch); err != nil {
++		return fmt.Errorf("failed to patch HostedCluster with restart annotation: %w", err)
+ 	}
+ 
+ 	return nil
+diff --git a/test/e2e/v2/backuprestore/README.md b/test/e2e/v2/backuprestore/README.md
+index 167d5c5aebb..059829d34b4 100644
+--- a/test/e2e/v2/backuprestore/README.md
++++ b/test/e2e/v2/backuprestore/README.md
+@@ -87,6 +87,16 @@ spec:
+ EOF
+ ```
+ 
++Note: For OpenShift ADP 1.5+, the customPlugins might be left out. Instead, the hypershift plugin can be listed directly under defaultPlugins as follows. This will use the default hypershift plugin version:
++```
++      defaultPlugins:
++        - openshift
++        - aws
++        - csi
++        - kubevirt
++        - hypershift
++```
++
+ * BackupStorageLocation
+ 
+ ```bash
+diff --git a/test/e2e/v2/backuprestore/cleanup.go b/test/e2e/v2/backuprestore/cleanup.go
+index 19e39f90a07..f999fd4537b 100644
+--- a/test/e2e/v2/backuprestore/cleanup.go
++++ b/test/e2e/v2/backuprestore/cleanup.go
+@@ -25,8 +25,7 @@ import (
+ 
+ const (
+ 	// DeletionTimeout is the default timeout for waiting for deletion
+-	DeletionTimeout      = 10 * time.Minute
+-	DeletionRetryTimeout = 5 * time.Minute
++	DeletionTimeout = 10 * time.Minute
+ 	// PollInterval is the interval for polling deletion status
+ 	PollInterval = 5 * time.Second
+ )
+@@ -41,6 +40,7 @@ const (
+ // 4. Delete HostedCluster namespace
+ // 5. Remove finalizers from orphaned resources in HostedCluster namespace
+ // 6. Wait for control plane namespace to be fully deleted
++// 7. Wait for hosted cluster namespace to be fully deleted
+ func BreakHostedClusterPreservingMachines(testCtx *internal.TestContext, logger logr.Logger) error {
+ 	// Step 1: Force delete HCP namespace (without waiting for completion)
+ 	// This removes the CAPI controller early, leaving machine resources orphaned
+@@ -59,7 +59,7 @@ func BreakHostedClusterPreservingMachines(testCtx *internal.TestContext, logger
+ 		return fmt.Errorf("failed to remove orphaned resource finalizers: %w", err)
+ 	}
+ 
+-	// Step 4: Delete HostedCluster namespace
++	// Step 4: Delete HostedCluster namespace (without waiting for completion)
+ 	if err := deleteHostedClusterNamespace(testCtx, false); err != nil {
+ 		return fmt.Errorf("failed to delete hosted cluster namespace: %w", err)
+ 	}
+@@ -74,6 +74,11 @@ func BreakHostedClusterPreservingMachines(testCtx *internal.TestContext, logger
+ 		return fmt.Errorf("failed to delete control plane namespace: %w", err)
+ 	}
+ 
++	// Step 7: Wait for hosted cluster namespace to be fully deleted
++	if err := deleteHostedClusterNamespace(testCtx, true); err != nil {
++		return fmt.Errorf("failed to wait for hosted cluster namespace deletion: %w", err)
++	}
++
+ 	return nil
+ }
+ 
+diff --git a/test/e2e/v2/backuprestore/cli.go b/test/e2e/v2/backuprestore/cli.go
+index 018de85fb0a..b47b98fdbd7 100644
+--- a/test/e2e/v2/backuprestore/cli.go
++++ b/test/e2e/v2/backuprestore/cli.go
+@@ -17,7 +17,8 @@ import (
+ 
+ const (
+ 	BackupTimeout        = 20 * time.Minute
+-	RestoreTimeout       = 20 * time.Minute
++	RestoreTimeout       = BackupTimeout
++	OIDCTimeout          = BackupTimeout
+ 	DefaultOADPNamespace = "openshift-adp"
+ )
+ 
+@@ -92,7 +93,7 @@ type OADPScheduleOptions struct {
+ 	OADPNamespace            string   // Namespace where OADP operator is installed (default: openshift-adp)
+ 	StorageLocation          string   // Backup storage location (default: default)
+ 	TTL                      string   // Backup retention time (default: 2h)
+-	SnapshotMoveData         *bool    // Enable snapshot data movement (default: true)
++	SnapshotMoveData         *bool    // Enable snapshot data movement (default: false)
+ 	DefaultVolumesToFsBackup bool     // Enable file system backup for volumes
+ 	IncludedResources        []string // Override included resources
+ 	IncludeNamespaces        []string // Additional namespaces to include
+@@ -102,6 +103,30 @@ type OADPScheduleOptions struct {
+ 	SkipImmediately          bool     // Skip immediate backup after schedule creation
+ }
+ 
++// FixDrOidcIamOptions contains options for fixing OIDC identity provider during disaster recovery
++type FixDrOidcIamOptions struct {
++	// HostedCluster options (alternative to manual specification)
++	HCName      string
++	HCNamespace string
++
++	// Manual specification options
++	InfraID    string
++	Region     string
++	OIDCBucket string
++	Issuer     string
++
++	// AWS Credentials options (one of these is required)
++	AWSCredsFile string
++	STSCredsFile string
++	RoleARN      string
++
++	// Optional flags
++	Timeout       time.Duration
++	DryRun        bool
++	ForceRecreate bool
++	RestartDelay  time.Duration
++}
++
+ // RunOADPBackup executes the "hypershift create oadp-backup" command
+ func RunOADPBackup(ctx context.Context, logger logr.Logger, artifactDir string, backupOpts *OADPBackupOptions) error {
+ 	if backupOpts.HCName == "" || backupOpts.HCNamespace == "" {
+@@ -369,3 +394,117 @@ func buildScheduleArgs(opts *OADPScheduleOptions) []string {
+ 
+ 	return args
+ }
++
++// RunFixDrOidcIam executes the "hypershift fix dr-oidc-iam" command
++func RunFixDrOidcIam(ctx context.Context, logger logr.Logger, artifactDir string, fixOpts *FixDrOidcIamOptions) error {
++	// Validate mode: either hosted-cluster mode or manual mode, but not both
++	if fixOpts.HCName != "" {
++		if fixOpts.HCNamespace == "" {
++			return fmt.Errorf("--hc-namespace is required when using --hc-name")
++		}
++		if fixOpts.InfraID != "" || fixOpts.Region != "" {
++			return fmt.Errorf("when using --hc-name, --infra-id and --region should not be specified")
++		}
++	} else {
++		if fixOpts.HCNamespace != "" {
++			return fmt.Errorf("--hc-namespace can only be used with --hc-name")
++		}
++		if fixOpts.InfraID == "" || fixOpts.Region == "" {
++			return fmt.Errorf("--infra-id and --region are required when --hc-name is not set")
++		}
++	}
++
++	// Validate credentials: either aws-creds or sts-creds+role-arn, but not both
++	if fixOpts.AWSCredsFile != "" {
++		if fixOpts.STSCredsFile != "" || fixOpts.RoleARN != "" {
++			return fmt.Errorf("only one of 'aws-creds' or 'sts-creds'/'role-arn' can be provided")
++		}
++	} else if fixOpts.STSCredsFile != "" || fixOpts.RoleARN != "" {
++		if fixOpts.STSCredsFile == "" {
++			return fmt.Errorf("sts-creds is required when using role-arn")
++		}
++		if fixOpts.RoleARN == "" {
++			return fmt.Errorf("role-arn is required when using sts-creds")
++		}
++	} else {
++		return fmt.Errorf("either 'aws-creds' or both 'sts-creds' and 'role-arn' must be provided")
++	}
++
++	hypershiftCLI, err := getHypershiftCLIPath()
++	if err != nil {
++		return err
++	}
++
++	if artifactDir == "" {
++		return fmt.Errorf("artifact directory is required")
++	}
++
++	if err := os.MkdirAll(artifactDir, 0755); err != nil {
++		return fmt.Errorf("failed to create artifact directory: %w", err)
++	}
++
++	args := buildFixDrOidcIamArgs(fixOpts)
++	cmd := exec.CommandContext(ctx, hypershiftCLI, args...)
++
++	var logPath string
++	if fixOpts.HCName != "" {
++		logPath = fmt.Sprintf("fix-dr-oidc-iam-%s-%s.log", fixOpts.HCNamespace, fixOpts.HCName)
++	} else {
++		logPath = fmt.Sprintf("fix-dr-oidc-iam-%s-%s.log", fixOpts.Region, fixOpts.InfraID)
++	}
++
++	// Create minimal framework options for RunCommand
++	opts := &framework.Options{
++		ArtifactDir: artifactDir,
++	}
++
++	return framework.RunCommand(logger, opts, logPath, cmd)
++}
++
++// buildFixDrOidcIamArgs constructs the command line arguments for fix dr-oidc-iam.
++// It only appends flags relevant to the chosen mode (hosted-cluster or manual).
++func buildFixDrOidcIamArgs(opts *FixDrOidcIamOptions) []string {
++	args := []string{"fix", "dr-oidc-iam"}
++
++	if opts.HCName != "" {
++		// Hosted-cluster mode
++		args = append(args, "--hc-name", opts.HCName)
++		args = append(args, "--hc-namespace", opts.HCNamespace)
++	} else {
++		// Manual mode
++		args = append(args, "--infra-id", opts.InfraID)
++		args = append(args, "--region", opts.Region)
++	}
++
++	// Optional target flags (valid in both modes)
++	if opts.OIDCBucket != "" {
++		args = append(args, "--oidc-bucket", opts.OIDCBucket)
++	}
++	if opts.Issuer != "" {
++		args = append(args, "--issuer", opts.Issuer)
++	}
++
++	// AWS Credentials flags (mutually exclusive, validated by RunFixDrOidcIam)
++	if opts.AWSCredsFile != "" {
++		args = append(args, "--aws-creds", opts.AWSCredsFile)
++	} else {
++		args = append(args, "--sts-creds", opts.STSCredsFile)
++		args = append(args, "--role-arn", opts.RoleARN)
++	}
++
++	// Optional flags
++	if opts.Timeout > 0 {
++		args = append(args, "--timeout", opts.Timeout.String())
++	}
++	if opts.DryRun {
++		args = append(args, "--dry-run")
++	}
++	if opts.ForceRecreate {
++		args = append(args, "--force-recreate")
++	}
++	if opts.RestartDelay > 0 {
++		args = append(args, "--restart-delay", opts.RestartDelay.String())
++	}
++
++	return args
++}
+diff --git a/test/e2e/v2/backuprestore/cli_test.go b/test/e2e/v2/backuprestore/cli_test.go
+index 6762534e55f..5b0f64fccca 100644
+--- a/test/e2e/v2/backuprestore/cli_test.go
++++ b/test/e2e/v2/backuprestore/cli_test.go
+@@ -3,8 +3,12 @@
+ package backuprestore
+ 
+ import (
++	"context"
++	"strings"
+ 	"testing"
++	"time"
+ 
++	"github.com/go-logr/logr"
+ 	"github.com/google/go-cmp/cmp"
+ )
+ 
+@@ -292,6 +296,256 @@ func TestBuildScheduleArgs(t *testing.T) {
+ 	}
+ }
+ 
++func TestBuildFixDrOidcIamArgs(t *testing.T) {
++	tests := []struct {
++		name     string
++		opts     *FixDrOidcIamOptions
++		expected []string
++	}{
++		{
++			name: "hosted cluster mode with aws creds",
++			opts: &FixDrOidcIamOptions{
++				HCName:       "my-cluster",
++				HCNamespace:  "clusters",
++				AWSCredsFile: "/path/to/creds",
++			},
++			expected: []string{
++				"fix", "dr-oidc-iam",
++				"--hc-name", "my-cluster",
++				"--hc-namespace", "clusters",
++				"--aws-creds", "/path/to/creds",
++			},
++		},
++		{
++			name: "hosted cluster mode with sts creds",
++			opts: &FixDrOidcIamOptions{
++				HCName:       "my-cluster",
++				HCNamespace:  "clusters",
++				STSCredsFile: "/path/to/sts-creds",
++				RoleARN:      "arn:aws:iam::123456789012:role/my-role",
++			},
++			expected: []string{
++				"fix", "dr-oidc-iam",
++				"--hc-name", "my-cluster",
++				"--hc-namespace", "clusters",
++				"--sts-creds", "/path/to/sts-creds",
++				"--role-arn", "arn:aws:iam::123456789012:role/my-role",
++			},
++		},
++		{
++			name: "manual mode with aws creds",
++			opts: &FixDrOidcIamOptions{
++				InfraID:      "my-infra-123",
++				Region:       "us-east-1",
++				AWSCredsFile: "/path/to/creds",
++			},
++			expected: []string{
++				"fix", "dr-oidc-iam",
++				"--infra-id", "my-infra-123",
++				"--region", "us-east-1",
++				"--aws-creds", "/path/to/creds",
++			},
++		},
++		{
++			name: "manual mode with sts creds",
++			opts: &FixDrOidcIamOptions{
++				InfraID:      "my-infra-123",
++				Region:       "us-west-2",
++				STSCredsFile: "/path/to/sts-creds",
++				RoleARN:      "arn:aws:iam::123456789012:role/my-role",
++			},
++			expected: []string{
++				"fix", "dr-oidc-iam",
++				"--infra-id", "my-infra-123",
++				"--region", "us-west-2",
++				"--sts-creds", "/path/to/sts-creds",
++				"--role-arn", "arn:aws:iam::123456789012:role/my-role",
++			},
++		},
++		{
++			name: "hosted cluster mode with oidc bucket and issuer",
++			opts: &FixDrOidcIamOptions{
++				HCName:       "my-cluster",
++				HCNamespace:  "clusters",
++				OIDCBucket:   "my-oidc-bucket",
++				Issuer:       "https://my-issuer.example.com",
++				AWSCredsFile: "/path/to/creds",
++			},
++			expected: []string{
++				"fix", "dr-oidc-iam",
++				"--hc-name", "my-cluster",
++				"--hc-namespace", "clusters",
++				"--oidc-bucket", "my-oidc-bucket",
++				"--issuer", "https://my-issuer.example.com",
++				"--aws-creds", "/path/to/creds",
++			},
++		},
++		{
++			name: "hosted cluster mode with all optional flags",
++			opts: &FixDrOidcIamOptions{
++				HCName:        "my-cluster",
++				HCNamespace:   "clusters",
++				OIDCBucket:    "my-oidc-bucket",
++				Issuer:        "https://issuer.example.com",
++				AWSCredsFile:  "/path/to/creds",
++				Timeout:       10 * time.Minute,
++				DryRun:        true,
++				ForceRecreate: true,
++				RestartDelay:  1 * time.Minute,
++			},
++			expected: []string{
++				"fix", "dr-oidc-iam",
++				"--hc-name", "my-cluster",
++				"--hc-namespace", "clusters",
++				"--oidc-bucket", "my-oidc-bucket",
++				"--issuer", "https://issuer.example.com",
++				"--aws-creds", "/path/to/creds",
++				"--timeout", "10m0s",
++				"--dry-run",
++				"--force-recreate",
++				"--restart-delay", "1m0s",
++			},
++		},
++		{
++			name: "manual mode with all optional flags",
++			opts: &FixDrOidcIamOptions{
++				InfraID:       "my-infra-123",
++				Region:        "us-west-2",
++				OIDCBucket:    "my-oidc-bucket",
++				Issuer:        "https://issuer.example.com",
++				AWSCredsFile:  "/path/to/creds",
++				Timeout:       5 * time.Minute,
++				DryRun:        true,
++				ForceRecreate: true,
++				RestartDelay:  30 * time.Second,
++			},
++			expected: []string{
++				"fix", "dr-oidc-iam",
++				"--infra-id", "my-infra-123",
++				"--region", "us-west-2",
++				"--oidc-bucket", "my-oidc-bucket",
++				"--issuer", "https://issuer.example.com",
++				"--aws-creds", "/path/to/creds",
++				"--timeout", "5m0s",
++				"--dry-run",
++				"--force-recreate",
++				"--restart-delay", "30s",
++			},
++		},
++	}
++
++	for _, tt := range tests {
++		t.Run(tt.name, func(t *testing.T) {
++			result := buildFixDrOidcIamArgs(tt.opts)
++			if diff := cmp.Diff(tt.expected, result); diff != "" {
++				t.Errorf("buildFixDrOidcIamArgs() mismatch (-want +got):\n%s", diff)
++			}
++		})
++	}
++}
++
++func TestRunFixDrOidcIamValidation(t *testing.T) {
++	tests := []struct {
++		name        string
++		opts        *FixDrOidcIamOptions
++		expectedErr string
++	}{
++		{
++			name: "hc-name without hc-namespace",
++			opts: &FixDrOidcIamOptions{
++				HCName:       "my-cluster",
++				AWSCredsFile: "/path/to/creds",
++			},
++			expectedErr: "--hc-namespace is required when using --hc-name",
++		},
++		{
++			name: "hc-namespace without hc-name",
++			opts: &FixDrOidcIamOptions{
++				HCNamespace:  "clusters",
++				AWSCredsFile: "/path/to/creds",
++			},
++			expectedErr: "--hc-namespace can only be used with --hc-name",
++		},
++		{
++			name: "both modes specified",
++			opts: &FixDrOidcIamOptions{
++				HCName:       "my-cluster",
++				HCNamespace:  "clusters",
++				InfraID:      "my-infra",
++				Region:       "us-east-1",
++				AWSCredsFile: "/path/to/creds",
++			},
++			expectedErr: "when using --hc-name, --infra-id and --region should not be specified",
++		},
++		{
++			name: "manual mode missing infra-id",
++			opts: &FixDrOidcIamOptions{
++				Region:       "us-east-1",
++				AWSCredsFile: "/path/to/creds",
++			},
++			expectedErr: "--infra-id and --region are required when --hc-name is not set",
++		},
++		{
++			name: "manual mode missing region",
++			opts: &FixDrOidcIamOptions{
++				InfraID:      "my-infra",
++				AWSCredsFile: "/path/to/creds",
++			},
++			expectedErr: "--infra-id and --region are required when --hc-name is not set",
++		},
++		{
++			name: "both credential modes specified",
++			opts: &FixDrOidcIamOptions{
++				HCName:       "my-cluster",
++				HCNamespace:  "clusters",
++				AWSCredsFile: "/path/to/creds",
++				STSCredsFile: "/path/to/sts-creds",
++				RoleARN:      "arn:aws:iam::123456789012:role/my-role",
++			},
++			expectedErr: "only one of 'aws-creds' or 'sts-creds'/'role-arn' can be provided",
++		},
++		{
++			name: "no credentials",
++			opts: &FixDrOidcIamOptions{
++				HCName:      "my-cluster",
++				HCNamespace: "clusters",
++			},
++			expectedErr: "either 'aws-creds' or both 'sts-creds' and 'role-arn' must be provided",
++		},
++		{
++			name: "sts-creds without role-arn",
++			opts: &FixDrOidcIamOptions{
++				HCName:       "my-cluster",
++				HCNamespace:  "clusters",
++				STSCredsFile: "/path/to/sts-creds",
++			},
++			expectedErr: "role-arn is required when using sts-creds",
++		},
++		{
++			name: "role-arn without sts-creds",
++			opts: &FixDrOidcIamOptions{
++				HCName:      "my-cluster",
++				HCNamespace: "clusters",
++				RoleARN:     "arn:aws:iam::123456789012:role/my-role",
++			},
++			expectedErr: "sts-creds is required when using role-arn",
++		},
++	}
++
++	for _, tt := range tests {
++		t.Run(tt.name, func(t *testing.T) {
++			// RunFixDrOidcIam will fail at validation before reaching CLI lookup
++			err := RunFixDrOidcIam(context.Background(), logr.Discard(), "/tmp/artifacts", tt.opts)
++			if err == nil {
++				t.Fatalf("expected error containing %q, got nil", tt.expectedErr)
++			}
++			if !strings.Contains(err.Error(), tt.expectedErr) {
++				t.Errorf("expected error containing %q, got %q", tt.expectedErr, err.Error())
++			}
++		})
++	}
++}
++
+ // boolPtr is a helper function to create a pointer to a bool value
+ func boolPtr(b bool) *bool {
+ 	return &b
+diff --git a/test/e2e/v2/internal/env_vars.go b/test/e2e/v2/internal/env_vars.go
+index 4702c5bf8d0..562271d7f6e 100644
+--- a/test/e2e/v2/internal/env_vars.go
++++ b/test/e2e/v2/internal/env_vars.go
+@@ -19,6 +19,7 @@ package internal
+ import (
+ 	"fmt"
+ 	"os"
++	"path/filepath"
+ 	"sort"
+ 	"strings"
+ )
+@@ -152,4 +153,10 @@ func init() {
+ 		false,
+ 		"/tmp/artifacts",
+ 	)
++	RegisterEnvVarWithDefault(
++		"AWS_GUEST_INFRA_CREDENTIALS_FILE",
++		"Path to the AWS guest infrastructure credentials file. Defaults to ~/.aws/credentials.",
++		false,
++		filepath.Join(os.Getenv("HOME"), ".aws", "credentials"),
++	)
+ }
+diff --git a/test/e2e/v2/internal/validation.go b/test/e2e/v2/internal/validation.go
+new file mode 100644
+index 00000000000..c2bfb41435f
+--- /dev/null
++++ b/test/e2e/v2/internal/validation.go
+@@ -0,0 +1,62 @@
++//go:build e2ev2
++
++/*
++Licensed under the Apache License, Version 2.0 (the "License");
++you may not use this file except in compliance with the License.
++You may obtain a copy of the License at
++
++    http://www.apache.org/licenses/LICENSE-2.0
++
++Unless required by applicable law or agreed to in writing, software
++distributed under the License is distributed on an "AS IS" BASIS,
++WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++See the License for the specific language governing permissions and
++limitations under the License.
++*/
++
++package internal
++
++import (
++	"fmt"
++	"strings"
++
++	"github.com/onsi/gomega"
++	"github.com/openshift/hypershift/test/e2e/util"
++	"sigs.k8s.io/controller-runtime/pkg/client"
++)
++
++// ValidateConditions validates that all expected conditions match the actual conditions.
++// It cycles through each expected condition and verifies that a matching condition exists
++// in the actual conditions list. Uses Gomega assertions to report failures.
++func ValidateConditions(g gomega.Gomega, object client.Object, expectedConditions []util.Condition) {
++	actualConditions, err := util.Conditions(object)
++	g.Expect(err).NotTo(gomega.HaveOccurred())
++
++	for _, expectedCondition := range expectedConditions {
++		var found bool
++		var actualCondition util.Condition
++
++		// Find the condition with matching Type
++		for _, condition := range actualConditions {
++			if condition.Type == expectedCondition.Type {
++				found = true
++				actualCondition = condition
++				break
++			}
++		}
++		printConditions := func() string {
++			conditions :=
++				[]string{fmt.Sprintf("%T %s/%s conditions at RV %s:", object, object.GetNamespace(), object.GetName(), object.GetResourceVersion())}
++			for _, condition := range actualConditions {
++				conditions = append(conditions, condition.String())
++			}
++			return strings.Join(conditions, "\n\t\t")
++		}
++
++		g.Expect(found).To(gomega.BeTrue(),
++			fmt.Sprintf("condition %s not found\n\t%s", expectedCondition.Type, printConditions()))
++		g.Expect(expectedCondition.Matches(actualCondition)).To(gomega.BeTrue(),
++			fmt.Sprintf("incorrect condition: wanted %s, got %s\n\t%s",
++				expectedCondition.String(), actualCondition.String(), printConditions()))
++	}
++}
+diff --git a/test/e2e/v2/internal/workload_registry.go b/test/e2e/v2/internal/workload_registry.go
+index c899262958e..16d9f980c51 100644
+--- a/test/e2e/v2/internal/workload_registry.go
++++ b/test/e2e/v2/internal/workload_registry.go
+@@ -575,7 +575,10 @@ func waitForControlPlaneWorkloadsByType(testCtx *TestContext, timeout time.Durat
+ 		}
+ 		return true, nil
+ 	}); err != nil {
+-		return fmt.Errorf("failed to wait for control plane workloads to be ready: %w", lastErr)
++		if lastErr != nil {
++			return fmt.Errorf("failed to wait for control plane workloads to be ready: %w (last validation error: %v)", err, lastErr)
++		}
++		return fmt.Errorf("failed to wait for control plane workloads to be ready: %w", err)
+ 	}
+ 	return nil
+ }
+diff --git a/test/e2e/v2/tests/backup_restore_test.go b/test/e2e/v2/tests/backup_restore_test.go
+index 869e25a4910..a9938375d55 100644
+--- a/test/e2e/v2/tests/backup_restore_test.go
++++ b/test/e2e/v2/tests/backup_restore_test.go
+@@ -25,6 +25,8 @@ import (
+ 
+ 	hyperv1 "github.com/openshift/hypershift/api/hypershift/v1beta1"
+ 	"github.com/openshift/hypershift/cmd/oadp"
++	"github.com/openshift/hypershift/support/conditions"
++	"github.com/openshift/hypershift/test/e2e/util"
+ 	"github.com/openshift/hypershift/test/e2e/v2/backuprestore"
+ 	"github.com/openshift/hypershift/test/e2e/v2/internal"
+ 	"k8s.io/apimachinery/pkg/api/meta"
+@@ -36,15 +38,12 @@ import (
+ // and unify naming conventions.
+ const (
+ 	ContextPreBackupControlPlane   = "PreBackupControlPlane"
+-	ContextPreBackupGuest          = "PreBackupGuest"
+ 	ContextSetupContinual          = "SetupContinual"
+ 	ContextBackup                  = "Backup"
+ 	ContextVerifyContinual         = "VerifyContinual"
+ 	ContextPostBackupControlPlane  = "PostBackupControlPlane"
+-	ContextPostBackupGuest         = "PostBackupGuest"
+ 	ContextRestore                 = "Restore"
+ 	ContextPostRestoreControlPlane = "PostRestoreControlPlane"
+-	ContextPostRestoreGuest        = "PostRestoreGuest"
+ 	ContextBreakControlPlane       = "BreakControlPlane"
+ )
+ 
+@@ -59,6 +58,7 @@ var _ = Describe("BackupRestore", Label("backup-restore", "aws"), Ordered, Seria
+ 		excludeWorkloads []string = []string{
+ 			"router", "karpenter", "karpenter-operator", "aws-node-termination-handler",
+ 		}
++		expectedConditions []util.Condition
+ 	)
+ 
+ 	AfterAll(func() {
+@@ -73,6 +73,7 @@ var _ = Describe("BackupRestore", Label("backup-restore", "aws"), Ordered, Seria
+ 
+ 	BeforeEach(func() {
+ 		testCtx = internal.GetTestContext()
++		Expect(testCtx).NotTo(BeNil())
+ 		if err := testCtx.ValidateControlPlaneNamespace(); err != nil {
+ 			AbortSuite(err.Error())
+ 		}
+@@ -95,12 +96,16 @@ var _ = Describe("BackupRestore", Label("backup-restore", "aws"), Ordered, Seria
+ 			Expect(err).NotTo(HaveOccurred())
+ 			err = internal.ValidateControlPlaneStatefulSetsReadiness(testCtx, excludeWorkloads)
+ 			Expect(err).NotTo(HaveOccurred())
+-		})
+-	})
+-
+-	Context(ContextPreBackupGuest, func() {
+-		It("should have guest cluster ready before backup", func() {
+-			Skip("Skipping due to OCPBUGS-59876")
++			nodePool, err := getNodePool(testCtx)
++			Expect(err).NotTo(HaveOccurred())
++			Expect(nodePool).NotTo(BeNil())
++			for conditionType, conditionStatus := range conditions.ExpectedNodePoolConditions(nodePool) {
++				expectedConditions = append(expectedConditions, util.Condition{
++					Type:   conditionType,
++					Status: metav1.ConditionStatus(conditionStatus),
++				})
++			}
++			internal.ValidateConditions(NewWithT(GinkgoT()), nodePool, expectedConditions)
+ 		})
+ 	})
+ 
+@@ -197,12 +202,6 @@ var _ = Describe("BackupRestore", Label("backup-restore", "aws"), Ordered, Seria
+ 		})
+ 	})
+ 
+-	Context(ContextPostBackupGuest, func() {
+-		It("should have guest cluster healthy after backup", func() {
+-			Skip("Skipping due to OCPBUGS-59876")
+-		})
+-	})
+-
+ 	Context(ContextBreakControlPlane, func() {
+ 		It("should break hosted cluster", func() {
+ 			err := backuprestore.BreakHostedClusterPreservingMachines(testCtx, GinkgoLogr.WithName("cleanup"))
+@@ -225,6 +224,17 @@ var _ = Describe("BackupRestore", Label("backup-restore", "aws"), Ordered, Seria
+ 			By("Waiting for restore to complete")
+ 			err = backuprestore.WaitForRestoreCompletion(testCtx, restoreName)
+ 			Expect(err).NotTo(HaveOccurred())
++
++			By("Fixing OIDC identity provider after restore")
++			awsCredsFile := internal.GetEnvVarValue("AWS_GUEST_INFRA_CREDENTIALS_FILE")
++			fixOpts := &backuprestore.FixDrOidcIamOptions{
++				HCName:       testCtx.ClusterName,
++				HCNamespace:  testCtx.ClusterNamespace,
++				AWSCredsFile: awsCredsFile,
++				Timeout:      backuprestore.OIDCTimeout,
++			}
++			err = backuprestore.RunFixDrOidcIam(testCtx.Context, GinkgoLogr.WithName("backup-restore"), testCtx.ArtifactDir, fixOpts)
++			Expect(err).NotTo(HaveOccurred())
+ 		})
+ 	})
+ 
+@@ -236,12 +246,31 @@ var _ = Describe("BackupRestore", Label("backup-restore", "aws"), Ordered, Seria
+ 			By("Waiting for control plane deployments to be ready")
+ 			err = internal.WaitForControlPlaneDeploymentsReadiness(testCtx, backuprestore.RestoreTimeout, excludeWorkloads)
+ 			Expect(err).NotTo(HaveOccurred())
+-		})
+-	})
+-
+-	Context(ContextPostRestoreGuest, func() {
+-		It("should have guest cluster healthy after restore", func() {
+-			Skip("Skipping due to OCPBUGS-59876")
++			By("Validating NodePool conditions")
++			Eventually(func(g Gomega) {
++				nodePool, err := getNodePool(testCtx)
++				g.Expect(err).NotTo(HaveOccurred())
++				g.Expect(nodePool).NotTo(BeNil())
++				internal.ValidateConditions(g, nodePool, expectedConditions)
++			}).WithPolling(backuprestore.PollInterval).WithTimeout(backuprestore.OIDCTimeout).Should(Succeed())
+ 		})
+ 	})
+ })
++
++func getNodePool(testCtx *internal.TestContext) (*hyperv1.NodePool, error) {
++	nodePoolList := &hyperv1.NodePoolList{}
++	err := testCtx.MgmtClient.List(testCtx.Context, nodePoolList, crclient.InNamespace(testCtx.ClusterNamespace))
++
++	if err != nil {
++		return nil, err
++	}
++	if len(nodePoolList.Items) == 0 {
++		return nil, fmt.Errorf("no NodePools found in namespace %s", testCtx.ClusterNamespace)
++	}
++	for i := range nodePoolList.Items {
++		if nodePoolList.Items[i].Spec.ClusterName == testCtx.ClusterName {
++			return &nodePoolList.Items[i], nil
++		}
++	}
++	return nil, fmt.Errorf("no NodePool found for cluster %s", testCtx.ClusterName)
++}

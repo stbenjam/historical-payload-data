@@ -1,0 +1,58 @@
+diff --git a/cmd/install/assets/hypershift_operator.go b/cmd/install/assets/hypershift_operator.go
+index a12384186df..711617609b8 100644
+--- a/cmd/install/assets/hypershift_operator.go
++++ b/cmd/install/assets/hypershift_operator.go
+@@ -1482,6 +1482,11 @@ func (o HyperShiftOperatorClusterRole) Build() *rbacv1.ClusterRole {
+ 				Verbs:         []string{"delete"},
+ 				ResourceNames: []string{hyperv1.GroupVersion.Group},
+ 			},
++			{
++				APIGroups: []string{"admissionregistration.k8s.io"},
++				Resources: []string{"mutatingwebhookconfigurations", "validatingwebhookconfigurations"},
++				Verbs:     []string{"get", "list", "watch", "update"},
++			},
+ 			{
+ 				APIGroups: []string{"certificates.k8s.io"},
+ 				Resources: []string{"certificatesigningrequests"},
+diff --git a/cmd/install/assets/hypershift_operator_test.go b/cmd/install/assets/hypershift_operator_test.go
+index bf9d7bbf806..5ca4665d1a9 100644
+--- a/cmd/install/assets/hypershift_operator_test.go
++++ b/cmd/install/assets/hypershift_operator_test.go
+@@ -9,6 +9,7 @@ import (
+ 	hyperv1 "github.com/openshift/hypershift/api/hypershift/v1beta1"
+ 
+ 	corev1 "k8s.io/api/core/v1"
++	rbacv1 "k8s.io/api/rbac/v1"
+ 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+ )
+ 
+@@ -772,3 +773,29 @@ func TestHyperShiftOperatorDeployment_Build_WorkloadIdentityLabel(t *testing.T)
+ 		})
+ 	}
+ }
++
++func TestHyperShiftOperatorClusterRole_WebhookRBAC(t *testing.T) {
++	t.Parallel()
++	clusterRole := HyperShiftOperatorClusterRole{}.Build()
++
++	t.Run("When building the ClusterRole it should include cluster-scoped RBAC for webhook configurations", func(t *testing.T) {
++		t.Parallel()
++		g := NewGomegaWithT(t)
++		g.Expect(clusterRole.Rules).To(ContainElement(Equal(rbacv1.PolicyRule{
++			APIGroups: []string{"admissionregistration.k8s.io"},
++			Resources: []string{"mutatingwebhookconfigurations", "validatingwebhookconfigurations"},
++			Verbs:     []string{"get", "list", "watch", "update"},
++		})))
++	})
++
++	t.Run("When building the ClusterRole it should include scoped delete for validatingwebhookconfigurations", func(t *testing.T) {
++		t.Parallel()
++		g := NewGomegaWithT(t)
++		g.Expect(clusterRole.Rules).To(ContainElement(Equal(rbacv1.PolicyRule{
++			APIGroups:     []string{"admissionregistration.k8s.io"},
++			Resources:     []string{"validatingwebhookconfigurations"},
++			Verbs:         []string{"delete"},
++			ResourceNames: []string{hyperv1.GroupVersion.Group},
++		})))
++	})
++}

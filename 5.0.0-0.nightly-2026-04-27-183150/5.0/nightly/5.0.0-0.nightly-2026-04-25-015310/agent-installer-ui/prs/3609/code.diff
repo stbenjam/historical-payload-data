@@ -1,0 +1,632 @@
+diff --git a/libs/ui-lib/lib/cim/components/Hypershift/modals/NodePoolForm.tsx b/libs/ui-lib/lib/cim/components/Hypershift/modals/NodePoolForm.tsx
+index 112433652a..b9e64ae603 100644
+--- a/libs/ui-lib/lib/cim/components/Hypershift/modals/NodePoolForm.tsx
++++ b/libs/ui-lib/lib/cim/components/Hypershift/modals/NodePoolForm.tsx
+@@ -13,7 +13,7 @@ import { useFormikContext } from 'formik';
+ import { InputField } from '../../../../common';
+ import { useTranslation } from '../../../../common/hooks/use-translation-wrapper';
+ import { AgentK8sResource } from '../../../types';
+-import { getAgentsForSelection, getVersionFromReleaseImage } from '../../helpers';
++import { getAgentsForSelection, getVersionFromReleaseString } from '../../helpers';
+ import NodePoolAgentsForm from '../forms/NodePoolAgentsForm';
+ import {
+   AgentMachineK8sResource,
+@@ -44,7 +44,7 @@ const NodePoolForm = ({ agents, nodePool, hostedCluster, agentMachines }: NodePo
+       !agent.spec.clusterDeploymentName,
+   );
+ 
+-  const ocpVersion = getVersionFromReleaseImage(hostedCluster.spec.release.image);
++  const ocpVersion = getVersionFromReleaseString(hostedCluster.spec.release.image);
+ 
+   if (isEdit) {
+     const nodePoolAgents = getNodepoolAgents(nodePool, agents, agentMachines, hostedCluster);
+diff --git a/libs/ui-lib/lib/cim/components/featureSupportLevels/ACMFeatureSupportLevelProvider.tsx b/libs/ui-lib/lib/cim/components/featureSupportLevels/ACMFeatureSupportLevelProvider.tsx
+index 22c9c8ace5..d03a4402de 100644
+--- a/libs/ui-lib/lib/cim/components/featureSupportLevels/ACMFeatureSupportLevelProvider.tsx
++++ b/libs/ui-lib/lib/cim/components/featureSupportLevels/ACMFeatureSupportLevelProvider.tsx
+@@ -9,7 +9,7 @@ import {
+ import { ClusterImageSetK8sResource } from '../../types';
+ import { featureSupportLevelsACM } from '../../config/constants';
+ import { getFeatureDisabledReason, isFeatureSupported } from './featureStateUtils';
+-import { getOCPVersions, getVersionFromReleaseImage } from '../helpers';
++import { getOCPVersions, getVersionFromClusterImageSet } from '../helpers';
+ import { useTranslation } from '../../../common/hooks/use-translation-wrapper';
+ import { SupportLevel } from '@openshift-assisted/types/assisted-installer-service';
+ import { getMajorMinorVersion } from '../../../common/utils';
+@@ -53,10 +53,7 @@ export const ACMFeatureSupportLevelProvider: React.FC<ACMFeatureSupportLevelProv
+       const clusterImage = clusterImages.find(
+         (clusterImageSet) => clusterImageSet.metadata?.name === versionName,
+       );
+-      const version =
+-        getVersionFromReleaseImage(clusterImage?.spec?.releaseImage) ||
+-        clusterImage?.metadata?.name ||
+-        '';
++      const version = getVersionFromClusterImageSet(clusterImage);
+       return getMajorMinorVersion(version);
+     },
+     [clusterImages],
+diff --git a/libs/ui-lib/lib/cim/components/helpers/versions.test.ts b/libs/ui-lib/lib/cim/components/helpers/versions.test.ts
+new file mode 100644
+index 0000000000..1d286833b0
+--- /dev/null
++++ b/libs/ui-lib/lib/cim/components/helpers/versions.test.ts
+@@ -0,0 +1,465 @@
++import { describe, expect, test } from 'vitest';
++import { CpuArchitecture } from '../../../common/types/cpuArchitecture';
++import { ClusterImageSetK8sResource } from '../../types/k8s/cluster-image-set';
++import { AgentClusterInstallK8sResource } from '../../types/k8s/agent-cluster-install';
++import { ClusterVersionK8sResource } from '../../types/k8s/cluster-version';
++import { OsImage } from '../../types/k8s/agent-service-config';
++import {
++  getCurrentClusterVersion,
++  getNetworkType,
++  getOCPVersions,
++  getSelectedVersion,
++  getVersionFromClusterImageSet,
++} from './versions';
++import { OpenshiftVersionOptionType } from '../../../common/types/versions';
++
++const ClusterImageSetApiVersion = 'hive.openshift.io/v1';
++const ClusterImageSetKind = 'ClusterImageSet';
++
++function makeClusterImageSet(
++  overrides: Partial<ClusterImageSetK8sResource> & {
++    metadata: NonNullable<ClusterImageSetK8sResource['metadata']>;
++  },
++): ClusterImageSetK8sResource {
++  return {
++    apiVersion: ClusterImageSetApiVersion,
++    kind: ClusterImageSetKind,
++    ...overrides,
++  };
++}
++
++function makeOsImage(overrides: Partial<OsImage> & Pick<OsImage, 'openshiftVersion'>): OsImage {
++  const { openshiftVersion, ...rest } = overrides;
++  return {
++    cpuArchitecture: 'x86_64',
++    openshiftVersion,
++    url: 'https://example.com',
++    version: '1',
++    ...rest,
++  };
++}
++
++describe('getVersionFromClusterImageSet', () => {
++  test('uses releaseTag when releaseImage is digest-only', () => {
++    const cis = makeClusterImageSet({
++      metadata: {
++        name: 'img4.21.3-multi-appsub',
++        labels: { visible: 'true', releaseTag: '4.21.3-multi' },
++      },
++      spec: {
++        releaseImage: 'quay.io/openshift-release-dev/ocp-release@sha256:abc123',
++      },
++    });
++    expect(getVersionFromClusterImageSet(cis)).toBe('4.21.3-multi');
++  });
++
++  test('falls back to releaseImage when releaseTag is absent', () => {
++    const cis = makeClusterImageSet({
++      metadata: { name: 'img4.15.36-multi-appsub', labels: { visible: 'true' } },
++      spec: {
++        releaseImage: 'quay.io/openshift-release-dev/ocp-release:4.15.36-multi',
++      },
++    });
++    expect(getVersionFromClusterImageSet(cis)).toBe('4.15.36-multi');
++  });
++
++  test('falls back to metadata.name when tag and image do not parse', () => {
++    const cis = makeClusterImageSet({
++      metadata: {
++        name: 'img4.18.10-multi-appsub',
++        labels: { visible: 'true' },
++      },
++      spec: {
++        releaseImage: 'quay.io/openshift-release-dev/ocp-release@sha256:abc123',
++      },
++    });
++    expect(getVersionFromClusterImageSet(cis)).toBe('img4.18.10-multi-appsub');
++  });
++});
++
++describe('getOCPVersions', () => {
++  test('excludes image sets without visible true when extended is false', () => {
++    const hidden = makeClusterImageSet({
++      metadata: {
++        name: '4.16.1',
++        labels: { visible: 'false', releaseTag: '4.16.1' },
++      },
++      spec: { releaseImage: 'quay.io/ocp/release:4.16.1-x86_64' },
++    });
++    expect(getOCPVersions([hidden])).toEqual([]);
++  });
++
++  test('includes image sets without visible true when extended is true', () => {
++    const hidden = makeClusterImageSet({
++      metadata: {
++        name: '4.16.2',
++        labels: { releaseTag: '4.16.2' },
++      },
++      spec: { releaseImage: 'quay.io/ocp/release:4.16.2-x86_64' },
++    });
++    const result = getOCPVersions([hidden], undefined, undefined, true);
++    expect(result).toHaveLength(1);
++    expect(result[0]?.version).toBe('4.16.2');
++    expect(result[0]?.default).toBe(true);
++  });
++
++  test('sorts by label descending', () => {
++    const a = makeClusterImageSet({
++      metadata: {
++        name: 'img-a',
++        labels: { visible: 'true', releaseTag: '4.15.0' },
++      },
++      spec: { releaseImage: 'quay.io/ocp/release:4.15.0-x86_64' },
++    });
++    const b = makeClusterImageSet({
++      metadata: {
++        name: 'img-b',
++        labels: { visible: 'true', releaseTag: '4.21.0' },
++      },
++      spec: { releaseImage: 'quay.io/ocp/release:4.21.0-x86_64' },
++    });
++    const result = getOCPVersions([a, b]);
++    expect(result.map((v) => v.version)).toEqual(['4.21.0', '4.15.0']);
++  });
++
++  test('marks only the first sorted option as default', () => {
++    const first = makeClusterImageSet({
++      metadata: {
++        name: 'first',
++        labels: { visible: 'true', releaseTag: '4.14.0' },
++      },
++      spec: { releaseImage: 'quay.io/ocp/release:4.14.0-x86_64' },
++    });
++    const second = makeClusterImageSet({
++      metadata: {
++        name: 'second',
++        labels: { visible: 'true', releaseTag: '4.16.0' },
++      },
++      spec: { releaseImage: 'quay.io/ocp/release:4.16.0-x86_64' },
++    });
++    const result = getOCPVersions([first, second]);
++    expect(result[0]?.default).toBe(true);
++    expect(result[1]?.default).toBe(false);
++  });
++
++  test('dedupes by version string keeping first in sorted order', () => {
++    const dupA = makeClusterImageSet({
++      metadata: {
++        name: 'dup-a',
++        labels: { visible: 'true', releaseTag: '4.17.0' },
++      },
++      spec: { releaseImage: 'quay.io/ocp/release:4.17.0-x86_64' },
++    });
++    const dupB = makeClusterImageSet({
++      metadata: {
++        name: 'dup-b',
++        labels: { visible: 'true', releaseTag: '4.17.0' },
++      },
++      spec: { releaseImage: 'quay.io/ocp/release:4.17.0-x86_64' },
++    });
++    const other = makeClusterImageSet({
++      metadata: {
++        name: 'other',
++        labels: { visible: 'true', releaseTag: '4.16.0' },
++      },
++      spec: { releaseImage: 'quay.io/ocp/release:4.16.0-x86_64' },
++    });
++    const result = getOCPVersions([dupA, dupB, other]);
++    expect(result.map((v) => v.value)).toEqual(['dup-a', 'other']);
++    expect(result.map((v) => v.version)).toEqual(['4.17.0', '4.16.0']);
++  });
++
++  test('when isNutanix, keeps only x86_64 or x86-64 release images or matching architecture label', () => {
++    const x86 = makeClusterImageSet({
++      metadata: {
++        name: 'nut-x86',
++        labels: { visible: 'true', releaseTag: '4.16.0' },
++      },
++      spec: { releaseImage: 'quay.io/ocp/release:4.16.0-x86_64' },
++    });
++    const multi = makeClusterImageSet({
++      metadata: {
++        name: 'nut-multi',
++        labels: { visible: 'true', releaseTag: '4.16.1-mutli', architecture: 'multi' },
++      },
++      spec: { releaseImage: 'quay.io/ocp/release:4.16.1-multi' },
++    });
++    const result = getOCPVersions([x86, multi], true);
++    expect(result.map((v) => v.value)).toEqual(['nut-x86']);
++  });
++
++  test('when isNutanix, allows architecture label x86_64 even if release image suffix differs', () => {
++    const cis = makeClusterImageSet({
++      metadata: {
++        name: 'nut-label',
++        labels: { visible: 'true', releaseTag: '4.16.2-multi', architecture: 'x86_64' },
++      },
++      spec: { releaseImage: 'quay.io/ocp/release:4.16.2-multi' },
++    });
++    const result = getOCPVersions([cis], true);
++    expect(result).toHaveLength(1);
++    expect(result[0]?.value).toBe('nut-label');
++  });
++
++  test('filters by osImages openshiftVersion major.minor', () => {
++    const inRange = makeClusterImageSet({
++      metadata: {
++        name: 'in',
++        labels: { visible: 'true', releaseTag: '4.18.55' },
++      },
++      spec: { releaseImage: 'quay.io/ocp/release:4.18.55-x86_64' },
++    });
++    const outRange = makeClusterImageSet({
++      metadata: {
++        name: 'out',
++        labels: { visible: 'true', releaseTag: '4.19.0' },
++      },
++      spec: { releaseImage: 'quay.io/ocp/release:4.19.0-x86_64' },
++    });
++    const osImages = [makeOsImage({ openshiftVersion: '4.18' })];
++    const result = getOCPVersions([inRange, outRange], false, osImages);
++    expect(result.map((v) => v.value)).toEqual(['in']);
++  });
++
++  test('cpuArchitectures from labels.architecture x86_64', () => {
++    const cis = makeClusterImageSet({
++      metadata: {
++        name: 'arch-x86',
++        labels: { visible: 'true', releaseTag: '4.17.0-multi', architecture: 'x86_64' },
++      },
++      spec: { releaseImage: 'quay.io/ocp/release:4.17.0-multi' },
++    });
++    const result = getOCPVersions([cis]);
++    expect(result[0]?.cpuArchitectures).toEqual([CpuArchitecture.x86]);
++  });
++
++  test('cpuArchitectures from labels.architecture arm64', () => {
++    const cis = makeClusterImageSet({
++      metadata: {
++        name: 'arch-arm',
++        labels: { visible: 'true', releaseTag: '4.17.0-multi', architecture: 'arm64' },
++      },
++      spec: { releaseImage: 'quay.io/ocp/release:4.17.0-multi' },
++    });
++    const result = getOCPVersions([cis]);
++    expect(result[0]?.cpuArchitectures).toEqual([CpuArchitecture.ARM]);
++  });
++
++  test('cpuArchitectures from labels.architecture multi', () => {
++    const cis = makeClusterImageSet({
++      metadata: {
++        name: 'arch-multi',
++        labels: { visible: 'true', releaseTag: '4.17.0-multi', architecture: 'multi' },
++      },
++      spec: { releaseImage: 'quay.io/ocp/release:4.17.0-multi' },
++    });
++    const result = getOCPVersions([cis]);
++    expect(result[0]?.cpuArchitectures).toEqual([CpuArchitecture.MULTI]);
++  });
++
++  test('cpuArchitectures from labels.architecture s390x', () => {
++    const cis = makeClusterImageSet({
++      metadata: {
++        name: 'arch-s390x',
++        labels: { visible: 'true', releaseTag: '4.17.0-multi', architecture: 's390x' },
++      },
++      spec: { releaseImage: 'quay.io/ocp/release:4.17.0-multi' },
++    });
++    const result = getOCPVersions([cis]);
++    expect(result[0]?.cpuArchitectures).toEqual([CpuArchitecture.s390x]);
++  });
++
++  test('cpuArchitectures normalizes x86-64 from release string when tag and image agree', () => {
++    const cis = makeClusterImageSet({
++      metadata: {
++        name: 'img4.17.1-x86-64-appsub',
++        labels: {
++          visible: 'true',
++          releaseTag: '4.17.1-x86-64',
++        },
++      },
++      spec: { releaseImage: 'quay.io/ocp/release:4.17.1-x86-64' },
++    });
++    const result = getOCPVersions([cis]);
++    expect(result[0]?.cpuArchitectures).toEqual([CpuArchitecture.x86]);
++  });
++
++  test('labels.architecture takes precedence over releaseTag arch segment', () => {
++    const cis = makeClusterImageSet({
++      metadata: {
++        name: 'prec',
++        labels: {
++          visible: 'true',
++          releaseTag: '4.19.0-multi',
++          architecture: 'x86_64',
++        },
++      },
++      spec: { releaseImage: 'quay.io/ocp/release:4.19.0-multi' },
++    });
++    const result = getOCPVersions([cis]);
++    expect(result[0]?.cpuArchitectures).toEqual([CpuArchitecture.x86]);
++  });
++
++  test('cpuArchitectures undefined when no arch in labels or release strings', () => {
++    const cis = makeClusterImageSet({
++      metadata: {
++        name: 'ocp-release4.17.0',
++        labels: { visible: 'true', releaseTag: '4.17.0' },
++      },
++      spec: { releaseImage: 'quay.io/ocp/release:4.17.0' },
++    });
++    const result = getOCPVersions([cis]);
++    expect(result[0]?.cpuArchitectures).toBeUndefined();
++  });
++});
++
++describe('getSelectedVersion', () => {
++  test('returns parsed version when cluster image matches imageSetRef', () => {
++    const cis = makeClusterImageSet({
++      metadata: {
++        name: 'my-imageset',
++        labels: { visible: 'true', releaseTag: '4.18.10' },
++      },
++      spec: { releaseImage: 'quay.io/ocp/release:4.18.10-x86_64' },
++    });
++    const aci = {
++      apiVersion: 'extensions.hive.openshift.io/v1beta1',
++      kind: 'AgentClusterInstall',
++      metadata: { name: 'aci', namespace: 'ns' },
++      spec: { imageSetRef: { name: 'my-imageset' } },
++    } as AgentClusterInstallK8sResource;
++    expect(getSelectedVersion([cis], aci)).toBe('4.18.10');
++  });
++
++  test('returns imageSetRef name when no cluster image matches', () => {
++    const aci = {
++      apiVersion: 'extensions.hive.openshift.io/v1beta1',
++      kind: 'AgentClusterInstall',
++      metadata: { name: 'aci', namespace: 'ns' },
++      spec: { imageSetRef: { name: 'missing' } },
++    } as AgentClusterInstallK8sResource;
++    expect(getSelectedVersion([], aci)).toBe('missing');
++  });
++
++  test('returns undefined when imageSetRef is missing', () => {
++    const aci = {
++      apiVersion: 'extensions.hive.openshift.io/v1beta1',
++      kind: 'AgentClusterInstall',
++      metadata: { name: 'aci', namespace: 'ns' },
++      spec: {},
++    } as AgentClusterInstallK8sResource;
++    expect(getSelectedVersion([], aci)).toBeUndefined();
++  });
++});
++
++describe('getCurrentClusterVersion', () => {
++  test('prefers status.history[0].version', () => {
++    const cv = {
++      apiVersion: 'config.openshift.io/v1',
++      kind: 'ClusterVersion',
++      metadata: { name: 'version' },
++      spec: {
++        channel: 'fast-4.18',
++        clusterID: 'id',
++        desiredUpdate: { version: '4.18.99', image: 'img' },
++      },
++      status: {
++        desired: { version: '4.18.0', image: 'img' },
++        history: [
++          {
++            version: '4.18.5',
++            state: 'Completed' as const,
++            startedTime: '',
++            completionTime: '',
++            image: '',
++            verified: true,
++          },
++        ],
++        observedGeneration: 1,
++        versionHash: 'h',
++        availableUpdates: [],
++      },
++    } as ClusterVersionK8sResource;
++    expect(getCurrentClusterVersion(cv)).toBe('4.18.5');
++  });
++
++  test('falls back to spec.desiredUpdate.version when history is empty', () => {
++    const cv = {
++      apiVersion: 'config.openshift.io/v1',
++      kind: 'ClusterVersion',
++      metadata: { name: 'version' },
++      spec: {
++        channel: 'fast-4.18',
++        clusterID: 'id',
++        desiredUpdate: { version: '4.18.99', image: 'img' },
++      },
++      status: {
++        desired: { version: '4.18.0', image: 'img' },
++        history: [],
++        observedGeneration: 1,
++        versionHash: 'h',
++        availableUpdates: [],
++      },
++    } as ClusterVersionK8sResource;
++    expect(getCurrentClusterVersion(cv)).toBe('4.18.99');
++  });
++
++  test('returns undefined when no version is available', () => {
++    const cv = {
++      apiVersion: 'config.openshift.io/v1',
++      kind: 'ClusterVersion',
++      metadata: { name: 'version' },
++      spec: {
++        channel: 'fast-4.18',
++        clusterID: 'id',
++      },
++      status: {
++        desired: { version: '4.18.0', image: 'img' },
++        history: [],
++        observedGeneration: 1,
++        versionHash: 'h',
++        availableUpdates: [],
++      },
++    } as ClusterVersionK8sResource;
++    expect(getCurrentClusterVersion(cv)).toBeUndefined();
++  });
++});
++
++describe('getNetworkType', () => {
++  test('returns OpenShiftSDN when version is below 4.12', () => {
++    const v: OpenshiftVersionOptionType = {
++      label: 'OpenShift 4.11.5',
++      version: '4.11.5',
++      value: 'x',
++      default: false,
++      supportLevel: 'production',
++    };
++    expect(getNetworkType(v)).toBe('OpenShiftSDN');
++  });
++
++  test('returns OVNKubernetes when version is 4.12 or higher', () => {
++    const v: OpenshiftVersionOptionType = {
++      label: 'OpenShift 4.12.0',
++      version: '4.12.0',
++      value: 'x',
++      default: false,
++      supportLevel: 'production',
++    };
++    expect(getNetworkType(v)).toBe('OVNKubernetes');
++  });
++
++  test('returns OVNKubernetes when ocpVersion is undefined', () => {
++    expect(getNetworkType(undefined)).toBe('OVNKubernetes');
++  });
++
++  test('returns OVNKubernetes when version string is empty', () => {
++    const v: OpenshiftVersionOptionType = {
++      label: 'OpenShift ',
++      version: '',
++      value: 'x',
++      default: false,
++      supportLevel: 'production',
++    };
++    expect(getNetworkType(v)).toBe('OVNKubernetes');
++  });
++});
+diff --git a/libs/ui-lib/lib/cim/components/helpers/versions.ts b/libs/ui-lib/lib/cim/components/helpers/versions.ts
+index 6ad102fb5e..cbdd206c91 100644
+--- a/libs/ui-lib/lib/cim/components/helpers/versions.ts
++++ b/libs/ui-lib/lib/cim/components/helpers/versions.ts
+@@ -7,44 +7,52 @@ import {
+   OsImage,
+ } from '../../types';
+ import { CpuArchitecture, OpenshiftVersionOptionType } from '../../../common';
+-import { OpenshiftVersion } from '@openshift-assisted/types/assisted-installer-service';
+ import { getComparableVersionInt } from '../../../common/utils';
+ 
+-export const getVersionFromReleaseImage = (releaseImage = '') => {
+-  const match = /.+:(\d+\.\d+(?:\.\d+)?(?:-\w+)?)/gm.exec(releaseImage);
++export const getVersionFromReleaseString = (value = '') => {
++  const match = /(\d+\.\d+(?:\.\d+)?(?:-\w+)?)/gm.exec(value);
+   if (match && match.length > 1 && match[1]) {
+     return match[1];
+   }
+ };
+ 
+-const getCPUArchFromReleaseImage = (releaseImage = '') => {
+-  const match = /.+:.*-(.*)/gm.exec(releaseImage);
++export const getVersionFromClusterImageSet = (clusterImageSet?: ClusterImageSetK8sResource) => {
++  return (
++    getVersionFromReleaseString(clusterImageSet?.metadata?.labels?.['releaseTag']) ||
++    getVersionFromReleaseString(clusterImageSet?.spec?.releaseImage) ||
++    clusterImageSet?.metadata?.name ||
++    ''
++  );
++};
++
++const getCPUArchFromReleaseString = (value = '') => {
++  const match = /(?:\d+\.)+\d+-(x86-64|[\w_]+)/gm.exec(value);
+   if (match && match.length > 1 && match[1]) {
+     return match[1];
+   }
+ };
+ 
+-// eslint-disable-next-line
+-const getSupportLevelFromChannel = (
+-  channel?: string,
+-): OpenshiftVersion['supportLevel'] | 'custom' => {
+-  if (!channel) {
+-    return 'maintenance';
+-  }
+-
+-  if (channel.startsWith('fast')) {
+-    return 'beta'; // TODO(mlibra): Is this correct?
+-  }
++const getCPUArchFromClusterImageSet = (clusterImageSet?: ClusterImageSetK8sResource) => {
++  const cpuArch =
++    clusterImageSet?.metadata?.labels?.architecture ||
++    getCPUArchFromReleaseString(clusterImageSet?.metadata?.labels?.['releaseTag']) ||
++    getCPUArchFromReleaseString(clusterImageSet?.spec?.releaseImage) ||
++    getCPUArchFromReleaseString(clusterImageSet?.metadata?.name) ||
++    '';
+ 
+-  if (channel.startsWith('stable')) {
+-    return 'production';
++  switch (cpuArch) {
++    case CpuArchitecture.x86:
++    case CpuArchitecture.ARM:
++    case CpuArchitecture.s390x:
++    case CpuArchitecture.MULTI:
++      return cpuArch as CpuArchitecture;
++    case 'x86-64':
++      return CpuArchitecture.x86;
++    default:
++      return undefined;
+   }
+-
+-  return 'beta';
+ };
+ 
+-export const supportedNutanixPlatforms = ['x86_64', 'x86-64'];
+-
+ export const isValidImageSet = (
+   cis: ClusterImageSetK8sResource,
+   architectures?: string[],
+@@ -71,20 +79,16 @@ const extractMajorMinor = (version: string): string => {
+ const toVersionOption = (
+   clusterImageSet: ClusterImageSetK8sResource,
+ ): OpenshiftVersionOptionType => {
+-  const version =
+-    getVersionFromReleaseImage(clusterImageSet.spec?.releaseImage) ||
+-    clusterImageSet.metadata?.name ||
+-    '';
+-  const cpuArch = getCPUArchFromReleaseImage(clusterImageSet.spec?.releaseImage);
++  const version = getVersionFromClusterImageSet(clusterImageSet);
++  const cpuArch = getCPUArchFromClusterImageSet(clusterImageSet);
++
+   return {
+     label: `OpenShift ${version}`,
+     version,
+     value: clusterImageSet.metadata?.name as string,
+     default: false,
+-    // (rawagner) ACM does not have the warning so changing to 'production'
+-    // supportLevel : getSupportLevelFromChannel(clusterImageSet.metadata?.labels?.channel)
+-    supportLevel: 'production',
+-    cpuArchitectures: cpuArch ? [cpuArch as CpuArchitecture] : undefined,
++    supportLevel: 'production', // ACM doesn't have feature support levels
++    cpuArchitectures: cpuArch ? [cpuArch] : undefined,
+   };
+ };
+ 
+@@ -101,6 +105,8 @@ const hasMatchingOsImage = (
+   return osImageVersions.includes(extractMajorMinor(version.version));
+ };
+ 
++const supportedNutanixPlatforms = ['x86_64', 'x86-64'];
++
+ export const getOCPVersions = (
+   clusterImageSets: ClusterImageSetK8sResource[],
+   isNutanix?: boolean,

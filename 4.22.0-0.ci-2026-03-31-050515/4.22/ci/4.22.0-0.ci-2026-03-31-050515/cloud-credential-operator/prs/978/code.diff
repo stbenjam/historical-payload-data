@@ -1,0 +1,997 @@
+diff --git a/pkg/cmd/operator/cmd.go b/pkg/cmd/operator/cmd.go
+index 138fa1c03d..add91000ef 100644
+--- a/pkg/cmd/operator/cmd.go
++++ b/pkg/cmd/operator/cmd.go
+@@ -35,6 +35,7 @@ import (
+ 	"github.com/spf13/cobra"
+ 	"github.com/spf13/pflag"
+ 
++	appsv1 "k8s.io/api/apps/v1"
+ 	corev1 "k8s.io/api/core/v1"
+ 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+ 	"k8s.io/apimachinery/pkg/fields"
+@@ -229,6 +230,11 @@ func NewOperator() *cobra.Command {
+ 							"metadata.name":      constants.CloudCredOperatorConfigMap,
+ 						}),
+ 					},
++					&appsv1.Deployment{}: {
++						Field: fields.SelectorFromSet(fields.Set{
++							"metadata.namespace": minterv1.CloudCredOperatorNamespace,
++						}),
++					},
+ 				}
+ 				if filteredWatchPossible {
+ 					log.Infof("adding label selector %s=%s to cache options for Secrets", minterv1.LabelCredentialsRequest, minterv1.LabelCredentialsRequestValue)
+diff --git a/pkg/operator/cleanup/status.go b/pkg/operator/cleanup/status.go
+index 82cea22924..c571a915fd 100644
+--- a/pkg/operator/cleanup/status.go
++++ b/pkg/operator/cleanup/status.go
+@@ -1,6 +1,8 @@
+ package cleanup
+ 
+ import (
++	"context"
++
+ 	log "github.com/sirupsen/logrus"
+ 
+ 	configv1 "github.com/openshift/api/config/v1"
+@@ -9,7 +11,7 @@ import (
+ 
+ var _ status.Handler = &ReconcileStaleCredentialsRequest{}
+ 
+-func (r *ReconcileStaleCredentialsRequest) GetConditions(logger log.FieldLogger) ([]configv1.ClusterOperatorStatusCondition, error) {
++func (r *ReconcileStaleCredentialsRequest) GetConditions(ctx context.Context, logger log.FieldLogger) ([]configv1.ClusterOperatorStatusCondition, error) {
+ 	return []configv1.ClusterOperatorStatusCondition{}, nil
+ }
+ 
+diff --git a/pkg/operator/credentialsrequest/credentialsrequest_controller.go b/pkg/operator/credentialsrequest/credentialsrequest_controller.go
+index 1dc5c34aa4..8be2808ec7 100644
+--- a/pkg/operator/credentialsrequest/credentialsrequest_controller.go
++++ b/pkg/operator/credentialsrequest/credentialsrequest_controller.go
+@@ -493,9 +493,9 @@ type ReconcileSecretMissingLabel struct {
+ 	mutatingClient corev1client.SecretsGetter
+ }
+ 
+-func (r *ReconcileSecretMissingLabel) GetConditions(logger log.FieldLogger) ([]configv1.ClusterOperatorStatusCondition, error) {
++func (r *ReconcileSecretMissingLabel) GetConditions(ctx context.Context, logger log.FieldLogger) ([]configv1.ClusterOperatorStatusCondition, error) {
+ 	var secrets corev1.SecretList
+-	if err := r.cachedClient.List(context.TODO(), &secrets); err != nil {
++	if err := r.cachedClient.List(ctx, &secrets); err != nil {
+ 		return nil, err
+ 	}
+ 	var missing int
+diff --git a/pkg/operator/credentialsrequest/credentialsrequest_controller_azure_test.go b/pkg/operator/credentialsrequest/credentialsrequest_controller_azure_test.go
+index ef98fc1015..2e204d3420 100644
+--- a/pkg/operator/credentialsrequest/credentialsrequest_controller_azure_test.go
++++ b/pkg/operator/credentialsrequest/credentialsrequest_controller_azure_test.go
+@@ -253,7 +253,7 @@ func TestCredentialsRequestAzureReconcile(t *testing.T) {
+ 
+ 			if test.expectedCOConditions != nil {
+ 				logger := log.WithFields(log.Fields{"controller": controllerName})
+-				currentConditions, err := rcr.GetConditions(logger)
++				currentConditions, err := rcr.GetConditions(context.TODO(), logger)
+ 				require.NoError(t, err, "failed getting conditions")
+ 
+ 				for _, expectedCondition := range test.expectedCOConditions {
+diff --git a/pkg/operator/credentialsrequest/credentialsrequest_controller_gcp_test.go b/pkg/operator/credentialsrequest/credentialsrequest_controller_gcp_test.go
+index 13144157bb..795c94e60f 100644
+--- a/pkg/operator/credentialsrequest/credentialsrequest_controller_gcp_test.go
++++ b/pkg/operator/credentialsrequest/credentialsrequest_controller_gcp_test.go
+@@ -974,7 +974,7 @@ func TestCredentialsRequestGCPReconcile(t *testing.T) {
+ 
+ 			if test.expectedCOConditions != nil {
+ 				logger := log.WithFields(log.Fields{"controller": controllerName})
+-				currentConditions, err := rcr.GetConditions(logger)
++				currentConditions, err := rcr.GetConditions(context.TODO(), logger)
+ 				require.NoError(t, err, "failed getting conditions")
+ 
+ 				for _, expectedCondition := range test.expectedCOConditions {
+diff --git a/pkg/operator/credentialsrequest/credentialsrequest_controller_label_test.go b/pkg/operator/credentialsrequest/credentialsrequest_controller_label_test.go
+index 7db0d3b81a..50d5d4d304 100644
+--- a/pkg/operator/credentialsrequest/credentialsrequest_controller_label_test.go
++++ b/pkg/operator/credentialsrequest/credentialsrequest_controller_label_test.go
+@@ -251,7 +251,7 @@ func TestReconcileSecretMissingLabel_GetConditions(t *testing.T) {
+ 				mutatingClient: nil,
+ 			}
+ 
+-			conditions, err := rcr.GetConditions(logrus.StandardLogger())
++			conditions, err := rcr.GetConditions(context.TODO(), logrus.StandardLogger())
+ 
+ 			if err != nil && !test.expectErr {
+ 				require.NoError(t, err, "Unexpected error: %v", err)
+diff --git a/pkg/operator/credentialsrequest/credentialsrequest_controller_test.go b/pkg/operator/credentialsrequest/credentialsrequest_controller_test.go
+index 09953918ea..cb86c9244e 100644
+--- a/pkg/operator/credentialsrequest/credentialsrequest_controller_test.go
++++ b/pkg/operator/credentialsrequest/credentialsrequest_controller_test.go
+@@ -1535,7 +1535,7 @@ func TestCredentialsRequestReconcile(t *testing.T) {
+ 
+ 			if test.expectedCOConditions != nil {
+ 				logger := log.WithFields(log.Fields{"controller": controllerName})
+-				currentConditions, err := rcr.GetConditions(logger)
++				currentConditions, err := rcr.GetConditions(context.TODO(), logger)
+ 				require.NoError(t, err, "failed getting conditions")
+ 
+ 				for _, expectedCondition := range test.expectedCOConditions {
+diff --git a/pkg/operator/credentialsrequest/credentialsrequest_controller_vsphere_test.go b/pkg/operator/credentialsrequest/credentialsrequest_controller_vsphere_test.go
+index 6dc919bf02..46c162fe3b 100644
+--- a/pkg/operator/credentialsrequest/credentialsrequest_controller_vsphere_test.go
++++ b/pkg/operator/credentialsrequest/credentialsrequest_controller_vsphere_test.go
+@@ -226,7 +226,7 @@ func TestCredentialsRequestVSphereReconcile(t *testing.T) {
+ 
+ 			if test.expectedCOConditions != nil {
+ 				logger := log.WithFields(log.Fields{"controller": controllerName})
+-				currentConditions, err := rcr.GetConditions(logger)
++				currentConditions, err := rcr.GetConditions(context.TODO(), logger)
+ 				require.NoError(t, err, "failed getting conditions")
+ 
+ 				for _, expectedCondition := range test.expectedCOConditions {
+diff --git a/pkg/operator/credentialsrequest/status.go b/pkg/operator/credentialsrequest/status.go
+index a433dc0b15..573b57cd64 100644
+--- a/pkg/operator/credentialsrequest/status.go
++++ b/pkg/operator/credentialsrequest/status.go
+@@ -29,8 +29,8 @@ const (
+ 
+ var _ status.Handler = &ReconcileCredentialsRequest{}
+ 
+-func (r *ReconcileCredentialsRequest) GetConditions(logger log.FieldLogger) ([]configv1.ClusterOperatorStatusCondition, error) {
+-	_, credRequests, mode, err := r.getOperatorState(logger)
++func (r *ReconcileCredentialsRequest) GetConditions(ctx context.Context, logger log.FieldLogger) ([]configv1.ClusterOperatorStatusCondition, error) {
++	_, credRequests, mode, err := r.getOperatorState(ctx, logger)
+ 	if err != nil {
+ 		return []configv1.ClusterOperatorStatusCondition{}, fmt.Errorf("failed to get operator state: %v", err)
+ 	}
+@@ -43,7 +43,7 @@ func (r *ReconcileCredentialsRequest) GetConditions(logger log.FieldLogger) ([]c
+ }
+ 
+ func (r *ReconcileCredentialsRequest) GetRelatedObjects(logger log.FieldLogger) ([]configv1.ObjectReference, error) {
+-	_, credRequests, _, err := r.getOperatorState(logger)
++	_, credRequests, _, err := r.getOperatorState(context.TODO(), logger)
+ 	if err != nil {
+ 		return []configv1.ObjectReference{}, fmt.Errorf("failed to get operator state: %v", err)
+ 	}
+@@ -56,10 +56,10 @@ func (r *ReconcileCredentialsRequest) Name() string {
+ 
+ // getOperatorState gets and returns the resources necessary to compute the
+ // operator's current state.
+-func (r *ReconcileCredentialsRequest) getOperatorState(logger log.FieldLogger) (*corev1.Namespace, []minterv1.CredentialsRequest, operatorv1.CloudCredentialsMode, error) {
++func (r *ReconcileCredentialsRequest) getOperatorState(ctx context.Context, logger log.FieldLogger) (*corev1.Namespace, []minterv1.CredentialsRequest, operatorv1.CloudCredentialsMode, error) {
+ 
+ 	ns := &corev1.Namespace{}
+-	if err := r.Client.Get(context.TODO(), types.NamespacedName{Name: minterv1.CloudCredOperatorNamespace}, ns); err != nil {
++	if err := r.Client.Get(ctx, types.NamespacedName{Name: minterv1.CloudCredOperatorNamespace}, ns); err != nil {
+ 		if apierrors.IsNotFound(err) {
+ 			return nil, nil, operatorv1.CloudCredentialsModeDefault, nil
+ 		}
+@@ -72,7 +72,7 @@ func (r *ReconcileCredentialsRequest) getOperatorState(logger log.FieldLogger) (
+ 	// central list to live. Other credentials requests in other namespaces will not affect status,
+ 	// but they will still work fine.
+ 	credRequestList := &minterv1.CredentialsRequestList{}
+-	err := r.Client.List(context.TODO(), credRequestList, client.InNamespace(minterv1.CloudCredOperatorNamespace))
++	err := r.Client.List(ctx, credRequestList, client.InNamespace(minterv1.CloudCredOperatorNamespace))
+ 	if err != nil {
+ 		return nil, nil, operatorv1.CloudCredentialsModeDefault, fmt.Errorf(
+ 			"failed to list CredentialsRequests: %v", err)
+diff --git a/pkg/operator/loglevel/status.go b/pkg/operator/loglevel/status.go
+index 70928f9f09..6b9e96077b 100644
+--- a/pkg/operator/loglevel/status.go
++++ b/pkg/operator/loglevel/status.go
+@@ -1,6 +1,8 @@
+ package loglevel
+ 
+ import (
++	"context"
++
+ 	log "github.com/sirupsen/logrus"
+ 
+ 	configv1 "github.com/openshift/api/config/v1"
+@@ -9,7 +11,7 @@ import (
+ 
+ var _ status.Handler = &ReconcileCloudCredentialConfig{}
+ 
+-func (r *ReconcileCloudCredentialConfig) GetConditions(logger log.FieldLogger) ([]configv1.ClusterOperatorStatusCondition, error) {
++func (r *ReconcileCloudCredentialConfig) GetConditions(ctx context.Context, logger log.FieldLogger) ([]configv1.ClusterOperatorStatusCondition, error) {
+ 	return []configv1.ClusterOperatorStatusCondition{}, nil
+ }
+ 
+diff --git a/pkg/operator/podidentity/podidentitywebhook_controller.go b/pkg/operator/podidentity/podidentitywebhook_controller.go
+index 134f51e01f..a9599c23f0 100644
+--- a/pkg/operator/podidentity/podidentitywebhook_controller.go
++++ b/pkg/operator/podidentity/podidentitywebhook_controller.go
+@@ -4,11 +4,13 @@ import (
+ 	"context"
+ 	"fmt"
+ 	"strings"
++	"sync"
+ 	"time"
+ 
+ 	log "github.com/sirupsen/logrus"
+ 	appsv1 "k8s.io/api/apps/v1"
+ 	corev1 "k8s.io/api/core/v1"
++	"k8s.io/apimachinery/pkg/api/errors"
+ 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+ 	"k8s.io/apimachinery/pkg/runtime/serializer"
+ 	"k8s.io/client-go/kubernetes"
+@@ -37,12 +39,14 @@ import (
+ )
+ 
+ const (
+-	controllerName                      = "pod-identity"
+-	deploymentName                      = "cloud-credential-operator"
+-	operatorNamespace                   = "openshift-cloud-credential-operator"
+-	retryInterval                       = 10 * time.Second
+-	reasonStaticResourceReconcileFailed = "StaticResourceReconcileFailed"
+-	pdb                                 = "v4.1.0/common/poddisruptionbudget.yaml"
++	controllerName                            = "pod-identity"
++	deploymentName                            = "cloud-credential-operator"
++	operatorNamespace                         = "openshift-cloud-credential-operator"
++	retryInterval                             = 10 * time.Second
++	reasonStaticResourceReconcileFailed       = "StaticResourceReconcileFailed"
++	reasonPodIdentityWebhookPodsStillUpdating = "PodIdentityWebhookPodsStillUpdating"
++	reasonPodIdentityWebhookPodsNotAvailable  = "PodIdentityWebhookPodsNotAvailable"
++	pdb                                       = "v4.1.0/common/poddisruptionbudget.yaml"
+ )
+ 
+ var (
+@@ -198,6 +202,7 @@ func Add(mgr, rootCredentialManager manager.Manager, kubeconfig string) error {
+ 		logger:          logger,
+ 		eventRecorder:   eventRecorder,
+ 		imagePullSpec:   imagePullSpec,
++		conditionsMutex: &sync.RWMutex{},
+ 		conditions:      []configv1.ClusterOperatorStatusCondition{},
+ 		cache:           resourceapply.NewResourceCache(),
+ 		podIdentityType: podIdentityType,
+@@ -282,6 +287,7 @@ type staticResourceReconciler struct {
+ 	eventRecorder        events.Recorder
+ 	deploymentGeneration int64
+ 	imagePullSpec        string
++	conditionsMutex      *sync.RWMutex
+ 	conditions           []configv1.ClusterOperatorStatusCondition
+ 	cache                resourceapply.ResourceCache
+ 	podIdentityType      PodIdentityManifestSource
+@@ -291,6 +297,8 @@ var _ reconcile.Reconciler = &staticResourceReconciler{}
+ 
+ func (r *staticResourceReconciler) Reconcile(ctx context.Context, request reconcile.Request) (reconcile.Result, error) {
+ 	r.logger.Debugf("reconciling after watch event %#v", request)
++	r.conditionsMutex.Lock()
++
+ 	err := r.ReconcileResources(ctx)
+ 	if err != nil {
+ 		r.logger.Errorf("reconciliation failed, retrying in %s", retryInterval.String())
+@@ -302,9 +310,13 @@ func (r *staticResourceReconciler) Reconcile(ctx context.Context, request reconc
+ 				Message: fmt.Sprintf("static resource reconciliation failed: %v", err),
+ 			},
+ 		}
++
++		r.conditionsMutex.Unlock()
+ 		return reconcile.Result{RequeueAfter: retryInterval}, err
+ 	}
++
+ 	r.conditions = []configv1.ClusterOperatorStatusCondition{}
++	r.conditionsMutex.Unlock()
+ 	return reconcile.Result{}, nil
+ }
+ 
+@@ -384,10 +396,95 @@ func (r *staticResourceReconciler) ReconcileResources(ctx context.Context) error
+ 	return nil
+ }
+ 
++type webhookPodStatus struct {
++	desiredReplicas   int32
++	availableReplicas int32
++	updatedReplicas   int32
++	totalReplicas     int32
++}
++
++func (wps *webhookPodStatus) Available() bool {
++	return wps.availableReplicas > 0
++}
++
++func (wps *webhookPodStatus) Progressing() bool {
++	return wps.updatedReplicas != wps.desiredReplicas || wps.totalReplicas != wps.desiredReplicas
++}
++
++func (r *staticResourceReconciler) CheckPodStatus(ctx context.Context) (*webhookPodStatus, error) {
++	deployment := &appsv1.Deployment{}
++	err := r.client.Get(ctx, client.ObjectKey{
++		Name:      "pod-identity-webhook",
++		Namespace: operatorNamespace,
++	}, deployment)
++	if err != nil {
++		if errors.IsNotFound(err) {
++			// If the pod identity webhook controller is running, we know that
++			// we will eventually want at least one pod identity webhook pod. If
++			// the Deployment is missing, we can still assume we want at least one.
++			// This is important to set the proper status of this controller later on.
++			return &webhookPodStatus{
++				desiredReplicas: 1,
++			}, nil
++		}
++		return nil, err
++	}
++
++	desiredReplicas := int32(1) // kubernetes defaults to 1 if not specified
++	if deployment.Spec.Replicas != nil {
++		desiredReplicas = *deployment.Spec.Replicas
++	}
++
++	deploymentStatus := &webhookPodStatus{
++		desiredReplicas:   desiredReplicas,
++		availableReplicas: deployment.Status.AvailableReplicas,
++		updatedReplicas:   deployment.Status.UpdatedReplicas,
++		totalReplicas:     deployment.Status.Replicas,
++	}
++
++	return deploymentStatus, nil
++}
++
+ var _ status.Handler = &staticResourceReconciler{}
+ 
+-func (r *staticResourceReconciler) GetConditions(logger log.FieldLogger) ([]configv1.ClusterOperatorStatusCondition, error) {
+-	return r.conditions, nil
++func (r *staticResourceReconciler) GetConditions(ctx context.Context, logger log.FieldLogger) ([]configv1.ClusterOperatorStatusCondition, error) {
++	r.conditionsMutex.RLock()
++	conditions := make([]configv1.ClusterOperatorStatusCondition, len(r.conditions))
++	copy(conditions, r.conditions)
++	r.conditionsMutex.RUnlock()
++
++	podStatus, err := r.CheckPodStatus(ctx)
++	if err != nil {
++		logger.WithError(err).Errorf("checking pod identity webhook status failed")
++		if len(conditions) > 0 {
++			// Ignore the pod status error for now, we have bigger conditions to report
++			return conditions, nil
++		}
++		return nil, err
++	}
++
++	if !podStatus.Available() {
++		conditions = append(conditions, configv1.ClusterOperatorStatusCondition{
++			Type:    configv1.OperatorAvailable,
++			Status:  configv1.ConditionFalse,
++			Reason:  reasonPodIdentityWebhookPodsNotAvailable,
++			Message: "No pod identity webhook pods are available",
++		})
++	}
++	if podStatus.Progressing() {
++		conditions = append(conditions, configv1.ClusterOperatorStatusCondition{
++			Type:   configv1.OperatorProgressing,
++			Status: configv1.ConditionTrue,
++			Reason: reasonPodIdentityWebhookPodsStillUpdating,
++			Message: fmt.Sprintf(
++				"Waiting for pod identity webhook deployment rollout to finish: %d out of %d new replica(s) have been updated...",
++				podStatus.updatedReplicas,
++				podStatus.desiredReplicas,
++			),
++		})
++	}
++
++	return conditions, nil
+ }
+ 
+ func (r *staticResourceReconciler) GetRelatedObjects(logger log.FieldLogger) ([]configv1.ObjectReference, error) {
+diff --git a/pkg/operator/podidentity/podidentitywebhook_controller_test.go b/pkg/operator/podidentity/podidentitywebhook_controller_test.go
+index fb1e91b86b..64af0eca7e 100644
+--- a/pkg/operator/podidentity/podidentitywebhook_controller_test.go
++++ b/pkg/operator/podidentity/podidentitywebhook_controller_test.go
+@@ -20,6 +20,7 @@ import (
+ 	"context"
+ 	"fmt"
+ 	"strings"
++	"sync"
+ 	"testing"
+ 
+ 	clientgotesting "k8s.io/client-go/testing"
+@@ -201,6 +202,7 @@ func TestPodIdentityWebhookController(t *testing.T) {
+ 				logger:          logger,
+ 				eventRecorder:   events.NewInMemoryRecorder("", clock.RealClock{}),
+ 				cache:           resourceapply.NewResourceCache(),
++				conditionsMutex: &sync.RWMutex{},
+ 				conditions:      []configv1.ClusterOperatorStatusCondition{},
+ 				imagePullSpec:   test.podIdentityType.GetImagePullSpec(),
+ 				podIdentityType: test.podIdentityType,
+@@ -276,6 +278,304 @@ func TestPodIdentityWebhookController(t *testing.T) {
+ 	}
+ }
+ 
++func TestCheckPodStatus(t *testing.T) {
++	schemeutils.SetupScheme(scheme.Scheme)
++
++	tests := []struct {
++		name              string
++		deployment        *appsv1.Deployment
++		expectedDesired   int32
++		expectedAvailable int32
++		expectedUpdated   int32
++		expectedTotal     int32
++	}{
++		{
++			name:            "Deployment not found",
++			deployment:      nil,
++			expectedDesired: 1,
++		},
++		{
++			name:              "Deployment with all replicas available and updated",
++			deployment:        testDeploymentWithReplicas(2, 2, 2, 2),
++			expectedDesired:   2,
++			expectedAvailable: 2,
++			expectedUpdated:   2,
++			expectedTotal:     2,
++		},
++		{
++			name: "Deployment with nil replicas",
++			deployment: &appsv1.Deployment{
++				ObjectMeta: v1.ObjectMeta{
++					Name:      "pod-identity-webhook",
++					Namespace: "openshift-cloud-credential-operator",
++				},
++				Spec: appsv1.DeploymentSpec{
++					Replicas: nil,
++				},
++				Status: appsv1.DeploymentStatus{
++					AvailableReplicas: 1,
++					UpdatedReplicas:   0,
++					Replicas:          1,
++				},
++			},
++			expectedDesired:   1,
++			expectedAvailable: 1,
++			expectedUpdated:   0,
++			expectedTotal:     1,
++		},
++	}
++
++	for _, test := range tests {
++		t.Run(test.name, func(t *testing.T) {
++			existing := []runtime.Object{}
++			if test.deployment != nil {
++				existing = append(existing, test.deployment)
++			}
++
++			fakeClient := fake.NewClientBuilder().WithRuntimeObjects(existing...).Build()
++			logger := log.WithField("controller", "podidentitywebhookcontrollertest")
++			r := &staticResourceReconciler{
++				client: fakeClient,
++				logger: logger,
++			}
++
++			podStatus, err := r.CheckPodStatus(context.TODO())
++
++			assert.Nil(t, err, "unexpected error: %v", err)
++			assert.NotNil(t, podStatus)
++			assert.Equal(t, test.expectedDesired, podStatus.desiredReplicas, "desiredReplicas mismatch")
++			assert.Equal(t, test.expectedAvailable, podStatus.availableReplicas, "availableReplicas mismatch")
++			assert.Equal(t, test.expectedUpdated, podStatus.updatedReplicas, "updatedReplicas mismatch")
++			assert.Equal(t, test.expectedTotal, podStatus.totalReplicas, "totalReplicas mismatch")
++		})
++	}
++}
++
++func TestWebhookPodStatus(t *testing.T) {
++	tests := []struct {
++		name                string
++		desiredReplicas     int32
++		availableReplicas   int32
++		updatedReplicas     int32
++		totalReplicas       int32
++		expectedAvailable   bool
++		expectedProgressing bool
++	}{
++		{
++			name:                "All pods available and up to date",
++			desiredReplicas:     2,
++			availableReplicas:   2,
++			updatedReplicas:     2,
++			totalReplicas:       2,
++			expectedAvailable:   true,
++			expectedProgressing: false,
++		},
++		{
++			name:                "No pods available",
++			desiredReplicas:     2,
++			availableReplicas:   0,
++			updatedReplicas:     0,
++			totalReplicas:       0,
++			expectedAvailable:   false,
++			expectedProgressing: true,
++		},
++		{
++			name:                "Some pods available, rollout in progress",
++			desiredReplicas:     2,
++			availableReplicas:   1,
++			updatedReplicas:     1,
++			totalReplicas:       2,
++			expectedAvailable:   true,
++			expectedProgressing: true,
++		},
++		{
++			name:                "All pods available but not updated yet",
++			desiredReplicas:     2,
++			availableReplicas:   2,
++			updatedReplicas:     0,
++			totalReplicas:       2,
++			expectedAvailable:   true,
++			expectedProgressing: true,
++		},
++		{
++			name:                "Single replica available and updated",
++			desiredReplicas:     1,
++			availableReplicas:   1,
++			updatedReplicas:     1,
++			totalReplicas:       1,
++			expectedAvailable:   true,
++			expectedProgressing: false,
++		},
++		{
++			name:                "Scale down in progress",
++			desiredReplicas:     2,
++			availableReplicas:   2,
++			updatedReplicas:     2,
++			totalReplicas:       3,
++			expectedAvailable:   true,
++			expectedProgressing: true,
++		},
++		{
++			name:                "Scale up in progress",
++			desiredReplicas:     3,
++			availableReplicas:   1,
++			updatedReplicas:     1,
++			totalReplicas:       1,
++			expectedAvailable:   true,
++			expectedProgressing: true,
++		},
++	}
++
++	for _, test := range tests {
++		t.Run(test.name, func(t *testing.T) {
++			wps := &webhookPodStatus{
++				desiredReplicas:   test.desiredReplicas,
++				availableReplicas: test.availableReplicas,
++				updatedReplicas:   test.updatedReplicas,
++				totalReplicas:     test.totalReplicas,
++			}
++
++			assert.Equal(t, test.expectedAvailable, wps.Available(), "Available() returned unexpected value")
++			assert.Equal(t, test.expectedProgressing, wps.Progressing(), "Progressing() returned unexpected value")
++		})
++	}
++}
++
++func TestGetConditions(t *testing.T) {
++	schemeutils.SetupScheme(scheme.Scheme)
++
++	tests := []struct {
++		name                   string
++		deployment             *appsv1.Deployment
++		existingConditions     []configv1.ClusterOperatorStatusCondition
++		expectedConditionCount int
++		expectAvailableFalse   bool
++		expectProgressingTrue  bool
++	}{
++		{
++			name:                   "Deployment not found",
++			deployment:             nil,
++			expectedConditionCount: 2,
++			expectAvailableFalse:   true,
++			expectProgressingTrue:  true,
++		},
++		{
++			name:       "Deployment not found with existing conditions",
++			deployment: nil,
++			existingConditions: []configv1.ClusterOperatorStatusCondition{
++				{
++					Type:    configv1.OperatorDegraded,
++					Status:  configv1.ConditionTrue,
++					Reason:  "JustBecause",
++					Message: "Test degraded condition",
++				},
++			},
++			expectedConditionCount: 3,
++			expectAvailableFalse:   true,
++			expectProgressingTrue:  true,
++		},
++		{
++			name:                   "All pods available and updated - no additional conditions",
++			deployment:             testDeploymentWithReplicas(2, 2, 2, 2),
++			expectedConditionCount: 0,
++			expectAvailableFalse:   false,
++			expectProgressingTrue:  false,
++		},
++		{
++			name:                   "No pods available",
++			deployment:             testDeploymentWithReplicas(2, 0, 0, 0),
++			expectedConditionCount: 2,
++			expectAvailableFalse:   true,
++			expectProgressingTrue:  true,
++		},
++		{
++			name:                   "Rollout in progress",
++			deployment:             testDeploymentWithReplicas(2, 1, 1, 2),
++			expectedConditionCount: 1,
++			expectAvailableFalse:   false,
++			expectProgressingTrue:  true,
++		},
++		{
++			name:                   "Rollout hasn't begun",
++			deployment:             testDeploymentWithReplicas(2, 2, 0, 2),
++			expectedConditionCount: 1,
++			expectAvailableFalse:   false,
++			expectProgressingTrue:  true,
++		},
++		{
++			name:       "Existing conditions preserved and new ones added",
++			deployment: testDeploymentWithReplicas(2, 0, 0, 0),
++			existingConditions: []configv1.ClusterOperatorStatusCondition{
++				{
++					Type:    configv1.OperatorDegraded,
++					Status:  configv1.ConditionFalse,
++					Reason:  "AsExpected",
++					Message: "All is well",
++				},
++			},
++			expectedConditionCount: 3,
++			expectAvailableFalse:   true,
++			expectProgressingTrue:  true,
++		},
++		{
++			name:                   "Scale down in progress",
++			deployment:             testDeploymentWithReplicas(2, 2, 2, 3),
++			expectedConditionCount: 1,
++			expectAvailableFalse:   false,
++			expectProgressingTrue:  true,
++		},
++		{
++			name:                   "Scale up in progress",
++			deployment:             testDeploymentWithReplicas(3, 2, 2, 2),
++			expectedConditionCount: 1,
++			expectAvailableFalse:   false,
++			expectProgressingTrue:  true,
++		},
++	}
++
++	for _, test := range tests {
++		t.Run(test.name, func(t *testing.T) {
++			existing := []runtime.Object{}
++			if test.deployment != nil {
++				existing = append(existing, test.deployment)
++			}
++
++			fakeClient := fake.NewClientBuilder().WithRuntimeObjects(existing...).Build()
++			logger := log.WithField("controller", "podidentitywebhookcontrollertest")
++			r := &staticResourceReconciler{
++				client:          fakeClient,
++				logger:          logger,
++				conditionsMutex: &sync.RWMutex{},
++				conditions:      test.existingConditions,
++			}
++
++			conditions, err := r.GetConditions(context.TODO(), logger)
++
++			assert.Nil(t, err, "unexpected error: %v", err)
++			assert.Equal(t, test.expectedConditionCount, len(conditions), "unexpected number of conditions")
++
++			// Check for conditions
++			foundAvailableFalse := false
++			foundProgressingTrue := false
++			for _, cond := range conditions {
++				if cond.Type == configv1.OperatorAvailable && cond.Status == configv1.ConditionFalse {
++					foundAvailableFalse = true
++					assert.Equal(t, reasonPodIdentityWebhookPodsNotAvailable, cond.Reason)
++					assert.Contains(t, cond.Message, "No pod identity webhook pods are available")
++				}
++				if cond.Type == configv1.OperatorProgressing && cond.Status == configv1.ConditionTrue {
++					foundProgressingTrue = true
++					assert.Equal(t, reasonPodIdentityWebhookPodsStillUpdating, cond.Reason)
++					assert.Contains(t, cond.Message, "Waiting for pod identity webhook deployment rollout")
++				}
++			}
++
++			assert.Equal(t, test.expectAvailableFalse, foundAvailableFalse, "Available=False condition expectation mismatch")
++			assert.Equal(t, test.expectProgressingTrue, foundProgressingTrue, "Progressing=True condition expectation mismatch")
++		})
++	}
++}
++
+ func TestPodIdentityShouldDeploy(t *testing.T) {
+ 	schemeutils.SetupScheme(scheme.Scheme)
+ 
+@@ -359,3 +659,22 @@ func TestPodIdentityShouldDeploy(t *testing.T) {
+ 		})
+ 	}
+ }
++
++func testDeploymentWithReplicas(desired, available, updated, total int) *appsv1.Deployment {
++	int32Ptr := func(i int32) *int32 { return &i }
++
++	return &appsv1.Deployment{
++		ObjectMeta: v1.ObjectMeta{
++			Name:      "pod-identity-webhook",
++			Namespace: "openshift-cloud-credential-operator",
++		},
++		Spec: appsv1.DeploymentSpec{
++			Replicas: int32Ptr(int32(desired)),
++		},
++		Status: appsv1.DeploymentStatus{
++			AvailableReplicas: int32(available),
++			UpdatedReplicas:   int32(updated),
++			Replicas:          int32(total),
++		},
++	}
++}
+diff --git a/pkg/operator/secretannotator/status/status.go b/pkg/operator/secretannotator/status/status.go
+index 367079f65a..aaccecb714 100644
+--- a/pkg/operator/secretannotator/status/status.go
++++ b/pkg/operator/secretannotator/status/status.go
+@@ -1,6 +1,7 @@
+ package status
+ 
+ import (
++	"context"
+ 	"fmt"
+ 
+ 	log "github.com/sirupsen/logrus"
+@@ -28,7 +29,7 @@ func NewSecretStatusHandler(kubeClient client.Client) *SecretStatusHandler {
+ 
+ var _ status.Handler = &SecretStatusHandler{}
+ 
+-func (s *SecretStatusHandler) GetConditions(logger log.FieldLogger) ([]configv1.ClusterOperatorStatusCondition, error) {
++func (s *SecretStatusHandler) GetConditions(ctx context.Context, logger log.FieldLogger) ([]configv1.ClusterOperatorStatusCondition, error) {
+ 	conditions := []configv1.ClusterOperatorStatusCondition{}
+ 
+ 	mode, conflict, err := utils.GetOperatorConfiguration(s.kubeClient, logger)
+diff --git a/pkg/operator/status/status_controller.go b/pkg/operator/status/status_controller.go
+index 24ea90f478..a69a793fba 100644
+--- a/pkg/operator/status/status_controller.go
++++ b/pkg/operator/status/status_controller.go
+@@ -10,6 +10,7 @@ import (
+ 	"github.com/pkg/errors"
+ 	log "github.com/sirupsen/logrus"
+ 
++	appsv1 "k8s.io/api/apps/v1"
+ 	corev1 "k8s.io/api/core/v1"
+ 	k8errors "k8s.io/apimachinery/pkg/api/errors"
+ 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+@@ -44,7 +45,7 @@ const (
+ // Handler produces conditions and related objects to be reflected
+ // in the cloud-credential-operator ClusterOperatorStatus
+ type Handler interface {
+-	GetConditions(logger log.FieldLogger) ([]configv1.ClusterOperatorStatusCondition, error)
++	GetConditions(ctx context.Context, logger log.FieldLogger) ([]configv1.ClusterOperatorStatusCondition, error)
+ 	GetRelatedObjects(logger log.FieldLogger) ([]configv1.ObjectReference, error)
+ 	Name() string
+ }
+@@ -156,6 +157,15 @@ func Add(mgr, rootCredentialManager manager.Manager, kubeConfig string) error {
+ 		return err
+ 	}
+ 
++	// Watch the pod-identity-webhook Deployment to re-reconcile status when pod identity controller reconciles
++	// The manager cache is already filtered to only this deployment in cmd.go
++	err = c.Watch(source.Kind(operatorCache, &appsv1.Deployment{},
++		handler.TypedEnqueueRequestsFromMapFunc[*appsv1.Deployment](alwaysReconcileCCOConfigObject),
++	))
++	if err != nil {
++		return err
++	}
++
+ 	return nil
+ }
+ 
+@@ -179,7 +189,7 @@ func (r *ReconcileStatus) Reconcile(ctx context.Context, request reconcile.Reque
+ 		metrics.MetricControllerReconcileTime.WithLabelValues(controllerName).Observe(dur.Seconds())
+ 	}()
+ 
+-	err := syncStatus(r.Client, r.Logger)
++	err := syncStatus(ctx, r.Client, r.Logger)
+ 	return reconcile.Result{
+ 		RequeueAfter: defaultRequeuePeriod,
+ 	}, err
+@@ -188,11 +198,11 @@ func (r *ReconcileStatus) Reconcile(ctx context.Context, request reconcile.Reque
+ // syncStatus is written in a way so that if we expose this function it would allow
+ // external controllers to trigger a static sync. But for now we will make this an internal
+ // function until the need arises to expose it.
+-func syncStatus(kubeClient client.Client, logger log.FieldLogger) error {
++func syncStatus(ctx context.Context, kubeClient client.Client, logger log.FieldLogger) error {
+ 	log.Info("reconciling clusteroperator status")
+ 
+ 	co := &configv1.ClusterOperator{}
+-	err := kubeClient.Get(context.TODO(), types.NamespacedName{Name: constants.CloudCredClusterOperatorName}, co)
++	err := kubeClient.Get(ctx, types.NamespacedName{Name: constants.CloudCredClusterOperatorName}, co)
+ 	isNotFound := k8errors.IsNotFound(err)
+ 	if err != nil && !isNotFound {
+ 		logger.WithError(err).WithField("clusterOperator", constants.CloudCredClusterOperatorName).Error("failed to retrive ClusterOperator")
+@@ -209,7 +219,7 @@ func syncStatus(kubeClient client.Client, logger log.FieldLogger) error {
+ 	conditions := []configv1.ClusterOperatorStatusCondition{}
+ 	relatedObjects := []configv1.ObjectReference{}
+ 	for handlerName, handler := range statusHandlers {
+-		handlerConditions, err := handler.GetConditions(logger)
++		handlerConditions, err := handler.GetConditions(ctx, logger)
+ 		logger.WithFields(log.Fields{
+ 			"handlerconditions": handlerConditions,
+ 			"statushandler":     handlerName,
+@@ -261,11 +271,14 @@ func syncStatus(kubeClient client.Client, logger log.FieldLogger) error {
+ 		progressing, _ := findClusterOperatorCondition(co.Status.Conditions, configv1.OperatorProgressing)
+ 		// We know this should be there.
+ 		progressing.LastTransitionTime = metav1.Now()
++		progressing.Status = configv1.ConditionTrue
++		progressing.Reason = "VersionChanged"
++		progressing.Message = "Operator version is updating"
+ 	}
+ 
+ 	// ClusterOperator should already exist (from the manifest payload), but recreate it if needed
+ 	if isNotFound {
+-		if err := kubeClient.Create(context.TODO(), co); err != nil {
++		if err := kubeClient.Create(ctx, co); err != nil {
+ 			return errors.Wrap(err, "failed to create clusteroperator")
+ 		}
+ 		logger.Info("created clusteroperator")
+@@ -281,7 +294,7 @@ func syncStatus(kubeClient client.Client, logger log.FieldLogger) error {
+ 		!reflect.DeepEqual(oldVersions, co.Status.Versions) ||
+ 		!reflect.DeepEqual(oldRelatedObjects, co.Status.RelatedObjects) {
+ 
+-		if err := kubeClient.Status().Update(context.TODO(), co); err != nil {
++		if err := kubeClient.Status().Update(ctx, co); err != nil {
+ 			return errors.Wrap(err, "failed to update clusteroperator status")
+ 		}
+ 		logger.Info("clusteroperator status updated")
+diff --git a/pkg/operator/status/status_controller_test.go b/pkg/operator/status/status_controller_test.go
+index e288a357dd..e2cc2b246e 100644
+--- a/pkg/operator/status/status_controller_test.go
++++ b/pkg/operator/status/status_controller_test.go
+@@ -98,6 +98,9 @@ func TestClusterOperatorVersion(t *testing.T) {
+ 			if test.expectProgressingTransition {
+ 				assert.True(t, progCond.LastTransitionTime.Time.After(
+ 					test.currentProgressingLastTransition.Time))
++				assert.Equal(t, configv1.ConditionTrue, progCond.Status, "Progressing condition should be True when version changes")
++				assert.Equal(t, "VersionChanged", progCond.Reason, "Progressing condition should have VersionChanged reason")
++				assert.Equal(t, "Operator version is updating", progCond.Message, "Progressing condition should have expected message")
+ 			} else {
+ 				assert.Equal(t, test.currentProgressingLastTransition.Time.Format(time.UnixDate),
+ 					progCond.LastTransitionTime.Time.Format(time.UnixDate))
+@@ -165,11 +168,14 @@ func TestConditionsEqual(t *testing.T) {
+ 	}
+ 
+ 	for _, tc := range testCases {
+-		actual := conditionEqual(tc.a, tc.b)
+-		if actual != tc.expected {
+-			t.Fatalf("%q: expected %v, got %v", tc.description,
+-				tc.expected, actual)
+-		}
++		t.Run(tc.description, func(t *testing.T) {
++
++			actual := conditionEqual(tc.a, tc.b)
++			if actual != tc.expected {
++				t.Fatalf("%q: expected %v, got %v", tc.description,
++					tc.expected, actual)
++			}
++		})
+ 	}
+ }
+ 
+@@ -293,43 +299,48 @@ func TestConditions(t *testing.T) {
+ 	}
+ 
+ 	for _, test := range tests {
++		t.Run(test.name, func(t *testing.T) {
++
++			basicClusterOperator := testBasicClusterOperator()
++			// Make sure we have a clean ClusterOperator and CCO config for each test run
++			objects := []runtime.Object{
++				basicClusterOperator,
++				testOperatorConfig(""),
++			}
++
++			fakeClient := fake.NewClientBuilder().
++				WithStatusSubresource(basicClusterOperator).
++				WithRuntimeObjects(objects...).Build()
++
++			// Set RELEASE_VERSION to match the cluster operator's initial version
++			require.NoError(t, os.Setenv("RELEASE_VERSION", "ANYVERSION"), "unable to set environment variable for testing")
++
++			r := &ReconcileStatus{
++				Client:   fakeClient,
++				Logger:   log.WithField("controller", controllerName),
++				platform: configv1.AWSPlatformType,
++			}
+ 
+-		basicClusterOperator := testBasicClusterOperator()
+-		// Make sure we have a clean ClusterOperator and CCO config for each test run
+-		objects := []runtime.Object{
+-			basicClusterOperator,
+-			testOperatorConfig(""),
+-		}
+-
+-		fakeClient := fake.NewClientBuilder().
+-			WithStatusSubresource(basicClusterOperator).
+-			WithRuntimeObjects(objects...).Build()
+-
+-		r := &ReconcileStatus{
+-			Client:   fakeClient,
+-			Logger:   log.WithField("controller", controllerName),
+-			platform: configv1.AWSPlatformType,
+-		}
+-
+-		for _, handler := range test.statusHandlers {
+-			AddHandler(handler.Name(), handler)
+-		}
+-		defer clearHandlers()
+-
+-		_, err := r.Reconcile(context.TODO(), reconcile.Request{})
+-
+-		require.NoError(t, err, "unexpected error")
+-
+-		for _, condition := range test.expectedConditions {
+-			co := getClusterOperator(fakeClient)
+-			assert.NotNil(t, co)
+-			foundCondition, _ := findClusterOperatorCondition(co.Status.Conditions, condition.conditionType)
+-			require.NotNil(t, foundCondition)
+-			assert.Equal(t, string(condition.status), string(foundCondition.Status), "condition %s had unexpected status", condition.conditionType)
+-			if condition.reason != "" {
+-				assert.Exactly(t, condition.reason, foundCondition.Reason)
++			for _, handler := range test.statusHandlers {
++				AddHandler(handler.Name(), handler)
+ 			}
+-		}
++			defer clearHandlers()
++
++			_, err := r.Reconcile(context.TODO(), reconcile.Request{})
++
++			require.NoError(t, err, "unexpected error")
++
++			for _, condition := range test.expectedConditions {
++				co := getClusterOperator(fakeClient)
++				assert.NotNil(t, co)
++				foundCondition, _ := findClusterOperatorCondition(co.Status.Conditions, condition.conditionType)
++				require.NotNil(t, foundCondition)
++				assert.Equal(t, string(condition.status), string(foundCondition.Status), "condition %s had unexpected status", condition.conditionType)
++				if condition.reason != "" {
++					assert.Exactly(t, condition.reason, foundCondition.Reason)
++				}
++			}
++		})
+ 	}
+ }
+ 
+@@ -438,21 +449,23 @@ func TestSortedStatus(t *testing.T) {
+ 	}
+ 
+ 	for _, test := range tests {
+-		sortStatusArrays(&test.status)
+-		assert.ElementsMatchf(t, test.status.Conditions, test.expected.Conditions, "conditions = %v, want %v", test.status.Conditions, test.expected.Conditions)
+-		assert.ElementsMatchf(t, test.status.RelatedObjects, test.expected.RelatedObjects, "conditions = %v, want %v", test.status.RelatedObjects, test.expected.RelatedObjects)
++		t.Run(test.name, func(t *testing.T) {
++			sortStatusArrays(&test.status)
++			assert.ElementsMatchf(t, test.status.Conditions, test.expected.Conditions, "conditions = %v, want %v", test.status.Conditions, test.expected.Conditions)
++			assert.ElementsMatchf(t, test.status.RelatedObjects, test.expected.RelatedObjects, "conditions = %v, want %v", test.status.RelatedObjects, test.expected.RelatedObjects)
+ 
+-		for i, expected := range test.expected.Conditions {
+-			assert.Equal(t, expected, test.status.Conditions[i])
+-		}
++			for i, expected := range test.expected.Conditions {
++				assert.Equal(t, expected, test.status.Conditions[i])
++			}
+ 
+-		for i, expected := range test.expected.RelatedObjects {
+-			assert.Equal(t, expected, test.expected.RelatedObjects[i])
+-		}
++			for i, expected := range test.expected.RelatedObjects {
++				assert.Equal(t, expected, test.status.RelatedObjects[i])
++			}
+ 
+-		if !reflect.DeepEqual(test.status, test.expected) {
+-			t.Error("status' are not equal")
+-		}
++			if !reflect.DeepEqual(test.status, test.expected) {
++				t.Error("status' are not equal")
++			}
++		})
+ 	}
+ }
+ 
+@@ -534,7 +547,7 @@ func newHandler(name string, conditions []configv1.ClusterOperatorStatusConditio
+ 	}
+ }
+ 
+-func (h *miniHandler) GetConditions(log.FieldLogger) ([]configv1.ClusterOperatorStatusCondition, error) {
++func (h *miniHandler) GetConditions(context.Context, log.FieldLogger) ([]configv1.ClusterOperatorStatusCondition, error) {
+ 	return h.conditions, nil
+ }
+ 

@@ -1,0 +1,235 @@
+diff --git a/control-plane-operator/controllers/azureprivatelinkservice/controller.go b/control-plane-operator/controllers/azureprivatelinkservice/controller.go
+index a43b09b57be..e2f3bee6f3f 100644
+--- a/control-plane-operator/controllers/azureprivatelinkservice/controller.go
++++ b/control-plane-operator/controllers/azureprivatelinkservice/controller.go
+@@ -745,15 +745,17 @@ func (r *AzurePrivateLinkServiceReconciler) reconcileDNS(ctx context.Context, az
+ }
+ 
+ // reconcileBaseDomainDNS creates a Private DNS Zone for the cluster's base domain,
+-// links it to the guest VNet, and creates A records for the API and/or OAuth hostnames.
+-// This enables worker VMs to resolve api-<name>.<basedomain> and oauth-<name>.<basedomain>
+-// to the Private Endpoint IP, which is required for the console OAuth flow and other
+-// services that use the external API/OAuth hostnames from within the private network.
++// links it to the guest VNet, and creates A records for the API, *.apps, and/or OAuth
++// hostnames. This enables worker VMs to resolve api-<name>.<basedomain>,
++// *.apps.<name>.<basedomain>, and oauth-<name>.<basedomain> to the Private Endpoint IP,
++// which is required for the console, OAuth flow, and other services that use the external
++// hostnames from within the private network.
+ //
+ // Record selection depends on the CR name:
+-//   - private-router: Creates api-<name> record. Also creates oauth-<name> record
+-//     ONLY if no sibling OAuth AzurePrivateLinkService CR exists in the same namespace
+-//     (backward compatibility for clusters without a separate OAuth PLS).
++//   - private-router: Creates api-<name> and *.apps.<name> records. Also creates
++//     oauth-<name> record ONLY if no sibling OAuth AzurePrivateLinkService CR exists
++//     in the same namespace (backward compatibility for clusters without a separate
++//     OAuth PLS).
+ //   - Any other CR (e.g., oauth-openshift): Creates only oauth-<name> record, pointing
+ //     to this CR's own PE IP.
+ func (r *AzurePrivateLinkServiceReconciler) reconcileBaseDomainDNS(ctx context.Context, azPLS *hyperv1.AzurePrivateLinkService, clusterName string, log logr.Logger) (ctrl.Result, error) {
+@@ -784,15 +786,19 @@ func (r *AzurePrivateLinkServiceReconciler) reconcileBaseDomainDNS(ctx context.C
+ }
+ 
+ // recordNamesForCR determines which DNS A records this CR is responsible for.
+-// The private-router CR creates the api record and, for backward compatibility,
+-// the oauth record when no sibling OAuth CR exists. All other CRs create only
+-// the oauth record.
++// The private-router CR creates the api record, the *.apps wildcard record,
++// and for backward compatibility, the oauth record when no sibling OAuth CR
++// exists. All other CRs create only the oauth record.
+ func (r *AzurePrivateLinkServiceReconciler) recordNamesForCR(ctx context.Context, azPLS *hyperv1.AzurePrivateLinkService, clusterName string, log logr.Logger) ([]string, error) {
+ 	if azPLS.Name != privateRouterCRName {
+ 		return []string{oauthBaseDomainRecordPrefix + clusterName}, nil
+ 	}
+ 
+-	records := []string{kasBaseDomainRecordPrefix + clusterName}
++	// The *.apps wildcard in the base domain zone enables guest cluster services
++	// (e.g., console, monitoring) to resolve *.apps.<cluster>.<basedomain> to the
++	// Private Endpoint IP. On private clusters, all *.apps traffic flows through
++	// the private-router via the passthrough ingress route.
++	records := []string{kasBaseDomainRecordPrefix + clusterName, appsARecordName + "." + clusterName}
+ 
+ 	hasSiblingOAuth, err := r.hasSiblingCR(ctx, azPLS)
+ 	if err != nil {
+@@ -941,6 +947,7 @@ func (r *AzurePrivateLinkServiceReconciler) reconcileDelete(ctx context.Context,
+ 			var baseDomainRecords []string
+ 			if azPLS.Name == privateRouterCRName {
+ 				baseDomainRecords = append(baseDomainRecords, kasBaseDomainRecordPrefix+clusterName)
++				baseDomainRecords = append(baseDomainRecords, appsARecordName+"."+clusterName)
+ 				// Only delete the oauth record if there is no sibling OAuth CR that
+ 				// owns it. This prevents the private-router deletion from removing
+ 				// an oauth record that now belongs to the dedicated OAuth CR.
+diff --git a/control-plane-operator/controllers/azureprivatelinkservice/controller_test.go b/control-plane-operator/controllers/azureprivatelinkservice/controller_test.go
+index 5caadd72510..df31057160b 100644
+--- a/control-plane-operator/controllers/azureprivatelinkservice/controller_test.go
++++ b/control-plane-operator/controllers/azureprivatelinkservice/controller_test.go
+@@ -1433,7 +1433,7 @@ func TestReconcile_WhenNonPrivateRouterCR_ItShouldSkipHypershiftLocalDNS(t *test
+ 	g.Expect(updated.Status.DNSZoneName).To(Equal("test-hcp.hypershift.local"), "non-private-router CRs should persist DNSZoneName for delete-path cleanup")
+ }
+ 
+-func TestReconcileBaseDomainDNS_WhenPrivateRouterWithNoSibling_ItShouldCreateBothRecords(t *testing.T) {
++func TestReconcileBaseDomainDNS_WhenPrivateRouterWithNoSibling_ItShouldCreateAllRecords(t *testing.T) {
+ 	g := NewGomegaWithT(t)
+ 	scheme := newTestScheme(t, g)
+ 
+@@ -1462,12 +1462,12 @@ func TestReconcileBaseDomainDNS_WhenPrivateRouterWithNoSibling_ItShouldCreateBot
+ 	g.Expect(err).ToNot(HaveOccurred())
+ 	g.Expect(result.IsZero()).To(BeTrue())
+ 
+-	// When no sibling OAuth CR exists, private-router should create both api and oauth records
+-	g.Expect(mockRecords.createCallCount).To(Equal(2), "should create two A records (api and oauth)")
+-	g.Expect(mockRecords.createdRecordNames).To(ConsistOf("api-test-hcp", "oauth-test-hcp"), "should create api and oauth base domain records")
++	// When no sibling OAuth CR exists, private-router should create api, *.apps, and oauth records
++	g.Expect(mockRecords.createCallCount).To(Equal(3), "should create three A records (api, *.apps, and oauth)")
++	g.Expect(mockRecords.createdRecordNames).To(ConsistOf("api-test-hcp", "*.apps.test-hcp", "oauth-test-hcp"), "should create api, *.apps, and oauth base domain records")
+ }
+ 
+-func TestReconcileBaseDomainDNS_WhenPrivateRouterWithSiblingOAuth_ItShouldOnlyCreateAPIRecord(t *testing.T) {
++func TestReconcileBaseDomainDNS_WhenPrivateRouterWithSiblingOAuth_ItShouldCreateApiAndAppsRecords(t *testing.T) {
+ 	g := NewGomegaWithT(t)
+ 	scheme := newTestScheme(t, g)
+ 
+@@ -1500,9 +1500,9 @@ func TestReconcileBaseDomainDNS_WhenPrivateRouterWithSiblingOAuth_ItShouldOnlyCr
+ 	g.Expect(err).ToNot(HaveOccurred())
+ 	g.Expect(result.IsZero()).To(BeTrue())
+ 
+-	// When a sibling OAuth CR exists, private-router should only create the api record
+-	g.Expect(mockRecords.createCallCount).To(Equal(1), "should create only one A record (api)")
+-	g.Expect(mockRecords.createdRecordNames).To(ConsistOf("api-test-hcp"), "should only create api base domain record")
++	// When a sibling OAuth CR exists, private-router should create api and *.apps records (not oauth)
++	g.Expect(mockRecords.createCallCount).To(Equal(2), "should create two A records (api and *.apps)")
++	g.Expect(mockRecords.createdRecordNames).To(ConsistOf("api-test-hcp", "*.apps.test-hcp"), "should create api and *.apps base domain records")
+ }
+ 
+ func TestReconcileBaseDomainDNS_WhenOAuthCR_ItShouldOnlyCreateOAuthRecord(t *testing.T) {
+@@ -1576,11 +1576,11 @@ func TestReconcileDelete_WhenSiblingCRsExist_ItShouldNotDeleteBaseDomainZone(t *
+ 	err := r.reconcileDelete(context.Background(), azPLS, testr.New(t))
+ 	g.Expect(err).ToNot(HaveOccurred())
+ 
+-	// A records should only include the api record (sibling OAuth owns the oauth record)
++	// A records should include api and *.apps records (sibling OAuth owns the oauth record)
+ 	g.Expect(mockRecords.deleteCalled).To(BeTrue(), "should delete A records")
+-	// The hypershift.local records (api, *.apps) + only api-test-hcp from base domain = 3
+-	g.Expect(mockRecords.deletedRecordNames).To(ConsistOf("api", "*.apps", "api-test-hcp"),
+-		"should delete hypershift.local records and only api base domain record (sibling owns oauth)")
++	// The hypershift.local records (api, *.apps) + api-test-hcp and *.apps.test-hcp from base domain = 4
++	g.Expect(mockRecords.deletedRecordNames).To(ConsistOf("api", "*.apps", "api-test-hcp", "*.apps.test-hcp"),
++		"should delete hypershift.local records and api + *.apps base domain records (sibling owns oauth)")
+ 
+ 	// VNet link deletion should include hypershift.local link + base domain link
+ 	g.Expect(mockLinks.deletedLinkNames).To(ConsistOf("private-router-vnet-link", "private-router-basedomain-vnet-link"),
+@@ -1629,10 +1629,10 @@ func TestReconcileDelete_WhenNoSiblingCRs_ItShouldDeleteBaseDomainZone(t *testin
+ 	err := r.reconcileDelete(context.Background(), azPLS, testr.New(t))
+ 	g.Expect(err).ToNot(HaveOccurred())
+ 
+-	// With no siblings, private-router should delete both api and oauth base domain records
++	// With no siblings, private-router should delete api, *.apps, and oauth base domain records
+ 	g.Expect(mockRecords.deleteCalled).To(BeTrue(), "should delete A records")
+-	g.Expect(mockRecords.deletedRecordNames).To(ConsistOf("api", "*.apps", "api-test-hcp", "oauth-test-hcp"),
+-		"should delete hypershift.local records and both api+oauth base domain records when no siblings")
++	g.Expect(mockRecords.deletedRecordNames).To(ConsistOf("api", "*.apps", "api-test-hcp", "*.apps.test-hcp", "oauth-test-hcp"),
++		"should delete hypershift.local records and all base domain records when no siblings")
+ 
+ 	// Both zones should be deleted (last CR using them)
+ 	g.Expect(mockDNS.deletedZoneNames).To(ConsistOf("test-hcp.hypershift.local", "example.com"),
+diff --git a/test/e2e/azure_private_link_test.go b/test/e2e/azure_private_link_test.go
+index 98b36243fda..2ef0955812a 100644
+--- a/test/e2e/azure_private_link_test.go
++++ b/test/e2e/azure_private_link_test.go
+@@ -10,8 +10,12 @@ import (
+ 	"testing"
+ 	"time"
+ 
++	"github.com/Azure/azure-sdk-for-go/sdk/azcore/arm"
++	"github.com/Azure/azure-sdk-for-go/sdk/resourcemanager/privatedns/armprivatedns"
++	"github.com/go-logr/logr"
+ 	. "github.com/onsi/gomega"
+ 	hyperv1 "github.com/openshift/hypershift/api/hypershift/v1beta1"
++	cmdutil "github.com/openshift/hypershift/cmd/util"
+ 	"github.com/openshift/hypershift/hypershift-operator/controllers/manifests"
+ 	"github.com/openshift/hypershift/support/azureutil"
+ 	e2eutil "github.com/openshift/hypershift/test/e2e/util"
+@@ -209,5 +213,83 @@ func TestAzurePrivateTopology(t *testing.T) {
+ 				e2eutil.WithInterval(15*time.Second),
+ 			)
+ 		})
++
++		// Verify the base domain Private DNS zone contains the expected A records.
++		// The private-router CR always creates api-<cluster> and *.apps.<cluster>
++		// records, and conditionally creates oauth-<cluster> when no sibling OAuth
++		// CR exists. Without *.apps, guest cluster services (console, monitoring)
++		// fail to resolve *.apps.<cluster>.<basedomain>. See OCPBUGS-83730.
++		t.Run("BaseDomainDNSRecordsExist", func(t *testing.T) {
++			g := NewGomegaWithT(t)
++
++			// Wait for BaseDomainDNSZoneID to be populated on private-router CR
++			var baseDomainZoneID string
++			e2eutil.EventuallyObject(t, ctx, "private-router has BaseDomainDNSZoneID",
++				func(ctx context.Context) (*hyperv1.AzurePrivateLinkService, error) {
++					pls := &hyperv1.AzurePrivateLinkService{
++						ObjectMeta: metav1.ObjectMeta{
++							Namespace: controlPlaneNamespace,
++							Name:      "private-router",
++						},
++					}
++					err := mgtClient.Get(ctx, crclient.ObjectKeyFromObject(pls), pls)
++					if err == nil {
++						baseDomainZoneID = pls.Status.BaseDomainDNSZoneID
++					}
++					return pls, err
++				},
++				[]e2eutil.Predicate[*hyperv1.AzurePrivateLinkService]{
++					func(pls *hyperv1.AzurePrivateLinkService) (done bool, reasons string, err error) {
++						if pls.Status.BaseDomainDNSZoneID == "" {
++							return false, "BaseDomainDNSZoneID is empty", nil
++						}
++						return true, fmt.Sprintf("BaseDomainDNSZoneID is %q", pls.Status.BaseDomainDNSZoneID), nil
++					},
++				},
++				e2eutil.WithTimeout(15*time.Minute),
++				e2eutil.WithInterval(15*time.Second),
++			)
++
++			// Parse the zone resource ID to extract subscription, RG, and zone name
++			zoneResource, err := arm.ParseResourceID(baseDomainZoneID)
++			g.Expect(err).ToNot(HaveOccurred(), "failed to parse BaseDomainDNSZoneID: %s", baseDomainZoneID)
++
++			// Create Azure Private DNS RecordSets client using the cluster Azure credentials.
++			// The CPO creates DNS zones via workload identity; use the cluster credentials
++			// (which have access to the guest subscription) to query the zones.
++			azureCredsFile := globalOpts.ConfigurableClusterOptions.AzureCredentialsFile
++			g.Expect(azureCredsFile).ToNot(BeEmpty(), "azure-credentials-file is required for DNS record validation")
++
++			_, azureCreds, err := cmdutil.SetupAzureCredentials(logr.Discard(), nil, azureCredsFile)
++			g.Expect(err).ToNot(HaveOccurred(), "failed to set up Azure credentials")
++
++			recordSetsClient, err := armprivatedns.NewRecordSetsClient(zoneResource.SubscriptionID, azureCreds, nil)
++			g.Expect(err).ToNot(HaveOccurred(), "failed to create RecordSets client")
++
++			// Query Azure DNS for the expected A records with retries,
++			// as record visibility can lag after the zone ID is set.
++			clusterName := hostedCluster.Name
++			expectedRecords := []string{
++				"api-" + clusterName,
++				"*.apps." + clusterName,
++			}
++			g.Eventually(func(gg Gomega) {
++				var recordNames []string
++				pager := recordSetsClient.NewListByTypePager(zoneResource.ResourceGroupName, zoneResource.Name, armprivatedns.RecordTypeA, nil)
++				for pager.More() {
++					page, err := pager.NextPage(ctx)
++					gg.Expect(err).ToNot(HaveOccurred(), "failed to list A records in base domain zone")
++					for _, rs := range page.Value {
++						if rs.Name != nil {
++							recordNames = append(recordNames, *rs.Name)
++						}
++					}
++				}
++				for _, expected := range expectedRecords {
++					gg.Expect(recordNames).To(ContainElement(expected),
++						"base domain zone %q missing expected A record %q; found records: %v", zoneResource.Name, expected, recordNames)
++				}
++			}, 5*time.Minute, 15*time.Second).Should(Succeed())
++		})
+ 	}).Execute(&clusterOpts, globalOpts.Platform, globalOpts.ArtifactDir, "azure-private-topology", globalOpts.ServiceAccountSigningKey)
+ }

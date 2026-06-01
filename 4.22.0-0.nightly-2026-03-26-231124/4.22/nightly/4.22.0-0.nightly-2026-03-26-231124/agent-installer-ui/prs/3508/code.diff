@@ -1,0 +1,288 @@
+diff --git a/apps/assisted-disconnected-ui/proxy/app.go b/apps/assisted-disconnected-ui/proxy/app.go
+index 6e45de8211..5bdab1216b 100644
+--- a/apps/assisted-disconnected-ui/proxy/app.go
++++ b/apps/assisted-disconnected-ui/proxy/app.go
+@@ -10,6 +10,7 @@ import (
+ 	"github.com/openshift-assisted/assisted-disconnected-ui/bridge"
+ 	"github.com/openshift-assisted/assisted-disconnected-ui/config"
+ 	"github.com/openshift-assisted/assisted-disconnected-ui/log"
++	"github.com/openshift-assisted/assisted-disconnected-ui/pullsecret"
+ 	"github.com/openshift-assisted/assisted-disconnected-ui/server"
+ )
+ 
+@@ -27,6 +28,8 @@ func main() {
+ 	}
+ 
+ 	router := mux.NewRouter()
++	// Served before SPA catch-all: mounted manifest or plain JSON pull secret for the UI.
++	router.HandleFunc("/api/pull-secret", pullsecret.Handler(config.PullSecretManifestPath)).Methods(http.MethodGet)
+ 	router.PathPrefix("/api/{forward:.*}").Handler(apiHandler)
+ 
+ 	spa := server.SpaHandler{}
+diff --git a/apps/assisted-disconnected-ui/proxy/config/config.go b/apps/assisted-disconnected-ui/proxy/config/config.go
+index c4be68205a..62777f91cb 100644
+--- a/apps/assisted-disconnected-ui/proxy/config/config.go
++++ b/apps/assisted-disconnected-ui/proxy/config/config.go
+@@ -6,12 +6,13 @@ import (
+ )
+ 
+ var (
+-	BridgePort     = ":" + getEnvVar("BRIDGE_PORT", "3001")
+-	AssistedApiUrl = getEnvUrlVar("AIUI_APP_API_URL", "http://localhost:8090")
+-	ApiInsecure    = getEnvVar("API_INSECURE_SKIP_VERIFY", "false")
+-	TlsKeyPath     = getEnvVar("TLS_KEY", "")
+-	TlsCertPath    = getEnvVar("TLS_CERT", "")
+-	UserAuthToken  = getEnvVar("USER_AUTH_TOKEN", "")
++	BridgePort              = ":" + getEnvVar("BRIDGE_PORT", "3001")
++	AssistedApiUrl          = getEnvUrlVar("AIUI_APP_API_URL", "http://localhost:8090")
++	ApiInsecure             = getEnvVar("API_INSECURE_SKIP_VERIFY", "false")
++	TlsKeyPath              = getEnvVar("TLS_KEY", "")
++	TlsCertPath             = getEnvVar("TLS_CERT", "")
++	UserAuthToken           = getEnvVar("USER_AUTH_TOKEN", "")
++	PullSecretManifestPath  = getEnvVar("PULL_SECRET_MANIFEST_PATH", "/etc/assisted/manifests/pull-secret.yaml")
+ )
+ 
+ func getEnvUrlVar(key string, defaultValue string) string {
+diff --git a/apps/assisted-disconnected-ui/proxy/pullsecret/handler.go b/apps/assisted-disconnected-ui/proxy/pullsecret/handler.go
+new file mode 100644
+index 0000000000..5a631856d8
+--- /dev/null
++++ b/apps/assisted-disconnected-ui/proxy/pullsecret/handler.go
+@@ -0,0 +1,33 @@
++package pullsecret
++
++import (
++	"net/http"
++	"os"
++
++	"github.com/openshift-assisted/assisted-disconnected-ui/log"
++)
++
++// Handler serves GET /pull-secret: JSON pull-secret string for the UI (same shape as cluster pullSecret field).
++func Handler(manifestPath string) http.HandlerFunc {
++	return func(w http.ResponseWriter, r *http.Request) {
++		if r.Method != http.MethodGet {
++			w.WriteHeader(http.StatusMethodNotAllowed)
++			return
++		}
++
++		raw, err := os.ReadFile(manifestPath)
++		if err != nil {
++			if os.IsNotExist(err) {
++				log.GetLog().WithField("path", manifestPath).Debug("pull secret manifest not found")
++				w.WriteHeader(http.StatusNotFound)
++				return
++			}
++			log.GetLog().WithError(err).Error("failed to read pull secret manifest")
++			http.Error(w, "failed to read manifest", http.StatusInternalServerError)
++			return
++		}
++
++		w.Header().Set("Content-Type", "application/json")
++		_, _ = w.Write(raw)
++	}
++}
+diff --git a/libs/locales/lib/en/translation.json b/libs/locales/lib/en/translation.json
+index 8d8fd55964..49a4d6ff25 100644
+--- a/libs/locales/lib/en/translation.json
++++ b/libs/locales/lib/en/translation.json
+@@ -50,6 +50,7 @@
+   "ai:A comma separated list of IP or domain names of the NTP pools or servers.": "A comma-separated list of IP addresses or the domain names of the NTP pools or servers.",
+   "ai:A comma separated list of IP or domain names of the NTP pools or servers. Additional NTP sources are added to all hosts to ensure all hosts clocks are synchronized with a valid NTP server. It may take a few minutes for the new NTP sources to sync.": "A comma-separated list of IP addresses or domain names of the NTP pools or servers. Additional NTP sources are added to all hosts to ensure that all clocks of the hosts are synchronized with a valid NTP server. It might take a few minutes for the new NTP sources to synchronize.",
+   "ai:A pull secret has already been set for this cluster. You can continue to the next step.": "A pull secret has already been set for this cluster. You can continue to the next step.",
++  "ai:A pull secret has already been set for this cluster. You can edit it below.": "A pull secret has already been set for this cluster. You can edit it below.",
+   "ai:A Red Hat account's pull secret can be found in ": "A Red Hat account pull secret can be found in ",
+   "ai:A role will be chosen automatically based on detected hardware and network latency.": "A role will be chosen automatically based on detected hardware and network latency.",
+   "ai:Actions": "Actions",
+diff --git a/libs/ui-lib/lib/common/components/clusters/PullSecret.tsx b/libs/ui-lib/lib/common/components/clusters/PullSecret.tsx
+index 542516402d..2c3bdf949d 100644
+--- a/libs/ui-lib/lib/common/components/clusters/PullSecret.tsx
++++ b/libs/ui-lib/lib/common/components/clusters/PullSecret.tsx
+@@ -1,5 +1,5 @@
+ import React from 'react';
+-import { Checkbox } from '@patternfly/react-core';
++import { Alert, AlertVariant, Checkbox } from '@patternfly/react-core';
+ import { useFormikContext } from 'formik';
+ import { ClusterCreateParams } from '@openshift-assisted/types/assisted-installer-service';
+ import { PullSecretField, PullSecretInfo } from '../ui';
+@@ -8,42 +8,54 @@ import { useTranslation } from '../../hooks/use-translation-wrapper';
+ export type PullSecretProps = {
+   defaultPullSecret?: string;
+   isOcm?: boolean;
++  isPullSecretSet?: boolean;
++  isSingleClusterFeatureEnabled?: boolean;
+ };
+ 
+-const PullSecret: React.FC<PullSecretProps> = ({ defaultPullSecret, isOcm = false }) => {
++const PullSecret: React.FC<PullSecretProps> = ({
++  defaultPullSecret,
++  isOcm = false,
++  isPullSecretSet = false,
++  isSingleClusterFeatureEnabled = false,
++}) => {
+   // Fetched pull secret will never change - see LoadingState in NewCluster
+   const [isExpanded, setExpanded] = React.useState(!defaultPullSecret);
+   const { setFieldValue } = useFormikContext<ClusterCreateParams>();
+   const { t } = useTranslation();
+-  if (isOcm) {
+-    const onCheckboxChange = () => {
+-      if (isExpanded) {
+-        // about to collapse, reset to original value
+-        setFieldValue('pullSecret', defaultPullSecret);
+-      }
+-      setExpanded(!isExpanded);
+-    };
++  const onCheckboxChange = () => {
++    if (isExpanded) {
++      // about to collapse, reset to original value
++      setFieldValue('pullSecret', defaultPullSecret);
++    }
++    setExpanded(!isExpanded);
++  };
+ 
+-    return (
+-      <>
+-        <Checkbox
+-          id="checkbox-pull-secret"
+-          className="pf-v6-u-display-inline-flex"
+-          aria-label={t('ai:edit pull secret')}
+-          isChecked={isExpanded}
+-          onChange={onCheckboxChange}
+-          label={
+-            <>
+-              {t('ai:Edit pull secret')} <PullSecretInfo isOcm={isOcm} />
+-            </>
+-          }
+-        />
+-        {isExpanded && <PullSecretField isOcm={isOcm} />}
+-      </>
+-    );
++  if (!(isOcm || isSingleClusterFeatureEnabled)) {
++    return <PullSecretField isOcm={isOcm} />;
+   }
+ 
+-  return <PullSecretField isOcm={isOcm} />;
++  return (
++    <>
++      {isPullSecretSet && (
++        <Alert variant={AlertVariant.success} isInline title={t('ai:Pull secret configured')}>
++          {t('ai:A pull secret has already been set for this cluster. You can edit it below.')}
++        </Alert>
++      )}
++      <Checkbox
++        id="checkbox-pull-secret"
++        className="pf-v6-u-display-inline-flex"
++        aria-label={t('ai:edit pull secret')}
++        isChecked={isExpanded}
++        onChange={onCheckboxChange}
++        label={
++          <>
++            {t('ai:Edit pull secret')} <PullSecretInfo isOcm={isOcm} />
++          </>
++        }
++      />
++      {isExpanded && <PullSecretField isOcm={isOcm} />}
++    </>
++  );
+ };
+ 
+ export default PullSecret;
+diff --git a/libs/ui-lib/lib/ocm/components/clusterConfiguration/OcmClusterDetailsFormFields.tsx b/libs/ui-lib/lib/ocm/components/clusterConfiguration/OcmClusterDetailsFormFields.tsx
+index 374ef7b40b..3d1bbebc48 100644
+--- a/libs/ui-lib/lib/ocm/components/clusterConfiguration/OcmClusterDetailsFormFields.tsx
++++ b/libs/ui-lib/lib/ocm/components/clusterConfiguration/OcmClusterDetailsFormFields.tsx
+@@ -179,9 +179,12 @@ export const OcmClusterDetailsFormFields = ({
+         />
+       )}
+ 
+-      {!cluster?.pullSecretSet && (
+-        <PullSecret isOcm={isOcm} defaultPullSecret={defaultPullSecret} />
+-      )}
++      <PullSecret
++        isOcm={isOcm}
++        defaultPullSecret={defaultPullSecret}
++        isPullSecretSet={!!cluster?.pullSecretSet}
++        isSingleClusterFeatureEnabled={isSingleClusterFeatureEnabled}
++      />
+ 
+       {!isSingleClusterFeatureEnabled &&
+         (clusterExists ? (
+diff --git a/libs/ui-lib/lib/ocm/components/clusterWizard/ClusterDetails.tsx b/libs/ui-lib/lib/ocm/components/clusterWizard/ClusterDetails.tsx
+index b59a54e2ff..5c31f77a26 100644
+--- a/libs/ui-lib/lib/ocm/components/clusterWizard/ClusterDetails.tsx
++++ b/libs/ui-lib/lib/ocm/components/clusterWizard/ClusterDetails.tsx
+@@ -46,8 +46,7 @@ const ClusterDetails = ({ cluster, infraEnv }: ClusterDetailsProps) => {
+   } = useOpenShiftVersionsContext();
+   const location = useLocation();
+   const isSingleClusterFeatureEnabled = useFeature('ASSISTED_INSTALLER_SINGLE_CLUSTER_FEATURE');
+-  const defaultPullSecret = usePullSecret();
+-  const pullSecret = isSingleClusterFeatureEnabled ? infraEnv?.pullSecret || '' : defaultPullSecret;
++  const pullSecret = usePullSecret(isSingleClusterFeatureEnabled);
+ 
+   const handleClusterUpdate = React.useCallback(
+     async (clusterId: Cluster['id'], params: ClusterDetailsUpdateParams) => {
+diff --git a/libs/ui-lib/lib/ocm/hooks/usePullSecret.ts b/libs/ui-lib/lib/ocm/hooks/usePullSecret.ts
+index 669507fe2d..acbfe248a6 100644
+--- a/libs/ui-lib/lib/ocm/hooks/usePullSecret.ts
++++ b/libs/ui-lib/lib/ocm/hooks/usePullSecret.ts
+@@ -1,27 +1,52 @@
+ import React from 'react';
+-import { getApiErrorMessage, handleApiError } from '../../common/api';
++import { getApiErrorMessage, handleApiError, isInOcm } from '../../common/api';
+ import { useAlerts } from '../../common';
+ import { AccessTokenAPI } from '../../common/api/accounts-management-service/access-token-api';
+ 
+-export default function usePullSecret() {
++/**
++ * Standalone / disconnected UI: bridge serves GET /pull-secret from a mounted manifest
++ * (see assisted-disconnected-ui proxy).
++ */
++async function fetchPullSecretFromBridge(): Promise<string | undefined> {
++  const res = await fetch('/api/pull-secret', { credentials: 'same-origin' });
++  if (!res.ok) {
++    throw new Error(`Unexpected status code ${res.status}`);
++  }
++  const text = (await res.text()).trim();
++  return text || undefined;
++}
++
++export default function usePullSecret(isSingleClusterFeatureEnabled?: boolean) {
+   const [pullSecret, setPullSecret] = React.useState<string>();
+   const { addAlert } = useAlerts();
+ 
+   const getPullSecret = React.useCallback(async () => {
+     try {
+-      const accessTokenCfg = await AccessTokenAPI.fetchPullSecret();
+-      if (accessTokenCfg) {
+-        setPullSecret(JSON.stringify(accessTokenCfg)); // unmarshalled response as a string
+-      } else {
+-        setPullSecret('');
++      if (isInOcm) {
++        const accessTokenCfg = await AccessTokenAPI.fetchPullSecret();
++        if (accessTokenCfg) {
++          setPullSecret(JSON.stringify(accessTokenCfg)); // unmarshalled response as a string
++        } else {
++          setPullSecret('');
++        }
++        return;
+       }
++
++      if (isSingleClusterFeatureEnabled) {
++        const fromBridge = await fetchPullSecretFromBridge();
++        setPullSecret(fromBridge ?? '');
++        return;
++      }
++
++      // Non-OCM multinode flow: user enters pull secret manually.
++      setPullSecret('');
+     } catch (e) {
+       handleApiError(e, (e) => {
+         setPullSecret('');
+         addAlert({ title: 'Failed to retrieve pull secret', message: getApiErrorMessage(e) });
+       });
+     }
+-  }, [addAlert]);
++  }, [addAlert, isSingleClusterFeatureEnabled]);
+ 
+   React.useEffect(() => {
+     if (!pullSecret) {

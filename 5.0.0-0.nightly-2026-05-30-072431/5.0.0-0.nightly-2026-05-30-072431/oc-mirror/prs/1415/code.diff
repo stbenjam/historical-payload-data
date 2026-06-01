@@ -1,0 +1,252 @@
+diff --git a/internal/pkg/mirror/mirror.go b/internal/pkg/mirror/mirror.go
+index f537120197..9f1d04471f 100644
+--- a/internal/pkg/mirror/mirror.go
++++ b/internal/pkg/mirror/mirror.go
+@@ -237,9 +237,9 @@ func isErrorRetryable(err error) bool {
+ 	case errors.Is(err, context.Canceled):
+ 		return false
+ 	case errors.As(err, &httpError):
+-		// Retry on 502, 503, and 504 server errors, they appear to be quite common in the field
++		// Retry on 500-504 server errors, they appear to be quite common in the field
+ 		// We duplicate this here because older versions of oc-mirror cannot bump containers/common given Golang version restrictions
+-		if httpError.StatusCode >= http.StatusBadGateway && httpError.StatusCode <= http.StatusGatewayTimeout {
++		if httpError.StatusCode >= http.StatusInternalServerError && httpError.StatusCode <= http.StatusGatewayTimeout {
+ 			return true
+ 		}
+ 		return false
+diff --git a/tests/integration/image-builders/additional_images/README.md b/tests/integration/image-builders/additional_images/README.md
+new file mode 100644
+index 0000000000..cabe738a35
+--- /dev/null
++++ b/tests/integration/image-builders/additional_images/README.md
+@@ -0,0 +1,5 @@
++# additional_images
++
++Builders for additional images referenced in integration test ImageSetConfigurations.
++
++Each image lives in its own subdirectory (for example `multilayers/`).
+diff --git a/tests/integration/image-builders/additional_images/multilayers/Dockerfile b/tests/integration/image-builders/additional_images/multilayers/Dockerfile
+new file mode 100644
+index 0000000000..59da65f491
+--- /dev/null
++++ b/tests/integration/image-builders/additional_images/multilayers/Dockerfile
+@@ -0,0 +1,31 @@
++FROM quay.io/openshifttest/registry
++
++# Layer 1
++RUN touch /layer1 && echo "Layer 1" > /layer1
++
++# Layer 2
++RUN touch /layer2 && echo "Layer 2" > /layer2
++
++# Layer 3
++RUN touch /layer3 && echo "Layer 3" > /layer3
++
++# Layer 4
++RUN touch /layer4 && echo "Layer 4" > /layer4
++
++# Layer 5
++RUN touch /layer5 && echo "Layer 5" > /layer5
++
++# Layer 6
++RUN touch /layer6 && echo "Layer 6" > /layer6
++
++# Layer 7
++RUN touch /layer7 && echo "Layer 7" > /layer7
++
++# Layer 8
++RUN touch /layer8 && echo "Layer 8" > /layer8
++
++# Layer 9
++RUN touch /layer9 && echo "Layer 9" > /layer9
++
++# Layer 10
++RUN touch /layer10 && echo "Layer 10" > /layer10
+diff --git a/tests/integration/image-builders/additional_images/multilayers/Makefile b/tests/integration/image-builders/additional_images/multilayers/Makefile
+new file mode 100644
+index 0000000000..669bdd4cc9
+--- /dev/null
++++ b/tests/integration/image-builders/additional_images/multilayers/Makefile
+@@ -0,0 +1,19 @@
++REGISTRY ?= quay.io/oc-mirror/oc-mirror-dev
++TAG ?= multilayers-latest
++RUNTIME ?= podman
++
++IMAGE_REF = $(REGISTRY):$(TAG)
++
++.PHONY: all build push digest
++
++all: build
++
++build:
++	$(RUNTIME) build -f Dockerfile -t $(IMAGE_REF) .
++
++# Maintainer-only: run manually after build.
++push: build
++	$(RUNTIME) push $(IMAGE_REF)
++
++digest:
++	@$(RUNTIME) inspect $(IMAGE_REF) --format '{{index .Digest}}'
+diff --git a/tests/integration/image-builders/additional_images/multilayers/README.md b/tests/integration/image-builders/additional_images/multilayers/README.md
+new file mode 100644
+index 0000000000..ad64642f32
+--- /dev/null
++++ b/tests/integration/image-builders/additional_images/multilayers/README.md
+@@ -0,0 +1,19 @@
++# multilayers
++
++OCI image with more than 10 layers, used by integration tests for `--parallel-layers` behavior.
++
++## Build
++
++```bash
++make build
++```
++
++## Publish (maintainer only)
++
++Push to `quay.io/oc-mirror/oc-mirror-dev` (not `openshifttest`):
++
++```bash
++make push
++```
++
++The integration test ISC references `quay.io/oc-mirror/oc-mirror-dev:multilayers-latest`.
+diff --git a/tests/integration/parallel_copy_test.go b/tests/integration/parallel_copy_test.go
+new file mode 100644
+index 0000000000..c3a6a088be
+--- /dev/null
++++ b/tests/integration/parallel_copy_test.go
+@@ -0,0 +1,96 @@
++package integration_test
++
++import (
++	"path/filepath"
++	"regexp"
++	"strconv"
++	"strings"
++
++	. "github.com/onsi/ginkgo/v2"
++	. "github.com/onsi/gomega"
++
++	"github.com/openshift/oc-mirror/tests/integration/pkg/ocmirror"
++)
++
++var _ = Describe("parallel copy", func() {
++	var workDir string
++
++	BeforeEach(func() {
++		workDir = setupWorkDir()
++	})
++
++	AfterEach(func() {
++		cleanupWorkDir(workDir)
++	})
++
++	Describe("parallel-layers", func() {
++		Describe("multilayers image mirrorToDisk", func() {
++			iscFile := filepath.Join("parallel_copy", "isc-multilayers.yaml")
++
++			It("should copy with --parallel-layers 10", func() {
++				By("running mirrorToDisk with --parallel-layers 10")
++				result, err := runner.MirrorToDisk(ctx, filepath.Join(iscDir, iscFile), workDir,
++					"--parallel-layers", "10",
++				)
++				expectOcMirrorCommandSuccess(result, err)
++			})
++		})
++	})
++
++	Describe("parallel-images", func() {
++		iscFile := filepath.Join("parallel_copy", "isc-parallel-images.yaml")
++
++		It("should copy 10 images in parallel with --parallel-images 10", func() {
++			By("running mirrorToDisk with --parallel-images 10")
++			result, err := runner.MirrorToDisk(ctx, filepath.Join(iscDir, iscFile), workDir,
++				"--parallel-images", "10",
++				"--log-level", "debug",
++			)
++			expectOcMirrorCommandSuccess(result, err)
++
++			By("verifying enough images are collected to exercise parallelism")
++			expectMinImagesToCopy(result, 10)
++		})
++	})
++})
++
++var imagesToCopyRe = regexp.MustCompile(`images to copy\s+(\d+)`)
++
++// mirrorCopyOutput returns the section of oc-mirror output that covers image copying.
++func mirrorCopyOutput(output string) string {
++	start := strings.Index(output, "Start copying the images")
++	if start == -1 {
++		start = strings.Index(output, "going to discover")
++	}
++	if start == -1 {
++		return output
++	}
++
++	end := strings.Index(output[start:], "=== Results ===")
++	if end == -1 {
++		return output[start:]
++	}
++	return output[start : start+end]
++}
++
++// imagesToCopyCount parses the "images to copy N" line from oc-mirror output.
++// It only inspects the copy phase (after "Start copying the images") so debug
++// lines like "total operator images to copy 0" are not matched first.
++func imagesToCopyCount(output string) int {
++	match := imagesToCopyRe.FindStringSubmatch(mirrorCopyOutput(output))
++	if len(match) < 2 {
++		return 0
++	}
++	count, err := strconv.Atoi(match[1])
++	Expect(err).NotTo(HaveOccurred())
++	return count
++}
++
++// expectMinImagesToCopy verifies the mirror collected at least the expected number of images.
++func expectMinImagesToCopy(result *ocmirror.Result, min int) {
++	output := result.Stdout + result.Stderr
++	count := imagesToCopyCount(output)
++	Expect(count).To(BeNumerically(">=", min),
++		"expected at least %d images to copy but got %d\nstdout: %s\nstderr: %s",
++		min, count, result.Stdout, result.Stderr)
++}
+diff --git a/tests/integration/testdata/imagesetconfigs/parallel_copy/isc-multilayers.yaml b/tests/integration/testdata/imagesetconfigs/parallel_copy/isc-multilayers.yaml
+new file mode 100644
+index 0000000000..2c67ada7c9
+--- /dev/null
++++ b/tests/integration/testdata/imagesetconfigs/parallel_copy/isc-multilayers.yaml
+@@ -0,0 +1,7 @@
++# ImageSetConfig for --parallel-layers testing with a multi-layer additional image.
++# Image source: tests/integration/image-builders/additional_images/multilayers (see README there).
++apiVersion: mirror.openshift.io/v2alpha1
++kind: ImageSetConfiguration
++mirror:
++  additionalImages:
++    - name: quay.io/oc-mirror/oc-mirror-dev:multilayers-latest
+diff --git a/tests/integration/testdata/imagesetconfigs/parallel_copy/isc-parallel-images.yaml b/tests/integration/testdata/imagesetconfigs/parallel_copy/isc-parallel-images.yaml
+new file mode 100644
+index 0000000000..f88449b952
+--- /dev/null
++++ b/tests/integration/testdata/imagesetconfigs/parallel_copy/isc-parallel-images.yaml
+@@ -0,0 +1,17 @@
++# ImageSetConfig for parallel-images testing.
++# Operator mirrorToDisk copies only catalog images (source + rebuilt), not bundle
++# related images. Use additionalImages to mirror 10+ distinct images.
++kind: ImageSetConfiguration
++apiVersion: mirror.openshift.io/v2alpha1
++mirror:
++  additionalImages:
++    - name: quay.io/oc-mirror/oc-mirror-dev:foo-v0.1.0
++    - name: quay.io/oc-mirror/oc-mirror-dev:foo-v0.2.0
++    - name: quay.io/oc-mirror/oc-mirror-dev:foo-v0.3.0
++    - name: quay.io/oc-mirror/oc-mirror-dev:foo-v0.3.1
++    - name: quay.io/oc-mirror/oc-mirror-dev:bar-v0.1.0
++    - name: quay.io/oc-mirror/oc-mirror-dev:bar-v0.2.0
++    - name: quay.io/oc-mirror/oc-mirror-dev:bar-v1.0.0
++    - name: quay.io/oc-mirror/oc-mirror-dev:baz-v1.0.0
++    - name: quay.io/oc-mirror/oc-mirror-dev:baz-v1.0.1
++    - name: quay.io/oc-mirror/oc-mirror-dev:baz-v1.1.0

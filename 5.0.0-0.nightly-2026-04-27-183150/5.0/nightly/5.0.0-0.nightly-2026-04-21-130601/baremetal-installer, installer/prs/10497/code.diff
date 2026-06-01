@@ -1,0 +1,168 @@
+diff --git a/pkg/asset/manifests/vsphere/infrastructure.go b/pkg/asset/manifests/vsphere/infrastructure.go
+index c727482e3b8..a3531a9617a 100644
+--- a/pkg/asset/manifests/vsphere/infrastructure.go
++++ b/pkg/asset/manifests/vsphere/infrastructure.go
+@@ -52,22 +52,18 @@ func GetInfraPlatformSpec(ic *installconfig.InstallConfig, clusterID string) *co
+ 				},
+ 			}
+ 
+-			if ic.Config.Enabled(features.FeatureGateVSphereHostVMGroupZonal) {
+-				logrus.Debug("Host VM Group based zonal feature gate enabled")
+-
+-				if failureDomain.ZoneType == vsphere.HostGroupFailureDomain {
+-					vmGroupAndRuleName := fmt.Sprintf("%s-%s", clusterID, failureDomain.Name)
+-					failureDomainSpec.RegionAffinity = &configv1.VSphereFailureDomainRegionAffinity{
+-						Type: configv1.VSphereFailureDomainRegionType(failureDomain.RegionType),
+-					}
+-					failureDomainSpec.ZoneAffinity = &configv1.VSphereFailureDomainZoneAffinity{
+-						Type: configv1.VSphereFailureDomainZoneType(failureDomain.ZoneType),
+-						HostGroup: &configv1.VSphereFailureDomainHostGroup{
+-							HostGroup:  failureDomain.Topology.HostGroup,
+-							VMGroup:    vmGroupAndRuleName,
+-							VMHostRule: vmGroupAndRuleName,
+-						},
+-					}
++			if failureDomain.ZoneType == vsphere.HostGroupFailureDomain {
++				vmGroupAndRuleName := fmt.Sprintf("%s-%s", clusterID, failureDomain.Name)
++				failureDomainSpec.RegionAffinity = &configv1.VSphereFailureDomainRegionAffinity{
++					Type: configv1.VSphereFailureDomainRegionType(failureDomain.RegionType),
++				}
++				failureDomainSpec.ZoneAffinity = &configv1.VSphereFailureDomainZoneAffinity{
++					Type: configv1.VSphereFailureDomainZoneType(failureDomain.ZoneType),
++					HostGroup: &configv1.VSphereFailureDomainHostGroup{
++						HostGroup:  failureDomain.Topology.HostGroup,
++						VMGroup:    vmGroupAndRuleName,
++						VMHostRule: vmGroupAndRuleName,
++					},
+ 				}
+ 			}
+ 
+diff --git a/pkg/asset/manifests/vsphere/infrastructure_test.go b/pkg/asset/manifests/vsphere/infrastructure_test.go
+new file mode 100644
+index 00000000000..57192be6cbe
+--- /dev/null
++++ b/pkg/asset/manifests/vsphere/infrastructure_test.go
+@@ -0,0 +1,69 @@
++package vsphere
++
++import (
++	"testing"
++
++	"github.com/stretchr/testify/assert"
++
++	configv1 "github.com/openshift/api/config/v1"
++	"github.com/openshift/installer/pkg/asset/installconfig"
++	"github.com/openshift/installer/pkg/ipnet"
++	"github.com/openshift/installer/pkg/types"
++	vsphereconfig "github.com/openshift/installer/pkg/types/vsphere"
++)
++
++func TestGetInfraPlatformSpecHostGroupAffinity(t *testing.T) {
++	ic := installconfig.MakeAsset(&types.InstallConfig{
++		Networking: &types.Networking{
++			MachineNetwork: []types.MachineNetworkEntry{
++				{CIDR: *ipnet.MustParseCIDR("10.0.0.0/16")},
++			},
++		},
++		Platform: types.Platform{
++			VSphere: &vsphereconfig.Platform{
++				VCenters: []vsphereconfig.VCenter{
++					{
++						Server:      "test-vcenter",
++						Port:        443,
++						Datacenters: []string{"test-datacenter"},
++					},
++				},
++				FailureDomains: []vsphereconfig.FailureDomain{
++					{
++						Name:       "fd-a",
++						Region:     "region-a",
++						Zone:       "zone-a",
++						Server:     "test-vcenter",
++						RegionType: vsphereconfig.ComputeClusterFailureDomain,
++						ZoneType:   vsphereconfig.HostGroupFailureDomain,
++						Topology: vsphereconfig.Topology{
++							Datacenter:     "test-datacenter",
++							ComputeCluster: "/test-datacenter/host/test-cluster",
++							Datastore:      "/test-datacenter/datastore/test-datastore",
++							Networks:       []string{"test-portgroup"},
++							HostGroup:      "host-group-a",
++						},
++					},
++				},
++			},
++		},
++	})
++
++	platformSpec := GetInfraPlatformSpec(ic, "cluster-id")
++	if !assert.Len(t, platformSpec.FailureDomains, 1) {
++		return
++	}
++
++	fd := platformSpec.FailureDomains[0]
++	if assert.NotNil(t, fd.RegionAffinity) {
++		assert.Equal(t, configv1.ComputeClusterFailureDomainRegion, fd.RegionAffinity.Type)
++	}
++	if assert.NotNil(t, fd.ZoneAffinity) {
++		assert.Equal(t, configv1.HostGroupFailureDomainZone, fd.ZoneAffinity.Type)
++		if assert.NotNil(t, fd.ZoneAffinity.HostGroup) {
++			assert.Equal(t, "host-group-a", fd.ZoneAffinity.HostGroup.HostGroup)
++			assert.Equal(t, "cluster-id-fd-a", fd.ZoneAffinity.HostGroup.VMGroup)
++			assert.Equal(t, "cluster-id-fd-a", fd.ZoneAffinity.HostGroup.VMHostRule)
++		}
++	}
++}
+diff --git a/pkg/types/validation/featuregate_test.go b/pkg/types/validation/featuregate_test.go
+index 9ada1ec87dd..efffd9a3e4d 100644
+--- a/pkg/types/validation/featuregate_test.go
++++ b/pkg/types/validation/featuregate_test.go
+@@ -120,6 +120,19 @@ func TestFeatureGates(t *testing.T) {
+ 				return c
+ 			}(),
+ 		},
++		{
++			name: "vSphere HostGroup zonal configuration is allowed with default Feature Set",
++			installConfig: func() *types.InstallConfig {
++				c := validInstallConfig()
++				c.FeatureSet = v1.Default
++				c.AWS = nil // validInstallConfig defaults to AWS
++				c.VSphere = validVSpherePlatform()
++				c.VSphere.FailureDomains[0].RegionType = vsphere.ComputeClusterFailureDomain
++				c.VSphere.FailureDomains[0].ZoneType = vsphere.HostGroupFailureDomain
++				c.VSphere.FailureDomains[0].Topology.HostGroup = "host-group-a"
++				return c
++			}(),
++		},
+ 		{
+ 			name: "Azure user-assigned identities (control plane) > 1 requires MachineAPIMigration feature gate",
+ 			installConfig: func() *types.InstallConfig {
+diff --git a/pkg/types/vsphere/validation/featuregates.go b/pkg/types/vsphere/validation/featuregates.go
+index 8cbe5f60266..a4c03171018 100644
+--- a/pkg/types/vsphere/validation/featuregates.go
++++ b/pkg/types/vsphere/validation/featuregates.go
+@@ -7,7 +7,6 @@ import (
+ 	"github.com/openshift/api/features"
+ 	"github.com/openshift/installer/pkg/types"
+ 	"github.com/openshift/installer/pkg/types/featuregates"
+-	"github.com/openshift/installer/pkg/types/vsphere"
+ )
+ 
+ // GatedFeatures determines all of the vSphere install config fields that should
+@@ -38,17 +37,6 @@ func GatedFeatures(c *types.InstallConfig) []featuregates.GatedInstallConfigFeat
+ 			Condition:       nodeNetworkingDefined,
+ 			Field:           field.NewPath("platform", "vsphere", "nodeNetworking"),
+ 		},
+-		{
+-			FeatureGateName: features.FeatureGateVSphereHostVMGroupZonal,
+-			Condition: func(v *vsphere.Platform) bool {
+-				for _, fd := range v.FailureDomains {
+-					if fd.ZoneType == vsphere.HostGroupFailureDomain || fd.Topology.HostGroup != "" {
+-						return true
+-					}
+-				}
+-				return false
+-			}(v),
+-		},
+ 		{
+ 			FeatureGateName: features.FeatureGateVSphereMultiDisk,
+ 			Condition:       cpDef != nil && len(cpDef.DataDisks) > 0, // Here we need to check disk count

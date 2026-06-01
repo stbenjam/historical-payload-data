@@ -1,0 +1,1222 @@
+diff --git a/docs/hive-integration/README.md b/docs/hive-integration/README.md
+index e474affdc844..69ba96690bc8 100644
+--- a/docs/hive-integration/README.md
++++ b/docs/hive-integration/README.md
+@@ -330,6 +330,131 @@ metadata:
+ ...
+ ```
+ 
++### Ignoring cluster and host validations
++
++The Assisted Service runs a set of validations on clusters and hosts before allowing installation to proceed.
++In some cases, specific validations may need to be bypassed. There are two mechanisms for this:
++**disabling** validations at the service level, and **ignoring** validations on a per-cluster basis.
++
++> [!WARNING]
++> Using either of the mechanisms below is unsupported and voids support for the affected cluster.
++> Assisted Service validations exist to ensure that cluster provisioning can succeed safely and predictably.
++> If validations are disabled or ignored, we cannot support customers using that configuration, because the installation may proceed despite known issues that would normally block provisioning.
++
++#### Semantics: disabled vs. ignored
++
++These two mechanisms have different effects:
++
++| | Disabled (service-level) | Ignored (per-cluster) |
++|---|---|---|
++| **Scope** | All clusters managed by the service instance | A single cluster |
++| **Behaviour** | Validation is **not executed**; reported as `disabled` | Validation **runs** and reports its actual result, but does not block installation |
++| **Configuration** | Environment variable on the Assisted Service deployment | Annotation on `AgentClusterInstall` (Kube API) or REST API call |
++
++In both cases, the state machine treats the affected validation as passing, allowing the cluster to proceed to installation even if the underlying condition is not met.
++
++**Per-cluster overrides service-level**: when per-cluster ignored validations are set for a cluster (even if the list is empty), the service-level disabled validations do not apply to that cluster. For example, if `DISABLED_CLUSTER_VALIDATIONS=A,B,C` is set globally and a cluster has `ignored-cluster-validations: B`, only validation B is ignored for that cluster — A and C run normally. Setting the annotation to an empty value explicitly overrides the service-level configuration with zero ignored validations.
++
++Validation IDs are checked for validity: unknown or misspelled IDs are rejected with an error in both the REST API and Kube API paths.
++
++#### Service-level: disabling validations via environment variables
++
++Validations can be disabled globally (for all clusters) by setting environment variables on the Assisted Service deployment.
++Disabled validations are skipped entirely and reported with a `disabled` status.
++
++| Environment Variable | Description |
++|---|---|
++| `DISABLED_HOST_VALIDATIONS` | Comma-separated list of host validation IDs to disable |
++| `DISABLED_CLUSTER_VALIDATIONS` | Comma-separated list of cluster validation IDs to disable |
++
++Example:
++```
++DISABLED_HOST_VALIDATIONS=valid-platform,container-images-available
++DISABLED_CLUSTER_VALIDATIONS=ntp-server-configured,dns-domain-defined
++```
++
++See [Specifying environmental variables via ConfigMap](../operator.md#specifying-environmental-variables-via-configmap) for how to set these in an operator-based deployment.
++
++#### Per-cluster: ignoring validations via annotations
++
++Validations can be ignored on a per-cluster basis by setting annotations on the AgentClusterInstall CR.
++Ignored validations still run and report their actual result, but they do not block installation.
++This leverages the same mechanism available in the REST API (`PUT /v2/clusters/{cluster_id}/ignored-validations`).
++
++> [!NOTE]
++> In the REST API, ignoring validations requires the organization to have the `IgnoreValidations` capability enabled.
++> In the Kube API, no such capability check is performed — any user with permission to annotate the `AgentClusterInstall` CR can ignore validations.
++
++| Annotation | Description |
++|---|---|
++| `agent-install.openshift.io/ignored-cluster-validations` | Comma-separated list of cluster validation IDs to ignore |
++| `agent-install.openshift.io/ignored-host-validations` | Comma-separated list of host validation IDs to ignore |
++
++Example:
++```sh
++$ kubectl annotate agentclusterinstalls.extensions.hive.openshift.io my-cluster -n mynamespace \
++    agent-install.openshift.io/ignored-cluster-validations="dns-domain-defined,ntp-server-configured" \
++    agent-install.openshift.io/ignored-host-validations="has-cpu-cores-for-role,has-memory-for-role"
++```
++
++```sh
++$ kubectl get agentclusterinstalls.extensions.hive.openshift.io my-cluster -n mynamespace -o yaml
++```
++```yaml
++apiVersion: extensions.hive.openshift.io/v1beta1
++kind: AgentClusterInstall
++metadata:
++  annotations:
++    agent-install.openshift.io/ignored-cluster-validations: dns-domain-defined,ntp-server-configured
++    agent-install.openshift.io/ignored-host-validations: has-cpu-cores-for-role,has-memory-for-role
++  name: my-cluster
++  namespace: mynamespace
++...
++```
++
++To remove ignored validations, delete the annotations:
++```sh
++$ kubectl annotate agentclusterinstalls.extensions.hive.openshift.io my-cluster -n mynamespace \
++    agent-install.openshift.io/ignored-cluster-validations- \
++    agent-install.openshift.io/ignored-host-validations-
++```
++
++Note that certain mandatory validations cannot be ignored. For cluster validations these are:
++`api-vips-defined`, `ingress-vips-defined`, `all-hosts-are-ready-to-install`, `sufficient-masters-count`, `pull-secret-set`.
++For host validations: `connected`, `has-inventory`, `machine-cidr-defined`, `hostname-unique`, `hostname-valid`.
++
++#### Annotation format and database representation
++
++The annotation value is a **comma-separated list** of validation IDs. The controller converts it to a **JSON array** before persisting it to the database. The table below shows how different annotation states map to what is stored in the `clusters` table:
++
++| Scenario | Annotation on AgentClusterInstall | Value stored in DB (`ignored_cluster_validations`) |
++|---|---|---|
++| Ignore specific validations | `"dns-domain-defined,ntp-server-configured"` | `["dns-domain-defined","ntp-server-configured"]` |
++| Ignore a single validation | `"ntp-server-configured"` | `["ntp-server-configured"]` |
++| Annotation present but empty (explicit override with zero ignores) | `""` | `[]` |
++| Annotation absent (no override; service-level disabled validations still apply) | *(annotation not set)* | *(empty string — no value stored)* |
++
++The same format applies to `ignored-host-validations` / `ignored_host_validations`.
++
++> [!NOTE]
++> There is an important distinction between an **absent annotation** and an **empty annotation**.
++> When the annotation is absent, the service-level disabled validations (set via `DISABLED_CLUSTER_VALIDATIONS` / `DISABLED_HOST_VALIDATIONS`) still apply to the cluster.
++> When the annotation is explicitly set to an empty value (`""`), it overrides the service-level configuration: no validations are ignored or disabled for that cluster, even if the environment variables list some.
++
++**Example: setting an explicit empty override**
++```sh
++$ kubectl annotate agentclusterinstalls.extensions.hive.openshift.io my-cluster -n mynamespace \
++    agent-install.openshift.io/ignored-cluster-validations=""
++```
++
++**Example: removing the override (reverting to service-level defaults)**
++```sh
++$ kubectl annotate agentclusterinstalls.extensions.hive.openshift.io my-cluster -n mynamespace \
++    agent-install.openshift.io/ignored-cluster-validations-
++```
++
++For more background on the ignored validations feature, see the [enhancement proposal](../enhancements/api-for-ignoring-validations.md).
++
+ ### Creating host installer args overrides
+ 
+ In order to alter the default coreos-installer arguments used when running `coreos-installer`openshift-install create command.
+diff --git a/internal/bminventory/inventory.go b/internal/bminventory/inventory.go
+index 7155e924d2e9..2321763c32d0 100644
+--- a/internal/bminventory/inventory.go
++++ b/internal/bminventory/inventory.go
+@@ -189,6 +189,7 @@ type InstallerInternals interface {
+ 	V2UpdateHostInstallProgressInternal(ctx context.Context, params installer.V2UpdateHostInstallProgressParams) error
+ 	CreateHostInKubeKeyNamespace(ctx context.Context, kubeKey types.NamespacedName, host *models.Host) error
+ 	GetHostByIdInternal(ctx context.Context, hostId string) (*common.Host, error)
++	SetIgnoredValidationsInternal(ctx context.Context, clusterID strfmt.UUID, ignoredClusterValidations, ignoredHostValidations string) error
+ }
+ 
+ //go:generate mockgen --build_flags=--mod=mod -package bminventory -destination mock_crd_utils.go . CRDUtils
+diff --git a/internal/bminventory/inventory_test.go b/internal/bminventory/inventory_test.go
+index 6a473ef8329d..bb31320b50d6 100644
+--- a/internal/bminventory/inventory_test.go
++++ b/internal/bminventory/inventory_test.go
+@@ -5463,6 +5463,57 @@ var _ = Describe("cluster", func() {
+ 			})
+ 		})
+ 
++		Describe("SetIgnoredValidationsInternal", func() {
++			type rejectionCase struct {
++				name                   string
++				clusterStatus          string
++				updatabilityError      error
++				ignoredValidations     string
++				expectedErrorSubstring string
++			}
++
++			cases := []rejectionCase{
++				{
++					name:                   "rejects unknown cluster validation IDs",
++					clusterStatus:          models.ClusterStatusReady,
++					updatabilityError:      nil,
++					ignoredValidations:     `["not-a-real-validation"]`,
++					expectedErrorSubstring: "Validation ID 'not-a-real-validation' is not a known cluster validation",
++				},
++				{
++					name:                   "rejects non-ignorable cluster validations",
++					clusterStatus:          models.ClusterStatusReady,
++					updatabilityError:      nil,
++					ignoredValidations:     `["pull-secret-set"]`,
++					expectedErrorSubstring: "unable to ignore the following cluster validations (pull-secret-set)",
++				},
++				{
++					name:                   "rejects updates when the cluster is not updatable",
++					clusterStatus:          models.ClusterStatusPreparingForInstallation,
++					updatabilityError:      errors.Errorf("wrong state"),
++					ignoredValidations:     `["dns-domain-defined"]`,
++					expectedErrorSubstring: "wrong state",
++				},
++			}
++
++			for i := range cases {
++				tc := cases[i]
++				It(tc.name, func() {
++					cluster := &common.Cluster{Cluster: models.Cluster{
++						ID:               &clusterID,
++						OpenshiftVersion: common.TestDefaultConfig.OpenShiftVersion,
++						Status:           swag.String(tc.clusterStatus),
++					}}
++					createCluster(cluster)
++					mockClusterApi.EXPECT().VerifyClusterUpdatability(createClusterIdMatcher(cluster)).Return(tc.updatabilityError).Times(1)
++
++					err := bm.SetIgnoredValidationsInternal(ctx, *cluster.ID, tc.ignoredValidations, "")
++					Expect(err).To(HaveOccurred())
++					Expect(err.Error()).To(ContainSubstring(tc.expectedErrorSubstring))
++				})
++			}
++		})
++
+ 		Describe("V2GetClusterUISettings", func() {
+ 			It("returns ui settings for cluster", func() {
+ 				createCluster(defaultCluster)
+diff --git a/internal/bminventory/inventory_v2_handlers.go b/internal/bminventory/inventory_v2_handlers.go
+index 67f11424e540..d56cb49978fc 100644
+--- a/internal/bminventory/inventory_v2_handlers.go
++++ b/internal/bminventory/inventory_v2_handlers.go
+@@ -713,6 +713,34 @@ func (b *bareMetalInventory) validateIgnoredValidations(problems []string, ignor
+ 	return problems
+ }
+ 
++// applyIgnoredValidations validates and persists the given ignored cluster and host validation
++// ID lists (JSON arrays) to the database for the specified cluster. It verifies that the cluster
++// is in an updatable state and that none of the requested validations are non-ignorable.
++func (b *bareMetalInventory) applyIgnoredValidations(cluster *common.Cluster, ignoredClusterValidations, ignoredHostValidations string) error {
++	if err := b.clusterApi.VerifyClusterUpdatability(cluster); err != nil {
++		return common.NewApiError(http.StatusBadRequest, err)
++	}
++
++	problems := []string{}
++	problems = b.validateIgnoredValidations(problems, ignoredClusterValidations, common.NonIgnorableClusterValidations, common.ValidationTypeCluster)
++	problems = b.validateIgnoredValidations(problems, ignoredHostValidations, common.NonIgnorableHostValidations, common.ValidationTypeHost)
++	if len(problems) > 0 {
++		return common.NewApiError(http.StatusBadRequest, errors.New("cannot proceed due to the following errors: "+strings.Join(problems, "\n")))
++	}
++
++	if err := b.db.Model(&common.Cluster{}).Where("id = ?", cluster.ID.String()).Updates(map[string]interface{}{
++		"ignored_cluster_validations": ignoredClusterValidations,
++		"ignored_host_validations":    ignoredHostValidations,
++	}).Error; err != nil {
++		return errors.Wrapf(err, "failed to apply ignored validations to cluster %s", *cluster.ID)
++	}
++
++	cluster.IgnoredClusterValidations = ignoredClusterValidations
++	cluster.IgnoredHostValidations = ignoredHostValidations
++
++	return nil
++}
++
+ func (b *bareMetalInventory) V2GetIgnoredValidations(ctx context.Context, params installer.V2GetIgnoredValidationsParams) middleware.Responder {
+ 	if !b.allowedToIgnoreValidations(ctx) {
+ 
+@@ -736,24 +764,14 @@ func (b *bareMetalInventory) V2SetIgnoredValidations(ctx context.Context, params
+ 	}
+ 	cluster, err := b.getCluster(ctx, params.ClusterID.String())
+ 	if err != nil {
+-		err = errors.Wrapf(err, "failed to fetch cluster %s to apply ignored validations", *cluster.ID)
++		err = errors.Wrapf(err, "failed to fetch cluster %s to apply ignored validations", params.ClusterID)
+ 		return installer.NewV2SetIgnoredValidationsInternalServerError().WithPayload(common.GenerateError(http.StatusInternalServerError, err))
+ 	}
+-	err = b.clusterApi.VerifyClusterUpdatability(cluster)
++	err = b.applyIgnoredValidations(cluster, params.IgnoredValidations.ClusterValidationIds, params.IgnoredValidations.HostValidationIds)
+ 	if err != nil {
+-		return b.setIgnoredValidationsBadRequest(err.Error())
+-	}
+-	problems := []string{}
+-	cluster.IgnoredClusterValidations = params.IgnoredValidations.ClusterValidationIds
+-	cluster.IgnoredHostValidations = params.IgnoredValidations.HostValidationIds
+-
+-	problems = b.validateIgnoredValidations(problems, cluster.IgnoredClusterValidations, common.NonIgnorableClusterValidations, common.ValidationTypeCluster)
+-	problems = b.validateIgnoredValidations(problems, cluster.IgnoredHostValidations, common.NonIgnorableHostValidations, common.ValidationTypeHost)
+-	if len(problems) > 0 {
+-		return b.setIgnoredValidationsBadRequest("cannot proceed due to the following errors: " + strings.Join(problems, "\n"))
+-	}
+-
+-	if err = b.db.Save(cluster).Error; err != nil {
++		if apiErr, ok := err.(*common.ApiErrorResponse); ok && apiErr.StatusCode() == http.StatusBadRequest {
++			return b.setIgnoredValidationsBadRequest(apiErr.Error())
++		}
+ 		err = errors.Wrapf(err, "failed to apply ignored validations to cluster %s", *cluster.ID)
+ 		return installer.NewV2SetIgnoredValidationsInternalServerError().WithPayload(common.GenerateError(http.StatusInternalServerError, err))
+ 	}
+@@ -764,6 +782,17 @@ func (b *bareMetalInventory) V2SetIgnoredValidations(ctx context.Context, params
+ 	return installer.NewV2SetIgnoredValidationsCreated().WithPayload(&ignoredValidations)
+ }
+ 
++// SetIgnoredValidationsInternal is the internal (non-REST) entry point for updating ignored
++// validations on a cluster. It is used by the Kube-API controller to apply ignored validations
++// parsed from AgentClusterInstall annotations.
++func (b *bareMetalInventory) SetIgnoredValidationsInternal(ctx context.Context, clusterID strfmt.UUID, ignoredClusterValidations, ignoredHostValidations string) error {
++	cluster, err := common.GetClusterFromDB(b.db, clusterID, common.SkipEagerLoading)
++	if err != nil {
++		return errors.Wrapf(err, "failed to get cluster %s for ignored validations update", clusterID)
++	}
++	return b.applyIgnoredValidations(cluster, ignoredClusterValidations, ignoredHostValidations)
++}
++
+ func (b *bareMetalInventory) V2GetClusterUISettings(ctx context.Context, params installer.V2GetClusterUISettingsParams) middleware.Responder {
+ 	cluster, err := b.getCluster(ctx, params.ClusterID.String())
+ 	if err != nil {
+diff --git a/internal/bminventory/mock_installer_internal.go b/internal/bminventory/mock_installer_internal.go
+index 71a176fe1c27..2d269637b80f 100644
+--- a/internal/bminventory/mock_installer_internal.go
++++ b/internal/bminventory/mock_installer_internal.go
+@@ -367,6 +367,20 @@ func (mr *MockInstallerInternalsMockRecorder) RegisterInfraEnvInternal(arg0, arg
+ 	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "RegisterInfraEnvInternal", reflect.TypeOf((*MockInstallerInternals)(nil).RegisterInfraEnvInternal), arg0, arg1, arg2, arg3)
+ }
+ 
++// SetIgnoredValidationsInternal mocks base method.
++func (m *MockInstallerInternals) SetIgnoredValidationsInternal(arg0 context.Context, arg1 strfmt.UUID, arg2, arg3 string) error {
++	m.ctrl.T.Helper()
++	ret := m.ctrl.Call(m, "SetIgnoredValidationsInternal", arg0, arg1, arg2, arg3)
++	ret0, _ := ret[0].(error)
++	return ret0
++}
++
++// SetIgnoredValidationsInternal indicates an expected call of SetIgnoredValidationsInternal.
++func (mr *MockInstallerInternalsMockRecorder) SetIgnoredValidationsInternal(arg0, arg1, arg2, arg3 interface{}) *gomock.Call {
++	mr.mock.ctrl.T.Helper()
++	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "SetIgnoredValidationsInternal", reflect.TypeOf((*MockInstallerInternals)(nil).SetIgnoredValidationsInternal), arg0, arg1, arg2, arg3)
++}
++
+ // TransformClusterToDay2Internal mocks base method.
+ func (m *MockInstallerInternals) TransformClusterToDay2Internal(arg0 context.Context, arg1 strfmt.UUID) (*common.Cluster, error) {
+ 	m.ctrl.T.Helper()
+diff --git a/internal/cluster/cluster.go b/internal/cluster/cluster.go
+index fed04f264cd6..07cfb076a914 100644
+--- a/internal/cluster/cluster.go
++++ b/internal/cluster/cluster.go
+@@ -154,7 +154,38 @@ type Config struct {
+ 	// MonitorBlacklistDuration is how long to blacklist a cluster after a deadline is exceeded
+ 	MonitorBlacklistDuration time.Duration `envconfig:"CLUSTER_MONITOR_BLACKLIST_DURATION" default:"15m"`
+ 	// MonitorCycleDeadline bounds the total time for one ClusterMonitoring cycle
+-	MonitorCycleDeadline time.Duration `envconfig:"CLUSTER_MONITOR_CYCLE_DEADLINE" default:"4m"`
++	MonitorCycleDeadline       time.Duration              `envconfig:"CLUSTER_MONITOR_CYCLE_DEADLINE" default:"4m"`
++	DisabledClusterValidations DisabledClusterValidations `envconfig:"DISABLED_CLUSTER_VALIDATIONS" default:""`
++}
++
++type DisabledClusterValidations map[string]struct{}
++
++// Decode parses a comma-separated string of cluster validation IDs into the
++// DisabledClusterValidations map. It implements the envconfig.Decoder interface
++// so that DISABLED_CLUSTER_VALIDATIONS can be loaded from environment variables.
++func (d *DisabledClusterValidations) Decode(value string) error {
++	disabledClusterValidations := DisabledClusterValidations{}
++	if value == `""` {
++		value = ""
++	}
++	validationIDs, err := common.ParseCommaSeparatedUniqueValues(value, "cluster validation ID")
++	if err != nil {
++		return err
++	}
++	for _, element := range validationIDs {
++		if err := models.ClusterValidationID(element).Validate(nil); err != nil {
++			return fmt.Errorf("disabled cluster validation ID '%s' is not a known cluster validation", element)
++		}
++		disabledClusterValidations[element] = struct{}{}
++	}
++	*d = disabledClusterValidations
++	return nil
++}
++
++// IsDisabled returns true if the given validation ID is present in the disabled set.
++func (d DisabledClusterValidations) IsDisabled(id ValidationID) bool {
++	_, ok := d[id.String()]
++	return ok
+ }
+ 
+ type Manager struct {
+@@ -213,7 +244,7 @@ func NewManager(cfg Config, log logrus.FieldLogger, db *gorm.DB, stream stream.N
+ 		metricAPI:             metricApi,
+ 		manifestsGeneratorAPI: manifestsGeneratorAPI,
+ 		hostAPI:               hostAPI,
+-		rp:                    newRefreshPreprocessor(log, hostAPI, operatorsApi, usageApi, eventsHandler),
++		rp:                    newRefreshPreprocessor(log, hostAPI, operatorsApi, usageApi, eventsHandler, cfg.DisabledClusterValidations),
+ 		leaderElector:         leaderElector,
+ 		prevMonitorInvokedAt:  time.Time{},
+ 		ocmClient:             ocmClient,
+diff --git a/internal/cluster/refresh_status_preprocessor.go b/internal/cluster/refresh_status_preprocessor.go
+index 5e065be03088..c7a6867baf3a 100644
+--- a/internal/cluster/refresh_status_preprocessor.go
++++ b/internal/cluster/refresh_status_preprocessor.go
+@@ -3,6 +3,7 @@ package cluster
+ import (
+ 	"context"
+ 	"encoding/json"
++	"errors"
+ 	"fmt"
+ 	"reflect"
+ 	"sort"
+@@ -36,32 +37,39 @@ type stringer interface {
+ }
+ 
+ type refreshPreprocessor struct {
+-	log           logrus.FieldLogger
+-	validations   []validation
+-	conditions    []condition
+-	operatorsAPI  operators.API
+-	usageAPI      usage.API
+-	eventsHandler eventsapi.Handler
++	log                        logrus.FieldLogger
++	validations                []validation
++	conditions                 []condition
++	operatorsAPI               operators.API
++	usageAPI                   usage.API
++	eventsHandler              eventsapi.Handler
++	disabledClusterValidations DisabledClusterValidations
+ }
+ 
+ func newRefreshPreprocessor(log logrus.FieldLogger, hostAPI host.API, operatorsAPI operators.API, usageAPI usage.API,
+-	eventsHandler eventsapi.Handler) *refreshPreprocessor {
++	eventsHandler eventsapi.Handler, disabledClusterValidations DisabledClusterValidations) *refreshPreprocessor {
+ 	v := clusterValidator{
+ 		log:     log,
+ 		hostAPI: hostAPI,
+ 	}
+ 
+ 	return &refreshPreprocessor{
+-		log:           log,
+-		validations:   newValidations(&v),
+-		conditions:    newConditions(&v),
+-		operatorsAPI:  operatorsAPI,
+-		usageAPI:      usageAPI,
+-		eventsHandler: eventsHandler,
++		log:                        log,
++		validations:                newValidations(&v),
++		conditions:                 newConditions(&v),
++		operatorsAPI:               operatorsAPI,
++		usageAPI:                   usageAPI,
++		eventsHandler:              eventsHandler,
++		disabledClusterValidations: disabledClusterValidations,
+ 	}
+ }
+ 
++const validationDisabledByConfiguration = "Validation disabled by configuration"
++
+ func (r *refreshPreprocessor) preprocess(ctx context.Context, c *clusterPreprocessContext) (map[string]bool, map[string][]ValidationResult, error) {
++	if c.cluster == nil {
++		return nil, nil, errors.New("cluster is nil")
++	}
+ 	stateMachineInput := make(map[string]bool)
+ 	validationsOutput := make(map[string][]ValidationResult)
+ 	checkValidationsInStatuses := []string{
+@@ -69,7 +77,8 @@ func (r *refreshPreprocessor) preprocess(ctx context.Context, c *clusterPreproce
+ 	}
+ 	var ignoredValidations []string
+ 	var err error
+-	if c.cluster != nil {
++	hasPerClusterOverride := c.cluster.IgnoredClusterValidations != ""
++	if hasPerClusterOverride {
+ 		ignoredValidations, err = common.DeserializeJSONList(c.cluster.IgnoredClusterValidations)
+ 		if err != nil {
+ 			return nil, nil, fmt.Errorf("unable to deserialize ignored cluster validations for cluster %s: %w", c.cluster.ID.String(), err)
+@@ -81,8 +90,16 @@ func (r *refreshPreprocessor) preprocess(ctx context.Context, c *clusterPreproce
+ 		return stateMachineInput, validationsOutput, nil
+ 	}
+ 	for _, v := range r.validations {
+-		st, message := v.condition(c)
+-		stateMachineInput[v.id.String()] = st == ValidationSuccess
++		var st ValidationStatus
++		var message string
++		if !hasPerClusterOverride && r.disabledClusterValidations.IsDisabled(v.id) {
++			st = ValidationDisabled
++			message = validationDisabledByConfiguration
++			stateMachineInput[v.id.String()] = true
++		} else {
++			st, message = v.condition(c)
++			stateMachineInput[v.id.String()] = st == ValidationSuccess
++		}
+ 		var category string
+ 		category, err = v.id.Category()
+ 		if err != nil {
+diff --git a/internal/cluster/refresh_status_preprocessor_test.go b/internal/cluster/refresh_status_preprocessor_test.go
+index 240e82254ff3..1c528a785ba4 100644
+--- a/internal/cluster/refresh_status_preprocessor_test.go
++++ b/internal/cluster/refresh_status_preprocessor_test.go
+@@ -2,11 +2,13 @@ package cluster
+ 
+ import (
+ 	"context"
++	"os"
+ 	"strings"
+ 
+ 	"github.com/go-openapi/strfmt"
+ 	"github.com/golang/mock/gomock"
+ 	"github.com/google/uuid"
++	"github.com/kelseyhightower/envconfig"
+ 	. "github.com/onsi/ginkgo"
+ 	. "github.com/onsi/gomega"
+ 	"github.com/openshift/assisted-service/internal/common"
+@@ -48,6 +50,7 @@ var _ = Describe("Cluster Refresh Status Preprocessor", func() {
+ 			mockOperatorManager,
+ 			mockUsageApi,
+ 			nil,
++			DisabledClusterValidations{},
+ 		)
+ 	})
+ 
+@@ -241,4 +244,217 @@ var _ = Describe("Cluster Refresh Status Preprocessor", func() {
+ 			Expect(err).ToNot(HaveOccurred())
+ 		})
+ 	})
++
++	Context("Disabled Cluster Validations", func() {
++		var validationContext *clusterPreprocessContext
++
++		BeforeEach(func() {
++			createCluster()
++			validationContext = newClusterValidationContext(cluster, db)
++		})
++
++		AfterEach(func() {
++			deleteCluster()
++		})
++
++		It("Should mark disabled validations with disabled status and pass them in the state machine", func() {
++			disabledValidations := DisabledClusterValidations{
++				string(IsDNSDomainDefined):    {},
++				string(IsNtpServerConfigured): {},
++			}
++			preprocessor = newRefreshPreprocessor(
++				logrus.New(),
++				mockHostApi,
++				mockOperatorManager,
++				mockUsageApi,
++				nil,
++				disabledValidations,
++			)
++			mockNoChangeInOperatorDependencies()
++			mockOperatorValidationsSuccess()
++
++			conditions, validationsOutput, err := preprocessor.preprocess(ctx, validationContext)
++			Expect(err).ToNot(HaveOccurred())
++
++			for _, disabledID := range []string{string(IsDNSDomainDefined), string(IsNtpServerConfigured)} {
++				conditionState, conditionPresent := conditions[disabledID]
++				Expect(conditionPresent).To(BeTrue(), disabledID+" was not present in conditions")
++				Expect(conditionState).To(BeTrue(), disabledID+" was not forced to true")
++			}
++
++			for _, results := range validationsOutput {
++				for _, v := range results {
++					if v.ID == IsDNSDomainDefined || v.ID == IsNtpServerConfigured {
++						Expect(v.Status).To(Equal(ValidationDisabled), string(v.ID)+" was not disabled")
++						Expect(v.Message).To(Equal(validationDisabledByConfiguration))
++					}
++				}
++			}
++		})
++
++		It("Should run non-disabled validations normally", func() {
++			disabledValidations := DisabledClusterValidations{
++				string(IsDNSDomainDefined): {},
++			}
++			preprocessor = newRefreshPreprocessor(
++				logrus.New(),
++				mockHostApi,
++				mockOperatorManager,
++				mockUsageApi,
++				nil,
++				disabledValidations,
++			)
++			mockNoChangeInOperatorDependencies()
++			mockOperatorValidationsSuccess()
++
++			_, validationsOutput, err := preprocessor.preprocess(ctx, validationContext)
++			Expect(err).ToNot(HaveOccurred())
++
++			for _, results := range validationsOutput {
++				for _, v := range results {
++					if v.ID == IsNtpServerConfigured {
++						Expect(v.Status).ToNot(Equal(ValidationDisabled), "non-disabled validation should not be disabled")
++					}
++				}
++			}
++		})
++
++		It("Should work with empty disabled set", func() {
++			preprocessor = newRefreshPreprocessor(
++				logrus.New(),
++				mockHostApi,
++				mockOperatorManager,
++				mockUsageApi,
++				nil,
++				DisabledClusterValidations{},
++			)
++			mockNoChangeInOperatorDependencies()
++			mockOperatorValidationsSuccess()
++
++			_, validationsOutput, err := preprocessor.preprocess(ctx, validationContext)
++			Expect(err).ToNot(HaveOccurred())
++
++			for _, results := range validationsOutput {
++				for _, v := range results {
++					Expect(v.Status).ToNot(Equal(ValidationDisabled))
++				}
++			}
++		})
++
++		It("Per-cluster ignored validations override service-level disabled validations", func() {
++			disabledValidations := DisabledClusterValidations{
++				string(IsDNSDomainDefined):    {},
++				string(IsNtpServerConfigured): {},
++				string(IsMachineCidrDefined):  {},
++			}
++			preprocessor = newRefreshPreprocessor(
++				logrus.New(),
++				mockHostApi,
++				mockOperatorManager,
++				mockUsageApi,
++				nil,
++				disabledValidations,
++			)
++			mockNoChangeInOperatorDependencies()
++			mockOperatorValidationsSuccess()
++
++			cluster.IgnoredClusterValidations = `["ntp-server-configured"]`
++			validationContext = newClusterValidationContext(cluster, db)
++
++			conditions, validationsOutput, err := preprocessor.preprocess(ctx, validationContext)
++			Expect(err).ToNot(HaveOccurred())
++
++			for _, results := range validationsOutput {
++				for _, v := range results {
++					Expect(v.Status).ToNot(Equal(ValidationDisabled),
++						string(v.ID)+" should not be disabled when per-cluster override is set")
++				}
++			}
++
++			ntpCondition, ntpPresent := conditions[string(IsNtpServerConfigured)]
++			Expect(ntpPresent).To(BeTrue())
++			Expect(ntpCondition).To(BeTrue(), "ignored validation should be forced to true in state machine")
++		})
++
++		It("Per-cluster empty ignored list overrides service-level disabled validations", func() {
++			disabledValidations := DisabledClusterValidations{
++				string(IsDNSDomainDefined):    {},
++				string(IsNtpServerConfigured): {},
++			}
++			preprocessor = newRefreshPreprocessor(
++				logrus.New(),
++				mockHostApi,
++				mockOperatorManager,
++				mockUsageApi,
++				nil,
++				disabledValidations,
++			)
++			mockNoChangeInOperatorDependencies()
++			mockOperatorValidationsSuccess()
++
++			cluster.IgnoredClusterValidations = `[]`
++			validationContext = newClusterValidationContext(cluster, db)
++
++			_, validationsOutput, err := preprocessor.preprocess(ctx, validationContext)
++			Expect(err).ToNot(HaveOccurred())
++
++			for _, results := range validationsOutput {
++				for _, v := range results {
++					Expect(v.Status).ToNot(Equal(ValidationDisabled),
++						string(v.ID)+" should not be disabled when per-cluster override is explicitly empty")
++				}
++			}
++		})
++	})
++})
++
++var _ = Describe("Disabled Cluster Validation Config", func() {
++	const (
++		disabledClusterValidationEnvironmentName = "DISABLED_CLUSTER_VALIDATIONS"
++		twoValidationIDs                         = "dns-domain-defined,ntp-server-configured"
++		malformedValue                           = "dns-domain-defined,,"
++	)
++
++	AfterEach(func() {
++		os.Unsetenv(disabledClusterValidationEnvironmentName)
++	})
++
++	It("should have values when environment is defined", func() {
++		Expect(os.Setenv(disabledClusterValidationEnvironmentName, twoValidationIDs)).NotTo(HaveOccurred())
++		cfg := Config{}
++		Expect(envconfig.Process(common.EnvConfigPrefix, &cfg)).ToNot(HaveOccurred())
++		Expect(cfg.DisabledClusterValidations.IsDisabled("dns-domain-defined")).To(BeTrue())
++		Expect(cfg.DisabledClusterValidations.IsDisabled("ntp-server-configured")).To(BeTrue())
++	})
++
++	It("should trim whitespace around environment values", func() {
++		Expect(os.Setenv(disabledClusterValidationEnvironmentName, "dns-domain-defined, ntp-server-configured")).NotTo(HaveOccurred())
++		cfg := Config{}
++		Expect(envconfig.Process(common.EnvConfigPrefix, &cfg)).ToNot(HaveOccurred())
++		Expect(cfg.DisabledClusterValidations.IsDisabled("dns-domain-defined")).To(BeTrue())
++		Expect(cfg.DisabledClusterValidations.IsDisabled("ntp-server-configured")).To(BeTrue())
++	})
++
++	It("should have no values when environment is not defined", func() {
++		cfg := Config{}
++		Expect(envconfig.Process(common.EnvConfigPrefix, &cfg)).ToNot(HaveOccurred())
++		Expect(cfg.DisabledClusterValidations.IsDisabled("dns-domain-defined")).To(BeFalse())
++	})
++
++	It("should error when environment value is malformed", func() {
++		Expect(os.Setenv(disabledClusterValidationEnvironmentName, malformedValue)).NotTo(HaveOccurred())
++		cfg := Config{}
++		err := envconfig.Process(common.EnvConfigPrefix, &cfg)
++		Expect(err).To(HaveOccurred())
++		Expect(err.Error()).To(ContainSubstring("empty cluster validation ID found in"))
++	})
++
++	It("should error when environment value contains an unknown validation ID", func() {
++		Expect(os.Setenv(disabledClusterValidationEnvironmentName, "dns-domain-defined,not-a-real-validation")).NotTo(HaveOccurred())
++		cfg := Config{}
++		err := envconfig.Process(common.EnvConfigPrefix, &cfg)
++		Expect(err).To(HaveOccurred())
++		Expect(err.Error()).To(ContainSubstring("not-a-real-validation"))
++		Expect(err.Error()).To(ContainSubstring("not a known cluster validation"))
++	})
+ })
+diff --git a/internal/cluster/validator.go b/internal/cluster/validator.go
+index 2cff8a264d23..7e79cb835b80 100644
+--- a/internal/cluster/validator.go
++++ b/internal/cluster/validator.go
+@@ -29,6 +29,7 @@ const (
+ 	ValidationFailure     ValidationStatus = "failure"
+ 	ValidationPending     ValidationStatus = "pending"
+ 	ValidationError       ValidationStatus = "error"
++	ValidationDisabled    ValidationStatus = "disabled"
+ 	DefaultIPV4HostPrefix                  = 25
+ 	DefaultIPV6HostPrefix                  = 64
+ )
+diff --git a/internal/common/validations.go b/internal/common/validations.go
+index 86fba3fcb296..c45147ed1555 100644
+--- a/internal/common/validations.go
++++ b/internal/common/validations.go
+@@ -4,6 +4,9 @@
+ package common
+ 
+ import (
++	"fmt"
++	"strings"
++
+ 	"github.com/go-openapi/swag"
+ 	"github.com/openshift/assisted-service/models"
+ )
+@@ -59,3 +62,31 @@ func MayIgnoreValidations(validationIDs []string, nonIgnorables []string) (bool,
+ 	}
+ 	return result, cantBeIgnored
+ }
++
++// ParseCommaSeparatedUniqueValues splits a comma-separated string into a deduplicated slice
++// of trimmed values. It returns an error if any item is empty after trimming (e.g. "a,,b").
++// itemDescription is used in error messages to describe what the values represent.
++// Returns (nil, nil) when the input is empty or whitespace-only.
++func ParseCommaSeparatedUniqueValues(value string, itemDescription string) ([]string, error) {
++	value = strings.TrimSpace(value)
++	if value == "" {
++		return nil, nil
++	}
++
++	result := make([]string, 0)
++	seen := make(map[string]struct{})
++
++	for _, item := range strings.Split(value, ",") {
++		item = strings.TrimSpace(item)
++		if item == "" {
++			return nil, fmt.Errorf("empty %s found in '%s'", itemDescription, value)
++		}
++		if _, exists := seen[item]; exists {
++			continue
++		}
++		seen[item] = struct{}{}
++		result = append(result, item)
++	}
++
++	return result, nil
++}
+diff --git a/internal/controller/controllers/clusterdeployments_controller.go b/internal/controller/controllers/clusterdeployments_controller.go
+index 9c07d3faa701..c6caeeae05ae 100644
+--- a/internal/controller/controllers/clusterdeployments_controller.go
++++ b/internal/controller/controllers/clusterdeployments_controller.go
+@@ -80,11 +80,13 @@ import (
+ )
+ 
+ const (
+-	adminPasswordSecretStringTemplate = "%s-admin-password"
+-	adminKubeConfigStringTemplate     = "%s-admin-kubeconfig"
+-	InstallConfigOverrides            = aiv1beta1.Group + "/install-config-overrides"
+-	ClusterDeploymentFinalizerName    = "clusterdeployments." + aiv1beta1.Group + "/ai-deprovision"
+-	AgentClusterInstallFinalizerName  = "agentclusterinstall." + aiv1beta1.Group + "/ai-deprovision"
++	adminPasswordSecretStringTemplate   = "%s-admin-password"
++	adminKubeConfigStringTemplate       = "%s-admin-kubeconfig"
++	InstallConfigOverrides              = aiv1beta1.Group + "/install-config-overrides"
++	IgnoredClusterValidationsAnnotation = aiv1beta1.Group + "/ignored-cluster-validations"
++	IgnoredHostValidationsAnnotation    = aiv1beta1.Group + "/ignored-host-validations"
++	ClusterDeploymentFinalizerName      = "clusterdeployments." + aiv1beta1.Group + "/ai-deprovision"
++	AgentClusterInstallFinalizerName    = "agentclusterinstall." + aiv1beta1.Group + "/ai-deprovision"
+ )
+ 
+ const HighAvailabilityModeNone = "None"
+@@ -256,10 +258,9 @@ func (r *ClusterDeploymentsReconciler) Reconcile(origCtx context.Context, req ct
+ 		return r.updateStatus(ctx, log, clusterInstall, clusterDeployment, cluster, err)
+ 	}
+ 
+-	// check for install config overrides and update if needed
+-	err = r.updateInstallConfigOverrides(ctx, log, clusterInstall, cluster)
++	err = r.applyClusterInstallAnnotations(ctx, log, clusterInstall, cluster)
+ 	if err != nil {
+-		log.WithError(err).Error("failed to update install config overrides")
++		log.WithError(err).Error("failed to apply AgentClusterInstall annotations")
+ 		return r.updateStatus(ctx, log, clusterInstall, clusterDeployment, cluster, err)
+ 	}
+ 
+@@ -1261,7 +1262,7 @@ func (r *ClusterDeploymentsReconciler) updateInstallConfigOverrides(ctx context.
+ 				apiErr := errors.Wrapf(err, "Failed to parse '%s' annotation", InstallConfigOverrides)
+ 				return common.NewApiError(http.StatusBadRequest, apiErr)
+ 			}
+-			return err
++			return errors.Wrapf(err, "failed to update install-config overrides for cluster %s", *cluster.ID)
+ 		}
+ 		log.Infof("Updated InstallConfig overrides on clusterInstall %s/%s", clusterInstall.Namespace, clusterInstall.Name)
+ 		return nil
+@@ -1269,6 +1270,92 @@ func (r *ClusterDeploymentsReconciler) updateInstallConfigOverrides(ctx context.
+ 	return nil
+ }
+ 
++// applyClusterInstallAnnotations processes AgentClusterInstall annotations that affect the
++// cluster configuration, including install-config overrides and ignored validations.
++func (r *ClusterDeploymentsReconciler) applyClusterInstallAnnotations(ctx context.Context, log logrus.FieldLogger,
++	clusterInstall *hiveext.AgentClusterInstall, cluster *common.Cluster) error {
++	if err := r.updateInstallConfigOverrides(ctx, log, clusterInstall, cluster); err != nil {
++		return err
++	}
++	if err := r.updateIgnoredValidations(ctx, log, clusterInstall, cluster); err != nil {
++		return err
++	}
++	return nil
++}
++
++// commaSeparatedToJSONArray converts a comma-separated string (e.g. "a,b,c") into a JSON array
++// string (e.g. '["a","b","c"]'). Returns an empty string when the input has no items.
++func commaSeparatedToJSONArray(csv string) (string, error) {
++	items, err := common.ParseCommaSeparatedUniqueValues(csv, "ignored validation ID")
++	if err != nil {
++		return "", errors.Wrap(err, "failed to parse comma-separated validation IDs")
++	}
++	if len(items) == 0 {
++		return "", nil
++	}
++	data, err := json.Marshal(items)
++	if err != nil {
++		return "", errors.Wrap(err, "failed to marshal ignored validation IDs to JSON")
++	}
++	return string(data), nil
++}
++
++// annotationToIgnoredJSON reads a comma-separated list of validation IDs from the
++// given annotation key and returns it as a JSON array string (e.g. '["id-1","id-2"]').
++// If the annotation is present but empty, it returns "[]".
++// If the annotation is not present, it returns an empty string.
++func annotationToIgnoredJSON(annotations map[string]string, key string) (string, error) {
++	value, exists := annotations[key]
++	if !exists {
++		return "", nil
++	}
++	jsonArray, err := commaSeparatedToJSONArray(value)
++	if err != nil {
++		return "", errors.Wrapf(err, "annotation %q", key)
++	}
++	if jsonArray == "" {
++		return "[]", nil
++	}
++	return jsonArray, nil
++}
++
++// updateIgnoredValidations reads the ignored-cluster-validations and ignored-host-validations
++// annotations from the AgentClusterInstall and applies them to the cluster via the installer API.
++// It is a no-op when the annotations have not changed since the last reconciliation.
++func (r *ClusterDeploymentsReconciler) updateIgnoredValidations(ctx context.Context, log logrus.FieldLogger,
++	clusterInstall *hiveext.AgentClusterInstall, cluster *common.Cluster) error {
++
++	annotations := clusterInstall.ObjectMeta.GetAnnotations()
++
++	newIgnoredCluster, err := annotationToIgnoredJSON(annotations, IgnoredClusterValidationsAnnotation)
++	if err != nil {
++		return common.NewApiError(http.StatusBadRequest, errors.Wrapf(err, "Failed to parse '%s' annotation", IgnoredClusterValidationsAnnotation))
++	}
++	newIgnoredHost, err := annotationToIgnoredJSON(annotations, IgnoredHostValidationsAnnotation)
++	if err != nil {
++		return common.NewApiError(http.StatusBadRequest, errors.Wrapf(err, "Failed to parse '%s' annotation", IgnoredHostValidationsAnnotation))
++	}
++
++	if newIgnoredCluster == cluster.IgnoredClusterValidations && newIgnoredHost == cluster.IgnoredHostValidations {
++		return nil
++	}
++
++	log.Infof("Updating ignored validations on cluster %s/%s (cluster: %q, host: %q)",
++		clusterInstall.Namespace, clusterInstall.Name, newIgnoredCluster, newIgnoredHost)
++
++	err = r.Installer.SetIgnoredValidationsInternal(ctx, *cluster.ID, newIgnoredCluster, newIgnoredHost)
++	if err != nil {
++		if IsUserError(err) {
++			return err
++		}
++		return errors.Wrapf(err, "failed to update ignored validations for cluster %s", cluster.ID)
++	}
++
++	cluster.IgnoredClusterValidations = newIgnoredCluster
++	cluster.IgnoredHostValidations = newIgnoredHost
++	return nil
++}
++
+ func (r *ClusterDeploymentsReconciler) syncManifests(ctx context.Context, log logrus.FieldLogger, cluster *common.Cluster,
+ 	clusterInstall *hiveext.AgentClusterInstall, alreadyCreatedManifests models.ListManifests) error {
+ 
+diff --git a/internal/controller/controllers/clusterdeployments_controller_test.go b/internal/controller/controllers/clusterdeployments_controller_test.go
+index 0c6d2357de3e..8dcebaeb2ac5 100644
+--- a/internal/controller/controllers/clusterdeployments_controller_test.go
++++ b/internal/controller/controllers/clusterdeployments_controller_test.go
+@@ -4074,6 +4074,205 @@ var _ = Describe("cluster reconcile", func() {
+ 			Expect(FindStatusCondition(aci.Status.Conditions, hiveext.ClusterRequirementsMetCondition).Message).To(Equal(hiveext.ClusterNotReadyMsg))
+ 			Expect(FindStatusCondition(aci.Status.Conditions, hiveext.ClusterRequirementsMetCondition).Status).To(Equal(corev1.ConditionFalse))
+ 		})
++
++		It("add ignored cluster validations annotation", func() {
++			mockMirrorRegistries.EXPECT().IsMirrorRegistriesConfigured().AnyTimes().Return(false)
++
++			backEndCluster := getDefaultTestCluster()
++			mockInstallerInternal.EXPECT().GetClusterByKubeKey(gomock.Any()).Return(backEndCluster, nil)
++			mockInstallerInternal.EXPECT().ValidatePullSecret(gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any()).Return(nil).AnyTimes()
++			mockInstallerInternal.EXPECT().HostWithCollectedLogsExists(gomock.Any()).Return(false, nil)
++			mockInstallerInternal.EXPECT().UpdateClusterNonInteractive(gomock.Any(), gomock.Any(), gomock.Any()).Return(backEndCluster, nil).AnyTimes()
++
++			mockInstallerInternal.EXPECT().SetIgnoredValidationsInternal(gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any()).
++				Do(func(ctx context.Context, clusterID strfmt.UUID, ignoredCluster, ignoredHost string) {
++					Expect(clusterID).To(Equal(sId))
++					Expect(ignoredCluster).To(Equal(`["dns-domain-defined","ntp-server-configured"]`))
++					Expect(ignoredHost).To(Equal(""))
++				}).Return(nil)
++
++			aci.ObjectMeta.SetAnnotations(map[string]string{
++				IgnoredClusterValidationsAnnotation: "dns-domain-defined,ntp-server-configured",
++			})
++			Expect(c.Update(ctx, aci)).Should(BeNil())
++			request := newClusterDeploymentRequest(cluster)
++			result, err := cr.Reconcile(ctx, request)
++			Expect(err).To(BeNil())
++			Expect(result).To(Equal(ctrl.Result{}))
++		})
++
++		It("add ignored host validations annotation", func() {
++			mockMirrorRegistries.EXPECT().IsMirrorRegistriesConfigured().AnyTimes().Return(false)
++
++			backEndCluster := getDefaultTestCluster()
++			mockInstallerInternal.EXPECT().GetClusterByKubeKey(gomock.Any()).Return(backEndCluster, nil)
++			mockInstallerInternal.EXPECT().ValidatePullSecret(gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any()).Return(nil).AnyTimes()
++			mockInstallerInternal.EXPECT().HostWithCollectedLogsExists(gomock.Any()).Return(false, nil)
++			mockInstallerInternal.EXPECT().UpdateClusterNonInteractive(gomock.Any(), gomock.Any(), gomock.Any()).Return(backEndCluster, nil).AnyTimes()
++
++			mockInstallerInternal.EXPECT().SetIgnoredValidationsInternal(gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any()).
++				Do(func(ctx context.Context, clusterID strfmt.UUID, ignoredCluster, ignoredHost string) {
++					Expect(clusterID).To(Equal(sId))
++					Expect(ignoredCluster).To(Equal(""))
++					Expect(ignoredHost).To(Equal(`["has-cpu-cores-for-role","has-memory-for-role"]`))
++				}).Return(nil)
++
++			aci.ObjectMeta.SetAnnotations(map[string]string{
++				IgnoredHostValidationsAnnotation: "has-cpu-cores-for-role,has-memory-for-role",
++			})
++			Expect(c.Update(ctx, aci)).Should(BeNil())
++			request := newClusterDeploymentRequest(cluster)
++			result, err := cr.Reconcile(ctx, request)
++			Expect(err).To(BeNil())
++			Expect(result).To(Equal(ctrl.Result{}))
++		})
++
++		It("add both ignored cluster and host validations annotations", func() {
++			mockMirrorRegistries.EXPECT().IsMirrorRegistriesConfigured().AnyTimes().Return(false)
++
++			backEndCluster := getDefaultTestCluster()
++			mockInstallerInternal.EXPECT().GetClusterByKubeKey(gomock.Any()).Return(backEndCluster, nil)
++			mockInstallerInternal.EXPECT().ValidatePullSecret(gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any()).Return(nil).AnyTimes()
++			mockInstallerInternal.EXPECT().HostWithCollectedLogsExists(gomock.Any()).Return(false, nil)
++			mockInstallerInternal.EXPECT().UpdateClusterNonInteractive(gomock.Any(), gomock.Any(), gomock.Any()).Return(backEndCluster, nil).AnyTimes()
++
++			mockInstallerInternal.EXPECT().SetIgnoredValidationsInternal(gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any()).
++				Do(func(ctx context.Context, clusterID strfmt.UUID, ignoredCluster, ignoredHost string) {
++					Expect(clusterID).To(Equal(sId))
++					Expect(ignoredCluster).To(Equal(`["dns-domain-defined"]`))
++					Expect(ignoredHost).To(Equal(`["has-cpu-cores-for-role"]`))
++				}).Return(nil)
++
++			aci.ObjectMeta.SetAnnotations(map[string]string{
++				IgnoredClusterValidationsAnnotation: "dns-domain-defined",
++				IgnoredHostValidationsAnnotation:    "has-cpu-cores-for-role",
++			})
++			Expect(c.Update(ctx, aci)).Should(BeNil())
++			request := newClusterDeploymentRequest(cluster)
++			result, err := cr.Reconcile(ctx, request)
++			Expect(err).To(BeNil())
++			Expect(result).To(Equal(ctrl.Result{}))
++		})
++
++		It("remove ignored validations annotation clears ignored validations", func() {
++			mockMirrorRegistries.EXPECT().IsMirrorRegistriesConfigured().AnyTimes().Return(false)
++
++			backEndCluster := getDefaultTestCluster()
++			backEndCluster.IgnoredClusterValidations = `["dns-domain-defined"]`
++			backEndCluster.IgnoredHostValidations = `["has-cpu-cores-for-role"]`
++			mockInstallerInternal.EXPECT().GetClusterByKubeKey(gomock.Any()).Return(backEndCluster, nil)
++			mockInstallerInternal.EXPECT().ValidatePullSecret(gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any()).Return(nil).AnyTimes()
++			mockInstallerInternal.EXPECT().HostWithCollectedLogsExists(gomock.Any()).Return(false, nil)
++			mockInstallerInternal.EXPECT().UpdateClusterNonInteractive(gomock.Any(), gomock.Any(), gomock.Any()).Return(backEndCluster, nil).AnyTimes()
++
++			mockInstallerInternal.EXPECT().SetIgnoredValidationsInternal(gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any()).
++				Do(func(ctx context.Context, clusterID strfmt.UUID, ignoredCluster, ignoredHost string) {
++					Expect(clusterID).To(Equal(sId))
++					Expect(ignoredCluster).To(Equal(""))
++					Expect(ignoredHost).To(Equal(""))
++				}).Return(nil)
++
++			request := newClusterDeploymentRequest(cluster)
++			result, err := cr.Reconcile(ctx, request)
++			Expect(err).To(BeNil())
++			Expect(result).To(Equal(ctrl.Result{}))
++		})
++
++		It("empty annotation explicitly overrides with empty JSON array", func() {
++			mockMirrorRegistries.EXPECT().IsMirrorRegistriesConfigured().AnyTimes().Return(false)
++
++			backEndCluster := getDefaultTestCluster()
++			backEndCluster.IgnoredClusterValidations = `["dns-domain-defined"]`
++			mockInstallerInternal.EXPECT().GetClusterByKubeKey(gomock.Any()).Return(backEndCluster, nil)
++			mockInstallerInternal.EXPECT().ValidatePullSecret(gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any()).Return(nil).AnyTimes()
++			mockInstallerInternal.EXPECT().HostWithCollectedLogsExists(gomock.Any()).Return(false, nil)
++			mockInstallerInternal.EXPECT().UpdateClusterNonInteractive(gomock.Any(), gomock.Any(), gomock.Any()).Return(backEndCluster, nil).AnyTimes()
++
++			mockInstallerInternal.EXPECT().SetIgnoredValidationsInternal(gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any()).
++				Do(func(ctx context.Context, clusterID strfmt.UUID, ignoredCluster, ignoredHost string) {
++					Expect(clusterID).To(Equal(sId))
++					Expect(ignoredCluster).To(Equal("[]"))
++					Expect(ignoredHost).To(Equal(""))
++				}).Return(nil)
++
++			aci.ObjectMeta.SetAnnotations(map[string]string{
++				IgnoredClusterValidationsAnnotation: "",
++			})
++			Expect(c.Update(ctx, aci)).Should(BeNil())
++
++			request := newClusterDeploymentRequest(cluster)
++			result, err := cr.Reconcile(ctx, request)
++			Expect(err).To(BeNil())
++			Expect(result).To(Equal(ctrl.Result{}))
++		})
++
++		It("no change in ignored validations does not call SetIgnoredValidationsInternal", func() {
++			mockMirrorRegistries.EXPECT().IsMirrorRegistriesConfigured().AnyTimes().Return(false)
++
++			backEndCluster := getDefaultTestCluster()
++			mockInstallerInternal.EXPECT().GetClusterByKubeKey(gomock.Any()).Return(backEndCluster, nil)
++			mockInstallerInternal.EXPECT().ValidatePullSecret(gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any()).Return(nil).AnyTimes()
++			mockInstallerInternal.EXPECT().HostWithCollectedLogsExists(gomock.Any()).Return(false, nil)
++			mockInstallerInternal.EXPECT().UpdateClusterNonInteractive(gomock.Any(), gomock.Any(), gomock.Any()).Return(backEndCluster, nil).AnyTimes()
++
++			request := newClusterDeploymentRequest(cluster)
++			result, err := cr.Reconcile(ctx, request)
++			Expect(err).To(BeNil())
++			Expect(result).To(Equal(ctrl.Result{}))
++		})
++
++		It("invalid ignored validations annotation reports an input error", func() {
++			mockMirrorRegistries.EXPECT().IsMirrorRegistriesConfigured().AnyTimes().Return(false)
++
++			backEndCluster := getDefaultTestCluster()
++			mockInstallerInternal.EXPECT().GetClusterByKubeKey(gomock.Any()).Return(backEndCluster, nil)
++			mockInstallerInternal.EXPECT().ValidatePullSecret(gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any()).Return(nil).AnyTimes()
++			mockInstallerInternal.EXPECT().HostWithCollectedLogsExists(gomock.Any()).Return(false, nil)
++			mockInstallerInternal.EXPECT().UpdateClusterNonInteractive(gomock.Any(), gomock.Any(), gomock.Any()).Return(backEndCluster, nil).AnyTimes()
++
++			aci.ObjectMeta.SetAnnotations(map[string]string{
++				IgnoredClusterValidationsAnnotation: "dns-domain-defined,,ntp-server-configured",
++			})
++			Expect(c.Update(ctx, aci)).Should(BeNil())
++
++			request := newClusterDeploymentRequest(cluster)
++			result, err := cr.Reconcile(ctx, request)
++			Expect(err).To(BeNil())
++			Expect(result).To(Equal(ctrl.Result{}))
++
++			aci = getTestClusterInstall()
++			Expect(FindStatusCondition(aci.Status.Conditions, hiveext.ClusterSpecSyncedCondition).Reason).To(Equal(hiveext.ClusterInputErrorReason))
++			Expect(FindStatusCondition(aci.Status.Conditions, hiveext.ClusterSpecSyncedCondition).Message).To(ContainSubstring(
++				"Failed to parse 'agent-install.openshift.io/ignored-cluster-validations' annotation"))
++		})
++
++		It("unknown validation ID in annotation is rejected by the service", func() {
++			mockMirrorRegistries.EXPECT().IsMirrorRegistriesConfigured().AnyTimes().Return(false)
++
++			backEndCluster := getDefaultTestCluster()
++			mockInstallerInternal.EXPECT().GetClusterByKubeKey(gomock.Any()).Return(backEndCluster, nil)
++			mockInstallerInternal.EXPECT().ValidatePullSecret(gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any()).Return(nil).AnyTimes()
++			mockInstallerInternal.EXPECT().HostWithCollectedLogsExists(gomock.Any()).Return(false, nil)
++			mockInstallerInternal.EXPECT().UpdateClusterNonInteractive(gomock.Any(), gomock.Any(), gomock.Any()).Return(backEndCluster, nil).AnyTimes()
++
++			mockInstallerInternal.EXPECT().SetIgnoredValidationsInternal(gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any()).
++				Return(common.NewApiError(http.StatusBadRequest, errors.New("Validation ID 'not-a-real-validation' is not a known cluster validation")))
++
++			aci.ObjectMeta.SetAnnotations(map[string]string{
++				IgnoredClusterValidationsAnnotation: "not-a-real-validation",
++			})
++			Expect(c.Update(ctx, aci)).Should(BeNil())
++
++			request := newClusterDeploymentRequest(cluster)
++			result, err := cr.Reconcile(ctx, request)
++			Expect(err).To(BeNil())
++			Expect(result).To(Equal(ctrl.Result{}))
++
++			aci = getTestClusterInstall()
++			Expect(FindStatusCondition(aci.Status.Conditions, hiveext.ClusterSpecSyncedCondition).Reason).To(Equal(hiveext.ClusterInputErrorReason))
++			Expect(FindStatusCondition(aci.Status.Conditions, hiveext.ClusterSpecSyncedCondition).Message).To(ContainSubstring(
++				"not a known cluster validation"))
++		})
+ 	})
+ 
+ 	Context("cluster update not needed", func() {
+diff --git a/internal/host/host.go b/internal/host/host.go
+index 2e43918afce9..7a5f1f2929a7 100644
+--- a/internal/host/host.go
++++ b/internal/host/host.go
+@@ -1497,13 +1497,16 @@ type DisabledHostValidations map[string]struct{}
+ 
+ func (d *DisabledHostValidations) Decode(value string) error {
+ 	disabledHostValidations := DisabledHostValidations{}
+-	if len(strings.Trim(value, "")) == 0 {
+-		*d = disabledHostValidations
+-		return nil
++	if value == `""` {
++		value = ""
++	}
++	validationIDs, err := common.ParseCommaSeparatedUniqueValues(value, "host validation ID")
++	if err != nil {
++		return err
+ 	}
+-	for _, element := range strings.Split(value, ",") {
+-		if len(element) == 0 {
+-			return fmt.Errorf("empty host validation ID found in '%s'", value)
++	for _, element := range validationIDs {
++		if err := models.HostValidationID(element).Validate(nil); err != nil {
++			return fmt.Errorf("disabled host validation ID '%s' is not a known host validation", element)
+ 		}
+ 		disabledHostValidations[element] = struct{}{}
+ 	}
+diff --git a/internal/host/host_test.go b/internal/host/host_test.go
+index 7bc665a99fce..ecc3defba5ef 100644
+--- a/internal/host/host_test.go
++++ b/internal/host/host_test.go
+@@ -3769,8 +3769,8 @@ var _ = Describe("ResetHostValidation", func() {
+ var _ = Describe("Disabled Host Validation", func() {
+ 	const (
+ 		disabledHostValidationEnvironmentName = "DISABLED_HOST_VALIDATIONS"
+-		twoValidationIDs                      = "validation-1,validation-2"
+-		malformedValue                        = "validation-1,,"
++		twoValidationIDs                      = "connected,has-inventory"
++		malformedValue                        = "connected,,"
+ 	)
+ 
+ 	AfterEach(func() {
+@@ -3780,15 +3780,30 @@ var _ = Describe("Disabled Host Validation", func() {
+ 		Expect(os.Setenv(disabledHostValidationEnvironmentName, twoValidationIDs)).NotTo(HaveOccurred())
+ 		cfg := Config{}
+ 		Expect(envconfig.Process(common.EnvConfigPrefix, &cfg)).ToNot(HaveOccurred())
+-		Expect(cfg.DisabledHostvalidations.IsDisabled("validation-1")).To(BeTrue())
+-		Expect(cfg.DisabledHostvalidations.IsDisabled("validation-2")).To(BeTrue())
++		Expect(cfg.DisabledHostvalidations.IsDisabled("connected")).To(BeTrue())
++		Expect(cfg.DisabledHostvalidations.IsDisabled("has-inventory")).To(BeTrue())
++	})
++	It("should trim whitespace around environment values", func() {
++		Expect(os.Setenv(disabledHostValidationEnvironmentName, "connected, has-inventory")).NotTo(HaveOccurred())
++		cfg := Config{}
++		Expect(envconfig.Process(common.EnvConfigPrefix, &cfg)).ToNot(HaveOccurred())
++		Expect(cfg.DisabledHostvalidations.IsDisabled("connected")).To(BeTrue())
++		Expect(cfg.DisabledHostvalidations.IsDisabled("has-inventory")).To(BeTrue())
+ 	})
+ 	It("should error when environment value is malformed", func() {
+ 		Expect(os.Setenv(disabledHostValidationEnvironmentName, malformedValue)).NotTo(HaveOccurred())
+ 		cfg := Config{}
+ 		err := envconfig.Process(common.EnvConfigPrefix, &cfg)
+ 		Expect(err).To(HaveOccurred())
+-		Expect(err.Error()).To(Equal("envconfig.Process: assigning MYAPP_DISABLED_HOST_VALIDATIONS to DisabledHostvalidations: converting 'validation-1,,' to type host.DisabledHostValidations. details: empty host validation ID found in 'validation-1,,'"))
++		Expect(err.Error()).To(ContainSubstring("empty host validation ID found in"))
++	})
++	It("should error when environment value contains an unknown validation ID", func() {
++		Expect(os.Setenv(disabledHostValidationEnvironmentName, "connected,not-a-real-validation")).NotTo(HaveOccurred())
++		cfg := Config{}
++		err := envconfig.Process(common.EnvConfigPrefix, &cfg)
++		Expect(err).To(HaveOccurred())
++		Expect(err.Error()).To(ContainSubstring("not-a-real-validation"))
++		Expect(err.Error()).To(ContainSubstring("not a known host validation"))
+ 	})
+ 
+ })
+diff --git a/internal/host/refresh_status_preprocessor.go b/internal/host/refresh_status_preprocessor.go
+index 87464bea4342..e6879a2d2cd5 100644
+--- a/internal/host/refresh_status_preprocessor.go
++++ b/internal/host/refresh_status_preprocessor.go
+@@ -68,11 +68,13 @@ func (r *refreshPreprocessor) preprocess(ctx context.Context, c *validationConte
+ 	validationsOutput := make(ValidationsStatus)
+ 	var err error
+ 	var ignoredValidations []string
++	hasPerClusterOverride := false
+ 	if c.cluster != nil {
+ 		ignoredValidations, err = common.DeserializeJSONList(c.cluster.IgnoredHostValidations)
+ 		if err != nil {
+ 			return nil, nil, errors.Wrap(err, fmt.Sprintf("Unable to deserialize ignored host validations for cluster %s", string(*c.cluster.ID)))
+ 		}
++		hasPerClusterOverride = c.cluster.IgnoredHostValidations != ""
+ 	}
+ 	for _, v := range r.validations {
+ 
+@@ -88,7 +90,7 @@ func (r *refreshPreprocessor) preprocess(ctx context.Context, c *validationConte
+ 
+ 		var st ValidationStatus
+ 		var message string
+-		if r.disabledHostValidations.IsDisabled(v.id) {
++		if !hasPerClusterOverride && r.disabledHostValidations.IsDisabled(v.id) {
+ 			st = ValidationDisabled
+ 			message = validationDisabledByConfiguration
+ 			conditions[v.id.String()] = true

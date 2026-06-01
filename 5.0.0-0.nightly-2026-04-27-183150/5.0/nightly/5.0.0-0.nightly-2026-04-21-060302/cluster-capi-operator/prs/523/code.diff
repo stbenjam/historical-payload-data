@@ -1,0 +1,320 @@
+diff --git a/go.mod b/go.mod
+index c97a840a2..e96b36f2f 100644
+--- a/go.mod
++++ b/go.mod
+@@ -397,7 +397,7 @@ require (
+ 	gomodules.xyz/jsonpatch/v2 v2.5.0 // indirect
+ 	google.golang.org/genproto/googleapis/api v0.0.0-20260209200024-4cfbd4190f57 // indirect
+ 	google.golang.org/genproto/googleapis/rpc v0.0.0-20260209200024-4cfbd4190f57 // indirect
+-	google.golang.org/grpc v1.79.1 // indirect
++	google.golang.org/grpc v1.79.3 // indirect
+ 	google.golang.org/protobuf v1.36.11 // indirect
+ 	gopkg.in/evanphx/json-patch.v4 v4.13.0 // indirect
+ 	gopkg.in/inf.v0 v0.9.1 // indirect
+diff --git a/go.sum b/go.sum
+index 70936fac0..5f742c95c 100644
+--- a/go.sum
++++ b/go.sum
+@@ -901,8 +901,8 @@ google.golang.org/genproto/googleapis/api v0.0.0-20260209200024-4cfbd4190f57 h1:
+ google.golang.org/genproto/googleapis/api v0.0.0-20260209200024-4cfbd4190f57/go.mod h1:kSJwQxqmFXeo79zOmbrALdflXQeAYcUbgS7PbpMknCY=
+ google.golang.org/genproto/googleapis/rpc v0.0.0-20260209200024-4cfbd4190f57 h1:mWPCjDEyshlQYzBpMNHaEof6UX1PmHcaUODUywQ0uac=
+ google.golang.org/genproto/googleapis/rpc v0.0.0-20260209200024-4cfbd4190f57/go.mod h1:j9x/tPzZkyxcgEFkiKEEGxfvyumM01BEtsW8xzOahRQ=
+-google.golang.org/grpc v1.79.1 h1:zGhSi45ODB9/p3VAawt9a+O/MULLl9dpizzNNpq7flY=
+-google.golang.org/grpc v1.79.1/go.mod h1:KmT0Kjez+0dde/v2j9vzwoAScgEPx/Bw1CYChhHLrHQ=
++google.golang.org/grpc v1.79.3 h1:sybAEdRIEtvcD68Gx7dmnwjZKlyfuc61Dyo9pGXXkKE=
++google.golang.org/grpc v1.79.3/go.mod h1:KmT0Kjez+0dde/v2j9vzwoAScgEPx/Bw1CYChhHLrHQ=
+ google.golang.org/protobuf v1.36.11 h1:fV6ZwhNocDyBLK0dj+fg8ektcVegBBuEolpbTQyBNVE=
+ google.golang.org/protobuf v1.36.11/go.mod h1:HTf+CrKn2C3g5S8VImy6tdcUvCska2kB7j23XfzDpco=
+ gopkg.in/check.v1 v0.0.0-20161208181325-20d25e280405/go.mod h1:Co6ibVJAznAaIkqp8huTwlJQCZ016jof/cbN4VW5Yz0=
+diff --git a/vendor/google.golang.org/grpc/internal/envconfig/envconfig.go b/vendor/google.golang.org/grpc/internal/envconfig/envconfig.go
+index e8dc79129..7ad6fb44c 100644
+--- a/vendor/google.golang.org/grpc/internal/envconfig/envconfig.go
++++ b/vendor/google.golang.org/grpc/internal/envconfig/envconfig.go
+@@ -88,6 +88,22 @@ var (
+ 	// feature can be disabled by setting the environment variable
+ 	// GRPC_EXPERIMENTAL_PF_WEIGHTED_SHUFFLING to "false".
+ 	PickFirstWeightedShuffling = boolFromEnv("GRPC_EXPERIMENTAL_PF_WEIGHTED_SHUFFLING", true)
++
++	// DisableStrictPathChecking indicates whether strict path checking is
++	// disabled. This feature can be disabled by setting the environment
++	// variable GRPC_GO_EXPERIMENTAL_DISABLE_STRICT_PATH_CHECKING to "true".
++	//
++	// When strict path checking is enabled, gRPC will reject requests with
++	// paths that do not conform to the gRPC over HTTP/2 specification found at
++	// https://github.com/grpc/grpc/blob/master/doc/PROTOCOL-HTTP2.md.
++	//
++	// When disabled, gRPC will allow paths that do not contain a leading slash.
++	// Enabling strict path checking is recommended for security reasons, as it
++	// prevents potential path traversal vulnerabilities.
++	//
++	// A future release will remove this environment variable, enabling strict
++	// path checking behavior unconditionally.
++	DisableStrictPathChecking = boolFromEnv("GRPC_GO_EXPERIMENTAL_DISABLE_STRICT_PATH_CHECKING", false)
+ )
+ 
+ func boolFromEnv(envVar string, def bool) bool {
+diff --git a/vendor/google.golang.org/grpc/internal/transport/client_stream.go b/vendor/google.golang.org/grpc/internal/transport/client_stream.go
+index 980452519..cd8152ef1 100644
+--- a/vendor/google.golang.org/grpc/internal/transport/client_stream.go
++++ b/vendor/google.golang.org/grpc/internal/transport/client_stream.go
+@@ -24,6 +24,7 @@ import (
+ 	"golang.org/x/net/http2"
+ 	"google.golang.org/grpc/mem"
+ 	"google.golang.org/grpc/metadata"
++	"google.golang.org/grpc/stats"
+ 	"google.golang.org/grpc/status"
+ )
+ 
+@@ -46,10 +47,11 @@ type ClientStream struct {
+ 	// meaningful after headerChan is closed (always call waitOnHeader() before
+ 	// reading its value).
+ 	headerValid      bool
+-	noHeaders        bool        // set if the client never received headers (set only after the stream is done).
+-	headerChanClosed uint32      // set when headerChan is closed. Used to avoid closing headerChan multiple times.
+-	bytesReceived    atomic.Bool // indicates whether any bytes have been received on this stream
+-	unprocessed      atomic.Bool // set if the server sends a refused stream or GOAWAY including this stream
++	noHeaders        bool          // set if the client never received headers (set only after the stream is done).
++	headerChanClosed uint32        // set when headerChan is closed. Used to avoid closing headerChan multiple times.
++	bytesReceived    atomic.Bool   // indicates whether any bytes have been received on this stream
++	unprocessed      atomic.Bool   // set if the server sends a refused stream or GOAWAY including this stream
++	statsHandler     stats.Handler // nil for internal streams (e.g., health check, ORCA) where telemetry is not supported.
+ }
+ 
+ // Read reads an n byte message from the input stream.
+diff --git a/vendor/google.golang.org/grpc/internal/transport/http2_client.go b/vendor/google.golang.org/grpc/internal/transport/http2_client.go
+index 38ca031af..37b1acc34 100644
+--- a/vendor/google.golang.org/grpc/internal/transport/http2_client.go
++++ b/vendor/google.golang.org/grpc/internal/transport/http2_client.go
+@@ -478,7 +478,7 @@ func NewHTTP2Client(connectCtx, ctx context.Context, addr resolver.Address, opts
+ 	return t, nil
+ }
+ 
+-func (t *http2Client) newStream(ctx context.Context, callHdr *CallHdr) *ClientStream {
++func (t *http2Client) newStream(ctx context.Context, callHdr *CallHdr, handler stats.Handler) *ClientStream {
+ 	// TODO(zhaoq): Handle uint32 overflow of Stream.id.
+ 	s := &ClientStream{
+ 		Stream: Stream{
+@@ -486,10 +486,11 @@ func (t *http2Client) newStream(ctx context.Context, callHdr *CallHdr) *ClientSt
+ 			sendCompress:   callHdr.SendCompress,
+ 			contentSubtype: callHdr.ContentSubtype,
+ 		},
+-		ct:         t,
+-		done:       make(chan struct{}),
+-		headerChan: make(chan struct{}),
+-		doneFunc:   callHdr.DoneFunc,
++		ct:           t,
++		done:         make(chan struct{}),
++		headerChan:   make(chan struct{}),
++		doneFunc:     callHdr.DoneFunc,
++		statsHandler: handler,
+ 	}
+ 	s.Stream.buf.init()
+ 	s.Stream.wq.init(defaultWriteQuota, s.done)
+@@ -744,7 +745,7 @@ func (e NewStreamError) Error() string {
+ 
+ // NewStream creates a stream and registers it into the transport as "active"
+ // streams.  All non-nil errors returned will be *NewStreamError.
+-func (t *http2Client) NewStream(ctx context.Context, callHdr *CallHdr) (*ClientStream, error) {
++func (t *http2Client) NewStream(ctx context.Context, callHdr *CallHdr, handler stats.Handler) (*ClientStream, error) {
+ 	ctx = peer.NewContext(ctx, t.Peer())
+ 
+ 	// ServerName field of the resolver returned address takes precedence over
+@@ -781,7 +782,7 @@ func (t *http2Client) NewStream(ctx context.Context, callHdr *CallHdr) (*ClientS
+ 	if err != nil {
+ 		return nil, &NewStreamError{Err: err, AllowTransparentRetry: false}
+ 	}
+-	s := t.newStream(ctx, callHdr)
++	s := t.newStream(ctx, callHdr, handler)
+ 	cleanup := func(err error) {
+ 		if s.swapState(streamDone) == streamDone {
+ 			// If it was already done, return.
+@@ -902,7 +903,7 @@ func (t *http2Client) NewStream(ctx context.Context, callHdr *CallHdr) (*ClientS
+ 			return nil, &NewStreamError{Err: ErrConnClosing, AllowTransparentRetry: true}
+ 		}
+ 	}
+-	if t.statsHandler != nil {
++	if s.statsHandler != nil {
+ 		header, ok := metadata.FromOutgoingContext(ctx)
+ 		if ok {
+ 			header.Set("user-agent", t.userAgent)
+@@ -911,7 +912,7 @@ func (t *http2Client) NewStream(ctx context.Context, callHdr *CallHdr) (*ClientS
+ 		}
+ 		// Note: The header fields are compressed with hpack after this call returns.
+ 		// No WireLength field is set here.
+-		t.statsHandler.HandleRPC(s.ctx, &stats.OutHeader{
++		s.statsHandler.HandleRPC(s.ctx, &stats.OutHeader{
+ 			Client:      true,
+ 			FullMethod:  callHdr.Method,
+ 			RemoteAddr:  t.remoteAddr,
+@@ -1587,16 +1588,16 @@ func (t *http2Client) operateHeaders(frame *http2.MetaHeadersFrame) {
+ 		}
+ 	}
+ 
+-	if t.statsHandler != nil {
++	if s.statsHandler != nil {
+ 		if !endStream {
+-			t.statsHandler.HandleRPC(s.ctx, &stats.InHeader{
++			s.statsHandler.HandleRPC(s.ctx, &stats.InHeader{
+ 				Client:      true,
+ 				WireLength:  int(frame.Header().Length),
+ 				Header:      metadata.MD(mdata).Copy(),
+ 				Compression: s.recvCompress,
+ 			})
+ 		} else {
+-			t.statsHandler.HandleRPC(s.ctx, &stats.InTrailer{
++			s.statsHandler.HandleRPC(s.ctx, &stats.InTrailer{
+ 				Client:     true,
+ 				WireLength: int(frame.Header().Length),
+ 				Trailer:    metadata.MD(mdata).Copy(),
+diff --git a/vendor/google.golang.org/grpc/internal/transport/transport.go b/vendor/google.golang.org/grpc/internal/transport/transport.go
+index 10b9155f0..b86094da9 100644
+--- a/vendor/google.golang.org/grpc/internal/transport/transport.go
++++ b/vendor/google.golang.org/grpc/internal/transport/transport.go
+@@ -617,7 +617,7 @@ type ClientTransport interface {
+ 	GracefulClose()
+ 
+ 	// NewStream creates a Stream for an RPC.
+-	NewStream(ctx context.Context, callHdr *CallHdr) (*ClientStream, error)
++	NewStream(ctx context.Context, callHdr *CallHdr, handler stats.Handler) (*ClientStream, error)
+ 
+ 	// Error returns a channel that is closed when some I/O error
+ 	// happens. Typically the caller should have a goroutine to monitor
+diff --git a/vendor/google.golang.org/grpc/server.go b/vendor/google.golang.org/grpc/server.go
+index 1b5cefe81..8efb29a7b 100644
+--- a/vendor/google.golang.org/grpc/server.go
++++ b/vendor/google.golang.org/grpc/server.go
+@@ -42,6 +42,7 @@ import (
+ 	"google.golang.org/grpc/internal"
+ 	"google.golang.org/grpc/internal/binarylog"
+ 	"google.golang.org/grpc/internal/channelz"
++	"google.golang.org/grpc/internal/envconfig"
+ 	"google.golang.org/grpc/internal/grpcsync"
+ 	"google.golang.org/grpc/internal/grpcutil"
+ 	istats "google.golang.org/grpc/internal/stats"
+@@ -149,6 +150,8 @@ type Server struct {
+ 
+ 	serverWorkerChannel      chan func()
+ 	serverWorkerChannelClose func()
++
++	strictPathCheckingLogEmitted atomic.Bool
+ }
+ 
+ type serverOptions struct {
+@@ -1762,6 +1765,24 @@ func (s *Server) processStreamingRPC(ctx context.Context, stream *transport.Serv
+ 	return ss.s.WriteStatus(statusOK)
+ }
+ 
++func (s *Server) handleMalformedMethodName(stream *transport.ServerStream, ti *traceInfo) {
++	if ti != nil {
++		ti.tr.LazyLog(&fmtStringer{"Malformed method name %q", []any{stream.Method()}}, true)
++		ti.tr.SetError()
++	}
++	errDesc := fmt.Sprintf("malformed method name: %q", stream.Method())
++	if err := stream.WriteStatus(status.New(codes.Unimplemented, errDesc)); err != nil {
++		if ti != nil {
++			ti.tr.LazyLog(&fmtStringer{"%v", []any{err}}, true)
++			ti.tr.SetError()
++		}
++		channelz.Warningf(logger, s.channelz, "grpc: Server.handleStream failed to write status: %v", err)
++	}
++	if ti != nil {
++		ti.tr.Finish()
++	}
++}
++
+ func (s *Server) handleStream(t transport.ServerTransport, stream *transport.ServerStream) {
+ 	ctx := stream.Context()
+ 	ctx = contextWithServer(ctx, s)
+@@ -1782,26 +1803,30 @@ func (s *Server) handleStream(t transport.ServerTransport, stream *transport.Ser
+ 	}
+ 
+ 	sm := stream.Method()
+-	if sm != "" && sm[0] == '/' {
++	if sm == "" {
++		s.handleMalformedMethodName(stream, ti)
++		return
++	}
++	if sm[0] != '/' {
++		// TODO(easwars): Add a link to the CVE in the below log messages once
++		// published.
++		if envconfig.DisableStrictPathChecking {
++			if old := s.strictPathCheckingLogEmitted.Swap(true); !old {
++				channelz.Warningf(logger, s.channelz, "grpc: Server.handleStream received malformed method name %q. Allowing it because the environment variable GRPC_GO_EXPERIMENTAL_DISABLE_STRICT_PATH_CHECKING is set to true, but this option will be removed in a future release.", sm)
++			}
++		} else {
++			if old := s.strictPathCheckingLogEmitted.Swap(true); !old {
++				channelz.Warningf(logger, s.channelz, "grpc: Server.handleStream rejected malformed method name %q. To temporarily allow such requests, set the environment variable GRPC_GO_EXPERIMENTAL_DISABLE_STRICT_PATH_CHECKING to true. Note that this is not recommended as it may allow requests to bypass security policies.", sm)
++			}
++			s.handleMalformedMethodName(stream, ti)
++			return
++		}
++	} else {
+ 		sm = sm[1:]
+ 	}
+ 	pos := strings.LastIndex(sm, "/")
+ 	if pos == -1 {
+-		if ti != nil {
+-			ti.tr.LazyLog(&fmtStringer{"Malformed method name %q", []any{sm}}, true)
+-			ti.tr.SetError()
+-		}
+-		errDesc := fmt.Sprintf("malformed method name: %q", stream.Method())
+-		if err := stream.WriteStatus(status.New(codes.Unimplemented, errDesc)); err != nil {
+-			if ti != nil {
+-				ti.tr.LazyLog(&fmtStringer{"%v", []any{err}}, true)
+-				ti.tr.SetError()
+-			}
+-			channelz.Warningf(logger, s.channelz, "grpc: Server.handleStream failed to write status: %v", err)
+-		}
+-		if ti != nil {
+-			ti.tr.Finish()
+-		}
++		s.handleMalformedMethodName(stream, ti)
+ 		return
+ 	}
+ 	service := sm[:pos]
+diff --git a/vendor/google.golang.org/grpc/stream.go b/vendor/google.golang.org/grpc/stream.go
+index f92102fb4..eedb5f9b9 100644
+--- a/vendor/google.golang.org/grpc/stream.go
++++ b/vendor/google.golang.org/grpc/stream.go
+@@ -548,7 +548,7 @@ func (a *csAttempt) newStream() error {
+ 			}
+ 		}
+ 	}
+-	s, err := a.transport.NewStream(a.ctx, cs.callHdr)
++	s, err := a.transport.NewStream(a.ctx, cs.callHdr, a.statsHandler)
+ 	if err != nil {
+ 		nse, ok := err.(*transport.NewStreamError)
+ 		if !ok {
+@@ -1354,7 +1354,8 @@ func newNonRetryClientStream(ctx context.Context, desc *StreamDesc, method strin
+ 		transport:        t,
+ 	}
+ 
+-	s, err := as.transport.NewStream(as.ctx, as.callHdr)
++	// nil stats handler: internal streams like health and ORCA do not support telemetry.
++	s, err := as.transport.NewStream(as.ctx, as.callHdr, nil)
+ 	if err != nil {
+ 		err = toRPCErr(err)
+ 		return nil, err
+diff --git a/vendor/google.golang.org/grpc/version.go b/vendor/google.golang.org/grpc/version.go
+index c1225b910..76c2eed77 100644
+--- a/vendor/google.golang.org/grpc/version.go
++++ b/vendor/google.golang.org/grpc/version.go
+@@ -19,4 +19,4 @@
+ package grpc
+ 
+ // Version is the current grpc version.
+-const Version = "1.79.1"
++const Version = "1.79.3"
+diff --git a/vendor/modules.txt b/vendor/modules.txt
+index 1427ae35a..076274b50 100644
+--- a/vendor/modules.txt
++++ b/vendor/modules.txt
+@@ -1939,7 +1939,7 @@ google.golang.org/genproto/googleapis/api/httpbody
+ ## explicit; go 1.24.0
+ google.golang.org/genproto/googleapis/rpc/errdetails
+ google.golang.org/genproto/googleapis/rpc/status
+-# google.golang.org/grpc v1.79.1
++# google.golang.org/grpc v1.79.3
+ ## explicit; go 1.24.0
+ google.golang.org/grpc
+ google.golang.org/grpc/attributes

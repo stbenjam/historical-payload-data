@@ -1,0 +1,380 @@
+diff --git a/frontend/packages/console-app/src/components/data-view/useConsoleDataViewData.tsx b/frontend/packages/console-app/src/components/data-view/useConsoleDataViewData.tsx
+index 58f65da00ee..055355b795d 100644
+--- a/frontend/packages/console-app/src/components/data-view/useConsoleDataViewData.tsx
++++ b/frontend/packages/console-app/src/components/data-view/useConsoleDataViewData.tsx
+@@ -134,14 +134,6 @@ export const useConsoleDataViewData = <
+       return filteredData;
+     }
+ 
+-    if (typeof sortColumn.props.sort === 'string') {
+-      return filteredData.sort(
+-        sortResourceByValue(sortDirection, (obj) =>
+-          _.get(obj, (sortColumn.props.sort as unknown) as string, ''),
+-        ),
+-      );
+-    }
+-
+     if (typeof sortColumn.sortFunction === 'string') {
+       return filteredData.sort(
+         sortResourceByValue(sortDirection, (obj) => _.get(obj, sortColumn.sortFunction as string)),
+diff --git a/frontend/packages/console-app/src/components/volume-snapshot/volume-snapshot-content-details.tsx b/frontend/packages/console-app/src/components/volume-snapshot/volume-snapshot-content-details.tsx
+index a76135a102d..af8983a98bc 100644
+--- a/frontend/packages/console-app/src/components/volume-snapshot/volume-snapshot-content-details.tsx
++++ b/frontend/packages/console-app/src/components/volume-snapshot/volume-snapshot-content-details.tsx
+@@ -21,7 +21,7 @@ import type { VolumeSnapshotContentKind } from '@console/internal/module/k8s';
+ import { referenceForModel } from '@console/internal/module/k8s';
+ import PaneBody from '@console/shared/src/components/layout/PaneBody';
+ import { Status } from '@console/shared/src/components/status/Status';
+-import { volumeSnapshotStatus } from '../../status';
++import { snapshotStatus } from '@console/shared/src/sorts/snapshot';
+ 
+ const { editYaml, events } = navFactory;
+ 
+@@ -43,7 +43,7 @@ const Details: FC<DetailsProps> = ({ obj }) => {
+             <DescriptionListGroup>
+               <DescriptionListTerm>{t('console-app~Status')}</DescriptionListTerm>
+               <DescriptionListDescription>
+-                <Status status={volumeSnapshotStatus(obj)} />
++                <Status status={snapshotStatus(obj)} />
+               </DescriptionListDescription>
+             </DescriptionListGroup>
+           </ResourceSummary>
+@@ -113,7 +113,7 @@ const VolumeSnapshotContentDetailsPage: FC<DetailsPageProps> = (props) => {
+     editYaml(),
+     events(ResourceEventStream),
+   ];
+-  return <DetailsPage {...props} getResourceStatus={volumeSnapshotStatus} pages={pages} />;
++  return <DetailsPage {...props} getResourceStatus={snapshotStatus} pages={pages} />;
+ };
+ 
+ type DetailsProps = {
+diff --git a/frontend/packages/console-app/src/components/volume-snapshot/volume-snapshot-content.tsx b/frontend/packages/console-app/src/components/volume-snapshot/volume-snapshot-content.tsx
+index 714392b7363..fc7820e76dd 100644
+--- a/frontend/packages/console-app/src/components/volume-snapshot/volume-snapshot-content.tsx
++++ b/frontend/packages/console-app/src/components/volume-snapshot/volume-snapshot-content.tsx
+@@ -14,6 +14,8 @@ import {
+   ListPageCreate,
+   ListPageHeader,
+ } from '@console/dynamic-plugin-sdk/src/lib-core';
++import { sorts } from '@console/internal/components/factory/table';
++import { sortResourceByValue } from '@console/internal/components/factory/Table/sort';
+ import type { PageComponentProps } from '@console/internal/components/utils/horizontal-nav';
+ import { useK8sWatchResource } from '@console/internal/components/utils/k8s-watch-hook';
+ import { ResourceLink } from '@console/internal/components/utils/resource-link';
+@@ -30,7 +32,7 @@ import { Timestamp } from '@console/shared/src/components/datetime/Timestamp';
+ import { LoadingBox } from '@console/shared/src/components/loading/LoadingBox';
+ import { Status } from '@console/shared/src/components/status/Status';
+ import { DASH } from '@console/shared/src/constants/ui';
+-import { volumeSnapshotStatus } from '../../status';
++import { snapshotStatus } from '@console/shared/src/sorts/snapshot';
+ 
+ const kind = referenceForModel(VolumeSnapshotContentModel);
+ 
+@@ -59,7 +61,7 @@ const getDataViewRows: GetDataViewRows<VolumeSnapshotContentKind> = (data, colum
+         props: getNameCellProps(name),
+       },
+       [tableColumnInfo[1].id]: {
+-        cell: <Status status={volumeSnapshotStatus(obj)} />,
++        cell: <Status status={snapshotStatus(obj)} />,
+       },
+       [tableColumnInfo[2].id]: {
+         cell: sizeMetrics,
+@@ -115,13 +117,15 @@ const useVolumeSnapshotContentColumns = (): TableColumn<VolumeSnapshotContentKin
+       },
+       {
+         title: t('console-app~Status'),
+-        sort: 'snapshotStatus',
++        sort: (data, direction) =>
++          data.sort(sortResourceByValue(direction, sorts.volumeSnapshotStatus)),
+         id: tableColumnInfo[1].id,
+         props: { modifier: 'nowrap' },
+       },
+       {
+         title: t('console-app~Size'),
+-        sort: 'volumeSnapshotSize',
++        sort: (data, direction) =>
++          data.sort(sortResourceByValue(direction, sorts.volumeSnapshotContentSize)),
+         id: tableColumnInfo[2].id,
+         props: { modifier: 'nowrap' },
+       },
+diff --git a/frontend/packages/console-app/src/components/volume-snapshot/volume-snapshot-details.tsx b/frontend/packages/console-app/src/components/volume-snapshot/volume-snapshot-details.tsx
+index 9e3923b572e..78cf4d0fdf3 100644
+--- a/frontend/packages/console-app/src/components/volume-snapshot/volume-snapshot-details.tsx
++++ b/frontend/packages/console-app/src/components/volume-snapshot/volume-snapshot-details.tsx
+@@ -30,8 +30,7 @@ import PaneBody from '@console/shared/src/components/layout/PaneBody';
+ import { Status } from '@console/shared/src/components/status/Status';
+ import { FLAGS } from '@console/shared/src/constants/common';
+ import { useFlag } from '@console/shared/src/hooks/useFlag';
+-import { snapshotSource } from '@console/shared/src/sorts/snapshot';
+-import { volumeSnapshotStatus } from '../../status';
++import { snapshotSource, snapshotStatus } from '@console/shared/src/sorts/snapshot';
+ 
+ const { editYaml, events } = navFactory;
+ 
+@@ -59,7 +58,7 @@ const Details: FC<DetailsProps> = ({ obj }) => {
+             <DescriptionListGroup>
+               <DescriptionListTerm>{t('console-app~Status')}</DescriptionListTerm>
+               <DescriptionListDescription>
+-                <Status status={volumeSnapshotStatus(obj)} />
++                <Status status={snapshotStatus(obj)} />
+               </DescriptionListDescription>
+             </DescriptionListGroup>
+           </ResourceSummary>
+@@ -143,7 +142,7 @@ export const VolumeSnapshotDetailsPage: FC<DetailsPageProps> = (props) => {
+     <DetailsPage
+       {...props}
+       customActionMenu={customActionMenu}
+-      getResourceStatus={volumeSnapshotStatus}
++      getResourceStatus={snapshotStatus}
+       pages={pages}
+     />
+   );
+diff --git a/frontend/packages/console-app/src/components/volume-snapshot/volume-snapshot.tsx b/frontend/packages/console-app/src/components/volume-snapshot/volume-snapshot.tsx
+index 9ef7ea84725..589c1964b4a 100644
+--- a/frontend/packages/console-app/src/components/volume-snapshot/volume-snapshot.tsx
++++ b/frontend/packages/console-app/src/components/volume-snapshot/volume-snapshot.tsx
+@@ -18,6 +18,8 @@ import {
+   ListPageHeader,
+   ListPageCreateLink,
+ } from '@console/dynamic-plugin-sdk/src/lib-core';
++import { sorts } from '@console/internal/components/factory/table';
++import { sortResourceByValue } from '@console/internal/components/factory/Table/sort';
+ import { useK8sWatchResource } from '@console/internal/components/utils/k8s-watch-hook';
+ import { ResourceLink } from '@console/internal/components/utils/resource-link';
+ import { convertToBaseValue, humanizeBinaryBytes } from '@console/internal/components/utils/units';
+@@ -43,8 +45,7 @@ import { FLAGS } from '@console/shared/src/constants/common';
+ import { DASH } from '@console/shared/src/constants/ui';
+ import { useFlag } from '@console/shared/src/hooks/useFlag';
+ import { getName, getNamespace } from '@console/shared/src/selectors/common';
+-import { snapshotSource } from '@console/shared/src/sorts/snapshot';
+-import { volumeSnapshotStatus } from '../../status';
++import { snapshotSource, snapshotStatus } from '@console/shared/src/sorts/snapshot';
+ 
+ const kind = referenceForModel(VolumeSnapshotModel);
+ 
+@@ -88,7 +89,7 @@ const getDataViewRows: GetDataViewRows<VolumeSnapshotKind, VolumeSnapshotRowData
+         cell: <ResourceLink kind={NamespaceModel.kind} name={namespace} />,
+       },
+       [tableColumnInfo[2].id]: {
+-        cell: <Status status={volumeSnapshotStatus(obj)} />,
++        cell: <Status status={snapshotStatus(obj)} />,
+       },
+       [tableColumnInfo[3].id]: {
+         cell: sizeMetrics,
+@@ -165,19 +166,22 @@ const useVolumeSnapshotColumns = (
+         },
+         {
+           title: t('console-app~Status'),
+-          sort: 'snapshotStatus',
++          sort: (data, direction) =>
++            data.sort(sortResourceByValue(direction, sorts.volumeSnapshotStatus)),
+           id: tableColumnInfo[2].id,
+           props: { modifier: 'nowrap' },
+         },
+         {
+           title: t('console-app~Size'),
+-          sort: 'volumeSnapshotSize',
++          sort: (data, direction) =>
++            data.sort(sortResourceByValue(direction, sorts.volumeSnapshotSize)),
+           id: tableColumnInfo[3].id,
+           props: { modifier: 'nowrap' },
+         },
+         {
+           title: t('console-app~Source'),
+-          sort: 'volumeSnapshotSource',
++          sort: (data, direction) =>
++            data.sort(sortResourceByValue(direction, sorts.volumeSnapshotSource)),
+           id: tableColumnInfo[4].id,
+           props: { modifier: 'nowrap' },
+         },
+@@ -222,7 +226,7 @@ const VolumeSnapshotTable: FC<VolumeSnapshotTableProps> = ({ data, loaded, ...pr
+ 
+   const columns = useVolumeSnapshotColumns(customRowData);
+ 
+-  const volumeSnapshotStatusFilterOptions = useMemo<DataViewFilterOption[]>(
++  const snapshotStatusFilterOptions = useMemo<DataViewFilterOption[]>(
+     () => [
+       {
+         value: 'Ready',
+@@ -252,17 +256,17 @@ const VolumeSnapshotTable: FC<VolumeSnapshotTableProps> = ({ data, loaded, ...pr
+         filterId="status"
+         title={t('console-app~Status')}
+         placeholder={t('console-app~Filter by status')}
+-        options={volumeSnapshotStatusFilterOptions}
++        options={snapshotStatusFilterOptions}
+       />,
+     ],
+-    [t, volumeSnapshotStatusFilterOptions],
++    [t, snapshotStatusFilterOptions],
+   );
+ 
+   const matchesAdditionalFilters = useCallback(
+     (resource: VolumeSnapshotKind, filters: VolumeSnapshotFilters) => {
+       // Status filter
+       if (filters.status.length > 0) {
+-        const status = volumeSnapshotStatus(resource);
++        const status = snapshotStatus(resource);
+         if (!filters.status.includes(status)) {
+           return false;
+         }
+diff --git a/frontend/packages/console-app/src/status/snapshot.ts b/frontend/packages/console-app/src/status/snapshot.ts
+index c26cf16ca5c..e20b4f7f179 100644
+--- a/frontend/packages/console-app/src/status/snapshot.ts
++++ b/frontend/packages/console-app/src/status/snapshot.ts
+@@ -1,19 +1,13 @@
+ import type { TFunction } from 'i18next';
+ import type { RowFilter } from '@console/dynamic-plugin-sdk/src/extensions/console-types';
+-import type { VolumeSnapshotStatus } from '@console/internal/module/k8s';
+-
+-export const volumeSnapshotStatus = ({ status }: { status?: VolumeSnapshotStatus }) => {
+-  const readyToUse = status?.readyToUse;
+-  const isError = !!status?.error?.message;
+-  return readyToUse ? 'Ready' : isError ? 'Error' : 'Pending';
+-};
++import { snapshotStatus } from '@console/shared/src/sorts/snapshot';
+ 
+ export const snapshotStatusFilters = (t: TFunction): RowFilter[] => {
+   return [
+     {
+       filterGroupName: t('console-app~Status'),
+       type: 'snapshot-status',
+-      reducer: volumeSnapshotStatus,
++      reducer: snapshotStatus,
+       filter: () => null,
+       items: [
+         { id: 'Ready', title: 'Ready' },
+diff --git a/frontend/packages/console-shared/src/components/dashboard/inventory-card/utils.ts b/frontend/packages/console-shared/src/components/dashboard/inventory-card/utils.ts
+index 45616e54cc5..7b289313fe6 100644
+--- a/frontend/packages/console-shared/src/components/dashboard/inventory-card/utils.ts
++++ b/frontend/packages/console-shared/src/components/dashboard/inventory-card/utils.ts
+@@ -1,6 +1,6 @@
+ import { nodeStatus } from '@console/app/src/status/node';
+-import { volumeSnapshotStatus } from '@console/app/src/status/snapshot';
+ import { podPhaseFilterReducer } from '@console/internal/module/k8s';
++import { snapshotStatus } from '@console/shared/src/sorts/snapshot';
+ import type { StatusGroupMapper } from './InventoryItem';
+ import { InventoryStatusGroup } from './status-group';
+ 
+@@ -69,4 +69,4 @@ export const getPVCStatusGroups: StatusGroupMapper = (resources) =>
+ export const getPVStatusGroups: StatusGroupMapper = (resources) =>
+   getStatusGroups(resources, PV_STATUS_GROUP_MAPPING, (pv) => pv.status.phase, 'status');
+ export const getVSStatusGroups: StatusGroupMapper = (resources) =>
+-  getStatusGroups(resources, VS_STATUS_GROUP_MAPPING, volumeSnapshotStatus, 'status');
++  getStatusGroups(resources, VS_STATUS_GROUP_MAPPING, snapshotStatus, 'status');
+diff --git a/frontend/packages/console-shared/src/sorts/snapshot.ts b/frontend/packages/console-shared/src/sorts/snapshot.ts
+index d822e25cfe2..de9ba58aee4 100644
+--- a/frontend/packages/console-shared/src/sorts/snapshot.ts
++++ b/frontend/packages/console-shared/src/sorts/snapshot.ts
+@@ -1,5 +1,15 @@
+ import { convertToBaseValue } from '@console/internal/components/utils/units';
+-import type { VolumeSnapshotKind } from '@console/internal/module/k8s';
++import type {
++  VolumeSnapshotContentKind,
++  VolumeSnapshotKind,
++  VolumeSnapshotStatus,
++} from '@console/internal/module/k8s';
++
++export const snapshotStatus = ({ status }: { status?: VolumeSnapshotStatus }): string => {
++  const readyToUse = status?.readyToUse;
++  const isError = !!status?.error?.message;
++  return readyToUse ? 'Ready' : isError ? 'Error' : 'Pending';
++};
+ 
+ export const snapshotSize = (snapshot: VolumeSnapshotKind): number => {
+   const size = snapshot?.status?.restoreSize;
+@@ -9,3 +19,7 @@ export const snapshotSize = (snapshot: VolumeSnapshotKind): number => {
+ export const snapshotSource = (snapshot: VolumeSnapshotKind): string =>
+   snapshot.spec?.source?.persistentVolumeClaimName ??
+   snapshot.spec?.source?.volumeSnapshotContentName;
++
++export const snapshotContentSize = (snapshot: VolumeSnapshotContentKind): number => {
++  return snapshot?.status?.restoreSize ?? 0;
++};
+diff --git a/frontend/public/components/factory/table-filters.ts b/frontend/public/components/factory/table-filters.ts
+index fa51fbda9fa..1cbc4ed672c 100644
+--- a/frontend/public/components/factory/table-filters.ts
++++ b/frontend/public/components/factory/table-filters.ts
+@@ -1,7 +1,7 @@
+ import * as _ from 'lodash';
+ import * as fuzzy from 'fuzzysearch';
+ import { nodeStatus } from '@console/app/src/status/node';
+-import { volumeSnapshotStatus } from '@console/app/src/status/snapshot';
++import { snapshotStatus } from '@console/shared/src/sorts/snapshot';
+ import { getNodeRoles } from '@console/shared/src/selectors/node';
+ import { getLabelsAsString } from '@console/shared/src/utils/label-filter';
+ import { Alert, Rule } from '@console/dynamic-plugin-sdk/src/api/common-types';
+@@ -220,7 +220,7 @@ export const tableFilters = (isExactSearch: boolean): FilterMap => {
+         return true;
+       }
+ 
+-      const status = volumeSnapshotStatus(snapshot);
++      const status = snapshotStatus(snapshot);
+       return statuses.selected.includes(status) || !_.includes(statuses.all, status);
+     },
+     'node-disk-name': (name, disks) => matchFn(name.selected?.[0], disks?.path),
+diff --git a/frontend/public/components/factory/table.tsx b/frontend/public/components/factory/table.tsx
+index 87a8f6be14c..714258ee7b3 100644
+--- a/frontend/public/components/factory/table.tsx
++++ b/frontend/public/components/factory/table.tsx
+@@ -26,7 +26,12 @@ import { useNavigate } from 'react-router';
+ import { getMachinePhase } from '@console/shared/src/selectors/machine';
+ import { getMachineSetInstanceType } from '@console/shared/src/selectors/machineSet';
+ import { pvcUsed } from '@console/shared/src/sorts/pvc';
+-import { snapshotSize, snapshotSource } from '@console/shared/src/sorts/snapshot';
++import {
++  snapshotContentSize,
++  snapshotSize,
++  snapshotSource,
++  snapshotStatus,
++} from '@console/shared/src/sorts/snapshot';
+ import { ALL_NAMESPACES_KEY } from '@console/shared/src/constants/common';
+ import { getName } from '@console/shared/src/selectors/common';
+ import { useDeepCompareMemoize } from '@console/shared/src/hooks/useDeepCompareMemoize';
+@@ -49,6 +54,7 @@ import {
+   MachineKind,
+   VolumeSnapshotKind,
+   ClusterOperator,
++  VolumeSnapshotContentKind,
+ } from '../../module/k8s/types';
+ import { getClusterOperatorStatus } from '../../module/k8s/cluster-operator';
+ import { getClusterOperatorVersion, getJobTypeAndCompletions } from '../../module/k8s';
+@@ -86,7 +92,11 @@ export const sorts = {
+   getTemplateInstanceStatus,
+   machinePhase: (machine: MachineKind): string => getMachinePhase(machine),
+   pvcUsed: (pvc: K8sResourceKind): number => pvcUsed(pvc),
++  volumeSnapshotStatus: (snapshot: VolumeSnapshotKind | VolumeSnapshotContentKind): string =>
++    snapshotStatus(snapshot),
+   volumeSnapshotSize: (snapshot: VolumeSnapshotKind): number => snapshotSize(snapshot),
++  volumeSnapshotContentSize: (snapshot: VolumeSnapshotContentKind): number =>
++    snapshotContentSize(snapshot),
+   volumeSnapshotSource: (snapshot: VolumeSnapshotKind): string => snapshotSource(snapshot),
+   snapshotLastRestore: (snapshot: K8sResourceKind, { restores }) =>
+     restores[getName(snapshot)]?.status?.restoreTime,
+diff --git a/frontend/public/module/k8s/types.ts b/frontend/public/module/k8s/types.ts
+index 9c12abaa65a..b845c323d07 100644
+--- a/frontend/public/module/k8s/types.ts
++++ b/frontend/public/module/k8s/types.ts
+@@ -1087,6 +1087,7 @@ export type MachineHealthCheckKind = K8sResourceCommon & {
+ export type VolumeSnapshotKind = K8sResourceCommon & {
+   status?: VolumeSnapshotStatus & {
+     boundVolumeSnapshotContentName?: string;
++    restoreSize?: string;
+   };
+   spec: {
+     source: {
+@@ -1100,6 +1101,7 @@ export type VolumeSnapshotKind = K8sResourceCommon & {
+ export type VolumeSnapshotContentKind = K8sResourceCommon & {
+   status: VolumeSnapshotStatus & {
+     snapshotHandle?: string;
++    restoreSize?: number;
+   };
+   spec: {
+     volumeSnapshotRef: {
+@@ -1118,7 +1120,6 @@ export type VolumeSnapshotContentKind = K8sResourceCommon & {
+ 
+ export type VolumeSnapshotStatus = {
+   readyToUse: boolean;
+-  restoreSize?: number;
+   error?: {
+     message: string;
+     time: string;

@@ -1,0 +1,187 @@
+diff --git a/assets/prometheus-operator-user-workload/cluster-role.yaml b/assets/prometheus-operator-user-workload/cluster-role.yaml
+index 96f9ab0bae..95d09a8b62 100644
+--- a/assets/prometheus-operator-user-workload/cluster-role.yaml
++++ b/assets/prometheus-operator-user-workload/cluster-role.yaml
+@@ -117,6 +117,12 @@ rules:
+   - list
+   - update
+   - delete
++- apiGroups:
++  - ""
++  resources:
++  - pods/eviction
++  verbs:
++  - create
+ - apiGroups:
+   - authentication.k8s.io
+   resources:
+diff --git a/assets/prometheus-operator-user-workload/deployment.yaml b/assets/prometheus-operator-user-workload/deployment.yaml
+index 92ccce9843..0fde995089 100644
+--- a/assets/prometheus-operator-user-workload/deployment.yaml
++++ b/assets/prometheus-operator-user-workload/deployment.yaml
+@@ -37,6 +37,7 @@ spec:
+         - --disable-unmanaged-prometheus-configuration=true
+         - --kubelet-endpoints=true
+         - --kubelet-endpointslice=true
++        - --repair-policy-for-statefulsets=evict
+         - --prometheus-instance-namespaces=openshift-user-workload-monitoring
+         - --alertmanager-instance-namespaces=openshift-user-workload-monitoring
+         - --thanos-ruler-instance-namespaces=openshift-user-workload-monitoring
+diff --git a/assets/prometheus-operator/cluster-role.yaml b/assets/prometheus-operator/cluster-role.yaml
+index 396aa3a945..21c2c4ca48 100644
+--- a/assets/prometheus-operator/cluster-role.yaml
++++ b/assets/prometheus-operator/cluster-role.yaml
+@@ -117,6 +117,12 @@ rules:
+   - list
+   - update
+   - delete
++- apiGroups:
++  - ""
++  resources:
++  - pods/eviction
++  verbs:
++  - create
+ - apiGroups:
+   - authentication.k8s.io
+   resources:
+diff --git a/assets/prometheus-operator/deployment.yaml b/assets/prometheus-operator/deployment.yaml
+index 9b5051382f..1ecfabde81 100644
+--- a/assets/prometheus-operator/deployment.yaml
++++ b/assets/prometheus-operator/deployment.yaml
+@@ -38,6 +38,7 @@ spec:
+         - --disable-unmanaged-prometheus-configuration=true
+         - --kubelet-endpoints=true
+         - --kubelet-endpointslice=true
++        - --repair-policy-for-statefulsets=evict
+         - --prometheus-instance-namespaces=openshift-monitoring
+         - --thanos-ruler-instance-namespaces=openshift-monitoring
+         - --alertmanager-instance-namespaces=openshift-monitoring
+diff --git a/jsonnet/main.jsonnet b/jsonnet/main.jsonnet
+index 0c6916e507..404785e787 100644
+--- a/jsonnet/main.jsonnet
++++ b/jsonnet/main.jsonnet
+@@ -286,6 +286,7 @@ local inCluster =
+           },
+         },
+         tlsCipherSuites: $.values.common.tlsCipherSuites,
++        repairPolicy: 'evict',
+       },
+       thanos: {
+         image: $.values.common.images.thanos,
+@@ -482,6 +483,7 @@ local userWorkload =
+         kubeRbacProxyImage: $.values.common.images.kubeRbacProxy,
+         configReloaderImage: $.values.common.images.prometheusOperatorReloader,
+         commonLabels+: $.values.common.commonLabels,
++        repairPolicy: 'evict',
+       },
+     },
+ 
+diff --git a/manifests/0000_50_cluster-monitoring-operator_02-role.yaml b/manifests/0000_50_cluster-monitoring-operator_02-role.yaml
+index 1a27fa1657..96e6324903 100644
+--- a/manifests/0000_50_cluster-monitoring-operator_02-role.yaml
++++ b/manifests/0000_50_cluster-monitoring-operator_02-role.yaml
+@@ -806,6 +806,12 @@ rules:
+   - list
+   - update
+   - delete
++- apiGroups:
++  - ""
++  resources:
++  - pods/eviction
++  verbs:
++  - create
+ - apiGroups:
+   - authentication.k8s.io
+   resources:
+diff --git a/pkg/manifests/manifests_test.go b/pkg/manifests/manifests_test.go
+index bdda90ee35..f381123123 100644
+--- a/pkg/manifests/manifests_test.go
++++ b/pkg/manifests/manifests_test.go
+@@ -700,8 +700,6 @@ func TestPrometheusOperatorConfiguration(t *testing.T) {
+ 		t.Fatal("k8s-prometheus-operator topology spread constraints WhenUnsatisfiable not configured correctly")
+ 	}
+ 
+-	prometheusReloaderFound := false
+-	prometheusWebListenLocal := false
+ 	kubeRbacProxyTLSCipherSuitesArg := ""
+ 	kubeRbacProxyMinTLSVersionArg := ""
+ 	for _, container := range d.Spec.Template.Spec.Containers {
+@@ -715,12 +713,13 @@ func TestPrometheusOperatorConfiguration(t *testing.T) {
+ 				t.Fatalf("%s resources incorrectly configured", container.Name)
+ 			}
+ 
+-			if getContainerArgValue(d.Spec.Template.Spec.Containers, PrometheusConfigReloaderFlag+"docker.io/openshift/origin-prometheus-config-reloader:latest", container.Name) != "" {
+-				prometheusReloaderFound = true
+-			}
+-
+-			if getContainerArgValue(d.Spec.Template.Spec.Containers, "--web.listen-address=127.0.0.1:8080", container.Name) != "" {
+-				prometheusWebListenLocal = true
++			for _, arg := range []string{
++				PrometheusConfigReloaderFlag + "docker.io/openshift/origin-prometheus-config-reloader:latest",
++				"--web.listen-address=127.0.0.1:8080",
++				"--repair-policy-for-statefulsets=evict",
++			} {
++				_, found := getArgValue(container, arg)
++				require.True(t, found, "%q argument not found", arg)
+ 			}
+ 		case "kube-rbac-proxy":
+ 			if container.Image != "docker.io/openshift/origin-kube-rbac-proxy:latest" {
+@@ -731,14 +730,6 @@ func TestPrometheusOperatorConfiguration(t *testing.T) {
+ 		}
+ 	}
+ 
+-	if !prometheusReloaderFound {
+-		t.Fatal("Configuring the Prometheus Config reloader image failed")
+-	}
+-
+-	if !prometheusWebListenLocal {
+-		t.Fatal("expected Prometheus operator to listen on 127.0.0.1:8080")
+-	}
+-
+ 	expectedKubeRbacProxyTLSCipherSuitesArg := fmt.Sprintf("%s%s",
+ 		KubeRbacProxyTLSCipherSuitesFlag,
+ 		strings.Join(crypto.OpenSSLToIANACipherSuites(APIServerDefaultTLSCiphers), ","))
+@@ -4830,8 +4821,6 @@ func TestPrometheusOperatorUserWorkloadConfiguration(t *testing.T) {
+ 		t.Fatal(err)
+ 	}
+ 
+-	prometheusReloaderFound := false
+-	prometheusWebListenLocal := false
+ 	kubeRbacProxyTLSCipherSuitesArg := ""
+ 	kubeRbacProxyMinTLSVersionArg := ""
+ 	for _, container := range d.Spec.Template.Spec.Containers {
+@@ -4840,12 +4829,14 @@ func TestPrometheusOperatorUserWorkloadConfiguration(t *testing.T) {
+ 			if container.Image != "docker.io/openshift/origin-prometheus-operator:latest" {
+ 				t.Fatalf("%s image incorrectly configured", container.Name)
+ 			}
+-			if getContainerArgValue(d.Spec.Template.Spec.Containers, PrometheusConfigReloaderFlag+"docker.io/openshift/origin-prometheus-config-reloader:latest", container.Name) != "" {
+-				prometheusReloaderFound = true
+-			}
+ 
+-			if getContainerArgValue(d.Spec.Template.Spec.Containers, "--web.listen-address=127.0.0.1:8080", container.Name) != "" {
+-				prometheusWebListenLocal = true
++			for _, arg := range []string{
++				PrometheusConfigReloaderFlag + "docker.io/openshift/origin-prometheus-config-reloader:latest",
++				"--web.listen-address=127.0.0.1:8080",
++				"--repair-policy-for-statefulsets=evict",
++			} {
++				_, found := getArgValue(container, arg)
++				require.True(t, found, "%q argument not found", arg)
+ 			}
+ 		case "kube-rbac-proxy":
+ 			if container.Image != "docker.io/openshift/origin-kube-rbac-proxy:latest" {
+@@ -4856,14 +4847,6 @@ func TestPrometheusOperatorUserWorkloadConfiguration(t *testing.T) {
+ 		}
+ 	}
+ 
+-	if !prometheusReloaderFound {
+-		t.Fatal("Configuring the Prometheus Config reloader image failed")
+-	}
+-
+-	if !prometheusWebListenLocal {
+-		t.Fatal("expected Prometheus operator to listen on 127.0.0.1:8080")
+-	}
+-
+ 	expectedKubeRbacProxyTLSCipherSuitesArg := fmt.Sprintf("%s%s",
+ 		KubeRbacProxyTLSCipherSuitesFlag,
+ 		strings.Join(crypto.OpenSSLToIANACipherSuites(APIServerDefaultTLSCiphers), ","))

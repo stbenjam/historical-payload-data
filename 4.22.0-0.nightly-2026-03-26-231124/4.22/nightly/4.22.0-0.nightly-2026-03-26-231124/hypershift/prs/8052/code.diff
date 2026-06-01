@@ -1,0 +1,579 @@
+diff --git a/.github/workflows/lint.yaml b/.github/workflows/lint.yaml
+index a2e87a3237f..eb74fd22efe 100644
+--- a/.github/workflows/lint.yaml
++++ b/.github/workflows/lint.yaml
+@@ -14,4 +14,12 @@ jobs:
+         with:
+           fetch-depth: 0
+       - run: git fetch origin main:main
++      - name: Use pre-built lint tools
++        run: |
++          if [ -d /opt/lint-tools ]; then
++            mkdir -p hack/tools/bin
++            cp /opt/lint-tools/golangci-lint hack/tools/bin/
++            cp /opt/lint-tools/kube-api-linter.so hack/tools/bin/
++            touch hack/tools/bin/golangci-lint hack/tools/bin/kube-api-linter.so
++          fi
+       - run: make lint
+diff --git a/.tekton/hypershift-cli-mce-217-pull-request.yaml b/.tekton/hypershift-cli-mce-217-pull-request.yaml
+index 42124a26d52..9509b59c0e5 100644
+--- a/.tekton/hypershift-cli-mce-217-pull-request.yaml
++++ b/.tekton/hypershift-cli-mce-217-pull-request.yaml
+@@ -8,7 +8,12 @@ metadata:
+     build.appstudio.redhat.com/target_branch: '{{target_branch}}'
+     pipelinesascode.tekton.dev/cancel-in-progress: "true"
+     pipelinesascode.tekton.dev/max-keep-runs: "3"
+-    pipelinesascode.tekton.dev/on-cel-expression: event == "pull_request" && ( target_branch == "release-4.22" || target_branch == "main" )
++    pipelinesascode.tekton.dev/on-cel-expression: |
++      event == "pull_request"
++      && (target_branch == "release-4.22" || target_branch == "main")
++      && (files.all.exists(x, !x.matches('^(?:docs|examples|enhancements|contrib|hack|\\.tekton|\\.github|\\.claude)/|\\.md$|^(?:Dockerfile|Containerfile)\\b|^(?:.*/)?(?:\\.gitignore|OWNERS|PROJECT|LICENSE|renovate\\.json)$'))
++         || "Containerfile.cli".pathChanged()
++         || ".tekton/hypershift-cli-mce-217-pull-request.yaml".pathChanged())
+   creationTimestamp:
+   labels:
+     appstudio.openshift.io/application: release-mce-217
+diff --git a/.tekton/hypershift-gh-actions-runner-pull-request.yaml b/.tekton/hypershift-gh-actions-runner-pull-request.yaml
+index 6011152e096..73bba6275a5 100644
+--- a/.tekton/hypershift-gh-actions-runner-pull-request.yaml
++++ b/.tekton/hypershift-gh-actions-runner-pull-request.yaml
+@@ -30,7 +30,10 @@ spec:
+     value: 5d
+   - name: build-platforms
+     value:
++    - linux/amd64
+     - linux/arm64
++  - name: hermetic
++    value: "false"
+   - name: dockerfile
+     value: Dockerfile.github-actions-runner
+   pipelineRef:
+diff --git a/.tekton/hypershift-gh-actions-runner-push.yaml b/.tekton/hypershift-gh-actions-runner-push.yaml
+index 16db637b300..1bfb8b6c69d 100644
+--- a/.tekton/hypershift-gh-actions-runner-push.yaml
++++ b/.tekton/hypershift-gh-actions-runner-push.yaml
+@@ -27,7 +27,10 @@ spec:
+     value: quay.io/redhat-user-workloads/crt-redhat-acm-tenant/hypershift-gh-actions-runner:{{revision}}
+   - name: build-platforms
+     value:
++    - linux/amd64
+     - linux/arm64
++  - name: hermetic
++    value: "false"
+   - name: dockerfile
+     value: Dockerfile.github-actions-runner
+   - name: additional-tags
+diff --git a/.tekton/hypershift-operator-main-pull-request.yaml b/.tekton/hypershift-operator-main-pull-request.yaml
+index a3f98e7def5..e43505d41e0 100644
+--- a/.tekton/hypershift-operator-main-pull-request.yaml
++++ b/.tekton/hypershift-operator-main-pull-request.yaml
+@@ -11,7 +11,8 @@ metadata:
+     pipelinesascode.tekton.dev/on-cel-expression: |
+       event == "pull_request"
+       && target_branch == "main"
+-      && (files.all.exists(x, !x.matches('^(?:docs|examples|enhancements|contrib|\\.tekton)/|\\.md$|^(?:.*/)?(?:\\.gitignore|OWNERS|PROJECT|LICENSE|renovate\\.json)$'))
++      && (files.all.exists(x, !x.matches('^(?:docs|examples|enhancements|contrib|hack|\\.tekton|\\.github|\\.claude)/|\\.md$|^(?:Dockerfile|Containerfile)\\b|^(?:.*/)?(?:\\.gitignore|OWNERS|PROJECT|LICENSE|renovate\\.json)$'))
++         || "Containerfile.operator".pathChanged()
+          || ".tekton/pipelines/common-operator-build.yaml".pathChanged()
+          || ".tekton/hypershift-operator-main-pull-request.yaml".pathChanged())
+     pipelinesascode.tekton.dev/pipeline: ".tekton/pipelines/common-operator-build.yaml"
+diff --git a/.tekton/hypershift-release-mce-217-pull-request.yaml b/.tekton/hypershift-release-mce-217-pull-request.yaml
+index f387f709d56..dd111fa4006 100644
+--- a/.tekton/hypershift-release-mce-217-pull-request.yaml
++++ b/.tekton/hypershift-release-mce-217-pull-request.yaml
+@@ -11,7 +11,8 @@ metadata:
+     pipelinesascode.tekton.dev/on-cel-expression: |
+       event == "pull_request"
+       && (target_branch == "release-4.22" || target_branch == "main")
+-      && (files.all.exists(x, !x.matches('^(?:docs|examples|enhancements|contrib|\\.tekton)/|\\.md$|^(?:.*/)?(?:\\.gitignore|OWNERS|PROJECT|LICENSE|renovate\\.json)$'))
++      && (files.all.exists(x, !x.matches('^(?:docs|examples|enhancements|contrib|hack|\\.tekton|\\.github|\\.claude)/|\\.md$|^(?:Dockerfile|Containerfile)\\b|^(?:.*/)?(?:\\.gitignore|OWNERS|PROJECT|LICENSE|renovate\\.json)$'))
++         || "Containerfile.operator".pathChanged()
+          || ".tekton/hypershift-release-mce-217-pull-request.yaml".pathChanged())
+   creationTimestamp:
+   labels:
+diff --git a/.tekton/pipelines/common-operator-build.yaml b/.tekton/pipelines/common-operator-build.yaml
+index 9ed87336942..fc77e0cd8e7 100644
+--- a/.tekton/pipelines/common-operator-build.yaml
++++ b/.tekton/pipelines/common-operator-build.yaml
+@@ -62,6 +62,10 @@ spec:
+       set of values is determined by the configuration of the multi-platform-controller.
+     name: build-platforms
+     type: array
++  - default: "true"
++    description: Execute the build with network isolation
++    name: hermetic
++    type: string
+   - default: []
+     description: Additional tags to apply to the built image.
+     name: additional-tags
+@@ -155,7 +159,7 @@ spec:
+     - name: CONTEXT
+       value: $(params.path-context)
+     - name: HERMETIC
+-      value: "true"
++      value: $(params.hermetic)
+     - name: PREFETCH_INPUT
+       value: $(params.prefetch-input)
+     - name: IMAGE_EXPIRES_AFTER
+@@ -336,7 +340,7 @@ spec:
+     - name: CONTEXT
+       value: $(params.path-context)
+     - name: HERMETIC
+-      value: "true"
++      value: $(params.hermetic)
+     - name: PREFETCH_INPUT
+       value: $(params.prefetch-input)
+     - name: IMAGE_EXPIRES_AFTER
+diff --git a/Dockerfile.github-actions-runner b/Dockerfile.github-actions-runner
+index d5e8d91b73a..36c691b21fb 100644
+--- a/Dockerfile.github-actions-runner
++++ b/Dockerfile.github-actions-runner
+@@ -1,4 +1,4 @@
+-FROM ghcr.io/actions/actions-runner@sha256:5b922563ee9406d55e77a57d3dde85e1d793e600ed326ef6739182a847efae0f
++FROM ghcr.io/actions/actions-runner@sha256:1ad983536759ceec39ed75a2c8f007ca8c37b66eee35ed86f13623b29a4db97d
+ 
+ USER root
+ 
+@@ -13,13 +13,25 @@ RUN apt-get update && \
+         python3-pip \
+     && rm -rf /var/lib/apt/lists/*
+ 
++ARG TARGETARCH
+ ARG GO_VERSION=1.25.3
+-RUN curl -fsSL "https://go.dev/dl/go${GO_VERSION}.linux-arm64.tar.gz" | tar -C /usr/local -xz
++RUN curl -fsSL "https://go.dev/dl/go${GO_VERSION}.linux-${TARGETARCH}.tar.gz" | tar -C /usr/local -xz
+ 
+-RUN curl -fsSL "https://mirror.openshift.com/pub/openshift-v4/aarch64/clients/ocp/stable/openshift-client-linux.tar.gz" | tar -C /usr/local/bin -xz oc kubectl
++RUN OCP_ARCH=$([ "$TARGETARCH" = "amd64" ] && echo "x86_64" || echo "aarch64") && \
++    curl -fsSL "https://mirror.openshift.com/pub/openshift-v4/${OCP_ARCH}/clients/ocp/stable/openshift-client-linux.tar.gz" | tar -C /usr/local/bin -xz oc kubectl
+ 
+ ENV PATH="/usr/local/go/bin:${PATH}"
+ ENV GOPATH="/home/runner/go"
+ ENV PATH="${GOPATH}/bin:${PATH}"
+ 
++# Pre-build lint tools (golangci-lint and kube-api-linter plugin)
++COPY hack/tools/ /tmp/tools/
++RUN cd /tmp/tools && \
++    mkdir -p /opt/lint-tools && \
++    GO111MODULE=on GOWORK=off GOFLAGS=-mod=vendor go build -tags=tools \
++        -o /opt/lint-tools/golangci-lint github.com/golangci/golangci-lint/v2/cmd/golangci-lint && \
++    CGO_ENABLED=1 GO111MODULE=on GOWORK=off GOFLAGS=-mod=vendor go build -buildmode=plugin \
++        -o /opt/lint-tools/kube-api-linter.so sigs.k8s.io/kube-api-linter/pkg/plugin && \
++    rm -rf /tmp/tools
++
+ USER runner
+diff --git a/hack/tools/check-konflux-triggers/README.md b/hack/tools/check-konflux-triggers/README.md
+new file mode 100644
+index 00000000000..92b2a338cdd
+--- /dev/null
++++ b/hack/tools/check-konflux-triggers/README.md
+@@ -0,0 +1,39 @@
++# check-konflux-triggers
++
++Evaluates Pipelines as Code CEL expressions from `.tekton/*pull-request*` files
++against the current branch's changed files to predict which Konflux pipelines
++would trigger.
++
++Uses the same [`gobwas/glob`](https://github.com/gobwas/glob) library and
++[`google/cel-go`](https://github.com/google/cel-go) engine as
++[Pipelines as Code](https://github.com/tektoncd/pipelines-as-code/blob/main/pkg/matcher/cel.go).
++
++## Usage
++
++```bash
++# From the repository root:
++(cd hack/tools && go run ./check-konflux-triggers/)
++
++# With a custom base ref (defaults to origin/main):
++(cd hack/tools && go run ./check-konflux-triggers/ upstream/main)
++```
++
++Output is automatically paged through `less` when stdout is a terminal (like
++`git` and `systemctl`). Set `$PAGER` to override. When piped, output goes
++directly to stdout.
++
++## Example output
++
++```
++Changed files (2):
++  .github/workflows/lint.yaml
++  Dockerfile.github-actions-runner
++
++Pipeline trigger evaluation (event=pull_request, target_branch=main):
++
++  Pipeline                                        Trigger   CEL Expression
++  ──────────────────────────────────────────────  ────────  ────────────────────────────────────────
++  hypershift-cli-mce-217-on-pull-request          no        event == "pull_request" && ...
++▶ hypershift-gh-actions-runner-on-pull-request    YES       event == "pull_request" && ...
++  hypershift-operator-main-on-pull-request        no        event == "pull_request" && ...
++```
+diff --git a/hack/tools/check-konflux-triggers/main.go b/hack/tools/check-konflux-triggers/main.go
+new file mode 100644
+index 00000000000..27de661ca15
+--- /dev/null
++++ b/hack/tools/check-konflux-triggers/main.go
+@@ -0,0 +1,318 @@
++package main
++
++import (
++	"fmt"
++	"os"
++	"os/exec"
++	"path/filepath"
++	"strings"
++
++	"github.com/gobwas/glob"
++	"github.com/google/cel-go/cel"
++	"github.com/google/cel-go/common/types"
++	"github.com/google/cel-go/common/types/ref"
++	"sigs.k8s.io/yaml"
++)
++
++// pipelineRun is a minimal representation to extract the CEL annotation and name.
++type pipelineRun struct {
++	Metadata struct {
++		Name        string            `json:"name"`
++		Annotations map[string]string `json:"annotations"`
++	} `json:"metadata"`
++}
++
++func setupPager() func() {
++	if !isTerminal(os.Stdout) {
++		return func() {}
++	}
++	pager := os.Getenv("PAGER")
++	if pager == "" {
++		// Use less with options similar to systemctl/git:
++		// -R: pass through ANSI escape sequences (for future color support)
++		// -F: quit if output fits on one screen
++		// -X: don't clear screen on exit
++		// -S: chop long lines instead of wrapping
++		pager = "less"
++		os.Setenv("LESS", "RFXS")
++	}
++
++	r, w, err := os.Pipe()
++	if err != nil {
++		return func() {}
++	}
++
++	cmd := exec.Command(pager)
++	cmd.Stdin = r
++	cmd.Stdout = os.Stdout
++	cmd.Stderr = os.Stderr
++
++	origStdout := os.Stdout
++	os.Stdout = w
++
++	if err := cmd.Start(); err != nil {
++		os.Stdout = origStdout
++		w.Close()
++		r.Close()
++		return func() {}
++	}
++
++	return func() {
++		w.Close()
++		cmd.Wait()
++		os.Stdout = origStdout
++	}
++}
++
++func isTerminal(f *os.File) bool {
++	fi, err := f.Stat()
++	if err != nil {
++		return false
++	}
++	return fi.Mode()&os.ModeCharDevice != 0
++}
++
++func main() {
++	cleanup := setupPager()
++	defer cleanup()
++
++	baseRef := "origin/main"
++	if len(os.Args) > 1 {
++		baseRef = os.Args[1]
++	}
++
++	changedFiles, err := getChangedFiles(baseRef)
++	if err != nil {
++		fmt.Fprintf(os.Stderr, "Error getting changed files: %v\n", err)
++		os.Exit(1)
++	}
++
++	fmt.Printf("Changed files (%d):\n", len(changedFiles))
++	for _, f := range changedFiles {
++		fmt.Printf("  %s\n", f)
++	}
++	fmt.Println()
++
++	repoRoot, err := getRepoRoot()
++	if err != nil {
++		fmt.Fprintf(os.Stderr, "Error finding repo root: %v\n", err)
++		os.Exit(1)
++	}
++	tektonDir := filepath.Join(repoRoot, ".tekton")
++	entries, err := os.ReadDir(tektonDir)
++	if err != nil {
++		fmt.Fprintf(os.Stderr, "Error reading %s: %v\n", tektonDir, err)
++		os.Exit(1)
++	}
++
++	type result struct {
++		name    string
++		status  string
++		celExpr string
++	}
++
++	var results []result
++	hasFailure := false
++	maxName := len("Pipeline")
++
++	for _, entry := range entries {
++		if !strings.Contains(entry.Name(), "pull-request") || entry.IsDir() {
++			continue
++		}
++
++		path := filepath.Join(tektonDir, entry.Name())
++		data, err := os.ReadFile(path)
++		if err != nil {
++			fmt.Fprintf(os.Stderr, "Error reading %s: %v\n", path, err)
++			continue
++		}
++
++		var pr pipelineRun
++		if err := yaml.Unmarshal(data, &pr); err != nil {
++			fmt.Fprintf(os.Stderr, "Error parsing %s: %v\n", path, err)
++			continue
++		}
++
++		celExpr, ok := pr.Metadata.Annotations["pipelinesascode.tekton.dev/on-cel-expression"]
++		if !ok {
++			r := result{name: pr.Metadata.Name, status: "SKIP", celExpr: "(no CEL expression)"}
++			results = append(results, r)
++			if len(r.name) > maxName {
++				maxName = len(r.name)
++			}
++			continue
++		}
++
++		celExpr = strings.Join(strings.Fields(celExpr), " ")
++
++		triggered, err := evaluateCEL(celExpr, changedFiles)
++		if err != nil {
++			r := result{name: pr.Metadata.Name, status: "ERROR", celExpr: err.Error()}
++			results = append(results, r)
++			hasFailure = true
++			if len(r.name) > maxName {
++				maxName = len(r.name)
++			}
++			continue
++		}
++
++		status := "no"
++		if triggered {
++			status = "YES"
++		}
++		r := result{name: pr.Metadata.Name, status: status, celExpr: celExpr}
++		results = append(results, r)
++		if len(r.name) > maxName {
++			maxName = len(r.name)
++		}
++	}
++
++	fmt.Println("Pipeline trigger evaluation (event=pull_request, target_branch=main):")
++	fmt.Println()
++
++	// Table header
++	fmt.Printf("  %-*s  %-8s  %s\n", maxName, "Pipeline", "Trigger", "CEL Expression")
++	fmt.Printf("  %s  %s  %s\n", strings.Repeat("─", maxName), strings.Repeat("─", 8), strings.Repeat("─", 40))
++
++	for _, r := range results {
++		marker := "  "
++		if r.status == "YES" {
++			marker = "▶ "
++		}
++		fmt.Printf("%s%-*s  %-8s  %s\n", marker, maxName, r.name, r.status, r.celExpr)
++	}
++
++	if hasFailure {
++		os.Exit(1)
++	}
++}
++
++func getRepoRoot() (string, error) {
++	out, err := exec.Command("git", "rev-parse", "--show-toplevel").Output()
++	if err != nil {
++		return "", fmt.Errorf("git rev-parse --show-toplevel: %w", err)
++	}
++	return strings.TrimSpace(string(out)), nil
++}
++
++func getChangedFiles(baseRef string) ([]string, error) {
++	cmd := exec.Command("git", "diff", "--name-only", baseRef+"...HEAD")
++	out, err := cmd.Output()
++	if err != nil {
++		return nil, fmt.Errorf("git diff: %w", err)
++	}
++	trimmed := strings.TrimSpace(string(out))
++	if trimmed == "" {
++		return nil, nil
++	}
++	return strings.Split(trimmed, "\n"), nil
++}
++
++// celPac implements cel.Library, mirroring the Pipelines as Code CEL
++// environment from tektoncd/pipelines-as-code/pkg/matcher/cel.go.
++type celPac struct {
++	changedFiles []string
++}
++
++func (c celPac) CompileOptions() []cel.EnvOption {
++	return []cel.EnvOption{
++		cel.Function("pathChanged",
++			cel.MemberOverload("string_pathChanged",
++				[]*cel.Type{cel.StringType},
++				cel.BoolType,
++				cel.UnaryBinding(c.pathChanged),
++			),
++		),
++	}
++}
++
++func (c celPac) ProgramOptions() []cel.ProgramOption {
++	return nil
++}
++
++// pathChanged matches exactly like PaC: uses gobwas/glob on each changed file.
++func (c celPac) pathChanged(val ref.Val) ref.Val {
++	pattern, ok := val.Value().(string)
++	if !ok {
++		return types.False
++	}
++	g, err := glob.Compile(pattern)
++	if err != nil {
++		return types.NewErr("glob compile error for %q: %v", pattern, err)
++	}
++	for _, f := range c.changedFiles {
++		if g.Match(f) {
++			return types.True
++		}
++	}
++	return types.False
++}
++
++func evaluateCEL(expr string, changedFiles []string) (bool, error) {
++	env, err := cel.NewEnv(
++		cel.Lib(celPac{changedFiles: changedFiles}),
++		cel.Variable("event", cel.StringType),
++		cel.Variable("event_type", cel.StringType),
++		cel.Variable("event_title", cel.StringType),
++		cel.Variable("target_branch", cel.StringType),
++		cel.Variable("source_branch", cel.StringType),
++		cel.Variable("target_url", cel.StringType),
++		cel.Variable("source_url", cel.StringType),
++		cel.Variable("headers", cel.MapType(cel.StringType, cel.DynType)),
++		cel.Variable("body", cel.MapType(cel.StringType, cel.DynType)),
++		cel.Variable("files", cel.MapType(cel.StringType, cel.DynType)),
++	)
++	if err != nil {
++		return false, fmt.Errorf("creating CEL env: %w", err)
++	}
++
++	ast, issues := env.Parse(expr)
++	if issues != nil && issues.Err() != nil {
++		return false, fmt.Errorf("parsing CEL: %w", issues.Err())
++	}
++
++	checked, issues := env.Check(ast)
++	if issues != nil && issues.Err() != nil {
++		return false, fmt.Errorf("checking CEL: %w", issues.Err())
++	}
++
++	prg, err := env.Program(checked)
++	if err != nil {
++		return false, fmt.Errorf("creating CEL program: %w", err)
++	}
++
++	// Build the files map matching PaC's structure
++	allFiles := make([]interface{}, len(changedFiles))
++	for i, f := range changedFiles {
++		allFiles[i] = f
++	}
++	filesMap := map[string]interface{}{
++		"all":      allFiles,
++		"added":    []interface{}{},
++		"deleted":  []interface{}{},
++		"modified": allFiles, // approximate: treat all as modified
++		"renamed":  []interface{}{},
++	}
++
++	out, _, err := prg.Eval(map[string]interface{}{
++		"event":         "pull_request",
++		"event_type":    "",
++		"event_title":   "",
++		"target_branch": "main",
++		"source_branch": "",
++		"target_url":    "",
++		"source_url":    "",
++		"headers":       map[string]interface{}{},
++		"body":          map[string]interface{}{},
++		"files":         filesMap,
++	})
++	if err != nil {
++		return false, fmt.Errorf("evaluating CEL: %w", err)
++	}
++
++	result, ok := out.Value().(bool)
++	if !ok {
++		return false, fmt.Errorf("CEL result is not bool: %v (%T)", out.Value(), out.Value())
++	}
++	return result, nil
++}
+diff --git a/hack/tools/go.mod b/hack/tools/go.mod
+index 952e3d603a1..77fc5213322 100644
+--- a/hack/tools/go.mod
++++ b/hack/tools/go.mod
+@@ -4,7 +4,9 @@ go 1.25.3
+ 
+ require (
+ 	github.com/ahmetb/gen-crd-api-reference-docs v0.3.0
++	github.com/gobwas/glob v0.2.3
+ 	github.com/golangci/golangci-lint/v2 v2.11.1
++	github.com/google/cel-go v0.26.1
+ 	github.com/openshift/api/tools v0.0.0-20250915151906-94481d71bb6f
+ 	go.uber.org/mock v0.6.0
+ 	gotest.tools/gotestsum v1.13.0
+@@ -12,6 +14,7 @@ require (
+ 	k8s.io/code-generator v0.34.2
+ 	k8s.io/utils v0.0.0-20260108192941-914a6e750570
+ 	sigs.k8s.io/kube-api-linter v0.0.0-20260206102632-39e3d06a2850
++	sigs.k8s.io/yaml v1.6.0
+ )
+ 
+ require (
+@@ -115,7 +118,6 @@ require (
+ 	github.com/go-viper/mapstructure/v2 v2.5.0 // indirect
+ 	github.com/go-xmlfmt/xmlfmt v1.1.3 // indirect
+ 	github.com/gobuffalo/flect v1.0.3 // indirect
+-	github.com/gobwas/glob v0.2.3 // indirect
+ 	github.com/goccy/go-json v0.10.3 // indirect
+ 	github.com/goccy/go-yaml v1.18.0 // indirect
+ 	github.com/godoc-lint/godoc-lint v0.11.2 // indirect
+@@ -132,7 +134,6 @@ require (
+ 	github.com/golangci/revgrep v0.8.0 // indirect
+ 	github.com/golangci/swaggoswag v0.0.0-20250504205917-77f2aca3143e // indirect
+ 	github.com/golangci/unconvert v0.0.0-20250410112200-a129a6e6413e // indirect
+-	github.com/google/cel-go v0.26.1 // indirect
+ 	github.com/google/gnostic-models v0.7.0 // indirect
+ 	github.com/google/go-cmp v0.7.0 // indirect
+ 	github.com/google/shlex v0.0.0-20191202100458-e7afc7fbc510 // indirect
+@@ -320,7 +321,6 @@ require (
+ 	sigs.k8s.io/json v0.0.0-20250730193827-2d320260d730 // indirect
+ 	sigs.k8s.io/randfill v1.0.0 // indirect
+ 	sigs.k8s.io/structured-merge-diff/v6 v6.3.0 // indirect
+-	sigs.k8s.io/yaml v1.6.0 // indirect
+ )
+ 
+ replace sigs.k8s.io/controller-tools => github.com/openshift/controller-tools v0.12.1-0.20250402141027-24f590ca0886

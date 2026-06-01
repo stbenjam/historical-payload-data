@@ -1,0 +1,478 @@
+diff --git a/pkg/operator/controller/canary/controller.go b/pkg/operator/controller/canary/controller.go
+index 59548f2194..e5645d0840 100644
+--- a/pkg/operator/controller/canary/controller.go
++++ b/pkg/operator/controller/canary/controller.go
+@@ -10,6 +10,7 @@ import (
+ 
+ 	logf "github.com/openshift/cluster-ingress-operator/pkg/log"
+ 	"github.com/openshift/cluster-ingress-operator/pkg/manifests"
++	kerrors "k8s.io/apimachinery/pkg/api/errors"
+ 
+ 	"github.com/google/go-cmp/cmp"
+ 	"github.com/google/go-cmp/cmp/cmpopts"
+@@ -17,6 +18,7 @@ import (
+ 	operatorcontroller "github.com/openshift/cluster-ingress-operator/pkg/operator/controller"
+ 	ingresscontroller "github.com/openshift/cluster-ingress-operator/pkg/operator/controller/ingress"
+ 
++	configv1 "github.com/openshift/api/config/v1"
+ 	operatorv1 "github.com/openshift/api/operator/v1"
+ 	routev1 "github.com/openshift/api/route/v1"
+ 
+@@ -174,6 +176,15 @@ func New(mgr manager.Manager, config Config) (controller.Controller, error) {
+ 		return nil, err
+ 	}
+ 
++	// Watch the cluster APIServer config so that changes to the TLS security
++	// profile cause the canary daemonset to be reconciled.
++	apiServerPredicate := predicate.NewPredicateFuncs(func(o client.Object) bool {
++		return o.GetName() == "cluster"
++	})
++	if err := c.Watch(source.Kind[client.Object](operatorCache, &configv1.APIServer{}, enqueueRequestForDefaultIngressController(config.Namespace), apiServerPredicate)); err != nil {
++		return nil, err
++	}
++
+ 	return c, nil
+ }
+ 
+@@ -202,7 +213,22 @@ func (r *reconciler) Reconcile(ctx context.Context, request reconcile.Request) (
+ 		return result, fmt.Errorf("failed to ensure canary namespace: %v", err)
+ 	}
+ 
+-	haveDs, daemonset, err := r.ensureCanaryDaemonSet(ctx)
++	// Read the cluster APIServer config to get the TLS security profile.
++	// If this read fails (e.g. transient API error), continue with the
++	// intermediate default profile instead of hard-failing reconcile.
++	apiConfig := &configv1.APIServer{}
++	tlsProfileSpec := configv1.TLSProfiles[configv1.TLSProfileIntermediateType]
++	if err := r.client.Get(ctx, types.NamespacedName{Name: "cluster"}, apiConfig); err != nil {
++		if kerrors.IsNotFound(err) {
++			log.Info("APIServer 'cluster' not found; falling back to intermediate TLS profile")
++		} else {
++			return result, fmt.Errorf("failed to get APIServer 'cluster': %w", err)
++		}
++	} else {
++		tlsProfileSpec = operatorcontroller.TLSProfileSpecForSecurityProfile(apiConfig.Spec.TLSSecurityProfile)
++	}
++
++	haveDs, daemonset, err := r.ensureCanaryDaemonSet(ctx, tlsProfileSpec)
+ 	if err != nil {
+ 		return result, fmt.Errorf("failed to ensure canary daemonset: %v", err)
+ 	} else if !haveDs {
+diff --git a/pkg/operator/controller/canary/daemonset.go b/pkg/operator/controller/canary/daemonset.go
+index a565eed264..92ca73a0ed 100644
+--- a/pkg/operator/controller/canary/daemonset.go
++++ b/pkg/operator/controller/canary/daemonset.go
+@@ -3,10 +3,13 @@ package canary
+ import (
+ 	"context"
+ 	"fmt"
++	"strings"
+ 
+ 	"github.com/google/go-cmp/cmp"
+ 	"github.com/google/go-cmp/cmp/cmpopts"
+ 
++	configv1 "github.com/openshift/api/config/v1"
++
+ 	"github.com/openshift/cluster-ingress-operator/pkg/manifests"
+ 	"github.com/openshift/cluster-ingress-operator/pkg/operator/controller"
+ 
+@@ -23,7 +26,7 @@ const (
+ )
+ 
+ // ensureCanaryDaemonSet ensures the canary daemonset exists
+-func (r *reconciler) ensureCanaryDaemonSet(ctx context.Context) (bool, *appsv1.DaemonSet, error) {
++func (r *reconciler) ensureCanaryDaemonSet(ctx context.Context, tlsProfileSpec *configv1.TLSProfileSpec) (bool, *appsv1.DaemonSet, error) {
+ 	// Attempt to read the canary serving cert secret and compute a content hash.
+ 	// If the secret is missing or incomplete, proceed without the annotation but
+ 	// surface a log entry so operators can investigate.
+@@ -43,7 +46,7 @@ func (r *reconciler) ensureCanaryDaemonSet(ctx context.Context) (bool, *appsv1.D
+ 		}
+ 	}
+ 
+-	desired := desiredCanaryDaemonSet(r.config.CanaryImage, certHash)
++	desired := desiredCanaryDaemonSet(r.config.CanaryImage, certHash, tlsProfileSpec)
+ 	haveDs, current, err := r.currentCanaryDaemonSet(ctx)
+ 	if err != nil {
+ 		return false, nil, err
+@@ -129,7 +132,7 @@ func (r *reconciler) updateCanaryDaemonSet(ctx context.Context, current, desired
+ 
+ // desiredCanaryDaemonSet returns the desired canary daemonset read in
+ // from manifests
+-func desiredCanaryDaemonSet(canaryImage string, certHash string) *appsv1.DaemonSet {
++func desiredCanaryDaemonSet(canaryImage string, certHash string, tlsProfileSpec *configv1.TLSProfileSpec) *appsv1.DaemonSet {
+ 	daemonset := manifests.CanaryDaemonSet()
+ 	name := controller.CanaryDaemonSetName()
+ 	daemonset.Name = name.Name
+@@ -147,6 +150,30 @@ func desiredCanaryDaemonSet(canaryImage string, certHash string) *appsv1.DaemonS
+ 	daemonset.Spec.Template.Spec.Containers[0].Command = []string{"ingress-operator", CanaryHealthcheckCommand}
+ 	daemonset.Spec.Template.Spec.ServiceAccountName = controller.CanaryServiceAccountName().Name
+ 
++	// Set the TLS cipher suites and minimum TLS version from the API Server's
++	// TLS security profile so that the canary server inherits the centrally
++	// managed TLS configuration.
++	if tlsProfileSpec != nil {
++		if len(tlsProfileSpec.Ciphers) > 0 {
++			daemonset.Spec.Template.Spec.Containers[0].Env = append(
++				daemonset.Spec.Template.Spec.Containers[0].Env,
++				corev1.EnvVar{
++					Name:  "TLS_CIPHERS",
++					Value: strings.Join(tlsProfileSpec.Ciphers, ","),
++				},
++			)
++		}
++		if len(tlsProfileSpec.MinTLSVersion) > 0 {
++			daemonset.Spec.Template.Spec.Containers[0].Env = append(
++				daemonset.Spec.Template.Spec.Containers[0].Env,
++				corev1.EnvVar{
++					Name:  "TLS_MIN_VERSION",
++					Value: string(tlsProfileSpec.MinTLSVersion),
++				},
++			)
++		}
++	}
++
+ 	if certHash != "" {
+ 		if daemonset.Spec.Template.Annotations == nil {
+ 			daemonset.Spec.Template.Annotations = map[string]string{}
+diff --git a/pkg/operator/controller/canary/daemonset_test.go b/pkg/operator/controller/canary/daemonset_test.go
+index 411625bb75..857851f7ae 100644
+--- a/pkg/operator/controller/canary/daemonset_test.go
++++ b/pkg/operator/controller/canary/daemonset_test.go
+@@ -1,10 +1,13 @@
+ package canary
+ 
+ import (
++	"strings"
+ 	"testing"
+ 
+ 	"github.com/google/go-cmp/cmp"
+ 
++	configv1 "github.com/openshift/api/config/v1"
++
+ 	"github.com/openshift/cluster-ingress-operator/pkg/manifests"
+ 	"github.com/openshift/cluster-ingress-operator/pkg/operator/controller"
+ 
+@@ -16,7 +19,7 @@ import (
+ func Test_desiredCanaryDaemonSet(t *testing.T) {
+ 	// canaryImageName is the ingress-operator image
+ 	canaryImageName := "openshift/origin-cluster-ingress-operator:latest"
+-	daemonset := desiredCanaryDaemonSet(canaryImageName, "")
++	daemonset := desiredCanaryDaemonSet(canaryImageName, "", configv1.TLSProfiles[configv1.TLSProfileIntermediateType])
+ 
+ 	expectedDaemonSetName := controller.CanaryDaemonSetName()
+ 
+@@ -253,7 +256,7 @@ func Test_canaryDaemonsetChanged(t *testing.T) {
+ 
+ 	for _, tc := range testCases {
+ 		t.Run(tc.description, func(t *testing.T) {
+-			original := desiredCanaryDaemonSet("", "")
++			original := desiredCanaryDaemonSet("", "", configv1.TLSProfiles[configv1.TLSProfileIntermediateType])
+ 			mutated := original.DeepCopy()
+ 			tc.mutate(mutated)
+ 			if changed, updated := canaryDaemonSetChanged(original, mutated); changed != tc.expect {
+@@ -269,3 +272,69 @@ func Test_canaryDaemonsetChanged(t *testing.T) {
+ 		})
+ 	}
+ }
++
++// getEnvVar returns the value of the environment variable with the given name
++// from the daemonset's container, or an empty string if not found.
++func getEnvVar(ds *appsv1.DaemonSet, name string) string {
++	for _, env := range ds.Spec.Template.Spec.Containers[0].Env {
++		if env.Name == name {
++			return env.Value
++		}
++	}
++	return ""
++}
++
++func Test_desiredCanaryDaemonSet_TLS_Profile(t *testing.T) {
++	canaryImageName := "openshift/origin-cluster-ingress-operator:latest"
++
++	testCases := []struct {
++		name             string
++		tlsProfile       *configv1.TLSProfileSpec
++		expectCiphers    string
++		expectMinVersion string
++	}{
++		{
++			name:             "Intermediate profile",
++			tlsProfile:       configv1.TLSProfiles[configv1.TLSProfileIntermediateType],
++			expectCiphers:    strings.Join(configv1.TLSProfiles[configv1.TLSProfileIntermediateType].Ciphers, ","),
++			expectMinVersion: string(configv1.TLSProfiles[configv1.TLSProfileIntermediateType].MinTLSVersion),
++		},
++		{
++			name:             "Old profile",
++			tlsProfile:       configv1.TLSProfiles[configv1.TLSProfileOldType],
++			expectCiphers:    strings.Join(configv1.TLSProfiles[configv1.TLSProfileOldType].Ciphers, ","),
++			expectMinVersion: string(configv1.TLSProfiles[configv1.TLSProfileOldType].MinTLSVersion),
++		},
++		{
++			name: "Custom profile",
++			tlsProfile: &configv1.TLSProfileSpec{
++				Ciphers:       []string{"ECDHE-RSA-AES128-GCM-SHA256", "ECDHE-RSA-AES256-GCM-SHA384"},
++				MinTLSVersion: configv1.VersionTLS13,
++			},
++			expectCiphers:    "ECDHE-RSA-AES128-GCM-SHA256,ECDHE-RSA-AES256-GCM-SHA384",
++			expectMinVersion: string(configv1.VersionTLS13),
++		},
++		{
++			name:             "Nil profile",
++			tlsProfile:       nil,
++			expectCiphers:    "",
++			expectMinVersion: "",
++		},
++	}
++
++	for _, tc := range testCases {
++		t.Run(tc.name, func(t *testing.T) {
++			ds := desiredCanaryDaemonSet(canaryImageName, "", tc.tlsProfile)
++
++			actualCiphers := getEnvVar(ds, "TLS_CIPHERS")
++			if diff := cmp.Diff(tc.expectCiphers, actualCiphers); diff != "" {
++				t.Errorf("TLS_CIPHERS mismatch (-want +got):\n%s", diff)
++			}
++
++			actualMinVersion := getEnvVar(ds, "TLS_MIN_VERSION")
++			if diff := cmp.Diff(tc.expectMinVersion, actualMinVersion); diff != "" {
++				t.Errorf("TLS_MIN_VERSION mismatch (-want +got):\n%s", diff)
++			}
++		})
++	}
++}
+diff --git a/pkg/operator/controller/ingress/controller.go b/pkg/operator/controller/ingress/controller.go
+index 177abec10c..3e8fb04480 100644
+--- a/pkg/operator/controller/ingress/controller.go
++++ b/pkg/operator/controller/ingress/controller.go
+@@ -853,9 +853,9 @@ func setDefaultProviderParameters(lbs *operatorv1.LoadBalancerStrategy, ingressC
+ // caller; the caller must make a copy if it needs to mutate the value.
+ func tlsProfileSpecForIngressController(ic *operatorv1.IngressController, apiConfig *configv1.APIServer) *configv1.TLSProfileSpec {
+ 	if hasTLSSecurityProfile(ic) {
+-		return tlsProfileSpecForSecurityProfile(ic.Spec.TLSSecurityProfile)
++		return operatorcontroller.TLSProfileSpecForSecurityProfile(ic.Spec.TLSSecurityProfile)
+ 	}
+-	return tlsProfileSpecForSecurityProfile(apiConfig.Spec.TLSSecurityProfile)
++	return operatorcontroller.TLSProfileSpecForSecurityProfile(apiConfig.Spec.TLSSecurityProfile)
+ }
+ 
+ // hasTLSSecurityProfile checks whether the given ingresscontroller specifies a
+@@ -870,25 +870,6 @@ func hasTLSSecurityProfile(ic *operatorv1.IngressController) bool {
+ 	return true
+ }
+ 
+-// tlsProfileSpecForSecurityProfile returns a TLS profile spec based on the
+-// provided security profile, or the "Intermediate" profile if an unknown
+-// security profile type is provided.  Note that the return value must not be
+-// mutated by the caller; the caller must make a copy if it needs to mutate the
+-// value.
+-func tlsProfileSpecForSecurityProfile(profile *configv1.TLSSecurityProfile) *configv1.TLSProfileSpec {
+-	if profile != nil {
+-		if profile.Type == configv1.TLSProfileCustomType {
+-			if profile.Custom != nil {
+-				return &profile.Custom.TLSProfileSpec
+-			}
+-			return &configv1.TLSProfileSpec{}
+-		} else if spec, ok := configv1.TLSProfiles[profile.Type]; ok {
+-			return spec
+-		}
+-	}
+-	return configv1.TLSProfiles[configv1.TLSProfileIntermediateType]
+-}
+-
+ // validate attempts to perform validation of the given ingresscontroller and
+ // returns an error value, which will have a non-nil value of type
+ // admissionRejection if the ingresscontroller is invalid, or a non-nil value of
+diff --git a/pkg/operator/controller/ingress/controller_test.go b/pkg/operator/controller/ingress/controller_test.go
+index 04ca2aca91..aaee3fda9b 100644
+--- a/pkg/operator/controller/ingress/controller_test.go
++++ b/pkg/operator/controller/ingress/controller_test.go
+@@ -9,6 +9,7 @@ import (
+ 
+ 	configv1 "github.com/openshift/api/config/v1"
+ 	operatorv1 "github.com/openshift/api/operator/v1"
++	operatorcontroller "github.com/openshift/cluster-ingress-operator/pkg/operator/controller"
+ 	util "github.com/openshift/cluster-ingress-operator/pkg/util"
+ 
+ 	corev1 "k8s.io/api/core/v1"
+@@ -1006,7 +1007,7 @@ func TestSetDefaultPublishingStrategyHandlesUpdates(t *testing.T) {
+ 	}
+ }
+ 
+-func Test_tlsProfileSpecForSecurityProfile(t *testing.T) {
++func Test_TLSProfileSpecForSecurityProfile(t *testing.T) {
+ 	invalidTLSVersion := configv1.TLSProtocolVersion("abc")
+ 	invalidCiphers := []string{"ECDHE-ECDSA-AES256-GCM-SHA384", "invalid cipher"}
+ 	validCiphers := []string{"ECDHE-ECDSA-AES256-GCM-SHA384"}
+@@ -1151,7 +1152,7 @@ func Test_tlsProfileSpecForSecurityProfile(t *testing.T) {
+ 					TLSSecurityProfile: tc.profile,
+ 				},
+ 			}
+-			tlsProfileSpec := tlsProfileSpecForSecurityProfile(ic.Spec.TLSSecurityProfile)
++			tlsProfileSpec := operatorcontroller.TLSProfileSpecForSecurityProfile(ic.Spec.TLSSecurityProfile)
+ 			err := validateTLSSecurityProfile(ic)
+ 			if tc.valid && err != nil {
+ 				t.Fatalf("unexpected error: %v\nprofile:\n%s", err, util.ToYaml(tlsProfileSpec))
+diff --git a/pkg/operator/controller/ingress/deployment.go b/pkg/operator/controller/ingress/deployment.go
+index ea2e1ad354..c1e1e43632 100644
+--- a/pkg/operator/controller/ingress/deployment.go
++++ b/pkg/operator/controller/ingress/deployment.go
+@@ -984,7 +984,7 @@ func desiredRouterDeployment(ci *operatorv1.IngressController, config *Config, i
+ 	}
+ 	env = append(env, corev1.EnvVar{Name: "SSL_MIN_VERSION", Value: minTLSVersion})
+ 
+-	tlsProfileMetrics := tlsProfileSpecForSecurityProfile(apiConfig.Spec.TLSSecurityProfile)
++	tlsProfileMetrics := controller.TLSProfileSpecForSecurityProfile(apiConfig.Spec.TLSSecurityProfile)
+ 
+ 	// User facing config uses OpenSSL names. Internally we always use IANA ones.
+ 	// OpenSSLToIANACipherSuites() converts and also removes any invalid cipher, otherwise router would crash.
+diff --git a/pkg/operator/controller/tls.go b/pkg/operator/controller/tls.go
+new file mode 100644
+index 0000000000..1bc8a0b408
+--- /dev/null
++++ b/pkg/operator/controller/tls.go
+@@ -0,0 +1,35 @@
++package controller
++
++import (
++	configv1 "github.com/openshift/api/config/v1"
++)
++
++// copyTLSSpec creates a defensive copy of the given TLSProfileSpec to prevent
++// mutations of shared/global TLS profile instances.
++func copyTLSSpec(in *configv1.TLSProfileSpec) *configv1.TLSProfileSpec {
++	if in == nil {
++		return &configv1.TLSProfileSpec{}
++	}
++	out := *in
++	out.Ciphers = append([]string(nil), in.Ciphers...)
++	return &out
++}
++
++// TLSProfileSpecForSecurityProfile returns a TLS profile spec based on the
++// provided security profile, or the "Intermediate" profile if an unknown
++// security profile type is provided or the profile is nil.  Note that the
++// return value must not be mutated by the caller; the caller must make a copy
++// if it needs to mutate the value.
++func TLSProfileSpecForSecurityProfile(profile *configv1.TLSSecurityProfile) *configv1.TLSProfileSpec {
++	if profile != nil {
++		if profile.Type == configv1.TLSProfileCustomType {
++			if profile.Custom != nil {
++				return copyTLSSpec(&profile.Custom.TLSProfileSpec)
++			}
++			return &configv1.TLSProfileSpec{}
++		} else if spec, ok := configv1.TLSProfiles[profile.Type]; ok {
++			return copyTLSSpec(spec)
++		}
++	}
++	return copyTLSSpec(configv1.TLSProfiles[configv1.TLSProfileIntermediateType])
++}
+diff --git a/test/http/serve-healthcheck.go b/test/http/serve-healthcheck.go
+index b7794744d9..880a56cecf 100644
+--- a/test/http/serve-healthcheck.go
++++ b/test/http/serve-healthcheck.go
+@@ -1,15 +1,18 @@
+ package http
+ 
+ import (
++	"crypto/tls"
+ 	"fmt"
+ 	"net"
+ 	"net/http"
+ 	"os"
+ 	"strconv"
++	"strings"
+ 
+ 	"github.com/spf13/cobra"
+ 
+ 	canarycontroller "github.com/openshift/cluster-ingress-operator/pkg/operator/controller/canary"
++	"github.com/openshift/library-go/pkg/crypto"
+ )
+ 
+ func healthCheckHandler(w http.ResponseWriter, r *http.Request) {
+@@ -33,9 +36,62 @@ func healthCheckHandler(w http.ResponseWriter, r *http.Request) {
+ 	}
+ }
+ 
+-func listenAndServeTLS(port, certFile, keyFile string) {
++// tlsConfigFromEnv builds a tls.Config from the TLS_CIPHERS and
++// TLS_MIN_VERSION environment variables.  When both are unset the returned
++// config uses the library-go secure defaults.
++// If env vars are set but invalid, logs warnings and falls back to defaults.
++func tlsConfigFromEnv() *tls.Config {
++	cfg := &tls.Config{}
++
++	if cipherEnv := os.Getenv("TLS_CIPHERS"); len(cipherEnv) > 0 {
++		raw := strings.Split(cipherEnv, ",")
++		openSSLNames := make([]string, 0, len(raw))
++		for _, name := range raw {
++			if trimmed := strings.TrimSpace(name); trimmed != "" {
++				openSSLNames = append(openSSLNames, trimmed)
++			}
++		}
++		ianaNames := crypto.OpenSSLToIANACipherSuites(openSSLNames)
++		if len(ianaNames) > 0 {
++			var cipherSuites []uint16
++			for _, name := range ianaNames {
++				id, err := crypto.CipherSuite(name)
++				if err != nil {
++					fmt.Printf("Warning: skipping unknown cipher suite %q: %v\n", name, err)
++					continue
++				}
++				cipherSuites = append(cipherSuites, id)
++			}
++			if len(cipherSuites) > 0 {
++				cfg.CipherSuites = cipherSuites
++			} else {
++				fmt.Printf("Warning: TLS_CIPHERS env var is set (%s) but no cipher suites could be resolved; using defaults\n", cipherEnv)
++			}
++		} else {
++			fmt.Printf("Warning: TLS_CIPHERS env var is set (%s) but contains no valid cipher suites; using defaults\n", cipherEnv)
++		}
++	}
++
++	if minVersion := os.Getenv("TLS_MIN_VERSION"); len(minVersion) > 0 {
++		v, err := crypto.TLSVersion(minVersion)
++		if err != nil {
++			fmt.Printf("Warning: TLS_MIN_VERSION env var is set (%s) but invalid (%v); using defaults\n", minVersion, err)
++		} else {
++			cfg.MinVersion = v
++		}
++	}
++
++	// Apply secure defaults for any fields not set by the env vars.
++	return crypto.SecureTLSConfig(cfg)
++}
++
++func listenAndServeTLS(port, certFile, keyFile string, tlsCfg *tls.Config) {
+ 	fmt.Printf("serving TLS on %s\n", port)
+-	err := http.ListenAndServeTLS(":"+port, certFile, keyFile, nil)
++	server := &http.Server{
++		Addr:      ":" + port,
++		TLSConfig: tlsCfg,
++	}
++	err := server.ListenAndServeTLS(certFile, keyFile)
+ 	if err != nil {
+ 		panic("ListenAndServeTLS: " + err.Error())
+ 	}
+@@ -59,18 +115,19 @@ func serveHealthCheck() {
+ 
+ 	tlsCertFile := os.Getenv("TLS_CERT")
+ 	tlsKeyFile := os.Getenv("TLS_KEY")
++	tlsCfg := tlsConfigFromEnv()
+ 
+ 	port := os.Getenv("PORT")
+ 	if len(port) == 0 {
+ 		port = "8443"
+ 	}
+-	go listenAndServeTLS(port, tlsCertFile, tlsKeyFile)
++	go listenAndServeTLS(port, tlsCertFile, tlsKeyFile, tlsCfg.Clone())
+ 
+ 	port = os.Getenv("SECOND_PORT")
+ 	if len(port) == 0 {
+ 		port = "8888"
+ 	}
+-	go listenAndServeTLS(port, tlsCertFile, tlsKeyFile)
++	go listenAndServeTLS(port, tlsCertFile, tlsKeyFile, tlsCfg.Clone())
+ 
+ 	select {}
+ }

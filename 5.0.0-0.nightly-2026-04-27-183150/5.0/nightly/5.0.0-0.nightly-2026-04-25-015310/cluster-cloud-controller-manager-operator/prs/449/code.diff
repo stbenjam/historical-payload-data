@@ -1,0 +1,152 @@
+diff --git a/cmd/cloud-controller-manager-aws-tests-ext/go.mod b/cmd/cloud-controller-manager-aws-tests-ext/go.mod
+index bdf63933b..4d4017d9c 100644
+--- a/cmd/cloud-controller-manager-aws-tests-ext/go.mod
++++ b/cmd/cloud-controller-manager-aws-tests-ext/go.mod
+@@ -16,7 +16,7 @@ require (
+ 	k8s.io/api v0.35.0
+ 	k8s.io/apimachinery v0.35.0
+ 	k8s.io/client-go v0.35.0
+-	k8s.io/cloud-provider-aws/tests/e2e v0.0.0-20260227223131-ea961d6fafc4
++	k8s.io/cloud-provider-aws/tests/e2e v0.0.0-20260420202152-40f1dcbd8488
+ 	k8s.io/kubernetes v1.35.0
+ 	k8s.io/pod-security-admission v0.35.0
+ )
+diff --git a/cmd/cloud-controller-manager-aws-tests-ext/go.sum b/cmd/cloud-controller-manager-aws-tests-ext/go.sum
+index 334c23526..bf4206777 100644
+--- a/cmd/cloud-controller-manager-aws-tests-ext/go.sum
++++ b/cmd/cloud-controller-manager-aws-tests-ext/go.sum
+@@ -281,8 +281,8 @@ k8s.io/client-go v0.35.0 h1:IAW0ifFbfQQwQmga0UdoH0yvdqrbwMdq9vIFEhRpxBE=
+ k8s.io/client-go v0.35.0/go.mod h1:q2E5AAyqcbeLGPdoRB+Nxe3KYTfPce1Dnu1myQdqz9o=
+ k8s.io/cloud-provider v0.34.0 h1:OgrNE+WSgfvDBQf6WS9qFM7Xr37bc0Og5kkL4hyWDmU=
+ k8s.io/cloud-provider v0.34.0/go.mod h1:JbMa0t6JIGDMLI7Py6bdp9TN6cfuHrWGq+E/X+Ljkmo=
+-k8s.io/cloud-provider-aws/tests/e2e v0.0.0-20260227223131-ea961d6fafc4 h1:P2kEeJ9pxw1o/zMuotP+GSMHI0sKMyvsbM6+OTG6DfY=
+-k8s.io/cloud-provider-aws/tests/e2e v0.0.0-20260227223131-ea961d6fafc4/go.mod h1:6q0Y7+Tbsr4ResiMxyA5t4yyiNRw+doPG2SiBeAwdpM=
++k8s.io/cloud-provider-aws/tests/e2e v0.0.0-20260420202152-40f1dcbd8488 h1:Z8EjeEH2TBjikfjGj5oZP2XGSAuTGoEwOa5bKN28qm4=
++k8s.io/cloud-provider-aws/tests/e2e v0.0.0-20260420202152-40f1dcbd8488/go.mod h1:55GTU6/xzdbv+yd0Vb4T6YgF+z+iFem0e4R56xAuq1Y=
+ k8s.io/component-base v0.35.0 h1:+yBrOhzri2S1BVqyVSvcM3PtPyx5GUxCK2tinZz1G94=
+ k8s.io/component-base v0.35.0/go.mod h1:85SCX4UCa6SCFt6p3IKAPej7jSnF3L8EbfSyMZayJR0=
+ k8s.io/component-helpers v0.35.0 h1:wcXv7HJRksgVjM4VlXJ1CNFBpyDHruRI99RrBtrJceA=
+diff --git a/cmd/cloud-controller-manager-aws-tests-ext/vendor/k8s.io/cloud-provider-aws/tests/e2e/loadbalancer.go b/cmd/cloud-controller-manager-aws-tests-ext/vendor/k8s.io/cloud-provider-aws/tests/e2e/loadbalancer.go
+index 9012112ab..217706061 100644
+--- a/cmd/cloud-controller-manager-aws-tests-ext/vendor/k8s.io/cloud-provider-aws/tests/e2e/loadbalancer.go
++++ b/cmd/cloud-controller-manager-aws-tests-ext/vendor/k8s.io/cloud-provider-aws/tests/e2e/loadbalancer.go
+@@ -34,6 +34,7 @@ import (
+ 	admissionapi "k8s.io/pod-security-admission/api"
+ 
+ 	"github.com/aws/aws-sdk-go-v2/aws"
++	"github.com/aws/aws-sdk-go-v2/aws/retry"
+ 	"github.com/aws/aws-sdk-go-v2/config"
+ 	elbv2 "github.com/aws/aws-sdk-go-v2/service/elasticloadbalancingv2"
+ 	elbv2types "github.com/aws/aws-sdk-go-v2/service/elasticloadbalancingv2/types"
+@@ -674,32 +675,49 @@ func getAWSClientLoadBalancer(ctx context.Context) (*elbv2.Client, error) {
+ 	if err != nil {
+ 		return nil, fmt.Errorf("unable to load AWS config: %v", err)
+ 	}
+-	return elbv2.NewFromConfig(cfg), nil
++
++	// Configure custom retryer to handle primarily transient AWS API errors and DNS failures.
++	customRetryer := retry.NewStandard(func(o *retry.StandardOptions) {
++		o.MaxAttempts = 10              // Handle transient errors
++		o.MaxBackoff = 30 * time.Second // Cap backoff to avoid excessive waiting
++	})
++
++	return elbv2.NewFromConfig(cfg, func(o *elbv2.Options) {
++		o.Retryer = customRetryer
++	}), nil
+ }
+ 
+ func getAWSLoadBalancerFromDNSName(ctx context.Context, elbClient *elbv2.Client, lbDNSName string) (*elbv2types.LoadBalancer, error) {
+ 	var foundLB *elbv2types.LoadBalancer
+ 	framework.Logf("describing load balancers with DNS %s", lbDNSName)
+ 
+-	paginator := elbv2.NewDescribeLoadBalancersPaginator(elbClient, &elbv2.DescribeLoadBalancersInput{})
+-	for paginator.HasMorePages() {
+-		page, err := paginator.NextPage(ctx)
+-		if err != nil {
+-			return nil, fmt.Errorf("failed to describe load balancers: %v", err)
+-		}
++	// Retry wrapper for DNS failures in EUSC regions
++	// AWS endpoint DNS may take up to 15 minutes to propagate in new regions
++	err := wait.PollUntilContextTimeout(ctx, 5*time.Second, 15*time.Minute, true, func(ctx context.Context) (bool, error) {
++		paginator := elbv2.NewDescribeLoadBalancersPaginator(elbClient, &elbv2.DescribeLoadBalancersInput{})
++		for paginator.HasMorePages() {
++			page, err := paginator.NextPage(ctx)
++			if err != nil {
++				framework.Logf("transient error describing load balancers (will retry): %v", err)
++				return false, nil // Retry on any error
++			}
+ 
+-		framework.Logf("found %d load balancers in page", len(page.LoadBalancers))
+-		// Search for the load balancer with matching DNS name in this page
+-		for i := range page.LoadBalancers {
+-			if aws.ToString(page.LoadBalancers[i].DNSName) == lbDNSName {
+-				foundLB = &page.LoadBalancers[i]
+-				framework.Logf("found load balancer with DNS %s", aws.ToString(foundLB.DNSName))
+-				break
++			framework.Logf("found %d load balancers in page", len(page.LoadBalancers))
++			// Search for the load balancer with matching DNS name in this page
++			for i := range page.LoadBalancers {
++				if aws.ToString(page.LoadBalancers[i].DNSName) == lbDNSName {
++					foundLB = &page.LoadBalancers[i]
++					framework.Logf("found load balancer with DNS %s", aws.ToString(foundLB.DNSName))
++					return true, nil
++				}
+ 			}
+ 		}
+-		if foundLB != nil {
+-			break
+-		}
++		// Load balancer not found yet, retry
++		return false, nil
++	})
++
++	if err != nil {
++		return nil, fmt.Errorf("failed to find load balancer with DNS name %s: %v", lbDNSName, err)
+ 	}
+ 
+ 	if foundLB == nil {
+@@ -749,12 +767,16 @@ func inClusterTestReachableHTTP(cs clientset.Interface, namespace, nodeName, tar
+ 					Image:   imageutils.GetE2EImage(imageutils.Agnhost),
+ 					Command: []string{"curl"},
+ 					Args: []string{
+-						"--retry", "15", // Retry up to 15 times in case of transient network issues.
+-						"--retry-delay", "20", // Wait 20 seconds between retries.
+-						"--retry-max-time", "480", // Maximum time for retries is 480 seconds.
+-						"--retry-all-errors",                                                       // Retry on all errors, ensuring robustness against temporary failures.
+-						"--trace-time",                                                             // Include timestamps in trace output for debugging.
+-						"-w", "\\\"\\n---> HTTPCode=%{http_code} Time=%{time_total}ms <---\\n\\\"", // Format output to include HTTP code and response time.
++						"--retry", "30", // Retry in case of transient network issues.
++						"--retry-delay", "30", // Wait in seconds between retries.
++						"--retry-max-time", "1200", // Max time for retries.
++						"--retry-all-errors",  // Retry on all errors
++						"--retry-connrefused", // Retry connection refused
++						"--connect-timeout", "30",
++						"--max-time", "60", // Max time for each operation.
++						"--trace-time", // Include timestamps in trace output for debugging
++						"--verbose",
++						"-w", "\\\"\\n---> HTTPCode=%{http_code} time_total('%{time_total}s') time_namelookup('%{time_namelookup}s') time_connect('%{time_connect}s') time_appconnect('%{time_appconnect}s') time_pretransfer('%{time_pretransfer}s') time_redirect('%{time_redirect}s') time_starttransfer('%{time_starttransfer}s') <---\\n\\\"",
+ 						fmt.Sprintf("http://%s:%d/echo?msg=hello", target, targetPort),
+ 					},
+ 				},
+@@ -821,7 +843,7 @@ func inClusterTestReachableHTTP(cs clientset.Interface, namespace, nodeName, tar
+ 	// Wait for the test pod to complete. Limit waiter be higher than curl retries.
+ 	waitCount := 0
+ 	pendingCount := 0
+-	err = wait.PollImmediate(15*time.Second, 15*time.Minute, func() (bool, error) {
++	err = wait.PollImmediate(15*time.Second, 25*time.Minute, func() (bool, error) {
+ 		p, err := cs.CoreV1().Pods(namespace).Get(context.TODO(), podName, metav1.GetOptions{})
+ 		if err != nil {
+ 			framework.Logf("Error getting pod %s: %v", podName, err)
+diff --git a/cmd/cloud-controller-manager-aws-tests-ext/vendor/modules.txt b/cmd/cloud-controller-manager-aws-tests-ext/vendor/modules.txt
+index ab8df0ca2..85293d81d 100644
+--- a/cmd/cloud-controller-manager-aws-tests-ext/vendor/modules.txt
++++ b/cmd/cloud-controller-manager-aws-tests-ext/vendor/modules.txt
+@@ -1133,7 +1133,7 @@ k8s.io/client-go/util/workqueue
+ # k8s.io/cloud-provider v0.34.0
+ ## explicit; go 1.24.0
+ k8s.io/cloud-provider/service/helpers
+-# k8s.io/cloud-provider-aws/tests/e2e v0.0.0-20260227223131-ea961d6fafc4
++# k8s.io/cloud-provider-aws/tests/e2e v0.0.0-20260420202152-40f1dcbd8488
+ ## explicit; go 1.25.0
+ k8s.io/cloud-provider-aws/tests/e2e
+ # k8s.io/component-base v0.35.0

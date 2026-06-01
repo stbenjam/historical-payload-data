@@ -1,0 +1,2097 @@
+diff --git a/Makefile b/Makefile
+index b5a2977e6fd..79d471a311b 100644
+--- a/Makefile
++++ b/Makefile
+@@ -87,15 +87,19 @@ KUBEAPILINTER_PLUGIN := $(abspath $(TOOLS_BIN_DIR)/kube-api-linter.so)
+ $(KUBEAPILINTER_PLUGIN): $(TOOLS_DIR)/go.mod # Build kube-api-linter as Go plugin
+ 	cd $(TOOLS_DIR); CGO_ENABLED=1 $(GO) build -buildmode=plugin -o $(KUBEAPILINTER_PLUGIN) sigs.k8s.io/kube-api-linter/pkg/plugin
+ 
++# When not otherwise set, diff/lint against the local main branch.
++# This is always set in OpenShift CI.
++PULL_BASE_SHA ?= main
++
+ .PHONY: lint
+ lint: generate $(GOLANGCI_LINT) $(KUBEAPILINTER_PLUGIN)
+ 	$(GOLANGCI_LINT) run --config ./.golangci.yml --modules-download-mode=readonly -v
+-	cd api && $(GOLANGCI_LINT) run --config ./.golangci.yml --modules-download-mode=readonly -v
++	cd api && $(GOLANGCI_LINT) run --config ./.golangci.yml --modules-download-mode=readonly -v --new-from-rev=${PULL_BASE_SHA}
+ 
+ .PHONY: lint-fix
+ lint-fix: generate $(GOLANGCI_LINT) $(KUBEAPILINTER_PLUGIN)
+ 	$(GOLANGCI_LINT) run --config ./.golangci.yml --fix -v
+-	cd api && $(GOLANGCI_LINT) run --config ./.golangci.yml --fix -v
++	cd api && $(GOLANGCI_LINT) run --config ./.golangci.yml --fix -v --new-from-rev=${PULL_BASE_SHA}
+ 
+ .PHONY: verify
+ verify: generate update staticcheck fmt vet verify-codespell lint cpo-container-sync run-gitlint
+diff --git a/api/.golangci.yml b/api/.golangci.yml
+index 7eb7e483302..e750590deee 100644
+--- a/api/.golangci.yml
++++ b/api/.golangci.yml
+@@ -11,26 +11,87 @@ linters:
+       kubeapilinter:
+         path: ../hack/tools/bin/kube-api-linter.so
+         description: kubeapilinter is the Kube-API-Linter and lints Kube like APIs based on API conventions and best practices.
+-        original-url: sigs.k8s.io/kube-api-linter
+         settings:
+           linters:
+-            # Disable all default linters and only enable specific ones.
+-            # This prevents new default linters from causing unexpected failures
+-            # when upgrading kube-api-linter.
+-            disable:
+-              - "*"
+             enable:
+-              - conditions
+-              - duplicatemarkers
++              - forbiddenmarkers
+               - maxlength
++              - minlength
++              - namingconventions
+               - nobools
+               - nomaps
++              - preferredmarkers
+               - statussubresource
++            disable:
++              - statusoptional # This is legacy and not something we currently recommend.
++              - nonpointerstructs # This is intended for native types, not CRD types.
+           lintersConfig:
+             conditions:
+               isFirstField: Warn
+-              usePatchStrategy: Ignore
+-              useProtobuf: Ignore
++              usePatchStrategy: Forbid # Variation from openshift/api as HyperShift only supports CRDs.
++              useProtobuf: Forbid # Variation from openshift/api as HyperShift only supports CRDs.
++            forbiddenmarkers:
++              markers:
++              - identifier: "openshift:enable:FeatureSets"
++              - identifier: "openshift:validation:FeatureSetAwareEnum"
++              - identifier: "openshift:validation:FeatureSetAwareXValidation"
++              - identifier: "kubebuilder:validation:UniqueItems"
++            optionalfields:
++              pointers:
++                preference: WhenRequired
++                policy: SuggestFix
++              omitEmpty:
++                # This will force omitempty on optional fields.
++                # This is in line with upstream guidance where optional fields should be omitted
++                # from the serialized output unless they are non-zero.
++                policy: SuggestFix
++              omitzero:
++                # This will force omitzero on optional struct fields.
++                # This means they can be omitted correctly and prevents the need for pointers to structs.
++                policy: SuggestFix
++            preferredmarkers:
++              markers:
++              - preferredIdentifier: "kubebuilder:validation:XValidation"
++                equivalentIdentifiers:
++                - identifier: "kubebuilder:validation:Pattern" # Use CEL expressions instead to allow more expressive error messages.
++            requiredfields:
++              pointers:
++                # This will force pointers when the field is required, but only when the zero
++                # value is a valid user choice, and has a semantic difference to being omitted (e.g. replicas allows 0).
++                policy: SuggestFix
++              omitempty:
++                # This will force omitempty on required fields.
++                # We do this so that the behaviour of not setting a value for the field is the same between
++                # both structured and unstructured clients.
++                policy: SuggestFix
++              omitzero:
++                # This will force omitzero on required struct fields.
++                # This means they can be omitted correctly and prevents the need for pointers to structs.
++                policy: SuggestFix
++            namingconventions:
++              conventions:
++              - name: nokind
++                violationMatcher: "^Kind$"
++                operation: Replacement
++                replacement: "Resource"
++                message: "API Kinds can be ambiguous and should be replaced with Resource"
++            noreferences:
++              policy: NoReferences
++            uniquemarkers:
++              customMarkers:
++              - identifier: "openshift:validation:FeatureGateAwareEnum"
++                attributes:
++                - featureGate
++                - requiredFeatureGate
++              - identifier: "openshift:validation:FeatureGateMaxItems"
++                attributes:
++                - featureGate
++                - requiredFeatureGate
++              - identifier: "openshift:validation:FeatureGateAwareXValidation"
++                attributes:
++                - featureGate
++                - requiredFeatureGate
++                - rule
+   exclusions:
+     warn-unused: true
+     generated: lax
+diff --git a/hack/tools/go.mod b/hack/tools/go.mod
+index 3bb37dd7488..5d2b95eef86 100644
+--- a/hack/tools/go.mod
++++ b/hack/tools/go.mod
+@@ -11,7 +11,7 @@ require (
+ 	honnef.co/go/tools v0.7.0
+ 	k8s.io/code-generator v0.34.2
+ 	k8s.io/utils v0.0.0-20260108192941-914a6e750570
+-	sigs.k8s.io/kube-api-linter v0.0.0-20251205122056-74c4ae94ad3d
++	sigs.k8s.io/kube-api-linter v0.0.0-20260206102632-39e3d06a2850
+ )
+ 
+ require (
+diff --git a/hack/tools/go.sum b/hack/tools/go.sum
+index ffe2c4268fd..093d5f7fccf 100644
+--- a/hack/tools/go.sum
++++ b/hack/tools/go.sum
+@@ -887,8 +887,8 @@ sigs.k8s.io/apiserver-network-proxy/konnectivity-client v0.31.2 h1:jpcvIRr3GLoUo
+ sigs.k8s.io/apiserver-network-proxy/konnectivity-client v0.31.2/go.mod h1:Ve9uj1L+deCXFrPOk1LpFXqTg7LCFzFso6PA48q/XZw=
+ sigs.k8s.io/json v0.0.0-20241014173422-cfa47c3a1cc8 h1:gBQPwqORJ8d8/YNZWEjoZs7npUVDpVXUUOFfW6CgAqE=
+ sigs.k8s.io/json v0.0.0-20241014173422-cfa47c3a1cc8/go.mod h1:mdzfpAEoE6DHQEN0uh9ZbOCuHbLK5wOm7dK4ctXE9Tg=
+-sigs.k8s.io/kube-api-linter v0.0.0-20251205122056-74c4ae94ad3d h1:IvCjirI9B/yN5FfckV6WRWRUPeg38qB9BpSpwq6ED+Q=
+-sigs.k8s.io/kube-api-linter v0.0.0-20251205122056-74c4ae94ad3d/go.mod h1:5mP60UakkCye+eOcZ5p98VnV2O49qreW1gq9TdsUf7Q=
++sigs.k8s.io/kube-api-linter v0.0.0-20260206102632-39e3d06a2850 h1:SdyNO1yIff2xcQ6aishcTRbaAuIDWzo7IvSgvY9L0W0=
++sigs.k8s.io/kube-api-linter v0.0.0-20260206102632-39e3d06a2850/go.mod h1:5mP60UakkCye+eOcZ5p98VnV2O49qreW1gq9TdsUf7Q=
+ sigs.k8s.io/randfill v1.0.0 h1:JfjMILfT8A6RbawdsK2JXGBR5AQVfd+9TbzrlneTyrU=
+ sigs.k8s.io/randfill v1.0.0/go.mod h1:XeLlZ/jmk4i1HRopwe7/aU3H5n1zNUcX6TM94b3QxOY=
+ sigs.k8s.io/structured-merge-diff/v6 v6.3.0 h1:jTijUJbW353oVOd9oTlifJqOGEkUw2jB/fXCbTiQEco=
+diff --git a/hack/tools/vendor/modules.txt b/hack/tools/vendor/modules.txt
+index e2aa93649d5..8d7fb5b7f87 100644
+--- a/hack/tools/vendor/modules.txt
++++ b/hack/tools/vendor/modules.txt
+@@ -2238,7 +2238,7 @@ sigs.k8s.io/controller-tools/pkg/webhook
+ ## explicit; go 1.23
+ sigs.k8s.io/json
+ sigs.k8s.io/json/internal/golang/encoding/json
+-# sigs.k8s.io/kube-api-linter v0.0.0-20251205122056-74c4ae94ad3d
++# sigs.k8s.io/kube-api-linter v0.0.0-20260206102632-39e3d06a2850
+ ## explicit; go 1.24.0
+ sigs.k8s.io/kube-api-linter
+ sigs.k8s.io/kube-api-linter/pkg/analysis/arrayofstruct
+@@ -2246,6 +2246,7 @@ sigs.k8s.io/kube-api-linter/pkg/analysis/commentstart
+ sigs.k8s.io/kube-api-linter/pkg/analysis/conditions
+ sigs.k8s.io/kube-api-linter/pkg/analysis/conflictingmarkers
+ sigs.k8s.io/kube-api-linter/pkg/analysis/defaultorrequired
++sigs.k8s.io/kube-api-linter/pkg/analysis/defaults
+ sigs.k8s.io/kube-api-linter/pkg/analysis/dependenttags
+ sigs.k8s.io/kube-api-linter/pkg/analysis/duplicatemarkers
+ sigs.k8s.io/kube-api-linter/pkg/analysis/errors
+@@ -2257,6 +2258,7 @@ sigs.k8s.io/kube-api-linter/pkg/analysis/initializer
+ sigs.k8s.io/kube-api-linter/pkg/analysis/integers
+ sigs.k8s.io/kube-api-linter/pkg/analysis/jsontags
+ sigs.k8s.io/kube-api-linter/pkg/analysis/maxlength
++sigs.k8s.io/kube-api-linter/pkg/analysis/minlength
+ sigs.k8s.io/kube-api-linter/pkg/analysis/namingconventions
+ sigs.k8s.io/kube-api-linter/pkg/analysis/nobools
+ sigs.k8s.io/kube-api-linter/pkg/analysis/nodurations
+diff --git a/hack/tools/vendor/sigs.k8s.io/kube-api-linter/Makefile b/hack/tools/vendor/sigs.k8s.io/kube-api-linter/Makefile
+index fa657126bcf..b624b2cca3d 100644
+--- a/hack/tools/vendor/sigs.k8s.io/kube-api-linter/Makefile
++++ b/hack/tools/vendor/sigs.k8s.io/kube-api-linter/Makefile
+@@ -69,6 +69,10 @@ unit: ## Run unit tests.
+ build: ## Build the golangci-lint custom plugin binary.
+ 	go build -o ./bin ./cmd/golangci-lint-kube-api-linter 
+ 
++.PHONY: validate-linter-registration
++validate-linter-registration: ## Validate registration linters.
++	hack/validate-linter-registration.sh
++
+ .PHONY: verify-%
+ verify-%:
+ 	make $*
+diff --git a/hack/tools/vendor/sigs.k8s.io/kube-api-linter/README.md b/hack/tools/vendor/sigs.k8s.io/kube-api-linter/README.md
+index e58b2e0ceef..740a9856ed1 100644
+--- a/hack/tools/vendor/sigs.k8s.io/kube-api-linter/README.md
++++ b/hack/tools/vendor/sigs.k8s.io/kube-api-linter/README.md
+@@ -20,7 +20,7 @@ go build -o ./bin ./cmd/golangci-lint-kube-api-linter
+ ```
+ 
+ The binary builds a custom version of `golangci-lint` with Kube API Linter included as a module.
+-See [Golangci-lint Moduule](#golangci-lint-module) for details on configuration of the module
++See [Golangci-lint Module](#golangci-lint-module) for details on configuration of the module
+ under `settings`.
+ 
+ ### Golangci-lint Module
+diff --git a/hack/tools/vendor/sigs.k8s.io/kube-api-linter/pkg/analysis/conditions/doc.go b/hack/tools/vendor/sigs.k8s.io/kube-api-linter/pkg/analysis/conditions/doc.go
+index a87587cc050..bf83db36296 100644
+--- a/hack/tools/vendor/sigs.k8s.io/kube-api-linter/pkg/analysis/conditions/doc.go
++++ b/hack/tools/vendor/sigs.k8s.io/kube-api-linter/pkg/analysis/conditions/doc.go
+@@ -17,7 +17,7 @@ limitations under the License.
+ /*
+ conditions is a linter that verifies that the conditions field within the struct is correctly defined.
+ 
+-conditions fields in Kuberenetes API types are expected to be a slice of metav1.Condition.
++conditions fields in Kubernetes API types are expected to be a slice of metav1.Condition.
+ This linter verifies that the field is a slice of metav1.Condition and that it is correctly annotated with the required markers,
+ and tags.
+ 
+diff --git a/hack/tools/vendor/sigs.k8s.io/kube-api-linter/pkg/analysis/defaults/analyzer.go b/hack/tools/vendor/sigs.k8s.io/kube-api-linter/pkg/analysis/defaults/analyzer.go
+new file mode 100644
+index 00000000000..9dc5c6db5e7
+--- /dev/null
++++ b/hack/tools/vendor/sigs.k8s.io/kube-api-linter/pkg/analysis/defaults/analyzer.go
+@@ -0,0 +1,397 @@
++/*
++Copyright 2025 The Kubernetes Authors.
++
++Licensed under the Apache License, Version 2.0 (the "License");
++you may not use this file except in compliance with the License.
++You may obtain a copy of the License at
++
++	http://www.apache.org/licenses/LICENSE-2.0
++
++Unless required by applicable law or agreed to in writing, software
++distributed under the License is distributed on an "AS IS" BASIS,
++WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++See the License for the specific language governing permissions and
++limitations under the License.
++*/
++package defaults
++
++import (
++	"fmt"
++	"go/ast"
++	"strings"
++
++	"golang.org/x/tools/go/analysis"
++	kalerrors "sigs.k8s.io/kube-api-linter/pkg/analysis/errors"
++	"sigs.k8s.io/kube-api-linter/pkg/analysis/helpers/extractjsontags"
++	"sigs.k8s.io/kube-api-linter/pkg/analysis/helpers/inspector"
++	markershelper "sigs.k8s.io/kube-api-linter/pkg/analysis/helpers/markers"
++	"sigs.k8s.io/kube-api-linter/pkg/analysis/utils"
++	"sigs.k8s.io/kube-api-linter/pkg/markers"
++)
++
++const (
++	name = "defaults"
++)
++
++func init() {
++	markershelper.DefaultRegistry().Register(
++		markers.DefaultMarker,
++		markers.KubebuilderDefaultMarker,
++		markers.K8sDefaultMarker,
++		markers.OptionalMarker,
++		markers.KubebuilderOptionalMarker,
++		markers.K8sOptionalMarker,
++		markers.RequiredMarker,
++		markers.KubebuilderRequiredMarker,
++		markers.K8sRequiredMarker,
++	)
++}
++
++type analyzer struct {
++	preferredDefaultMarker string
++	secondaryDefaultMarker string
++	omitEmptyPolicy        OmitEmptyPolicy
++	omitZeroPolicy         OmitZeroPolicy
++}
++
++// newAnalyzer creates a new analyzer with the given configuration.
++func newAnalyzer(cfg *DefaultsConfig) *analysis.Analyzer {
++	if cfg == nil {
++		cfg = &DefaultsConfig{}
++	}
++
++	defaultConfig(cfg)
++
++	a := &analyzer{
++		omitEmptyPolicy: cfg.OmitEmpty.Policy,
++		omitZeroPolicy:  cfg.OmitZero.Policy,
++	}
++
++	switch cfg.PreferredDefaultMarker {
++	case markers.DefaultMarker:
++		a.preferredDefaultMarker = markers.DefaultMarker
++		a.secondaryDefaultMarker = markers.KubebuilderDefaultMarker
++	case markers.KubebuilderDefaultMarker:
++		a.preferredDefaultMarker = markers.KubebuilderDefaultMarker
++		a.secondaryDefaultMarker = markers.DefaultMarker
++	}
++
++	return &analysis.Analyzer{
++		Name: name,
++		Doc: `Checks that fields with default markers are configured correctly.
++Fields with default markers (+default, +kubebuilder:default, or +k8s:default) should also be marked as optional and not required.
++Additionally, fields with default markers should have "omitempty" or "omitzero" in their json tags to ensure that the default values are applied correctly during serialization and deserialization.
++`,
++		Run:      a.run,
++		Requires: []*analysis.Analyzer{inspector.Analyzer},
++	}
++}
++
++func defaultConfig(cfg *DefaultsConfig) {
++	if cfg.PreferredDefaultMarker == "" {
++		cfg.PreferredDefaultMarker = markers.DefaultMarker
++	}
++
++	if cfg.OmitEmpty.Policy == "" {
++		cfg.OmitEmpty.Policy = OmitEmptyPolicySuggestFix
++	}
++
++	if cfg.OmitZero.Policy == "" {
++		cfg.OmitZero.Policy = OmitZeroPolicySuggestFix
++	}
++}
++
++func (a *analyzer) run(pass *analysis.Pass) (any, error) {
++	inspect, ok := pass.ResultOf[inspector.Analyzer].(inspector.Inspector)
++	if !ok {
++		return nil, kalerrors.ErrCouldNotGetInspector
++	}
++
++	inspect.InspectFields(func(field *ast.Field, jsonTagInfo extractjsontags.FieldTagInfo, markersAccess markershelper.Markers, qualifiedFieldName string) {
++		a.checkField(pass, field, jsonTagInfo, markersAccess, qualifiedFieldName)
++	})
++
++	return nil, nil //nolint:nilnil
++}
++
++func (a *analyzer) checkField(pass *analysis.Pass, field *ast.Field, jsonTagInfo extractjsontags.FieldTagInfo, markersAccess markershelper.Markers, qualifiedFieldName string) {
++	if field == nil || len(field.Names) == 0 {
++		return
++	}
++
++	fieldMarkers := markersAccess.FieldMarkers(field)
++
++	// Check for any default marker (+default, +kubebuilder:default, or +k8s:default)
++	hasPreferredDefault := fieldMarkers.Has(a.preferredDefaultMarker)
++	hasSecondaryDefault := fieldMarkers.Has(a.secondaryDefaultMarker)
++	hasK8sDefault := fieldMarkers.Has(markers.K8sDefaultMarker)
++
++	hasAnyDefault := hasPreferredDefault || hasSecondaryDefault || hasK8sDefault
++
++	if !hasAnyDefault {
++		return
++	}
++
++	// Check +k8s:default marker (for declarative validation, separate from preferred/secondary)
++	// If +k8s:default is present but neither +default nor +kubebuilder:default is present, suggest adding the preferred one
++	a.checkK8sDefault(pass, field, fieldMarkers, qualifiedFieldName, hasPreferredDefault || hasSecondaryDefault)
++
++	// Check secondary marker usage
++	// If both preferred and secondary exist, suggest removing secondary
++	// If only secondary exists, suggest replacing with preferred
++	if hasSecondaryDefault {
++		hasBothDefaults := hasPreferredDefault && hasSecondaryDefault
++		a.checkSecondaryDefault(pass, field, fieldMarkers, qualifiedFieldName, hasBothDefaults)
++	}
++
++	a.checkDefaultNotRequired(pass, field, markersAccess, qualifiedFieldName)
++
++	a.checkDefaultOptional(pass, field, markersAccess, qualifiedFieldName)
++
++	a.checkDefaultOmitEmptyOrOmitZero(pass, field, jsonTagInfo, qualifiedFieldName)
++}
++
++// checkK8sDefault checks for +k8s:default marker usage.
++// +k8s:default is for declarative validation and is separate from preferred/secondary default markers.
++// If the field has +k8s:default but doesn't have +default or +kubebuilder:default, we suggest adding the preferred one.
++func (a *analyzer) checkK8sDefault(pass *analysis.Pass, field *ast.Field, fieldMarkers markershelper.MarkerSet, qualifiedFieldName string, hasOtherDefault bool) {
++	if !fieldMarkers.Has(markers.K8sDefaultMarker) {
++		return
++	}
++
++	// If the field already has +default or +kubebuilder:default, +k8s:default is acceptable alongside them
++	// (e.g., in K/K where both are needed during transition period)
++	if hasOtherDefault {
++		return
++	}
++
++	// If only +k8s:default is present, suggest adding the preferred default marker
++	k8sDefaultMarkers := fieldMarkers.Get(markers.K8sDefaultMarker)
++	for _, marker := range k8sDefaultMarkers {
++		payloadValue := marker.Payload.Value
++		pass.Report(analysis.Diagnostic{
++			Pos:     field.Pos(),
++			Message: fmt.Sprintf("field %s has +%s but should also have +%s marker", qualifiedFieldName, markers.K8sDefaultMarker, a.preferredDefaultMarker),
++			SuggestedFixes: []analysis.SuggestedFix{
++				{
++					Message: fmt.Sprintf("add +%s=%s", a.preferredDefaultMarker, payloadValue),
++					TextEdits: []analysis.TextEdit{
++						{
++							Pos:     marker.Pos,
++							End:     marker.Pos,
++							NewText: fmt.Appendf(nil, "// +%s=%s\n\t", a.preferredDefaultMarker, payloadValue),
++						},
++					},
++				},
++			},
++		})
++	}
++}
++
++func (a *analyzer) checkSecondaryDefault(pass *analysis.Pass, field *ast.Field, fieldMarkers markershelper.MarkerSet, qualifiedFieldName string, hasBothDefaults bool) {
++	secondaryDefaultMarkers := fieldMarkers.Get(a.secondaryDefaultMarker)
++
++	if hasBothDefaults {
++		// Both preferred and secondary markers exist - suggest removing secondary
++		pass.Report(reportShouldRemoveSecondaryMarker(field, secondaryDefaultMarkers, a.preferredDefaultMarker, a.secondaryDefaultMarker, qualifiedFieldName))
++		return
++	}
++	// Only secondary marker exists - suggest replacing with preferred
++	pass.Report(reportShouldReplaceSecondaryMarker(field, secondaryDefaultMarkers, a.preferredDefaultMarker, a.secondaryDefaultMarker, qualifiedFieldName))
++}
++
++func reportShouldReplaceSecondaryMarker(field *ast.Field, markers []markershelper.Marker, preferredMarker, secondaryMarker, qualifiedFieldName string) analysis.Diagnostic {
++	textEdits := make([]analysis.TextEdit, len(markers))
++
++	for i, marker := range markers {
++		if i == 0 {
++			textEdits[i] = analysis.TextEdit{
++				Pos:     marker.Pos,
++				End:     marker.End,
++				NewText: fmt.Appendf(nil, "// +%s=%s", preferredMarker, marker.Payload.Value),
++			}
++
++			continue
++		}
++
++		textEdits[i] = analysis.TextEdit{
++			Pos:     marker.Pos,
++			End:     marker.End + 1, // Add 1 to position to include the new line
++			NewText: nil,
++		}
++	}
++
++	return analysis.Diagnostic{
++		Pos:     field.Pos(),
++		Message: fmt.Sprintf("field %s should use +%s marker instead of +%s", qualifiedFieldName, preferredMarker, secondaryMarker),
++		SuggestedFixes: []analysis.SuggestedFix{
++			{
++				Message:   fmt.Sprintf("replace +%s with +%s", secondaryMarker, preferredMarker),
++				TextEdits: textEdits,
++			},
++		},
++	}
++}
++
++func reportShouldRemoveSecondaryMarker(field *ast.Field, markers []markershelper.Marker, preferredMarker, secondaryMarker, qualifiedFieldName string) analysis.Diagnostic {
++	textEdits := make([]analysis.TextEdit, len(markers))
++
++	for i, marker := range markers {
++		textEdits[i] = analysis.TextEdit{
++			Pos:     marker.Pos,
++			End:     marker.End + 1, // Add 1 to position to include the new line
++			NewText: nil,
++		}
++	}
++
++	return analysis.Diagnostic{
++		Pos:     field.Pos(),
++		Message: fmt.Sprintf("field %s should use only the marker +%s, +%s is not required", qualifiedFieldName, preferredMarker, secondaryMarker),
++		SuggestedFixes: []analysis.SuggestedFix{
++			{
++				Message:   fmt.Sprintf("remove +%s", secondaryMarker),
++				TextEdits: textEdits,
++			},
++		},
++	}
++}
++
++func (a *analyzer) checkDefaultNotRequired(pass *analysis.Pass, field *ast.Field, markersAccess markershelper.Markers, qualifiedFieldName string) {
++	if utils.IsFieldRequired(field, markersAccess) {
++		pass.Report(analysis.Diagnostic{
++			Pos:     field.Pos(),
++			Message: fmt.Sprintf("field %s has a default value but is marked as required, which is contradictory", qualifiedFieldName),
++		})
++	}
++}
++
++func (a *analyzer) checkDefaultOptional(pass *analysis.Pass, field *ast.Field, markersAccess markershelper.Markers, qualifiedFieldName string) {
++	// If the field is required, we've already reported that issue in checkDefaultNotRequired
++	if utils.IsFieldRequired(field, markersAccess) {
++		return
++	}
++
++	if !utils.IsFieldOptional(field, markersAccess) {
++		pass.Report(analysis.Diagnostic{
++			Pos:     field.Pos(),
++			Message: fmt.Sprintf("field %s has a default value but is not marked as optional", qualifiedFieldName),
++		})
++	}
++}
++
++func (a *analyzer) checkDefaultOmitEmptyOrOmitZero(pass *analysis.Pass, field *ast.Field, jsonTagInfo extractjsontags.FieldTagInfo, qualifiedFieldName string) {
++	if jsonTagInfo.Inline || jsonTagInfo.Ignored {
++		return
++	}
++
++	hasOmitEmpty := jsonTagInfo.OmitEmpty
++	hasOmitZero := jsonTagInfo.OmitZero
++
++	// Check if the field is a pointer type - pointers don't need omitzero because nil is their zero value
++	isPointer, _ := utils.IsStarExpr(field.Type)
++	isStruct := !isPointer && utils.IsStructType(pass, field.Type)
++
++	// For struct types (but not pointers), we prefer omitzero over omitempty.
++	// When omitzero is present, omitempty is not needed (modernize linter would complain).
++	if isStruct && a.omitZeroPolicy != OmitZeroPolicyForbid {
++		if !hasOmitZero {
++			a.reportMissingOmitZero(pass, field, jsonTagInfo, qualifiedFieldName, hasOmitEmpty)
++		}
++
++		return
++	}
++
++	// Check omitempty for non-struct types (only if policy is not Ignore)
++	if a.omitEmptyPolicy != OmitEmptyPolicyIgnore && !hasOmitEmpty {
++		a.reportMissingOmitEmpty(pass, field, jsonTagInfo, qualifiedFieldName)
++	}
++}
++
++func (a *analyzer) reportMissingOmitEmpty(pass *analysis.Pass, field *ast.Field, jsonTagInfo extractjsontags.FieldTagInfo, qualifiedFieldName string) {
++	suggestedTag := fmt.Sprintf("%s,omitempty", jsonTagInfo.RawValue)
++	message := fmt.Sprintf("add omitempty to the json tag of field %s", qualifiedFieldName)
++
++	switch a.omitEmptyPolicy {
++	case OmitEmptyPolicySuggestFix:
++		pass.Report(analysis.Diagnostic{
++			Pos:     field.Pos(),
++			Message: fmt.Sprintf("field %s has a default value but does not have omitempty in its json tag", qualifiedFieldName),
++			SuggestedFixes: []analysis.SuggestedFix{
++				{
++					Message: message,
++					TextEdits: []analysis.TextEdit{
++						{
++							Pos:     jsonTagInfo.Pos,
++							End:     jsonTagInfo.End,
++							NewText: []byte(suggestedTag),
++						},
++					},
++				},
++			},
++		})
++	case OmitEmptyPolicyWarn:
++		pass.Reportf(field.Pos(), "field %s has a default value but does not have omitempty in its json tag", qualifiedFieldName)
++	case OmitEmptyPolicyIgnore:
++		// Unreachable: this function is only called when the policy is not Ignore.
++		return
++	}
++}
++
++func (a *analyzer) reportMissingOmitZero(pass *analysis.Pass, field *ast.Field, jsonTagInfo extractjsontags.FieldTagInfo, qualifiedFieldName string, hasOmitEmpty bool) {
++	// For struct types, we prefer omitzero over omitempty.
++	// If the field has omitempty, we replace it with omitzero.
++	// If the field doesn't have omitempty, we just add omitzero.
++	// We never add both omitempty and omitzero together (modernize linter would complain).
++	var suggestedTag string
++
++	var message string
++
++	if hasOmitEmpty {
++		// Replace omitempty with omitzero
++		suggestedTag = replaceOmitEmptyWithOmitZero(jsonTagInfo.RawValue)
++		message = fmt.Sprintf("replace omitempty with omitzero in the json tag of field %s", qualifiedFieldName)
++	} else {
++		// Just add omitzero
++		suggestedTag = fmt.Sprintf("%s,omitzero", jsonTagInfo.RawValue)
++		message = fmt.Sprintf("add omitzero to the json tag of field %s", qualifiedFieldName)
++	}
++
++	switch a.omitZeroPolicy {
++	case OmitZeroPolicySuggestFix:
++		pass.Report(analysis.Diagnostic{
++			Pos:     field.Pos(),
++			Message: fmt.Sprintf("field %s has a default value but does not have omitzero in its json tag", qualifiedFieldName),
++			SuggestedFixes: []analysis.SuggestedFix{
++				{
++					Message: message,
++					TextEdits: []analysis.TextEdit{
++						{
++							Pos:     jsonTagInfo.Pos,
++							End:     jsonTagInfo.End,
++							NewText: []byte(suggestedTag),
++						},
++					},
++				},
++			},
++		})
++	case OmitZeroPolicyWarn:
++		pass.Reportf(field.Pos(), "field %s has a default value but does not have omitzero in its json tag", qualifiedFieldName)
++	case OmitZeroPolicyForbid:
++		// Unreachable: this function is only called when the policy is not Forbid.
++		return
++	}
++}
++
++// replaceOmitEmptyWithOmitZero replaces omitempty with omitzero in the json tag value.
++func replaceOmitEmptyWithOmitZero(rawValue string) string {
++	// rawValue is like "fieldName,omitempty" or "fieldName,omitempty,inline"
++	// We need to replace "omitempty" with "omitzero"
++	parts := strings.Split(rawValue, ",")
++	for i, part := range parts {
++		if part == "omitempty" {
++			parts[i] = "omitzero"
++		}
++	}
++
++	return strings.Join(parts, ",")
++}
+diff --git a/hack/tools/vendor/sigs.k8s.io/kube-api-linter/pkg/analysis/defaults/config.go b/hack/tools/vendor/sigs.k8s.io/kube-api-linter/pkg/analysis/defaults/config.go
+new file mode 100644
+index 00000000000..5277e8da97a
+--- /dev/null
++++ b/hack/tools/vendor/sigs.k8s.io/kube-api-linter/pkg/analysis/defaults/config.go
+@@ -0,0 +1,93 @@
++/*
++Copyright 2025 The Kubernetes Authors.
++
++Licensed under the Apache License, Version 2.0 (the "License");
++you may not use this file except in compliance with the License.
++You may obtain a copy of the License at
++
++	http://www.apache.org/licenses/LICENSE-2.0
++
++Unless required by applicable law or agreed to in writing, software
++distributed under the License is distributed on an "AS IS" BASIS,
++WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++See the License for the specific language governing permissions and
++limitations under the License.
++*/
++package defaults
++
++// OmitEmptyPolicy is the policy for omitempty.
++// SuggestFix will suggest a fix for the field to add omitempty.
++// Warn will warn about the field to add omitempty.
++// Ignore will ignore the absence of omitempty.
++type OmitEmptyPolicy string
++
++const (
++	// OmitEmptyPolicySuggestFix will suggest a fix for the field.
++	OmitEmptyPolicySuggestFix OmitEmptyPolicy = "SuggestFix"
++
++	// OmitEmptyPolicyWarn will warn about the field.
++	OmitEmptyPolicyWarn OmitEmptyPolicy = "Warn"
++
++	// OmitEmptyPolicyIgnore will ignore the field.
++	OmitEmptyPolicyIgnore OmitEmptyPolicy = "Ignore"
++)
++
++// OmitZeroPolicy is the policy for omitzero.
++// SuggestFix will suggest a fix for the field to add omitzero.
++// Warn will warn about the field to add omitzero.
++// Forbid will forbid the field to have omitzero.
++type OmitZeroPolicy string
++
++const (
++	// OmitZeroPolicySuggestFix will suggest a fix for the field.
++	OmitZeroPolicySuggestFix OmitZeroPolicy = "SuggestFix"
++
++	// OmitZeroPolicyWarn will warn about the field.
++	OmitZeroPolicyWarn OmitZeroPolicy = "Warn"
++
++	// OmitZeroPolicyForbid will forbid the field.
++	OmitZeroPolicyForbid OmitZeroPolicy = "Forbid"
++)
++
++// DefaultsConfig contains configuration for the defaults linter.
++type DefaultsConfig struct {
++	// PreferredDefaultMarker is the preferred marker to use for default values.
++	// If this field is not set, the default value is "default".
++	// Valid values are "default" and "kubebuilder:default".
++	PreferredDefaultMarker string `json:"preferredDefaultMarker"`
++
++	// OmitEmpty is the configuration for the `omitempty` tag within the json tag for fields with defaults.
++	// This defines how the linter should handle fields with defaults, and whether they should have the omitempty tag or not.
++	// By default, all fields with defaults will be expected to have the `omitempty` tag.
++	OmitEmpty DefaultsOmitEmpty `json:"omitempty"`
++
++	// OmitZero is the configuration for the `omitzero` tag within the json tag for fields with defaults.
++	// This defines how the linter should handle fields with defaults, and whether they should have the omitzero tag or not.
++	// By default, struct fields with defaults will be expected to have the `omitzero` tag.
++	OmitZero DefaultsOmitZero `json:"omitzero"`
++}
++
++// DefaultsOmitEmpty is the configuration for the `omitempty` tag on fields with defaults.
++type DefaultsOmitEmpty struct {
++	// Policy determines whether the linter should require omitempty for fields with defaults.
++	// Valid values are "SuggestFix", "Warn" and "Ignore".
++	// When set to "SuggestFix", the linter will suggest adding the `omitempty` tag when a field with default does not have it.
++	// When set to "Warn", the linter will emit a warning if the field does not have the `omitempty` tag.
++	// When set to "Ignore", a field with default missing the `omitempty` tag will be ignored.
++	// When otherwise not specified, the default value is "SuggestFix".
++	Policy OmitEmptyPolicy `json:"policy"`
++}
++
++// DefaultsOmitZero is the configuration for the `omitzero` tag on fields with defaults.
++type DefaultsOmitZero struct {
++	// Policy determines whether the linter should require omitzero for struct fields with defaults.
++	// Valid values are "SuggestFix", "Warn" and "Forbid".
++	// When set to "SuggestFix", the linter will suggest adding the `omitzero` tag when a struct field with default does not have it.
++	// When set to "Warn", the linter will emit a warning if the field does not have the `omitzero` tag.
++	// When set to "Forbid", 'omitzero' tags will not be considered.
++	// Note, when set to "Forbid", and a field have the `omitzero` tag, the linter will not suggest adding it.
++	// Note, `omitzero` tag is supported in go version starting from go 1.24.
++	// Note, Configure omitzero policy to 'Forbid', if using with go version less than go 1.24.
++	// When otherwise not specified, the default value is "SuggestFix".
++	Policy OmitZeroPolicy `json:"policy"`
++}
+diff --git a/hack/tools/vendor/sigs.k8s.io/kube-api-linter/pkg/analysis/defaults/doc.go b/hack/tools/vendor/sigs.k8s.io/kube-api-linter/pkg/analysis/defaults/doc.go
+new file mode 100644
+index 00000000000..5ccb0bea1f9
+--- /dev/null
++++ b/hack/tools/vendor/sigs.k8s.io/kube-api-linter/pkg/analysis/defaults/doc.go
+@@ -0,0 +1,41 @@
++/*
++Copyright 2025 The Kubernetes Authors.
++
++Licensed under the Apache License, Version 2.0 (the "License");
++you may not use this file except in compliance with the License.
++You may obtain a copy of the License at
++
++	http://www.apache.org/licenses/LICENSE-2.0
++
++Unless required by applicable law or agreed to in writing, software
++distributed under the License is distributed on an "AS IS" BASIS,
++WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++See the License for the specific language governing permissions and
++limitations under the License.
++*/
++
++/*
++defaults is a linter to check that fields with default markers are configured correctly.
++
++Fields with default markers (+default, +kubebuilder:default, or +k8s:default) should also be marked as optional.
++Additionally, fields with default markers should have "omitempty" or "omitzero" in their json tags
++to ensure that the default values are applied correctly during serialization and deserialization.
++
++Example of a well-configured field with a default:
++
++	// +optional
++	// +default="default-value"
++	Field string `json:"field,omitempty"`
++
++Example of issues this linter will catch:
++
++	// Missing optional marker
++	// +default="value"
++	Field string `json:"field,omitempty"`
++
++	// Missing omitempty tag
++	// +optional
++	// +default="value"
++	Field string `json:"field"`
++*/
++package defaults
+diff --git a/hack/tools/vendor/sigs.k8s.io/kube-api-linter/pkg/analysis/defaults/initializer.go b/hack/tools/vendor/sigs.k8s.io/kube-api-linter/pkg/analysis/defaults/initializer.go
+new file mode 100644
+index 00000000000..6a16d284b9a
+--- /dev/null
++++ b/hack/tools/vendor/sigs.k8s.io/kube-api-linter/pkg/analysis/defaults/initializer.go
+@@ -0,0 +1,91 @@
++/*
++Copyright 2025 The Kubernetes Authors.
++
++Licensed under the Apache License, Version 2.0 (the "License");
++you may not use this file except in compliance with the License.
++You may obtain a copy of the License at
++
++	http://www.apache.org/licenses/LICENSE-2.0
++
++Unless required by applicable law or agreed to in writing, software
++distributed under the License is distributed on an "AS IS" BASIS,
++WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++See the License for the specific language governing permissions and
++limitations under the License.
++*/
++package defaults
++
++import (
++	"fmt"
++
++	"golang.org/x/tools/go/analysis"
++	"k8s.io/apimachinery/pkg/util/validation/field"
++	"sigs.k8s.io/kube-api-linter/pkg/analysis/initializer"
++	"sigs.k8s.io/kube-api-linter/pkg/analysis/registry"
++	"sigs.k8s.io/kube-api-linter/pkg/markers"
++)
++
++func init() {
++	registry.DefaultRegistry().RegisterLinter(Initializer())
++}
++
++// Initializer returns the AnalyzerInitializer for this
++// Analyzer so that it can be added to the registry.
++func Initializer() initializer.AnalyzerInitializer {
++	return initializer.NewConfigurableInitializer(
++		name,
++		initAnalyzer,
++		true,
++		validateConfig,
++	)
++}
++
++func initAnalyzer(cfg *DefaultsConfig) (*analysis.Analyzer, error) {
++	return newAnalyzer(cfg), nil
++}
++
++// validateConfig is used to validate the configuration in the DefaultsConfig struct.
++func validateConfig(cfg *DefaultsConfig, fldPath *field.Path) field.ErrorList {
++	if cfg == nil {
++		return field.ErrorList{}
++	}
++
++	fieldErrors := field.ErrorList{}
++
++	switch cfg.PreferredDefaultMarker {
++	case "", markers.DefaultMarker, markers.KubebuilderDefaultMarker:
++	default:
++		fieldErrors = append(fieldErrors, field.Invalid(fldPath.Child("preferredDefaultMarker"), cfg.PreferredDefaultMarker, fmt.Sprintf("invalid value, must be one of %q, %q or omitted", markers.DefaultMarker, markers.KubebuilderDefaultMarker)))
++	}
++
++	fieldErrors = append(fieldErrors, validateOmitEmpty(cfg.OmitEmpty, fldPath.Child("omitempty"))...)
++	fieldErrors = append(fieldErrors, validateOmitZero(cfg.OmitZero, fldPath.Child("omitzero"))...)
++
++	return fieldErrors
++}
++
++// validateOmitEmpty is used to validate the configuration in the DefaultsOmitEmpty struct.
++func validateOmitEmpty(oec DefaultsOmitEmpty, fldPath *field.Path) field.ErrorList {
++	fieldErrors := field.ErrorList{}
++
++	switch oec.Policy {
++	case "", OmitEmptyPolicyIgnore, OmitEmptyPolicyWarn, OmitEmptyPolicySuggestFix:
++	default:
++		fieldErrors = append(fieldErrors, field.Invalid(fldPath.Child("policy"), oec.Policy, fmt.Sprintf("invalid value, must be one of %q, %q, %q or omitted", OmitEmptyPolicyIgnore, OmitEmptyPolicyWarn, OmitEmptyPolicySuggestFix)))
++	}
++
++	return fieldErrors
++}
++
++// validateOmitZero is used to validate the configuration in the DefaultsOmitZero struct.
++func validateOmitZero(ozc DefaultsOmitZero, fldPath *field.Path) field.ErrorList {
++	fieldErrors := field.ErrorList{}
++
++	switch ozc.Policy {
++	case "", OmitZeroPolicyForbid, OmitZeroPolicyWarn, OmitZeroPolicySuggestFix:
++	default:
++		fieldErrors = append(fieldErrors, field.Invalid(fldPath.Child("policy"), ozc.Policy, fmt.Sprintf("invalid value, must be one of %q, %q, %q or omitted", OmitZeroPolicyForbid, OmitZeroPolicyWarn, OmitZeroPolicySuggestFix)))
++	}
++
++	return fieldErrors
++}
+diff --git a/hack/tools/vendor/sigs.k8s.io/kube-api-linter/pkg/analysis/dependenttags/analyzer.go b/hack/tools/vendor/sigs.k8s.io/kube-api-linter/pkg/analysis/dependenttags/analyzer.go
+index aa8b0e36d53..5286f77e276 100644
+--- a/hack/tools/vendor/sigs.k8s.io/kube-api-linter/pkg/analysis/dependenttags/analyzer.go
++++ b/hack/tools/vendor/sigs.k8s.io/kube-api-linter/pkg/analysis/dependenttags/analyzer.go
+@@ -41,7 +41,7 @@ func newAnalyzer(cfg Config) *analysis.Analyzer {
+ 	for _, rule := range cfg.Rules {
+ 		markers.DefaultRegistry().Register(rule.Identifier)
+ 
+-		for _, dep := range rule.Dependents {
++		for _, dep := range rule.DependsOn {
+ 			markers.DefaultRegistry().Register(dep)
+ 		}
+ 	}
+@@ -89,9 +89,9 @@ func (a *analyzer) run(pass *analysis.Pass) (any, error) {
+ 	return nil, nil //nolint:nilnil
+ }
+ func handleAll(pass *analysis.Pass, field *ast.Field, rule Rule, fieldMarkers markers.MarkerSet, qualifiedFieldName string) {
+-	missing := make([]string, 0, len(rule.Dependents))
++	missing := make([]string, 0, len(rule.DependsOn))
+ 
+-	for _, dependent := range rule.Dependents {
++	for _, dependent := range rule.DependsOn {
+ 		if _, depOk := fieldMarkers[dependent]; !depOk {
+ 			missing = append(missing, fmt.Sprintf("+%s", dependent))
+ 		}
+@@ -105,7 +105,7 @@ func handleAll(pass *analysis.Pass, field *ast.Field, rule Rule, fieldMarkers ma
+ func handleAny(pass *analysis.Pass, field *ast.Field, rule Rule, fieldMarkers markers.MarkerSet, qualifiedFieldName string) {
+ 	found := false
+ 
+-	for _, dependent := range rule.Dependents {
++	for _, dependent := range rule.DependsOn {
+ 		if _, depOk := fieldMarkers[dependent]; depOk {
+ 			found = true
+ 			break
+@@ -113,11 +113,11 @@ func handleAny(pass *analysis.Pass, field *ast.Field, rule Rule, fieldMarkers ma
+ 	}
+ 
+ 	if !found {
+-		dependents := make([]string, len(rule.Dependents))
+-		for i, d := range rule.Dependents {
+-			dependents[i] = fmt.Sprintf("+%s", d)
++		dependsOn := make([]string, len(rule.DependsOn))
++		for i, d := range rule.DependsOn {
++			dependsOn[i] = fmt.Sprintf("+%s", d)
+ 		}
+ 
+-		pass.Reportf(field.Pos(), "field %s with marker +%s requires at least one of the following markers, but none were found: %s", qualifiedFieldName, rule.Identifier, strings.Join(dependents, ", "))
++		pass.Reportf(field.Pos(), "field %s with marker +%s requires at least one of the following markers, but none were found: %s", qualifiedFieldName, rule.Identifier, strings.Join(dependsOn, ", "))
+ 	}
+ }
+diff --git a/hack/tools/vendor/sigs.k8s.io/kube-api-linter/pkg/analysis/dependenttags/config.go b/hack/tools/vendor/sigs.k8s.io/kube-api-linter/pkg/analysis/dependenttags/config.go
+index b8d1d4249ff..3bc95d93803 100644
+--- a/hack/tools/vendor/sigs.k8s.io/kube-api-linter/pkg/analysis/dependenttags/config.go
++++ b/hack/tools/vendor/sigs.k8s.io/kube-api-linter/pkg/analysis/dependenttags/config.go
+@@ -32,14 +32,14 @@ type Config struct {
+ 	Rules []Rule `mapstructure:"rules"`
+ }
+ 
+-// Rule defines a dependency rule where a main marker requires a set of dependent markers.
++// Rule defines a dependency rule where a specific marker requires a set of other markers.
+ type Rule struct {
+ 	// Identifier is the marker that requires other markers.
+ 	Identifier string `mapstructure:"identifier"`
+-	// Dependents are the markers that are required by Main.
+-	Dependents []string `mapstructure:"dependents"`
+-	// Type defines how to interpret the dependents list.
++	// DependsOn are the markers that are required when the identifier is present.
++	DependsOn []string `mapstructure:"dependsOn"`
++	// Type defines how to interpret the dependsOn list.
+ 	// When set to All, every dependent in the list must be present when the identifier is present on a field or type.
+-	// When set to Any, at least one of the listed dependents must be present when the identifier is present on a field or type.
++	// When set to Any, at least one of the listed dependsOn must be present when the identifier is present on a field or type.
+ 	Type DependencyType `mapstructure:"type,omitempty"`
+ }
+diff --git a/hack/tools/vendor/sigs.k8s.io/kube-api-linter/pkg/analysis/dependenttags/doc.go b/hack/tools/vendor/sigs.k8s.io/kube-api-linter/pkg/analysis/dependenttags/doc.go
+index 0c98ea52371..4178f7d791a 100644
+--- a/hack/tools/vendor/sigs.k8s.io/kube-api-linter/pkg/analysis/dependenttags/doc.go
++++ b/hack/tools/vendor/sigs.k8s.io/kube-api-linter/pkg/analysis/dependenttags/doc.go
+@@ -26,7 +26,7 @@ limitations under the License.
+ // # Configuration
+ //
+ // The linter is configured with a list of rules. Each rule specifies an identifier marker and a list of
+-// dependent markers. The `type` field is required and specifies how to interpret the dependents list:
++// dependent markers. The `type` field is required and specifies how to interpret the dependsOn list:
+ // - `All`: all dependent markers are required.
+ // - `Any`: at least one of the dependent markers is required.
+ //
+@@ -37,15 +37,15 @@ limitations under the License.
+ //	    rules:
+ //	    - identifier: "k8s:unionMember"
+ //	      type: "All"
+-//	      dependents:
++//	      dependsOn:
+ //	      - "k8s:optional"
+ //	    - identifier: "listType"
+ //	      type: "All"
+-//	      dependents:
++//	      dependsOn:
+ //	      - "k8s:listType"
+ //	    - identifier: "example:any"
+ //	      type: "Any"
+-//	      dependents:
++//	      dependsOn:
+ //	      - "dep1"
+ //	      - "dep2"
+ package dependenttags
+diff --git a/hack/tools/vendor/sigs.k8s.io/kube-api-linter/pkg/analysis/dependenttags/initializer.go b/hack/tools/vendor/sigs.k8s.io/kube-api-linter/pkg/analysis/dependenttags/initializer.go
+index 1b2244dcc81..9541ca79fe8 100644
+--- a/hack/tools/vendor/sigs.k8s.io/kube-api-linter/pkg/analysis/dependenttags/initializer.go
++++ b/hack/tools/vendor/sigs.k8s.io/kube-api-linter/pkg/analysis/dependenttags/initializer.go
+@@ -70,8 +70,8 @@ func validateConfig(cfg *Config, fldPath *field.Path) field.ErrorList {
+ 			errs = append(errs, field.Invalid(rulesPath.Index(i).Child("identifier"), rule.Identifier, "identifier marker cannot be empty"))
+ 		}
+ 
+-		if len(rule.Dependents) == 0 {
+-			errs = append(errs, field.Invalid(rulesPath.Index(i).Child("dependents"), rule.Dependents, "dependents list cannot be empty"))
++		if len(rule.DependsOn) == 0 {
++			errs = append(errs, field.Invalid(rulesPath.Index(i).Child("dependsOn"), rule.DependsOn, "dependsOn list cannot be empty"))
+ 		}
+ 
+ 		if rule.Type == "" {
+diff --git a/hack/tools/vendor/sigs.k8s.io/kube-api-linter/pkg/analysis/helpers/markers/analyzer.go b/hack/tools/vendor/sigs.k8s.io/kube-api-linter/pkg/analysis/helpers/markers/analyzer.go
+index ca3c2671d6d..6db10995045 100644
+--- a/hack/tools/vendor/sigs.k8s.io/kube-api-linter/pkg/analysis/helpers/markers/analyzer.go
++++ b/hack/tools/vendor/sigs.k8s.io/kube-api-linter/pkg/analysis/helpers/markers/analyzer.go
+@@ -159,30 +159,50 @@ func run(pass *analysis.Pass) (any, error) {
+ 		return nil, kalerrors.ErrCouldNotCreateMarkers
+ 	}
+ 
+-	inspect.Preorder(nodeFilter, func(n ast.Node) {
+-		switch typ := n.(type) {
+-		case *ast.GenDecl:
+-			// Find the file this declaration belongs to.
+-			// For most packages, there are only a few files (typically 1-10),
+-			// so a simple linear search is efficient and clear.
+-			var file *ast.File
+-
+-			for _, f := range pass.Files {
+-				if f.Pos() <= typ.Pos() && typ.End() <= f.End() {
+-					file = f
+-					break
++	// Pre-compute field Doc comment ownership map to avoid O(n²) complexity.
++	// This maps each field's Doc comment to the field itself, allowing O(1)
++	// lookups instead of full AST traversals in isDocCommentForField.
++	fieldDocComments := make(map[*ast.CommentGroup]*ast.Field)
++
++	for _, file := range pass.Files {
++		ast.Inspect(file, func(n ast.Node) bool {
++			if field, ok := n.(*ast.Field); ok {
++				if field.Doc != nil {
++					fieldDocComments[field.Doc] = field
+ 				}
+ 			}
+ 
++			return true
++		})
++	}
++
++	inspect.Preorder(nodeFilter, func(n ast.Node) {
++		switch typ := n.(type) {
++		case *ast.GenDecl:
++			file := findFileForNode(typ, pass.Files)
+ 			extractGenDeclMarkers(typ, file, pass.Fset, results)
+ 		case *ast.Field:
+-			extractFieldMarkers(typ, results)
++			file := findFileForNode(typ, pass.Files)
++			extractFieldMarkers(typ, file, pass.Fset, results, fieldDocComments)
+ 		}
+ 	})
+ 
+ 	return results, nil
+ }
+ 
++// findFileForNode finds the file that contains the given AST node.
++// For most packages, there are only a few files (typically 1-10),
++// so a simple linear search is efficient and clear.
++func findFileForNode(node ast.Node, files []*ast.File) *ast.File {
++	for _, f := range files {
++		if f.Pos() <= node.Pos() && node.End() <= f.End() {
++			return f
++		}
++	}
++
++	return nil
++}
++
+ func extractGenDeclMarkers(typ *ast.GenDecl, file *ast.File, fset *token.FileSet, results *markers) {
+ 	declMarkers := NewMarkerSet()
+ 
+@@ -219,7 +239,7 @@ func extractGenDeclMarkers(typ *ast.GenDecl, file *ast.File, fset *token.FileSet
+ // that are separated by a blank line. Only the immediately preceding comment group is checked,
+ // and it must be within maxMarkerSeparationLines lines of the godoc comment.
+ //
+-// This handles the "second level comment bug" (issue #53) where markers are separated from type
++// This handles the "second level comment bug" where markers are separated from type
+ // declarations by blank lines, which commonly occurs in real-world Kubernetes API code.
+ //
+ // Example scenario this handles:
+@@ -259,6 +279,95 @@ func extractOrphanedMarkers(docGroup *ast.CommentGroup, file *ast.File, fset *to
+ 	}
+ }
+ 
++// extractOrphanedFieldMarkers finds markers in the comment group immediately before a field's doc comment
++// that are separated by a blank line. This is a specialized version for fields that is more conservative
++// than extractOrphanedMarkers to avoid picking up markers from previous fields.
++//
++// This handles the "second level comment bug" for struct fields where markers are separated
++// from field declarations by blank lines.
++//
++// Example scenario this handles:
++//
++//	type FooStatus struct {
++//	    // +optional
++//	    // +listType=map
++//	    // +listMapKey=type
++//	    // +patchStrategy=merge
++//	    // +patchMergeKey=type
++//
++//	    // Conditions update as changes occur in the status.
++//	    Conditions []metav1.Condition `json:"conditions,omitempty"`
++//	}
++//
++// The markers will be detected even though separated by a blank line from the field doc comment.
++func extractOrphanedFieldMarkers(docGroup *ast.CommentGroup, file *ast.File, fset *token.FileSet, fieldMarkers MarkerSet, fieldDocComments map[*ast.CommentGroup]*ast.Field) {
++	if file == nil || fset == nil {
++		return
++	}
++
++	prevGroup := findPreviousCommentGroup(docGroup, file)
++	if prevGroup == nil {
++		return
++	}
++
++	// For fields, only consider comment groups that contain ONLY markers (no prose documentation)
++	// and are not Doc comments for other declarations or fields
++	if !isProperlySeparated(prevGroup, docGroup, fset) {
++		return
++	}
++
++	if !containsOnlyMarkers(prevGroup) {
++		return
++	}
++
++	if isDocCommentForDeclaration(prevGroup, file) || isDocCommentForField(prevGroup, fieldDocComments) {
++		return
++	}
++
++	// Extract markers from the previous comment group
++	for _, comment := range prevGroup.List {
++		if marker := extractMarker(comment); marker.Identifier != "" {
++			fieldMarkers.Insert(marker)
++		}
++	}
++}
++
++// containsOnlyMarkers checks if a comment group contains ONLY markers and no prose documentation.
++// This is a stricter version of containsMarkers used for field orphaned marker detection.
++func containsOnlyMarkers(group *ast.CommentGroup) bool {
++	if len(group.List) == 0 {
++		return false
++	}
++
++	hasMarker := false
++
++	// Every comment line must be a marker
++	for _, comment := range group.List {
++		text := strings.TrimPrefix(comment.Text, "//")
++		text = strings.TrimSpace(text)
++
++		// Empty lines are OK (e.g., blank comment lines)
++		if text == "" {
++			continue
++		}
++
++		// If it doesn't start with +, it's not a marker
++		if !strings.HasPrefix(text, "+") {
++			return false
++		}
++
++		// Check if this is a valid marker using regex (more efficient than full parsing)
++		markerContent := strings.TrimPrefix(text, "+")
++		if !validMarkerStart.MatchString(markerContent) {
++			return false
++		}
++
++		hasMarker = true
++	}
++
++	return hasMarker
++}
++
+ // findPreviousCommentGroup finds the comment group immediately before the given docGroup.
+ func findPreviousCommentGroup(docGroup *ast.CommentGroup, file *ast.File) *ast.CommentGroup {
+ 	for i, cg := range file.Comments {
+@@ -464,18 +573,31 @@ func isDocCommentForDeclaration(group *ast.CommentGroup, file *ast.File) bool {
+ 	return false
+ }
+ 
+-func extractFieldMarkers(field *ast.Field, results *markers) {
+-	if field == nil || field.Doc == nil {
+-		return
+-	}
++// isDocCommentForField checks if the comment group is a Doc comment for any field.
++// Uses a pre-computed map for O(1) lookup instead of O(n) AST traversal.
++func isDocCommentForField(group *ast.CommentGroup, fieldDocComments map[*ast.CommentGroup]*ast.Field) bool {
++	_, found := fieldDocComments[group]
++	return found
++}
+ 
++func extractFieldMarkers(field *ast.Field, file *ast.File, fset *token.FileSet, results *markers, fieldDocComments map[*ast.CommentGroup]*ast.Field) {
+ 	fieldMarkers := NewMarkerSet()
+ 
+-	for _, comment := range field.Doc.List {
+-		marker := extractMarker(comment)
+-		if marker.Identifier != "" {
+-			fieldMarkers.Insert(marker)
++	// Extract markers from the field's Doc field (comments directly attached to the field)
++	if field != nil && field.Doc != nil {
++		for _, comment := range field.Doc.List {
++			marker := extractMarker(comment)
++			if marker.Identifier != "" {
++				fieldMarkers.Insert(marker)
++			}
+ 		}
++
++		// Also collect markers from the comment group immediately before the field's doc comment
++		// if separated by a blank line (orphaned markers).
++		// For fields, we use a specialized version that only checks if the markers are immediately
++		// above the doc comment (within the same logical block) to avoid picking up markers from
++		// previous fields.
++		extractOrphanedFieldMarkers(field.Doc, file, fset, fieldMarkers, fieldDocComments)
+ 	}
+ 
+ 	results.insertFieldMarkers(field, fieldMarkers)
+@@ -736,7 +858,7 @@ type Marker struct {
+ 	// Pos is the starting position in the file for the comment line containing the marker.
+ 	Pos token.Pos
+ 
+-	// End is the ending position in the file for the coment line containing the marker.
++	// End is the ending position in the file for the comment line containing the marker.
+ 	End token.Pos
+ }
+ 
+diff --git a/hack/tools/vendor/sigs.k8s.io/kube-api-linter/pkg/analysis/initializer/initializer.go b/hack/tools/vendor/sigs.k8s.io/kube-api-linter/pkg/analysis/initializer/initializer.go
+index 60e5c77419d..c2c464d9abb 100644
+--- a/hack/tools/vendor/sigs.k8s.io/kube-api-linter/pkg/analysis/initializer/initializer.go
++++ b/hack/tools/vendor/sigs.k8s.io/kube-api-linter/pkg/analysis/initializer/initializer.go
+@@ -37,7 +37,7 @@ type AnalyzerInitializer interface {
+ 	// It will be passed the complete LintersConfig and is expected to rely only on its own configuration.
+ 	Init(any) (*analysis.Analyzer, error)
+ 
+-	// Default determines whether the inializer intializes an analyzer that should be
++	// Default determines whether the initializer initializes an analyzer that should be
+ 	// on by default, or not.
+ 	Default() bool
+ }
+@@ -64,7 +64,7 @@ func NewInitializer(name string, analyzer *analysis.Analyzer, isDefault bool) An
+ 	}
+ }
+ 
+-// NewConfigurableInitializer constructs a new initializer for intializing a
++// NewConfigurableInitializer constructs a new initializer for initializing a
+ // configurable Analyzer.
+ func NewConfigurableInitializer[T any](name string, initFunc InitializerFunc[T], isDefault bool, validateFunc ValidateFunc[T]) ConfigurableAnalyzerInitializer {
+ 	return configurableInitializer[T]{
+@@ -88,7 +88,7 @@ func (i initializer[T]) Name() string {
+ 	return i.name
+ }
+ 
+-// Init returns a newly initializr analyzer.
++// Init returns a newly initialized analyzer.
+ func (i initializer[T]) Init(_ any) (*analysis.Analyzer, error) {
+ 	var cfg *T
+ 
+diff --git a/hack/tools/vendor/sigs.k8s.io/kube-api-linter/pkg/analysis/integers/doc.go b/hack/tools/vendor/sigs.k8s.io/kube-api-linter/pkg/analysis/integers/doc.go
+index 88a31e958a5..3383ff7dcaa 100644
+--- a/hack/tools/vendor/sigs.k8s.io/kube-api-linter/pkg/analysis/integers/doc.go
++++ b/hack/tools/vendor/sigs.k8s.io/kube-api-linter/pkg/analysis/integers/doc.go
+@@ -25,7 +25,7 @@ values larger than int32.
+ It also states that unsigned integers should be replaced with signed integers, and then numeric
+ lower bounds added to prevent negative integers.
+ 
+-Succinctly this anaylzer checks for int, int8, int16, uint, uint8, uint16, uint32 and uint64 types
++Succinctly this analyzer checks for int, int8, int16, uint, uint8, uint16, uint32 and uint64 types
+ and highlights that they should not be used.
+ */
+ package integers
+diff --git a/hack/tools/vendor/sigs.k8s.io/kube-api-linter/pkg/analysis/minlength/analyzer.go b/hack/tools/vendor/sigs.k8s.io/kube-api-linter/pkg/analysis/minlength/analyzer.go
+new file mode 100644
+index 00000000000..8ad16e48962
+--- /dev/null
++++ b/hack/tools/vendor/sigs.k8s.io/kube-api-linter/pkg/analysis/minlength/analyzer.go
+@@ -0,0 +1,258 @@
++/*
++Copyright 2025 The Kubernetes Authors.
++
++Licensed under the Apache License, Version 2.0 (the "License");
++you may not use this file except in compliance with the License.
++You may obtain a copy of the License at
++
++	http://www.apache.org/licenses/LICENSE-2.0
++
++Unless required by applicable law or agreed to in writing, software
++distributed under the License is distributed on an "AS IS" BASIS,
++WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++See the License for the specific language governing permissions and
++limitations under the License.
++*/
++package minlength
++
++import (
++	"fmt"
++	"go/ast"
++
++	"golang.org/x/tools/go/analysis"
++	kalerrors "sigs.k8s.io/kube-api-linter/pkg/analysis/errors"
++	"sigs.k8s.io/kube-api-linter/pkg/analysis/helpers/extractjsontags"
++	"sigs.k8s.io/kube-api-linter/pkg/analysis/helpers/inspector"
++	markershelper "sigs.k8s.io/kube-api-linter/pkg/analysis/helpers/markers"
++	"sigs.k8s.io/kube-api-linter/pkg/analysis/utils"
++	"sigs.k8s.io/kube-api-linter/pkg/markers"
++)
++
++const (
++	name = "minlength"
++)
++
++// Analyzer is the analyzer for the minlength package.
++// It checks that strings and arrays have minimum lengths and minimum items respectively.
++var Analyzer = &analysis.Analyzer{
++	Name:     name,
++	Doc:      "Checks that all strings formatted fields are marked with a minimum length, and that arrays are marked with min items, maps are marked with min properties, and structs that do not have required fields are marked with min properties",
++	Run:      run,
++	Requires: []*analysis.Analyzer{inspector.Analyzer},
++}
++
++func run(pass *analysis.Pass) (any, error) {
++	inspect, ok := pass.ResultOf[inspector.Analyzer].(inspector.Inspector)
++	if !ok {
++		return nil, kalerrors.ErrCouldNotGetInspector
++	}
++
++	inspect.InspectFields(func(field *ast.Field, _ extractjsontags.FieldTagInfo, markersAccess markershelper.Markers, qualifiedFieldName string) {
++		checkField(pass, field, markersAccess, qualifiedFieldName)
++	})
++
++	return nil, nil //nolint:nilnil
++}
++
++func checkField(pass *analysis.Pass, field *ast.Field, markersAccess markershelper.Markers, qualifiedFieldName string) {
++	prefix := fmt.Sprintf("field %s", qualifiedFieldName)
++
++	checkTypeExpr(pass, field.Type, field, nil, markersAccess, prefix, markers.KubebuilderMinLengthMarker, needsStringMinLength)
++}
++
++func checkIdent(pass *analysis.Pass, ident *ast.Ident, node ast.Node, aliases []*ast.TypeSpec, markersAccess markershelper.Markers, prefix, marker string, needsMaxLength func(markershelper.MarkerSet) bool) {
++	if utils.IsBasicType(pass, ident) { // Built-in type
++		checkString(pass, ident, node, aliases, markersAccess, prefix, marker, needsMaxLength)
++
++		return
++	}
++
++	tSpec, ok := utils.LookupTypeSpec(pass, ident)
++	if !ok {
++		return
++	}
++
++	checkTypeSpec(pass, tSpec, node, append(aliases, tSpec), markersAccess, fmt.Sprintf("%s type", prefix), marker, needsMaxLength)
++}
++
++func checkString(pass *analysis.Pass, ident *ast.Ident, node ast.Node, aliases []*ast.TypeSpec, markersAccess markershelper.Markers, prefix, marker string, needsMinLength func(markershelper.MarkerSet) bool) {
++	if ident.Name != "string" {
++		return
++	}
++
++	markers := getCombinedMarkers(markersAccess, node, aliases)
++
++	if needsMinLength(markers) {
++		pass.Reportf(node.Pos(), "%s must have a minimum length, add %s marker", prefix, marker)
++	}
++}
++
++func checkTypeSpec(pass *analysis.Pass, tSpec *ast.TypeSpec, node ast.Node, aliases []*ast.TypeSpec, markersAccess markershelper.Markers, prefix, marker string, needsMinLength func(markershelper.MarkerSet) bool) {
++	if tSpec.Name == nil {
++		return
++	}
++
++	typeName := tSpec.Name.Name
++	prefix = fmt.Sprintf("%s %s", prefix, typeName)
++
++	checkTypeExpr(pass, tSpec.Type, node, aliases, markersAccess, prefix, marker, needsMinLength)
++}
++
++func checkTypeExpr(pass *analysis.Pass, typeExpr ast.Expr, node ast.Node, aliases []*ast.TypeSpec, markersAccess markershelper.Markers, prefix, marker string, needsMinLength func(markershelper.MarkerSet) bool) {
++	switch typ := typeExpr.(type) {
++	case *ast.Ident:
++		checkIdent(pass, typ, node, aliases, markersAccess, prefix, marker, needsMinLength)
++	case *ast.StarExpr:
++		checkTypeExpr(pass, typ.X, node, aliases, markersAccess, prefix, marker, needsMinLength)
++	case *ast.ArrayType:
++		checkArrayType(pass, typ, node, aliases, markersAccess, prefix)
++	case *ast.MapType:
++		checkMapType(pass, node, aliases, markersAccess, prefix)
++	case *ast.StructType:
++		checkStructType(pass, typ, node, aliases, markersAccess, prefix)
++	}
++}
++
++func checkArrayType(pass *analysis.Pass, arrayType *ast.ArrayType, node ast.Node, aliases []*ast.TypeSpec, markersAccess markershelper.Markers, prefix string) {
++	if arrayType.Elt != nil {
++		if ident, ok := arrayType.Elt.(*ast.Ident); ok {
++			if ident.Name == "byte" {
++				// byte slices are a special case as they are treated as strings.
++				// Pretend the ident is a string so that checkString can process it as expected.
++				i := &ast.Ident{
++					NamePos: ident.NamePos,
++					Name:    "string",
++				}
++				checkString(pass, i, node, aliases, markersAccess, prefix, markers.KubebuilderMinLengthMarker, needsStringMinLength)
++
++				return
++			}
++
++			checkArrayElementIdent(pass, ident, node, aliases, markersAccess, fmt.Sprintf("%s array element", prefix))
++		}
++	}
++
++	markerSet := getCombinedMarkers(markersAccess, node, aliases)
++
++	if !markerSet.Has(markers.KubebuilderMinItemsMarker) {
++		pass.Reportf(node.Pos(), "%s must have a minimum items, add %s marker", prefix, markers.KubebuilderMinItemsMarker)
++	}
++}
++
++func checkArrayElementIdent(pass *analysis.Pass, ident *ast.Ident, node ast.Node, aliases []*ast.TypeSpec, markersAccess markershelper.Markers, prefix string) {
++	if ident.Obj == nil { // Built-in type
++		checkString(pass, ident, node, aliases, markersAccess, prefix, markers.KubebuilderItemsMinLengthMarker, needsItemsMinLength)
++
++		return
++	}
++
++	tSpec, ok := ident.Obj.Decl.(*ast.TypeSpec)
++	if !ok {
++		return
++	}
++
++	// If the array element wasn't directly a string, allow a string alias to be used
++	// with either the items style markers or the on alias style markers.
++	checkTypeSpec(pass, tSpec, node, append(aliases, tSpec), markersAccess, fmt.Sprintf("%s type", prefix), markers.KubebuilderMinLengthMarker, func(ms markershelper.MarkerSet) bool {
++		return needsStringMinLength(ms) && needsItemsMinLength(ms)
++	})
++}
++
++func checkMapType(pass *analysis.Pass, node ast.Node, aliases []*ast.TypeSpec, markersAccess markershelper.Markers, prefix string) {
++	markerSet := getCombinedMarkers(markersAccess, node, aliases)
++
++	if !markerSet.Has(markers.KubebuilderMinPropertiesMarker) {
++		pass.Reportf(node.Pos(), "%s must have a minimum properties, add %s marker", prefix, markers.KubebuilderMinPropertiesMarker)
++	}
++}
++
++func checkStructType(pass *analysis.Pass, structType *ast.StructType, node ast.Node, aliases []*ast.TypeSpec, markersAccess markershelper.Markers, prefix string) {
++	markerSet := getCombinedMarkers(markersAccess, node, aliases)
++
++	minProperties, err := utils.GetMinProperties(markerSet)
++	if err != nil {
++		pass.Reportf(node.Pos(), "could not get min properties for struct: %v", err)
++		return
++	}
++
++	if minProperties != nil {
++		// There's already a min properties specified.
++		return
++	}
++
++	// Check if the struct has union markers that satisfy the required constraint
++	if markerSet.Has(markers.KubebuilderExactlyOneOf) || markerSet.Has(markers.KubebuilderAtLeastOneOfMarker) {
++		// ExactlyOneOf / AtLeastOneOf markers enforce that at least one field is required,
++		// this means that `{}` is not valid.
++		return
++	}
++
++	for _, field := range structType.Fields.List {
++		if utils.IsFieldRequired(field, markersAccess) {
++			// The struct has at least one required field,
++			// this means that `{}` is not valid.
++			return
++		}
++	}
++
++	// The field does not have a min properties, and does not have any required fields.
++	pass.Reportf(node.Pos(), "%s must have a minimum properties, add %s marker", prefix, markers.KubebuilderMinPropertiesMarker)
++}
++
++func getCombinedMarkers(markersAccess markershelper.Markers, node ast.Node, aliases []*ast.TypeSpec) markershelper.MarkerSet {
++	base := markershelper.NewMarkerSet(getMarkers(markersAccess, node).UnsortedList()...)
++
++	for _, a := range aliases {
++		base.Insert(getMarkers(markersAccess, a).UnsortedList()...)
++	}
++
++	return base
++}
++
++func getMarkers(markersAccess markershelper.Markers, node ast.Node) markershelper.MarkerSet {
++	switch t := node.(type) {
++	case *ast.Field:
++		return markersAccess.FieldMarkers(t)
++	case *ast.TypeSpec:
++		return markersAccess.TypeMarkers(t)
++	}
++
++	return nil
++}
++
++// needsMinLength returns true if the field needs a minimum length.
++// Fields do not need a minimum length if they are already marked with a minimum length,
++// or if they are an enum, or if they are a date, date-time or duration.
++func needsStringMinLength(markerSet markershelper.MarkerSet) bool {
++	switch {
++	case markerSet.Has(markers.KubebuilderMinLengthMarker),
++		markerSet.Has(markers.KubebuilderEnumMarker),
++		markerSet.HasWithValue(kubebuilderFormatWithValue("date")),
++		markerSet.HasWithValue(kubebuilderFormatWithValue("date-time")),
++		markerSet.HasWithValue(kubebuilderFormatWithValue("duration")):
++		return false
++	}
++
++	return true
++}
++
++func needsItemsMinLength(markerSet markershelper.MarkerSet) bool {
++	switch {
++	case markerSet.Has(markers.KubebuilderItemsMinLengthMarker),
++		markerSet.Has(markers.KubebuilderItemsEnumMarker),
++		markerSet.HasWithValue(kubebuilderItemsFormatWithValue("date")),
++		markerSet.HasWithValue(kubebuilderItemsFormatWithValue("date-time")),
++		markerSet.HasWithValue(kubebuilderItemsFormatWithValue("duration")):
++		return false
++	}
++
++	return true
++}
++
++func kubebuilderFormatWithValue(value string) string {
++	return fmt.Sprintf("%s:=%s", markers.KubebuilderFormatMarker, value)
++}
++
++func kubebuilderItemsFormatWithValue(value string) string {
++	return fmt.Sprintf("%s:=%s", markers.KubebuilderItemsFormatMarker, value)
++}
+diff --git a/hack/tools/vendor/sigs.k8s.io/kube-api-linter/pkg/analysis/minlength/doc.go b/hack/tools/vendor/sigs.k8s.io/kube-api-linter/pkg/analysis/minlength/doc.go
+new file mode 100644
+index 00000000000..080849e305e
+--- /dev/null
++++ b/hack/tools/vendor/sigs.k8s.io/kube-api-linter/pkg/analysis/minlength/doc.go
+@@ -0,0 +1,49 @@
++/*
++Copyright 2025 The Kubernetes Authors.
++
++Licensed under the Apache License, Version 2.0 (the "License");
++you may not use this file except in compliance with the License.
++You may obtain a copy of the License at
++
++	http://www.apache.org/licenses/LICENSE-2.0
++
++Unless required by applicable law or agreed to in writing, software
++distributed under the License is distributed on an "AS IS" BASIS,
++WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++See the License for the specific language governing permissions and
++limitations under the License.
++*/
++
++/*
++minlength is an analyzer that checks that all string fields have a minimum length, and that all array fields have a minimum number of items,
++that maps have a minimum number of properties, and that structs that do not have required fields have a minimum number of fields.
++
++String fields that are not otherwise bound in length, through being an enum or formatted in a certain way, should have a minimum length.
++This ensures that authors make a choice about whether or not the empty string is a valid choice for users.
++
++Array fields should have a minimum number of items.
++This ensures that empty arrays are not allowed.
++Empty arrays are generally not recommended and API authors should generally not distinguish between empty and omitted arrays.
++When the empty array is a valid choice, setting the minimum items marker to 0 can be used to indicate that this is an explicit choice.
++
++Maps should have a minimum number of properties.
++This ensures that empty maps are not allowed.
++Empty maps are generally not recommended and API authors should generally not distinguish between empty and omitted maps.
++When the empty map is a valid choice, setting the minimum properties marker to 0 can be used to indicate that this is an explicit choice.
++
++Structs that do not have required fields and do not define an equivalent constraint, i.e., `kubebuilder:validation:ExactlyOneOf` or `kubebuilder:validation:AtLeastOneOf`,
++should have a minimum number of fields.
++This ensures that empty structs are not allowed.
++Empty structs are generally not recommended and API authors should generally not distinguish between empty and omitted structs.
++When the empty struct is a valid choice, setting the minimum properties marker to 0 can be used to indicate that this is an explicit choice.
++
++For strings, the minimum length can be set using the `kubebuilder:validation:MinLength` tag.
++For arrays, the minimum number of items can be set using the `kubebuilder:validation:MinItems` tag.
++For maps, the minimum number of properties can be set using the `kubebuilder:validation:MinProperties` tag.
++For structs, the minimum number of fields can be set using the `kubebuilder:validation:MinProperties` tag.
++
++For arrays of strings, the minimum length of each string can be set using the `kubebuilder:validation:items:MinLength` tag,
++on the array field itself.
++Or, if the array uses a string type alias, the `kubebuilder:validation:MinLength` tag can be used on the alias.
++*/
++package minlength
+diff --git a/hack/tools/vendor/sigs.k8s.io/kube-api-linter/pkg/analysis/minlength/initializer.go b/hack/tools/vendor/sigs.k8s.io/kube-api-linter/pkg/analysis/minlength/initializer.go
+new file mode 100644
+index 00000000000..9d0823f31e3
+--- /dev/null
++++ b/hack/tools/vendor/sigs.k8s.io/kube-api-linter/pkg/analysis/minlength/initializer.go
+@@ -0,0 +1,35 @@
++/*
++Copyright 2025 The Kubernetes Authors.
++
++Licensed under the Apache License, Version 2.0 (the "License");
++you may not use this file except in compliance with the License.
++You may obtain a copy of the License at
++
++	http://www.apache.org/licenses/LICENSE-2.0
++
++Unless required by applicable law or agreed to in writing, software
++distributed under the License is distributed on an "AS IS" BASIS,
++WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++See the License for the specific language governing permissions and
++limitations under the License.
++*/
++package minlength
++
++import (
++	"sigs.k8s.io/kube-api-linter/pkg/analysis/initializer"
++	"sigs.k8s.io/kube-api-linter/pkg/analysis/registry"
++)
++
++func init() {
++	registry.DefaultRegistry().RegisterLinter(Initializer())
++}
++
++// Initializer returns the AnalyzerInitializer for this
++// Analyzer so that it can be added to the registry.
++func Initializer() initializer.AnalyzerInitializer {
++	return initializer.NewInitializer(
++		name,
++		Analyzer,
++		false, // For now, CRD only, and so not on by default.
++	)
++}
+diff --git a/hack/tools/vendor/sigs.k8s.io/kube-api-linter/pkg/analysis/nobools/doc.go b/hack/tools/vendor/sigs.k8s.io/kube-api-linter/pkg/analysis/nobools/doc.go
+index e4b09d18a70..d68e7975d2f 100644
+--- a/hack/tools/vendor/sigs.k8s.io/kube-api-linter/pkg/analysis/nobools/doc.go
++++ b/hack/tools/vendor/sigs.k8s.io/kube-api-linter/pkg/analysis/nobools/doc.go
+@@ -25,7 +25,7 @@ This is confusing and error-prone.
+ It is recommended instead to use a string type with a set of constants to represent the different states,
+ creating an enum.
+ 
+-By using an enum, not only can you provide meaningul names for the various states of the API,
++By using an enum, not only can you provide meaningful names for the various states of the API,
+ but you can also add additional states in the future without breaking the API.
+ */
+ package nobools
+diff --git a/hack/tools/vendor/sigs.k8s.io/kube-api-linter/pkg/analysis/nomaps/initializer.go b/hack/tools/vendor/sigs.k8s.io/kube-api-linter/pkg/analysis/nomaps/initializer.go
+index 4ed65d6ce5c..cd2d2cb8326 100644
+--- a/hack/tools/vendor/sigs.k8s.io/kube-api-linter/pkg/analysis/nomaps/initializer.go
++++ b/hack/tools/vendor/sigs.k8s.io/kube-api-linter/pkg/analysis/nomaps/initializer.go
+@@ -39,7 +39,7 @@ func Initializer() initializer.AnalyzerInitializer {
+ 	)
+ }
+ 
+-// Init returns the intialized Analyzer.
++// Init returns the initialized Analyzer.
+ func initAnalyzer(nmc *NoMapsConfig) (*analysis.Analyzer, error) {
+ 	return newAnalyzer(nmc), nil
+ }
+diff --git a/hack/tools/vendor/sigs.k8s.io/kube-api-linter/pkg/analysis/optionalfields/config.go b/hack/tools/vendor/sigs.k8s.io/kube-api-linter/pkg/analysis/optionalfields/config.go
+index f627addc43b..02269a15f5d 100644
+--- a/hack/tools/vendor/sigs.k8s.io/kube-api-linter/pkg/analysis/optionalfields/config.go
++++ b/hack/tools/vendor/sigs.k8s.io/kube-api-linter/pkg/analysis/optionalfields/config.go
+@@ -40,7 +40,7 @@ type OptionalFieldsPointers struct {
+ 	// Valid values are "Always" and "WhenRequired".
+ 	// When set to "Always", the linter will prefer pointers for all optional fields.
+ 	// When set to "WhenRequired", the linter will prefer pointers for optional fields where validation or serialization requires a pointer.
+-	// The "WhenRequired" option requires bounds on strings and numerical values to be able to acurately determine the correct pointer vs non-pointer decision.
++	// The "WhenRequired" option requires bounds on strings and numerical values to be able to accurately determine the correct pointer vs non-pointer decision.
+ 	// When otherwise not specified, the default value is "Always".
+ 	Preference OptionalFieldsPointerPreference `json:"preference"`
+ 	// policy is the policy for the pointer preferences for optional fields.
+diff --git a/hack/tools/vendor/sigs.k8s.io/kube-api-linter/pkg/analysis/optionalfields/doc.go b/hack/tools/vendor/sigs.k8s.io/kube-api-linter/pkg/analysis/optionalfields/doc.go
+index a31a73bb9a6..b9035dcc835 100644
+--- a/hack/tools/vendor/sigs.k8s.io/kube-api-linter/pkg/analysis/optionalfields/doc.go
++++ b/hack/tools/vendor/sigs.k8s.io/kube-api-linter/pkg/analysis/optionalfields/doc.go
+@@ -23,7 +23,7 @@ However, where the zero value for a field is not a valid value (e.g. the empty s
+ In this case, the field may not need to be a pointer, and, with the WhenRequired preference, the linter will point out where the fields do not need to be pointers.
+ 
+ Structs are also inspected to determine if they require a pointer.
+-If a struct has any required fields, or a minimum numebr of properties, then fields leveraging the struct should be pointers.
++If a struct has any required fields, or a minimum number of properties, then fields leveraging the struct should be pointers.
+ 
+ Optional structs do not always need to be pointers, but may be marshalled as `{}` because the JSON marshaller in Go cannot determine whether a struct is empty or not.
+ */
+diff --git a/hack/tools/vendor/sigs.k8s.io/kube-api-linter/pkg/analysis/optionalfields/initializer.go b/hack/tools/vendor/sigs.k8s.io/kube-api-linter/pkg/analysis/optionalfields/initializer.go
+index 14980741fa4..23cb329ee61 100644
+--- a/hack/tools/vendor/sigs.k8s.io/kube-api-linter/pkg/analysis/optionalfields/initializer.go
++++ b/hack/tools/vendor/sigs.k8s.io/kube-api-linter/pkg/analysis/optionalfields/initializer.go
+@@ -39,7 +39,7 @@ func Initializer() initializer.AnalyzerInitializer {
+ 	)
+ }
+ 
+-// Init returns the intialized Analyzer.
++// Init returns the initialized Analyzer.
+ func initAnalyzer(ofc *OptionalFieldsConfig) (*analysis.Analyzer, error) {
+ 	return newAnalyzer(ofc), nil
+ }
+diff --git a/hack/tools/vendor/sigs.k8s.io/kube-api-linter/pkg/analysis/preferredmarkers/analyzer.go b/hack/tools/vendor/sigs.k8s.io/kube-api-linter/pkg/analysis/preferredmarkers/analyzer.go
+index 494a03da6d0..ff0548ab475 100644
+--- a/hack/tools/vendor/sigs.k8s.io/kube-api-linter/pkg/analysis/preferredmarkers/analyzer.go
++++ b/hack/tools/vendor/sigs.k8s.io/kube-api-linter/pkg/analysis/preferredmarkers/analyzer.go
+@@ -34,6 +34,9 @@ const name = "preferredmarkers"
+ type analyzer struct {
+ 	// equivalentToPreferred maps equivalent marker identifiers to their preferred identifiers
+ 	equivalentToPreferred map[string]string
++
++	// preferredToMessage maps preferred marker identifiers to their custom message
++	preferredToMessage map[string]string
+ }
+ 
+ // newAnalyzer creates a new analysis.Analyzer for the preferredmarkers
+@@ -41,6 +44,7 @@ type analyzer struct {
+ func newAnalyzer(cfg *Config) *analysis.Analyzer {
+ 	a := &analyzer{
+ 		equivalentToPreferred: make(map[string]string),
++		preferredToMessage:    make(map[string]string),
+ 	}
+ 
+ 	// Build the mapping from equivalent identifiers to preferred identifiers
+@@ -48,6 +52,11 @@ func newAnalyzer(cfg *Config) *analysis.Analyzer {
+ 		for _, equivalent := range marker.EquivalentIdentifiers {
+ 			a.equivalentToPreferred[equivalent.Identifier] = marker.PreferredIdentifier
+ 		}
++
++		msg := marker.Message
++		if msg != "" {
++			a.preferredToMessage[marker.PreferredIdentifier] = msg
++		}
+ 	}
+ 
+ 	analyzer := &analysis.Analyzer{
+@@ -75,11 +84,11 @@ func (a *analyzer) run(pass *analysis.Pass) (any, error) {
+ 	}
+ 
+ 	inspect.InspectFields(func(field *ast.Field, _ extractjsontags.FieldTagInfo, markersAccess markers.Markers, qualifiedFieldName string) {
+-		checkField(pass, field, markersAccess, a.equivalentToPreferred, qualifiedFieldName)
++		checkField(pass, field, markersAccess, a.equivalentToPreferred, a.preferredToMessage, qualifiedFieldName)
+ 	})
+ 
+ 	inspect.InspectTypeSpec(func(typeSpec *ast.TypeSpec, markersAccess markers.Markers) {
+-		checkType(pass, typeSpec, markersAccess, a.equivalentToPreferred)
++		checkType(pass, typeSpec, markersAccess, a.equivalentToPreferred, a.preferredToMessage)
+ 	})
+ 
+ 	return nil, nil //nolint:nilnil
+@@ -88,26 +97,26 @@ func (a *analyzer) run(pass *analysis.Pass) (any, error) {
+ // checkField validates a single struct field for marker usage.
+ // Only checks markers directly on the field, not inherited from type aliases,
+ // since inherited markers are already reported at the type level.
+-func checkField(pass *analysis.Pass, field *ast.Field, markersAccess markers.Markers, equivalentToPreferred map[string]string, qualifiedFieldName string) {
++func checkField(pass *analysis.Pass, field *ast.Field, markersAccess markers.Markers, equivalentToPreferred, preferredToMessage map[string]string, qualifiedFieldName string) {
+ 	if field == nil || len(field.Names) == 0 {
+ 		return
+ 	}
+ 
+ 	markerSet := markersAccess.FieldMarkers(field)
+ 	check(markerSet, equivalentToPreferred, func(marks []markers.Marker, preferredIdentifier string, preferredExists bool) {
+-		reportMarkers(pass, marks, preferredIdentifier, qualifiedFieldName, field.Pos(), "field", preferredExists)
++		reportMarkers(pass, marks, preferredIdentifier, preferredToMessage[preferredIdentifier], qualifiedFieldName, field.Pos(), "field", preferredExists)
+ 	})
+ }
+ 
+ // checkType validates a single type definition for marker usage.
+-func checkType(pass *analysis.Pass, typeSpec *ast.TypeSpec, markersAccess markers.Markers, equivalentToPreferred map[string]string) {
++func checkType(pass *analysis.Pass, typeSpec *ast.TypeSpec, markersAccess markers.Markers, equivalentToPreferred, preferredToMessage map[string]string) {
+ 	if typeSpec == nil {
+ 		return
+ 	}
+ 
+ 	markerSet := markersAccess.TypeMarkers(typeSpec)
+ 	check(markerSet, equivalentToPreferred, func(marks []markers.Marker, preferredIdentifier string, preferredExists bool) {
+-		reportMarkers(pass, marks, preferredIdentifier, typeSpec.Name.Name, typeSpec.Pos(), "type", preferredExists)
++		reportMarkers(pass, marks, preferredIdentifier, preferredToMessage[preferredIdentifier], typeSpec.Name.Name, typeSpec.Pos(), "type", preferredExists)
+ 	})
+ }
+ 
+@@ -193,7 +202,7 @@ func buildTextEdits(marks []markers.Marker, preferredIdentifier string, preferre
+ // reportMarkers generates a diagnostic report for markers that should be
+ // replaced. This function handles the common logic for both field and type
+ // reporting.
+-func reportMarkers(pass *analysis.Pass, marks []markers.Marker, preferredIdentifier, elementName string, pos token.Pos, elementType string, preferredExists bool) {
++func reportMarkers(pass *analysis.Pass, marks []markers.Marker, preferredIdentifier, customMessage, elementName string, pos token.Pos, elementType string, preferredExists bool) {
+ 	if len(marks) == 0 {
+ 		return
+ 	}
+@@ -206,6 +215,10 @@ func reportMarkers(pass *analysis.Pass, marks []markers.Marker, preferredIdentif
+ 	message := fmt.Sprintf("%s %s uses %s %s, should use preferred marker %q instead",
+ 		elementType, elementName, markerWord, formatMarkerList(marks), preferredIdentifier)
+ 
++	if customMessage != "" {
++		message += fmt.Sprintf(": %s", customMessage)
++	}
++
+ 	fixMessage := "remove equivalent markers"
+ 	if !preferredExists {
+ 		fixMessage = fmt.Sprintf("replace with %q", preferredIdentifier)
+diff --git a/hack/tools/vendor/sigs.k8s.io/kube-api-linter/pkg/analysis/preferredmarkers/config.go b/hack/tools/vendor/sigs.k8s.io/kube-api-linter/pkg/analysis/preferredmarkers/config.go
+index 44a092eca44..f8441aabe7f 100644
+--- a/hack/tools/vendor/sigs.k8s.io/kube-api-linter/pkg/analysis/preferredmarkers/config.go
++++ b/hack/tools/vendor/sigs.k8s.io/kube-api-linter/pkg/analysis/preferredmarkers/config.go
+@@ -39,6 +39,10 @@ type Marker struct {
+ 	// preferred identifier.
+ 	// Must have at least one entry.
+ 	EquivalentIdentifiers []EquivalentIdentifier `json:"equivalentIdentifiers"`
++
++	// message is an explanation of why the preferred identifier should be used.
++	// If not provided, a default message will be used.
++	Message string `json:"message,omitempty"`
+ }
+ 
+ // EquivalentIdentifier represents a marker identifier that should be
+diff --git a/hack/tools/vendor/sigs.k8s.io/kube-api-linter/pkg/analysis/preferredmarkers/doc.go b/hack/tools/vendor/sigs.k8s.io/kube-api-linter/pkg/analysis/preferredmarkers/doc.go
+index 810115864e0..b7109c51a75 100644
+--- a/hack/tools/vendor/sigs.k8s.io/kube-api-linter/pkg/analysis/preferredmarkers/doc.go
++++ b/hack/tools/vendor/sigs.k8s.io/kube-api-linter/pkg/analysis/preferredmarkers/doc.go
+@@ -43,6 +43,7 @@ limitations under the License.
+ *       - preferredIdentifier: "k8s:optional"
+ *         equivalentIdentifiers:
+ *           - "kubebuilder:validation:Optional"
++*         message: "Use k8s:optional to ensure consistency with upstream Kubernetes types."
+ * ```
+ *
+ * **Scenario:** Enforce using a custom marker instead of multiple equivalent markers
+diff --git a/hack/tools/vendor/sigs.k8s.io/kube-api-linter/pkg/analysis/registry/registry.go b/hack/tools/vendor/sigs.k8s.io/kube-api-linter/pkg/analysis/registry/registry.go
+index d76ca7ea6b6..cdc13447901 100644
+--- a/hack/tools/vendor/sigs.k8s.io/kube-api-linter/pkg/analysis/registry/registry.go
++++ b/hack/tools/vendor/sigs.k8s.io/kube-api-linter/pkg/analysis/registry/registry.go
+@@ -100,6 +100,12 @@ func (r *registry) AllLinters() sets.Set[string] {
+ 	r.lock.RLock()
+ 	defer r.lock.RUnlock()
+ 
++	return r.allLinters()
++}
++
++// allLinters returns the list of all known linters without acquiring the lock.
++// Callers must hold the lock.
++func (r *registry) allLinters() sets.Set[string] {
+ 	linters := sets.New[string]()
+ 
+ 	for _, initializer := range r.initializers {
+@@ -165,11 +171,24 @@ func (r *registry) validateLintersConfig(cfg config.Linters, lintersCfg config.L
+ 		}
+ 	}
+ 
+-	fieldErrors = append(fieldErrors, validateUnusedLinters(lintersCfg, validatedLinters, fieldPath)...)
++	fieldErrors = append(fieldErrors, validateUnusedLinters(lintersCfg, validatedLinters, r.allConfigurableLinters(), r.allLinters(), fieldPath)...)
+ 
+ 	return fieldErrors
+ }
+ 
++// allConfigurableLinters returns the names of all linters that are configurable.
++func (r *registry) allConfigurableLinters() sets.Set[string] {
++	configurableLinters := sets.New[string]()
++
++	for _, init := range r.initializers {
++		if _, ok := isConfigurable(init); ok {
++			configurableLinters.Insert(init.Name())
++		}
++	}
++
++	return configurableLinters
++}
++
+ // getEnabledInitializers returns the initializers that are enabled by the config.
+ // It returns a list of initializers that are enabled by the config.
+ func (r *registry) getEnabledInitializers(cfg config.Linters) []initializer.AnalyzerInitializer {
+@@ -234,18 +253,34 @@ func getConfigByName(name string, lintersCfg config.LintersConfig) (any, bool) {
+ 	return nil, false
+ }
+ 
+-// validateUnusedLinters validates that all linters in the config are enabled.
+-// It returns a list of errors for each linter that is not enabled.
+-func validateUnusedLinters(lintersCfg config.LintersConfig, validatedLinters sets.Set[string], fieldPath *field.Path) field.ErrorList {
++// validateUnusedLinters validates that all linters in the config exist as configurable linters.
++// It returns a list of errors for each linter config that does not correspond to a known configurable linter.
++// It does NOT error for disabled linters that have configuration - this allows users to keep
++// configuration for linters they have temporarily disabled.
++func validateUnusedLinters(lintersCfg config.LintersConfig, validatedLinters, configurableLinters, allLinters sets.Set[string], fieldPath *field.Path) field.ErrorList {
+ 	fieldErrors := field.ErrorList{}
+ 
+ 	for name := range lintersCfg {
+ 		// Hack to allow backwards compatibility with early configuration.
+ 		// We use to have camelCased config names, but now it is all lowercase matched on the linter name.
+ 		// TODO(@JoelSpeed): Remove the strings.ToLower in a future release with a release note about the change.
+-		if !validatedLinters.Has(strings.ToLower(name)) {
+-			fieldErrors = append(fieldErrors, field.Invalid(fieldPath.Child(name), nil, "linter is not enabled"))
++		lowerName := strings.ToLower(name)
++
++		if validatedLinters.Has(lowerName) {
++			continue
++		}
++
++		// If the linter is configurable, it's OK to have config for it even if disabled
++		if configurableLinters.Has(lowerName) {
++			continue
+ 		}
++
++		if allLinters.Has(lowerName) {
++			fieldErrors = append(fieldErrors, field.Invalid(fieldPath.Child(name), name, "linter is not configurable"))
++			continue
++		}
++
++		fieldErrors = append(fieldErrors, field.Invalid(fieldPath.Child(name), name, "unknown linter"))
+ 	}
+ 
+ 	return fieldErrors
+diff --git a/hack/tools/vendor/sigs.k8s.io/kube-api-linter/pkg/analysis/requiredfields/config.go b/hack/tools/vendor/sigs.k8s.io/kube-api-linter/pkg/analysis/requiredfields/config.go
+index a5872c57465..a8fee9bc184 100644
+--- a/hack/tools/vendor/sigs.k8s.io/kube-api-linter/pkg/analysis/requiredfields/config.go
++++ b/hack/tools/vendor/sigs.k8s.io/kube-api-linter/pkg/analysis/requiredfields/config.go
+@@ -65,7 +65,7 @@ type RequiredFieldsOmitZero struct {
+ 	// Valid values are "SuggestFix", "Warn" and "Forbid".
+ 	// When set to "SuggestFix", the linter will suggest adding the `omitzero` tag when an required field does not have it.
+ 	// When set to "Warn", the linter will emit a warning if the field does not have the `omitzero` tag.
+-	// When set to "Forbid", 'omitzero' tags wont be considered.
++	// When set to "Forbid", 'omitzero' tags will not be considered.
+ 	// Note, when set to "Forbid", and a field have the `omitzero` tag, the linter will suggest to remove the `omitzero` tag.
+ 	// Note, `omitzero` tag is supported in go version starting from go 1.24.
+ 	// Note, Configure omitzero policy to 'Forbid', if using with go version less than go 1.24.
+diff --git a/hack/tools/vendor/sigs.k8s.io/kube-api-linter/pkg/analysis/ssatags/initializer.go b/hack/tools/vendor/sigs.k8s.io/kube-api-linter/pkg/analysis/ssatags/initializer.go
+index 7f65ec4c137..4859e09df57 100644
+--- a/hack/tools/vendor/sigs.k8s.io/kube-api-linter/pkg/analysis/ssatags/initializer.go
++++ b/hack/tools/vendor/sigs.k8s.io/kube-api-linter/pkg/analysis/ssatags/initializer.go
+@@ -41,7 +41,7 @@ func Initializer() initializer.AnalyzerInitializer {
+ 	)
+ }
+ 
+-// Init returns the intialized Analyzer.
++// Init returns the initialized Analyzer.
+ func initAnalyzer(stc *SSATagsConfig) (*analysis.Analyzer, error) {
+ 	return newAnalyzer(stc), nil
+ }
+diff --git a/hack/tools/vendor/sigs.k8s.io/kube-api-linter/pkg/analysis/statusoptional/initializer.go b/hack/tools/vendor/sigs.k8s.io/kube-api-linter/pkg/analysis/statusoptional/initializer.go
+index d7dd41f2413..9b12b3a8ce7 100644
+--- a/hack/tools/vendor/sigs.k8s.io/kube-api-linter/pkg/analysis/statusoptional/initializer.go
++++ b/hack/tools/vendor/sigs.k8s.io/kube-api-linter/pkg/analysis/statusoptional/initializer.go
+@@ -35,7 +35,7 @@ func Initializer() initializer.AnalyzerInitializer {
+ 	return initializer.NewConfigurableInitializer(
+ 		name,
+ 		initAnalyzer,
+-		true,
++		false,
+ 		validateConfig,
+ 	)
+ }
+diff --git a/hack/tools/vendor/sigs.k8s.io/kube-api-linter/pkg/analysis/uniquemarkers/initializer.go b/hack/tools/vendor/sigs.k8s.io/kube-api-linter/pkg/analysis/uniquemarkers/initializer.go
+index 571a3476f5b..50566fb01fd 100644
+--- a/hack/tools/vendor/sigs.k8s.io/kube-api-linter/pkg/analysis/uniquemarkers/initializer.go
++++ b/hack/tools/vendor/sigs.k8s.io/kube-api-linter/pkg/analysis/uniquemarkers/initializer.go
+@@ -38,7 +38,7 @@ func Initializer() initializer.AnalyzerInitializer {
+ 	)
+ }
+ 
+-// Init returns the intialized Analyzer.
++// Init returns the initialized Analyzer.
+ func initAnalyzer(umc *UniqueMarkersConfig) (*analysis.Analyzer, error) {
+ 	return newAnalyzer(umc), nil
+ }
+diff --git a/hack/tools/vendor/sigs.k8s.io/kube-api-linter/pkg/analysis/utils/serialization/config.go b/hack/tools/vendor/sigs.k8s.io/kube-api-linter/pkg/analysis/utils/serialization/config.go
+index 82ce747050f..294dc43ddbd 100644
+--- a/hack/tools/vendor/sigs.k8s.io/kube-api-linter/pkg/analysis/utils/serialization/config.go
++++ b/hack/tools/vendor/sigs.k8s.io/kube-api-linter/pkg/analysis/utils/serialization/config.go
+@@ -45,7 +45,7 @@ const (
+ // OmitEmptyPolicy is the policy for omitempty.
+ // SuggestFix will suggest a fix for the field to add omitempty.
+ // Warn will warn about the field to add omitempty.
+-// Ignore will ignore the the absence of omitempty.
++// Ignore will ignore the absence of omitempty.
+ type OmitEmptyPolicy string
+ 
+ const (
+diff --git a/hack/tools/vendor/sigs.k8s.io/kube-api-linter/pkg/analysis/utils/serialization/serialization_check.go b/hack/tools/vendor/sigs.k8s.io/kube-api-linter/pkg/analysis/utils/serialization/serialization_check.go
+index c8f1ac0a996..3e0071d0709 100644
+--- a/hack/tools/vendor/sigs.k8s.io/kube-api-linter/pkg/analysis/utils/serialization/serialization_check.go
++++ b/hack/tools/vendor/sigs.k8s.io/kube-api-linter/pkg/analysis/utils/serialization/serialization_check.go
+@@ -181,10 +181,14 @@ func (s *serializationCheck) checkFieldPropertiesWithoutOmitEmpty(pass *analysis
+ 		// The field is not omitempty, and the zero value is valid, the field does not need to be a pointer.
+ 		s.handleFieldShouldNotBePointer(pass, field, fieldName, isPointer, underlying, markersAccess, "field %s does not have omitempty and allows the zero value. The field does not need to be a pointer.", qualifiedFieldName)
+ 	case !hasValidZeroValue:
+-		// The zero value would not be accepted, so the field needs to have omitempty.
+-		// Force the omitempty policy to suggest a fix. We can only get to this function when the policy is configured to Ignore.
+-		// Since we absolutely have to add the omitempty tag, we can report it as a suggestion.
+-		reportShouldAddOmitEmpty(pass, field, OmitEmptyPolicySuggestFix, qualifiedFieldName, "field %s does not allow the zero value. It must have the omitempty tag.", jsonTags)
++		if s.omitZeroPolicy == OmitZeroPolicyForbid || !isStruct {
++			// The zero value would not be accepted, so the field needs to have omitempty.
++			// Force the omitempty policy to suggest a fix. We can only get to this function when the policy is configured to Ignore.
++			// Since we absolutely have to add the omitempty tag, we can report it as a suggestion.
++			// If we are checking omitzero separately, and it's a struct, this wouldn't apply so we skip.
++			reportShouldAddOmitEmpty(pass, field, OmitEmptyPolicySuggestFix, qualifiedFieldName, "field %s does not allow the zero value. It must have the omitempty tag.", jsonTags)
++		}
++
+ 		// Once it has the omitempty tag, it will also need to be a pointer in some cases.
+ 		// Now handle it as if it had the omitempty already.
+ 		// We already handle the omitempty tag above, so force the `hasOmitEmpty` to true.
+diff --git a/hack/tools/vendor/sigs.k8s.io/kube-api-linter/pkg/analysis/utils/utils.go b/hack/tools/vendor/sigs.k8s.io/kube-api-linter/pkg/analysis/utils/utils.go
+index 59c834279db..0735040fcec 100644
+--- a/hack/tools/vendor/sigs.k8s.io/kube-api-linter/pkg/analysis/utils/utils.go
++++ b/hack/tools/vendor/sigs.k8s.io/kube-api-linter/pkg/analysis/utils/utils.go
+@@ -29,6 +29,8 @@ import (
+ 	"sigs.k8s.io/kube-api-linter/pkg/markers"
+ )
+ 
++const stringTypeName = "string"
++
+ // IsBasicType checks if the type of the given identifier is a basic type.
+ // Basic types are types like int, string, bool, etc.
+ func IsBasicType(pass *analysis.Pass, expr ast.Expr) bool {
+@@ -46,7 +48,7 @@ func IsStringType(pass *analysis.Pass, expr ast.Expr) bool {
+ 		return false
+ 	}
+ 
+-	if ident.Name == "string" {
++	if ident.Name == stringTypeName {
+ 		return true
+ 	}
+ 
+diff --git a/hack/tools/vendor/sigs.k8s.io/kube-api-linter/pkg/analysis/utils/zero_value.go b/hack/tools/vendor/sigs.k8s.io/kube-api-linter/pkg/analysis/utils/zero_value.go
+index 8fd0885bf9d..c1146217d28 100644
+--- a/hack/tools/vendor/sigs.k8s.io/kube-api-linter/pkg/analysis/utils/zero_value.go
++++ b/hack/tools/vendor/sigs.k8s.io/kube-api-linter/pkg/analysis/utils/zero_value.go
+@@ -103,7 +103,7 @@ func isStructZeroValueValid(pass *analysis.Pass, field *ast.Field, structType *a
+ 
+ 	// Check if this struct should be validated as a string (Type=string marker).
+ 	// This handles structs with custom marshalling that serialize as strings.
+-	if GetTypeMarkerValue(pass, field, markersAccess) == "string" {
++	if GetTypeMarkerValue(pass, field, markersAccess) == stringTypeName {
+ 		// Use string validation logic instead of struct validation logic.
+ 		// This ensures that string-specific validation markers (MinLength, MaxLength, Pattern)
+ 		// are properly evaluated for structs that marshal as strings.
+@@ -456,7 +456,7 @@ func isIntegerIdent(ident *ast.Ident) bool {
+ 
+ // isStringIdent checks if the identifier is a string type.
+ func isStringIdent(ident *ast.Ident) bool {
+-	return ident.Name == "string"
++	return ident.Name == stringTypeName
+ }
+ 
+ // isBoolIdent checks if the identifier is a boolean type.
+diff --git a/hack/tools/vendor/sigs.k8s.io/kube-api-linter/pkg/markers/markers.go b/hack/tools/vendor/sigs.k8s.io/kube-api-linter/pkg/markers/markers.go
+index 300303c6697..f93bd7303f8 100644
+--- a/hack/tools/vendor/sigs.k8s.io/kube-api-linter/pkg/markers/markers.go
++++ b/hack/tools/vendor/sigs.k8s.io/kube-api-linter/pkg/markers/markers.go
+@@ -36,6 +36,9 @@ const (
+ 	// KubebuilderStatusSubresourceMarker is the marker that indicates that the CRD generated for a struct should include the /status subresource.
+ 	KubebuilderStatusSubresourceMarker = "kubebuilder:subresource:status"
+ 
++	// KubebuilderAtLeastOneOfMarker is the marker that indicates that a type has a CEL validation in kubebuilder enforcing that at least one field is set.
++	KubebuilderAtLeastOneOfMarker = "kubebuilder:validation:AtLeastOneOf"
++
+ 	// KubebuilderEnumMarker is the marker that indicates that a field has an enum in kubebuilder.
+ 	KubebuilderEnumMarker = "kubebuilder:validation:Enum"
+ 
+@@ -93,7 +96,7 @@ const (
+ 	// KubebuilderRequiredMarker is the marker that indicates that a field is required in kubebuilder.
+ 	KubebuilderRequiredMarker = "kubebuilder:validation:Required"
+ 
+-	// KubebuilderExactlyOneOf is the marker that indicates that a field has an exactly one of in kubebuilder.
++	// KubebuilderExactlyOneOf is the marker that indicates that a type has a CEL validation in kubebuilder enforcing that exactly one field is set.
+ 	KubebuilderExactlyOneOf = "kubebuilder:validation:ExactlyOneOf"
+ 
+ 	// KubebuilderItemsMaxLengthMarker is the marker that indicates that a field has a maximum length in kubebuilder.
+@@ -205,4 +208,7 @@ const (
+ 
+ 	// K8sListMapKeyMarker is the marker that indicates that a field is a map in k8s declarative validation.
+ 	K8sListMapKeyMarker = "k8s:listMapKey"
++
++	// K8sDefaultMarker is the marker that indicates the default value for a field in k8s declarative validation.
++	K8sDefaultMarker = "k8s:default"
+ )
+diff --git a/hack/tools/vendor/sigs.k8s.io/kube-api-linter/pkg/plugin/base/base.go b/hack/tools/vendor/sigs.k8s.io/kube-api-linter/pkg/plugin/base/base.go
+index 9fa1b87bf07..fbce4aa466c 100644
+--- a/hack/tools/vendor/sigs.k8s.io/kube-api-linter/pkg/plugin/base/base.go
++++ b/hack/tools/vendor/sigs.k8s.io/kube-api-linter/pkg/plugin/base/base.go
+@@ -43,7 +43,7 @@ func New(settings any) (register.LinterPlugin, error) {
+ // GolangCIPlugin constructs a new plugin for the golangci-lint
+ // plugin pattern.
+ // This allows golangci-lint to build a version of itself, containing
+-// all of the anaylzers included in KAL.
++// all of the analyzers included in KAL.
+ type GolangCIPlugin struct {
+ 	config config.GolangCIConfig
+ }
+diff --git a/hack/tools/vendor/sigs.k8s.io/kube-api-linter/pkg/registration/doc.go b/hack/tools/vendor/sigs.k8s.io/kube-api-linter/pkg/registration/doc.go
+index c9070c7c38b..cb8c5e4e20c 100644
+--- a/hack/tools/vendor/sigs.k8s.io/kube-api-linter/pkg/registration/doc.go
++++ b/hack/tools/vendor/sigs.k8s.io/kube-api-linter/pkg/registration/doc.go
+@@ -13,6 +13,7 @@ WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ See the License for the specific language governing permissions and
+ limitations under the License.
+ */
++
+ /*
+ This package is used as an internal registration of linters.
+ 
+@@ -28,12 +29,15 @@ import (
+ 	_ "sigs.k8s.io/kube-api-linter/pkg/analysis/conditions"
+ 	_ "sigs.k8s.io/kube-api-linter/pkg/analysis/conflictingmarkers"
+ 	_ "sigs.k8s.io/kube-api-linter/pkg/analysis/defaultorrequired"
++	_ "sigs.k8s.io/kube-api-linter/pkg/analysis/defaults"
+ 	_ "sigs.k8s.io/kube-api-linter/pkg/analysis/dependenttags"
+ 	_ "sigs.k8s.io/kube-api-linter/pkg/analysis/duplicatemarkers"
+ 	_ "sigs.k8s.io/kube-api-linter/pkg/analysis/forbiddenmarkers"
+ 	_ "sigs.k8s.io/kube-api-linter/pkg/analysis/integers"
+ 	_ "sigs.k8s.io/kube-api-linter/pkg/analysis/jsontags"
+ 	_ "sigs.k8s.io/kube-api-linter/pkg/analysis/maxlength"
++	_ "sigs.k8s.io/kube-api-linter/pkg/analysis/minlength"
++	_ "sigs.k8s.io/kube-api-linter/pkg/analysis/namingconventions"
+ 	_ "sigs.k8s.io/kube-api-linter/pkg/analysis/nobools"
+ 	_ "sigs.k8s.io/kube-api-linter/pkg/analysis/nodurations"
+ 	_ "sigs.k8s.io/kube-api-linter/pkg/analysis/nofloats"

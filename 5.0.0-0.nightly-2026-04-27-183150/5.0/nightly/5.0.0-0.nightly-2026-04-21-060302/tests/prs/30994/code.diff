@@ -1,0 +1,47 @@
+diff --git a/pkg/monitor/backenddisruption/disruption_backend_sampler.go b/pkg/monitor/backenddisruption/disruption_backend_sampler.go
+index a8200b040ec1..f66279a40af9 100644
+--- a/pkg/monitor/backenddisruption/disruption_backend_sampler.go
++++ b/pkg/monitor/backenddisruption/disruption_backend_sampler.go
+@@ -231,6 +231,12 @@ func (b *BackendSampler) WithSamplerHooks(samplerHooks []SamplerHook) *BackendSa
+ 	return b
+ }
+ 
++// WithTimeout sets a custom timeout for HTTP requests including DNS resolution and connection establishment
++func (b *BackendSampler) WithTimeout(timeout time.Duration) *BackendSampler {
++	b.timeout = &timeout
++	return b
++}
++
+ // bodyMatches checks the body content and returns an error if it doesn't match the expected.
+ func (b *BackendSampler) bodyMatches(body []byte) error {
+ 	switch {
+diff --git a/pkg/monitortests/network/disruptionserviceloadbalancer/monitortest.go b/pkg/monitortests/network/disruptionserviceloadbalancer/monitortest.go
+index c6cad8e760c5..1d64fa1ea802 100644
+--- a/pkg/monitortests/network/disruptionserviceloadbalancer/monitortest.go
++++ b/pkg/monitortests/network/disruptionserviceloadbalancer/monitortest.go
+@@ -256,7 +256,11 @@ func (w *availability) PrepareCollection(ctx context.Context, adminRESTConfig *r
+ 
+ 	// Hit it once before considering ourselves ready
+ 	fmt.Fprintf(os.Stderr, "hitting pods through the service's LoadBalancer\n")
++	// Use longer timeout for platforms (e.g. EUSC) known to experience slow DNS propagation.
+ 	timeout := 10 * time.Minute
++	if infra.Status.PlatformStatus.AWS != nil && strings.HasPrefix(infra.Status.PlatformStatus.AWS.Region, "eusc-") {
++		timeout = 20 * time.Minute
++	}
+ 	// require thirty seconds of passing requests to continue (in case the SLB becomes available and then degrades)
+ 	// TODO this seems weird to @deads2k, why is status not trustworthy
+ 	baseURL := fmt.Sprintf("http://%s", net.JoinHostPort(tcpIngressIP, strconv.Itoa(svcPort)))
+@@ -279,6 +283,13 @@ func (w *availability) PrepareCollection(ctx context.Context, adminRESTConfig *r
+ 		monitorapi.ReusedConnectionType).
+ 		WithExpectedBody("hello")
+ 
++	// Use longer timeout for platforms (e.g. EUSC) known to experience slow DNS propagation.
++	if infra.Status.PlatformStatus.AWS != nil && strings.HasPrefix(infra.Status.PlatformStatus.AWS.Region, "eusc-") {
++		connectionTimeout := 120 * time.Second
++		newConnectionDisruptionSampler.WithTimeout(connectionTimeout)
++		reusedConnectionDisruptionSampler.WithTimeout(connectionTimeout)
++	}
++
+ 	w.disruptionChecker = disruptionlibrary.NewAvailabilityInvariant(
+ 		newConnectionTestName, reusedConnectionTestName,
+ 		newConnectionDisruptionSampler, reusedConnectionDisruptionSampler,

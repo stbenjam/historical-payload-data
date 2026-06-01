@@ -1,0 +1,393 @@
+diff --git a/pkg/dns/aws/dns.go b/pkg/dns/aws/dns.go
+index 4fb66506c4..c9797b421d 100644
+--- a/pkg/dns/aws/dns.go
++++ b/pkg/dns/aws/dns.go
+@@ -11,6 +11,7 @@ import (
+ 	iov1 "github.com/openshift/api/operatoringress/v1"
+ 	"github.com/openshift/cluster-ingress-operator/pkg/dns"
+ 	logf "github.com/openshift/cluster-ingress-operator/pkg/log"
++	awsutil "github.com/openshift/cluster-ingress-operator/pkg/util/aws"
+ 
+ 	"github.com/aws/aws-sdk-go/aws"
+ 	"github.com/aws/aws-sdk-go/aws/arn"
+@@ -109,6 +110,11 @@ type Config struct {
+ 	// Client is a Kubernetes client, which the provider uses to annotate
+ 	// DNSRecord CRs.
+ 	Client client.Client
++
++	// IPFamily is the cluster's IP family configuration from the
++	// Infrastructure CR. When dual-stack, the provider creates both
++	// Alias A and Alias AAAA Route53 records.
++	IPFamily configv1.IPFamilyType
+ }
+ 
+ // ServiceEndpoint stores the configuration of a custom url to
+@@ -619,22 +625,34 @@ func (m *Provider) updateRecord(domain, zoneID, target, targetHostedZoneID, acti
+ 			},
+ 		}
+ 	} else {
+-		input.ChangeBatch = &route53.ChangeBatch{
+-			Changes: []*route53.Change{
+-				{
+-					Action: aws.String(action),
+-					ResourceRecordSet: &route53.ResourceRecordSet{
+-						Name: aws.String(domain),
+-						Type: aws.String(route53.RRTypeA),
+-						AliasTarget: &route53.AliasTarget{
+-							HostedZoneId:         aws.String(targetHostedZoneID),
+-							DNSName:              aws.String(target),
+-							EvaluateTargetHealth: aws.Bool(false),
+-						},
+-					},
++		aliasTarget := &route53.AliasTarget{
++			HostedZoneId:         aws.String(targetHostedZoneID),
++			DNSName:              aws.String(target),
++			EvaluateTargetHealth: aws.Bool(false),
++		}
++		changes := []*route53.Change{
++			{
++				Action: aws.String(action),
++				ResourceRecordSet: &route53.ResourceRecordSet{
++					Name:        aws.String(domain),
++					Type:        aws.String(route53.RRTypeA),
++					AliasTarget: aliasTarget,
+ 				},
+ 			},
+ 		}
++		if awsutil.IsDualStack(m.config.IPFamily) {
++			changes = append(changes, &route53.Change{
++				Action: aws.String(action),
++				ResourceRecordSet: &route53.ResourceRecordSet{
++					Name:        aws.String(domain),
++					Type:        aws.String(route53.RRTypeAaaa),
++					AliasTarget: aliasTarget,
++				},
++			})
++		}
++		input.ChangeBatch = &route53.ChangeBatch{
++			Changes: changes,
++		}
+ 	}
+ 	resp, err := m.route53.ChangeResourceRecordSets(&input)
+ 	if err != nil {
+diff --git a/pkg/operator/controller/dns/controller.go b/pkg/operator/controller/dns/controller.go
+index 245fd2dcbc..14b32fb2a2 100644
+--- a/pkg/operator/controller/dns/controller.go
++++ b/pkg/operator/controller/dns/controller.go
+@@ -594,8 +594,9 @@ func (r *reconciler) createDNSProvider(dnsConfig *configv1.DNS, platformStatus *
+ 	switch platformStatus.Type {
+ 	case configv1.AWSPlatformType:
+ 		cfg := awsdns.Config{
+-			Region: platformStatus.AWS.Region,
+-			Client: r.client,
++			Region:   platformStatus.AWS.Region,
++			IPFamily: platformStatus.AWS.IPFamily,
++			Client:   r.client,
+ 		}
+ 
+ 		sharedCredsFile, err := awsutil.SharedCredentialsFileFromSecret(creds)
+diff --git a/pkg/operator/controller/ingress/load_balancer_service.go b/pkg/operator/controller/ingress/load_balancer_service.go
+index fd6169f0d0..605a90fd49 100644
+--- a/pkg/operator/controller/ingress/load_balancer_service.go
++++ b/pkg/operator/controller/ingress/load_balancer_service.go
+@@ -15,6 +15,7 @@ import (
+ 
+ 	"github.com/openshift/cluster-ingress-operator/pkg/manifests"
+ 	"github.com/openshift/cluster-ingress-operator/pkg/operator/controller"
++	awsutil "github.com/openshift/cluster-ingress-operator/pkg/util/aws"
+ 	corev1 "k8s.io/api/core/v1"
+ 
+ 	configv1 "github.com/openshift/api/config/v1"
+@@ -496,6 +497,35 @@ func desiredLoadBalancerService(ci *operatorv1.IngressController, deploymentRef
+ 				}
+ 			}
+ 
++			// Set ipFamilies and ipFamilyPolicy for dual-stack clusters.
++			if platform.AWS != nil && awsutil.IsDualStack(platform.AWS.IPFamily) {
++				if lbStatus != nil && lbStatus.ProviderParameters != nil && lbStatus.ProviderParameters.AWS != nil {
++					switch lbStatus.ProviderParameters.AWS.Type {
++					case operatorv1.AWSNetworkLoadBalancer:
++						// NLB supports dual-stack natively.
++						ipFamilyPolicy := corev1.IPFamilyPolicyRequireDualStack
++						service.Spec.IPFamilyPolicy = &ipFamilyPolicy
++						if platform.AWS.IPFamily == configv1.DualStackIPv4Primary {
++							service.Spec.IPFamilies = []corev1.IPFamily{corev1.IPv4Protocol, corev1.IPv6Protocol}
++						} else {
++							service.Spec.IPFamilies = []corev1.IPFamily{corev1.IPv6Protocol, corev1.IPv4Protocol}
++						}
++					case operatorv1.AWSClassicLoadBalancer:
++						// CLB does not support dual-stack and only forwards
++						// IPv4 traffic. On DualStackIPv4Primary clusters,
++						// the service defaults to SingleStack/IPv4, which
++						// is correct. However on DualStackIPv6Primary, the
++						// default would be SingleStack/IPv6, causing OVN to
++						// refuse IPv4 traffic on the service's NodePort.
++						// Explicitly set SingleStack/IPv4 to ensure CLB
++						// traffic is always accepted.
++						ipFamilyPolicy := corev1.IPFamilyPolicySingleStack
++						service.Spec.IPFamilyPolicy = &ipFamilyPolicy
++						service.Spec.IPFamilies = []corev1.IPFamily{corev1.IPv4Protocol}
++					}
++				}
++			}
++
+ 			// Set the load balancer for AWS to be as aggressive as Azure (2 fail @ 5s interval, 2 healthy)
+ 			service.Annotations[awsLBHealthCheckTimeoutAnnotation] = awsLBHealthCheckTimeoutDefault
+ 			service.Annotations[awsLBHealthCheckUnhealthyThresholdAnnotation] = awsLBHealthCheckUnhealthyThresholdDefault
+@@ -715,6 +745,27 @@ func loadBalancerServiceChanged(current, expected *corev1.Service) (bool, *corev
+ 		}
+ 	}
+ 
++	// Reconcile ipFamilies and ipFamilyPolicy when the desired service
++	// specifies them (i.e. the cluster is dual-stack).
++	if len(expected.Spec.IPFamilies) != 0 {
++		if !reflect.DeepEqual(current.Spec.IPFamilies, expected.Spec.IPFamilies) {
++			if !changed {
++				changed = true
++				updated = current.DeepCopy()
++			}
++			updated.Spec.IPFamilies = expected.Spec.IPFamilies
++		}
++	}
++	if expected.Spec.IPFamilyPolicy != nil {
++		if current.Spec.IPFamilyPolicy == nil || *current.Spec.IPFamilyPolicy != *expected.Spec.IPFamilyPolicy {
++			if !changed {
++				changed = true
++				updated = current.DeepCopy()
++			}
++			updated.Spec.IPFamilyPolicy = expected.Spec.IPFamilyPolicy
++		}
++	}
++
+ 	return changed, updated
+ }
+ 
+@@ -858,6 +909,10 @@ func loadBalancerServiceIsProgressing(ic *operatorv1.IngressController, service
+ 		if wantLBType != haveLBType {
+ 			patchSpec := fmt.Sprintf(`{"spec":{"endpointPublishingStrategy":{"type":"LoadBalancerService","loadBalancer":{"providerParameters":{"type":"AWS","aws":{"type":"%s"}}}}}}`, haveLBType)
+ 			err := createEffectuationMessage("loadBalancer.providerParameters.aws.type", string(haveLBType), string(wantLBType), patchSpec, ic, service)
++			// Add a note to the effectuation message about CLB not supporting dual-stack.
++			if wantLBType == operatorv1.AWSClassicLoadBalancer && platform.AWS != nil && awsutil.IsDualStack(platform.AWS.IPFamily) {
++				err = fmt.Errorf("%w Classic Load Balancers do not support dual-stack. The IngressController %q will use IPv4-only despite that the cluster is configured as %q. Use an NLB type to support dual-stack networking.", err, ic.Name, platform.AWS.IPFamily)
++			}
+ 			errs = append(errs, err)
+ 		}
+ 
+diff --git a/pkg/operator/controller/ingress/load_balancer_service_test.go b/pkg/operator/controller/ingress/load_balancer_service_test.go
+index 2c2c60a17a..8cf23da6de 100644
+--- a/pkg/operator/controller/ingress/load_balancer_service_test.go
++++ b/pkg/operator/controller/ingress/load_balancer_service_test.go
+@@ -893,6 +893,176 @@ func TestDesiredLoadBalancerServiceAWSIdleTimeout(t *testing.T) {
+ 	}
+ }
+ 
++// TestDesiredLoadBalancerServiceDualStack verifies that
++// desiredLoadBalancerService sets the expected ipFamilies and ipFamilyPolicy
++// based on the infrastructure platform status ipFamily field.
++func TestDesiredLoadBalancerServiceDualStack(t *testing.T) {
++	testCases := []struct {
++		name                   string
++		strategyStatus         *operatorv1.EndpointPublishingStrategy
++		platformStatus         *configv1.PlatformStatus
++		expectedIPFamilies     []corev1.IPFamily
++		expectedIPFamilyPolicy *corev1.IPFamilyPolicyType
++	}{
++		{
++			name:           "NLB with DualStackIPv4Primary sets IPv4-primary dual-stack",
++			strategyStatus: nlbStrategy(operatorv1.ExternalLoadBalancer),
++			platformStatus: &configv1.PlatformStatus{
++				Type: configv1.AWSPlatformType,
++				AWS: &configv1.AWSPlatformStatus{
++					IPFamily: configv1.DualStackIPv4Primary,
++				},
++			},
++			expectedIPFamilies:     []corev1.IPFamily{corev1.IPv4Protocol, corev1.IPv6Protocol},
++			expectedIPFamilyPolicy: ipFamilyPolicyPtr(corev1.IPFamilyPolicyRequireDualStack),
++		},
++		{
++			name:           "NLB with DualStackIPv6Primary sets IPv6-primary dual-stack",
++			strategyStatus: nlbStrategy(operatorv1.ExternalLoadBalancer),
++			platformStatus: &configv1.PlatformStatus{
++				Type: configv1.AWSPlatformType,
++				AWS: &configv1.AWSPlatformStatus{
++					IPFamily: configv1.DualStackIPv6Primary,
++				},
++			},
++			expectedIPFamilies:     []corev1.IPFamily{corev1.IPv6Protocol, corev1.IPv4Protocol},
++			expectedIPFamilyPolicy: ipFamilyPolicyPtr(corev1.IPFamilyPolicyRequireDualStack),
++		},
++		{
++			name:           "NLB with IPv4 does not set ipFamilies",
++			strategyStatus: nlbStrategy(operatorv1.ExternalLoadBalancer),
++			platformStatus: &configv1.PlatformStatus{
++				Type: configv1.AWSPlatformType,
++				AWS: &configv1.AWSPlatformStatus{
++					IPFamily: configv1.IPv4,
++				},
++			},
++			expectedIPFamilies:     nil,
++			expectedIPFamilyPolicy: nil,
++		},
++		{
++			name:           "NLB with empty ipFamily does not set ipFamilies",
++			strategyStatus: nlbStrategy(operatorv1.ExternalLoadBalancer),
++			platformStatus: &configv1.PlatformStatus{
++				Type: configv1.AWSPlatformType,
++				AWS:  &configv1.AWSPlatformStatus{},
++			},
++			expectedIPFamilies:     nil,
++			expectedIPFamilyPolicy: nil,
++		},
++		{
++			name:           "NLB without AWS platform status does not set ipFamilies",
++			strategyStatus: nlbStrategy(operatorv1.ExternalLoadBalancer),
++			platformStatus: &configv1.PlatformStatus{
++				Type: configv1.AWSPlatformType,
++			},
++			expectedIPFamilies:     nil,
++			expectedIPFamilyPolicy: nil,
++		},
++		{
++			name:           "CLB with DualStackIPv4Primary sets SingleStack/IPv4",
++			strategyStatus: clbStrategy(operatorv1.ExternalLoadBalancer),
++			platformStatus: &configv1.PlatformStatus{
++				Type: configv1.AWSPlatformType,
++				AWS: &configv1.AWSPlatformStatus{
++					IPFamily: configv1.DualStackIPv4Primary,
++				},
++			},
++			expectedIPFamilies:     []corev1.IPFamily{corev1.IPv4Protocol},
++			expectedIPFamilyPolicy: ipFamilyPolicyPtr(corev1.IPFamilyPolicySingleStack),
++		},
++		{
++			name:           "CLB with DualStackIPv6Primary sets SingleStack/IPv4",
++			strategyStatus: clbStrategy(operatorv1.ExternalLoadBalancer),
++			platformStatus: &configv1.PlatformStatus{
++				Type: configv1.AWSPlatformType,
++				AWS: &configv1.AWSPlatformStatus{
++					IPFamily: configv1.DualStackIPv6Primary,
++				},
++			},
++			expectedIPFamilies:     []corev1.IPFamily{corev1.IPv4Protocol},
++			expectedIPFamilyPolicy: ipFamilyPolicyPtr(corev1.IPFamilyPolicySingleStack),
++		},
++		{
++			name:           "NLB with DualStackIPv4Primary on non-AWS platform does not set ipFamilies",
++			strategyStatus: nlbStrategy(operatorv1.ExternalLoadBalancer),
++			platformStatus: &configv1.PlatformStatus{
++				Type: configv1.GCPPlatformType,
++				AWS: &configv1.AWSPlatformStatus{
++					IPFamily: configv1.DualStackIPv6Primary,
++				},
++			},
++			expectedIPFamilies:     nil,
++			expectedIPFamilyPolicy: nil,
++		},
++	}
++
++	for _, tc := range testCases {
++		t.Run(tc.name, func(t *testing.T) {
++			ic := &operatorv1.IngressController{
++				ObjectMeta: metav1.ObjectMeta{Name: "default"},
++				Status: operatorv1.IngressControllerStatus{
++					EndpointPublishingStrategy: tc.strategyStatus,
++				},
++			}
++			trueVar := true
++			deploymentRef := metav1.OwnerReference{
++				APIVersion: "apps/v1",
++				Kind:       "Deployment",
++				Name:       "router-default",
++				UID:        "1",
++				Controller: &trueVar,
++			}
++			haveSvc, svc, err := desiredLoadBalancerService(ic, deploymentRef, tc.platformStatus, false)
++			if err != nil {
++				t.Fatal(err)
++			}
++			if !haveSvc {
++				t.Fatal("desiredLoadBalancerService didn't return a service")
++			}
++			assert.Equal(t, tc.expectedIPFamilies, svc.Spec.IPFamilies)
++			assert.Equal(t, tc.expectedIPFamilyPolicy, svc.Spec.IPFamilyPolicy)
++		})
++	}
++}
++
++// nlbStrategy returns an EndpointPublishingStrategy for an AWS NLB.
++func nlbStrategy(scope operatorv1.LoadBalancerScope) *operatorv1.EndpointPublishingStrategy {
++	return &operatorv1.EndpointPublishingStrategy{
++		Type: operatorv1.LoadBalancerServiceStrategyType,
++		LoadBalancer: &operatorv1.LoadBalancerStrategy{
++			Scope: scope,
++			ProviderParameters: &operatorv1.ProviderLoadBalancerParameters{
++				Type: operatorv1.AWSLoadBalancerProvider,
++				AWS: &operatorv1.AWSLoadBalancerParameters{
++					Type: operatorv1.AWSNetworkLoadBalancer,
++				},
++			},
++		},
++	}
++}
++
++// clbStrategy returns an EndpointPublishingStrategy for an AWS CLB.
++func clbStrategy(scope operatorv1.LoadBalancerScope) *operatorv1.EndpointPublishingStrategy {
++	return &operatorv1.EndpointPublishingStrategy{
++		Type: operatorv1.LoadBalancerServiceStrategyType,
++		LoadBalancer: &operatorv1.LoadBalancerStrategy{
++			Scope: scope,
++			ProviderParameters: &operatorv1.ProviderLoadBalancerParameters{
++				Type: operatorv1.AWSLoadBalancerProvider,
++				AWS: &operatorv1.AWSLoadBalancerParameters{
++					Type: operatorv1.AWSClassicLoadBalancer,
++				},
++			},
++		},
++	}
++}
++
++// ipFamilyPolicyPtr returns a pointer to the given IPFamilyPolicyType.
++func ipFamilyPolicyPtr(p corev1.IPFamilyPolicyType) *corev1.IPFamilyPolicyType {
++	return &p
++}
++
+ // Test_shouldUseLocalWithFallback verifies that shouldUseLocalWithFallback
+ // behaves as expected.
+ func Test_shouldUseLocalWithFallback(t *testing.T) {
+@@ -1148,6 +1318,21 @@ func Test_loadBalancerServiceChanged(t *testing.T) {
+ 			},
+ 			expect: false,
+ 		},
++		{
++			description: "if .spec.ipFamilies is added",
++			mutate: func(svc *corev1.Service) {
++				svc.Spec.IPFamilies = []corev1.IPFamily{corev1.IPv4Protocol, corev1.IPv6Protocol}
++			},
++			expect: true,
++		},
++		{
++			description: "if .spec.ipFamilyPolicy is added",
++			mutate: func(svc *corev1.Service) {
++				policy := corev1.IPFamilyPolicyRequireDualStack
++				svc.Spec.IPFamilyPolicy = &policy
++			},
++			expect: true,
++		},
+ 	}
+ 
+ 	for _, tc := range testCases {
+diff --git a/pkg/util/aws/dualstack.go b/pkg/util/aws/dualstack.go
+new file mode 100644
+index 0000000000..acbc3ce0db
+--- /dev/null
++++ b/pkg/util/aws/dualstack.go
+@@ -0,0 +1,9 @@
++package aws
++
++import configv1 "github.com/openshift/api/config/v1"
++
++// IsDualStack returns true if the given IPFamilyType indicates a dual-stack
++// configuration.
++func IsDualStack(ipFamily configv1.IPFamilyType) bool {
++	return ipFamily == configv1.DualStackIPv4Primary || ipFamily == configv1.DualStackIPv6Primary
++}

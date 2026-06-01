@@ -1,0 +1,127 @@
+diff --git a/pkg/asset/installconfig/aws/permissions.go b/pkg/asset/installconfig/aws/permissions.go
+index 6970df7da31..a26b21aee4e 100644
+--- a/pkg/asset/installconfig/aws/permissions.go
++++ b/pkg/asset/installconfig/aws/permissions.go
+@@ -29,9 +29,15 @@ const (
+ 	// PermissionCreateNetworking is an additional set of permissions required when the installer creates networking resources.
+ 	PermissionCreateNetworking PermissionGroup = "create-networking"
+ 
++	// PermissionCreateDualstackNetworking is an additional set of permissions required when the installer creates dualstack networking resources.
++	PermissionCreateDualstackNetworking PermissionGroup = "create-dualstack-networking"
++
+ 	// PermissionDeleteNetworking is a set of permissions required when the installer destroys networking resources.
+ 	PermissionDeleteNetworking PermissionGroup = "delete-networking"
+ 
++	// PermissionDeleteDualstackNetworking is an additional set of permissions required when the installer destroys dualstack networking resources.
++	PermissionDeleteDualstackNetworking PermissionGroup = "delete-dualstack-networking"
++
+ 	// PermissionDeleteSharedNetworking is a set of permissions required when the installer destroys resources from a shared-network cluster.
+ 	PermissionDeleteSharedNetworking PermissionGroup = "delete-shared-networking"
+ 
+@@ -258,6 +264,11 @@ var permissions = map[PermissionGroup][]string{
+ 		// Needed by CAPA to update outdated routes
+ 		"ec2:ReplaceRoute",
+ 	},
++	// Permissions required for creating dualstack network resources
++	PermissionCreateDualstackNetworking: {
++		"ec2:DescribeEgressOnlyInternetGateways",
++		"ec2:CreateEgressOnlyInternetGateway",
++	},
+ 	// Permissions required for deleting network resources
+ 	PermissionDeleteNetworking: {
+ 		"ec2:DeleteDhcpOptions",
+@@ -273,6 +284,10 @@ var permissions = map[PermissionGroup][]string{
+ 		"ec2:ReleaseAddress",
+ 		"ec2:ReplaceRouteTableAssociation",
+ 	},
++	// Permissions required for deleting dualstack network resources
++	PermissionDeleteDualstackNetworking: {
++		"ec2:DeleteEgressOnlyInternetGateway",
++	},
+ 	// Permissions required for deleting a cluster with shared network resources
+ 	PermissionDeleteSharedNetworking: {
+ 		"tag:UntagResources",
+@@ -491,6 +506,10 @@ func RequiredPermissionGroups(ic *types.InstallConfig) []PermissionGroup {
+ 
+ 	if !usingExistingVPC {
+ 		permissionGroups = append(permissionGroups, PermissionCreateNetworking)
++
++		if ic.AWS.IPFamily.DualStackEnabled() {
++			permissionGroups = append(permissionGroups, PermissionCreateDualstackNetworking)
++		}
+ 	}
+ 
+ 	if !usingExistingPrivateZone {
+@@ -514,6 +533,9 @@ func RequiredPermissionGroups(ic *types.InstallConfig) []PermissionGroup {
+ 			permissionGroups = append(permissionGroups, PermissionDeleteSharedNetworking)
+ 		} else {
+ 			permissionGroups = append(permissionGroups, PermissionDeleteNetworking)
++			if ic.AWS.IPFamily.DualStackEnabled() {
++				permissionGroups = append(permissionGroups, PermissionDeleteDualstackNetworking)
++			}
+ 		}
+ 		if !usingExistingPrivateZone {
+ 			permissionGroups = append(permissionGroups, PermissionDeleteHostedZone)
+diff --git a/pkg/asset/installconfig/aws/permissions_test.go b/pkg/asset/installconfig/aws/permissions_test.go
+index 6a5baaab011..ba71b16ac5f 100644
+--- a/pkg/asset/installconfig/aws/permissions_test.go
++++ b/pkg/asset/installconfig/aws/permissions_test.go
+@@ -10,6 +10,7 @@ import (
+ 	"github.com/openshift/installer/pkg/ipnet"
+ 	"github.com/openshift/installer/pkg/types"
+ 	"github.com/openshift/installer/pkg/types/aws"
++	"github.com/openshift/installer/pkg/types/network"
+ )
+ 
+ func basicInstallConfig() types.InstallConfig {
+@@ -992,3 +993,50 @@ func TestIncludesEdgeDefaultInstance(t *testing.T) {
+ 		})
+ 	})
+ }
++
++func TestDualstackNetworkingPermissions(t *testing.T) {
++	t.Run("Should include", func(t *testing.T) {
++		t.Run("create and delete dualstack permissions when dualstack IPv4 primary enabled", func(t *testing.T) {
++			ic := validBYOSubnetsInstallConfig()
++			ic.AWS.VPC.Subnets = nil
++			ic.AWS.IPFamily = network.DualStackIPv4Primary
++			requiredPerms := RequiredPermissionGroups(ic)
++			assert.Contains(t, requiredPerms, PermissionCreateDualstackNetworking)
++			assert.Contains(t, requiredPerms, PermissionDeleteDualstackNetworking)
++		})
++		t.Run("create and delete dualstack permissions when dualstack IPv6 primary enabled", func(t *testing.T) {
++			ic := validBYOSubnetsInstallConfig()
++			ic.AWS.VPC.Subnets = nil
++			ic.AWS.IPFamily = network.DualStackIPv6Primary
++			requiredPerms := RequiredPermissionGroups(ic)
++			assert.Contains(t, requiredPerms, PermissionCreateDualstackNetworking)
++			assert.Contains(t, requiredPerms, PermissionDeleteDualstackNetworking)
++		})
++	})
++
++	t.Run("Should not include", func(t *testing.T) {
++		t.Run("dualstack permissions when VPC specified", func(t *testing.T) {
++			ic := validBYOSubnetsInstallConfig()
++			ic.AWS.IPFamily = network.DualStackIPv4Primary
++			requiredPerms := RequiredPermissionGroups(ic)
++			assert.NotContains(t, requiredPerms, PermissionCreateDualstackNetworking)
++			assert.NotContains(t, requiredPerms, PermissionDeleteDualstackNetworking)
++		})
++		t.Run("dualstack permissions when IPv4 only", func(t *testing.T) {
++			ic := validBYOSubnetsInstallConfig()
++			ic.AWS.VPC.Subnets = nil
++			ic.AWS.IPFamily = network.IPv4
++			requiredPerms := RequiredPermissionGroups(ic)
++			assert.NotContains(t, requiredPerms, PermissionCreateDualstackNetworking)
++			assert.NotContains(t, requiredPerms, PermissionDeleteDualstackNetworking)
++		})
++		t.Run("dualstack delete permissions on secret regions", func(t *testing.T) {
++			ic := validBYOSubnetsInstallConfig()
++			ic.AWS.VPC.Subnets = nil
++			ic.AWS.Region = "us-iso-east-1"
++			ic.AWS.IPFamily = network.DualStackIPv4Primary
++			requiredPerms := RequiredPermissionGroups(ic)
++			assert.NotContains(t, requiredPerms, PermissionDeleteDualstackNetworking)
++		})
++	})
++}

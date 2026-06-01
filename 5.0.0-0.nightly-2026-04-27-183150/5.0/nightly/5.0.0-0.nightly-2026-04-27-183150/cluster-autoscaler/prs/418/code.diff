@@ -1,0 +1,185 @@
+diff --git a/cluster-autoscaler/cloudprovider/clusterapi/clusterapi_controller.go b/cluster-autoscaler/cloudprovider/clusterapi/clusterapi_controller.go
+index f79e3853b51e..c2e176fab4c4 100644
+--- a/cluster-autoscaler/cloudprovider/clusterapi/clusterapi_controller.go
++++ b/cluster-autoscaler/cloudprovider/clusterapi/clusterapi_controller.go
+@@ -611,6 +611,36 @@ func getAPIGroupPreferredVersion(client discovery.DiscoveryInterface, APIGroup s
+ 	return "", fmt.Errorf("failed to find API group %q", APIGroup)
+ }
+ 
++// getKindPreferredVersion returns the first version in apiGroup that serves the given Kind.
++// In CAPI v1beta2, infrastructureRef only carries apiGroup (no apiVersion), so the
++// group-level preferred version may not match what the infra provider actually serves.
++func getKindPreferredVersion(client discovery.DiscoveryInterface, apiGroup, kind string) (string, error) {
++	groupList, err := client.ServerGroups()
++	if err != nil {
++		return "", fmt.Errorf("failed to get ServerGroups: %v", err)
++	}
++
++	for _, group := range groupList.Groups {
++		if group.Name != apiGroup {
++			continue
++		}
++		for _, v := range group.Versions {
++			resourceList, err := client.ServerResourcesForGroupVersion(v.GroupVersion)
++			if err != nil {
++				return "", fmt.Errorf("failed to get resources for %s: %v", v.GroupVersion, err)
++			}
++			for _, r := range resourceList.APIResources {
++				if r.Kind == kind {
++					return v.Version, nil
++				}
++			}
++		}
++		return "", fmt.Errorf("kind %q not found in any version of group %q", kind, apiGroup)
++	}
++
++	return "", fmt.Errorf("failed to find API group %q", apiGroup)
++}
++
+ func (c *machineController) scalableResourceProviderIDs(scalableResource *unstructured.Unstructured) ([]string, error) {
+ 	if scalableResource.GetKind() == machinePoolKind {
+ 		return c.findMachinePoolProviderIDs(scalableResource)
+diff --git a/cluster-autoscaler/cloudprovider/clusterapi/clusterapi_controller_test.go b/cluster-autoscaler/cloudprovider/clusterapi/clusterapi_controller_test.go
+index 9844424bf854..842410c9f7b5 100644
+--- a/cluster-autoscaler/cloudprovider/clusterapi/clusterapi_controller_test.go
++++ b/cluster-autoscaler/cloudprovider/clusterapi/clusterapi_controller_test.go
+@@ -1151,6 +1151,86 @@ func TestGetAPIGroupPreferredVersion(t *testing.T) {
+ 	}
+ }
+ 
++func TestGetKindPreferredVersion(t *testing.T) {
++	const infraGroup = "infrastructure.cluster.x-k8s.io"
++	const nutanixKind = "NutanixMachineTemplate"
++	const awsKind = "AWSMachineTemplate"
++
++	testCases := []struct {
++		description     string
++		apiGroup        string
++		kind            string
++		expectedVersion string
++		error           bool
++	}{
++		{
++			description:     "kind exists only in v1beta1",
++			apiGroup:        infraGroup,
++			kind:            nutanixKind,
++			expectedVersion: "v1beta1",
++			error:           false,
++		},
++		{
++			description:     "kind exists in both versions, returns highest priority",
++			apiGroup:        infraGroup,
++			kind:            awsKind,
++			expectedVersion: "v1beta2",
++			error:           false,
++		},
++		{
++			description:     "kind does not exist in any version",
++			apiGroup:        infraGroup,
++			kind:            "NonExistentTemplate",
++			expectedVersion: "",
++			error:           true,
++		},
++		{
++			description:     "group does not exist",
++			apiGroup:        "does.not.exist",
++			kind:            nutanixKind,
++			expectedVersion: "",
++			error:           true,
++		},
++	}
++
++	// v1beta2 only has AWSMachineTemplate; v1beta1 has both.
++	// FakeDiscovery.ServerGroups() builds group.Versions by appending in Resources
++	// slice order, so listing v1beta2 first makes it the higher-priority version
++	// for infraGroup. getKindPreferredVersion iterates group.Versions in order,
++	// so it returns v1beta2 for kinds available in both versions.
++	discoveryClient := &fakediscovery.FakeDiscovery{
++		Fake: &clientgotesting.Fake{
++			Resources: []*metav1.APIResourceList{
++				{
++					GroupVersion: fmt.Sprintf("%s/v1beta2", infraGroup),
++					APIResources: []metav1.APIResource{
++						{Kind: awsKind},
++					},
++				},
++				{
++					GroupVersion: fmt.Sprintf("%s/v1beta1", infraGroup),
++					APIResources: []metav1.APIResource{
++						{Kind: nutanixKind},
++						{Kind: awsKind},
++					},
++				},
++			},
++		},
++	}
++
++	for _, tc := range testCases {
++		t.Run(tc.description, func(t *testing.T) {
++			version, err := getKindPreferredVersion(discoveryClient, tc.apiGroup, tc.kind)
++			if (err != nil) != tc.error {
++				t.Errorf("expected to have error: %t. Had an error: %t", tc.error, err != nil)
++			}
++			if version != tc.expectedVersion {
++				t.Errorf("expected %v, got: %v", tc.expectedVersion, version)
++			}
++		})
++	}
++}
++
+ func TestGroupVersionHasResource(t *testing.T) {
+ 	testCases := []struct {
+ 		description  string
+diff --git a/cluster-autoscaler/cloudprovider/clusterapi/clusterapi_test_framework.go b/cluster-autoscaler/cloudprovider/clusterapi/clusterapi_test_framework.go
+index ac93f990d4f6..c3f0e299b2fa 100644
+--- a/cluster-autoscaler/cloudprovider/clusterapi/clusterapi_test_framework.go
++++ b/cluster-autoscaler/cloudprovider/clusterapi/clusterapi_test_framework.go
+@@ -588,6 +588,7 @@ func NewTestMachineController(t testing.TB) *testMachineController {
+ 					APIResources: []metav1.APIResource{
+ 						{
+ 							Name: "machinetemplates",
++							Kind: machineTemplateKind,
+ 						},
+ 					},
+ 				},
+diff --git a/cluster-autoscaler/cloudprovider/clusterapi/clusterapi_unstructured.go b/cluster-autoscaler/cloudprovider/clusterapi/clusterapi_unstructured.go
+index 4e04c10f76d2..31db83eb72ce 100644
+--- a/cluster-autoscaler/cloudprovider/clusterapi/clusterapi_unstructured.go
++++ b/cluster-autoscaler/cloudprovider/clusterapi/clusterapi_unstructured.go
+@@ -491,12 +491,20 @@ func (r *unstructuredScalableResource) readInfrastructureReferenceResource() (*u
+ 		return nil, nil
+ 	}
+ 
++	// kind must be read before version discovery — getKindPreferredVersion needs it.
++	kind, ok := infraref["kind"]
++	if !ok {
++		info := fmt.Sprintf("Missing kind from %s %s's InfrastructureReference", obKind, obName)
++		klog.V(4).Info(info)
++		return nil, errors.New(info)
++	}
++
+ 	var apiversion string
+ 
+ 	apiGroup, ok := infraref["apiGroup"]
+ 	if ok {
+-		if apiversion, err = getAPIGroupPreferredVersion(r.controller.managementDiscoveryClient, apiGroup); err != nil {
+-			klog.V(4).Infof("Unable to read preferred version from api group %s, error: %v", apiGroup, err)
++		if apiversion, err = getKindPreferredVersion(r.controller.managementDiscoveryClient, apiGroup, kind); err != nil {
++			klog.V(4).Infof("Unable to read preferred version for kind %s in api group %s, error: %v", kind, apiGroup, err)
+ 			return nil, err
+ 		}
+ 		apiversion = fmt.Sprintf("%s/%s", apiGroup, apiversion)
+@@ -509,13 +517,6 @@ func (r *unstructuredScalableResource) readInfrastructureReferenceResource() (*u
+ 			return nil, errors.New(info)
+ 		}
+ 	}
+-
+-	kind, ok := infraref["kind"]
+-	if !ok {
+-		info := fmt.Sprintf("Missing kind from %s %s's InfrastructureReference", obKind, obName)
+-		klog.V(4).Info(info)
+-		return nil, errors.New(info)
+-	}
+ 	name, ok := infraref["name"]
+ 	if !ok {
+ 		info := fmt.Sprintf("Missing name from %s %s's InfrastructureReference", obKind, obName)

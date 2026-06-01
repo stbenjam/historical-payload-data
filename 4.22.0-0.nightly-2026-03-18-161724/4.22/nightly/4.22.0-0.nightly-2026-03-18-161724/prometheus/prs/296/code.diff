@@ -1,0 +1,128 @@
+diff --git a/cmd/prometheus/main.go b/cmd/prometheus/main.go
+index e3da4351ca9..e1f370f4c7f 100644
+--- a/cmd/prometheus/main.go
++++ b/cmd/prometheus/main.go
+@@ -55,6 +55,7 @@ import (
+ 	toolkit_web "github.com/prometheus/exporter-toolkit/web"
+ 	"go.uber.org/atomic"
+ 	"go.uber.org/automaxprocs/maxprocs"
++	"k8s.io/client-go/rest"
+ 	"k8s.io/klog"
+ 	klogv2 "k8s.io/klog/v2"
+ 
+@@ -795,6 +796,9 @@ func main() {
+ 
+ 	klogv2.SetSlogLogger(logger.With("component", "k8s_client_runtime"))
+ 	klog.SetOutputBySeverity("INFO", klogv1Writer{})
++	// Avoid duplicate API deprecation warnings (e.g., "v1 Endpoints is deprecated in v1.33+...")
++	// that can pollute the logs.
++	rest.SetDefaultWarningHandlerWithContext(logging.NewDedupDeprecationWarningLogger())
+ 
+ 	modeAppName := "Prometheus Server"
+ 	mode := "server"
+diff --git a/util/logging/dedupe.go b/util/logging/dedupe.go
+index 8137f4f22b9..e0e62da37ec 100644
+--- a/util/logging/dedupe.go
++++ b/util/logging/dedupe.go
+@@ -18,6 +18,9 @@ import (
+ 	"log/slog"
+ 	"sync"
+ 	"time"
++
++	"github.com/grafana/regexp"
++	"k8s.io/client-go/rest"
+ )
+ 
+ const (
+@@ -134,3 +137,44 @@ func (d *Deduper) run() {
+ 		}
+ 	}
+ }
++
++// deprecationRegex matches the format of Kubernetes API deprecation warnings:
++// See https://github.com/kubernetes/kubernetes/blob/da663405beb487d66c27a0220ea4073305ae9077/staging/src/k8s.io/apiserver/pkg/endpoints/deprecation/deprecation.go#L117.
++var deprecationRegex = regexp.MustCompile(`\S+ \S+ is deprecated in v\d+\.\d+\+`)
++
++// Even though deprecation warnings should be bounded in number, this safeguard should help prevent leaks.
++const maxDeprecationWarnings = 32
++
++// DedupDeprecationWarningLogger deduplicates Kube API deprecation warnings by message before logging them.
++// Inspired by https://github.com/kubernetes/kubernetes/blob/3edae6c1c49958fd10a708d9cc8c4c9e7f5fb6e8/staging/src/k8s.io/client-go/rest/warnings.go#L113
++type DedupDeprecationWarningLogger struct {
++	logger rest.WarningHandlerWithContext
++	lock   sync.Mutex
++	logged map[string]struct{}
++}
++
++func NewDedupDeprecationWarningLogger() *DedupDeprecationWarningLogger {
++	return &DedupDeprecationWarningLogger{
++		logger: rest.WarningLogger{},
++		logged: make(map[string]struct{}),
++	}
++}
++
++func (w *DedupDeprecationWarningLogger) HandleWarningHeaderWithContext(ctx context.Context, code int, agent, message string) {
++	if code != 299 || message == "" {
++		return
++	}
++
++	w.lock.Lock()
++	defer w.lock.Unlock()
++
++	if _, seen := w.logged[message]; seen {
++		return
++	}
++
++	if deprecationRegex.MatchString(message) && len(w.logged) < maxDeprecationWarnings {
++		w.logged[message] = struct{}{}
++	}
++
++	w.logger.HandleWarningHeaderWithContext(ctx, code, agent, message)
++}
+diff --git a/util/logging/dedupe_test.go b/util/logging/dedupe_test.go
+index 918c5d60bd2..7d7b1bd12dc 100644
+--- a/util/logging/dedupe_test.go
++++ b/util/logging/dedupe_test.go
+@@ -15,6 +15,8 @@ package logging
+ 
+ import (
+ 	"bytes"
++	"context"
++	"fmt"
+ 	"log/slog"
+ 	"strings"
+ 	"testing"
+@@ -80,3 +82,33 @@ func TestDedupeConcurrent(t *testing.T) {
+ 
+ 	require.NotPanics(t, func() { concurrentWriteFunc() })
+ }
++
++type fakeWarningLogger struct {
++	logs []string
++}
++
++func (fl *fakeWarningLogger) HandleWarningHeaderWithContext(_ context.Context, _ int, _, message string) {
++	fl.logs = append(fl.logs, message)
++}
++
++func TestDedupeDeprecationWarningLogger(t *testing.T) {
++	wl := DedupDeprecationWarningLogger{
++		logger: &fakeWarningLogger{},
++		logged: make(map[string]struct{}),
++	}
++
++	deprecationMessage := "v1 Endpoints is deprecated in v1.33+; use [discovery.k8s.io/v1](http://discovery.k8s.io/v1) EndpointSlice"
++	for range 10 {
++		wl.HandleWarningHeaderWithContext(context.Background(), 299, "", deprecationMessage)
++	}
++	require.Len(t, wl.logger.(*fakeWarningLogger).logs, 1)
++	require.Len(t, wl.logged, 1)
++	require.Equal(t, wl.logger.(*fakeWarningLogger).logs[0], deprecationMessage)
++
++	for i := range 10 {
++		wl.HandleWarningHeaderWithContext(context.Background(), 299, "", fmt.Sprintf("some other warning %d", i+1))
++	}
++	require.Len(t, wl.logger.(*fakeWarningLogger).logs, 11)
++	require.Len(t, wl.logged, 1)
++	require.Equal(t, "some other warning 10", wl.logger.(*fakeWarningLogger).logs[10])
++}

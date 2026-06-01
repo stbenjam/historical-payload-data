@@ -1,0 +1,3276 @@
+diff --git a/CLAUDE.md b/CLAUDE.md
+index 23487b5c6..440ecd39d 100644
+--- a/CLAUDE.md
++++ b/CLAUDE.md
+@@ -17,13 +17,6 @@ go test ./pkg/operator/ -run TestSyncName -count 1
+ # Run e2e tests (requires cluster access)
+ make test-e2e
+ 
+-# Regenerate bindata (after modifying files in bindata/v4.0.0/)
+-# Output: pkg/operator/v4_00_assets/bindata.go (generated — never hand-edit)
+-make update-bindata
+-
+-# Verify bindata is up-to-date
+-make verify-bindata
+-
+ # Verify all generated files
+ make verify
+ 
+@@ -41,7 +34,7 @@ This is an OpenShift ClusterOperator with a two-process architecture running fro
+ ### Operator Process (`service-ca-operator operator`)
+ - **Package:** `pkg/operator/`
+ - Has two main responsibilities:
+-  1. **Operand lifecycle:** Manages the controller Deployment in the `openshift-service-ca` namespace, syncing static resources (namespace, service account, RBAC, deployment) from bindata
++  1. **Operand lifecycle:** Manages the controller Deployment in the `openshift-service-ca` namespace, syncing static resources (namespace, service account, RBAC, deployment) from embedded assets
+   2. **Signing CA management:** Creates and rotates the signing CA keypair (Secret) and maintains the CA bundle ConfigMap
+ - Reports the "service-ca" ClusterOperator status conditions
+ 
+@@ -52,6 +45,13 @@ This is an OpenShift ClusterOperator with a two-process architecture running fro
+   2. **ConfigMap CA Bundle Injector** (`pkg/controller/cabundleinjector/configmap.go`): Injects the CA bundle into ConfigMaps annotated with `service.beta.openshift.io/inject-cabundle=true`
+   3. **Generic CA Bundle Injector** (`pkg/controller/cabundleinjector/`): Injects the CA bundle into APIServices, MutatingWebhookConfigurations, ValidatingWebhookConfigurations, and CRDs with the same annotation
+ 
++### Embedded Assets
++Static resource manifests are embedded using Go's native `embed.FS`:
++- **Asset location:** `bindata/assets/*.yaml`
++- **Embed declaration:** `bindata/assets.go` (uses `//go:embed assets/*.yaml`)
++- **Usage:** `bindata.MustAsset("assets/<filename>.yaml")` to read asset bytes at runtime
++- No code generation step is required — assets are embedded at compile time
++
+ ### User-Facing Annotations
+ Users interact with the controller by annotating their resources. The annotation constants are defined in `pkg/controller/api/api.go`.
+ 
+@@ -76,12 +76,9 @@ Legacy `service.alpha.openshift.io` equivalents of both annotations are also sup
+ 
+ PRs should separate code changes from generated/vendored artifacts:
+ 
+-**Code commits** — one or more commits with source code changes. Exclude `go.mod`, `go.sum`, `vendor/`, and generated files (like `bindata.go`) from these commits.
++**Code commits** — one or more commits with source code changes. Exclude `go.mod`, `go.sum`, and `vendor/` from these commits.
+ 
+-**Generated/vendor commit (if needed)** — a single final commit containing all generated and vendored changes. If a PR has no dependency or generated file changes, this commit is not needed. Contents and commit message by scenario:
+-- Vendor only (`go.mod`, `go.sum`, `vendor/`): `vendor: bump(*)`
+-- Bindata only (`pkg/operator/v4_00_assets/bindata.go`): `update bindata`
+-- Both vendor and bindata: `vendor: bump(*), update bindata`
++**Vendor commit (if needed)** — a single final commit containing all vendored changes (`go.mod`, `go.sum`, `vendor/`). Commit message: `vendor: bump(*)`. If a PR has no dependency changes, this commit is not needed.
+ 
+ Always base commits on `upstream/main`, not `origin/main`.
+ 
+diff --git a/Makefile b/Makefile
+index 764dc3952..4b4c17d49 100644
+--- a/Makefile
++++ b/Makefile
+@@ -7,7 +7,6 @@ GO_LD_FLAGS := -ldflags "-X $(GO_PACKAGE)/pkg/version.versionFromGit=$(shell git
+ # Include the library makefile
+ include $(addprefix ./vendor/github.com/openshift/build-machinery-go/make/, \
+ 	golang.mk \
+-	targets/openshift/bindata.mk \
+ 	targets/openshift/deps-gomod.mk \
+ 	targets/openshift/images.mk \
+ 	targets/openshift/operator/profile-manifests.mk \
+@@ -24,17 +23,6 @@ IMAGE_REGISTRY?=registry.svc.ci.openshift.org
+ # It will generate target "image-$(1)" for building the image and binding it as a prerequisite to target "images".
+ $(call build-image,ocp-service-ca-operator,$(IMAGE_REGISTRY)/ocp/4.3:service-ca-operator,./Dockerfile.rhel7,.)
+ 
+-# This will call a macro called "add-bindata" which will generate bindata specific targets based on the parameters:
+-# $0 - macro name
+-# $1 - target suffix
+-# $2 - input dirs
+-# $3 - prefix
+-# $4 - pkg
+-# $5 - output
+-# It will generate targets {update,verify}-bindata-$(1) logically grouping them in unsuffixed versions of these targets
+-# and also hooked into {update,verify}-generated for broader integration.
+-$(call add-bindata,v4.0.0,./bindata/v4.0.0/...,bindata,v4_00_assets,pkg/operator/v4_00_assets/bindata.go)
+-
+ # include targets for profile manifest patches
+ # $0 - macro name
+ # $1 - target name
+diff --git a/bindata/assets.go b/bindata/assets.go
+new file mode 100644
+index 000000000..7fb66959c
+--- /dev/null
++++ b/bindata/assets.go
+@@ -0,0 +1,14 @@
++package bindata
++
++import "embed"
++
++//go:embed assets/*.yaml
++var content embed.FS
++
++func MustAsset(name string) []byte {
++	data, err := content.ReadFile(name)
++	if err != nil {
++		panic(err)
++	}
++	return data
++}
+diff --git a/bindata/v4.0.0/controller/clusterrole.yaml b/bindata/assets/clusterrole.yaml
+similarity index 100%
+rename from bindata/v4.0.0/controller/clusterrole.yaml
+rename to bindata/assets/clusterrole.yaml
+diff --git a/bindata/v4.0.0/controller/clusterrolebinding.yaml b/bindata/assets/clusterrolebinding.yaml
+similarity index 100%
+rename from bindata/v4.0.0/controller/clusterrolebinding.yaml
+rename to bindata/assets/clusterrolebinding.yaml
+diff --git a/bindata/v4.0.0/controller/deployment.yaml b/bindata/assets/deployment.yaml
+similarity index 100%
+rename from bindata/v4.0.0/controller/deployment.yaml
+rename to bindata/assets/deployment.yaml
+diff --git a/bindata/v4.0.0/controller/ns.yaml b/bindata/assets/ns.yaml
+similarity index 100%
+rename from bindata/v4.0.0/controller/ns.yaml
+rename to bindata/assets/ns.yaml
+diff --git a/bindata/v4.0.0/controller/role.yaml b/bindata/assets/role.yaml
+similarity index 100%
+rename from bindata/v4.0.0/controller/role.yaml
+rename to bindata/assets/role.yaml
+diff --git a/bindata/v4.0.0/controller/rolebinding.yaml b/bindata/assets/rolebinding.yaml
+similarity index 100%
+rename from bindata/v4.0.0/controller/rolebinding.yaml
+rename to bindata/assets/rolebinding.yaml
+diff --git a/bindata/v4.0.0/controller/sa.yaml b/bindata/assets/sa.yaml
+similarity index 100%
+rename from bindata/v4.0.0/controller/sa.yaml
+rename to bindata/assets/sa.yaml
+diff --git a/bindata/v4.0.0/controller/signing-cabundle.yaml b/bindata/assets/signing-cabundle.yaml
+similarity index 100%
+rename from bindata/v4.0.0/controller/signing-cabundle.yaml
+rename to bindata/assets/signing-cabundle.yaml
+diff --git a/bindata/v4.0.0/controller/signing-secret.yaml b/bindata/assets/signing-secret.yaml
+similarity index 100%
+rename from bindata/v4.0.0/controller/signing-secret.yaml
+rename to bindata/assets/signing-secret.yaml
+diff --git a/go.mod b/go.mod
+index 10d2da3df..3f6d43e3d 100644
+--- a/go.mod
++++ b/go.mod
+@@ -3,7 +3,6 @@ module github.com/openshift/service-ca-operator
+ go 1.25.0
+ 
+ require (
+-	github.com/go-bindata/go-bindata v3.1.2+incompatible
+ 	github.com/google/uuid v1.6.0
+ 	github.com/onsi/ginkgo/v2 v2.27.2
+ 	github.com/openshift-eng/openshift-tests-extension v0.0.0-20250804142706-7b3ab438a292
+diff --git a/go.sum b/go.sum
+index ad2b3d8a6..432d882b5 100644
+--- a/go.sum
++++ b/go.sum
+@@ -43,8 +43,6 @@ github.com/fsnotify/fsnotify v1.9.0 h1:2Ml+OJNzbYCTzsxtv8vKSFD9PbJjmhYF14k/jKC7S
+ github.com/fsnotify/fsnotify v1.9.0/go.mod h1:8jBTzvmWwFyi3Pb8djgCCO5IBqzKJ/Jwo8TRcHyHii0=
+ github.com/fxamacker/cbor/v2 v2.9.0 h1:NpKPmjDBgUfBms6tr6JZkTHtfFGcMKsw3eGcmD/sapM=
+ github.com/fxamacker/cbor/v2 v2.9.0/go.mod h1:vM4b+DJCtHn+zz7h3FFp/hDAI9WNWCsZj23V5ytsSxQ=
+-github.com/go-bindata/go-bindata v3.1.2+incompatible h1:5vjJMVhowQdPzjE1LdxyFF7YFTXg5IgGVW4gBr5IbvE=
+-github.com/go-bindata/go-bindata v3.1.2+incompatible/go.mod h1:xK8Dsgwmeed+BBsSy2XTopBn/8uK2HWuGSnA11C3Joo=
+ github.com/go-logr/logr v1.2.2/go.mod h1:jdQByPbusPIv2/zmleS9BjJVeZ6kBagPoEUsqbVz/1A=
+ github.com/go-logr/logr v1.4.3 h1:CjnDlHq8ikf6E492q6eKboGOC0T8CDaOvkHCIg8idEI=
+ github.com/go-logr/logr v1.4.3/go.mod h1:9T104GzyrTigFIr8wt5mBrctHMim0Nb2HLGrmQ40KvY=
+diff --git a/pkg/dependencymagnet/doc.go b/pkg/dependencymagnet/doc.go
+index 306427a2c..10b80ece4 100644
+--- a/pkg/dependencymagnet/doc.go
++++ b/pkg/dependencymagnet/doc.go
+@@ -6,6 +6,5 @@
+ package dependencymagnet
+ 
+ import (
+-	_ "github.com/go-bindata/go-bindata/go-bindata"
+ 	_ "github.com/openshift/build-machinery-go"
+ )
+diff --git a/pkg/operator/sync_common.go b/pkg/operator/sync_common.go
+index 1d4b2c2dd..435167bed 100644
+--- a/pkg/operator/sync_common.go
++++ b/pkg/operator/sync_common.go
+@@ -22,50 +22,46 @@ import (
+ 	"github.com/openshift/library-go/pkg/operator/resource/resourceapply"
+ 	"github.com/openshift/library-go/pkg/operator/resource/resourcemerge"
+ 	"github.com/openshift/library-go/pkg/operator/resource/resourceread"
++	"github.com/openshift/service-ca-operator/bindata"
+ 	"github.com/openshift/service-ca-operator/pkg/controller/api"
+-	"github.com/openshift/service-ca-operator/pkg/operator/v4_00_assets"
+-)
+-
+-const (
+-	resourcePath = "v4.0.0/controller/"
+ )
+ 
+ func (c *serviceCAOperator) manageControllerNS(ctx context.Context) (bool, error) {
+-	_, modified, err := resourceapply.ApplyNamespace(ctx, c.corev1Client, c.eventRecorder, resourceread.ReadNamespaceV1OrDie(v4_00_assets.MustAsset(resourcePath+"ns.yaml")))
++	_, modified, err := resourceapply.ApplyNamespace(ctx, c.corev1Client, c.eventRecorder, resourceread.ReadNamespaceV1OrDie(bindata.MustAsset("assets/ns.yaml")))
+ 	return modified, err
+ }
+ 
+ func (c *serviceCAOperator) manageControllerResources(ctx context.Context, modified *bool) error {
+ 	var err error
+-	requiredClusterRole := resourceread.ReadClusterRoleV1OrDie(v4_00_assets.MustAsset(resourcePath + "clusterrole.yaml"))
++	requiredClusterRole := resourceread.ReadClusterRoleV1OrDie(bindata.MustAsset("assets/clusterrole.yaml"))
+ 	_, mod, err := resourceapply.ApplyClusterRole(ctx, c.rbacv1Client, c.eventRecorder, requiredClusterRole)
+ 	if err != nil {
+ 		return err
+ 	}
+ 	*modified = *modified || mod
+ 
+-	requiredClusterRoleBinding := resourceread.ReadClusterRoleBindingV1OrDie(v4_00_assets.MustAsset(resourcePath + "clusterrolebinding.yaml"))
++	requiredClusterRoleBinding := resourceread.ReadClusterRoleBindingV1OrDie(bindata.MustAsset("assets/clusterrolebinding.yaml"))
+ 	_, mod, err = resourceapply.ApplyClusterRoleBinding(ctx, c.rbacv1Client, c.eventRecorder, requiredClusterRoleBinding)
+ 	if err != nil {
+ 		return err
+ 	}
+ 	*modified = *modified || mod
+ 
+-	requiredRole := resourceread.ReadRoleV1OrDie(v4_00_assets.MustAsset(resourcePath + "role.yaml"))
++	requiredRole := resourceread.ReadRoleV1OrDie(bindata.MustAsset("assets/role.yaml"))
+ 	_, mod, err = resourceapply.ApplyRole(ctx, c.rbacv1Client, c.eventRecorder, requiredRole)
+ 	if err != nil {
+ 		return err
+ 	}
+ 	*modified = *modified || mod
+ 
+-	requiredRoleBinding := resourceread.ReadRoleBindingV1OrDie(v4_00_assets.MustAsset(resourcePath + "rolebinding.yaml"))
++	requiredRoleBinding := resourceread.ReadRoleBindingV1OrDie(bindata.MustAsset("assets/rolebinding.yaml"))
+ 	_, mod, err = resourceapply.ApplyRoleBinding(ctx, c.rbacv1Client, c.eventRecorder, requiredRoleBinding)
+ 	if err != nil {
+ 		return err
+ 	}
+ 	*modified = *modified || mod
+ 
+-	requiredSA := resourceread.ReadServiceAccountV1OrDie(v4_00_assets.MustAsset(resourcePath + "sa.yaml"))
++	requiredSA := resourceread.ReadServiceAccountV1OrDie(bindata.MustAsset("assets/sa.yaml"))
+ 	_, mod, err = resourceapply.ApplyServiceAccount(ctx, c.corev1Client, c.eventRecorder, requiredSA)
+ 	if err != nil {
+ 		return err
+@@ -76,7 +72,7 @@ func (c *serviceCAOperator) manageControllerResources(ctx context.Context, modif
+ }
+ 
+ func (c *serviceCAOperator) manageSignerCA(ctx context.Context, rawUnsupportedServiceCAConfig []byte) (bool, error) {
+-	secret := resourceread.ReadSecretV1OrDie(v4_00_assets.MustAsset(resourcePath + "signing-secret.yaml"))
++	secret := resourceread.ReadSecretV1OrDie(bindata.MustAsset("assets/signing-secret.yaml"))
+ 
+ 	var existingCert *x509.Certificate
+ 	existing, err := c.corev1Client.Secrets(secret.Namespace).Get(ctx, secret.Name, metav1.GetOptions{})
+@@ -171,7 +167,7 @@ func initializeSigningSecret(secret *corev1.Secret, duration time.Duration, life
+ }
+ 
+ func (c *serviceCAOperator) manageSignerCABundle(ctx context.Context, forceUpdate bool) (bool, error) {
+-	configMap := resourceread.ReadConfigMapV1OrDie(v4_00_assets.MustAsset(resourcePath + "signing-cabundle.yaml"))
++	configMap := resourceread.ReadConfigMapV1OrDie(bindata.MustAsset("assets/signing-cabundle.yaml"))
+ 	if !forceUpdate {
+ 		// We don't need to force an update; return if the configmap already exists (or error getting).
+ 		_, err := c.corev1Client.ConfigMaps(configMap.Namespace).Get(ctx, configMap.Name, metav1.GetOptions{})
+@@ -181,7 +177,7 @@ func (c *serviceCAOperator) manageSignerCABundle(ctx context.Context, forceUpdat
+ 	}
+ 
+ 	klog.V(4).Infof("updating CA bundle configmap")
+-	secret := resourceread.ReadSecretV1OrDie(v4_00_assets.MustAsset(resourcePath + "signing-secret.yaml"))
++	secret := resourceread.ReadSecretV1OrDie(bindata.MustAsset("assets/signing-secret.yaml"))
+ 	currentSigningKeySecret, err := c.corev1Client.Secrets(secret.Namespace).Get(ctx, secret.Name, metav1.GetOptions{})
+ 	// Return err or if the signing secret has no data (should not normally happen).
+ 	if err != nil || len(currentSigningKeySecret.Data[corev1.TLSCertKey]) == 0 {
+@@ -200,7 +196,7 @@ func (c *serviceCAOperator) manageSignerCABundle(ctx context.Context, forceUpdat
+ }
+ 
+ func (c *serviceCAOperator) manageDeployment(ctx context.Context, options *operatorv1.ServiceCA, forceDeployment, runOnWorkers bool) (bool, error) {
+-	required := resourceread.ReadDeploymentV1OrDie(v4_00_assets.MustAsset(resourcePath + "deployment.yaml"))
++	required := resourceread.ReadDeploymentV1OrDie(bindata.MustAsset("assets/deployment.yaml"))
+ 	required.Spec.Template.Spec.Containers[0].Image = os.Getenv("CONTROLLER_IMAGE")
+ 	required.Spec.Template.Spec.Containers[0].Args = append(required.Spec.Template.Spec.Containers[0].Args, fmt.Sprintf("-v=%d", loglevel.LogLevelToVerbosity(options.Spec.LogLevel)))
+ 
+diff --git a/pkg/operator/sync_common_test.go b/pkg/operator/sync_common_test.go
+index 8f4393122..82da16f13 100644
+--- a/pkg/operator/sync_common_test.go
++++ b/pkg/operator/sync_common_test.go
+@@ -24,7 +24,7 @@ import (
+ 	"github.com/openshift/library-go/pkg/operator/resource/resourcemerge"
+ 	"github.com/openshift/library-go/pkg/operator/resource/resourceread"
+ 
+-	"github.com/openshift/service-ca-operator/pkg/operator/v4_00_assets"
++	"github.com/openshift/service-ca-operator/bindata"
+ )
+ 
+ func TestInitializeSigningSecret(t *testing.T) {
+@@ -78,7 +78,7 @@ func TestInitializeSigningSecret(t *testing.T) {
+ }
+ 
+ func TestManageDeployment(t *testing.T) {
+-	baseDeployment := resourceread.ReadDeploymentV1OrDie(v4_00_assets.MustAsset(resourcePath + "deployment.yaml"))
++	baseDeployment := resourceread.ReadDeploymentV1OrDie(bindata.MustAsset("assets/deployment.yaml"))
+ 	baseDeploymentPopulated := deployment(baseDeployment).withImage("foobar").withLogLevel(operatorv1.Normal).valueOrDie()
+ 	tests := []struct {
+ 		name                     string
+diff --git a/pkg/operator/v4_00_assets/bindata.go b/pkg/operator/v4_00_assets/bindata.go
+deleted file mode 100644
+index 1a9c93eb9..000000000
+--- a/pkg/operator/v4_00_assets/bindata.go
++++ /dev/null
+@@ -1,645 +0,0 @@
+-// Code generated for package v4_00_assets by go-bindata DO NOT EDIT. (@generated)
+-// sources:
+-// bindata/v4.0.0/controller/clusterrole.yaml
+-// bindata/v4.0.0/controller/clusterrolebinding.yaml
+-// bindata/v4.0.0/controller/deployment.yaml
+-// bindata/v4.0.0/controller/ns.yaml
+-// bindata/v4.0.0/controller/role.yaml
+-// bindata/v4.0.0/controller/rolebinding.yaml
+-// bindata/v4.0.0/controller/sa.yaml
+-// bindata/v4.0.0/controller/signing-cabundle.yaml
+-// bindata/v4.0.0/controller/signing-secret.yaml
+-package v4_00_assets
+-
+-import (
+-	"fmt"
+-	"io/ioutil"
+-	"os"
+-	"path/filepath"
+-	"strings"
+-	"time"
+-)
+-
+-type asset struct {
+-	bytes []byte
+-	info  os.FileInfo
+-}
+-
+-type bindataFileInfo struct {
+-	name    string
+-	size    int64
+-	mode    os.FileMode
+-	modTime time.Time
+-}
+-
+-// Name return file name
+-func (fi bindataFileInfo) Name() string {
+-	return fi.name
+-}
+-
+-// Size return file size
+-func (fi bindataFileInfo) Size() int64 {
+-	return fi.size
+-}
+-
+-// Mode return file mode
+-func (fi bindataFileInfo) Mode() os.FileMode {
+-	return fi.mode
+-}
+-
+-// Mode return file modify time
+-func (fi bindataFileInfo) ModTime() time.Time {
+-	return fi.modTime
+-}
+-
+-// IsDir return file whether a directory
+-func (fi bindataFileInfo) IsDir() bool {
+-	return fi.mode&os.ModeDir != 0
+-}
+-
+-// Sys return file is sys mode
+-func (fi bindataFileInfo) Sys() interface{} {
+-	return nil
+-}
+-
+-var _v400ControllerClusterroleYaml = []byte(`apiVersion: rbac.authorization.k8s.io/v1
+-kind: ClusterRole
+-metadata:
+-  name: system:openshift:controller:service-ca
+-rules:
+-- apiGroups:
+-  - ""
+-  resources:
+-  - secrets
+-  verbs:
+-  - get
+-  - list
+-  - watch
+-  - create
+-  - update
+-  - patch
+-- apiGroups:
+-  - ""
+-  resources:
+-  - services
+-  verbs:
+-  - get
+-  - list
+-  - watch
+-  - update
+-  - patch
+-- apiGroups:
+-  - admissionregistration.k8s.io
+-  resources:
+-  - mutatingwebhookconfigurations
+-  - validatingwebhookconfigurations
+-  verbs:
+-  - get
+-  - list
+-  - watch
+-  - update
+-- apiGroups:
+-  - apiextensions.k8s.io
+-  resources:
+-  - customresourcedefinitions
+-  verbs:
+-  - get
+-  - list
+-  - watch
+-  - update
+-- apiGroups:
+-  - apiregistration.k8s.io
+-  resources:
+-  - apiservices
+-  verbs:
+-  - get
+-  - list
+-  - watch
+-  - update
+-  - patch
+-- apiGroups:
+-  - ""
+-  resources:
+-  - configmaps
+-  verbs:
+-  - get
+-  - list
+-  - watch
+-  - update
+-- apiGroups:
+-  - config.openshift.io
+-  resources:
+-  - infrastructures
+-  verbs:
+-  - get
+-  - list
+-  - watch
+-- apiGroups:
+-  - config.openshift.io
+-  resources:
+-  - clusterversions
+-  verbs:
+-  - get
+-  - list
+-  - watch
+-`)
+-
+-func v400ControllerClusterroleYamlBytes() ([]byte, error) {
+-	return _v400ControllerClusterroleYaml, nil
+-}
+-
+-func v400ControllerClusterroleYaml() (*asset, error) {
+-	bytes, err := v400ControllerClusterroleYamlBytes()
+-	if err != nil {
+-		return nil, err
+-	}
+-
+-	info := bindataFileInfo{name: "v4.0.0/controller/clusterrole.yaml", size: 0, mode: os.FileMode(0), modTime: time.Unix(0, 0)}
+-	a := &asset{bytes: bytes, info: info}
+-	return a, nil
+-}
+-
+-var _v400ControllerClusterrolebindingYaml = []byte(`apiVersion: rbac.authorization.k8s.io/v1
+-kind: ClusterRoleBinding
+-metadata:
+-  name: system:openshift:controller:service-ca
+-roleRef:
+-  kind: ClusterRole
+-  name: system:openshift:controller:service-ca
+-subjects:
+-- kind: ServiceAccount
+-  namespace: openshift-service-ca
+-  name: service-ca
+-`)
+-
+-func v400ControllerClusterrolebindingYamlBytes() ([]byte, error) {
+-	return _v400ControllerClusterrolebindingYaml, nil
+-}
+-
+-func v400ControllerClusterrolebindingYaml() (*asset, error) {
+-	bytes, err := v400ControllerClusterrolebindingYamlBytes()
+-	if err != nil {
+-		return nil, err
+-	}
+-
+-	info := bindataFileInfo{name: "v4.0.0/controller/clusterrolebinding.yaml", size: 0, mode: os.FileMode(0), modTime: time.Unix(0, 0)}
+-	a := &asset{bytes: bytes, info: info}
+-	return a, nil
+-}
+-
+-var _v400ControllerDeploymentYaml = []byte(`apiVersion: apps/v1
+-kind: Deployment
+-metadata:
+-  namespace: openshift-service-ca
+-  name: service-ca
+-  labels:
+-    app: service-ca
+-    service-ca: "true"
+-spec:
+-  strategy:
+-    type: Recreate
+-  selector:
+-    matchLabels:
+-      app: service-ca
+-      service-ca: "true"
+-  template:
+-    metadata:
+-      name: service-ca
+-      annotations:
+-        target.workload.openshift.io/management: '{"effect": "PreferredDuringScheduling"}'
+-        openshift.io/required-scc: restricted-v2
+-      labels:
+-        app: service-ca
+-        service-ca: "true"
+-    spec:
+-      serviceAccountName: service-ca
+-      containers:
+-      - name: service-ca-controller
+-        image: ${IMAGE}
+-        imagePullPolicy: IfNotPresent
+-        command: ["service-ca-operator", "controller"]
+-        ports:
+-        - containerPort: 8443
+-        securityContext:
+-          runAsNonRoot: true
+-        resources:
+-          requests:
+-            memory: 120Mi
+-            cpu: 10m
+-        terminationMessagePolicy: FallbackToLogsOnError
+-        volumeMounts:
+-        - mountPath: /var/run/secrets/signing-key
+-          name: signing-key
+-        - mountPath: /var/run/configmaps/signing-cabundle
+-          name: signing-cabundle
+-      volumes:
+-      - name: signing-key
+-        secret:
+-          secretName: signing-key
+-      - name: signing-cabundle
+-        configMap:
+-          name: signing-cabundle
+-      nodeSelector:
+-        node-role.kubernetes.io/master: ""
+-      priorityClassName: "system-cluster-critical"
+-      tolerations:
+-      - key: node-role.kubernetes.io/master
+-        operator: Exists
+-        effect: "NoSchedule"
+-      - key: "node.kubernetes.io/unreachable"
+-        operator: "Exists"
+-        effect: "NoExecute"
+-        tolerationSeconds: 120
+-      - key: "node.kubernetes.io/not-ready"
+-        operator: "Exists"
+-        effect: "NoExecute"
+-        tolerationSeconds: 120
+-`)
+-
+-func v400ControllerDeploymentYamlBytes() ([]byte, error) {
+-	return _v400ControllerDeploymentYaml, nil
+-}
+-
+-func v400ControllerDeploymentYaml() (*asset, error) {
+-	bytes, err := v400ControllerDeploymentYamlBytes()
+-	if err != nil {
+-		return nil, err
+-	}
+-
+-	info := bindataFileInfo{name: "v4.0.0/controller/deployment.yaml", size: 0, mode: os.FileMode(0), modTime: time.Unix(0, 0)}
+-	a := &asset{bytes: bytes, info: info}
+-	return a, nil
+-}
+-
+-var _v400ControllerNsYaml = []byte(`apiVersion: v1
+-kind: Namespace
+-metadata:
+-  name: openshift-service-ca
+-  annotations:
+-    openshift.io/node-selector: ""
+-    workload.openshift.io/allowed: "management"
+-  labels:
+-    openshift.io/run-level-: "" # remove the label on upgrades
+-`)
+-
+-func v400ControllerNsYamlBytes() ([]byte, error) {
+-	return _v400ControllerNsYaml, nil
+-}
+-
+-func v400ControllerNsYaml() (*asset, error) {
+-	bytes, err := v400ControllerNsYamlBytes()
+-	if err != nil {
+-		return nil, err
+-	}
+-
+-	info := bindataFileInfo{name: "v4.0.0/controller/ns.yaml", size: 0, mode: os.FileMode(0), modTime: time.Unix(0, 0)}
+-	a := &asset{bytes: bytes, info: info}
+-	return a, nil
+-}
+-
+-var _v400ControllerRoleYaml = []byte(`apiVersion: rbac.authorization.k8s.io/v1
+-kind: Role
+-metadata:
+-  name: system:openshift:controller:service-ca
+-  namespace: openshift-service-ca
+-rules:
+-- apiGroups:
+-  - security.openshift.io
+-  resources:
+-  - securitycontextconstraints
+-  resourceNames:
+-  - restricted
+-  verbs:
+-  - use
+-- apiGroups:
+-  - ""
+-  resources:
+-  - events
+-  verbs:
+-  - create
+-- apiGroups:
+-  - coordination.k8s.io
+-  resources:
+-  - leases
+-  verbs:
+-  - get
+-  - update
+-  - create
+-- apiGroups:
+-  - ""
+-  resources:
+-  - configmaps
+-  verbs:
+-  - get
+-  - list
+-  - watch
+-  - update
+-  - create
+-- apiGroups:
+-  - ""
+-  resources:
+-  - pods
+-  verbs:
+-  - get
+-  - list
+-  - watch
+-- apiGroups:
+-  - "apps"
+-  resources:
+-  - replicasets
+-  - deployments
+-  verbs:
+-  - get
+-  - list
+-  - watch
+-`)
+-
+-func v400ControllerRoleYamlBytes() ([]byte, error) {
+-	return _v400ControllerRoleYaml, nil
+-}
+-
+-func v400ControllerRoleYaml() (*asset, error) {
+-	bytes, err := v400ControllerRoleYamlBytes()
+-	if err != nil {
+-		return nil, err
+-	}
+-
+-	info := bindataFileInfo{name: "v4.0.0/controller/role.yaml", size: 0, mode: os.FileMode(0), modTime: time.Unix(0, 0)}
+-	a := &asset{bytes: bytes, info: info}
+-	return a, nil
+-}
+-
+-var _v400ControllerRolebindingYaml = []byte(`apiVersion: rbac.authorization.k8s.io/v1
+-kind: RoleBinding
+-metadata:
+-  name: system:openshift:controller:service-ca
+-  namespace: openshift-service-ca
+-roleRef:
+-  kind: Role
+-  name: system:openshift:controller:service-ca
+-subjects:
+-- kind: ServiceAccount
+-  namespace: openshift-service-ca
+-  name: service-ca
+-`)
+-
+-func v400ControllerRolebindingYamlBytes() ([]byte, error) {
+-	return _v400ControllerRolebindingYaml, nil
+-}
+-
+-func v400ControllerRolebindingYaml() (*asset, error) {
+-	bytes, err := v400ControllerRolebindingYamlBytes()
+-	if err != nil {
+-		return nil, err
+-	}
+-
+-	info := bindataFileInfo{name: "v4.0.0/controller/rolebinding.yaml", size: 0, mode: os.FileMode(0), modTime: time.Unix(0, 0)}
+-	a := &asset{bytes: bytes, info: info}
+-	return a, nil
+-}
+-
+-var _v400ControllerSaYaml = []byte(`apiVersion: v1
+-kind: ServiceAccount
+-metadata:
+-  namespace: openshift-service-ca
+-  name: service-ca
+-`)
+-
+-func v400ControllerSaYamlBytes() ([]byte, error) {
+-	return _v400ControllerSaYaml, nil
+-}
+-
+-func v400ControllerSaYaml() (*asset, error) {
+-	bytes, err := v400ControllerSaYamlBytes()
+-	if err != nil {
+-		return nil, err
+-	}
+-
+-	info := bindataFileInfo{name: "v4.0.0/controller/sa.yaml", size: 0, mode: os.FileMode(0), modTime: time.Unix(0, 0)}
+-	a := &asset{bytes: bytes, info: info}
+-	return a, nil
+-}
+-
+-var _v400ControllerSigningCabundleYaml = []byte(`apiVersion: v1
+-kind: ConfigMap
+-metadata:
+-  namespace: openshift-service-ca
+-  name: signing-cabundle
+-  annotations:
+-    openshift.io/owning-component: service-ca
+-    openshift.io/description: "Service CA configmap contains the data for the PEM-encoded CA signing bundle which will be injected to resources annotated with 'service.beta.openshift.io/inject-cabundle=true'"
+-data:
+-  ca-bundle.crt:
+-`)
+-
+-func v400ControllerSigningCabundleYamlBytes() ([]byte, error) {
+-	return _v400ControllerSigningCabundleYaml, nil
+-}
+-
+-func v400ControllerSigningCabundleYaml() (*asset, error) {
+-	bytes, err := v400ControllerSigningCabundleYamlBytes()
+-	if err != nil {
+-		return nil, err
+-	}
+-
+-	info := bindataFileInfo{name: "v4.0.0/controller/signing-cabundle.yaml", size: 0, mode: os.FileMode(0), modTime: time.Unix(0, 0)}
+-	a := &asset{bytes: bytes, info: info}
+-	return a, nil
+-}
+-
+-var _v400ControllerSigningSecretYaml = []byte(`apiVersion: v1
+-kind: Secret
+-metadata:
+-  namespace: openshift-service-ca
+-  name: signing-key
+-  annotations:
+-    openshift.io/owning-component: service-ca
+-    openshift.io/description: "Service CA secret contains a signing key that will be used to issue a signed serving certificate/key pair to services annotated with 'service.beta.openshift.io/serving-cert-secret-name'"
+-type: kubernetes.io/tls
+-data:
+-  tls.crt:
+-  tls.key:
+-`)
+-
+-func v400ControllerSigningSecretYamlBytes() ([]byte, error) {
+-	return _v400ControllerSigningSecretYaml, nil
+-}
+-
+-func v400ControllerSigningSecretYaml() (*asset, error) {
+-	bytes, err := v400ControllerSigningSecretYamlBytes()
+-	if err != nil {
+-		return nil, err
+-	}
+-
+-	info := bindataFileInfo{name: "v4.0.0/controller/signing-secret.yaml", size: 0, mode: os.FileMode(0), modTime: time.Unix(0, 0)}
+-	a := &asset{bytes: bytes, info: info}
+-	return a, nil
+-}
+-
+-// Asset loads and returns the asset for the given name.
+-// It returns an error if the asset could not be found or
+-// could not be loaded.
+-func Asset(name string) ([]byte, error) {
+-	cannonicalName := strings.Replace(name, "\\", "/", -1)
+-	if f, ok := _bindata[cannonicalName]; ok {
+-		a, err := f()
+-		if err != nil {
+-			return nil, fmt.Errorf("Asset %s can't read by error: %v", name, err)
+-		}
+-		return a.bytes, nil
+-	}
+-	return nil, fmt.Errorf("Asset %s not found", name)
+-}
+-
+-// MustAsset is like Asset but panics when Asset would return an error.
+-// It simplifies safe initialization of global variables.
+-func MustAsset(name string) []byte {
+-	a, err := Asset(name)
+-	if err != nil {
+-		panic("asset: Asset(" + name + "): " + err.Error())
+-	}
+-
+-	return a
+-}
+-
+-// AssetInfo loads and returns the asset info for the given name.
+-// It returns an error if the asset could not be found or
+-// could not be loaded.
+-func AssetInfo(name string) (os.FileInfo, error) {
+-	cannonicalName := strings.Replace(name, "\\", "/", -1)
+-	if f, ok := _bindata[cannonicalName]; ok {
+-		a, err := f()
+-		if err != nil {
+-			return nil, fmt.Errorf("AssetInfo %s can't read by error: %v", name, err)
+-		}
+-		return a.info, nil
+-	}
+-	return nil, fmt.Errorf("AssetInfo %s not found", name)
+-}
+-
+-// AssetNames returns the names of the assets.
+-func AssetNames() []string {
+-	names := make([]string, 0, len(_bindata))
+-	for name := range _bindata {
+-		names = append(names, name)
+-	}
+-	return names
+-}
+-
+-// _bindata is a table, holding each asset generator, mapped to its name.
+-var _bindata = map[string]func() (*asset, error){
+-	"v4.0.0/controller/clusterrole.yaml":        v400ControllerClusterroleYaml,
+-	"v4.0.0/controller/clusterrolebinding.yaml": v400ControllerClusterrolebindingYaml,
+-	"v4.0.0/controller/deployment.yaml":         v400ControllerDeploymentYaml,
+-	"v4.0.0/controller/ns.yaml":                 v400ControllerNsYaml,
+-	"v4.0.0/controller/role.yaml":               v400ControllerRoleYaml,
+-	"v4.0.0/controller/rolebinding.yaml":        v400ControllerRolebindingYaml,
+-	"v4.0.0/controller/sa.yaml":                 v400ControllerSaYaml,
+-	"v4.0.0/controller/signing-cabundle.yaml":   v400ControllerSigningCabundleYaml,
+-	"v4.0.0/controller/signing-secret.yaml":     v400ControllerSigningSecretYaml,
+-}
+-
+-// AssetDir returns the file names below a certain
+-// directory embedded in the file by go-bindata.
+-// For example if you run go-bindata on data/... and data contains the
+-// following hierarchy:
+-//
+-//	data/
+-//	  foo.txt
+-//	  img/
+-//	    a.png
+-//	    b.png
+-//
+-// then AssetDir("data") would return []string{"foo.txt", "img"}
+-// AssetDir("data/img") would return []string{"a.png", "b.png"}
+-// AssetDir("foo.txt") and AssetDir("notexist") would return an error
+-// AssetDir("") will return []string{"data"}.
+-func AssetDir(name string) ([]string, error) {
+-	node := _bintree
+-	if len(name) != 0 {
+-		cannonicalName := strings.Replace(name, "\\", "/", -1)
+-		pathList := strings.Split(cannonicalName, "/")
+-		for _, p := range pathList {
+-			node = node.Children[p]
+-			if node == nil {
+-				return nil, fmt.Errorf("Asset %s not found", name)
+-			}
+-		}
+-	}
+-	if node.Func != nil {
+-		return nil, fmt.Errorf("Asset %s not found", name)
+-	}
+-	rv := make([]string, 0, len(node.Children))
+-	for childName := range node.Children {
+-		rv = append(rv, childName)
+-	}
+-	return rv, nil
+-}
+-
+-type bintree struct {
+-	Func     func() (*asset, error)
+-	Children map[string]*bintree
+-}
+-
+-var _bintree = &bintree{nil, map[string]*bintree{
+-	"v4.0.0": {nil, map[string]*bintree{
+-		"controller": {nil, map[string]*bintree{
+-			"clusterrole.yaml":        {v400ControllerClusterroleYaml, map[string]*bintree{}},
+-			"clusterrolebinding.yaml": {v400ControllerClusterrolebindingYaml, map[string]*bintree{}},
+-			"deployment.yaml":         {v400ControllerDeploymentYaml, map[string]*bintree{}},
+-			"ns.yaml":                 {v400ControllerNsYaml, map[string]*bintree{}},
+-			"role.yaml":               {v400ControllerRoleYaml, map[string]*bintree{}},
+-			"rolebinding.yaml":        {v400ControllerRolebindingYaml, map[string]*bintree{}},
+-			"sa.yaml":                 {v400ControllerSaYaml, map[string]*bintree{}},
+-			"signing-cabundle.yaml":   {v400ControllerSigningCabundleYaml, map[string]*bintree{}},
+-			"signing-secret.yaml":     {v400ControllerSigningSecretYaml, map[string]*bintree{}},
+-		}},
+-	}},
+-}}
+-
+-// RestoreAsset restores an asset under the given directory
+-func RestoreAsset(dir, name string) error {
+-	data, err := Asset(name)
+-	if err != nil {
+-		return err
+-	}
+-	info, err := AssetInfo(name)
+-	if err != nil {
+-		return err
+-	}
+-	err = os.MkdirAll(_filePath(dir, filepath.Dir(name)), os.FileMode(0755))
+-	if err != nil {
+-		return err
+-	}
+-	err = ioutil.WriteFile(_filePath(dir, name), data, info.Mode())
+-	if err != nil {
+-		return err
+-	}
+-	err = os.Chtimes(_filePath(dir, name), info.ModTime(), info.ModTime())
+-	if err != nil {
+-		return err
+-	}
+-	return nil
+-}
+-
+-// RestoreAssets restores an asset under the given directory recursively
+-func RestoreAssets(dir, name string) error {
+-	children, err := AssetDir(name)
+-	// File
+-	if err != nil {
+-		return RestoreAsset(dir, name)
+-	}
+-	// Dir
+-	for _, child := range children {
+-		err = RestoreAssets(dir, filepath.Join(name, child))
+-		if err != nil {
+-			return err
+-		}
+-	}
+-	return nil
+-}
+-
+-func _filePath(dir, name string) string {
+-	cannonicalName := strings.Replace(name, "\\", "/", -1)
+-	return filepath.Join(append([]string{dir}, strings.Split(cannonicalName, "/")...)...)
+-}
+diff --git a/vendor/github.com/go-bindata/go-bindata/.gitignore b/vendor/github.com/go-bindata/go-bindata/.gitignore
+deleted file mode 100644
+index b9abe353d..000000000
+--- a/vendor/github.com/go-bindata/go-bindata/.gitignore
++++ /dev/null
+@@ -1,16 +0,0 @@
+-# Binaries for programs and plugins
+-*.exe
+-*.exe~
+-*.dll
+-*.so
+-*.dylib
+-
+-# Test binary, build with `go test -c`
+-*.test
+-
+-# Output of the go coverage tool, specifically when used with LiteIDE
+-*.out
+-
+-# Goland project files
+-.idea/
+-*.iml
+diff --git a/vendor/github.com/go-bindata/go-bindata/CONTRIBUTING.md b/vendor/github.com/go-bindata/go-bindata/CONTRIBUTING.md
+deleted file mode 100644
+index e0732f54e..000000000
+--- a/vendor/github.com/go-bindata/go-bindata/CONTRIBUTING.md
++++ /dev/null
+@@ -1,79 +0,0 @@
+-## Contribution guidelines.
+-
+-So you wish to contribute to this project? Fantastic!
+-Here are a few guidelines to help you do this in a
+-streamlined fashion.
+-
+-
+-## Bug reports
+-
+-When supplying a bug report, please consider the following guidelines.
+-These serve to make it easier for us to address the issue and find a solution.
+-Most of these are pretty self-evident, but sometimes it is still necessary
+-to reiterate them.
+-
+-* Be clear in the way you express the problem. Use simple language and
+-  just enough of it to clearly define the issue. Not everyone is a native
+-  English speaker. And while most can handle themselves pretty well,
+-  it helps to stay away from more esoteric vocabulary.
+-  
+-  Be patient with non-native English speakers. If their bug reports
+-  or comments are hard to understand, just ask for clarification.
+-  Do not start guessing at their meaning, as this may just lead to
+-  more confusion and misunderstandings.
+-* Clearly define any information which is relevant to the problem.
+-  This includes library versions, operating system and any other
+-  external dependencies which may be needed.
+-* Where applicable, provide a step-by-step listing of the way to
+-  reproduce the problem. Make sure this is the simplest possible
+-  way to do so. Omit any and all unneccesary steps, because they may
+-  just complicate our understanding of the real problem.
+-  If need be, create a whole new code project on your local machine,
+-  which specifically tries to create the problem you are running into;
+-  nothing more, nothing less.
+-  
+-  Include this program in the bug report. It often suffices to paste
+-  the code in a [Gist](https://gist.github.com) or on the
+-  [Go playground](http://play.golang.org).
+-* If possible, provide us with a listing of the steps you have already
+-  undertaken to solve the problem. This can save us a great deal of
+-  wasted time, trying out solutions you have already covered.
+-
+-
+-## Pull requests
+-
+-Bug reports are great. Supplying fixes to bugs is even better.
+-When submitting a pull request, the following guidelines are
+-good to keep in mind:
+-
+-* `go fmt`: **Always** run your code through `go fmt`, before
+-  committing it. Code has to be readable by many different
+-  people. And the only way this will be as painless as possible,
+-  is if we all stick to the same code style.
+-  
+-  Some of our projects may have automated build-servers hooked up
+-  to commit hooks. These will vet any submitted code and determine
+-  if it meets a set of properties. One of which is code formatting.
+-  These servers will outright deny a submission which has not been
+-  run through `go fmt`, even if the code itself is correct.
+-  
+-  We try to maintain a zero-tolerance policy on this matter,
+-  because consistently formatted code makes life a great deal
+-  easier for everyone involved.
+-* Commit log messages: When committing changes, do so often and
+-  clearly -- Even if you have changed only 1 character in a code
+-  comment. This means that commit log messages should clearly state
+-  exactly what the change does and why. If it fixes a known issue,
+-  then mention the issue number in the commit log. E.g.:
+-  
+-  > Fixes return value for `foo/boo.Baz()` to be consistent with
+-  > the rest of the API. This addresses issue #32
+-  
+-  Do not pile a lot of unrelated changes into a single commit.
+-  Pick and choose only those changes for a single commit, which are
+-  directly related. We would much rather see a hundred commits
+-  saying nothing but `"Runs go fmt"` in between any real fixes
+-  than have these style changes embedded in those real fixes.
+-  It creates a lot of noise when trying to review code.
+-
+-
+diff --git a/vendor/github.com/go-bindata/go-bindata/LICENSE b/vendor/github.com/go-bindata/go-bindata/LICENSE
+deleted file mode 100644
+index c07a9311f..000000000
+--- a/vendor/github.com/go-bindata/go-bindata/LICENSE
++++ /dev/null
+@@ -1,3 +0,0 @@
+-This work is subject to the CC0 1.0 Universal (CC0 1.0) Public Domain Dedication
+-license. Its contents can be found at:
+-http://creativecommons.org/publicdomain/zero/1.0
+diff --git a/vendor/github.com/go-bindata/go-bindata/Makefile b/vendor/github.com/go-bindata/go-bindata/Makefile
+deleted file mode 100644
+index 84b661cb2..000000000
+--- a/vendor/github.com/go-bindata/go-bindata/Makefile
++++ /dev/null
+@@ -1,2 +0,0 @@
+-all:
+-	make -C testdata
+diff --git a/vendor/github.com/go-bindata/go-bindata/README.md b/vendor/github.com/go-bindata/go-bindata/README.md
+deleted file mode 100644
+index 155350532..000000000
+--- a/vendor/github.com/go-bindata/go-bindata/README.md
++++ /dev/null
+@@ -1,199 +0,0 @@
+-## bindata
+-
+-[![Go Report Card](https://goreportcard.com/badge/github.com/go-bindata/bindata)](https://goreportcard.com/report/github.com/go-bindata/bindata)
+-
+-This package converts any file into managable Go source code. Useful for
+-embedding binary data into a go program. The file data is optionally gzip
+-compressed before being converted to a raw byte slice.
+-
+-It comes with a command line tool in the `go-bindata` sub directory.
+-This tool offers a set of command line options, used to customize the
+-output being generated.
+-
+-
+-### Installation
+-
+-To install the library and command line program, use the following:
+-
+-	go get -u github.com/go-bindata/go-bindata/...
+-
+-
+-### Usage
+-
+-Conversion is done on one or more sets of files. They are all embedded in a new
+-Go source file, along with a table of contents and an `Asset` function,
+-which allows quick access to the asset, based on its name.
+-
+-The simplest invocation generates a `bindata.go` file in the current
+-working directory. It includes all assets from the `data` directory.
+-
+-	$ go-bindata data/
+-
+-To include all input sub-directories recursively, use the elipsis postfix
+-as defined for Go import paths. Otherwise it will only consider assets in the
+-input directory itself.
+-
+-	$ go-bindata data/...
+-
+-To specify the name of the output file being generated, we use the following:
+-
+-	$ go-bindata -o myfile.go data/
+-
+-Multiple input directories can be specified if necessary.
+-
+-	$ go-bindata dir1/... /path/to/dir2/... dir3
+-
+-
+-The following paragraphs detail some of the command line options which can be 
+-supplied to `go-bindata`. Refer to the `testdata/out` directory for various
+-output examples from the assets in `testdata/in`. Each example uses different
+-command line options.
+-
+-To ignore files, pass in regexes using -ignore, for example:
+-
+-    $ go-bindata -ignore=\\.gitignore data/...
+-
+-### Accessing an asset
+-
+-To access asset data, we use the `Asset(string) ([]byte, error)` function which
+-is included in the generated output.
+-
+-	data, err := Asset("pub/style/foo.css")
+-	if err != nil {
+-		// Asset was not found.
+-	}
+-
+-	// use asset data
+-
+-
+-### Debug vs Release builds
+-
+-When invoking the program with the `-debug` flag, the generated code does
+-not actually include the asset data. Instead, it generates function stubs
+-which load the data from the original file on disk. The asset API remains
+-identical between debug and release builds, so your code will not have to
+-change.
+-
+-This is useful during development when you expect the assets to change often.
+-The host application using these assets uses the same API in both cases and
+-will not have to care where the actual data comes from.
+-
+-An example is a Go webserver with some embedded, static web content like
+-HTML, JS and CSS files. While developing it, you do not want to rebuild the
+-whole server and restart it every time you make a change to a bit of
+-javascript. You just want to build and launch the server once. Then just press
+-refresh in the browser to see those changes. Embedding the assets with the
+-`debug` flag allows you to do just that. When you are finished developing and
+-ready for deployment, just re-invoke `go-bindata` without the `-debug` flag.
+-It will now embed the latest version of the assets.
+-
+-
+-### Lower memory footprint
+-
+-Using the `-nomemcopy` flag, will alter the way the output file is generated.
+-It will employ a hack that allows us to read the file data directly from
+-the compiled program's `.rodata` section. This ensures that when we call
+-call our generated function, we omit unnecessary memcopies.
+-
+-The downside of this, is that it requires dependencies on the `reflect` and
+-`unsafe` packages. These may be restricted on platforms like AppEngine and
+-thus prevent you from using this mode.
+-
+-Another disadvantage is that the byte slice we create, is strictly read-only.
+-For most use-cases this is not a problem, but if you ever try to alter the
+-returned byte slice, a runtime panic is thrown. Use this mode only on target
+-platforms where memory constraints are an issue.
+-
+-The default behaviour is to use the old code generation method. This
+-prevents the two previously mentioned issues, but will employ at least one
+-extra memcopy and thus increase memory requirements.
+-
+-For instance, consider the following two examples:
+-
+-This would be the default mode, using an extra memcopy but gives a safe
+-implementation without dependencies on `reflect` and `unsafe`:
+-
+-```go
+-func myfile() []byte {
+-    return []byte{0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a}
+-}
+-```
+-
+-Here is the same functionality, but uses the `.rodata` hack.
+-The byte slice returned from this example can not be written to without
+-generating a runtime error.
+-
+-```go
+-var _myfile = "\x89\x50\x4e\x47\x0d\x0a\x1a"
+-
+-func myfile() []byte {
+-    var empty [0]byte
+-    sx := (*reflect.StringHeader)(unsafe.Pointer(&_myfile))
+-    b := empty[:]
+-    bx := (*reflect.SliceHeader)(unsafe.Pointer(&b))
+-    bx.Data = sx.Data
+-    bx.Len = len(_myfile)
+-    bx.Cap = bx.Len
+-    return b
+-}
+-```
+-
+-
+-### Optional compression
+-
+-When the `-nocompress` flag is given, the supplied resource is *not* GZIP
+-compressed before being turned into Go code. The data should still be accessed
+-through a function call, so nothing changes in the usage of the generated file.
+-
+-This feature is useful if you do not care for compression, or the supplied
+-resource is already compressed. Doing it again would not add any value and may
+-even increase the size of the data.
+-
+-The default behaviour of the program is to use compression.
+-
+-
+-### Path prefix stripping
+-
+-The keys used in the `_bindata` map, are the same as the input file name
+-passed to `go-bindata`. This includes the path. In most cases, this is not
+-desireable, as it puts potentially sensitive information in your code base.
+-For this purpose, the tool supplies another command line flag `-prefix`.
+-This accepts a portion of a path name, which should be stripped off from
+-the map keys and function names.
+-
+-For example, running without the `-prefix` flag, we get:
+-
+-	$ go-bindata /path/to/templates/
+-
+-	_bindata["/path/to/templates/foo.html"] = path_to_templates_foo_html
+-
+-Running with the `-prefix` flag, we get:
+-
+-	$ go-bindata -prefix "/path/to/" /path/to/templates/
+-
+-	_bindata["templates/foo.html"] = templates_foo_html
+-
+-
+-### Build tags
+-
+-With the optional `-tags` flag, you can specify any go build tags that
+-must be fulfilled for the output file to be included in a build. This
+-is useful when including binary data in multiple formats, where the desired
+-format is specified at build time with the appropriate tags.
+-
+-The tags are appended to a `// +build` line in the beginning of the output file
+-and must follow the build tags syntax specified by the go tool.
+-
+-### Serve assets with `net/http`
+-
+-With the `-fs` flag, `go-bindata` will add an `AssetFile()` method returning an `http.FileSystem` interface:
+-
+-	$ go-bindata -fs -prefix "static/" static/
+-
+-Use `-prefix` flag to strip first level dir, then in your `net/http` router, you can use `AssetFile()` with `http.FileServer()` like:
+-
+-```go
+-mux := http.NewServeMux()
+-mux.Handle("/static", http.FileServer(AssetFile()))
+-http.ListenAndServe(":8080", mux)
+-```
+diff --git a/vendor/github.com/go-bindata/go-bindata/_config.yml b/vendor/github.com/go-bindata/go-bindata/_config.yml
+deleted file mode 100644
+index c4192631f..000000000
+--- a/vendor/github.com/go-bindata/go-bindata/_config.yml
++++ /dev/null
+@@ -1 +0,0 @@
+-theme: jekyll-theme-cayman
+\ No newline at end of file
+diff --git a/vendor/github.com/go-bindata/go-bindata/asset.go b/vendor/github.com/go-bindata/go-bindata/asset.go
+deleted file mode 100644
+index 95b6b94f3..000000000
+--- a/vendor/github.com/go-bindata/go-bindata/asset.go
++++ /dev/null
+@@ -1,12 +0,0 @@
+-// This work is subject to the CC0 1.0 Universal (CC0 1.0) Public Domain Dedication
+-// license. Its contents can be found at:
+-// http://creativecommons.org/publicdomain/zero/1.0/
+-
+-package bindata
+-
+-// Asset holds information about a single asset to be processed.
+-type Asset struct {
+-	Path string // Full file path.
+-	Name string // Key used in TOC -- name by which asset is referenced.
+-	Func string // Function name for the procedure returning the asset contents.
+-}
+diff --git a/vendor/github.com/go-bindata/go-bindata/bytewriter.go b/vendor/github.com/go-bindata/go-bindata/bytewriter.go
+deleted file mode 100644
+index 05d6d6780..000000000
+--- a/vendor/github.com/go-bindata/go-bindata/bytewriter.go
++++ /dev/null
+@@ -1,44 +0,0 @@
+-// This work is subject to the CC0 1.0 Universal (CC0 1.0) Public Domain Dedication
+-// license. Its contents can be found at:
+-// http://creativecommons.org/publicdomain/zero/1.0/
+-
+-package bindata
+-
+-import (
+-	"fmt"
+-	"io"
+-)
+-
+-var (
+-	newline    = []byte{'\n'}
+-	dataindent = []byte{'\t', '\t'}
+-	space      = []byte{' '}
+-)
+-
+-type ByteWriter struct {
+-	io.Writer
+-	c int
+-}
+-
+-func (w *ByteWriter) Write(p []byte) (n int, err error) {
+-	if len(p) == 0 {
+-		return
+-	}
+-
+-	for n = range p {
+-		if w.c%12 == 0 {
+-			w.Writer.Write(newline)
+-			w.Writer.Write(dataindent)
+-			w.c = 0
+-		} else {
+-			w.Writer.Write(space)
+-		}
+-
+-		fmt.Fprintf(w.Writer, "0x%02x,", p[n])
+-		w.c++
+-	}
+-
+-	n++
+-
+-	return
+-}
+diff --git a/vendor/github.com/go-bindata/go-bindata/config.go b/vendor/github.com/go-bindata/go-bindata/config.go
+deleted file mode 100644
+index 471c32f1b..000000000
+--- a/vendor/github.com/go-bindata/go-bindata/config.go
++++ /dev/null
+@@ -1,208 +0,0 @@
+-// This work is subject to the CC0 1.0 Universal (CC0 1.0) Public Domain Dedication
+-// license. Its contents can be found at:
+-// http://creativecommons.org/publicdomain/zero/1.0/
+-
+-package bindata
+-
+-import (
+-	"fmt"
+-	"os"
+-	"path/filepath"
+-	"regexp"
+-)
+-
+-// InputConfig defines options on a asset directory to be convert.
+-type InputConfig struct {
+-	// Path defines a directory containing asset files to be included
+-	// in the generated output.
+-	Path string
+-
+-	// Recusive defines whether subdirectories of Path
+-	// should be recursively included in the conversion.
+-	Recursive bool
+-}
+-
+-// Config defines a set of options for the asset conversion.
+-type Config struct {
+-	// Name of the package to use. Defaults to 'main'.
+-	Package string
+-
+-	// Tags specify a set of optional build tags, which should be
+-	// included in the generated output. The tags are appended to a
+-	// `// +build` line in the beginning of the output file
+-	// and must follow the build tags syntax specified by the go tool.
+-	Tags string
+-
+-	// Input defines the directory path, containing all asset files as
+-	// well as whether to recursively process assets in any sub directories.
+-	Input []InputConfig
+-
+-	// Output defines the output file for the generated code.
+-	// If left empty, this defaults to 'bindata.go' in the current
+-	// working directory.
+-	Output string
+-
+-	// Prefix defines a path prefix which should be stripped from all
+-	// file names when generating the keys in the table of contents.
+-	// For example, running without the `-prefix` flag, we get:
+-	//
+-	// 	$ go-bindata /path/to/templates
+-	// 	go_bindata["/path/to/templates/foo.html"] = _path_to_templates_foo_html
+-	//
+-	// Running with the `-prefix` flag, we get:
+-	//
+-	// 	$ go-bindata -prefix "/path/to/" /path/to/templates/foo.html
+-	// 	go_bindata["templates/foo.html"] = templates_foo_html
+-	Prefix string
+-
+-	// NoMemCopy will alter the way the output file is generated.
+-	//
+-	// It will employ a hack that allows us to read the file data directly from
+-	// the compiled program's `.rodata` section. This ensures that when we call
+-	// call our generated function, we omit unnecessary mem copies.
+-	//
+-	// The downside of this, is that it requires dependencies on the `reflect` and
+-	// `unsafe` packages. These may be restricted on platforms like AppEngine and
+-	// thus prevent you from using this mode.
+-	//
+-	// Another disadvantage is that the byte slice we create, is strictly read-only.
+-	// For most use-cases this is not a problem, but if you ever try to alter the
+-	// returned byte slice, a runtime panic is thrown. Use this mode only on target
+-	// platforms where memory constraints are an issue.
+-	//
+-	// The default behaviour is to use the old code generation method. This
+-	// prevents the two previously mentioned issues, but will employ at least one
+-	// extra memcopy and thus increase memory requirements.
+-	//
+-	// For instance, consider the following two examples:
+-	//
+-	// This would be the default mode, using an extra memcopy but gives a safe
+-	// implementation without dependencies on `reflect` and `unsafe`:
+-	//
+-	// 	func myfile() []byte {
+-	// 		return []byte{0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a}
+-	// 	}
+-	//
+-	// Here is the same functionality, but uses the `.rodata` hack.
+-	// The byte slice returned from this example can not be written to without
+-	// generating a runtime error.
+-	//
+-	// 	var _myfile = "\x89\x50\x4e\x47\x0d\x0a\x1a"
+-	//
+-	// 	func myfile() []byte {
+-	// 		var empty [0]byte
+-	// 		sx := (*reflect.StringHeader)(unsafe.Pointer(&_myfile))
+-	// 		b := empty[:]
+-	// 		bx := (*reflect.SliceHeader)(unsafe.Pointer(&b))
+-	// 		bx.Data = sx.Data
+-	// 		bx.Len = len(_myfile)
+-	// 		bx.Cap = bx.Len
+-	// 		return b
+-	// 	}
+-	NoMemCopy bool
+-
+-	// NoCompress means the assets are /not/ GZIP compressed before being turned
+-	// into Go code. The generated function will automatically unzip
+-	// the file data when called. Defaults to false.
+-	NoCompress bool
+-
+-	// HttpFileSystem means whether generate return http.FileSystem interface
+-	// instance's function.When true,will generate relate code.
+-	HttpFileSystem bool
+-
+-	// Perform a debug build. This generates an asset file, which
+-	// loads the asset contents directly from disk at their original
+-	// location, instead of embedding the contents in the code.
+-	//
+-	// This is mostly useful if you anticipate that the assets are
+-	// going to change during your development cycle. You will always
+-	// want your code to access the latest version of the asset.
+-	// Only in release mode, will the assets actually be embedded
+-	// in the code. The default behaviour is Release mode.
+-	Debug bool
+-
+-	// Perform a dev build, which is nearly identical to the debug option. The
+-	// only difference is that instead of absolute file paths in generated code,
+-	// it expects a variable, `rootDir`, to be set in the generated code's
+-	// package (the author needs to do this manually), which it then prepends to
+-	// an asset's name to construct the file path on disk.
+-	//
+-	// This is mainly so you can push the generated code file to a shared
+-	// repository.
+-	Dev bool
+-
+-	// When true, size, mode and modtime are not preserved from files
+-	NoMetadata bool
+-	// When nonzero, use this as mode for all files.
+-	Mode uint
+-	// When nonzero, use this as unix timestamp for all files.
+-	ModTime int64
+-
+-	// Ignores any filenames matching the regex pattern specified, e.g.
+-	// path/to/file.ext will ignore only that file, or \\.gitignore
+-	// will match any .gitignore file.
+-	//
+-	// This parameter can be provided multiple times.
+-	Ignore []*regexp.Regexp
+-}
+-
+-// NewConfig returns a default configuration struct.
+-func NewConfig() *Config {
+-	c := new(Config)
+-	c.Package = "main"
+-	c.NoMemCopy = false
+-	c.NoCompress = false
+-	c.HttpFileSystem = false
+-	c.Debug = false
+-	c.Output = "./bindata.go"
+-	c.Ignore = make([]*regexp.Regexp, 0)
+-	return c
+-}
+-
+-// validate ensures the config has sane values.
+-// Part of which means checking if certain file/directory paths exist.
+-func (c *Config) validate() error {
+-	if len(c.Package) == 0 {
+-		return fmt.Errorf("Missing package name")
+-	}
+-
+-	for _, input := range c.Input {
+-		_, err := os.Lstat(input.Path)
+-		if err != nil {
+-			return fmt.Errorf("Failed to stat input path '%s': %v", input.Path, err)
+-		}
+-	}
+-
+-	if len(c.Output) == 0 {
+-		cwd, err := os.Getwd()
+-		if err != nil {
+-			return fmt.Errorf("Unable to determine current working directory.")
+-		}
+-
+-		c.Output = filepath.Join(cwd, "bindata.go")
+-	}
+-
+-	stat, err := os.Lstat(c.Output)
+-	if err != nil {
+-		if !os.IsNotExist(err) {
+-			return fmt.Errorf("Output path: %v", err)
+-		}
+-
+-		// File does not exist. This is fine, just make
+-		// sure the directory it is to be in exists.
+-		dir, _ := filepath.Split(c.Output)
+-		if dir != "" {
+-			err = os.MkdirAll(dir, 0744)
+-
+-			if err != nil {
+-				return fmt.Errorf("Create output directory: %v", err)
+-			}
+-		}
+-	}
+-
+-	if stat != nil && stat.IsDir() {
+-		return fmt.Errorf("Output path is a directory.")
+-	}
+-
+-	return nil
+-}
+diff --git a/vendor/github.com/go-bindata/go-bindata/convert.go b/vendor/github.com/go-bindata/go-bindata/convert.go
+deleted file mode 100644
+index 8660ee9f4..000000000
+--- a/vendor/github.com/go-bindata/go-bindata/convert.go
++++ /dev/null
+@@ -1,261 +0,0 @@
+-// This work is subject to the CC0 1.0 Universal (CC0 1.0) Public Domain Dedication
+-// license. Its contents can be found at:
+-// http://creativecommons.org/publicdomain/zero/1.0/
+-
+-package bindata
+-
+-import (
+-	"bufio"
+-	"fmt"
+-	"os"
+-	"path/filepath"
+-	"regexp"
+-	"sort"
+-	"strings"
+-	"unicode"
+-)
+-
+-// Translate reads assets from an input directory, converts them
+-// to Go code and writes new files to the output specified
+-// in the given configuration.
+-func Translate(c *Config) error {
+-	var toc []Asset
+-
+-	// Ensure our configuration has sane values.
+-	err := c.validate()
+-	if err != nil {
+-		return err
+-	}
+-
+-	var knownFuncs = make(map[string]int)
+-	var visitedPaths = make(map[string]bool)
+-	// Locate all the assets.
+-	for _, input := range c.Input {
+-		err = findFiles(input.Path, c.Prefix, input.Recursive, &toc, c.Ignore, knownFuncs, visitedPaths)
+-		if err != nil {
+-			return err
+-		}
+-	}
+-
+-	// Create output file.
+-	fd, err := os.Create(c.Output)
+-	if err != nil {
+-		return err
+-	}
+-
+-	defer fd.Close()
+-
+-	// Create a buffered writer for better performance.
+-	bfd := bufio.NewWriter(fd)
+-	defer bfd.Flush()
+-
+-	// Write the header. This makes e.g. Github ignore diffs in generated files.
+-	if _, err = fmt.Fprintf(bfd, "// Code generated for package %s by go-bindata DO NOT EDIT. (@generated)\n", c.Package); err != nil {
+-		return err
+-	}
+-	if _, err = fmt.Fprint(bfd, "// sources:\n"); err != nil {
+-		return err
+-	}
+-
+-	wd, err := os.Getwd()
+-	if err != nil {
+-		return err
+-	}
+-
+-	for _, asset := range toc {
+-		relative, _ := filepath.Rel(wd, asset.Path)
+-		if _, err = fmt.Fprintf(bfd, "// %s\n", filepath.ToSlash(relative)); err != nil {
+-			return err
+-		}
+-	}
+-	//if _, err = fmt.Fprint(bfd, "// DO NOT EDIT!\n\n"); err != nil {
+-	//	return err
+-	//}
+-
+-	// Write build tags, if applicable.
+-	if len(c.Tags) > 0 {
+-		if _, err = fmt.Fprintf(bfd, "// +build %s\n\n", c.Tags); err != nil {
+-			return err
+-		}
+-	}
+-
+-	// Write package declaration.
+-	_, err = fmt.Fprintf(bfd, "package %s\n\n", c.Package)
+-	if err != nil {
+-		return err
+-	}
+-
+-	// Write assets.
+-	if c.Debug || c.Dev {
+-		err = writeDebug(bfd, c, toc)
+-	} else {
+-		err = writeRelease(bfd, c, toc)
+-	}
+-
+-	if err != nil {
+-		return err
+-	}
+-
+-	// Write table of contents
+-	if err := writeTOC(bfd, toc); err != nil {
+-		return err
+-	}
+-	// Write hierarchical tree of assets
+-	if err := writeTOCTree(bfd, toc); err != nil {
+-		return err
+-	}
+-
+-	// Write restore procedure
+-	return writeRestore(bfd)
+-}
+-
+-// ByName implements sort.Interface for []os.FileInfo based on Name()
+-type ByName []os.FileInfo
+-
+-func (v ByName) Len() int           { return len(v) }
+-func (v ByName) Swap(i, j int)      { v[i], v[j] = v[j], v[i] }
+-func (v ByName) Less(i, j int) bool { return v[i].Name() < v[j].Name() }
+-
+-// findFiles recursively finds all the file paths in the given directory tree.
+-// They are added to the given map as keys. Values will be safe function names
+-// for each file, which will be used when generating the output code.
+-func findFiles(dir, prefix string, recursive bool, toc *[]Asset, ignore []*regexp.Regexp, knownFuncs map[string]int, visitedPaths map[string]bool) error {
+-	dirpath := dir
+-	if len(prefix) > 0 {
+-		dirpath, _ = filepath.Abs(dirpath)
+-		prefix, _ = filepath.Abs(prefix)
+-		prefix = filepath.ToSlash(prefix)
+-	}
+-
+-	fi, err := os.Stat(dirpath)
+-	if err != nil {
+-		return err
+-	}
+-
+-	var list []os.FileInfo
+-
+-	if !fi.IsDir() {
+-		dirpath = filepath.Dir(dirpath)
+-		list = []os.FileInfo{fi}
+-	} else {
+-		visitedPaths[dirpath] = true
+-		fd, err := os.Open(dirpath)
+-		if err != nil {
+-			return err
+-		}
+-
+-		defer fd.Close()
+-
+-		list, err = fd.Readdir(0)
+-		if err != nil {
+-			return err
+-		}
+-
+-		// Sort to make output stable between invocations
+-		sort.Sort(ByName(list))
+-	}
+-
+-	for _, file := range list {
+-		var asset Asset
+-		asset.Path = filepath.Join(dirpath, file.Name())
+-		asset.Name = filepath.ToSlash(asset.Path)
+-
+-		ignoring := false
+-		for _, re := range ignore {
+-			if re.MatchString(asset.Path) {
+-				ignoring = true
+-				break
+-			}
+-		}
+-		if ignoring {
+-			continue
+-		}
+-
+-		if file.IsDir() {
+-			if recursive {
+-				recursivePath := filepath.Join(dir, file.Name())
+-				visitedPaths[asset.Path] = true
+-				findFiles(recursivePath, prefix, recursive, toc, ignore, knownFuncs, visitedPaths)
+-			}
+-			continue
+-		} else if file.Mode()&os.ModeSymlink == os.ModeSymlink {
+-			var linkPath string
+-			if linkPath, err = os.Readlink(asset.Path); err != nil {
+-				return err
+-			}
+-			if !filepath.IsAbs(linkPath) {
+-				if linkPath, err = filepath.Abs(dirpath + "/" + linkPath); err != nil {
+-					return err
+-				}
+-			}
+-			if _, ok := visitedPaths[linkPath]; !ok {
+-				visitedPaths[linkPath] = true
+-				findFiles(asset.Path, prefix, recursive, toc, ignore, knownFuncs, visitedPaths)
+-			}
+-			continue
+-		}
+-
+-		if strings.HasPrefix(asset.Name, prefix) {
+-			asset.Name = asset.Name[len(prefix):]
+-		} else {
+-			asset.Name = filepath.Join(dir, file.Name())
+-		}
+-
+-		// If we have a leading slash, get rid of it.
+-		if len(asset.Name) > 0 && asset.Name[0] == '/' {
+-			asset.Name = asset.Name[1:]
+-		}
+-
+-		// This shouldn't happen.
+-		if len(asset.Name) == 0 {
+-			return fmt.Errorf("Invalid file: %v", asset.Path)
+-		}
+-
+-		asset.Func = safeFunctionName(asset.Name, knownFuncs)
+-		asset.Path, _ = filepath.Abs(asset.Path)
+-		*toc = append(*toc, asset)
+-	}
+-
+-	return nil
+-}
+-
+-var regFuncName = regexp.MustCompile(`[^a-zA-Z0-9_]`)
+-
+-// safeFunctionName converts the given name into a name
+-// which qualifies as a valid function identifier. It
+-// also compares against a known list of functions to
+-// prevent conflict based on name translation.
+-func safeFunctionName(name string, knownFuncs map[string]int) string {
+-	var inBytes, outBytes []byte
+-	var toUpper bool
+-
+-	name = strings.ToLower(name)
+-	inBytes = []byte(name)
+-
+-	for i := 0; i < len(inBytes); i++ {
+-		if regFuncName.Match([]byte{inBytes[i]}) {
+-			toUpper = true
+-		} else if toUpper {
+-			outBytes = append(outBytes, []byte(strings.ToUpper(string(inBytes[i])))...)
+-			toUpper = false
+-		} else {
+-			outBytes = append(outBytes, inBytes[i])
+-		}
+-	}
+-
+-	name = string(outBytes)
+-
+-	// Identifier can't start with a digit.
+-	if unicode.IsDigit(rune(name[0])) {
+-		name = "_" + name
+-	}
+-
+-	if num, ok := knownFuncs[name]; ok {
+-		knownFuncs[name] = num + 1
+-		name = fmt.Sprintf("%s%d", name, num)
+-	} else {
+-		knownFuncs[name] = 2
+-	}
+-
+-	return name
+-}
+diff --git a/vendor/github.com/go-bindata/go-bindata/debug.go b/vendor/github.com/go-bindata/go-bindata/debug.go
+deleted file mode 100644
+index edb3270d6..000000000
+--- a/vendor/github.com/go-bindata/go-bindata/debug.go
++++ /dev/null
+@@ -1,108 +0,0 @@
+-// This work is subject to the CC0 1.0 Universal (CC0 1.0) Public Domain Dedication
+-// license. Its contents can be found at:
+-// http://creativecommons.org/publicdomain/zero/1.0/
+-
+-package bindata
+-
+-import (
+-	"fmt"
+-	"io"
+-)
+-
+-// writeDebug writes the debug code file.
+-func writeDebug(w io.Writer, c *Config, toc []Asset) error {
+-	err := writeDebugHeader(w, c)
+-	if err != nil {
+-		return err
+-	}
+-
+-	err = writeAssetFS(w, c)
+-	if err != nil {
+-		return err
+-	}
+-
+-	for i := range toc {
+-		err = writeDebugAsset(w, c, &toc[i])
+-		if err != nil {
+-			return err
+-		}
+-	}
+-
+-	return nil
+-}
+-
+-// writeDebugHeader writes output file headers.
+-// This targets debug builds.
+-func writeDebugHeader(w io.Writer, c *Config) error {
+-	var header string
+-
+-	if c.HttpFileSystem {
+-		header = `import (
+-	"bytes"
+-	"net/http"
+-	"fmt"
+-	"io/ioutil"
+-	"os"
+-	"path/filepath"
+-	"strings"
+-	"time"`
+-	} else {
+-		header = `import (
+-	"fmt"
+-	"io/ioutil"
+-	"os"
+-	"path/filepath"
+-	"strings"`
+-	}
+-
+-	_, err := fmt.Fprintf(w, `%s
+-)
+-
+-// bindataRead reads the given file from disk. It returns an error on failure.
+-func bindataRead(path, name string) ([]byte, error) {
+-	buf, err := ioutil.ReadFile(path)
+-	if err != nil {
+-		err = fmt.Errorf("Error reading asset %%s at %%s: %%v", name, path, err)
+-	}
+-	return buf, err
+-}
+-
+-type asset struct {
+-	bytes []byte
+-	info  os.FileInfo
+-}
+-
+-`, header)
+-	return err
+-}
+-
+-// writeDebugAsset write a debug entry for the given asset.
+-// A debug entry is simply a function which reads the asset from
+-// the original file (e.g.: from disk).
+-func writeDebugAsset(w io.Writer, c *Config, asset *Asset) error {
+-	pathExpr := fmt.Sprintf("%q", asset.Path)
+-	if c.Dev {
+-		pathExpr = fmt.Sprintf("filepath.Join(rootDir, %q)", asset.Name)
+-	}
+-
+-	_, err := fmt.Fprintf(w, `// %s reads file data from disk. It returns an error on failure.
+-func %s() (*asset, error) {
+-	path := %s
+-	name := %q
+-	bytes, err := bindataRead(path, name)
+-	if err != nil {
+-		return nil, err
+-	}
+-
+-	fi, err := os.Stat(path)
+-	if err != nil {
+-		err = fmt.Errorf("Error reading asset info %%s at %%s: %%v", name, path, err)
+-	}
+-
+-	a := &asset{bytes: bytes, info: fi}
+-	return a, err
+-}
+-
+-`, asset.Func, asset.Func, pathExpr, asset.Name)
+-	return err
+-}
+diff --git a/vendor/github.com/go-bindata/go-bindata/doc.go b/vendor/github.com/go-bindata/go-bindata/doc.go
+deleted file mode 100644
+index 09ead1e3b..000000000
+--- a/vendor/github.com/go-bindata/go-bindata/doc.go
++++ /dev/null
+@@ -1,129 +0,0 @@
+-// This work is subject to the CC0 1.0 Universal (CC0 1.0) Public Domain Dedication
+-// license. Its contents can be found at:
+-// http://creativecommons.org/publicdomain/zero/1.0/
+-
+-/*
+-bindata converts any file into managable Go source code. Useful for
+-embedding binary data into a go program. The file data is optionally gzip
+-compressed before being converted to a raw byte slice.
+-
+-The following paragraphs cover some of the customization options
+-which can be specified in the Config struct, which must be passed into
+-the Translate() call.
+-
+-
+-Debug vs Release builds
+-
+-When used with the `Debug` option, the generated code does not actually include
+-the asset data. Instead, it generates function stubs which load the data from
+-the original file on disk. The asset API remains identical between debug and
+-release builds, so your code will not have to change.
+-
+-This is useful during development when you expect the assets to change often.
+-The host application using these assets uses the same API in both cases and
+-will not have to care where the actual data comes from.
+-
+-An example is a Go webserver with some embedded, static web content like
+-HTML, JS and CSS files. While developing it, you do not want to rebuild the
+-whole server and restart it every time you make a change to a bit of
+-javascript. You just want to build and launch the server once. Then just press
+-refresh in the browser to see those changes. Embedding the assets with the
+-`debug` flag allows you to do just that. When you are finished developing and
+-ready for deployment, just re-invoke `go-bindata` without the `-debug` flag.
+-It will now embed the latest version of the assets.
+-
+-
+-Lower memory footprint
+-
+-The `NoMemCopy` option will alter the way the output file is generated.
+-It will employ a hack that allows us to read the file data directly from
+-the compiled program's `.rodata` section. This ensures that when we call
+-call our generated function, we omit unnecessary memcopies.
+-
+-The downside of this, is that it requires dependencies on the `reflect` and
+-`unsafe` packages. These may be restricted on platforms like AppEngine and
+-thus prevent you from using this mode.
+-
+-Another disadvantage is that the byte slice we create, is strictly read-only.
+-For most use-cases this is not a problem, but if you ever try to alter the
+-returned byte slice, a runtime panic is thrown. Use this mode only on target
+-platforms where memory constraints are an issue.
+-
+-The default behaviour is to use the old code generation method. This
+-prevents the two previously mentioned issues, but will employ at least one
+-extra memcopy and thus increase memory requirements.
+-
+-For instance, consider the following two examples:
+-
+-This would be the default mode, using an extra memcopy but gives a safe
+-implementation without dependencies on `reflect` and `unsafe`:
+-
+-	func myfile() []byte {
+-		return []byte{0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a}
+-	}
+-
+-Here is the same functionality, but uses the `.rodata` hack.
+-The byte slice returned from this example can not be written to without
+-generating a runtime error.
+-
+-	var _myfile = "\x89\x50\x4e\x47\x0d\x0a\x1a"
+-
+-	func myfile() []byte {
+-		var empty [0]byte
+-		sx := (*reflect.StringHeader)(unsafe.Pointer(&_myfile))
+-		b := empty[:]
+-		bx := (*reflect.SliceHeader)(unsafe.Pointer(&b))
+-		bx.Data = sx.Data
+-		bx.Len = len(_myfile)
+-		bx.Cap = bx.Len
+-		return b
+-	}
+-
+-
+-Optional compression
+-
+-The NoCompress option indicates that the supplied assets are *not* GZIP
+-compressed before being turned into Go code. The data should still be accessed
+-through a function call, so nothing changes in the API.
+-
+-This feature is useful if you do not care for compression, or the supplied
+-resource is already compressed. Doing it again would not add any value and may
+-even increase the size of the data.
+-
+-The default behaviour of the program is to use compression.
+-
+-
+-Path prefix stripping
+-
+-The keys used in the `_bindata` map are the same as the input file name
+-passed to `go-bindata`. This includes the path. In most cases, this is not
+-desireable, as it puts potentially sensitive information in your code base.
+-For this purpose, the tool supplies another command line flag `-prefix`.
+-This accepts a portion of a path name, which should be stripped off from
+-the map keys and function names.
+-
+-For example, running without the `-prefix` flag, we get:
+-
+-	$ go-bindata /path/to/templates/
+-
+-	_bindata["/path/to/templates/foo.html"] = path_to_templates_foo_html
+-
+-Running with the `-prefix` flag, we get:
+-
+-	$ go-bindata -prefix "/path/to/" /path/to/templates/
+-
+-	_bindata["templates/foo.html"] = templates_foo_html
+-
+-
+-Build tags
+-
+-With the optional Tags field, you can specify any go build tags that
+-must be fulfilled for the output file to be included in a build. This
+-is useful when including binary data in multiple formats, where the desired
+-format is specified at build time with the appropriate tags.
+-
+-The tags are appended to a `// +build` line in the beginning of the output file
+-and must follow the build tags syntax specified by the go tool.
+-
+-*/
+-package bindata
+diff --git a/vendor/github.com/go-bindata/go-bindata/file.go b/vendor/github.com/go-bindata/go-bindata/file.go
+deleted file mode 100644
+index 8c83926c8..000000000
+--- a/vendor/github.com/go-bindata/go-bindata/file.go
++++ /dev/null
+@@ -1,102 +0,0 @@
+-package bindata
+-
+-import (
+-	"fmt"
+-	"io"
+-)
+-
+-func writeAssetFS(w io.Writer, c *Config) error {
+-	if !c.HttpFileSystem {
+-		return nil
+-	}
+-
+-	_, err := fmt.Fprintf(w, `
+-type assetFile struct {
+-	*bytes.Reader
+-	name            string
+-	childInfos      []os.FileInfo
+-	childInfoOffset int
+-}
+-
+-type assetOperator struct{}
+-
+-// Open implement http.FileSystem interface
+-func (f *assetOperator) Open(name string) (http.File, error) {
+-	var err error
+-	if len(name) > 0 && name[0] == '/' {
+-		name = name[1:]
+-	}
+-	content, err := Asset(name)
+-	if err == nil {
+-		return &assetFile{name: name, Reader: bytes.NewReader(content)}, nil
+-	}
+-	children, err := AssetDir(name)
+-	if err == nil {
+-		childInfos := make([]os.FileInfo, 0, len(children))
+-		for _, child := range children {
+-			childPath := filepath.Join(name, child)
+-			info, errInfo := AssetInfo(filepath.Join(name, child))
+-			if errInfo == nil {
+-				childInfos = append(childInfos, info)
+-			} else {
+-				childInfos = append(childInfos, newDirFileInfo(childPath))
+-			}
+-		}
+-		return &assetFile{name: name, childInfos: childInfos}, nil
+-	} else {
+-		// If the error is not found, return an error that will
+-		// result in a 404 error. Otherwise the server returns
+-		// a 500 error for files not found.
+-		if strings.Contains(err.Error(), "not found") {
+-			return nil, os.ErrNotExist
+-		}
+-		return nil, err
+-	}
+-}
+-
+-// Close no need do anything
+-func (f *assetFile) Close() error {
+-	return nil
+-}
+-
+-// Readdir read dir's children file info
+-func (f *assetFile) Readdir(count int) ([]os.FileInfo, error) {
+-	if len(f.childInfos) == 0 {
+-		return nil, os.ErrNotExist
+-	}
+-	if count <= 0 {
+-		return f.childInfos, nil
+-	}
+-	if f.childInfoOffset+count > len(f.childInfos) {
+-		count = len(f.childInfos) - f.childInfoOffset
+-	}
+-	offset := f.childInfoOffset
+-	f.childInfoOffset += count
+-	return f.childInfos[offset : offset+count], nil
+-}
+-
+-// Stat read file info from asset item
+-func (f *assetFile) Stat() (os.FileInfo, error) {
+-	if len(f.childInfos) != 0 {
+-		return newDirFileInfo(f.name), nil
+-	}
+-	return AssetInfo(f.name)
+-}
+-
+-// newDirFileInfo return default dir file info
+-func newDirFileInfo(name string) os.FileInfo {
+-	return &bindataFileInfo{
+-		name:    name,
+-		size:    0,
+-		mode:    os.FileMode(2147484068), // equal os.FileMode(0644)|os.ModeDir
+-		modTime: time.Time{}}
+-}
+-
+-// AssetFile return a http.FileSystem instance that data backend by asset
+-func AssetFile() http.FileSystem {
+-	return &assetOperator{}
+-}
+-
+-`)
+-	return err
+-}
+diff --git a/vendor/github.com/go-bindata/go-bindata/go-bindata/.gitignore b/vendor/github.com/go-bindata/go-bindata/go-bindata/.gitignore
+deleted file mode 100644
+index 099edf6f9..000000000
+--- a/vendor/github.com/go-bindata/go-bindata/go-bindata/.gitignore
++++ /dev/null
+@@ -1 +0,0 @@
+-go-bindata
+diff --git a/vendor/github.com/go-bindata/go-bindata/go-bindata/AppendSliceValue.go b/vendor/github.com/go-bindata/go-bindata/go-bindata/AppendSliceValue.go
+deleted file mode 100644
+index f5da49596..000000000
+--- a/vendor/github.com/go-bindata/go-bindata/go-bindata/AppendSliceValue.go
++++ /dev/null
+@@ -1,22 +0,0 @@
+-package main
+-
+-import "strings"
+-
+-// borrowed from https://github.com/hashicorp/serf/blob/master/command/agent/flag_slice_value.go
+-
+-// AppendSliceValue implements the flag.Value interface and allows multiple
+-// calls to the same variable to append a list.
+-type AppendSliceValue []string
+-
+-func (s *AppendSliceValue) String() string {
+-	return strings.Join(*s, ",")
+-}
+-
+-func (s *AppendSliceValue) Set(value string) error {
+-	if *s == nil {
+-		*s = make([]string, 0, 1)
+-	}
+-
+-	*s = append(*s, value)
+-	return nil
+-}
+diff --git a/vendor/github.com/go-bindata/go-bindata/go-bindata/main.go b/vendor/github.com/go-bindata/go-bindata/go-bindata/main.go
+deleted file mode 100644
+index f0155a5d0..000000000
+--- a/vendor/github.com/go-bindata/go-bindata/go-bindata/main.go
++++ /dev/null
+@@ -1,108 +0,0 @@
+-// This work is subject to the CC0 1.0 Universal (CC0 1.0) Public Domain Dedication
+-// license. Its contents can be found at:
+-// http://creativecommons.org/publicdomain/zero/1.0/
+-
+-package main
+-
+-import (
+-	"flag"
+-	"fmt"
+-	"os"
+-	"path/filepath"
+-	"regexp"
+-	"strings"
+-
+-	"github.com/go-bindata/go-bindata"
+-)
+-
+-func main() {
+-	cfg := parseArgs()
+-	err := bindata.Translate(cfg)
+-
+-	if err != nil {
+-		fmt.Fprintf(os.Stderr, "bindata: %v\n", err)
+-		os.Exit(1)
+-	}
+-}
+-
+-// parseArgs create s a new, filled configuration instance
+-// by reading and parsing command line options.
+-//
+-// This function exits the program with an error, if
+-// any of the command line options are incorrect.
+-func parseArgs() *bindata.Config {
+-	var version bool
+-
+-	c := bindata.NewConfig()
+-
+-	flag.Usage = func() {
+-		fmt.Printf("Usage: %s [options] <input directories>\n\n", os.Args[0])
+-		flag.PrintDefaults()
+-	}
+-
+-	flag.BoolVar(&c.Debug, "debug", c.Debug, "Do not embed the assets, but provide the embedding API. Contents will still be loaded from disk.")
+-	flag.BoolVar(&c.Dev, "dev", c.Dev, "Similar to debug, but does not emit absolute paths. Expects a rootDir variable to already exist in the generated code's package.")
+-	flag.StringVar(&c.Tags, "tags", c.Tags, "Optional set of build tags to include.")
+-	flag.StringVar(&c.Prefix, "prefix", c.Prefix, "Optional path prefix to strip off asset names.")
+-	flag.StringVar(&c.Package, "pkg", c.Package, "Package name to use in the generated code.")
+-	flag.BoolVar(&c.NoMemCopy, "nomemcopy", c.NoMemCopy, "Use a .rodata hack to get rid of unnecessary memcopies. Refer to the documentation to see what implications this carries.")
+-	flag.BoolVar(&c.NoCompress, "nocompress", c.NoCompress, "Assets will *not* be GZIP compressed when this flag is specified.")
+-	flag.BoolVar(&c.NoMetadata, "nometadata", c.NoMetadata, "Assets will not preserve size, mode, and modtime info.")
+-	flag.BoolVar(&c.HttpFileSystem, "fs", c.HttpFileSystem, "Whether generate instance http.FileSystem interface code.")
+-	flag.UintVar(&c.Mode, "mode", c.Mode, "Optional file mode override for all files.")
+-	flag.Int64Var(&c.ModTime, "modtime", c.ModTime, "Optional modification unix timestamp override for all files.")
+-	flag.StringVar(&c.Output, "o", c.Output, "Optional name of the output file to be generated.")
+-	flag.BoolVar(&version, "version", false, "Displays version information.")
+-
+-	ignore := make([]string, 0)
+-	flag.Var((*AppendSliceValue)(&ignore), "ignore", "Regex pattern to ignore")
+-
+-	flag.Parse()
+-
+-	patterns := make([]*regexp.Regexp, 0)
+-	for _, pattern := range ignore {
+-		patterns = append(patterns, regexp.MustCompile(pattern))
+-	}
+-	c.Ignore = patterns
+-
+-	if version {
+-		fmt.Printf("%s\n", Version())
+-		os.Exit(0)
+-	}
+-
+-	// Make sure we have input paths.
+-	if flag.NArg() == 0 {
+-		fmt.Fprintf(os.Stderr, "Missing <input dir>\n\n")
+-		flag.Usage()
+-		os.Exit(1)
+-	}
+-
+-	// Create input configurations.
+-	c.Input = make([]bindata.InputConfig, flag.NArg())
+-	for i := range c.Input {
+-		c.Input[i] = parseInput(flag.Arg(i))
+-	}
+-
+-	return c
+-}
+-
+-// parseRecursive determines whether the given path has a recrusive indicator and
+-// returns a new path with the recursive indicator chopped off if it does.
+-//
+-//  ex:
+-//      /path/to/foo/...    -> (/path/to/foo, true)
+-//      /path/to/bar        -> (/path/to/bar, false)
+-func parseInput(path string) bindata.InputConfig {
+-	if strings.HasSuffix(path, "/...") {
+-		return bindata.InputConfig{
+-			Path:      filepath.Clean(path[:len(path)-4]),
+-			Recursive: true,
+-		}
+-	} else {
+-		return bindata.InputConfig{
+-			Path:      filepath.Clean(path),
+-			Recursive: false,
+-		}
+-	}
+-
+-}
+diff --git a/vendor/github.com/go-bindata/go-bindata/go-bindata/version.go b/vendor/github.com/go-bindata/go-bindata/go-bindata/version.go
+deleted file mode 100644
+index 5a4cfb794..000000000
+--- a/vendor/github.com/go-bindata/go-bindata/go-bindata/version.go
++++ /dev/null
+@@ -1,31 +0,0 @@
+-// This work is subject to the CC0 1.0 Universal (CC0 1.0) Public Domain Dedication
+-// license. Its contents can be found at:
+-// http://creativecommons.org/publicdomain/zero/1.0/
+-
+-package main
+-
+-import (
+-	"fmt"
+-	"runtime"
+-)
+-
+-const (
+-	AppName         = "go-bindata"
+-	AppVersionMajor = 3
+-	AppVersionMinor = 1
+-)
+-
+-// revision part of the program version.
+-// This will be set automatically at build time like so:
+-//
+-//     go build -ldflags "-X main.AppVersionRev `date -u +%s`"
+-var AppVersionRev string
+-
+-func Version() string {
+-	if len(AppVersionRev) == 0 {
+-		AppVersionRev = "2"
+-	}
+-
+-	return fmt.Sprintf("%s %d.%d.%s (Go runtime %s).\nCopyright (c) 2010-2013, Jim Teeuwen.",
+-		AppName, AppVersionMajor, AppVersionMinor, AppVersionRev, runtime.Version())
+-}
+diff --git a/vendor/github.com/go-bindata/go-bindata/release.go b/vendor/github.com/go-bindata/go-bindata/release.go
+deleted file mode 100644
+index d1bef160f..000000000
+--- a/vendor/github.com/go-bindata/go-bindata/release.go
++++ /dev/null
+@@ -1,473 +0,0 @@
+-// This work is subject to the CC0 1.0 Universal (CC0 1.0) Public Domain Dedication
+-// license. Its contents can be found at:
+-// http://creativecommons.org/publicdomain/zero/1.0/
+-
+-package bindata
+-
+-import (
+-	"bytes"
+-	"compress/gzip"
+-	"fmt"
+-	"io"
+-	"io/ioutil"
+-	"os"
+-	"unicode/utf8"
+-)
+-
+-// writeRelease writes the release code file.
+-func writeRelease(w io.Writer, c *Config, toc []Asset) error {
+-	err := writeReleaseHeader(w, c)
+-	if err != nil {
+-		return err
+-	}
+-
+-	err = writeAssetFS(w, c)
+-	if err != nil {
+-		return err
+-	}
+-
+-	for i := range toc {
+-		err = writeReleaseAsset(w, c, &toc[i])
+-		if err != nil {
+-			return err
+-		}
+-	}
+-
+-	return nil
+-}
+-
+-// writeReleaseHeader writes output file headers.
+-// This targets release builds.
+-func writeReleaseHeader(w io.Writer, c *Config) error {
+-	var err error
+-	if c.NoCompress {
+-		if c.NoMemCopy {
+-			err = header_uncompressed_nomemcopy(w, c)
+-		} else {
+-			err = header_uncompressed_memcopy(w, c)
+-		}
+-	} else {
+-		if c.NoMemCopy {
+-			err = header_compressed_nomemcopy(w, c)
+-		} else {
+-			err = header_compressed_memcopy(w, c)
+-		}
+-	}
+-	if err != nil {
+-		return err
+-	}
+-	return header_release_common(w)
+-}
+-
+-// writeReleaseAsset write a release entry for the given asset.
+-// A release entry is a function which embeds and returns
+-// the file's byte content.
+-func writeReleaseAsset(w io.Writer, c *Config, asset *Asset) error {
+-	fd, err := os.Open(asset.Path)
+-	if err != nil {
+-		return err
+-	}
+-
+-	defer fd.Close()
+-
+-	if c.NoCompress {
+-		if c.NoMemCopy {
+-			err = uncompressed_nomemcopy(w, asset, fd)
+-		} else {
+-			err = uncompressed_memcopy(w, asset, fd)
+-		}
+-	} else {
+-		if c.NoMemCopy {
+-			err = compressed_nomemcopy(w, asset, fd)
+-		} else {
+-			err = compressed_memcopy(w, asset, fd)
+-		}
+-	}
+-	if err != nil {
+-		return err
+-	}
+-	return asset_release_common(w, c, asset)
+-}
+-
+-// sanitize prepares a valid UTF-8 string as a raw string constant.
+-// Based on https://code.google.com/p/go/source/browse/godoc/static/makestatic.go?repo=tools
+-func sanitize(b []byte) []byte {
+-	// Replace ` with `+"`"+`
+-	b = bytes.Replace(b, []byte("`"), []byte("`+\"`\"+`"), -1)
+-
+-	// Replace BOM with `+"\xEF\xBB\xBF"+`
+-	// (A BOM is valid UTF-8 but not permitted in Go source files.
+-	// I wouldn't bother handling this, but for some insane reason
+-	// jquery.js has a BOM somewhere in the middle.)
+-	return bytes.Replace(b, []byte("\xEF\xBB\xBF"), []byte("`+\"\\xEF\\xBB\\xBF\"+`"), -1)
+-}
+-
+-func header_compressed_nomemcopy(w io.Writer, c *Config) error {
+-	var header string
+-
+-	if c.HttpFileSystem {
+-		header = `import (
+-	"bytes"
+-	"compress/gzip"
+-	"fmt"
+-	"net/http"
+-	"io"
+-	"io/ioutil"
+-	"os"
+-	"path/filepath"
+-	"strings"
+-	"time"`
+-	} else {
+-		header = `import (
+-	"bytes"
+-	"compress/gzip"
+-	"fmt"
+-	"io"
+-	"io/ioutil"
+-	"os"
+-	"path/filepath"
+-	"strings"
+-	"time"`
+-	}
+-
+-	_, err := fmt.Fprintf(w, `%s
+-)
+-
+-func bindataRead(data, name string) ([]byte, error) {
+-	gz, err := gzip.NewReader(strings.NewReader(data))
+-	if err != nil {
+-		return nil, fmt.Errorf("Read %%q: %%v", name, err)
+-	}
+-
+-	var buf bytes.Buffer
+-	_, err = io.Copy(&buf, gz)
+-	clErr := gz.Close()
+-
+-	if err != nil {
+-		return nil, fmt.Errorf("Read %%q: %%v", name, err)
+-	}
+-	if clErr != nil {
+-		return nil, err
+-	}
+-
+-	return buf.Bytes(), nil
+-}
+-
+-`, header)
+-	return err
+-}
+-
+-func header_compressed_memcopy(w io.Writer, c *Config) error {
+-	var header string
+-
+-	if c.HttpFileSystem {
+-		header = `import (
+-	"bytes"
+-	"compress/gzip"
+-	"fmt"
+-	"net/http"
+-	"io"
+-	"io/ioutil"
+-	"os"
+-	"path/filepath"
+-	"strings"
+-	"time"`
+-	} else {
+-		header = `import (
+-	"bytes"
+-	"compress/gzip"
+-	"fmt"
+-	"io"
+-	"io/ioutil"
+-	"os"
+-	"path/filepath"
+-	"strings"
+-	"time"`
+-	}
+-
+-	_, err := fmt.Fprintf(w, `%s
+-)
+-
+-func bindataRead(data []byte, name string) ([]byte, error) {
+-	gz, err := gzip.NewReader(bytes.NewBuffer(data))
+-	if err != nil {
+-		return nil, fmt.Errorf("Read %%q: %%v", name, err)
+-	}
+-
+-	var buf bytes.Buffer
+-	_, err = io.Copy(&buf, gz)
+-	clErr := gz.Close()
+-
+-	if err != nil {
+-		return nil, fmt.Errorf("Read %%q: %%v", name, err)
+-	}
+-	if clErr != nil {
+-		return nil, err
+-	}
+-
+-	return buf.Bytes(), nil
+-}
+-
+-`, header)
+-	return err
+-}
+-
+-func header_uncompressed_nomemcopy(w io.Writer, c *Config) error {
+-	var header string
+-
+-	if c.HttpFileSystem {
+-		header = `import (
+-	"bytes"
+-	"fmt"
+-	"net/http"
+-	"io/ioutil"
+-	"os"
+-	"path/filepath"
+-	"reflect"
+-	"strings"
+-	"time"
+-	"unsafe"`
+-	} else {
+-		header = `import (
+-	"fmt"
+-	"io/ioutil"
+-	"os"
+-	"path/filepath"
+-	"reflect"
+-	"strings"
+-	"time"
+-	"unsafe"`
+-	}
+-
+-	_, err := fmt.Fprintf(w, `%s
+-)
+-
+-func bindataRead(data, name string) ([]byte, error) {
+-	var empty [0]byte
+-	sx := (*reflect.StringHeader)(unsafe.Pointer(&data))
+-	b := empty[:]
+-	bx := (*reflect.SliceHeader)(unsafe.Pointer(&b))
+-	bx.Data = sx.Data
+-	bx.Len = len(data)
+-	bx.Cap = bx.Len
+-	return b, nil
+-}
+-
+-`, header)
+-	return err
+-}
+-
+-func header_uncompressed_memcopy(w io.Writer, c *Config) error {
+-	var header string
+-
+-	if c.HttpFileSystem {
+-		header = `import (
+-	"bytes"
+-	"fmt"
+-	"net/http"
+-	"io/ioutil"
+-	"os"
+-	"path/filepath"
+-	"strings"
+-	"time"`
+-	} else {
+-		header = `import (
+-	"fmt"
+-	"io/ioutil"
+-	"os"
+-	"path/filepath"
+-	"strings"
+-	"time"`
+-	}
+-
+-	_, err := fmt.Fprintf(w, `%s
+-)
+-`, header)
+-	return err
+-}
+-
+-func header_release_common(w io.Writer) error {
+-	_, err := fmt.Fprintf(w, `type asset struct {
+-	bytes []byte
+-	info  os.FileInfo
+-}
+-
+-type bindataFileInfo struct {
+-	name    string
+-	size    int64
+-	mode    os.FileMode
+-	modTime time.Time
+-}
+-
+-// Name return file name
+-func (fi bindataFileInfo) Name() string {
+-	return fi.name
+-}
+-
+-// Size return file size
+-func (fi bindataFileInfo) Size() int64 {
+-	return fi.size
+-}
+-
+-// Mode return file mode
+-func (fi bindataFileInfo) Mode() os.FileMode {
+-	return fi.mode
+-}
+-
+-// Mode return file modify time
+-func (fi bindataFileInfo) ModTime() time.Time {
+-	return fi.modTime
+-}
+-
+-// IsDir return file whether a directory
+-func (fi bindataFileInfo) IsDir() bool {
+-	return fi.mode&os.ModeDir != 0
+-}
+-
+-// Sys return file is sys mode
+-func (fi bindataFileInfo) Sys() interface{} {
+-	return nil
+-}
+-
+-`)
+-	return err
+-}
+-
+-func compressed_nomemcopy(w io.Writer, asset *Asset, r io.Reader) error {
+-	_, err := fmt.Fprintf(w, `var _%s = "`, asset.Func)
+-	if err != nil {
+-		return err
+-	}
+-
+-	gz := gzip.NewWriter(&StringWriter{Writer: w})
+-	_, err = io.Copy(gz, r)
+-	gz.Close()
+-
+-	if err != nil {
+-		return err
+-	}
+-
+-	_, err = fmt.Fprintf(w, `"
+-
+-func %sBytes() ([]byte, error) {
+-	return bindataRead(
+-		_%s,
+-		%q,
+-	)
+-}
+-
+-`, asset.Func, asset.Func, asset.Name)
+-	return err
+-}
+-
+-func compressed_memcopy(w io.Writer, asset *Asset, r io.Reader) error {
+-	_, err := fmt.Fprintf(w, `var _%s = []byte("`, asset.Func)
+-	if err != nil {
+-		return err
+-	}
+-
+-	gz := gzip.NewWriter(&StringWriter{Writer: w})
+-	_, err = io.Copy(gz, r)
+-	gz.Close()
+-
+-	if err != nil {
+-		return err
+-	}
+-
+-	_, err = fmt.Fprintf(w, `")
+-
+-func %sBytes() ([]byte, error) {
+-	return bindataRead(
+-		_%s,
+-		%q,
+-	)
+-}
+-
+-`, asset.Func, asset.Func, asset.Name)
+-	return err
+-}
+-
+-func uncompressed_nomemcopy(w io.Writer, asset *Asset, r io.Reader) error {
+-	_, err := fmt.Fprintf(w, `var _%s = "`, asset.Func)
+-	if err != nil {
+-		return err
+-	}
+-
+-	_, err = io.Copy(&StringWriter{Writer: w}, r)
+-	if err != nil {
+-		return err
+-	}
+-
+-	_, err = fmt.Fprintf(w, `"
+-
+-func %sBytes() ([]byte, error) {
+-	return bindataRead(
+-		_%s,
+-		%q,
+-	)
+-}
+-
+-`, asset.Func, asset.Func, asset.Name)
+-	return err
+-}
+-
+-func uncompressed_memcopy(w io.Writer, asset *Asset, r io.Reader) error {
+-	_, err := fmt.Fprintf(w, `var _%s = []byte(`, asset.Func)
+-	if err != nil {
+-		return err
+-	}
+-
+-	b, err := ioutil.ReadAll(r)
+-	if err != nil {
+-		return err
+-	}
+-	if utf8.Valid(b) && !bytes.Contains(b, []byte{0}) {
+-		fmt.Fprintf(w, "`%s`", sanitize(b))
+-	} else {
+-		fmt.Fprintf(w, "%+q", b)
+-	}
+-
+-	_, err = fmt.Fprintf(w, `)
+-
+-func %sBytes() ([]byte, error) {
+-	return _%s, nil
+-}
+-
+-`, asset.Func, asset.Func)
+-	return err
+-}
+-
+-func asset_release_common(w io.Writer, c *Config, asset *Asset) error {
+-	fi, err := os.Stat(asset.Path)
+-	if err != nil {
+-		return err
+-	}
+-
+-	mode := uint(fi.Mode())
+-	modTime := fi.ModTime().Unix()
+-	size := fi.Size()
+-	if c.NoMetadata {
+-		mode = 0
+-		modTime = 0
+-		size = 0
+-	}
+-	if c.Mode > 0 {
+-		mode = uint(os.ModePerm) & c.Mode
+-	}
+-	if c.ModTime > 0 {
+-		modTime = c.ModTime
+-	}
+-	_, err = fmt.Fprintf(w, `func %s() (*asset, error) {
+-	bytes, err := %sBytes()
+-	if err != nil {
+-		return nil, err
+-	}
+-
+-	info := bindataFileInfo{name: %q, size: %d, mode: os.FileMode(%d), modTime: time.Unix(%d, 0)}
+-	a := &asset{bytes: bytes, info: info}
+-	return a, nil
+-}
+-
+-`, asset.Func, asset.Func, asset.Name, size, mode, modTime)
+-	return err
+-}
+diff --git a/vendor/github.com/go-bindata/go-bindata/restore.go b/vendor/github.com/go-bindata/go-bindata/restore.go
+deleted file mode 100644
+index 268ec7464..000000000
+--- a/vendor/github.com/go-bindata/go-bindata/restore.go
++++ /dev/null
+@@ -1,62 +0,0 @@
+-// This work is subject to the CC0 1.0 Universal (CC0 1.0) Public Domain Dedication
+-// license. Its contents can be found at:
+-// http://creativecommons.org/publicdomain/zero/1.0/
+-
+-package bindata
+-
+-import (
+-	"fmt"
+-	"io"
+-)
+-
+-func writeRestore(w io.Writer) error {
+-	_, err := fmt.Fprintf(w, `
+-// RestoreAsset restores an asset under the given directory
+-func RestoreAsset(dir, name string) error {
+-	data, err := Asset(name)
+-	if err != nil {
+-		return err
+-	}
+-	info, err := AssetInfo(name)
+-	if err != nil {
+-		return err
+-	}
+-	err = os.MkdirAll(_filePath(dir, filepath.Dir(name)), os.FileMode(0755))
+-	if err != nil {
+-		return err
+-	}
+-	err = ioutil.WriteFile(_filePath(dir, name), data, info.Mode())
+-	if err != nil {
+-		return err
+-	}
+-	err = os.Chtimes(_filePath(dir, name), info.ModTime(), info.ModTime())
+-	if err != nil {
+-		return err
+-	}
+-	return nil
+-}
+-
+-// RestoreAssets restores an asset under the given directory recursively
+-func RestoreAssets(dir, name string) error {
+-	children, err := AssetDir(name)
+-	// File
+-	if err != nil {
+-		return RestoreAsset(dir, name)
+-	}
+-	// Dir
+-	for _, child := range children {
+-		err = RestoreAssets(dir, filepath.Join(name, child))
+-		if err != nil {
+-			return err
+-		}
+-	}
+-	return nil
+-}
+-
+-func _filePath(dir, name string) string {
+-	cannonicalName := strings.Replace(name, "\\", "/", -1)
+-	return filepath.Join(append([]string{dir}, strings.Split(cannonicalName, "/")...)...)
+-}
+-`)
+-	return err
+-}
+diff --git a/vendor/github.com/go-bindata/go-bindata/stringwriter.go b/vendor/github.com/go-bindata/go-bindata/stringwriter.go
+deleted file mode 100644
+index 77daa04cb..000000000
+--- a/vendor/github.com/go-bindata/go-bindata/stringwriter.go
++++ /dev/null
+@@ -1,36 +0,0 @@
+-// This work is subject to the CC0 1.0 Universal (CC0 1.0) Public Domain Dedication
+-// license. Its contents can be found at:
+-// http://creativecommons.org/publicdomain/zero/1.0/
+-
+-package bindata
+-
+-import (
+-	"io"
+-)
+-
+-const lowerHex = "0123456789abcdef"
+-
+-type StringWriter struct {
+-	io.Writer
+-	c int
+-}
+-
+-func (w *StringWriter) Write(p []byte) (n int, err error) {
+-	if len(p) == 0 {
+-		return
+-	}
+-
+-	buf := []byte(`\x00`)
+-	var b byte
+-
+-	for n, b = range p {
+-		buf[2] = lowerHex[b/16]
+-		buf[3] = lowerHex[b%16]
+-		w.Writer.Write(buf)
+-		w.c++
+-	}
+-
+-	n++
+-
+-	return
+-}
+diff --git a/vendor/github.com/go-bindata/go-bindata/toc.go b/vendor/github.com/go-bindata/go-bindata/toc.go
+deleted file mode 100644
+index be4a01654..000000000
+--- a/vendor/github.com/go-bindata/go-bindata/toc.go
++++ /dev/null
+@@ -1,288 +0,0 @@
+-// This work is subject to the CC0 1.0 Universal (CC0 1.0) Public Domain Dedication
+-// license. Its contents can be found at:
+-// http://creativecommons.org/publicdomain/zero/1.0/
+-
+-package bindata
+-
+-import (
+-	"fmt"
+-	"io"
+-	"sort"
+-	"strings"
+-)
+-
+-type assetTree struct {
+-	Asset    Asset
+-	Children map[string]*assetTree
+-}
+-
+-func newAssetTree() *assetTree {
+-	tree := &assetTree{}
+-	tree.Children = make(map[string]*assetTree)
+-	return tree
+-}
+-
+-func (node *assetTree) child(name string) *assetTree {
+-	rv, ok := node.Children[name]
+-	if !ok {
+-		rv = newAssetTree()
+-		node.Children[name] = rv
+-	}
+-	return rv
+-}
+-
+-func (root *assetTree) Add(route []string, asset Asset) {
+-	for _, name := range route {
+-		root = root.child(name)
+-	}
+-	root.Asset = asset
+-}
+-
+-func ident(w io.Writer, n int) {
+-	for i := 0; i < n; i++ {
+-		w.Write([]byte{'\t'})
+-	}
+-}
+-
+-func (root *assetTree) funcOrNil() string {
+-	if root.Asset.Func == "" {
+-		return "nil"
+-	} else {
+-		return root.Asset.Func
+-	}
+-}
+-
+-func getFillerSize(tokenIndex int, lengths []int, nident int) int {
+-	var (
+-		curlen    int = lengths[tokenIndex]
+-		maxlen    int = 0
+-		substart  int = 0
+-		subend    int = 0
+-		spacediff int = 0
+-	)
+-
+-	if curlen > 0 {
+-		substart = tokenIndex
+-		for (substart-1) >= 0 && lengths[substart-1] > 0 {
+-			substart -= 1
+-		}
+-
+-		subend = tokenIndex
+-		for (subend+1) < len(lengths) && lengths[subend+1] > 0 {
+-			subend += 1
+-		}
+-
+-		var candidate int
+-		for j := substart; j <= subend; j += 1 {
+-			candidate = lengths[j]
+-			if candidate > maxlen {
+-				maxlen = candidate
+-			}
+-		}
+-
+-		spacediff = maxlen - curlen
+-	}
+-
+-	return spacediff
+-}
+-
+-func (root *assetTree) writeGoMap(w io.Writer, nident int) {
+-	fmt.Fprintf(w, "&bintree{%s, map[string]*bintree{", root.funcOrNil())
+-
+-	if len(root.Children) > 0 {
+-		io.WriteString(w, "\n")
+-
+-		// Sort to make output stable between invocations
+-		filenames := make([]string, len(root.Children))
+-		hasChildren := make(map[string]bool)
+-		i := 0
+-		for filename, node := range root.Children {
+-			filenames[i] = filename
+-			hasChildren[filename] = len(node.Children) > 0
+-			i++
+-		}
+-		sort.Strings(filenames)
+-
+-		lengths := make([]int, len(root.Children))
+-		for i, filename := range filenames {
+-			if hasChildren[filename] {
+-				lengths[i] = 0
+-			} else {
+-				lengths[i] = len(filename)
+-			}
+-		}
+-
+-		for i, p := range filenames {
+-			ident(w, nident+1)
+-			filler := strings.Repeat(" ", getFillerSize(i, lengths, nident))
+-			fmt.Fprintf(w, `"%s": %s`, p, filler)
+-			root.Children[p].writeGoMap(w, nident+1)
+-		}
+-		ident(w, nident)
+-	}
+-
+-	io.WriteString(w, "}}")
+-	if nident > 0 {
+-		io.WriteString(w, ",")
+-	}
+-	io.WriteString(w, "\n")
+-}
+-
+-func (root *assetTree) WriteAsGoMap(w io.Writer) error {
+-	_, err := fmt.Fprint(w, `type bintree struct {
+-	Func     func() (*asset, error)
+-	Children map[string]*bintree
+-}
+-
+-var _bintree = `)
+-	root.writeGoMap(w, 0)
+-	return err
+-}
+-
+-func writeTOCTree(w io.Writer, toc []Asset) error {
+-	_, err := fmt.Fprintf(w, `// AssetDir returns the file names below a certain
+-// directory embedded in the file by go-bindata.
+-// For example if you run go-bindata on data/... and data contains the
+-// following hierarchy:
+-//     data/
+-//       foo.txt
+-//       img/
+-//         a.png
+-//         b.png
+-// then AssetDir("data") would return []string{"foo.txt", "img"}
+-// AssetDir("data/img") would return []string{"a.png", "b.png"}
+-// AssetDir("foo.txt") and AssetDir("notexist") would return an error
+-// AssetDir("") will return []string{"data"}.
+-func AssetDir(name string) ([]string, error) {
+-	node := _bintree
+-	if len(name) != 0 {
+-		cannonicalName := strings.Replace(name, "\\", "/", -1)
+-		pathList := strings.Split(cannonicalName, "/")
+-		for _, p := range pathList {
+-			node = node.Children[p]
+-			if node == nil {
+-				return nil, fmt.Errorf("Asset %%s not found", name)
+-			}
+-		}
+-	}
+-	if node.Func != nil {
+-		return nil, fmt.Errorf("Asset %%s not found", name)
+-	}
+-	rv := make([]string, 0, len(node.Children))
+-	for childName := range node.Children {
+-		rv = append(rv, childName)
+-	}
+-	return rv, nil
+-}
+-
+-`)
+-	if err != nil {
+-		return err
+-	}
+-	tree := newAssetTree()
+-	for i := range toc {
+-		pathList := strings.Split(toc[i].Name, "/")
+-		tree.Add(pathList, toc[i])
+-	}
+-	return tree.WriteAsGoMap(w)
+-}
+-
+-// writeTOC writes the table of contents file.
+-func writeTOC(w io.Writer, toc []Asset) error {
+-	err := writeTOCHeader(w)
+-	if err != nil {
+-		return err
+-	}
+-
+-	var maxlen = 0
+-	for i := range toc {
+-		l := len(toc[i].Name)
+-		if l > maxlen {
+-			maxlen = l
+-		}
+-	}
+-
+-	for i := range toc {
+-		err = writeTOCAsset(w, &toc[i], maxlen)
+-		if err != nil {
+-			return err
+-		}
+-	}
+-
+-	return writeTOCFooter(w)
+-}
+-
+-// writeTOCHeader writes the table of contents file header.
+-func writeTOCHeader(w io.Writer) error {
+-	_, err := fmt.Fprintf(w, `// Asset loads and returns the asset for the given name.
+-// It returns an error if the asset could not be found or
+-// could not be loaded.
+-func Asset(name string) ([]byte, error) {
+-	cannonicalName := strings.Replace(name, "\\", "/", -1)
+-	if f, ok := _bindata[cannonicalName]; ok {
+-		a, err := f()
+-		if err != nil {
+-			return nil, fmt.Errorf("Asset %%s can't read by error: %%v", name, err)
+-		}
+-		return a.bytes, nil
+-	}
+-	return nil, fmt.Errorf("Asset %%s not found", name)
+-}
+-
+-// MustAsset is like Asset but panics when Asset would return an error.
+-// It simplifies safe initialization of global variables.
+-func MustAsset(name string) []byte {
+-	a, err := Asset(name)
+-	if err != nil {
+-		panic("asset: Asset(" + name + "): " + err.Error())
+-	}
+-
+-	return a
+-}
+-
+-// AssetInfo loads and returns the asset info for the given name.
+-// It returns an error if the asset could not be found or
+-// could not be loaded.
+-func AssetInfo(name string) (os.FileInfo, error) {
+-	cannonicalName := strings.Replace(name, "\\", "/", -1)
+-	if f, ok := _bindata[cannonicalName]; ok {
+-		a, err := f()
+-		if err != nil {
+-			return nil, fmt.Errorf("AssetInfo %%s can't read by error: %%v", name, err)
+-		}
+-		return a.info, nil
+-	}
+-	return nil, fmt.Errorf("AssetInfo %%s not found", name)
+-}
+-
+-// AssetNames returns the names of the assets.
+-func AssetNames() []string {
+-	names := make([]string, 0, len(_bindata))
+-	for name := range _bindata {
+-		names = append(names, name)
+-	}
+-	return names
+-}
+-
+-// _bindata is a table, holding each asset generator, mapped to its name.
+-var _bindata = map[string]func() (*asset, error){
+-`)
+-	return err
+-}
+-
+-// writeTOCAsset write a TOC entry for the given asset.
+-func writeTOCAsset(w io.Writer, asset *Asset, maxlen int) error {
+-	spacediff := maxlen - len(asset.Name)
+-	filler := strings.Repeat(" ", spacediff)
+-
+-	_, err := fmt.Fprintf(w, "\t%q: %s%s,\n", asset.Name, filler, asset.Func)
+-	return err
+-}
+-
+-// writeTOCFooter writes the table of contents file footer.
+-func writeTOCFooter(w io.Writer) error {
+-	_, err := fmt.Fprintf(w, `}
+-
+-`)
+-	return err
+-}
+diff --git a/vendor/modules.txt b/vendor/modules.txt
+index 46f3025f3..fa3952ef0 100644
+--- a/vendor/modules.txt
++++ b/vendor/modules.txt
+@@ -46,10 +46,6 @@ github.com/fsnotify/fsnotify/internal
+ # github.com/fxamacker/cbor/v2 v2.9.0
+ ## explicit; go 1.20
+ github.com/fxamacker/cbor/v2
+-# github.com/go-bindata/go-bindata v3.1.2+incompatible
+-## explicit
+-github.com/go-bindata/go-bindata
+-github.com/go-bindata/go-bindata/go-bindata
+ # github.com/go-logr/logr v1.4.3
+ ## explicit; go 1.18
+ github.com/go-logr/logr

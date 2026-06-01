@@ -1,0 +1,78 @@
+diff --git a/pkg/infrastructure/azure/storage.go b/pkg/infrastructure/azure/storage.go
+index 669bff0cebd..9dbdb34e653 100644
+--- a/pkg/infrastructure/azure/storage.go
++++ b/pkg/infrastructure/azure/storage.go
+@@ -3,7 +3,9 @@ package azure
+ import (
+ 	"bytes"
+ 	"context"
++	"errors"
+ 	"fmt"
++	"net/http"
+ 	"strings"
+ 	"sync"
+ 	"time"
+@@ -24,6 +26,7 @@ import (
+ 	"github.com/Azure/azure-sdk-for-go/sdk/storage/azblob/service"
+ 	"github.com/Azure/azure-sdk-for-go/storage"
+ 	"github.com/sirupsen/logrus"
++	"k8s.io/apimachinery/pkg/util/wait"
+ 
+ 	azic "github.com/openshift/installer/pkg/asset/installconfig/azure"
+ 	aztypes "github.com/openshift/installer/pkg/types/azure"
+@@ -147,20 +150,44 @@ func CreateStorageAccount(ctx context.Context, in *CreateStorageAccountInput) (*
+ 
+ 	logrus.Debugf("Creating storage account")
+ 	accountsClient := storageClientFactory.NewAccountsClient()
+-	pollerResponse, err := accountsClient.BeginCreate(
+-		ctx,
+-		in.ResourceGroupName,
+-		in.StorageAccountName,
+-		accountCreateParameters,
+-		nil,
+-	)
+-	if err != nil {
+-		return nil, fmt.Errorf("error creating storage account %s: %w", in.StorageAccountName, err)
++
++	var pollDoneResponse armstorage.AccountsClientCreateResponse
++	backoff := wait.Backoff{
++		Duration: 10 * time.Second,
++		Factor:   2,
++		Jitter:   0.2,
++		Steps:    6,
+ 	}
++	err = wait.ExponentialBackoffWithContext(ctx, backoff, func(ctx context.Context) (bool, error) {
++		pollerResponse, createErr := accountsClient.BeginCreate(
++			ctx,
++			in.ResourceGroupName,
++			in.StorageAccountName,
++			accountCreateParameters,
++			nil,
++		)
++		if createErr != nil {
++			var respErr *azcore.ResponseError
++			if errors.As(createErr, &respErr) && respErr.StatusCode == http.StatusConflict {
++				logrus.Infof("Storage account %s has an operation in progress, retrying in %s", in.StorageAccountName, backoff.Duration)
++				return false, nil
++			}
++			return false, createErr
++		}
+ 
+-	pollDoneResponse, err := pollerResponse.PollUntilDone(ctx, nil)
++		pollDoneResponse, createErr = pollerResponse.PollUntilDone(ctx, nil)
++		if createErr != nil {
++			var respErr *azcore.ResponseError
++			if errors.As(createErr, &respErr) && respErr.StatusCode == http.StatusConflict {
++				logrus.Infof("Storage account %s has an operation in progress, retrying in %s", in.StorageAccountName, backoff.Duration)
++				return false, nil
++			}
++			return false, createErr
++		}
++		return true, nil
++	})
+ 	if err != nil {
+-		return nil, fmt.Errorf("error waiting for creation of storage account %s: %w", in.StorageAccountName, err)
++		return nil, fmt.Errorf("error creating storage account %s: %w", in.StorageAccountName, err)
+ 	}
+ 
+ 	logrus.Debugf("Getting storage keys")

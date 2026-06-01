@@ -1,0 +1,88 @@
+diff --git a/bindata/etcd/networkpolicy-allow.yaml b/bindata/etcd/networkpolicy-allow.yaml
+new file mode 100644
+index 0000000000..6c5ebb41df
+--- /dev/null
++++ b/bindata/etcd/networkpolicy-allow.yaml
+@@ -0,0 +1,41 @@
++# Allow all egress for guard, installer, pruner, and backup pods in the
++# openshift-etcd namespace.
++#
++# These pods run on the pod network (unlike etcd which uses hostNetwork and
++# bypasses NetworkPolicy entirely). They need egress for:
++# - installer/pruner/backup: API server access to manage static pod manifests
++# - guard: etcd health checks
++# - all: DNS resolution via openshift-dns
++#
++# All egress is permitted because the API server address can vary by cluster
++# configuration.
++apiVersion: networking.k8s.io/v1
++kind: NetworkPolicy
++metadata:
++  name: allow-all-egress
++  namespace: openshift-etcd
++spec:
++  podSelector:
++    matchExpressions:
++    - key: app
++      operator: In
++      values:
++      - guard
++      - installer
++      - pruner
++      - cluster-backup-cronjob
++  egress:
++  - {}
++  # DNS egress documented explicitly for clarity, though already covered by
++  # the allow-all rule above.
++  - ports:
++    - protocol: UDP
++      port: 53
++    - protocol: TCP
++      port: 53
++    - protocol: UDP
++      port: 5353
++    - protocol: TCP
++      port: 5353
++  policyTypes:
++  - Egress
+diff --git a/bindata/etcd/networkpolicy-default-deny.yaml b/bindata/etcd/networkpolicy-default-deny.yaml
+new file mode 100644
+index 0000000000..3580245518
+--- /dev/null
++++ b/bindata/etcd/networkpolicy-default-deny.yaml
+@@ -0,0 +1,22 @@
++# Default-deny policy for the openshift-etcd namespace.
++# This policy selects all pods in the namespace and enables default-deny for both
++# ingress and egress by specifying policyTypes without any allow rules.
++#
++# NetworkPolicies are additive (use OR logic):
++# - This policy enables default-deny for all pods
++# - Subsequent policies add specific allow rules
++# - If any policy allows traffic, that traffic is permitted
++# - Policies cannot override or block traffic allowed by other policies
++#
++# Note: etcd static pods use hostNetwork: true and bypass all NetworkPolicy rules.
++# This policy only affects pods running on the pod network (guard, installer, pruner).
++apiVersion: networking.k8s.io/v1
++kind: NetworkPolicy
++metadata:
++  name: default-deny
++  namespace: openshift-etcd
++spec:
++  podSelector: {}
++  policyTypes:
++  - Ingress
++  - Egress
+diff --git a/pkg/operator/starter.go b/pkg/operator/starter.go
+index 8c8b43a950..06bc0e911f 100644
+--- a/pkg/operator/starter.go
++++ b/pkg/operator/starter.go
+@@ -252,6 +252,8 @@ func RunOperator(ctx context.Context, controllerContext *controllercmd.Controlle
+ 			"etcd/backups-sa.yaml",
+ 			"etcd/backups-cr.yaml",
+ 			"etcd/backups-crb.yaml",
++			"etcd/networkpolicy-allow.yaml",
++			"etcd/networkpolicy-default-deny.yaml",
+ 		},
+ 		(&resourceapply.ClientHolder{}).WithKubernetes(kubeClient).WithDynamicClient(dynamicClient),
+ 		operatorClient,

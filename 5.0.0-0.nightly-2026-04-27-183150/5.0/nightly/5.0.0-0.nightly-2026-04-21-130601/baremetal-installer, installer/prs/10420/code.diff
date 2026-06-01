@@ -1,0 +1,45 @@
+diff --git a/pkg/types/validation/installconfig.go b/pkg/types/validation/installconfig.go
+index 04ad977ff11..b05a721d67a 100644
+--- a/pkg/types/validation/installconfig.go
++++ b/pkg/types/validation/installconfig.go
+@@ -148,6 +148,15 @@ func ValidateInstallConfig(c *types.InstallConfig, usingAgentMethod bool) field.
+ 		allErrs = append(allErrs, field.Required(field.NewPath("controlPlane"), "controlPlane is required"))
+ 	}
+ 
++	if c.BootstrapInPlace != nil && c.ControlPlane.Replicas != nil &&
++		*c.ControlPlane.Replicas == 1 && c.Platform.Name() == baremetal.Name {
++		allErrs = append(allErrs, field.Invalid(
++			field.NewPath("bootstrapInPlace"),
++			"",
++			"Single Node OpenShift is not supported on the baremetal platform",
++		))
++	}
++
+ 	if c.Arbiter != nil {
+ 		if c.Enabled(features.FeatureGateHighlyAvailableArbiter) {
+ 			allErrs = append(allErrs, validateArbiter(&c.Platform, c.Arbiter, c.ControlPlane, field.NewPath("arbiter"))...)
+diff --git a/pkg/types/validation/installconfig_test.go b/pkg/types/validation/installconfig_test.go
+index 1a89db2ec4b..7b76fbbba6a 100644
+--- a/pkg/types/validation/installconfig_test.go
++++ b/pkg/types/validation/installconfig_test.go
+@@ -3043,6 +3043,20 @@ func TestValidateInstallConfig(t *testing.T) {
+ 			}(),
+ 			expectedError: "Unsupported OS Image Stream. Supported values are: rhel-9, rhel-10",
+ 		},
++		{
++			name: "sno on baremetal not supported",
++			installConfig: func() *types.InstallConfig {
++				c := validInstallConfig()
++				c.Platform = types.Platform{
++					BareMetal: validBareMetalPlatform(),
++				}
++				c.BootstrapInPlace = &types.BootstrapInPlace{
++					InstallationDisk: "/dev/sda",
++				}
++				return c
++			}(),
++			expectedError: `^bootstrapInPlace: Invalid value: "": Single Node OpenShift is not supported on the baremetal platform$`,
++		},
+ 	}
+ 	for _, tc := range cases {
+ 		t.Run(tc.name, func(t *testing.T) {

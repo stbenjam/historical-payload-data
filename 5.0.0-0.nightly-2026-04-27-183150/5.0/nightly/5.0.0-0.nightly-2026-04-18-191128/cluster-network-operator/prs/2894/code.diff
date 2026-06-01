@@ -1,0 +1,132 @@
+diff --git a/pkg/network/cluster_config_test.go b/pkg/network/cluster_config_test.go
+index a6d8ea322a..1d4b889347 100644
+--- a/pkg/network/cluster_config_test.go
++++ b/pkg/network/cluster_config_test.go
+@@ -39,7 +39,8 @@ func getFeatureGatesWithDualStack() featuregates.FeatureGate {
+ 			apifeatures.FeatureGateDNSNameResolver,
+ 			apifeatures.FeatureGateOVNObservability,
+ 			apifeatures.FeatureGateAWSDualStackInstall,
+-			apifeatures.FeatureGateAzureDualStackInstall},
++			apifeatures.FeatureGateAzureDualStackInstall,
++			apifeatures.FeatureGateGCPDualStackInstall},
+ 		[]configv1.FeatureGateName{
+ 			apifeatures.FeatureGateNetworkConnect,
+ 		},
+@@ -129,6 +130,7 @@ func getFeatureGatesWithIncompleteDualStack() featuregates.FeatureGate {
+ 		[]configv1.FeatureGateName{
+ 			apifeatures.FeatureGateNetworkConnect,
+ 			apifeatures.FeatureGateAzureDualStackInstall,
++			apifeatures.FeatureGateGCPDualStackInstall,
+ 		},
+ 	)
+ }
+@@ -205,7 +207,7 @@ func TestValidateClusterConfigDualStack(t *testing.T) {
+ 	err = ValidateClusterConfig(&configv1.Network{Spec: cc}, infraRes, featureGates)
+ 	g.Expect(err).NotTo(HaveOccurred())
+ 
+-	// You can't use dual-stack if enabled on an unsupported platform
++	// GCP supports dual-stack with the feature gate enabled
+ 	infrastructure.Status.PlatformStatus.Type = configv1.GCPPlatformType
+ 	infrastructure.Status.PlatformStatus.GCP = &configv1.GCPPlatformStatus{
+ 		Region: "us-west1",
+@@ -221,8 +223,8 @@ func TestValidateClusterConfigDualStack(t *testing.T) {
+ 		CIDR:       "fd01::/48",
+ 		HostPrefix: 64,
+ 	})
+-	haveError(cc, fmt.Sprintf("%s is not one of the supported platforms for dual stack",
+-		infrastructure.Status.PlatformStatus.Type))
++	err = ValidateClusterConfig(&configv1.Network{Spec: cc}, infraRes, featureGates)
++	g.Expect(err).NotTo(HaveOccurred())
+ 
+ 	// DualStack supported only with featuregates
+ 	infrastructure.Status.PlatformStatus.Type = configv1.AWSPlatformType
+@@ -261,6 +263,27 @@ func TestValidateClusterConfigDualStack(t *testing.T) {
+ 	err = ValidateClusterConfig(&configv1.Network{Spec: cc}, infraRes, featureGates)
+ 	haveError(cc, fmt.Sprintf("%s is not one of the supported platforms for dual stack",
+ 		infrastructure.Status.PlatformStatus.Type))
++
++	// GCP DualStack without feature gate should fail
++	featureGates = getFeatureGatesWithIncompleteDualStack()
++	infrastructure.Status.PlatformStatus.Type = configv1.GCPPlatformType
++	infrastructure.Status.PlatformStatus.GCP = &configv1.GCPPlatformStatus{
++		Region: "us-west1",
++	}
++	client = fake.NewFakeClient(infrastructure)
++	err = createProxy(client)
++	g.Expect(err).NotTo(HaveOccurred())
++	infraRes, err = platform.InfraStatus(client)
++	g.Expect(err).NotTo(HaveOccurred())
++	cc = *ClusterConfig.DeepCopy()
++	cc.ServiceNetwork = append(cc.ServiceNetwork, "fd02::/112")
++	cc.ClusterNetwork = append(cc.ClusterNetwork, configv1.ClusterNetworkEntry{
++		CIDR:       "fd01::/48",
++		HostPrefix: 64,
++	})
++	err = ValidateClusterConfig(&configv1.Network{Spec: cc}, infraRes, featureGates)
++	haveError(cc, fmt.Sprintf("%s is not one of the supported platforms for dual stack",
++		infrastructure.Status.PlatformStatus.Type))
+ }
+ 
+ func TestMergeClusterConfig(t *testing.T) {
+diff --git a/pkg/network/render.go b/pkg/network/render.go
+index 43458e2046..0947941085 100644
+--- a/pkg/network/render.go
++++ b/pkg/network/render.go
+@@ -873,7 +873,7 @@ func renderAdditionalRoutingCapabilities(conf *operv1.NetworkSpec, manifestDir s
+ }
+ 
+ // isSupportedDualStackPlatform returns true if the platform supports dual-stack networking
+-// on Day-0 (initial cluster installation). Some platforms (AWS, Azure) require feature gates
++// on Day-0 (initial cluster installation). Some platforms (AWS, Azure, GCP) require feature gates
+ // to be enabled to support dual-stack.
+ func isSupportedDualStackPlatform(platformType configv1.PlatformType, featureGates featuregates.FeatureGate) bool {
+ 	switch platformType {
+@@ -883,6 +883,8 @@ func isSupportedDualStackPlatform(platformType configv1.PlatformType, featureGat
+ 		return featureGates.Enabled(apifeatures.FeatureGateAWSDualStackInstall)
+ 	case configv1.AzurePlatformType:
+ 		return featureGates.Enabled(apifeatures.FeatureGateAzureDualStackInstall)
++	case configv1.GCPPlatformType:
++		return featureGates.Enabled(apifeatures.FeatureGateGCPDualStackInstall)
+ 	default:
+ 		return false
+ 	}
+diff --git a/pkg/network/render_test.go b/pkg/network/render_test.go
+index 3aa824d78c..3e13ec8b68 100644
+--- a/pkg/network/render_test.go
++++ b/pkg/network/render_test.go
+@@ -190,6 +190,25 @@ func TestAllowMigrationOnlyForSupportedTypes(t *testing.T) {
+ 	g.Expect(err).NotTo(HaveOccurred())
+ }
+ 
++func TestGCPDualStackDay0SupportedDay2Blocked(t *testing.T) {
++	g, infra, prev, next := setupTestInfraAndBasicRenderConfigs(t, OVNKubernetesConfig, OVNKubernetesConfig)
++
++	infra.PlatformType = configv1.GCPPlatformType
++
++	// GCP does NOT support Day-2 conversion from single-stack to dual-stack
++	next.ServiceNetwork = append(next.ServiceNetwork, "fd02::/112")
++	next.ClusterNetwork = append(next.ClusterNetwork, operv1.ClusterNetworkEntry{
++		CIDR:       "fd01::/48",
++		HostPrefix: 64,
++	})
++	err := IsChangeSafe(prev, next, infra)
++	g.Expect(err).To(MatchError(ContainSubstring(fmt.Sprintf("%s does not allow conversion to dual-stack cluster", infra.PlatformType))))
++
++	// ... but the migration in the other direction (dual to single) should work
++	err = IsChangeSafe(next, prev, infra)
++	g.Expect(err).NotTo(HaveOccurred())
++}
++
+ // ClusterNetwork CIDR tests
+ func TestAllowExpandingClusterNetworkCIDRMaskForOVN(t *testing.T) {
+ 	g, infra, prev, next := setupTestInfraAndBasicRenderConfigs(t, OVNKubernetesConfig, OVNKubernetesConfig)
+@@ -272,7 +291,8 @@ func getDefaultFeatureGatesWithDualStack() featuregates.FeatureGate {
+ 		[]configv1.FeatureGateName{apifeatures.FeatureGateDNSNameResolver,
+ 			apifeatures.FeatureGateOVNObservability,
+ 			apifeatures.FeatureGateAWSDualStackInstall,
+-			apifeatures.FeatureGateAzureDualStackInstall},
++			apifeatures.FeatureGateAzureDualStackInstall,
++			apifeatures.FeatureGateGCPDualStackInstall},
+ 		[]configv1.FeatureGateName{
+ 			apifeatures.FeatureGateNetworkConnect,
+ 		},

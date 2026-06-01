@@ -1,0 +1,1659 @@
+diff --git a/libs/locales/lib/en/translation.json b/libs/locales/lib/en/translation.json
+index 0eafbc6141..ecc2fa5cd9 100644
+--- a/libs/locales/lib/en/translation.json
++++ b/libs/locales/lib/en/translation.json
+@@ -970,6 +970,7 @@
+   "ai:Unable to SSH into your hosts through the network?": "Unable to SSH into your hosts through the network?",
+   "ai:Unique hostname": "Unique hostname",
+   "ai:Unknown": "Unknown",
++  "ai:Unmonitored": "Unmonitored",
+   "ai:Unreachable": "Unreachable",
+   "ai:Update": "Update",
+   "ai:Upload": "Upload",
+diff --git a/libs/types/assisted-installer-service.d.ts b/libs/types/assisted-installer-service.d.ts
+index 58c7f5e366..e13a478270 100644
+--- a/libs/types/assisted-installer-service.d.ts
++++ b/libs/types/assisted-installer-service.d.ts
+@@ -111,6 +111,7 @@ export interface Cluster {
+   /**
+    * Indicates the type of this object. Will be 'Cluster' if this is a complete object,
+    * 'AddHostsCluster' for cluster that add hosts to existing OCP cluster,
++   * 'DisconnectedCluster' for clusters with embedded ignition for offline installation,
+    *
+    */
+   kind: 'Cluster' | 'AddHostsCluster' | 'DisconnectedCluster';
+@@ -215,7 +216,8 @@ export interface Cluster {
+     | 'installed'
+     | 'adding-hosts'
+     | 'cancelled'
+-    | 'installing-pending-user-action';
++    | 'installing-pending-user-action'
++    | 'unmonitored';
+   /**
+    * Additional information pertaining to the status of the OpenShift cluster.
+    */
+@@ -357,8 +359,15 @@ export interface Cluster {
+   featureUsage?: string;
+   /**
+    * The desired network type used.
++   * - OVNKubernetes: Default CNI for OpenShift (recommended)
++   * - OpenShiftSDN: Legacy SDN (deprecated in newer versions)
++   * - CiscoACI: Cisco ACI CNI (requires custom manifests)
++   * - Cilium: Isovalent Cilium CNI (requires custom manifests)
++   * - Calico: Tigera Calico CNI (requires custom manifests)
++   * - None: No CNI - user must provide custom CNI manifests
++   *
+    */
+-  networkType?: 'OpenShiftSDN' | 'OVNKubernetes';
++  networkType?: 'OpenShiftSDN' | 'OVNKubernetes' | 'CiscoACI' | 'Cilium' | 'Calico' | 'None';
+   /**
+    * Cluster networks that are associated with this cluster.
+    */
+@@ -505,8 +514,17 @@ export interface ClusterCreateParams {
+     | 'all';
+   /**
+    * The desired network type used.
++   * - OVNKubernetes: Default CNI for OpenShift (recommended)
++   * - OpenShiftSDN: Legacy SDN (deprecated in newer versions)
++   * - CiscoACI: Cisco ACI CNI (requires custom manifests)
++   * - Cilium: Isovalent Cilium CNI (requires custom manifests)
++   * - Calico: Tigera Calico CNI (requires custom manifests)
++   * - None: No CNI - user must provide custom CNI manifests
++   * Note: Third-party CNIs (CiscoACI, Cilium, Calico, None) require uploading
++   * CNI manifests via the custom manifests API before installation.
++   *
+    */
+-  networkType?: 'OpenShiftSDN' | 'OVNKubernetes';
++  networkType?: 'OpenShiftSDN' | 'OVNKubernetes' | 'CiscoACI' | 'Cilium' | 'Calico' | 'None';
+   /**
+    * Schedule workloads on masters
+    */
+@@ -666,6 +684,7 @@ export type ClusterValidationId =
+   | 'mtv-requirements-satisfied'
+   | 'osc-requirements-satisfied'
+   | 'network-type-valid'
++  | 'custom-manifests-requirements-satisfied'
+   | 'platform-requirements-satisfied'
+   | 'node-feature-discovery-requirements-satisfied'
+   | 'nvidia-gpu-requirements-satisfied'
+@@ -823,6 +842,16 @@ export interface DhcpAllocationResponse {
+    */
+   ingressVipLease?: string;
+ }
++export interface DisconnectedClusterCreateParams {
++  /**
++   * Name of the OpenShift cluster.
++   */
++  name: string;
++  /**
++   * Version of the OpenShift cluster.
++   */
++  openshiftVersion: string;
++}
+ export interface Disk {
+   /**
+    * Determine the disk's unique identifier which is the by-id field if it exists and fallback to the by-path field otherwise
+@@ -1053,9 +1082,16 @@ export interface Event {
+   props?: string;
+ }
+ export type EventList = Event[];
++export interface Feature {
++  'feature-support-level-id': FeatureSupportLevelId;
++  supportLevel: SupportLevel;
++  reason?: IncompatibilityReason;
++  incompatibilities: FeatureSupportLevelId[];
++}
+ export type FeatureSupportLevelId =
+   | 'SNO'
+   | 'TNA'
++  | 'TNF'
+   | 'VIP_AUTO_ALLOC'
+   | 'CUSTOM_MANIFEST'
+   | 'SINGLE_NODE_EXPANSION'
+@@ -1081,6 +1117,10 @@ export type FeatureSupportLevelId =
+   | 'EXTERNAL_PLATFORM'
+   | 'OVN_NETWORK_TYPE'
+   | 'SDN_NETWORK_TYPE'
++  | 'CILIUM_NETWORK_TYPE'
++  | 'CALICO_NETWORK_TYPE'
++  | 'CISCO_ACI_NETWORK_TYPE'
++  | 'NONE_NETWORK_TYPE'
+   | 'NODE_FEATURE_DISCOVERY'
+   | 'NVIDIA_GPU'
+   | 'PIPELINES'
+@@ -1102,8 +1142,27 @@ export type FeatureSupportLevelId =
+   | 'NUMA_RESOURCES'
+   | 'OADP'
+   | 'METALLB'
++  | 'DUAL_STACK_PRIMARY_IPV6'
+   | 'LOKI'
+   | 'OPENSHIFT_LOGGING';
++export interface FencingCredentialsParams {
++  /**
++   * The URL of the host's BMC, for example https://bmc1.example.com.
++   */
++  address: string;
++  /**
++   * The username to connect to the host's BMC.
++   */
++  username: string;
++  /**
++   * The password to connect to the host's BMC.
++   */
++  password: string;
++  /**
++   * Whether to enable or disable certificate verification when connecting to the host's BMC.
++   */
++  certificateVerification?: 'Enabled' | 'Disabled';
++}
+ /**
+  * Cluster finalizing stage managed by controller
+  */
+@@ -1318,6 +1377,10 @@ export interface Host {
+    * formatting.
+    */
+   skipFormattingDisks?: string;
++  /**
++   * The host's BMC credentials that will be used in TNF.
++   */
++  fencingCredentials?: string;
+ }
+ export interface HostCreateParams {
+   hostId: string; // uuid
+@@ -1525,6 +1588,10 @@ export interface HostRegistrationResponse {
+    * formatting.
+    */
+   skipFormattingDisks?: string;
++  /**
++   * The host's BMC credentials that will be used in TNF.
++   */
++  fencingCredentials?: string;
+   /**
+    * Command for starting the next step runner
+    */
+@@ -1546,6 +1613,7 @@ export type HostStage =
+   | 'Waiting for controller'
+   | 'Installing'
+   | 'Writing image to disk'
++  | 'Copying registry data to disk'
+   | 'Rebooting'
+   | 'Waiting for ignition'
+   | 'Configuring'
+@@ -1603,6 +1671,10 @@ export interface HostUpdateParams {
+    * Labels to be added to the corresponding node.
+    */
+   nodeLabels?: NodeLabelParams[];
++  /**
++   * The host's BMC credentials that will be used in TNF.
++   */
++  fencingCredentials?: FencingCredentialsParams;
+ }
+ export type HostValidationId =
+   | 'connected'
+@@ -1753,6 +1825,11 @@ export interface ImportClusterParams {
+    */
+   openshiftClusterId: string; // uuid
+ }
++export type IncompatibilityReason =
++  | 'cpuArchitecture'
++  | 'platform'
++  | 'openshiftVersion'
++  | 'ociExternalIntegrationDisabled';
+ export interface InfraEnv {
+   /**
+    * Indicates the type of this object.
+@@ -1794,6 +1871,12 @@ export interface InfraEnv {
+    * static network configuration string in the format expected by discovery ignition generation.
+    */
+   staticNetworkConfig?: string;
++  /**
++   * The IP address of the host that will act as the rendezvous (bootstrap) node for agent-based installations.
++   * This is optional for disconnected-iso image type and specifies which host will run the assisted service
++   * during the bootstrap phase. All other hosts will connect to this IP to coordinate the installation.
++   */
++  rendezvousIp?: string; // ^(?:$|(?:(?:(?:25[0-5]|2[0-4][0-9]|1[0-9]{2}|[1-9]?[0-9])\.){3}(?:25[0-5]|2[0-4][0-9]|1[0-9]{2}|[1-9]?[0-9])|(?:([0-9a-fA-F]{1,4}:){7}[0-9a-fA-F]{1,4}|([0-9a-fA-F]{1,4}:){1,7}:|([0-9a-fA-F]{1,4}:){1,6}:[0-9a-fA-F]{1,4}|([0-9a-fA-F]{1,4}:){1,5}(:[0-9a-fA-F]{1,4}){1,2}|([0-9a-fA-F]{1,4}:){1,4}(:[0-9a-fA-F]{1,4}){1,3}|([0-9a-fA-F]{1,4}:){1,3}(:[0-9a-fA-F]{1,4}){1,4}|([0-9a-fA-F]{1,4}:){1,2}(:[0-9a-fA-F]{1,4}){1,5}|[0-9a-fA-F]{1,4}:(:[0-9a-fA-F]{1,4}){1,6}|:(:[0-9a-fA-F]{1,4}){1,7}|:|fe80:(:[0-9a-fA-F]{0,4}){0,4}%[0-9a-zA-Z]{1,}|::(ffff(:0{1,4}){0,1}:){0,1}((25[0-5]|(2[0-4]|1?[0-9])?[0-9])\.){3}(25[0-5]|(2[0-4]|1?[0-9])?[0-9])|([0-9a-fA-F]{1,4}:){1,4}:((25[0-5]|(2[0-4]|1?[0-9])?[0-9])\.){3}(25[0-5]|(2[0-4]|1?[0-9])?[0-9]))))$
+   type: ImageType;
+   /**
+    * Json formatted string containing the user overrides for the initial ignition config.
+@@ -1830,14 +1913,6 @@ export interface InfraEnv {
+    * certificates in this bundle.
+    */
+   additionalTrustBundle?: string;
+-  /**
+-   * The IP address that hosts will use to communicate with the bootstrap node during installation.
+-   */
+-  rendezvousIp?: string;
+-  /**
+-   * The type of network configuration for hosts: 'dhcp' for DHCP only, 'static' for static IP configuration.
+-   */
+-  hostsNetworkConfigurationType?: 'dhcp' | 'static';
+   /**
+    * The pull secret obtained from Red Hat OpenShift Cluster Manager at console.redhat.com/openshift/install/pull-secret.
+    */
+@@ -1862,6 +1937,12 @@ export interface InfraEnvCreateParams {
+    */
+   pullSecret: string;
+   staticNetworkConfig?: HostStaticNetworkConfig[];
++  /**
++   * The IP address of the host that will act as the rendezvous (bootstrap) node for agent-based installations.
++   * This is optional for disconnected-iso image type and specifies which host will run the assisted service
++   * during the bootstrap phase. All other hosts will connect to this IP to coordinate the installation.
++   */
++  rendezvousIp?: string; // ^(?:$|(?:(?:(?:25[0-5]|2[0-4][0-9]|1[0-9]{2}|[1-9]?[0-9])\.){3}(?:25[0-5]|2[0-4][0-9]|1[0-9]{2}|[1-9]?[0-9])|(?:([0-9a-fA-F]{1,4}:){7}[0-9a-fA-F]{1,4}|([0-9a-fA-F]{1,4}:){1,7}:|([0-9a-fA-F]{1,4}:){1,6}:[0-9a-fA-F]{1,4}|([0-9a-fA-F]{1,4}:){1,5}(:[0-9a-fA-F]{1,4}){1,2}|([0-9a-fA-F]{1,4}:){1,4}(:[0-9a-fA-F]{1,4}){1,3}|([0-9a-fA-F]{1,4}:){1,3}(:[0-9a-fA-F]{1,4}){1,4}|([0-9a-fA-F]{1,4}:){1,2}(:[0-9a-fA-F]{1,4}){1,5}|[0-9a-fA-F]{1,4}:(:[0-9a-fA-F]{1,4}){1,6}|:(:[0-9a-fA-F]{1,4}){1,7}|:|fe80:(:[0-9a-fA-F]{0,4}){0,4}%[0-9a-zA-Z]{1,}|::(ffff(:0{1,4}){0,1}:){0,1}((25[0-5]|(2[0-4]|1?[0-9])?[0-9])\.){3}(25[0-5]|(2[0-4]|1?[0-9])?[0-9])|([0-9a-fA-F]{1,4}:){1,4}:((25[0-5]|(2[0-4]|1?[0-9])?[0-9])\.){3}(25[0-5]|(2[0-4]|1?[0-9])?[0-9]))))$
+   imageType?: ImageType;
+   /**
+    * JSON formatted string containing the user overrides for the initial ignition config.
+@@ -1887,14 +1968,6 @@ export interface InfraEnvCreateParams {
+    * certificates in this bundle.
+    */
+   additionalTrustBundle?: string;
+-  /**
+-   * The IP address that hosts will use to communicate with the bootstrap node during installation.
+-   */
+-  rendezvousIp?: string;
+-  /**
+-   * The type of network configuration for hosts: 'dhcp' for DHCP only, 'static' for static IP configuration.
+-   */
+-  hostsNetworkConfigurationType?: 'dhcp' | 'static';
+ }
+ export type InfraEnvList = InfraEnv[];
+ export interface InfraEnvUpdateParams {
+@@ -1912,6 +1985,12 @@ export interface InfraEnvUpdateParams {
+    */
+   pullSecret?: string;
+   staticNetworkConfig?: HostStaticNetworkConfig[];
++  /**
++   * The IP address of the host that will act as the rendezvous (bootstrap) node for agent-based installations.
++   * This is optional for disconnected-iso image type and specifies which host will run the assisted service
++   * during the bootstrap phase. All other hosts will connect to this IP to coordinate the installation.
++   */
++  rendezvousIp?: string; // ^(?:$|(?:(?:(?:25[0-5]|2[0-4][0-9]|1[0-9]{2}|[1-9]?[0-9])\.){3}(?:25[0-5]|2[0-4][0-9]|1[0-9]{2}|[1-9]?[0-9])|(?:([0-9a-fA-F]{1,4}:){7}[0-9a-fA-F]{1,4}|([0-9a-fA-F]{1,4}:){1,7}:|([0-9a-fA-F]{1,4}:){1,6}:[0-9a-fA-F]{1,4}|([0-9a-fA-F]{1,4}:){1,5}(:[0-9a-fA-F]{1,4}){1,2}|([0-9a-fA-F]{1,4}:){1,4}(:[0-9a-fA-F]{1,4}){1,3}|([0-9a-fA-F]{1,4}:){1,3}(:[0-9a-fA-F]{1,4}){1,4}|([0-9a-fA-F]{1,4}:){1,2}(:[0-9a-fA-F]{1,4}){1,5}|[0-9a-fA-F]{1,4}:(:[0-9a-fA-F]{1,4}){1,6}|:(:[0-9a-fA-F]{1,4}){1,7}|:|fe80:(:[0-9a-fA-F]{0,4}){0,4}%[0-9a-zA-Z]{1,}|::(ffff(:0{1,4}){0,1}:){0,1}((25[0-5]|(2[0-4]|1?[0-9])?[0-9])\.){3}(25[0-5]|(2[0-4]|1?[0-9])?[0-9])|([0-9a-fA-F]{1,4}:){1,4}:((25[0-5]|(2[0-4]|1?[0-9])?[0-9])\.){3}(25[0-5]|(2[0-4]|1?[0-9])?[0-9]))))$
+   imageType?: ImageType;
+   /**
+    * JSON formatted string containing the user overrides for the initial ignition config.
+@@ -1926,14 +2005,6 @@ export interface InfraEnvUpdateParams {
+    * Version of the OS image
+    */
+   openshiftVersion?: string;
+-  /**
+-   * The IP address that hosts will use to communicate with the bootstrap node during installation.
+-   */
+-  rendezvousIp?: string;
+-  /**
+-   * The type of network configuration for hosts: 'dhcp' for DHCP only, 'static' for static IP configuration.
+-   */
+-  hostsNetworkConfigurationType?: 'dhcp' | 'static';
+ }
+ export interface InfraError {
+   /**
+@@ -2204,7 +2275,7 @@ export type MacInterfaceMap = {
+   /**
+    * mac address present on the host
+    */
+-  macAddress?: string; // ^([0-9A-Fa-f]{2}[:]){5}([0-9A-Fa-f]{2})$
++  macAddress: string; // ^([0-9A-Fa-f]{2}[:]){5}([0-9A-Fa-f]{2})$
+   /**
+    * nic name used in the yaml, which relates 1:1 to the mac address
+    */
+@@ -2368,6 +2439,17 @@ export interface OpenshiftVersion {
+ export interface OpenshiftVersions {
+   [name: string]: OpenshiftVersion;
+ }
++export interface Operator {
++  'feature-support-level-id': FeatureSupportLevelId;
++  supportLevel: SupportLevel;
++  reason?: IncompatibilityReason;
++  incompatibilities: FeatureSupportLevelId[];
++  /**
++   * Name of the operator
++   */
++  name: string;
++  dependencies: FeatureSupportLevelId[];
++}
+ export interface OperatorCreateParams {
+   name?: string;
+   /**
+@@ -2875,8 +2957,17 @@ export interface V2ClusterUpdateParams {
+     | 'all';
+   /**
+    * The desired network type used.
++   * - OVNKubernetes: Default CNI for OpenShift (recommended)
++   * - OpenShiftSDN: Legacy SDN (deprecated in newer versions)
++   * - CiscoACI: Cisco ACI CNI (requires custom manifests)
++   * - Cilium: Isovalent Cilium CNI (requires custom manifests)
++   * - Calico: Tigera Calico CNI (requires custom manifests)
++   * - None: No CNI - user must provide custom CNI manifests
++   * Note: Third-party CNIs (CiscoACI, Cilium, Calico, None) require uploading
++   * CNI manifests via the custom manifests API before installation.
++   *
+    */
+-  networkType?: 'OpenShiftSDN' | 'OVNKubernetes';
++  networkType?: 'OpenShiftSDN' | 'OVNKubernetes' | 'CiscoACI' | 'Cilium' | 'Calico' | 'None';
+   /**
+    * Schedule workloads on masters
+    */
+@@ -2933,6 +3024,13 @@ export interface V2OpenshiftVersions {
+   version?: string;
+   onlyLatest?: boolean;
+ }
++export interface V2OperatorsBundles {
++  openshiftVersion?: string;
++  cpuArchitecture?: 'x86_64' | 'aarch64' | 'arm64' | 'ppc64le' | 's390x' | 'multi';
++  platformType?: 'baremetal' | 'none' | 'nutanix' | 'vsphere' | 'external';
++  externalPlatformName?: string;
++  featureIds?: 'SNO'[];
++}
+ export interface V2SupportLevelsArchitectures {
+   openshiftVersion: string;
+ }
+@@ -2942,6 +3040,12 @@ export interface V2SupportLevelsFeatures {
+   platformType?: 'baremetal' | 'none' | 'nutanix' | 'vsphere' | 'external';
+   externalPlatformName?: string;
+ }
++export interface V2SupportLevelsFeaturesDetailed {
++  openshiftVersion: string;
++  cpuArchitecture?: 'x86_64' | 'arm64' | 'ppc64le' | 's390x' | 'multi';
++  platformType?: 'baremetal' | 'none' | 'nutanix' | 'vsphere' | 'external';
++  externalPlatformName?: string;
++}
+ /**
+  * Single VIP verification result.
+  */
+diff --git a/libs/ui-lib-tests/cypress/fixtures/custom-manifests/1-cluster-created.ts b/libs/ui-lib-tests/cypress/fixtures/custom-manifests/1-cluster-created.ts
+index 027716a2ff..5407be9954 100644
+--- a/libs/ui-lib-tests/cypress/fixtures/custom-manifests/1-cluster-created.ts
++++ b/libs/ui-lib-tests/cypress/fixtures/custom-manifests/1-cluster-created.ts
+@@ -38,7 +38,7 @@ const customManifestsCluster = {
+   // We're adding this field to easily debug which mock is returning the response
+   feature_usage: JSON.stringify(featureUsage),
+   control_plane_count: 3,
+-  network_type: 'OpenShiftSDN',
++  network_type: 'Cilium',
+   user_managed_networking: false,
+   vip_dhcp_allocation: true,
+   e2e_mock_source: '5-cluster-ready',
+diff --git a/libs/ui-lib-tests/cypress/integration/create-multinode/2-networking.cy.ts b/libs/ui-lib-tests/cypress/integration/create-multinode/2-networking.cy.ts
+index 27b4f43daf..cb7dc5ce06 100644
+--- a/libs/ui-lib-tests/cypress/integration/create-multinode/2-networking.cy.ts
++++ b/libs/ui-lib-tests/cypress/integration/create-multinode/2-networking.cy.ts
+@@ -60,8 +60,7 @@ describe(`Assisted Installer Multinode Networking`, () => {
+ 
+     it('Should have the correct default network type', () => {
+       networkingPage.getAdvancedNetwork().click();
+-      networkingPage.getSdnNetworkingField().should('be.enabled').and('not.be.checked');
+-      networkingPage.getOvnNetworkingField().should('be.enabled').and('be.checked');
++      networkingPage.getNetworkTypeToggle().should('contain.text', 'Open Virtual Networking (OVN)');
+     });
+   });
+ });
+diff --git a/libs/ui-lib-tests/cypress/integration/create-sno/2-networking.cy.ts b/libs/ui-lib-tests/cypress/integration/create-sno/2-networking.cy.ts
+index 74cc946037..f8d4139a52 100644
+--- a/libs/ui-lib-tests/cypress/integration/create-sno/2-networking.cy.ts
++++ b/libs/ui-lib-tests/cypress/integration/create-sno/2-networking.cy.ts
+@@ -36,8 +36,7 @@ describe(`Assisted Installer SNO Networking`, () => {
+ 
+     it('Should have the correct default network type', () => {
+       networkingPage.getAdvancedNetwork().click();
+-      networkingPage.getSdnNetworkingField().should('not.be.enabled').and('not.be.checked');
+-      networkingPage.getOvnNetworkingField().should('not.be.enabled').and('be.checked');
++      networkingPage.getNetworkTypeToggle().should('contain.text', 'Open Virtual Networking (OVN)');
+     });
+   });
+ });
+diff --git a/libs/ui-lib-tests/cypress/integration/custom-manifests/1-create-cluster-with-custom-manifests.cy.ts b/libs/ui-lib-tests/cypress/integration/custom-manifests/1-create-cluster-with-custom-manifests.cy.ts
+index 516ad082ec..c3c720f6a5 100644
+--- a/libs/ui-lib-tests/cypress/integration/custom-manifests/1-create-cluster-with-custom-manifests.cy.ts
++++ b/libs/ui-lib-tests/cypress/integration/custom-manifests/1-create-cluster-with-custom-manifests.cy.ts
+@@ -21,18 +21,9 @@ describe(`Assisted Installer Cluster Installation with Custom Manifests`, () =>
+       clusterDetailsPage.inputOpenshiftVersion();
+       clusterDetailsPage.inputPullSecret();
+ 
+-      clusterDetailsPage.getCustomManifestCheckbox().should('be.visible').check();
+-      clusterDetailsPage.getCustomManifestCheckbox().should('be.checked');
+-      commonActions
+-        .getInfoAlert()
+-        .should('contain.text', 'This is an advanced configuration feature.');
+-
+       commonActions.getWizardStepNav('Custom manifests').should('exist');
+ 
+       commonActions.getNextButton().click();
+-      cy.wait('@update-ui-settings').then(({ request }) => {
+-        expect(request.body).to.deep.equal('AI_UI:{"addCustomManifests":true}');
+-      });
+     });
+   });
+ });
+diff --git a/libs/ui-lib-tests/cypress/integration/custom-manifests/2-modifying-existing-custom-manifest.cy.ts b/libs/ui-lib-tests/cypress/integration/custom-manifests/2-modifying-existing-custom-manifest.cy.ts
+index 338b052456..378ec849e9 100644
+--- a/libs/ui-lib-tests/cypress/integration/custom-manifests/2-modifying-existing-custom-manifest.cy.ts
++++ b/libs/ui-lib-tests/cypress/integration/custom-manifests/2-modifying-existing-custom-manifest.cy.ts
+@@ -105,10 +105,9 @@ describe(`Assisted Installer Custom manifests step`, () => {
+           'Must have a yaml, yml, json, yaml.patch or yml.patch extension and can not contain /.',
+         );
+ 
+-      CustomManifestsForm.validationAlert().should(
+-        'contain.text',
+-        'Custom manifests configuration contains missing or invalid fields',
+-      );
++      CustomManifestsForm.validationAlert()
++        .should('be.visible')
++        .and('contain.text', 'Custom manifests configuration contains missing or invalid fields');
+       commonActions.verifyNextIsDisabled();
+     });
+ 
+@@ -130,10 +129,9 @@ describe(`Assisted Installer Custom manifests step`, () => {
+           'Must have a yaml, yml, json, yaml.patch or yml.patch extension and can not contain /.',
+         );
+ 
+-      CustomManifestsForm.validationAlert().should(
+-        'contain.text',
+-        'Custom manifests configuration contains missing or invalid fields',
+-      );
++      CustomManifestsForm.validationAlert()
++        .should('be.visible')
++        .and('contain.text', 'Custom manifests configuration contains missing or invalid fields');
+       commonActions.verifyNextIsDisabled();
+     });
+   });
+diff --git a/libs/ui-lib-tests/cypress/integration/dualstack/2-networking.cy.ts b/libs/ui-lib-tests/cypress/integration/dualstack/2-networking.cy.ts
+index 30566b900e..6f5160b0e1 100644
+--- a/libs/ui-lib-tests/cypress/integration/dualstack/2-networking.cy.ts
++++ b/libs/ui-lib-tests/cypress/integration/dualstack/2-networking.cy.ts
+@@ -39,8 +39,7 @@ describe(`Assisted Installer Dualstack Networking`, () => {
+       networkingPage.getStackTypeDualStack().should('be.enabled').and('be.checked');
+       networkingPage.getClusterManagedNetworking().should('be.disabled').and('be.checked');
+       networkingPage.getVipDhcp().should('be.disabled').and('not.be.checked');
+-      networkingPage.getOvnNetworkingField().should('not.be.enabled').and('be.checked');
+-      networkingPage.getSdnNetworkingField().should('not.be.enabled').and('not.be.checked');
++      networkingPage.getNetworkTypeToggle().should('contain.text', 'Open Virtual Networking (OVN)');
+       networkingPage
+         .getClusterSubnetCidrIpv4()
+         .should('contain.text', '192.168.122.0/24 (192.168.122.0 - 192.168.122.255)');
+@@ -71,8 +70,7 @@ describe(`Assisted Installer Dualstack Networking`, () => {
+       networkingPage.getClusterManagedNetworking().should('be.enabled').and('be.checked');
+       networkingPage.getStackTypeSingleStack().should('be.enabled').and('be.checked');
+       networkingPage.getVipDhcp().should('be.disabled').and('not.be.checked');
+-      networkingPage.getOvnNetworkingField().should('be.enabled').and('be.checked');
+-      networkingPage.getSdnNetworkingField().should('be.enabled').and('not.be.checked');
++      networkingPage.getNetworkTypeToggle().should('contain.text', 'Open Virtual Networking (OVN)');
+ 
+       cy.wait('@update-cluster').then(({ request }) => {
+         expect(request.body, 'Networking request body').to.deep.equal(ipv4NetworkingRequest);
+diff --git a/libs/ui-lib-tests/cypress/integration/use-cases/create-cluster/with-external-partner-integrations.cy.ts b/libs/ui-lib-tests/cypress/integration/use-cases/create-cluster/with-external-partner-integrations.cy.ts
+index c5f2b0af82..500a37567d 100644
+--- a/libs/ui-lib-tests/cypress/integration/use-cases/create-cluster/with-external-partner-integrations.cy.ts
++++ b/libs/ui-lib-tests/cypress/integration/use-cases/create-cluster/with-external-partner-integrations.cy.ts
+@@ -47,15 +47,6 @@ describe('Create a new cluster with external partner integrations', () => {
+       });
+     });
+ 
+-    it('Selecting oracle as external partner integration enables custom manifests as well', () => {
+-      ClusterDetailsForm.openshiftVersionField.selectVersion('4.14');
+-      ClusterDetailsForm.externalPartnerIntegrationsField.selectPlatform('Oracle');
+-      ClusterDetailsForm.customManifestsField
+-        .findCheckbox()
+-        .should('be.checked')
+-        .and('be.disabled');
+-    });
+-
+     it('Validate that oracle as external partner integration is unselected in dropdown after OCP < v4.14 is selected', () => {
+       ClusterDetailsForm.openshiftVersionField.selectVersion('4.14');
+       ClusterDetailsForm.externalPartnerIntegrationsField.selectPlatform('Oracle');
+diff --git a/libs/ui-lib-tests/cypress/support/interceptors.ts b/libs/ui-lib-tests/cypress/support/interceptors.ts
+index 72bd385979..25fd13b1d3 100644
+--- a/libs/ui-lib-tests/cypress/support/interceptors.ts
++++ b/libs/ui-lib-tests/cypress/support/interceptors.ts
+@@ -135,9 +135,9 @@ const mockCustomManifestFileResponse: HttpRequestInterceptor = (req) => {
+ 
+ const mockUISettingsResponse: HttpRequestInterceptor = (req) => {
+   if (hasWizardSignal('CUSTOM_MANIFEST_ADDED')) {
+-    req.reply('AI_UI:{"addCustomManifests":true,"customManifestsAdded":true}');
++    req.reply('AI_UI:{"customManifestsAdded":true}');
+   } else if (hasWizardSignal('ONLY_DUMMY_CUSTOM_MANIFEST_ADDED')) {
+-    req.reply('AI_UI:{"addCustomManifests":true}');
++    req.reply('AI_UI:{}');
+   } else {
+     req.reply('""');
+   }
+diff --git a/libs/ui-lib-tests/cypress/support/variables/networking.ts b/libs/ui-lib-tests/cypress/support/variables/networking.ts
+index 017d455776..c75f301fff 100644
+--- a/libs/ui-lib-tests/cypress/support/variables/networking.ts
++++ b/libs/ui-lib-tests/cypress/support/variables/networking.ts
+@@ -19,8 +19,7 @@ Cypress.env(
+ Cypress.env('serviceNetworkCidrFieldHelperId', '#form-input-serviceNetworks-0-cidr-field-helper');
+ Cypress.env('userManagedNetworkingRadioText', 'User-Managed Networking');
+ Cypress.env('openVirtualNetworkingRadioText', 'Open Virtual Networking');
+-Cypress.env('openshiftSdnInputValue', 'input[value="OpenShiftSDN"]');
+-Cypress.env('ovnKubernetesRadioId', `#form-radio-networkType-OVNKubernetes-field`);
++Cypress.env('networkTypeToggleId', '#form-input-networkType-field');
+ Cypress.env('hostSubnetFieldId', '#form-input-hostSubnet-field');
+ Cypress.env('clusterNetworkCidrFieldId', '#form-input-clusterNetworks-0-cidr-field');
+ Cypress.env('clusterNetworks0HostPrefixFieldId', '#form-input-clusterNetworks-0-hostPrefix-field');
+diff --git a/libs/ui-lib-tests/cypress/views/forms/CustomManifests/CustomManifestsForm.ts b/libs/ui-lib-tests/cypress/views/forms/CustomManifests/CustomManifestsForm.ts
+index 3bb99f933c..2f7cf8afe6 100644
+--- a/libs/ui-lib-tests/cypress/views/forms/CustomManifests/CustomManifestsForm.ts
++++ b/libs/ui-lib-tests/cypress/views/forms/CustomManifests/CustomManifestsForm.ts
+@@ -13,7 +13,7 @@ export const CustomManifestsForm = {
+   },
+ 
+   validationAlert: () => {
+-    return cy.get('.pf-v6-c-alert.pf-m-danger');
++    return cy.contains('.pf-v6-c-alert', 'Custom manifests configuration contains missing or invalid fields');
+   },
+   addManifest: () => {
+     return CustomManifestsForm.body().findByTestId('add-manifest');
+diff --git a/libs/ui-lib-tests/cypress/views/networkingPage.ts b/libs/ui-lib-tests/cypress/views/networkingPage.ts
+index 135587ffad..fc8f0cb669 100644
+--- a/libs/ui-lib-tests/cypress/views/networkingPage.ts
++++ b/libs/ui-lib-tests/cypress/views/networkingPage.ts
+@@ -277,11 +277,8 @@ export const networkingPage = {
+         });
+       });
+   },
+-  getSdnNetworkingField: () => {
+-    return cy.get(Cypress.env('openshiftSdnInputValue')).scrollIntoView();
+-  },
+-  getOvnNetworkingField: () => {
+-    return cy.get(Cypress.env('ovnKubernetesRadioId')).scrollIntoView();
++  getNetworkTypeToggle: () => {
++    return cy.get(Cypress.env('networkTypeToggleId')).scrollIntoView();
+   },
+   setOvnNetworking: () => {
+     cy.get(`.pf-v6-c-radio__label:contains(${Cypress.env('openVirtualNetworkingRadioText')})`)
+diff --git a/libs/ui-lib/lib/common/config/constants.ts b/libs/ui-lib/lib/common/config/constants.ts
+index fe7ccb59c8..708c6b487a 100644
+--- a/libs/ui-lib/lib/common/config/constants.ts
++++ b/libs/ui-lib/lib/common/config/constants.ts
+@@ -53,6 +53,7 @@ export const clusterStatusLabels = (t: TFunction): { [key in Cluster['status']]:
+   error: t('ai:Error'),
+   installed: t('ai:Installed'),
+   'adding-hosts': t('ai:Adding hosts'),
++  unmonitored: t('ai:Unmonitored'),
+ });
+ 
+ export const clusterFieldLabels = (t: TFunction): { [key in string]: string } => ({
+@@ -334,6 +335,19 @@ export const NO_SUBNET_SET = 'NO_SUBNET_SET';
+ 
+ export const NETWORK_TYPE_OVN = 'OVNKubernetes';
+ export const NETWORK_TYPE_SDN = 'OpenShiftSDN';
++export const NETWORK_TYPE_CISCO_ACI = 'CiscoACI';
++export const NETWORK_TYPE_CILIUM = 'Cilium';
++export const NETWORK_TYPE_CALICO = 'Calico';
++export const NETWORK_TYPE_NONE = 'None';
++
++export const NETWORK_TYPE_LABELS: Record<string, string> = {
++  [NETWORK_TYPE_OVN]: 'Open Virtual Networking (OVN)',
++  [NETWORK_TYPE_SDN]: 'Software-Defined Networking (SDN)',
++  [NETWORK_TYPE_CISCO_ACI]: 'Cisco ACI',
++  [NETWORK_TYPE_CILIUM]: 'Isovalent Cilium',
++  [NETWORK_TYPE_CALICO]: 'Tigera Calico',
++  [NETWORK_TYPE_NONE]: 'None (Custom CNI)',
++};
+ 
+ export const IPV4_STACK = 'singleStack';
+ export const DUAL_STACK = 'dualStack';
+diff --git a/libs/ui-lib/lib/common/config/docs_links.ts b/libs/ui-lib/lib/common/config/docs_links.ts
+index d756870d06..b375517c5c 100644
+--- a/libs/ui-lib/lib/common/config/docs_links.ts
++++ b/libs/ui-lib/lib/common/config/docs_links.ts
+@@ -54,6 +54,8 @@ export const getOpenShiftNetworkingDocsLink = (ocpVersion?: string) => {
+   return `https://docs.redhat.com/en/documentation/openshift_container_platform/${validOcpVersion}/html/installing_on_bare_metal/${variant}#installation-network-user-infra_installing-bare-metal`;
+ };
+ 
++export const RED_HAT_CNI_SUPPORT_MATRIX_LINK = 'https://access.redhat.com/articles/5436171';
++
+ export const SSH_GENERATION_DOC_LINK = 'https://www.redhat.com/sysadmin/configure-ssh-keygen';
+ 
+ //Hosts status
+diff --git a/libs/ui-lib/lib/common/types/ui-settings.ts b/libs/ui-lib/lib/common/types/ui-settings.ts
+index 13bcc62bf2..53c826f9b7 100644
+--- a/libs/ui-lib/lib/common/types/ui-settings.ts
++++ b/libs/ui-lib/lib/common/types/ui-settings.ts
+@@ -1,5 +1,4 @@
+ export type UISettingsValues = {
+-  addCustomManifests?: boolean;
+   customManifestsAdded?: boolean;
+   customManifestsUpdated?: boolean;
+   bundlesSelected?: string[];
+diff --git a/libs/ui-lib/lib/ocm/components/clusterConfiguration/CustomManifestCheckbox.tsx b/libs/ui-lib/lib/ocm/components/clusterConfiguration/CustomManifestCheckbox.tsx
+deleted file mode 100644
+index 9b02e0f6d6..0000000000
+--- a/libs/ui-lib/lib/ocm/components/clusterConfiguration/CustomManifestCheckbox.tsx
++++ /dev/null
+@@ -1,114 +0,0 @@
+-import * as React from 'react';
+-import {
+-  Alert,
+-  FormGroup,
+-  FormHelperText,
+-  HelperText,
+-  HelperTextItem,
+-} from '@patternfly/react-core';
+-import { useField } from 'formik';
+-import { getFieldId, PopoverIcon } from '../../../common';
+-import { OcmCheckbox } from '../ui/OcmFormFields';
+-import { useClusterWizardContext } from '../clusterWizard/ClusterWizardContext';
+-import DeleteCustomManifestModal from './manifestsConfiguration/DeleteCustomManifestModal';
+-import { ClustersService } from '../../services';
+-import { ClustersAPI } from '../../services/apis';
+-
+-const Label = () => {
+-  return (
+-    <>
+-      Include custom manifests{' '}
+-      <PopoverIcon
+-        noVerticalAlign
+-        bodyContent={
+-          <p>
+-            Incorporate third-party manifests that are not supported in Assisted Installer and APIs.
+-          </p>
+-        }
+-      />
+-    </>
+-  );
+-};
+-
+-type CustomManifestCheckboxProps = { clusterId: string; isDisabled: boolean };
+-
+-const CustomManifestCheckbox = ({ clusterId, isDisabled }: CustomManifestCheckboxProps) => {
+-  const [{ name }, { value }, { setValue }] = useField<boolean>('addCustomManifest');
+-  const fieldId = getFieldId(name, 'input');
+-  const clusterWizardContext = useClusterWizardContext();
+-  const [isDeleteCustomManifestsOpen, setDeleteCustomManifestsOpen] = React.useState(false);
+-
+-  const cleanCustomManifests = React.useCallback(async () => {
+-    const { data: manifests } = await ClustersAPI.getManifests(clusterId);
+-    void ClustersService.removeClusterManifests(manifests, clusterId);
+-
+-    setValue(false);
+-    clusterWizardContext.setCustomManifestsStep(false);
+-    setDeleteCustomManifestsOpen(false);
+-    await clusterWizardContext.updateUISettings({
+-      addCustomManifests: false,
+-      customManifestsAdded: false,
+-    });
+-  }, [clusterWizardContext, setValue, clusterId]);
+-
+-  const onChange = React.useCallback(
+-    (checked: boolean) => {
+-      if (!checked && clusterWizardContext.uiSettings?.customManifestsAdded) {
+-        setDeleteCustomManifestsOpen(true);
+-      }
+-
+-      setValue(checked);
+-      clusterWizardContext.setCustomManifestsStep(checked);
+-    },
+-    [setValue, clusterWizardContext, setDeleteCustomManifestsOpen],
+-  );
+-
+-  const onClose = React.useCallback(() => {
+-    setValue(true);
+-    clusterWizardContext.setCustomManifestsStep(true);
+-    setDeleteCustomManifestsOpen(false);
+-  }, [clusterWizardContext, setValue]);
+-
+-  return (
+-    <>
+-      <FormGroup id={`form-control__${fieldId}`} isInline fieldId={fieldId}>
+-        <OcmCheckbox
+-          id={fieldId}
+-          name={name}
+-          label={<Label />}
+-          aria-describedby={`${fieldId}-helper`}
+-          description={
+-            <FormGroup>
+-              <FormHelperText>
+-                <HelperText id={fieldId}>
+-                  <HelperTextItem
+-                    data-testid={`input-custommanifestcheckbox-${fieldId}-helper-text`}
+-                  >
+-                    Additional manifests will be applied at the install time for advanced
+-                    configuration of the cluster.
+-                  </HelperTextItem>
+-                </HelperText>
+-              </FormHelperText>
+-            </FormGroup>
+-          }
+-          onChange={(_event, value) => onChange(value)}
+-          className="with-tooltip"
+-          isChecked={value}
+-          isDisabled={isDisabled}
+-        />
+-        <DeleteCustomManifestModal
+-          isOpen={isDeleteCustomManifestsOpen}
+-          onClose={onClose}
+-          onDelete={() => void cleanCustomManifests()}
+-        />
+-      </FormGroup>
+-      {value && (
+-        <Alert isInline variant="info" title={'This is an advanced configuration feature.'}>
+-          Custom manifests will be added to the wizard as a new step.
+-        </Alert>
+-      )}
+-    </>
+-  );
+-};
+-
+-export default CustomManifestCheckbox;
+diff --git a/libs/ui-lib/lib/ocm/components/clusterConfiguration/OcmClusterDetailsFormFields.tsx b/libs/ui-lib/lib/ocm/components/clusterConfiguration/OcmClusterDetailsFormFields.tsx
+index 0268d9b488..374ef7b40b 100644
+--- a/libs/ui-lib/lib/ocm/components/clusterConfiguration/OcmClusterDetailsFormFields.tsx
++++ b/libs/ui-lib/lib/ocm/components/clusterConfiguration/OcmClusterDetailsFormFields.tsx
+@@ -21,7 +21,6 @@ import { useTranslation } from '../../../common/hooks/use-translation-wrapper';
+ import { OcmRichInputField } from '../ui/OcmFormFields';
+ import OcmOpenShiftVersion from './OcmOpenShiftVersion';
+ import OcmOpenShiftVersionSelect from './OcmOpenShiftVersionSelect';
+-import CustomManifestCheckbox from './CustomManifestCheckbox';
+ import CpuArchitectureDropdown from './CpuArchitectureDropdown';
+ import { OcmBaseDomainField } from './OcmBaseDomainField';
+ import useSupportLevelsAPI from '../../hooks/useSupportLevelsAPI';
+@@ -35,7 +34,6 @@ import {
+   ManagedDomain,
+   PlatformType,
+ } from '@openshift-assisted/types/assisted-installer-service';
+-import { useClusterWizardContext } from '../clusterWizard/ClusterWizardContext';
+ import { useFeature } from '../../hooks/use-feature';
+ import ControlPlaneNodesDropdown, {
+   ControlPlaneNodesLabel,
+@@ -68,7 +66,6 @@ export const OcmClusterDetailsFormFields = ({
+   const { openshiftVersion, platform } = values;
+   const { getCpuArchitectures } = useOpenShiftVersionsContext();
+   const cpuArchitecturesByVersionImage = getCpuArchitectures(openshiftVersion);
+-  const clusterWizardContext = useClusterWizardContext();
+   const featureSupportLevelData = useSupportLevelsAPI(
+     'features',
+     values.openshiftVersion,
+@@ -91,12 +88,10 @@ export const OcmClusterDetailsFormFields = ({
+     (selectedPlatform: PlatformType) => {
+       const isOracleSelected = selectedPlatform === 'external';
+       if (isOracleSelected) {
+-        setFieldValue('addCustomManifest', isOracleSelected, false);
+-        clusterWizardContext.setCustomManifestsStep(isOracleSelected);
+         setFieldValue('hostsNetworkConfigurationType', HostsNetworkConfigurationType.DHCP);
+       }
+     },
+-    [clusterWizardContext, setFieldValue],
++    [setFieldValue],
+   );
+ 
+   React.useEffect(() => {
+@@ -213,8 +208,6 @@ export const OcmClusterDetailsFormFields = ({
+       ) : (
+         <ControlPlaneNodesDropdown featureSupportLevelData={featureSupportLevelData} />
+       )}
+-      <CustomManifestCheckbox clusterId={cluster?.id || ''} isDisabled={platform === 'external'} />
+-
+       {!isSingleClusterFeatureEnabled && (
+         <HostsNetworkConfigurationControlGroup
+           clusterExists={clusterExists}
+diff --git a/libs/ui-lib/lib/ocm/components/clusterConfiguration/manifestsConfiguration/CustomManifestsPage.tsx b/libs/ui-lib/lib/ocm/components/clusterConfiguration/manifestsConfiguration/CustomManifestsPage.tsx
+index ee6d0a1f84..e8a87f5a15 100644
+--- a/libs/ui-lib/lib/ocm/components/clusterConfiguration/manifestsConfiguration/CustomManifestsPage.tsx
++++ b/libs/ui-lib/lib/ocm/components/clusterConfiguration/manifestsConfiguration/CustomManifestsPage.tsx
+@@ -1,10 +1,25 @@
+ import React from 'react';
+-import { Content, ContentVariants, Alert, Grid } from '@patternfly/react-core';
++import {
++  Content,
++  ContentVariants,
++  Alert,
++  AlertVariant,
++  Grid,
++  FormGroup,
++  Switch,
++  Tooltip,
++  Stack,
++  StackItem,
++} from '@patternfly/react-core';
+ 
+ import { CustomManifests } from './components/CustomManifests';
+ import { Cluster } from '@openshift-assisted/types/assisted-installer-service';
+ import { CustomManifestFormState } from './components/propTypes';
+-import { ClusterWizardStepHeader } from '../../../../common';
++import { ClustersAPI, ClusterWizardStepHeader } from '../../../../common';
++import { isOciPlatformType, isThirdPartyCNI } from '../../utils';
++import DeleteCustomManifestModal from './DeleteCustomManifestModal';
++import { ClustersService } from '../../../services';
++import { useClusterWizardContext } from '../../clusterWizard/ClusterWizardContext';
+ 
+ export const CustomManifestsPage = ({
+   cluster,
+@@ -12,22 +27,142 @@ export const CustomManifestsPage = ({
+ }: {
+   cluster: Cluster;
+   onFormStateChange(formState: CustomManifestFormState): void;
+-}) => (
+-  <Grid hasGutter>
+-    <Content>
+-      <ClusterWizardStepHeader>Custom manifests</ClusterWizardStepHeader>
+-      <Content component={ContentVariants.small}>
+-        Upload additional manifests that will be applied at the install time for advanced
+-        configuration of the cluster.
+-      </Content>
+-    </Content>
+-    <Alert
+-      isInline
+-      variant="warning"
+-      title={
+-        'No validation is performed for the custom manifest contents. Only include resources that are necessary for initial setup to reduce the chance of installation failures.'
++}) => {
++  const clusterWizardContext = useClusterWizardContext();
++  const isRequired = isThirdPartyCNI(cluster.networkType) || isOciPlatformType(cluster);
++  const [useCustomManifests, setUseCustomManifests] = React.useState(isRequired);
++  const [isDeleteModalOpen, setDeleteModalOpen] = React.useState(false);
++
++  React.useEffect(() => {
++    if (isRequired || clusterWizardContext.uiSettings?.customManifestsAdded) {
++      setUseCustomManifests(true);
++    }
++  }, [isRequired, clusterWizardContext]);
++
++  // The form unmounts when the switch is off, but its last state persists in the parent.
++  React.useEffect(() => {
++    if (!useCustomManifests) {
++      onFormStateChange({
++        isValid: true,
++        isSubmitting: false,
++        isAutoSaveRunning: false,
++        errors: {},
++        touched: {},
++        isEmpty: true,
++      });
++    }
++  }, [useCustomManifests, onFormStateChange]);
++
++  const handleSwitchChange = React.useCallback(
++    (_event: React.FormEvent<HTMLInputElement>, on: boolean) => {
++      if (!on && clusterWizardContext.uiSettings?.customManifestsAdded) {
++        setDeleteModalOpen(true);
++      } else {
++        setUseCustomManifests(on);
++        if (!on) {
++          void clusterWizardContext.updateUISettings({ customManifestsAdded: false });
++        }
+       }
+-    />
+-    <CustomManifests cluster={cluster} onFormStateChange={onFormStateChange} />
+-  </Grid>
+-);
++    },
++    [clusterWizardContext],
++  );
++
++  const handleCloseDeleteModal = React.useCallback(() => {
++    setDeleteModalOpen(false);
++  }, []);
++
++  const cleanCustomManifests = React.useCallback(async () => {
++    if (!clusterWizardContext.uiSettings?.customManifestsAdded || !cluster.id) return;
++    const { data: manifests } = await ClustersAPI.getManifests(cluster.id);
++    await ClustersService.removeClusterManifests(manifests, cluster.id);
++    setUseCustomManifests(false);
++    setDeleteModalOpen(false);
++    await clusterWizardContext.updateUISettings({ customManifestsAdded: false });
++  }, [cluster.id, clusterWizardContext]);
++
++  const tooltipWhenDisabled = isRequired
++    ? 'Custom manifests are required when using a third-party CNI or Oracle Cloud Infrastructure.'
++    : '';
++
++  const showExternalPlatformReminder = isOciPlatformType(cluster);
++  const showThirdPartyCnIReminder = isThirdPartyCNI(cluster.networkType);
++  const showCombinedReminder = showExternalPlatformReminder && showThirdPartyCnIReminder;
++  let reminderAlerts: React.ReactNode = null;
++  if (showCombinedReminder) {
++    reminderAlerts = (
++      <Stack>
++        <StackItem>
++          <Alert
++            variant={AlertVariant.info}
++            isInline
++            title="You're using an external platform and a third-party CNI"
++          >
++            Make sure to upload the required custom and CNI manifests in this step.
++          </Alert>
++        </StackItem>
++      </Stack>
++    );
++  } else if (showExternalPlatformReminder) {
++    reminderAlerts = (
++      <Stack>
++        <StackItem>
++          <Alert variant={AlertVariant.info} isInline title="You're using an external platform">
++            Make sure to upload the required custom manifests in this step.
++          </Alert>
++        </StackItem>
++      </Stack>
++    );
++  } else if (showThirdPartyCnIReminder) {
++    reminderAlerts = (
++      <Stack>
++        <StackItem>
++          <Alert variant={AlertVariant.info} isInline title="You're using a third-party CNI">
++            Make sure to upload the required CNI manifests in this step.
++          </Alert>
++        </StackItem>
++      </Stack>
++    );
++  }
++
++  return (
++    <Grid hasGutter>
++      <Content>
++        <ClusterWizardStepHeader>Custom manifests</ClusterWizardStepHeader>
++        <Content component={ContentVariants.small}>
++          Upload additional manifests that will be applied at the install time for advanced
++          configuration of the cluster.
++        </Content>
++      </Content>
++      <FormGroup fieldId="use-custom-manifests" label="">
++        <Tooltip content={tooltipWhenDisabled} hidden={!isRequired}>
++          <span style={{ display: 'inline-block', cursor: isRequired ? 'not-allowed' : undefined }}>
++            <Switch
++              id="use-custom-manifests"
++              isChecked={useCustomManifests}
++              isDisabled={isRequired}
++              onChange={handleSwitchChange}
++              label="Use custom manifests"
++            />
++          </span>
++        </Tooltip>
++      </FormGroup>
++      {!useCustomManifests && <div style={{ minHeight: '120px' }} aria-hidden="true" />}
++      {useCustomManifests && (
++        <>
++          {reminderAlerts}
++          <Alert
++            isInline
++            variant="warning"
++            title="No validation is performed for the custom manifest contents. Only include resources that are necessary for initial setup to reduce the chance of installation failures."
++          />
++          <CustomManifests cluster={cluster} onFormStateChange={onFormStateChange} />
++        </>
++      )}
++      <DeleteCustomManifestModal
++        isOpen={isDeleteModalOpen}
++        onClose={handleCloseDeleteModal}
++        onDelete={() => void cleanCustomManifests()}
++      />
++    </Grid>
++  );
++};
+diff --git a/libs/ui-lib/lib/ocm/components/clusterConfiguration/networkConfiguration/NetworkConfiguration.tsx b/libs/ui-lib/lib/ocm/components/clusterConfiguration/networkConfiguration/NetworkConfiguration.tsx
+index 6747af4174..b31c909bfc 100644
+--- a/libs/ui-lib/lib/ocm/components/clusterConfiguration/networkConfiguration/NetworkConfiguration.tsx
++++ b/libs/ui-lib/lib/ocm/components/clusterConfiguration/networkConfiguration/NetworkConfiguration.tsx
+@@ -23,9 +23,9 @@ import {
+   VirtualIPControlGroupProps,
+   AdvancedNetworkFields,
+ } from '../../../../common/components/clusterWizard/networkingSteps';
++import { NetworkTypeDropDown } from './NetworkTypeDropdown';
+ import { selectCurrentClusterPermissionsState } from '../../../store/slices/current-cluster/selectors';
+ import { OcmCheckbox } from '../../ui/OcmFormFields';
+-import { NetworkTypeControlGroup } from '../../../../common/components/clusterWizard/networkingSteps/NetworkTypeControlGroup';
+ import {
+   NewFeatureSupportLevelData,
+   NewFeatureSupportLevelMap,
+@@ -259,11 +259,13 @@ const NetworkConfiguration = ({
+           />
+         </StackItem>
+       )}
+-      {isSDNSupported && (
+-        <StackItem>
+-          <NetworkTypeControlGroup isDisabled={isViewerMode} isSDNSelectable={isSDNSelectable} />
+-        </StackItem>
+-      )}
++      <StackItem>
++        <NetworkTypeDropDown
++          isDisabled={isViewerMode}
++          isSDNSelectable={isSDNSelectable}
++          featureSupportLevelData={featureSupportLevelData}
++        />
++      </StackItem>
+ 
+       {!(isUserManagedNetworking && !isSNOCluster) && (
+         <StackItem>
+diff --git a/libs/ui-lib/lib/ocm/components/clusterConfiguration/networkConfiguration/NetworkTypeDropdown.tsx b/libs/ui-lib/lib/ocm/components/clusterConfiguration/networkConfiguration/NetworkTypeDropdown.tsx
+new file mode 100644
+index 0000000000..c25601a3aa
+--- /dev/null
++++ b/libs/ui-lib/lib/ocm/components/clusterConfiguration/networkConfiguration/NetworkTypeDropdown.tsx
+@@ -0,0 +1,157 @@
++import React from 'react';
++import { useField, useFormikContext } from 'formik';
++import {
++  Alert,
++  AlertVariant,
++  Dropdown,
++  DropdownItem,
++  FormGroup,
++  MenuToggle,
++  MenuToggleElement,
++  Stack,
++  StackItem,
++  Tooltip,
++} from '@patternfly/react-core';
++import {
++  NETWORK_TYPE_CALICO,
++  NETWORK_TYPE_CILIUM,
++  NETWORK_TYPE_CISCO_ACI,
++  NETWORK_TYPE_LABELS,
++  NETWORK_TYPE_NONE,
++  NETWORK_TYPE_OVN,
++  NETWORK_TYPE_SDN,
++} from '../../../../common/config';
++import { getFieldId, ExternalLink } from '../../../../common/components/ui';
++import {
++  NewFeatureSupportLevelMap,
++  useNewFeatureSupportLevel,
++} from '../../../../common/components/newFeatureSupportLevels';
++import { TechnologyPreview } from '../../../../common/components/ui/TechnologyPreview';
++import type { NetworkConfigurationValues } from '../../../../common/types/clusters';
++import { isThirdPartyCNI } from '../../utils';
++import { RED_HAT_CNI_SUPPORT_MATRIX_LINK } from '../../../../common/config/docs_links';
++
++export interface NetworkTypeDropDownProps {
++  isDisabled?: boolean;
++  isSDNSelectable: boolean;
++  featureSupportLevelData: NewFeatureSupportLevelMap | null;
++}
++
++export const NetworkTypeDropDown = ({
++  isDisabled = false,
++  isSDNSelectable,
++  featureSupportLevelData,
++}: NetworkTypeDropDownProps) => {
++  const [field, , { setValue }] = useField<string>('networkType');
++  const [isOpen, setOpen] = React.useState(false);
++  const { values } = useFormikContext<NetworkConfigurationValues>();
++  const { getFeatureDisabledReason } = useNewFeatureSupportLevel();
++  const fieldId = getFieldId('networkType', 'input');
++  const showThirdPartyBanner = isThirdPartyCNI(values.networkType);
++
++  const sdnDisabledReason = React.useMemo(() => {
++    if (!isSDNSelectable) {
++      return 'SDN is not supported for SNO clusters or when IPv6 is detected.';
++    }
++    return getFeatureDisabledReason('SDN_NETWORK_TYPE', featureSupportLevelData ?? undefined);
++  }, [isSDNSelectable, featureSupportLevelData, getFeatureDisabledReason]);
++
++  React.useEffect(() => {
++    if (field.value === NETWORK_TYPE_SDN && sdnDisabledReason) {
++      setValue(NETWORK_TYPE_OVN);
++    }
++  }, [sdnDisabledReason, field.value, setValue]);
++
++  const currentDisplayValue = NETWORK_TYPE_LABELS[field.value];
++
++  const dropdownItems = Object.entries(NETWORK_TYPE_LABELS).map(([value, label]) => {
++    const isSDN = value === NETWORK_TYPE_SDN;
++    const disabledReason = isSDN ? sdnDisabledReason : undefined;
++    const isTechPreview = [
++      NETWORK_TYPE_CISCO_ACI,
++      NETWORK_TYPE_CILIUM,
++      NETWORK_TYPE_CALICO,
++      NETWORK_TYPE_NONE,
++    ].includes(value);
++    return (
++      <DropdownItem
++        key={value}
++        id={value}
++        value={value}
++        isAriaDisabled={disabledReason !== undefined}
++      >
++        <Tooltip hidden={!disabledReason} content={disabledReason} position="top">
++          <div>
++            {label}
++            {isTechPreview && (
++              <span onClick={(event) => event.stopPropagation()}>
++                <TechnologyPreview testId={`${value}-support-level`} />
++              </span>
++            )}
++          </div>
++        </Tooltip>
++      </DropdownItem>
++    );
++  });
++
++  const onSelect = (event?: React.MouseEvent<Element, MouseEvent>, nextValue?: string): void => {
++    if (nextValue) {
++      setValue(nextValue);
++    }
++    setOpen(false);
++  };
++
++  const toggle = (toggleRef: React.Ref<MenuToggleElement>) => (
++    <MenuToggle
++      ref={toggleRef}
++      onClick={() => setOpen(!isOpen)}
++      isExpanded={isOpen}
++      isDisabled={isDisabled}
++      id={fieldId}
++      className="pf-v6-u-w-100"
++      style={{ minWidth: '100%' }}
++    >
++      {currentDisplayValue}
++    </MenuToggle>
++  );
++
++  return (
++    <Stack hasGutter>
++      <StackItem>
++        <FormGroup fieldId={fieldId} label="Network type" id={`form-control__${fieldId}`}>
++          <Dropdown
++            id={`${fieldId}-dropdown`}
++            onOpenChange={(open: boolean) => setOpen(open)}
++            onSelect={onSelect}
++            toggle={toggle}
++            isOpen={isOpen}
++          >
++            {dropdownItems}
++          </Dropdown>
++        </FormGroup>
++      </StackItem>
++      {showThirdPartyBanner && (
++        <StackItem>
++          <Alert
++            variant={AlertVariant.warning}
++            isInline
++            title="Third-party CNI (Technology Preview)"
++          >
++            <Stack hasGutter>
++              <StackItem>
++                Third-party CNIs require uploading CNI manifests. Please verify you have the
++                required manifests and that the chosen CNI is compatible with your platform and
++                OpenShift version.
++              </StackItem>
++              <StackItem>
++                <ExternalLink href={RED_HAT_CNI_SUPPORT_MATRIX_LINK}>
++                  Red Hat CNI Support Matrix
++                </ExternalLink>
++              </StackItem>
++            </Stack>
++          </Alert>
++        </StackItem>
++      )}
++    </Stack>
++  );
++};
+diff --git a/libs/ui-lib/lib/ocm/components/clusterConfiguration/review/ReviewNetworkingTable.tsx b/libs/ui-lib/lib/ocm/components/clusterConfiguration/review/ReviewNetworkingTable.tsx
+index bdc7d1619c..bfc0a56d44 100644
+--- a/libs/ui-lib/lib/ocm/components/clusterConfiguration/review/ReviewNetworkingTable.tsx
++++ b/libs/ui-lib/lib/ocm/components/clusterConfiguration/review/ReviewNetworkingTable.tsx
+@@ -1,12 +1,8 @@
+ import { Title } from '@patternfly/react-core';
+ import { Table, TableVariant, Tbody, Td, Tr } from '@patternfly/react-table';
+ import React from 'react';
+-import { genericTableRowKey, isDualStack } from '../../../../common';
+-import {
+-  getManagementType,
+-  getStackTypeLabel,
+-  getNetworkType,
+-} from '../../clusterDetail/ClusterProperties';
++import { genericTableRowKey, isDualStack, NETWORK_TYPE_LABELS } from '../../../../common';
++import { getManagementType, getStackTypeLabel } from '../../clusterDetail/ClusterProperties';
+ import { Cluster } from '@openshift-assisted/types/assisted-installer-service';
+ 
+ type ReviewTableRowsType = {
+@@ -201,7 +197,7 @@ export const ReviewNetworkingTable = ({ cluster }: { cluster: Cluster }) => {
+         cells: [
+           { title: 'Networking type' },
+           {
+-            title: getNetworkType(cluster.networkType),
++            title: cluster.networkType ? NETWORK_TYPE_LABELS[cluster.networkType] : '-',
+             props: { 'data-testid': 'networking-type', colSpan: 2 },
+           },
+         ],
+diff --git a/libs/ui-lib/lib/ocm/components/clusterDetail/ClusterProperties.tsx b/libs/ui-lib/lib/ocm/components/clusterDetail/ClusterProperties.tsx
+index dbc41d740f..78449bce7f 100644
+--- a/libs/ui-lib/lib/ocm/components/clusterDetail/ClusterProperties.tsx
++++ b/libs/ui-lib/lib/ocm/components/clusterDetail/ClusterProperties.tsx
+@@ -5,7 +5,7 @@ import {
+   DetailList,
+   getDefaultCpuArchitecture,
+   isDualStack,
+-  NETWORK_TYPE_SDN,
++  NETWORK_TYPE_LABELS,
+   selectApiVip,
+   selectIngressVip,
+   selectIpv4Cidr,
+@@ -25,11 +25,7 @@ type ClusterPropertiesProps = {
+ };
+ 
+ export const getNetworkType = (clusterNetworkType: Cluster['networkType']): string => {
+-  let networkType: string;
+-  clusterNetworkType === NETWORK_TYPE_SDN
+-    ? (networkType = 'Software-Defined Networking (SDN)')
+-    : (networkType = 'Open Virtual Network (OVN)');
+-  return networkType;
++  return NETWORK_TYPE_LABELS[clusterNetworkType || ''];
+ };
+ 
+ export const getManagementType = ({ userManagedNetworking }: Cluster): string => {
+diff --git a/libs/ui-lib/lib/ocm/components/clusterWizard/ClusterDetails.tsx b/libs/ui-lib/lib/ocm/components/clusterWizard/ClusterDetails.tsx
+index ce95bd2b61..b59a54e2ff 100644
+--- a/libs/ui-lib/lib/ocm/components/clusterWizard/ClusterDetails.tsx
++++ b/libs/ui-lib/lib/ocm/components/clusterWizard/ClusterDetails.tsx
+@@ -50,11 +50,7 @@ const ClusterDetails = ({ cluster, infraEnv }: ClusterDetailsProps) => {
+   const pullSecret = isSingleClusterFeatureEnabled ? infraEnv?.pullSecret || '' : defaultPullSecret;
+ 
+   const handleClusterUpdate = React.useCallback(
+-    async (
+-      clusterId: Cluster['id'],
+-      params: ClusterDetailsUpdateParams,
+-      addCustomManifests: boolean,
+-    ) => {
++    async (clusterId: Cluster['id'], params: ClusterDetailsUpdateParams) => {
+       clearAlerts();
+ 
+       try {
+@@ -63,7 +59,6 @@ const ClusterDetails = ({ cluster, infraEnv }: ClusterDetailsProps) => {
+           cluster?.tags,
+           params,
+         );
+-        await clusterWizardContext.updateUISettings({ addCustomManifests });
+         dispatch(updateCluster(updatedCluster));
+ 
+         canNextClusterDetails({ cluster: updatedCluster }) && clusterWizardContext.moveNext();
+@@ -80,7 +75,7 @@ const ClusterDetails = ({ cluster, infraEnv }: ClusterDetailsProps) => {
+   );
+ 
+   const handleClusterCreate = React.useCallback(
+-    async (params: ClusterCreateParamsWithStaticNetworking, addCustomManifests: boolean) => {
++    async (params: ClusterCreateParamsWithStaticNetworking) => {
+       clearAlerts();
+       try {
+         const searchParams = new URLSearchParams(location.search);
+@@ -108,14 +103,23 @@ const ClusterDetails = ({ cluster, infraEnv }: ClusterDetailsProps) => {
+         );
+         navigate(`../${cluster.id}`, { state: ClusterWizardFlowStateNew });
+ 
+-        const uiPatch: UISettingsValues = { addCustomManifests };
+         if (isAssistedMigration) {
+-          //For Assisted Migration we need to enable virtualization bundle
+-          uiPatch.bundlesSelected = ['virtualization'];
+-          uiPatch.isAssistedMigration = true;
++          try {
++            const uiPatch: UISettingsValues = {
++              bundlesSelected: ['virtualization'],
++              isAssistedMigration: true,
++            };
++            await UISettingService.update(cluster.id, uiPatch);
++            await clusterWizardContext.updateUISettings(uiPatch);
++          } catch (uiError) {
++            handleApiError(uiError, () =>
++              addAlert({
++                title: 'Failed to update UI settings',
++                message: getApiErrorMessage(uiError),
++              }),
++            );
++          }
+         }
+-        await UISettingService.update(cluster.id, uiPatch);
+-        await clusterWizardContext.updateUISettings(uiPatch); // keeps local state current
+       } catch (e) {
+         handleApiError(e, () =>
+           addAlert({ title: 'Failed to create new cluster', message: getApiErrorMessage(e) }),
+diff --git a/libs/ui-lib/lib/ocm/components/clusterWizard/ClusterDetailsForm.tsx b/libs/ui-lib/lib/ocm/components/clusterWizard/ClusterDetailsForm.tsx
+index f1d504050f..307c040e05 100644
+--- a/libs/ui-lib/lib/ocm/components/clusterWizard/ClusterDetailsForm.tsx
++++ b/libs/ui-lib/lib/ocm/components/clusterWizard/ClusterDetailsForm.tsx
+@@ -42,11 +42,10 @@ type ClusterDetailsFormProps = {
+   ocpVersions: OpenshiftVersionOptionType[];
+   usedClusterNames: string[];
+   navigation: React.ReactNode;
+-  handleClusterCreate: (params: ClusterCreateParams, addCustomManifests: boolean) => Promise<void>;
++  handleClusterCreate: (params: ClusterCreateParams) => Promise<void>;
+   handleClusterUpdate: (
+     clusterId: Cluster['id'],
+     params: ClusterDetailsUpdateParams,
+-    addCustomManifests: boolean,
+   ) => Promise<void>;
+ };
+ 
+@@ -63,7 +62,7 @@ const ClusterDetailsForm = (props: ClusterDetailsFormProps) => {
+     navigation,
+   } = props;
+ 
+-  const { customManifestsStep, moveNext } = useClusterWizardContext();
++  const { moveNext } = useClusterWizardContext();
+   const { search } = useLocation();
+   const { isViewerMode } = useSelector(selectCurrentClusterPermissionsState);
+   const { clearAlerts } = useAlerts();
+@@ -82,10 +81,10 @@ const ClusterDetailsForm = (props: ClusterDetailsFormProps) => {
+           resetPlatform = 'baremetal';
+         }
+         const params = ClusterDetailsService.getClusterUpdateParams(values, resetPlatform);
+-        await handleClusterUpdate(cluster.id, params, values.addCustomManifest);
++        await handleClusterUpdate(cluster.id, params);
+       } else {
+         const params = ClusterDetailsService.getClusterCreateParams(values);
+-        await handleClusterCreate(params, values.addCustomManifest);
++        await handleClusterCreate(params);
+       }
+     },
+     [cluster, handleClusterCreate, handleClusterUpdate],
+@@ -118,9 +117,8 @@ const ClusterDetailsForm = (props: ClusterDetailsFormProps) => {
+         managedDomains,
+         ocpVersions,
+         urlSearchParams: search,
+-        addCustomManifests: customManifestsStep,
+       }),
+-    [infraEnv, cluster, pullSecret, managedDomains, ocpVersions, search, customManifestsStep],
++    [infraEnv, cluster, pullSecret, managedDomains, ocpVersions, search],
+   );
+ 
+   const { t } = useTranslation();
+diff --git a/libs/ui-lib/lib/ocm/components/clusterWizard/ClusterWizardContext.tsx b/libs/ui-lib/lib/ocm/components/clusterWizard/ClusterWizardContext.tsx
+index 9c7522ca9a..b196aca486 100644
+--- a/libs/ui-lib/lib/ocm/components/clusterWizard/ClusterWizardContext.tsx
++++ b/libs/ui-lib/lib/ocm/components/clusterWizard/ClusterWizardContext.tsx
+@@ -13,8 +13,6 @@ export type ClusterWizardContextType = {
+   wizardStepIds: ClusterWizardStepsType[];
+   onUpdateStaticIpView(view: StaticIpView): void;
+   onUpdateHostNetworkConfigType(type: HostsNetworkConfigurationType): void;
+-  setCustomManifestsStep(addCustomManifest: boolean): void;
+-  customManifestsStep: boolean;
+   wizardPerPage: number;
+   setWizardPerPage: (perPage: number) => void;
+   updateUISettings: (data: UISettingsValues) => Promise<void>;
+diff --git a/libs/ui-lib/lib/ocm/components/clusterWizard/ClusterWizardContextProvider.tsx b/libs/ui-lib/lib/ocm/components/clusterWizard/ClusterWizardContextProvider.tsx
+index 86863ed601..c9b6c70959 100644
+--- a/libs/ui-lib/lib/ocm/components/clusterWizard/ClusterWizardContextProvider.tsx
++++ b/libs/ui-lib/lib/ocm/components/clusterWizard/ClusterWizardContextProvider.tsx
+@@ -19,6 +19,7 @@ import { Cluster, InfraEnv } from '@openshift-assisted/types/assisted-installer-
+ import { useUISettings } from '../../hooks';
+ import { AlertVariant } from '@patternfly/react-core';
+ import { useFeature } from '../../hooks/use-feature';
++import { isOciPlatformType, isThirdPartyCNI } from '../utils';
+ 
+ const addStepToClusterWizard = (
+   wizardStepIds: ClusterWizardStepsType[],
+@@ -50,7 +51,7 @@ const removeStepFromClusterWizard = (
+ const getWizardStepIds = (
+   wizardStepIds: ClusterWizardStepsType[] | undefined,
+   staticIpView?: StaticIpView | 'dhcp-selected',
+-  customManifestsStep?: boolean,
++
+   isSingleClusterFeatureEnabled?: boolean,
+ ): ClusterWizardStepsType[] => {
+   let stepsCopy = wizardStepIds ? [...wizardStepIds] : [...defaultWizardSteps];
+@@ -64,11 +65,6 @@ const getWizardStepIds = (
+     stepsCopy = removeStepFromClusterWizard(stepsCopy, 'static-ip-network-wide-configurations', 2);
+   }
+ 
+-  if (customManifestsStep) {
+-    stepsCopy = addStepToClusterWizard(stepsCopy, 'networking', ['custom-manifests']);
+-  } else {
+-    stepsCopy = removeStepFromClusterWizard(stepsCopy, 'custom-manifests', 1);
+-  }
+   if (isSingleClusterFeatureEnabled) {
+     stepsCopy = addStepToClusterWizard(stepsCopy, 'networking', ['credentials-download']);
+   }
+@@ -119,7 +115,6 @@ const ClusterWizardContextProvider = ({
+   const [disconnectedWizardStepIds, setDisconnectedWizardStepIds] =
+     React.useState<ClusterWizardStepsType[]>(disconnectedSteps);
+   const [wizardPerPage, setWizardPerPage] = React.useState(10);
+-  const [customManifestsStep, setCustomManifestsStep] = React.useState<boolean>(false);
+   const [installDisconnected, setInstallDisconnected] = React.useState(false);
+   const [disconnectedInfraEnv, setDisconnectedInfraEnv] = React.useState<InfraEnv | undefined>(
+     infraEnv,
+@@ -140,10 +135,13 @@ const ClusterWizardContextProvider = ({
+   React.useEffect(() => {
+     if (!UISettingsLoading) {
+       const staticIpInfo = infraEnv ? getStaticIpInfo(infraEnv) : undefined;
+-      const customManifestsStepEnabled = !!uiSettings?.addCustomManifests;
+-      const customManifestsStepNeedsToBeFilled = !!(
+-        uiSettings?.addCustomManifests && !uiSettings?.customManifestsAdded
+-      );
++      let customManifestsRequired = false;
++      if (cluster) {
++        customManifestsRequired =
++          isThirdPartyCNI(cluster.networkType) || isOciPlatformType(cluster);
++      }
++      const customManifestsStepNeedsToBeFilled =
++        customManifestsRequired && !uiSettings?.customManifestsAdded;
+ 
+       const requiredStepId = getClusterWizardFirstStep(
+         locationState,
+@@ -152,11 +150,10 @@ const ClusterWizardContextProvider = ({
+         cluster?.hosts,
+         customManifestsStepNeedsToBeFilled,
+       );
+-
+       const firstStepIds = getWizardStepIds(
+         wizardStepIds,
+         staticIpInfo?.view,
+-        customManifestsStepEnabled,
++
+         isSingleClusterFeatureEnabled,
+       );
+ 
+@@ -170,7 +167,6 @@ const ClusterWizardContextProvider = ({
+ 
+       setWizardStepIds(firstStepIds);
+       setClusterPermissions(cluster, permissions);
+-      setCustomManifestsStep(!!uiSettings?.addCustomManifests);
+     }
+ 
+     if (
+@@ -212,7 +208,7 @@ const ClusterWizardContextProvider = ({
+         const newStepIds = getWizardStepIds(
+           wizardStepIds,
+           staticIpInfo.view,
+-          customManifestsStep,
++
+           isSingleClusterFeatureEnabled,
+         );
+         setWizardStepIds(newStepIds);
+@@ -227,18 +223,6 @@ const ClusterWizardContextProvider = ({
+       setCurrentStepId(stepId);
+     };
+ 
+-    const onSetAddCustomManifestsStep = (addCustomManifest: boolean) => {
+-      setCustomManifestsStep(addCustomManifest);
+-      setWizardStepIds(
+-        getWizardStepIds(
+-          wizardStepIds,
+-          undefined,
+-          addCustomManifest,
+-          isSingleClusterFeatureEnabled,
+-        ),
+-      );
+-    };
+-
+     return {
+       moveBack(): void {
+         clearAlerts();
+@@ -266,14 +250,7 @@ const ClusterWizardContextProvider = ({
+             getDisconnectedWizardStepIds(disconnectedWizardStepIds, view),
+           );
+         } else {
+-          setWizardStepIds(
+-            getWizardStepIds(
+-              wizardStepIds,
+-              view,
+-              customManifestsStep,
+-              isSingleClusterFeatureEnabled,
+-            ),
+-          );
++          setWizardStepIds(getWizardStepIds(wizardStepIds, view, isSingleClusterFeatureEnabled));
+         }
+       },
+       onUpdateHostNetworkConfigType(type: HostsNetworkConfigurationType): void {
+@@ -295,18 +272,13 @@ const ClusterWizardContextProvider = ({
+               getWizardStepIds(
+                 wizardStepIds,
+                 StaticIpView.FORM,
+-                customManifestsStep,
++
+                 isSingleClusterFeatureEnabled,
+               ),
+             );
+           } else {
+             setWizardStepIds(
+-              getWizardStepIds(
+-                wizardStepIds,
+-                'dhcp-selected',
+-                customManifestsStep,
+-                isSingleClusterFeatureEnabled,
+-              ),
++              getWizardStepIds(wizardStepIds, 'dhcp-selected', isSingleClusterFeatureEnabled),
+             );
+           }
+         }
+@@ -314,8 +286,6 @@ const ClusterWizardContextProvider = ({
+       wizardStepIds: wizardStepIds,
+       currentStepId,
+       setCurrentStepId: onSetCurrentStepId,
+-      customManifestsStep,
+-      setCustomManifestsStep: onSetAddCustomManifestsStep,
+       wizardPerPage,
+       setWizardPerPage,
+       uiSettings,
+@@ -336,7 +306,6 @@ const ClusterWizardContextProvider = ({
+     wizardStepIds,
+     currentStepId,
+     infraEnv,
+-    customManifestsStep,
+     wizardPerPage,
+     isSingleClusterFeatureEnabled,
+     clearAlerts,
+diff --git a/libs/ui-lib/lib/ocm/components/clusterWizard/constants.ts b/libs/ui-lib/lib/ocm/components/clusterWizard/constants.ts
+index 869e940bae..12f66bed8a 100644
+--- a/libs/ui-lib/lib/ocm/components/clusterWizard/constants.ts
++++ b/libs/ui-lib/lib/ocm/components/clusterWizard/constants.ts
+@@ -23,6 +23,7 @@ export const defaultWizardSteps: ClusterWizardStepsType[] = [
+   'host-discovery',
+   'storage',
+   'networking',
++  'custom-manifests',
+   'review',
+ ];
+ 
+diff --git a/libs/ui-lib/lib/ocm/components/clusterWizard/disconnected/OptionalConfigurationsStep.tsx b/libs/ui-lib/lib/ocm/components/clusterWizard/disconnected/OptionalConfigurationsStep.tsx
+index f8dbc6028d..e044b89d44 100644
+--- a/libs/ui-lib/lib/ocm/components/clusterWizard/disconnected/OptionalConfigurationsStep.tsx
++++ b/libs/ui-lib/lib/ocm/components/clusterWizard/disconnected/OptionalConfigurationsStep.tsx
+@@ -83,7 +83,7 @@ const infraEnvToFormValues = (infraEnv: InfraEnv): OptionalConfigurationsFormVal
+   enableNtpSources: !!infraEnv.additionalNtpSources,
+   additionalNtpSources: infraEnv.additionalNtpSources ?? '',
+   hostsNetworkConfigurationType:
+-    infraEnv.hostsNetworkConfigurationType === 'static'
++    (infraEnv.staticNetworkConfig?.length ?? 0) > 0
+       ? HostsNetworkConfigurationType.STATIC
+       : HostsNetworkConfigurationType.DHCP,
+   rendezvousIp: infraEnv.rendezvousIp ?? '',
+diff --git a/libs/ui-lib/lib/ocm/components/clusterWizard/wizardTransition.ts b/libs/ui-lib/lib/ocm/components/clusterWizard/wizardTransition.ts
+index 264064eea6..0587c308aa 100644
+--- a/libs/ui-lib/lib/ocm/components/clusterWizard/wizardTransition.ts
++++ b/libs/ui-lib/lib/ocm/components/clusterWizard/wizardTransition.ts
+@@ -102,6 +102,9 @@ export const getClusterWizardFirstStep = (
+     case 'pending-for-input':
+     case 'adding-hosts':
+     case 'insufficient':
++      if (customManifestsStepNeedsToBeFilled) {
++        return 'custom-manifests';
++      }
+       return getStepForFailingHostValidations(hosts);
+     default:
+       return 'cluster-details';
+@@ -241,7 +244,12 @@ const networkingStepValidationsMap: WizardStepValidationMap = {
+   // Alternatively we would have to whitelist network validations instead of using group
+   // TODO(mlibra): remove that container-images-available from soft validations and let backend drive it via disabling it.
+   //   Depends on: https://issues.redhat.com/browse/MGMT-5265
+-  softValidationIds: ['ntp-synced', 'container-images-available', 'mtu-valid'],
++  softValidationIds: [
++    'ntp-synced',
++    'container-images-available',
++    'mtu-valid',
++    'custom-manifests-requirements-satisfied',
++  ],
+ };
+ 
+ const reviewStepValidationsMap: WizardStepValidationMap = {
+diff --git a/libs/ui-lib/lib/ocm/components/featureSupportLevels/featureStateUtils.ts b/libs/ui-lib/lib/ocm/components/featureSupportLevels/featureStateUtils.ts
+index 6d38fee98b..c5d562534b 100644
+--- a/libs/ui-lib/lib/ocm/components/featureSupportLevels/featureStateUtils.ts
++++ b/libs/ui-lib/lib/ocm/components/featureSupportLevels/featureStateUtils.ts
+@@ -181,6 +181,12 @@ export const getNewFeatureDisabledReason = (
+     case 'OSC': {
+       return getOscDisabledReason(cluster, activeFeatureConfiguration, isSupported);
+     }
++    case 'SDN_NETWORK_TYPE': {
++      if (!isSupported) {
++        return 'SDN is not available for the selected configuration.';
++      }
++      return undefined;
++    }
+     case 'NETWORK_TYPE_SELECTION': {
+       return getNetworkTypeSelectionDisabledReason(cluster);
+     }
+diff --git a/libs/ui-lib/lib/ocm/components/utils.ts b/libs/ui-lib/lib/ocm/components/utils.ts
+index ef4b670068..bb18268248 100644
+--- a/libs/ui-lib/lib/ocm/components/utils.ts
++++ b/libs/ui-lib/lib/ocm/components/utils.ts
+@@ -1,7 +1,11 @@
+ import { Cluster } from '@openshift-assisted/types/./assisted-installer-service';
++import { NETWORK_TYPE_OVN, NETWORK_TYPE_SDN } from '../../common/config';
+ 
+ export const isOciPlatformType = (cluster: Cluster): boolean => {
+   return (
+     cluster.platform?.type === 'external' && cluster.platform?.external?.platformName === 'oci'
+   );
+ };
++
++export const isThirdPartyCNI = (networkType: Cluster['networkType']): boolean =>
++  !!networkType && networkType !== NETWORK_TYPE_OVN && networkType !== NETWORK_TYPE_SDN;
+diff --git a/libs/ui-lib/lib/ocm/hooks/useUISettings.ts b/libs/ui-lib/lib/ocm/hooks/useUISettings.ts
+index b26071f84d..263b68a096 100644
+--- a/libs/ui-lib/lib/ocm/hooks/useUISettings.ts
++++ b/libs/ui-lib/lib/ocm/hooks/useUISettings.ts
+@@ -31,7 +31,6 @@ const useUISettings = (clusterId?: Cluster['id']) => {
+           const { data: customManifests } = await ClustersAPI.getManifests(clusterId);
+ 
+           const mockUISettings: UISettingsValues = {
+-            addCustomManifests: !!customManifests.length,
+             customManifestsAdded: !!customManifests.length,
+           };
+ 
+diff --git a/libs/ui-lib/lib/ocm/services/ClusterDetailsService.ts b/libs/ui-lib/lib/ocm/services/ClusterDetailsService.ts
+index d91b363d37..255cd23215 100644
+--- a/libs/ui-lib/lib/ocm/services/ClusterDetailsService.ts
++++ b/libs/ui-lib/lib/ocm/services/ClusterDetailsService.ts
+@@ -105,7 +105,6 @@ const ClusterDetailsService = {
+     cluster,
+     infraEnv,
+     urlSearchParams,
+-    addCustomManifests,
+     ...args
+   }: {
+     cluster?: Cluster;
+@@ -114,7 +113,6 @@ const ClusterDetailsService = {
+     managedDomains: ManagedDomain[];
+     ocpVersions: OpenshiftVersionOptionType[];
+     urlSearchParams: string;
+-    addCustomManifests?: boolean;
+   }): OcmClusterDetailsValues {
+     const values = getClusterDetailsInitialValues({
+       cluster,
+@@ -133,7 +131,6 @@ const ClusterDetailsService = {
+       ...values,
+       cpuArchitecture,
+       hostsNetworkConfigurationType,
+-      addCustomManifest: !!addCustomManifests,
+       isCMNSupported: true,
+       isSNODevPreview: false,
+     };
+diff --git a/libs/ui-lib/lib/ocm/services/types.ts b/libs/ui-lib/lib/ocm/services/types.ts
+index a87b156c3a..a3ff67d96e 100644
+--- a/libs/ui-lib/lib/ocm/services/types.ts
++++ b/libs/ui-lib/lib/ocm/services/types.ts
+@@ -21,7 +21,6 @@ export enum HostsNetworkConfigurationType {
+ 
+ export type OcmClusterDetailsValues = ClusterDetailsValues & {
+   hostsNetworkConfigurationType: HostsNetworkConfigurationType;
+-  addCustomManifest: boolean;
+   isCMNSupported: boolean;
+   isSNODevPreview: boolean;
+ };

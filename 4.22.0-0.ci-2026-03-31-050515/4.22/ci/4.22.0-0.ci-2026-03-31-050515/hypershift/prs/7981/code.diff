@@ -1,0 +1,1234 @@
+diff --git a/control-plane-operator/hostedclusterconfigoperator/controllers/globalps/globalps.go b/control-plane-operator/hostedclusterconfigoperator/controllers/globalps/globalps.go
+index 445948aaaa0..67c86778fc0 100644
+--- a/control-plane-operator/hostedclusterconfigoperator/controllers/globalps/globalps.go
++++ b/control-plane-operator/hostedclusterconfigoperator/controllers/globalps/globalps.go
+@@ -15,10 +15,8 @@ import (
+ 	apierrors "k8s.io/apimachinery/pkg/api/errors"
+ 	"k8s.io/apimachinery/pkg/api/resource"
+ 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+-	"k8s.io/apimachinery/pkg/labels"
+ 	"k8s.io/utils/ptr"
+ 
+-	capiv1 "sigs.k8s.io/cluster-api/api/v1beta1"
+ 	ctrl "sigs.k8s.io/controller-runtime"
+ 	crclient "sigs.k8s.io/controller-runtime/pkg/client"
+ 	crreconcile "sigs.k8s.io/controller-runtime/pkg/reconcile"
+@@ -40,7 +38,6 @@ type GlobalPullSecretPodConfig struct {
+ type Reconciler struct {
+ 	cpClient               crclient.Client
+ 	kubeSystemSecretClient crclient.Client
+-	nodeClient             crclient.Client
+ 	hcUncachedClient       crclient.Client
+ 	hcpNamespace           string
+ 	hccoImage              string
+@@ -129,13 +126,6 @@ func (r *Reconciler) reconcileGlobalPullSecret(ctx context.Context) error {
+ 		// Generate a hash of the original pull secret content to trigger pod recreation
+ 		configSeed := util.HashSimple(originalPullSecretBytes)
+ 
+-		// Label nodes that should have GlobalPullSecret DaemonSet (non-InPlace nodes)
+-		// This is critical to prevent DaemonSet deployment conflicts with Machine Config Daemon
+-		log.Info("labeling nodes eligible for GlobalPullSecret DaemonSet")
+-		if err := r.labelNodesForGlobalPullSecret(ctx); err != nil {
+-			return fmt.Errorf("failed to label nodes for GlobalPullSecret: %w", err)
+-		}
+-
+ 		// Reconcile DaemonSet with only original pull secret (global-pull-secret will be optional and empty)
+ 		daemonSet := manifests.GlobalPullSecretDaemonSet()
+ 		if err := reconcileDaemonSet(ctx, daemonSet, "", originalSecret.Name, configSeed, r.hcUncachedClient, r.CreateOrUpdate, r.hccoImage); err != nil {
+@@ -145,13 +135,6 @@ func (r *Reconciler) reconcileGlobalPullSecret(ctx context.Context) error {
+ 		return nil
+ 	}
+ 
+-	// Label nodes that should have GlobalPullSecret DaemonSet (non-InPlace nodes)
+-	// This is critical to prevent DaemonSet deployment conflicts with Machine Config Daemon
+-	log.Info("labeling nodes eligible for GlobalPullSecret DaemonSet")
+-	if err := r.labelNodesForGlobalPullSecret(ctx); err != nil {
+-		return fmt.Errorf("failed to label nodes for GlobalPullSecret: %w", err)
+-	}
+-
+ 	if userProvidedPullSecretBytes, err = validateAdditionalPullSecret(additionalPullSecret); err != nil {
+ 		return fmt.Errorf("failed to validate user provided pull secret: %w", err)
+ 	}
+@@ -195,84 +178,6 @@ func (r *Reconciler) reconcileGlobalPullSecret(ctx context.Context) error {
+ 	return nil
+ }
+ 
+-// labelNodesForGlobalPullSecret labels nodes that should receive the GlobalPullSecret DaemonSet.
+-// Only nodes that do NOT belong to InPlace NodePools are labeled with hypershift.openshift.io/nodepool-globalps-enabled.
+-// This ensures the DaemonSet only deploys on nodes where it won't conflict with Machine Config Daemon.
+-func (r *Reconciler) labelNodesForGlobalPullSecret(ctx context.Context) error {
+-	log := ctrl.LoggerFrom(ctx)
+-
+-	// Get all nodes from the hosted cluster
+-	nodeList := &corev1.NodeList{}
+-	if err := r.nodeClient.List(ctx, nodeList); err != nil {
+-		return fmt.Errorf("failed to list nodes: %w", err)
+-	}
+-
+-	// Get all MachineSets to identify which use InPlace upgrade strategy
+-	machineSetList := &capiv1.MachineSetList{}
+-	if err := r.cpClient.List(ctx, machineSetList, &crclient.ListOptions{
+-		Namespace: r.hcpNamespace,
+-	}); err != nil {
+-		return fmt.Errorf("failed to list MachineSets: %w", err)
+-	}
+-
+-	// Create set of nodes that should be labeled (from Replace NodePools)
+-	nodesToLabel := make(map[string]bool)
+-
+-	for _, ms := range machineSetList.Items {
+-		// Check if this MachineSet belongs to a NodePool with InPlace strategy
+-		// This can be identified by the presence of InPlace-specific annotations
+-		_, hasTargetConfig := ms.Annotations["hypershift.openshift.io/nodePoolTargetConfigVersion"]
+-		_, hasCurrentConfig := ms.Annotations["hypershift.openshift.io/nodePoolCurrentConfigVersion"]
+-
+-		if hasTargetConfig || hasCurrentConfig {
+-			// This is InPlace MachineSet - skip its nodes
+-			continue
+-		}
+-
+-		// This is Replace MachineSet - include its nodes for labeling
+-		machines := &capiv1.MachineList{}
+-		if err := r.cpClient.List(ctx, machines, &crclient.ListOptions{
+-			Namespace:     ms.Namespace,
+-			LabelSelector: labels.SelectorFromSet(ms.Spec.Selector.MatchLabels),
+-		}); err != nil {
+-			return fmt.Errorf("failed to list machines for Replace MachineSet %s: %w", ms.Name, err)
+-		}
+-
+-		// Mark nodes from this Replace MachineSet for labeling
+-		for _, machine := range machines.Items {
+-			if machine.Status.NodeRef != nil {
+-				nodesToLabel[machine.Status.NodeRef.Name] = true
+-			}
+-		}
+-	}
+-
+-	// Update labels only on nodes from Replace NodePools
+-	// These nodes are eligible for GlobalPullSecret DaemonSet scheduling
+-	for _, node := range nodeList.Items {
+-		if nodesToLabel[node.Name] {
+-			// Node belongs to a Replace NodePool, so it's eligible for GlobalPS
+-			nodeCopy := node.DeepCopy()
+-
+-			if nodeCopy.Labels == nil {
+-				nodeCopy.Labels = make(map[string]string)
+-			}
+-
+-			currentLabel := nodeCopy.Labels[globalPSLabelKey]
+-
+-			if currentLabel != "true" {
+-				nodeCopy.Labels[globalPSLabelKey] = "true"
+-				log.Info("labeling node as eligible for GlobalPullSecret DaemonSet", "node", node.Name)
+-
+-				if err := r.nodeClient.Update(ctx, nodeCopy); err != nil {
+-					return fmt.Errorf("failed to update node labels for GlobalPullSecret eligibility on node %s: %w", node.Name, err)
+-				}
+-			}
+-		}
+-	}
+-
+-	return nil
+-}
+-
+ func reconcileDaemonSet(ctx context.Context, daemonSet *appsv1.DaemonSet, globalPullSecretName string, originalPullSecretName string, configSeed string, c crclient.Client, createOrUpdate upsert.CreateOrUpdateFN, hccoImage string) error {
+ 	log := ctrl.LoggerFrom(ctx)
+ 	log.Info("Reconciling global pull secret daemon set")
+diff --git a/control-plane-operator/hostedclusterconfigoperator/controllers/globalps/globalps_test.go b/control-plane-operator/hostedclusterconfigoperator/controllers/globalps/globalps_test.go
+index d5013f42634..2c68f5a296e 100644
+--- a/control-plane-operator/hostedclusterconfigoperator/controllers/globalps/globalps_test.go
++++ b/control-plane-operator/hostedclusterconfigoperator/controllers/globalps/globalps_test.go
+@@ -19,7 +19,6 @@ import (
+ 	capiv1 "sigs.k8s.io/cluster-api/api/v1beta1"
+ 	"sigs.k8s.io/controller-runtime/pkg/client"
+ 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
+-	"sigs.k8s.io/controller-runtime/pkg/event"
+ )
+ 
+ var (
+@@ -355,14 +354,12 @@ func TestReconcileGlobalPullSecret(t *testing.T) {
+ 			// Create separate clients for different namespaces/purposes
+ 			cpClient := fake.NewClientBuilder().WithScheme(scheme).WithObjects(tt.existingObjects...).Build()
+ 			kubeSystemSecretClient := fake.NewClientBuilder().WithScheme(scheme).WithObjects(tt.existingObjects...).Build()
+-			nodeClient := fake.NewClientBuilder().WithScheme(scheme).WithObjects(tt.nodeObjects...).Build()
+ 			hcUncachedClient := fake.NewClientBuilder().WithScheme(scheme).WithObjects(tt.existingObjects...).Build()
+ 
+ 			// Create reconciler
+ 			reconciler := &Reconciler{
+ 				cpClient:               cpClient,
+ 				kubeSystemSecretClient: kubeSystemSecretClient,
+-				nodeClient:             nodeClient,
+ 				hcUncachedClient:       hcUncachedClient,
+ 				hcpNamespace:           tt.hcpNamespace,
+ 				hccoImage:              tt.hccoImage,
+@@ -713,418 +710,3 @@ func TestAdditionalPullSecretExists(t *testing.T) {
+ 		})
+ 	}
+ }
+-
+-func TestLabelNodesForGlobalPullSecret(t *testing.T) {
+-	tests := []struct {
+-		name            string
+-		nodes           []corev1.Node
+-		machineSets     []capiv1.MachineSet
+-		machines        []capiv1.Machine
+-		expectedLabeled []string // names of nodes that should have the label
+-	}{
+-		{
+-			name: "Replace-InPlace-Replace scenario: only Replace nodes should be labeled",
+-			nodes: []corev1.Node{
+-				{
+-					ObjectMeta: metav1.ObjectMeta{
+-						Name: "replace-node-1",
+-					},
+-				},
+-				{
+-					ObjectMeta: metav1.ObjectMeta{
+-						Name: "inplace-node-1",
+-					},
+-				},
+-				{
+-					ObjectMeta: metav1.ObjectMeta{
+-						Name: "replace-node-2",
+-					},
+-				},
+-			},
+-			machineSets: []capiv1.MachineSet{
+-				// First NodePool: Replace strategy (no InPlace annotations)
+-				{
+-					ObjectMeta: metav1.ObjectMeta{
+-						Name:      "replace-machineset-1",
+-						Namespace: "test-namespace",
+-					},
+-					Spec: capiv1.MachineSetSpec{
+-						Selector: metav1.LabelSelector{
+-							MatchLabels: map[string]string{
+-								"machineset": "replace-1",
+-							},
+-						},
+-					},
+-				},
+-				// Second NodePool: InPlace strategy (has InPlace annotations)
+-				{
+-					ObjectMeta: metav1.ObjectMeta{
+-						Name:      "inplace-machineset-1",
+-						Namespace: "test-namespace",
+-						Annotations: map[string]string{
+-							"hypershift.openshift.io/nodePoolTargetConfigVersion":  "config-hash-123",
+-							"hypershift.openshift.io/nodePoolCurrentConfigVersion": "config-hash-456",
+-						},
+-					},
+-					Spec: capiv1.MachineSetSpec{
+-						Selector: metav1.LabelSelector{
+-							MatchLabels: map[string]string{
+-								"machineset": "inplace-1",
+-							},
+-						},
+-					},
+-				},
+-				// Third NodePool: Replace strategy (no InPlace annotations) - this should work after InPlace
+-				{
+-					ObjectMeta: metav1.ObjectMeta{
+-						Name:      "replace-machineset-2",
+-						Namespace: "test-namespace",
+-					},
+-					Spec: capiv1.MachineSetSpec{
+-						Selector: metav1.LabelSelector{
+-							MatchLabels: map[string]string{
+-								"machineset": "replace-2",
+-							},
+-						},
+-					},
+-				},
+-			},
+-			machines: []capiv1.Machine{
+-				// Machine for first Replace NodePool
+-				{
+-					ObjectMeta: metav1.ObjectMeta{
+-						Name:      "replace-machine-1",
+-						Namespace: "test-namespace",
+-						Labels: map[string]string{
+-							"machineset": "replace-1",
+-						},
+-					},
+-					Status: capiv1.MachineStatus{
+-						NodeRef: &corev1.ObjectReference{
+-							Name: "replace-node-1",
+-						},
+-					},
+-				},
+-				// Machine for InPlace NodePool
+-				{
+-					ObjectMeta: metav1.ObjectMeta{
+-						Name:      "inplace-machine-1",
+-						Namespace: "test-namespace",
+-						Labels: map[string]string{
+-							"machineset": "inplace-1",
+-						},
+-					},
+-					Status: capiv1.MachineStatus{
+-						NodeRef: &corev1.ObjectReference{
+-							Name: "inplace-node-1",
+-						},
+-					},
+-				},
+-				// Machine for second Replace NodePool (created after InPlace)
+-				{
+-					ObjectMeta: metav1.ObjectMeta{
+-						Name:      "replace-machine-2",
+-						Namespace: "test-namespace",
+-						Labels: map[string]string{
+-							"machineset": "replace-2",
+-						},
+-					},
+-					Status: capiv1.MachineStatus{
+-						NodeRef: &corev1.ObjectReference{
+-							Name: "replace-node-2",
+-						},
+-					},
+-				},
+-			},
+-			expectedLabeled: []string{"replace-node-1", "replace-node-2"}, // Both Replace nodes should be labeled
+-		},
+-		{
+-			name: "Only InPlace NodePools: no nodes should be labeled",
+-			nodes: []corev1.Node{
+-				{
+-					ObjectMeta: metav1.ObjectMeta{
+-						Name: "inplace-node-1",
+-					},
+-				},
+-				{
+-					ObjectMeta: metav1.ObjectMeta{
+-						Name: "inplace-node-2",
+-					},
+-				},
+-			},
+-			machineSets: []capiv1.MachineSet{
+-				{
+-					ObjectMeta: metav1.ObjectMeta{
+-						Name:      "inplace-machineset-1",
+-						Namespace: "test-namespace",
+-						Annotations: map[string]string{
+-							"hypershift.openshift.io/nodePoolTargetConfigVersion": "config-hash-123",
+-						},
+-					},
+-					Spec: capiv1.MachineSetSpec{
+-						Selector: metav1.LabelSelector{
+-							MatchLabels: map[string]string{
+-								"machineset": "inplace-1",
+-							},
+-						},
+-					},
+-				},
+-			},
+-			machines: []capiv1.Machine{
+-				{
+-					ObjectMeta: metav1.ObjectMeta{
+-						Name:      "inplace-machine-1",
+-						Namespace: "test-namespace",
+-						Labels: map[string]string{
+-							"machineset": "inplace-1",
+-						},
+-					},
+-					Status: capiv1.MachineStatus{
+-						NodeRef: &corev1.ObjectReference{
+-							Name: "inplace-node-1",
+-						},
+-					},
+-				},
+-			},
+-			expectedLabeled: []string{}, // No nodes should be labeled
+-		},
+-		{
+-			name: "Only Replace NodePools: all nodes should be labeled",
+-			nodes: []corev1.Node{
+-				{
+-					ObjectMeta: metav1.ObjectMeta{
+-						Name: "replace-node-1",
+-					},
+-				},
+-				{
+-					ObjectMeta: metav1.ObjectMeta{
+-						Name: "replace-node-2",
+-					},
+-				},
+-			},
+-			machineSets: []capiv1.MachineSet{
+-				{
+-					ObjectMeta: metav1.ObjectMeta{
+-						Name:      "replace-machineset-1",
+-						Namespace: "test-namespace",
+-						// No InPlace annotations
+-					},
+-					Spec: capiv1.MachineSetSpec{
+-						Selector: metav1.LabelSelector{
+-							MatchLabels: map[string]string{
+-								"machineset": "replace-1",
+-							},
+-						},
+-					},
+-				},
+-			},
+-			machines: []capiv1.Machine{
+-				{
+-					ObjectMeta: metav1.ObjectMeta{
+-						Name:      "replace-machine-1",
+-						Namespace: "test-namespace",
+-						Labels: map[string]string{
+-							"machineset": "replace-1",
+-						},
+-					},
+-					Status: capiv1.MachineStatus{
+-						NodeRef: &corev1.ObjectReference{
+-							Name: "replace-node-1",
+-						},
+-					},
+-				},
+-				{
+-					ObjectMeta: metav1.ObjectMeta{
+-						Name:      "replace-machine-2",
+-						Namespace: "test-namespace",
+-						Labels: map[string]string{
+-							"machineset": "replace-1",
+-						},
+-					},
+-					Status: capiv1.MachineStatus{
+-						NodeRef: &corev1.ObjectReference{
+-							Name: "replace-node-2",
+-						},
+-					},
+-				},
+-			},
+-			expectedLabeled: []string{"replace-node-1", "replace-node-2"}, // All Replace nodes should be labeled
+-		},
+-		{
+-			name: "When Machine.Status.NodeRef is nil it should skip the node for labeling",
+-			nodes: []corev1.Node{
+-				{ObjectMeta: metav1.ObjectMeta{Name: "new-node-1"}},
+-				{ObjectMeta: metav1.ObjectMeta{Name: "existing-node-1"}},
+-			},
+-			machineSets: []capiv1.MachineSet{
+-				{
+-					ObjectMeta: metav1.ObjectMeta{
+-						Name:      "replace-machineset-1",
+-						Namespace: "test-namespace",
+-					},
+-					Spec: capiv1.MachineSetSpec{
+-						Selector: metav1.LabelSelector{
+-							MatchLabels: map[string]string{"machineset": "replace-1"},
+-						},
+-					},
+-				},
+-			},
+-			machines: []capiv1.Machine{
+-				{
+-					ObjectMeta: metav1.ObjectMeta{
+-						Name:      "machine-with-noderef",
+-						Namespace: "test-namespace",
+-						Labels:    map[string]string{"machineset": "replace-1"},
+-					},
+-					Status: capiv1.MachineStatus{
+-						NodeRef: &corev1.ObjectReference{Name: "existing-node-1"},
+-					},
+-				},
+-				{
+-					ObjectMeta: metav1.ObjectMeta{
+-						Name:      "machine-without-noderef",
+-						Namespace: "test-namespace",
+-						Labels:    map[string]string{"machineset": "replace-1"},
+-					},
+-					Status: capiv1.MachineStatus{NodeRef: nil},
+-				},
+-			},
+-			expectedLabeled: []string{"existing-node-1"},
+-		},
+-	}
+-
+-	for _, tt := range tests {
+-		t.Run(tt.name, func(t *testing.T) {
+-			g := NewWithT(t)
+-
+-			// Create runtime scheme and add required types
+-			scheme := runtime.NewScheme()
+-			_ = corev1.AddToScheme(scheme)
+-			_ = capiv1.AddToScheme(scheme)
+-
+-			// Convert to client.Object slices
+-			var objects []client.Object
+-			for i := range tt.nodes {
+-				objects = append(objects, &tt.nodes[i])
+-			}
+-			for i := range tt.machineSets {
+-				objects = append(objects, &tt.machineSets[i])
+-			}
+-			for i := range tt.machines {
+-				objects = append(objects, &tt.machines[i])
+-			}
+-
+-			// Create fake clients
+-			cpClient := fake.NewClientBuilder().WithScheme(scheme).WithObjects(objects...).Build()
+-			kubeSystemSecretClient := fake.NewClientBuilder().WithScheme(scheme).WithObjects(objects...).Build()
+-			nodeClient := fake.NewClientBuilder().WithScheme(scheme).WithObjects(objects...).Build()
+-			hcUncachedClient := fake.NewClientBuilder().WithScheme(scheme).WithObjects(objects...).Build()
+-
+-			// Create reconciler
+-			reconciler := &Reconciler{
+-				cpClient:               cpClient,
+-				kubeSystemSecretClient: kubeSystemSecretClient,
+-				nodeClient:             nodeClient,
+-				hcUncachedClient:       hcUncachedClient,
+-				hcpNamespace:           "test-namespace",
+-			}
+-
+-			// Execute the function under test
+-			err := reconciler.labelNodesForGlobalPullSecret(context.Background())
+-			g.Expect(err).NotTo(HaveOccurred())
+-
+-			// Check that only expected nodes have the label
+-			nodeList := &corev1.NodeList{}
+-			err = nodeClient.List(context.Background(), nodeList)
+-			g.Expect(err).NotTo(HaveOccurred())
+-
+-			labeledNodes := make(map[string]bool)
+-			for _, node := range nodeList.Items {
+-				if node.Labels != nil && node.Labels[globalPSLabelKey] == "true" {
+-					labeledNodes[node.Name] = true
+-				}
+-			}
+-
+-			// Verify expected nodes are labeled
+-			for _, expectedNode := range tt.expectedLabeled {
+-				g.Expect(labeledNodes[expectedNode]).To(BeTrue(), "Node %s should be labeled but wasn't", expectedNode)
+-			}
+-
+-			// Verify no unexpected nodes are labeled
+-			g.Expect(len(labeledNodes)).To(Equal(len(tt.expectedLabeled)), "Number of labeled nodes doesn't match expected")
+-		})
+-	}
+-}
+-
+-func TestMachineNodeRefPredicate(t *testing.T) {
+-	p := machineNodeRefPredicate()
+-
+-	t.Run("When a Machine is created it should not trigger reconciliation", func(t *testing.T) {
+-		g := NewWithT(t)
+-		e := event.TypedCreateEvent[*capiv1.Machine]{
+-			Object: &capiv1.Machine{},
+-		}
+-		g.Expect(p.Create(e)).To(BeFalse())
+-	})
+-
+-	t.Run("When a Machine is deleted it should not trigger reconciliation", func(t *testing.T) {
+-		g := NewWithT(t)
+-		e := event.TypedDeleteEvent[*capiv1.Machine]{
+-			Object: &capiv1.Machine{},
+-		}
+-		g.Expect(p.Delete(e)).To(BeFalse())
+-	})
+-
+-	t.Run("When a generic event occurs it should not trigger reconciliation", func(t *testing.T) {
+-		g := NewWithT(t)
+-		e := event.TypedGenericEvent[*capiv1.Machine]{
+-			Object: &capiv1.Machine{},
+-		}
+-		g.Expect(p.Generic(e)).To(BeFalse())
+-	})
+-
+-	t.Run("When NodeRef transitions from nil to non-nil it should trigger reconciliation", func(t *testing.T) {
+-		g := NewWithT(t)
+-		e := event.TypedUpdateEvent[*capiv1.Machine]{
+-			ObjectOld: &capiv1.Machine{
+-				Status: capiv1.MachineStatus{NodeRef: nil},
+-			},
+-			ObjectNew: &capiv1.Machine{
+-				Status: capiv1.MachineStatus{
+-					NodeRef: &corev1.ObjectReference{Name: "node-1"},
+-				},
+-			},
+-		}
+-		g.Expect(p.Update(e)).To(BeTrue())
+-	})
+-
+-	t.Run("When NodeRef is already set on both old and new it should not trigger reconciliation", func(t *testing.T) {
+-		g := NewWithT(t)
+-		e := event.TypedUpdateEvent[*capiv1.Machine]{
+-			ObjectOld: &capiv1.Machine{
+-				Status: capiv1.MachineStatus{
+-					NodeRef: &corev1.ObjectReference{Name: "node-1"},
+-				},
+-			},
+-			ObjectNew: &capiv1.Machine{
+-				Status: capiv1.MachineStatus{
+-					NodeRef: &corev1.ObjectReference{Name: "node-1"},
+-				},
+-			},
+-		}
+-		g.Expect(p.Update(e)).To(BeFalse())
+-	})
+-
+-	t.Run("When NodeRef is nil on both old and new it should not trigger reconciliation", func(t *testing.T) {
+-		g := NewWithT(t)
+-		e := event.TypedUpdateEvent[*capiv1.Machine]{
+-			ObjectOld: &capiv1.Machine{
+-				Status: capiv1.MachineStatus{NodeRef: nil},
+-			},
+-			ObjectNew: &capiv1.Machine{
+-				Status: capiv1.MachineStatus{NodeRef: nil},
+-			},
+-		}
+-		g.Expect(p.Update(e)).To(BeFalse())
+-	})
+-}
+diff --git a/control-plane-operator/hostedclusterconfigoperator/controllers/globalps/setup.go b/control-plane-operator/hostedclusterconfigoperator/controllers/globalps/setup.go
+index 8860298a03e..6ec2a951f20 100644
+--- a/control-plane-operator/hostedclusterconfigoperator/controllers/globalps/setup.go
++++ b/control-plane-operator/hostedclusterconfigoperator/controllers/globalps/setup.go
+@@ -8,17 +8,13 @@ import (
+ 	"github.com/openshift/hypershift/control-plane-operator/hostedclusterconfigoperator/operator"
+ 
+ 	corev1 "k8s.io/api/core/v1"
+-	"k8s.io/apimachinery/pkg/types"
+ 	"k8s.io/client-go/rest"
+ 
+-	capiv1 "sigs.k8s.io/cluster-api/api/v1beta1"
+ 	"sigs.k8s.io/controller-runtime/pkg/cache"
+ 	crclient "sigs.k8s.io/controller-runtime/pkg/client"
+ 	"sigs.k8s.io/controller-runtime/pkg/controller"
+-	"sigs.k8s.io/controller-runtime/pkg/event"
+ 	"sigs.k8s.io/controller-runtime/pkg/handler"
+ 	"sigs.k8s.io/controller-runtime/pkg/predicate"
+-	crreconcile "sigs.k8s.io/controller-runtime/pkg/reconcile"
+ 	"sigs.k8s.io/controller-runtime/pkg/source"
+ )
+ 
+@@ -39,17 +35,6 @@ func Setup(ctx context.Context, opts *operator.HostedClusterConfigOperatorConfig
+ 		return fmt.Errorf("failed to create kube-system cache: %w", err)
+ 	}
+ 
+-	// Create a cache for nodes (cluster-scoped)
+-	nodeCache, err := cache.New(opts.Manager.GetConfig(), cache.Options{
+-		Scheme: opts.Manager.GetScheme(),
+-		DefaultNamespaces: map[string]cache.Config{
+-			"": {}, // Empty string for cluster-scoped resources like nodes
+-		},
+-	})
+-	if err != nil {
+-		return fmt.Errorf("failed to create node cache: %w", err)
+-	}
+-
+ 	// Create a crclient from kube-system cache
+ 	kubeSystemClient, err := crclient.New(opts.Manager.GetConfig(), crclient.Options{
+ 		Scheme: opts.Manager.GetScheme(),
+@@ -59,26 +44,12 @@ func Setup(ctx context.Context, opts *operator.HostedClusterConfigOperatorConfig
+ 		return fmt.Errorf("failed to create kube-system client: %w", err)
+ 	}
+ 
+-	// Create a crclient from node cache
+-	nodeClient, err := crclient.New(opts.Manager.GetConfig(), crclient.Options{
+-		Scheme: opts.Manager.GetScheme(),
+-		Cache:  &crclient.CacheOptions{Reader: nodeCache},
+-	})
+-	if err != nil {
+-		return fmt.Errorf("failed to create node client: %w", err)
+-	}
+-
+-	// Get the informers for Watch usage only (not for hybrid approach)
++	// Get the informer for Watch usage
+ 	kubeSystemSecretInformer, err := kubeSystemCache.GetInformer(ctx, &corev1.Secret{})
+ 	if err != nil {
+ 		return fmt.Errorf("failed to get kube-system secret informer: %w", err)
+ 	}
+ 
+-	nodeInformer, err := nodeCache.GetInformer(ctx, &corev1.Node{})
+-	if err != nil {
+-		return fmt.Errorf("failed to get node informer: %w", err)
+-	}
+-
+ 	uncachedClientRestConfig := opts.Manager.GetConfig()
+ 	uncachedClientRestConfig.WarningHandler = rest.NoWarnings{}
+ 	uncachedClient, err := crclient.New(uncachedClientRestConfig, crclient.Options{
+@@ -98,19 +69,15 @@ func Setup(ctx context.Context, opts *operator.HostedClusterConfigOperatorConfig
+ 		cpClient:               opts.CPCluster.GetClient(),
+ 		hcUncachedClient:       uncachedClient,
+ 		kubeSystemSecretClient: kubeSystemClient,
+-		nodeClient:             nodeClient,
+ 		hcpNamespace:           opts.Namespace,
+ 		hccoImage:              hccoImage,
+ 		CreateOrUpdateProvider: opts.TargetCreateOrUpdateProvider,
+ 	}
+ 
+-	// Add the caches to the manager
++	// Add the cache to the manager
+ 	if err := opts.Manager.Add(kubeSystemCache); err != nil {
+ 		return fmt.Errorf("failed to add kube-system cache: %w", err)
+ 	}
+-	if err := opts.Manager.Add(nodeCache); err != nil {
+-		return fmt.Errorf("failed to add node cache: %w", err)
+-	}
+ 
+ 	// Create a controller
+ 	c, err := controller.New(ControllerName, opts.Manager, controller.Options{Reconciler: r})
+@@ -129,68 +96,5 @@ func Setup(ctx context.Context, opts *operator.HostedClusterConfigOperatorConfig
+ 		return fmt.Errorf("failed to watch kube-system secrets: %w", err)
+ 	}
+ 
+-	// Watch for nodes - when nodes are created, we need to reconcile global pull secret
+-	if err := c.Watch(&source.Informer{
+-		Informer: nodeInformer,
+-		Handler: handler.EnqueueRequestsFromMapFunc(func(ctx context.Context, o crclient.Object) []crreconcile.Request {
+-			// Trigger reconciliation for node creation using the node's name for better observability
+-			// The reconciler ignores the NamespacedName but this helps with logging and debugging
+-			return []crreconcile.Request{{NamespacedName: types.NamespacedName{Name: o.GetName(), Namespace: ""}}}
+-		}),
+-		Predicates: []predicate.Predicate{
+-			predicate.Funcs{
+-				CreateFunc: func(e event.CreateEvent) bool {
+-					// Only reconcile when new nodes are created
+-					return true
+-				},
+-				UpdateFunc: func(e event.UpdateEvent) bool {
+-					// Ignore node updates
+-					return false
+-				},
+-				DeleteFunc: func(e event.DeleteEvent) bool {
+-					// Ignore node deletions
+-					return false
+-				},
+-			},
+-		},
+-	}); err != nil {
+-		return fmt.Errorf("failed to watch nodes: %w", err)
+-	}
+-
+-	// Watch for Machine updates on the management cluster.
+-	// When CAPI sets Machine.Status.NodeRef (linking a Machine to a Node),
+-	// we need to reconcile so that labelNodesForGlobalPullSecret can label
+-	// the newly linked node. This closes a race where the Node CREATE event
+-	// fires before NodeRef is set, causing the node to be skipped.
+-	if err := c.Watch(source.Kind(opts.CPCluster.GetCache(), &capiv1.Machine{},
+-		// The reconciler does not use the request key; it always runs a full reconciliation.
+-		// We enqueue the Machine's name/namespace for logging and observability only.
+-		handler.TypedEnqueueRequestsFromMapFunc(func(ctx context.Context, o *capiv1.Machine) []crreconcile.Request {
+-			return []crreconcile.Request{{NamespacedName: types.NamespacedName{Name: o.GetName(), Namespace: o.GetNamespace()}}}
+-		}),
+-		machineNodeRefPredicate(),
+-	)); err != nil {
+-		return fmt.Errorf("failed to watch Machines: %w", err)
+-	}
+-
+ 	return nil
+ }
+-
+-// machineNodeRefPredicate returns a predicate that only triggers on Machine
+-// updates where Status.NodeRef transitions from nil to non-nil.
+-func machineNodeRefPredicate() predicate.TypedPredicate[*capiv1.Machine] {
+-	return predicate.TypedFuncs[*capiv1.Machine]{
+-		CreateFunc: func(e event.TypedCreateEvent[*capiv1.Machine]) bool {
+-			return false
+-		},
+-		UpdateFunc: func(e event.TypedUpdateEvent[*capiv1.Machine]) bool {
+-			return e.ObjectOld.Status.NodeRef == nil && e.ObjectNew.Status.NodeRef != nil
+-		},
+-		DeleteFunc: func(e event.TypedDeleteEvent[*capiv1.Machine]) bool {
+-			return false
+-		},
+-		GenericFunc: func(e event.TypedGenericEvent[*capiv1.Machine]) bool {
+-			return false
+-		},
+-	}
+-}
+diff --git a/hypershift-operator/controllers/nodepool/capi.go b/hypershift-operator/controllers/nodepool/capi.go
+index b5b6db14008..39917b81a22 100644
+--- a/hypershift-operator/controllers/nodepool/capi.go
++++ b/hypershift-operator/controllers/nodepool/capi.go
+@@ -40,6 +40,10 @@ import (
+ 
+ const (
+ 	interruptibleInstanceLabel = "hypershift.openshift.io/interruptible-instance"
++	// globalPSNodeLabel is the label applied to Nodes to indicate they are eligible for
++	// the GlobalPullSecret DaemonSet. Only Replace (MachineDeployment) nodes get this label;
++	// InPlace (MachineSet) nodes are excluded to avoid conflicts with Machine Config Daemon.
++	globalPSNodeLabel = "hypershift.openshift.io/nodepool-globalps-enabled"
+ )
+ 
+ // CAPI Knows how to reconcile all the CAPI resources for a unique token.
+@@ -498,14 +502,14 @@ func (c *CAPI) reconcileMachineDeployment(ctx context.Context, log logr.Logger,
+ 			continue
+ 		}
+ 
+-		if machine.Annotations == nil {
+-			machine.Annotations = make(map[string]string)
+-		}
+-		if machine.Labels == nil {
+-			machine.Labels = make(map[string]string)
+-		}
+-
+ 		if result, err := controllerutil.CreateOrPatch(ctx, c.Client, &machine, func() error {
++			if machine.Labels == nil {
++				machine.Labels = make(map[string]string)
++			}
++			if machine.Annotations == nil {
++				machine.Annotations = make(map[string]string)
++			}
++
+ 			// Propagate labels.
+ 			for k, v := range nodePool.Spec.NodeLabels {
+ 				// Propagated managed labels down to Machines with a known hardcoded prefix
+@@ -514,6 +518,14 @@ func (c *CAPI) reconcileMachineDeployment(ctx context.Context, log logr.Logger,
+ 				machine.Labels[labelKey] = v
+ 			}
+ 
++			// Propagate globalPS managed label to Machines so the HCCO Node controller
++			// applies it to Nodes. This enables the GlobalPullSecret DaemonSet to
++			// schedule on Replace nodes. Only AWS and Azure platforms support this.
++			if nodePool.Spec.Platform.Type == hyperv1.AWSPlatform || nodePool.Spec.Platform.Type == hyperv1.AzurePlatform {
++				globalPSLabelKey := fmt.Sprintf("%s.%s", labelManagedPrefix, globalPSNodeLabel)
++				machine.Labels[globalPSLabelKey] = "true"
++			}
++
+ 			// Propagate taints.
+ 			taintsInJSON, err := taintsToJSON(nodePool.Spec.Taints)
+ 			if err != nil {
+diff --git a/hypershift-operator/controllers/nodepool/capi_test.go b/hypershift-operator/controllers/nodepool/capi_test.go
+index 3ae6948f643..d651ffd38b1 100644
+--- a/hypershift-operator/controllers/nodepool/capi_test.go
++++ b/hypershift-operator/controllers/nodepool/capi_test.go
+@@ -24,7 +24,10 @@ import (
+ 	"k8s.io/utils/ptr"
+ 
+ 	capiaws "sigs.k8s.io/cluster-api-provider-aws/v2/api/v1beta2"
++	capiazure "sigs.k8s.io/cluster-api-provider-azure/api/v1beta1"
++	capikubevirt "sigs.k8s.io/cluster-api-provider-kubevirt/api/v1alpha1"
+ 	capiv1 "sigs.k8s.io/cluster-api/api/v1beta1"
++	ctrl "sigs.k8s.io/controller-runtime"
+ 	"sigs.k8s.io/controller-runtime/pkg/client"
+ 	"sigs.k8s.io/controller-runtime/pkg/client/apiutil"
+ 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
+@@ -1860,6 +1863,391 @@ func TestCAPIReconcile(t *testing.T) {
+ 	}
+ }
+ 
++func TestGlobalPSManagedLabelOnMachines(t *testing.T) {
++	maxUnavailable := intstr.FromInt(0)
++	maxSurge := intstr.FromInt(1)
++	awsMachineTemplateName := "test-nodepool-29e4de4b"
++	capiClusterName := "infra-id"
++	controlPlaneNamespace := "test-namespace-test-cluster"
++
++	tests := []struct {
++		name          string
++		nodePool      *hyperv1.NodePool
++		hostedCluster *hyperv1.HostedCluster
++		objects       []client.Object
++		reconcile     func(t *testing.T, capi *CAPI) error
++		expectLabel   bool
++	}{
++		{
++			name: "When using Replace upgrade strategy on AWS, it should apply globalPS managed label to Machines",
++			nodePool: &hyperv1.NodePool{
++				ObjectMeta: metav1.ObjectMeta{
++					Name:      "test-nodepool",
++					Namespace: "test-namespace",
++				},
++				Spec: hyperv1.NodePoolSpec{
++					ClusterName: "test-cluster",
++					Management: hyperv1.NodePoolManagement{
++						UpgradeType: hyperv1.UpgradeTypeReplace,
++						Replace: &hyperv1.ReplaceUpgrade{
++							Strategy: hyperv1.UpgradeStrategyRollingUpdate,
++							RollingUpdate: &hyperv1.RollingUpdate{
++								MaxUnavailable: &maxUnavailable,
++								MaxSurge:       &maxSurge,
++							},
++						},
++					},
++					Replicas: ptr.To[int32](3),
++					Platform: hyperv1.NodePoolPlatform{
++						Type: hyperv1.AWSPlatform,
++						AWS: &hyperv1.AWSNodePoolPlatform{
++							AMI: "an-ami",
++						},
++					},
++				},
++			},
++			hostedCluster: &hyperv1.HostedCluster{
++				ObjectMeta: metav1.ObjectMeta{Name: "test-cluster", Namespace: "test-namespace"},
++				Spec: hyperv1.HostedClusterSpec{
++					Platform: hyperv1.PlatformSpec{
++						Type: hyperv1.AWSPlatform,
++						AWS: &hyperv1.AWSPlatformSpec{
++							Region:                      "",
++							CloudProviderConfig:         &hyperv1.AWSCloudProviderConfig{},
++							ServiceEndpoints:            []hyperv1.AWSServiceEndpoint{},
++							RolesRef:                    hyperv1.AWSRolesRef{},
++							ResourceTags:                []hyperv1.AWSResourceTag{},
++							EndpointAccess:              "",
++							AdditionalAllowedPrincipals: []string{},
++							MultiArch:                   false,
++						},
++					},
++				},
++			},
++			objects: []client.Object{
++				&capiv1.MachineSet{
++					ObjectMeta: metav1.ObjectMeta{
++						Name:      "test-machineset",
++						Namespace: controlPlaneNamespace,
++						Annotations: map[string]string{
++							nodePoolAnnotation: "test-namespace/test-nodepool",
++						},
++					},
++					Spec: capiv1.MachineSetSpec{
++						Template: capiv1.MachineTemplateSpec{
++							Spec: capiv1.MachineSpec{
++								InfrastructureRef: corev1.ObjectReference{
++									Kind:       "AWSMachineTemplate",
++									APIVersion: "infrastructure.cluster.x-k8s.io/v1beta2",
++									Namespace:  controlPlaneNamespace,
++									Name:       awsMachineTemplateName,
++								},
++							},
++						},
++					},
++				},
++				&capiv1.Machine{
++					ObjectMeta: metav1.ObjectMeta{
++						Name:      "test-machine-1",
++						Namespace: controlPlaneNamespace,
++						Annotations: map[string]string{
++							nodePoolAnnotation: "test-namespace/test-nodepool",
++						},
++					},
++				},
++				&capiaws.AWSMachineTemplate{
++					ObjectMeta: metav1.ObjectMeta{
++						Name:      awsMachineTemplateName,
++						Namespace: controlPlaneNamespace,
++						Annotations: map[string]string{
++							nodePoolAnnotation: "test-namespace/test-nodepool",
++						},
++					},
++				},
++			},
++			expectLabel: true,
++		},
++		{
++			name: "When using Replace upgrade strategy on Azure, it should apply globalPS managed label to Machines",
++			nodePool: &hyperv1.NodePool{
++				ObjectMeta: metav1.ObjectMeta{
++					Name:      "test-nodepool",
++					Namespace: "test-namespace",
++				},
++				Spec: hyperv1.NodePoolSpec{
++					ClusterName: "test-cluster",
++					Management: hyperv1.NodePoolManagement{
++						UpgradeType: hyperv1.UpgradeTypeReplace,
++						Replace: &hyperv1.ReplaceUpgrade{
++							Strategy: hyperv1.UpgradeStrategyRollingUpdate,
++							RollingUpdate: &hyperv1.RollingUpdate{
++								MaxUnavailable: &maxUnavailable,
++								MaxSurge:       &maxSurge,
++							},
++						},
++					},
++					Replicas: ptr.To[int32](3),
++					Platform: hyperv1.NodePoolPlatform{
++						Type: hyperv1.AzurePlatform,
++					},
++				},
++			},
++			hostedCluster: &hyperv1.HostedCluster{
++				ObjectMeta: metav1.ObjectMeta{Name: "test-cluster", Namespace: "test-namespace"},
++				Spec: hyperv1.HostedClusterSpec{
++					Platform: hyperv1.PlatformSpec{
++						Type: hyperv1.AzurePlatform,
++					},
++				},
++			},
++			objects: []client.Object{
++				&capiv1.Machine{
++					ObjectMeta: metav1.ObjectMeta{
++						Name:      "test-machine-1",
++						Namespace: controlPlaneNamespace,
++						Annotations: map[string]string{
++							nodePoolAnnotation: "test-namespace/test-nodepool",
++						},
++					},
++				},
++				&capiv1.MachineDeployment{
++					ObjectMeta: metav1.ObjectMeta{
++						Name:      "test-nodepool",
++						Namespace: controlPlaneNamespace,
++					},
++				},
++			},
++			reconcile: func(t *testing.T, capi *CAPI) error {
++				md := &capiv1.MachineDeployment{}
++				if err := capi.Client.Get(t.Context(), client.ObjectKey{Namespace: controlPlaneNamespace, Name: "test-nodepool"}, md); err != nil {
++					return err
++				}
++				template := &capiazure.AzureMachineTemplate{
++					ObjectMeta: metav1.ObjectMeta{
++						Name:      "test-azure-template",
++						Namespace: controlPlaneNamespace,
++					},
++				}
++				log := ctrl.LoggerFrom(t.Context())
++				return capi.reconcileMachineDeployment(t.Context(), log, md, template)
++			},
++			expectLabel: true,
++		},
++		{
++			name: "When using InPlace upgrade strategy on AWS, it should not apply globalPS managed label to Machines",
++			nodePool: &hyperv1.NodePool{
++				ObjectMeta: metav1.ObjectMeta{
++					Name:      "test-nodepool",
++					Namespace: "test-namespace",
++				},
++				Spec: hyperv1.NodePoolSpec{
++					ClusterName: "test-cluster",
++					Management: hyperv1.NodePoolManagement{
++						UpgradeType: hyperv1.UpgradeTypeInPlace,
++					},
++					Replicas: ptr.To[int32](3),
++					Platform: hyperv1.NodePoolPlatform{
++						Type: hyperv1.AWSPlatform,
++						AWS: &hyperv1.AWSNodePoolPlatform{
++							AMI: "an-ami",
++						},
++					},
++				},
++			},
++			hostedCluster: &hyperv1.HostedCluster{
++				ObjectMeta: metav1.ObjectMeta{Name: "test-cluster", Namespace: "test-namespace"},
++				Spec: hyperv1.HostedClusterSpec{
++					Platform: hyperv1.PlatformSpec{
++						Type: hyperv1.AWSPlatform,
++						AWS: &hyperv1.AWSPlatformSpec{
++							Region:                      "",
++							CloudProviderConfig:         &hyperv1.AWSCloudProviderConfig{},
++							ServiceEndpoints:            []hyperv1.AWSServiceEndpoint{},
++							RolesRef:                    hyperv1.AWSRolesRef{},
++							ResourceTags:                []hyperv1.AWSResourceTag{},
++							EndpointAccess:              "",
++							AdditionalAllowedPrincipals: []string{},
++							MultiArch:                   false,
++						},
++					},
++				},
++			},
++			objects: []client.Object{
++				&capiv1.MachineSet{
++					ObjectMeta: metav1.ObjectMeta{
++						Name:      "test-machineset",
++						Namespace: controlPlaneNamespace,
++						Annotations: map[string]string{
++							nodePoolAnnotation: "test-namespace/test-nodepool",
++						},
++					},
++					Spec: capiv1.MachineSetSpec{
++						Template: capiv1.MachineTemplateSpec{
++							Spec: capiv1.MachineSpec{
++								InfrastructureRef: corev1.ObjectReference{
++									Kind:       "AWSMachineTemplate",
++									APIVersion: "infrastructure.cluster.x-k8s.io/v1beta2",
++									Namespace:  controlPlaneNamespace,
++									Name:       awsMachineTemplateName,
++								},
++							},
++						},
++					},
++				},
++				&capiv1.Machine{
++					ObjectMeta: metav1.ObjectMeta{
++						Name:      "test-machine-1",
++						Namespace: controlPlaneNamespace,
++						Annotations: map[string]string{
++							nodePoolAnnotation: "test-namespace/test-nodepool",
++						},
++					},
++				},
++				&capiaws.AWSMachineTemplate{
++					ObjectMeta: metav1.ObjectMeta{
++						Name:      awsMachineTemplateName,
++						Namespace: controlPlaneNamespace,
++						Annotations: map[string]string{
++							nodePoolAnnotation: "test-namespace/test-nodepool",
++						},
++					},
++				},
++			},
++		},
++		{
++			name: "When using Replace upgrade strategy on KubeVirt, it should not apply globalPS managed label to Machines",
++			nodePool: &hyperv1.NodePool{
++				ObjectMeta: metav1.ObjectMeta{
++					Name:      "test-nodepool",
++					Namespace: "test-namespace",
++				},
++				Spec: hyperv1.NodePoolSpec{
++					ClusterName: "test-cluster",
++					Management: hyperv1.NodePoolManagement{
++						UpgradeType: hyperv1.UpgradeTypeReplace,
++						Replace: &hyperv1.ReplaceUpgrade{
++							Strategy: hyperv1.UpgradeStrategyRollingUpdate,
++							RollingUpdate: &hyperv1.RollingUpdate{
++								MaxUnavailable: &maxUnavailable,
++								MaxSurge:       &maxSurge,
++							},
++						},
++					},
++					Replicas: ptr.To[int32](3),
++					Platform: hyperv1.NodePoolPlatform{
++						Type: hyperv1.KubevirtPlatform,
++					},
++				},
++			},
++			hostedCluster: &hyperv1.HostedCluster{
++				ObjectMeta: metav1.ObjectMeta{Name: "test-cluster", Namespace: "test-namespace"},
++				Spec: hyperv1.HostedClusterSpec{
++					Platform: hyperv1.PlatformSpec{
++						Type: hyperv1.KubevirtPlatform,
++					},
++				},
++			},
++			objects: []client.Object{
++				&capiv1.Machine{
++					ObjectMeta: metav1.ObjectMeta{
++						Name:      "test-machine-1",
++						Namespace: controlPlaneNamespace,
++						Annotations: map[string]string{
++							nodePoolAnnotation: "test-namespace/test-nodepool",
++						},
++					},
++				},
++				&capiv1.MachineDeployment{
++					ObjectMeta: metav1.ObjectMeta{
++						Name:      "test-nodepool",
++						Namespace: controlPlaneNamespace,
++					},
++				},
++			},
++			// Call reconcileMachineDeployment directly to test the label logic
++			// without requiring full KubeVirt machine template setup.
++			reconcile: func(t *testing.T, capi *CAPI) error {
++				md := &capiv1.MachineDeployment{}
++				if err := capi.Client.Get(t.Context(), client.ObjectKey{Namespace: controlPlaneNamespace, Name: "test-nodepool"}, md); err != nil {
++					return err
++				}
++				kvTemplate := &capikubevirt.KubevirtMachineTemplate{
++					ObjectMeta: metav1.ObjectMeta{
++						Name:      "test-kv-template",
++						Namespace: controlPlaneNamespace,
++					},
++				}
++				log := ctrl.LoggerFrom(t.Context())
++				return capi.reconcileMachineDeployment(t.Context(), log, md, kvTemplate)
++			},
++		},
++	}
++
++	for _, tt := range tests {
++		t.Run(tt.name, func(t *testing.T) {
++			g := NewWithT(t)
++
++			objects := append([]client.Object{tt.nodePool}, tt.objects...)
++			c := fake.NewClientBuilder().
++				WithScheme(api.Scheme).
++				WithObjects(objects...).
++				Build()
++
++			capi := &CAPI{
++				Token: &Token{
++					ConfigGenerator: &ConfigGenerator{
++						Client:                c,
++						hostedCluster:         tt.hostedCluster,
++						nodePool:              tt.nodePool,
++						controlplaneNamespace: controlPlaneNamespace,
++						rolloutConfig: &rolloutConfig{
++							releaseImage: &releaseinfo.ReleaseImage{
++								ImageStream: &imageapi.ImageStream{
++									ObjectMeta: metav1.ObjectMeta{
++										Name: "target-version",
++									},
++								},
++							},
++						},
++					},
++					cpoCapabilities:        &CPOCapabilities{},
++					CreateOrUpdateProvider: upsert.New(false),
++				},
++				capiClusterName: capiClusterName,
++				ApplyProvider:   upsert.NewApplyProvider(false),
++			}
++
++			reconcile := tt.reconcile
++			if reconcile == nil {
++				reconcile = func(t *testing.T, capi *CAPI) error {
++					return capi.Reconcile(t.Context())
++				}
++			}
++			err := reconcile(t, capi)
++			g.Expect(err).NotTo(HaveOccurred())
++
++			globalPSManagedLabelKey := fmt.Sprintf("%s.%s", labelManagedPrefix, globalPSNodeLabel)
++			machineList := &capiv1.MachineList{}
++			err = capi.Client.List(t.Context(), machineList, client.InNamespace(controlPlaneNamespace))
++			g.Expect(err).NotTo(HaveOccurred())
++			foundOwnedMachine := false
++			for _, m := range machineList.Items {
++				if m.Annotations[nodePoolAnnotation] == client.ObjectKeyFromObject(tt.nodePool).String() {
++					foundOwnedMachine = true
++					if tt.expectLabel {
++						g.Expect(m.Labels).To(HaveKeyWithValue(globalPSManagedLabelKey, "true"),
++							"Machine %s should have the globalPS managed label", m.Name)
++					} else {
++						g.Expect(m.Labels).ToNot(HaveKey(globalPSManagedLabelKey),
++							"Machine %s should NOT have the globalPS managed label", m.Name)
++					}
++				}
++			}
++			g.Expect(foundOwnedMachine).To(BeTrue(), "expected at least one Machine owned by NodePool %s", client.ObjectKeyFromObject(tt.nodePool).String())
++		})
++	}
++}
++
+ func TestPause(t *testing.T) {
+ 	g := NewWithT(t)
+ 
+diff --git a/test/e2e/util/util.go b/test/e2e/util/util.go
+index 94aa0afb8b5..5ff7a4d4fe8 100644
+--- a/test/e2e/util/util.go
++++ b/test/e2e/util/util.go
+@@ -1981,6 +1981,30 @@ func EnsureGlobalPullSecret(t *testing.T, ctx context.Context, mgmtClient crclie
+ 		nodeCount := *np.Spec.Replicas
+ 		t.Logf("NodePool replicas: %d", nodeCount)
+ 
++		// Verify that nodes from Replace NodePools have the globalPS label applied via CAPI propagation.
++		// This label is set on the MachineDeployment template so it flows to Nodes at creation time.
++		t.Run("Check Replace nodes have globalPS label from CAPI propagation", func(t *testing.T) {
++			globalPSLabelKey := "hypershift.openshift.io/nodepool-globalps-enabled"
++			g.Eventually(func() error {
++				nodeList := &corev1.NodeList{}
++				if err := guestClient.List(ctx, nodeList, crclient.MatchingLabels{
++					hyperv1.NodePoolLabel: np.Name,
++				}); err != nil {
++					return fmt.Errorf("failed to list nodes: %w", err)
++				}
++				if len(nodeList.Items) != int(nodeCount) {
++					return fmt.Errorf("expected %d nodes for NodePool %s, got %d", nodeCount, np.Name, len(nodeList.Items))
++				}
++				for _, node := range nodeList.Items {
++					if node.Labels[globalPSLabelKey] != "true" {
++						return fmt.Errorf("node %s does not have the globalPS label", node.Name)
++					}
++				}
++				t.Logf("All %d nodes have the globalPS label", len(nodeList.Items))
++				return nil
++			}, 30*time.Second, 5*time.Second).Should(Succeed())
++		})
++
+ 		// Create the additional-pull-secret secret in the DataPlane using the dummy pull secret.
+ 		// The dummy pull secret is not authorized to pull restricted images.
+ 		err = createAdditionalPullSecret(ctx, guestClient, additionalPullSecretDummyData, additionalPullSecretName, additionalPullSecretNamespace)

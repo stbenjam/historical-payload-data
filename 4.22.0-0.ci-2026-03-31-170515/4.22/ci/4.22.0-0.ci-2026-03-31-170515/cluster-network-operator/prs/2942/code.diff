@@ -1,0 +1,92 @@
+diff --git a/pkg/apply/merge.go b/pkg/apply/merge.go
+index 4dcb7000ef..30d8075194 100644
+--- a/pkg/apply/merge.go
++++ b/pkg/apply/merge.go
+@@ -59,6 +59,19 @@ func mergeOperConfigForUpdate(current, updated *uns.Unstructured) error {
+ 		}
+ 	}
+ 
++	// managementState has no omitempty JSON tag so it is always serialized,
++	// even as a zero value. Preserve the current value if already set,
++	// otherwise let the updated value through.
++	managementState, found, err := uns.NestedString(current.Object, "spec", "managementState")
++	if err != nil {
++		return err
++	}
++	if found && managementState != "" {
++		if err := uns.SetNestedField(updated.Object, managementState, "spec", "managementState"); err != nil {
++			return err
++		}
++	}
++
+ 	return nil
+ }
+ 
+diff --git a/pkg/apply/merge_test.go b/pkg/apply/merge_test.go
+index 5787c514b7..69b3b570c7 100644
+--- a/pkg/apply/merge_test.go
++++ b/pkg/apply/merge_test.go
+@@ -57,6 +57,48 @@ func Test_Merge(t *testing.T) {
+ 				},
+ 			},
+ 		},
++		{
++			"merge operator config ManagementState remains at current value",
++			schema.GroupVersionKind{
++				Group:   operv1.GroupName,
++				Kind:    "Network",
++				Version: operv1.GroupVersion.Version,
++			},
++			&operv1.Network{
++				Spec: operv1.NetworkSpec{
++					OperatorSpec: operv1.OperatorSpec{ManagementState: operv1.Unmanaged},
++				},
++			},
++			&operv1.Network{
++				Spec: operv1.NetworkSpec{
++					OperatorSpec: operv1.OperatorSpec{ManagementState: operv1.Managed},
++				},
++			},
++			&operv1.Network{
++				Spec: operv1.NetworkSpec{
++					OperatorSpec: operv1.OperatorSpec{ManagementState: operv1.Unmanaged},
++				},
++			},
++		},
++		{
++			"merge operator config ManagementState changes when previously unset",
++			schema.GroupVersionKind{
++				Group:   operv1.GroupName,
++				Kind:    "Network",
++				Version: operv1.GroupVersion.Version,
++			},
++			&operv1.Network{},
++			&operv1.Network{
++				Spec: operv1.NetworkSpec{
++					OperatorSpec: operv1.OperatorSpec{ManagementState: operv1.Managed},
++				},
++			},
++			&operv1.Network{
++				Spec: operv1.NetworkSpec{
++					OperatorSpec: operv1.OperatorSpec{ManagementState: operv1.Managed},
++				},
++			},
++		},
+ 	}
+ 
+ 	for _, tt := range tests {
+diff --git a/pkg/network/cluster_config.go b/pkg/network/cluster_config.go
+index 3e3a18d43d..7bf55d6e4c 100644
+--- a/pkg/network/cluster_config.go
++++ b/pkg/network/cluster_config.go
+@@ -119,6 +119,10 @@ func MergeClusterConfig(operConf *operv1.NetworkSpec, clusterConf configv1.Netwo
+ 	}
+ 
+ 	operConf.DefaultNetwork.Type = operv1.NetworkType(clusterConf.NetworkType)
++	// This only takes effect when the current value in the API is empty
++	// (initial creation). mergeOperConfigForUpdate preserves the existing
++	// ManagementState on subsequent SSA applies, preventing this default
++	// from overwriting a user-set value (e.g. "Unmanaged").
+ 	if operConf.ManagementState == "" {
+ 		operConf.ManagementState = "Managed"
+ 	}

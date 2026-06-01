@@ -1,0 +1,1016 @@
+diff --git a/go.mod b/go.mod
+index 1f9271b2c8..267dbe5ff3 100644
+--- a/go.mod
++++ b/go.mod
+@@ -40,6 +40,7 @@ require (
+ 	k8s.io/api v0.34.3
+ 	k8s.io/apimachinery v0.34.3
+ 	k8s.io/client-go v0.34.3
++	k8s.io/utils v0.0.0-20251002143259-bc988d571ff4
+ 	sigs.k8s.io/controller-runtime v0.22.4
+ 	sigs.k8s.io/yaml v1.6.0
+ )
+@@ -174,7 +175,6 @@ require (
+ 	gorm.io/gorm v1.25.8 // indirect
+ 	k8s.io/klog/v2 v2.130.1 // indirect
+ 	k8s.io/kube-openapi v0.0.0-20250710124328-f3f2b991d03b // indirect
+-	k8s.io/utils v0.0.0-20251002143259-bc988d571ff4 // indirect
+ 	sigs.k8s.io/json v0.0.0-20250730193827-2d320260d730 // indirect
+ 	sigs.k8s.io/randfill v1.0.0 // indirect
+ 	sigs.k8s.io/structured-merge-diff/v6 v6.3.1 // indirect
+diff --git a/src/installer/installer.go b/src/installer/installer.go
+index 685992d998..6e75982678 100644
+--- a/src/installer/installer.go
++++ b/src/installer/installer.go
+@@ -198,6 +198,22 @@ func (i *installer) InstallNode() error {
+ 		if err = i.waitForWorkers(ctx); err != nil {
+ 			return err
+ 		}
++
++		// Wait for MachineConfig annotations on all master nodes to be consistent
++		// before rebooting the bootstrap. This prevents the stale annotation deadlock
++		// where nodes point to non-existent MachineConfigs.
++		var kc k8s_client.K8SClient
++
++		kc, err = i.kcBuilder(KubeconfigPath, i.log)
++		if err != nil {
++			i.log.WithError(err).Error("failed to get K8s client")
++
++			return err
++		}
++
++		if err = i.waitForMCAnnotationsConsistent(ctx, kc); err != nil {
++			return fmt.Errorf("failed to wait for MachineConfig annotations to be consistent: %w", err)
++		}
+ 	}
+ 
+ 	//upload host logs and report log status before reboot
+@@ -896,6 +912,76 @@ func (i *installer) waitForNodes(ctx context.Context, minNodes int, role string,
+ 	}
+ }
+ 
++const (
++	mcCurrentConfigAnnotation = "machineconfiguration.openshift.io/currentConfig"
++	mcDesiredConfigAnnotation = "machineconfiguration.openshift.io/desiredConfig"
++	mcStateAnnotation         = "machineconfiguration.openshift.io/state"
++)
++
++// waitForMCAnnotationsConsistent waits for all master nodes to have MachineConfig annotations
++// that reference existing MachineConfig objects. This prevents the bootstrap from rebooting
++// while nodes have stale annotations pointing to non-existent MachineConfigs.
++func (i *installer) waitForMCAnnotationsConsistent(ctx context.Context, kc k8s_client.K8SClient) error {
++	i.log.Info("Waiting for MachineConfig annotations to be consistent on all master nodes")
++
++	return utils.WaitForPredicateWithContext(ctx, waitForeverTimeout, generalWaitInterval, func() bool {
++		nodes, err := kc.ListNodesByRole("master")
++		if err != nil {
++			i.log.WithError(err).Warn("Failed to list master nodes")
++
++			return false
++		}
++
++		if len(nodes.Items) == 0 {
++			i.log.Infof("No master nodes found, waiting...")
++
++			return false
++		}
++
++		var expectedDesiredConfig string
++		for _, node := range nodes.Items {
++			currentConfig := node.Annotations[mcCurrentConfigAnnotation]
++			desiredConfig := node.Annotations[mcDesiredConfigAnnotation]
++			state := node.Annotations[mcStateAnnotation]
++
++			// Skip if annotations are not set yet
++			if currentConfig == "" || desiredConfig == "" {
++				i.log.Infof("Node %s has no MC annotations yet, waiting...", node.Name)
++				return false
++			}
++
++			// Check if currentConfig exists
++			if _, err := kc.GetMachineConfig(ctx, currentConfig); err != nil {
++				i.log.Warnf("Node %s has currentConfig %s which does not exist (state=%s), waiting...",
++					node.Name, currentConfig, state)
++				return false
++			}
++
++			// Check if desiredConfig exists
++			if _, err := kc.GetMachineConfig(ctx, desiredConfig); err != nil {
++				i.log.Warnf("Node %s has desiredConfig %s which does not exist (state=%s), waiting...",
++					node.Name, desiredConfig, state)
++				return false
++			}
++
++			// Require all master nodes to target the same desiredConfig (pool is converged)
++			if expectedDesiredConfig == "" {
++				expectedDesiredConfig = desiredConfig
++			}
++
++			if desiredConfig != expectedDesiredConfig {
++				i.log.Warnf("Node %s has desiredConfig %s, expected %s (state=%s), waiting...",
++					node.Name, desiredConfig, expectedDesiredConfig, state)
++				return false
++			}
++		}
++
++		i.log.Infof("All master nodes have consistent MachineConfig annotations (desired=%s)", expectedDesiredConfig)
++
++		return true
++	})
++}
++
+ func (i *installer) getInventoryHostsMap(hostsMap map[string]inventory_client.HostData) (map[string]inventory_client.HostData, error) {
+ 	var err error
+ 	if hostsMap == nil {
+diff --git a/src/installer/installer_test.go b/src/installer/installer_test.go
+index 6a6bdc5d8b..7fcd87ec79 100644
+--- a/src/installer/installer_test.go
++++ b/src/installer/installer_test.go
+@@ -28,7 +28,9 @@ import (
+ 	"github.com/sirupsen/logrus"
+ 	gomock "go.uber.org/mock/gomock"
+ 	v1 "k8s.io/api/core/v1"
++	k8serrors "k8s.io/apimachinery/pkg/api/errors"
+ 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
++	"k8s.io/utils/ptr"
+ )
+ 
+ func TestValidator(t *testing.T) {
+@@ -143,6 +145,29 @@ var _ = Describe("installer HostRoleMaster role", func() {
+ 					}, nil)
+ 			}
+ 
++			// waitForMCAnnotationsConsistentSuccess sets expectations for the MC annotations
++			// check that runs after waitForWorkers (bootstrap only). Call after WaitMasterNodesSucccess
++			// so that ListNodesByRole("master") expectations are consumed in the right order.
++			waitForMCAnnotationsConsistentSuccess := func() {
++				masterNodesWithMCAnnotations := &v1.NodeList{
++					Items: []v1.Node{
++						{
++							ObjectMeta: metav1.ObjectMeta{
++								Name: "master-0",
++								Annotations: map[string]string{
++									"machineconfiguration.openshift.io/currentConfig": "rendered-master-12345",
++									"machineconfiguration.openshift.io/desiredConfig": "rendered-master-12345",
++									"machineconfiguration.openshift.io/state":         "Done",
++								},
++							},
++						},
++					},
++				}
++
++				mockk8sclient.EXPECT().ListNodesByRole("master").Return(masterNodesWithMCAnnotations, nil).MinTimes(1)
++				mockk8sclient.EXPECT().GetMachineConfig(gomock.Any(), gomock.Any()).Return(&mcfgv1.MachineConfig{}, nil).MinTimes(1)
++			}
++
+ 			setupInvoker := func(invoker ...string) {
+ 				i := "assisted-service"
+ 				if len(invoker) > 0 {
+@@ -371,7 +396,11 @@ var _ = Describe("installer HostRoleMaster role", func() {
+ 					createOpenshiftSshManifestSuccess()
+ 					daemonReload(nil)
+ 					setupInvoker(invoker...)
++					// InstallNode starts updateConfiguringStatus in a goroutine; it calls GetMCSLogs on each tick.
++					// Return an error so verifyHostCanMoveToConfigurationStatus returns without touching inventory.
++					mockops.EXPECT().GetMCSLogs().Return("", fmt.Errorf("dummy")).AnyTimes()
+ 				}
++
+ 				for _, version := range []string{"4.7", "4.7.1", "4.7-pre-release", "4.8"} {
+ 					Context(version, func() {
+ 						BeforeEach(func() {
+@@ -401,6 +430,7 @@ var _ = Describe("installer HostRoleMaster role", func() {
+ 							waitForETCDBootstrapSuccess()
+ 							bootstrapETCDStatusSuccess()
+ 							resolvConfSuccess()
++							waitForMCAnnotationsConsistentSuccess()
+ 							waitForControllerSuccessfully(conf.ClusterID)
+ 							//HostRoleMaster flow:
+ 							downloadHostIgnitionSuccess(infraEnvId, hostId, "master-host-id.ign")
+@@ -438,6 +468,7 @@ var _ = Describe("installer HostRoleMaster role", func() {
+ 							bootstrapETCDStatusSuccess()
+ 							resolvConfSuccess()
+ 							waitForControllerSuccessfully(conf.ClusterID)
++							waitForMCAnnotationsConsistentSuccess()
+ 							//HostRoleMaster flow:
+ 							downloadHostIgnitionSuccess(infraEnvId, hostId, "master-host-id.ign")
+ 							writeToDiskSuccess(gomock.Any())
+@@ -476,6 +507,7 @@ var _ = Describe("installer HostRoleMaster role", func() {
+ 							bootstrapETCDStatusSuccess()
+ 							resolvConfSuccess()
+ 							waitForControllerSuccessfully(conf.ClusterID)
++							waitForMCAnnotationsConsistentSuccess()
+ 							//HostRoleMaster flow:
+ 							downloadHostIgnitionSuccess(infraEnvId, hostId, "master-host-id.ign")
+ 							writeToDiskSuccess(gomock.Any())
+@@ -514,6 +546,7 @@ var _ = Describe("installer HostRoleMaster role", func() {
+ 							bootstrapETCDStatusSuccess()
+ 							resolvConfSuccess()
+ 							waitForControllerSuccessfully(conf.ClusterID)
++							waitForMCAnnotationsConsistentSuccess()
+ 							//HostRoleMaster flow:
+ 							downloadHostIgnitionSuccess(infraEnvId, hostId, "master-host-id.ign")
+ 							writeToDiskSuccess(gomock.Any())
+@@ -561,6 +594,7 @@ var _ = Describe("installer HostRoleMaster role", func() {
+ 							bootstrapETCDStatusSuccess()
+ 							resolvConfSuccess()
+ 							waitForControllerSuccessfully(conf.ClusterID)
++							waitForMCAnnotationsConsistentSuccess()
+ 							//HostRoleMaster flow:
+ 							downloadHostIgnitionSuccess(infraEnvId, hostId, "master-host-id.ign")
+ 							writeToDiskSuccess(gomock.Any())
+@@ -597,6 +631,7 @@ var _ = Describe("installer HostRoleMaster role", func() {
+ 							bootstrapETCDStatusSuccess()
+ 							resolvConfSuccess()
+ 							waitForControllerSuccessfully(conf.ClusterID)
++							waitForMCAnnotationsConsistentSuccess()
+ 							//HostRoleMaster flow:
+ 							downloadHostIgnitionSuccess(infraEnvId, hostId, "master-host-id.ign")
+ 							writeToDiskSuccess(gomock.Any())
+@@ -633,6 +668,7 @@ var _ = Describe("installer HostRoleMaster role", func() {
+ 							bootstrapETCDStatusSuccess()
+ 							resolvConfSuccess()
+ 							waitForControllerSuccessfully(conf.ClusterID)
++							waitForMCAnnotationsConsistentSuccess()
+ 							//HostRoleMaster flow:
+ 							downloadHostIgnitionSuccess(infraEnvId, hostId, "master-host-id.ign")
+ 							writeToDiskSuccess(gomock.Any())
+@@ -670,6 +706,7 @@ var _ = Describe("installer HostRoleMaster role", func() {
+ 							bootstrapETCDStatusSuccess()
+ 							resolvConfSuccess()
+ 							waitForControllerSuccessfully(conf.ClusterID)
++							waitForMCAnnotationsConsistentSuccess()
+ 							//HostRoleMaster flow:
+ 							downloadHostIgnitionSuccess(infraEnvId, hostId, "master-host-id.ign")
+ 							writeToDiskSuccess(gomock.Any())
+@@ -712,6 +749,7 @@ var _ = Describe("installer HostRoleMaster role", func() {
+ 							resolvConfSuccess()
+ 							waitForControllerSuccessfully(conf.ClusterID)
+ 							waitForWorkersSuccessfully()
++							waitForMCAnnotationsConsistentSuccess()
+ 							//HostRoleMaster flow:
+ 							downloadHostIgnitionSuccess(infraEnvId, hostId, "master-host-id.ign")
+ 							writeToDiskSuccess(gomock.Any())
+@@ -754,6 +792,7 @@ var _ = Describe("installer HostRoleMaster role", func() {
+ 							resolvConfSuccess()
+ 							waitForControllerSuccessfully(conf.ClusterID)
+ 							waitForWorkersSuccessfully()
++							waitForMCAnnotationsConsistentSuccess()
+ 							//HostRoleMaster flow:
+ 							downloadHostIgnitionSuccess(infraEnvId, hostId, "master-host-id.ign")
+ 							writeToDiskSuccess(gomock.Any())
+@@ -797,6 +836,7 @@ var _ = Describe("installer HostRoleMaster role", func() {
+ 						})
+ 					})
+ 				}
++
+ 				It("bootstrap role creating SSH manifest failed", func() {
+ 					updateProgressSuccess([][]string{{string(models.HostStageStartingInstallation), conf.Role}})
+ 					cleanInstallDevice()
+@@ -834,6 +874,7 @@ var _ = Describe("installer HostRoleMaster role", func() {
+ 					bootstrapETCDStatusSuccess()
+ 					resolvConfSuccess()
+ 					waitForControllerSuccessfully(conf.ClusterID)
++					waitForMCAnnotationsConsistentSuccess()
+ 					//HostRoleMaster flow:
+ 					downloadHostIgnitionSuccess(infraEnvId, hostId, "master-host-id.ign")
+ 					writeToDiskSuccess(gomock.Any())
+@@ -871,6 +912,7 @@ var _ = Describe("installer HostRoleMaster role", func() {
+ 					bootstrapETCDStatusSuccess()
+ 					resolvConfSuccess()
+ 					waitForControllerSuccessfully(conf.ClusterID)
++					waitForMCAnnotationsConsistentSuccess()
+ 					//HostRoleMaster flow:
+ 					downloadHostIgnitionSuccess(infraEnvId, hostId, "master-host-id.ign")
+ 					writeToDiskSuccess(gomock.Any())
+@@ -988,6 +1030,7 @@ var _ = Describe("installer HostRoleMaster role", func() {
+ 							bootstrapETCDStatusSuccess()
+ 							resolvConfSuccess()
+ 							waitForControllerSuccessfully(conf.ClusterID)
++							waitForMCAnnotationsConsistentSuccess()
+ 							//HostRoleMaster flow:
+ 							downloadHostIgnitionSuccess(infraEnvId, hostId, "master-host-id.ign")
+ 							writeToDiskSuccess(gomock.Any())
+@@ -1524,3 +1567,179 @@ func GetNotReadyKubeNodes(kubeNamesIds map[string]string) *v1.NodeList {
+ 	}
+ 	return newNodeList
+ }
++
++var _ = Describe("Testing installer.waitForMCAnnotationsConsistent", func() {
++	var (
++		ctrl *gomock.Controller
++
++		mockk8sclient *k8s_client.MockK8SClient
++		installer     = NewAssistedInstaller(logrus.New(), config.Config{}, nil, nil, nil, nil, nil)
++
++		originalGeneralWaitInterval time.Duration
++	)
++
++	validateIsContextDeadlineExceededError := func(err error) {
++		Expect(err).Should(HaveOccurred())
++		Expect(err).Should(MatchError(context.DeadlineExceeded))
++	}
++
++	type NodeToMock struct {
++		Name          string
++		CurrentConfig *string
++		DesiredConfig *string
++	}
++
++	addMasterNodesToMock := func(nodes ...NodeToMock) {
++		nodeList := &v1.NodeList{}
++		for _, node := range nodes {
++			annotations := make(map[string]string)
++
++			if node.CurrentConfig != nil {
++				annotations["machineconfiguration.openshift.io/currentConfig"] = *node.CurrentConfig
++			}
++
++			if node.DesiredConfig != nil {
++				annotations["machineconfiguration.openshift.io/desiredConfig"] = *node.DesiredConfig
++			}
++
++			nodeList.Items = append(nodeList.Items, v1.Node{
++				ObjectMeta: metav1.ObjectMeta{
++					Name:        node.Name,
++					Annotations: annotations,
++				},
++			})
++		}
++
++		mockk8sclient.EXPECT().ListNodesByRole("master").Return(nodeList, nil).MinTimes(1)
++	}
++
++	addMachineConfigToMock := func(name string, exists bool) {
++		if exists {
++			mockk8sclient.EXPECT().GetMachineConfig(gomock.Any(), name).Return(&mcfgv1.MachineConfig{}, nil).AnyTimes()
++		} else {
++			mockk8sclient.EXPECT().GetMachineConfig(gomock.Any(), name).Return(nil, k8serrors.NewNotFound(v1.Resource("machineconfig"), name)).AnyTimes()
++		}
++	}
++
++	itShouldFailWhenContextExpires := func() {
++		It("should return an error when the context expired", func() {
++			ctx, cancel := context.WithTimeout(context.Background(), 2*generalWaitInterval)
++
++			err := installer.waitForMCAnnotationsConsistent(ctx, mockk8sclient)
++			validateIsContextDeadlineExceededError(err)
++
++			cancel() // Should be already cancelled
++		}, float64(1)) // 1 second timeout
++	}
++
++	BeforeEach(func() {
++		ctrl = gomock.NewController(GinkgoT())
++		mockk8sclient = k8s_client.NewMockK8SClient(ctrl)
++
++		originalGeneralWaitInterval = generalWaitInterval
++		generalWaitInterval = 200 * time.Millisecond // Override package-level interval mutated by HostRoleMaster tests
++	})
++
++	AfterEach(func() {
++		generalWaitInterval = originalGeneralWaitInterval
++
++		ctrl.Finish()
++	})
++
++	Context("happy path", func() {
++		When("one master is mco-ready", func() {
++			BeforeEach(func() {
++				addMasterNodesToMock(NodeToMock{Name: "master-0", CurrentConfig: ptr.To("a"), DesiredConfig: ptr.To("a")})
++				addMachineConfigToMock("a", true)
++			})
++
++			It("should return nil", func() {
++				ctx, cancel := context.WithTimeout(context.Background(), 2*generalWaitInterval)
++
++				err := installer.waitForMCAnnotationsConsistent(ctx, mockk8sclient)
++				Expect(err).Should(BeNil())
++
++				cancel()
++			}, float64(1)) // 1 second timeout
++		})
++
++		When("two masters are mco-ready and consistent", func() {
++			BeforeEach(func() {
++				addMasterNodesToMock(
++					NodeToMock{Name: "master-0", CurrentConfig: ptr.To("a"), DesiredConfig: ptr.To("a")},
++					NodeToMock{Name: "master-1", CurrentConfig: ptr.To("a"), DesiredConfig: ptr.To("a")},
++				)
++				addMachineConfigToMock("a", true)
++			})
++
++			It("should return nil", func() {
++				ctx, cancel := context.WithTimeout(context.Background(), 2*generalWaitInterval)
++
++				err := installer.waitForMCAnnotationsConsistent(ctx, mockk8sclient)
++				Expect(err).Should(BeNil())
++
++				cancel()
++			}, float64(1)) // 1 second timeout
++		})
++	})
++
++	When("no masters are found", func() {
++		BeforeEach(func() {
++			mockk8sclient.EXPECT().ListNodesByRole("master").Return(&v1.NodeList{}, nil).MinTimes(1)
++		})
++
++		itShouldFailWhenContextExpires()
++	})
++
++	When("one master is returned", func() {
++		Context("and the currentConfig annotation is not set", func() {
++			BeforeEach(func() {
++				addMasterNodesToMock(NodeToMock{Name: "master-0", CurrentConfig: nil, DesiredConfig: ptr.To("a")})
++			})
++
++			itShouldFailWhenContextExpires()
++		})
++
++		Context("and the desiredConfig annotation is not set", func() {
++			BeforeEach(func() {
++				addMasterNodesToMock(NodeToMock{Name: "master-0", CurrentConfig: ptr.To("a"), DesiredConfig: nil})
++			})
++
++			itShouldFailWhenContextExpires()
++		})
++
++		Context("and the current machine config doesn't exist", func() {
++			BeforeEach(func() {
++				addMasterNodesToMock(NodeToMock{Name: "master-0", CurrentConfig: ptr.To("a"), DesiredConfig: ptr.To("b")})
++				addMachineConfigToMock("a", false)
++				addMachineConfigToMock("b", true)
++			})
++
++			itShouldFailWhenContextExpires()
++		})
++
++		Context("and the desired machine config doesn't exist", func() {
++			BeforeEach(func() {
++				addMasterNodesToMock(NodeToMock{Name: "master-0", CurrentConfig: ptr.To("a"), DesiredConfig: ptr.To("b")})
++				addMachineConfigToMock("a", true)
++				addMachineConfigToMock("b", false)
++			})
++
++			itShouldFailWhenContextExpires()
++		})
++
++	})
++
++	When("several masters are returned", func() {
++		Context("and two nodes don't have consistent desiredConfig annotations", func() {
++			BeforeEach(func() {
++				addMasterNodesToMock(NodeToMock{Name: "master-0", CurrentConfig: ptr.To("a"), DesiredConfig: ptr.To("b")}, NodeToMock{Name: "master-1", CurrentConfig: ptr.To("a"), DesiredConfig: ptr.To("c")})
++				addMachineConfigToMock("a", true)
++				addMachineConfigToMock("b", true)
++				addMachineConfigToMock("c", true)
++			})
++
++			itShouldFailWhenContextExpires()
++		})
++	})
++})
+diff --git a/src/k8s_client/k8s_client.go b/src/k8s_client/k8s_client.go
+index 584fda6b1b..18051e0bc5 100644
+--- a/src/k8s_client/k8s_client.go
++++ b/src/k8s_client/k8s_client.go
+@@ -38,7 +38,6 @@ import (
+ 	certificatesClient "k8s.io/client-go/kubernetes/typed/certificates/v1"
+ 	"k8s.io/client-go/tools/clientcmd"
+ 	runtimeclient "sigs.k8s.io/controller-runtime/pkg/client"
+-	runtimeconfig "sigs.k8s.io/controller-runtime/pkg/client/config"
+ 
+ 	"github.com/openshift/assisted-installer/src/ops"
+ 	"github.com/openshift/assisted-installer/src/utils"
+@@ -89,6 +88,7 @@ type K8SClient interface {
+ 	IsClusterCapabilityEnabled(configv1.ClusterVersionCapability) (bool, error)
+ 	UntaintNode(name string) error
+ 	PatchMachineConfigPoolPaused(pause bool, mcpName string) error
++	GetMachineConfig(ctx context.Context, name string) (*mcfgv1.MachineConfig, error)
+ }
+ 
+ type K8SClientBuilder func(configPath string, logger logrus.FieldLogger) (K8SClient, error)
+@@ -133,32 +133,33 @@ func NewK8SClient(configPath string, logger logrus.FieldLogger) (K8SClient, erro
+ 	if err != nil {
+ 		return &k8sClient{}, errors.Wrap(err, "creating openshift config client")
+ 	}
+-	var runtimeClient runtimeclient.Client
+-	if configPath == "" {
+-		scheme := runtime.NewScheme()
+-		err = clientgoscheme.AddToScheme(scheme)
+-		if err != nil {
+-			return &k8sClient{}, errors.Wrap(err, "failed to add scheme to")
+-		}
+ 
+-		err = metal3v1alpha1.AddToScheme(scheme)
+-		if err != nil {
+-			return &k8sClient{}, errors.Wrap(err, "failed to add BMH scheme")
+-		}
+-		err = machinev1beta1.AddToScheme(scheme)
+-		if err != nil {
+-			return &k8sClient{}, errors.Wrap(err, "failed to add Machine scheme")
+-		}
++	// Always create runtime client with full scheme support
++	scheme := runtime.NewScheme()
++	err = clientgoscheme.AddToScheme(scheme)
++	if err != nil {
++		return &k8sClient{}, errors.Wrap(err, "failed to add scheme to")
++	}
+ 
+-		err = mcfgv1.AddToScheme(scheme)
+-		if err != nil {
+-			return &k8sClient{}, errors.Wrap(err, "failed to add MCP scheme")
+-		}
++	err = metal3v1alpha1.AddToScheme(scheme)
++	if err != nil {
++		return &k8sClient{}, errors.Wrap(err, "failed to add BMH scheme")
++	}
+ 
+-		runtimeClient, err = runtimeclient.New(runtimeconfig.GetConfigOrDie(), runtimeclient.Options{Scheme: scheme})
+-		if err != nil {
+-			return &k8sClient{}, errors.Wrap(err, "failed to create runtime client")
+-		}
++	err = machinev1beta1.AddToScheme(scheme)
++	if err != nil {
++		return &k8sClient{}, errors.Wrap(err, "failed to add Machine scheme")
++	}
++
++	err = mcfgv1.AddToScheme(scheme)
++	if err != nil {
++		return &k8sClient{}, errors.Wrap(err, "failed to add MCP scheme")
++	}
++
++	// Use the config we already loaded (works with both in-cluster and kubeconfig)
++	runtimeClient, err := runtimeclient.New(config, runtimeclient.Options{Scheme: scheme})
++	if err != nil {
++		return &k8sClient{}, errors.Wrap(err, "failed to create runtime client")
+ 	}
+ 
+ 	return &k8sClient{logger, client, ocClient, csvClient, runtimeClient, csrClient,
+@@ -713,3 +714,14 @@ func (c *k8sClient) PatchMachineConfigPoolPaused(pause bool, mcpName string) err
+ 	c.log.Infof("Setting pause MCP %s to %t", mcpName, pause)
+ 	return c.runtimeClient.Patch(context.TODO(), mcp, runtimeclient.RawPatch(types.MergePatchType, pausePatch))
+ }
++
++func (c *k8sClient) GetMachineConfig(ctx context.Context, name string) (*mcfgv1.MachineConfig, error) {
++	mc := &mcfgv1.MachineConfig{}
++
++	err := c.runtimeClient.Get(ctx, types.NamespacedName{Name: name}, mc)
++	if err != nil {
++		return nil, fmt.Errorf("failed to get MachineConfig %s: %w", name, err)
++	}
++
++	return mc, nil
++}
+diff --git a/src/k8s_client/mock_k8s_client.go b/src/k8s_client/mock_k8s_client.go
+index b27a5b2659..a88f87b0f6 100644
+--- a/src/k8s_client/mock_k8s_client.go
++++ b/src/k8s_client/mock_k8s_client.go
+@@ -11,17 +11,19 @@ package k8s_client
+ 
+ import (
+ 	bytes "bytes"
++	context "context"
+ 	reflect "reflect"
+ 
+ 	v1alpha1 "github.com/metal3-io/baremetal-operator/apis/metal3.io/v1alpha1"
+ 	v1 "github.com/openshift/api/config/v1"
+ 	v1beta1 "github.com/openshift/api/machine/v1beta1"
+ 	ops "github.com/openshift/assisted-installer/src/ops"
++	v10 "github.com/openshift/machine-config-operator/pkg/apis/machineconfiguration.openshift.io/v1"
+ 	v1alpha10 "github.com/operator-framework/api/pkg/operators/v1alpha1"
+ 	gomock "go.uber.org/mock/gomock"
+-	v10 "k8s.io/api/batch/v1"
+-	v11 "k8s.io/api/certificates/v1"
+-	v12 "k8s.io/api/core/v1"
++	v11 "k8s.io/api/batch/v1"
++	v12 "k8s.io/api/certificates/v1"
++	v13 "k8s.io/api/core/v1"
+ 	types "k8s.io/apimachinery/pkg/types"
+ )
+ 
+@@ -49,7 +51,7 @@ func (m *MockK8SClient) EXPECT() *MockK8SClientMockRecorder {
+ }
+ 
+ // ApproveCsr mocks base method.
+-func (m *MockK8SClient) ApproveCsr(csr *v11.CertificateSigningRequest) error {
++func (m *MockK8SClient) ApproveCsr(csr *v12.CertificateSigningRequest) error {
+ 	m.ctrl.T.Helper()
+ 	ret := m.ctrl.Call(m, "ApproveCsr", csr)
+ 	ret0, _ := ret[0].(error)
+@@ -63,10 +65,10 @@ func (mr *MockK8SClientMockRecorder) ApproveCsr(csr any) *gomock.Call {
+ }
+ 
+ // CreateEvent mocks base method.
+-func (m *MockK8SClient) CreateEvent(namespace, name, message, component string) (*v12.Event, error) {
++func (m *MockK8SClient) CreateEvent(namespace, name, message, component string) (*v13.Event, error) {
+ 	m.ctrl.T.Helper()
+ 	ret := m.ctrl.Call(m, "CreateEvent", namespace, name, message, component)
+-	ret0, _ := ret[0].(*v12.Event)
++	ret0, _ := ret[0].(*v13.Event)
+ 	ret1, _ := ret[1].(error)
+ 	return ret0, ret1
+ }
+@@ -253,10 +255,10 @@ func (mr *MockK8SClientMockRecorder) GetClusterVersion() *gomock.Call {
+ }
+ 
+ // GetConfigMap mocks base method.
+-func (m *MockK8SClient) GetConfigMap(namespace, name string) (*v12.ConfigMap, error) {
++func (m *MockK8SClient) GetConfigMap(namespace, name string) (*v13.ConfigMap, error) {
+ 	m.ctrl.T.Helper()
+ 	ret := m.ctrl.Call(m, "GetConfigMap", namespace, name)
+-	ret0, _ := ret[0].(*v12.ConfigMap)
++	ret0, _ := ret[0].(*v13.ConfigMap)
+ 	ret1, _ := ret[1].(error)
+ 	return ret0, ret1
+ }
+@@ -282,11 +284,26 @@ func (mr *MockK8SClientMockRecorder) GetControlPlaneReplicas() *gomock.Call {
+ 	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "GetControlPlaneReplicas", reflect.TypeOf((*MockK8SClient)(nil).GetControlPlaneReplicas))
+ }
+ 
++// GetMachineConfig mocks base method.
++func (m *MockK8SClient) GetMachineConfig(ctx context.Context, name string) (*v10.MachineConfig, error) {
++	m.ctrl.T.Helper()
++	ret := m.ctrl.Call(m, "GetMachineConfig", ctx, name)
++	ret0, _ := ret[0].(*v10.MachineConfig)
++	ret1, _ := ret[1].(error)
++	return ret0, ret1
++}
++
++// GetMachineConfig indicates an expected call of GetMachineConfig.
++func (mr *MockK8SClientMockRecorder) GetMachineConfig(ctx, name any) *gomock.Call {
++	mr.mock.ctrl.T.Helper()
++	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "GetMachineConfig", reflect.TypeOf((*MockK8SClient)(nil).GetMachineConfig), ctx, name)
++}
++
+ // GetNode mocks base method.
+-func (m *MockK8SClient) GetNode(name string) (*v12.Node, error) {
++func (m *MockK8SClient) GetNode(name string) (*v13.Node, error) {
+ 	m.ctrl.T.Helper()
+ 	ret := m.ctrl.Call(m, "GetNode", name)
+-	ret0, _ := ret[0].(*v12.Node)
++	ret0, _ := ret[0].(*v13.Node)
+ 	ret1, _ := ret[1].(error)
+ 	return ret0, ret1
+ }
+@@ -328,10 +345,10 @@ func (mr *MockK8SClientMockRecorder) GetPodLogsAsBuffer(namespace, podName, sinc
+ }
+ 
+ // GetPods mocks base method.
+-func (m *MockK8SClient) GetPods(namespace string, labelMatch map[string]string, fieldSelector string) ([]v12.Pod, error) {
++func (m *MockK8SClient) GetPods(namespace string, labelMatch map[string]string, fieldSelector string) ([]v13.Pod, error) {
+ 	m.ctrl.T.Helper()
+ 	ret := m.ctrl.Call(m, "GetPods", namespace, labelMatch, fieldSelector)
+-	ret0, _ := ret[0].([]v12.Pod)
++	ret0, _ := ret[0].([]v13.Pod)
+ 	ret1, _ := ret[1].(error)
+ 	return ret0, ret1
+ }
+@@ -433,10 +450,10 @@ func (mr *MockK8SClientMockRecorder) ListClusterOperators() *gomock.Call {
+ }
+ 
+ // ListCsrs mocks base method.
+-func (m *MockK8SClient) ListCsrs() (*v11.CertificateSigningRequestList, error) {
++func (m *MockK8SClient) ListCsrs() (*v12.CertificateSigningRequestList, error) {
+ 	m.ctrl.T.Helper()
+ 	ret := m.ctrl.Call(m, "ListCsrs")
+-	ret0, _ := ret[0].(*v11.CertificateSigningRequestList)
++	ret0, _ := ret[0].(*v12.CertificateSigningRequestList)
+ 	ret1, _ := ret[1].(error)
+ 	return ret0, ret1
+ }
+@@ -448,10 +465,10 @@ func (mr *MockK8SClientMockRecorder) ListCsrs() *gomock.Call {
+ }
+ 
+ // ListEvents mocks base method.
+-func (m *MockK8SClient) ListEvents(namespace string) (*v12.EventList, error) {
++func (m *MockK8SClient) ListEvents(namespace string) (*v13.EventList, error) {
+ 	m.ctrl.T.Helper()
+ 	ret := m.ctrl.Call(m, "ListEvents", namespace)
+-	ret0, _ := ret[0].(*v12.EventList)
++	ret0, _ := ret[0].(*v13.EventList)
+ 	ret1, _ := ret[1].(error)
+ 	return ret0, ret1
+ }
+@@ -463,10 +480,10 @@ func (mr *MockK8SClientMockRecorder) ListEvents(namespace any) *gomock.Call {
+ }
+ 
+ // ListJobs mocks base method.
+-func (m *MockK8SClient) ListJobs(namespace string) (*v10.JobList, error) {
++func (m *MockK8SClient) ListJobs(namespace string) (*v11.JobList, error) {
+ 	m.ctrl.T.Helper()
+ 	ret := m.ctrl.Call(m, "ListJobs", namespace)
+-	ret0, _ := ret[0].(*v10.JobList)
++	ret0, _ := ret[0].(*v11.JobList)
+ 	ret1, _ := ret[1].(error)
+ 	return ret0, ret1
+ }
+@@ -493,10 +510,10 @@ func (mr *MockK8SClientMockRecorder) ListMachines() *gomock.Call {
+ }
+ 
+ // ListNodes mocks base method.
+-func (m *MockK8SClient) ListNodes() (*v12.NodeList, error) {
++func (m *MockK8SClient) ListNodes() (*v13.NodeList, error) {
+ 	m.ctrl.T.Helper()
+ 	ret := m.ctrl.Call(m, "ListNodes")
+-	ret0, _ := ret[0].(*v12.NodeList)
++	ret0, _ := ret[0].(*v13.NodeList)
+ 	ret1, _ := ret[1].(error)
+ 	return ret0, ret1
+ }
+@@ -508,10 +525,10 @@ func (mr *MockK8SClientMockRecorder) ListNodes() *gomock.Call {
+ }
+ 
+ // ListNodesByRole mocks base method.
+-func (m *MockK8SClient) ListNodesByRole(role string) (*v12.NodeList, error) {
++func (m *MockK8SClient) ListNodesByRole(role string) (*v13.NodeList, error) {
+ 	m.ctrl.T.Helper()
+ 	ret := m.ctrl.Call(m, "ListNodesByRole", role)
+-	ret0, _ := ret[0].(*v12.NodeList)
++	ret0, _ := ret[0].(*v13.NodeList)
+ 	ret1, _ := ret[1].(error)
+ 	return ret0, ret1
+ }
+@@ -523,10 +540,10 @@ func (mr *MockK8SClientMockRecorder) ListNodesByRole(role any) *gomock.Call {
+ }
+ 
+ // ListServices mocks base method.
+-func (m *MockK8SClient) ListServices(namespace string) (*v12.ServiceList, error) {
++func (m *MockK8SClient) ListServices(namespace string) (*v13.ServiceList, error) {
+ 	m.ctrl.T.Helper()
+ 	ret := m.ctrl.Call(m, "ListServices", namespace)
+-	ret0, _ := ret[0].(*v12.ServiceList)
++	ret0, _ := ret[0].(*v13.ServiceList)
+ 	ret1, _ := ret[1].(error)
+ 	return ret0, ret1
+ }
+diff --git a/vendor/modules.txt b/vendor/modules.txt
+index 6601781dd2..155e29f450 100644
+--- a/vendor/modules.txt
++++ b/vendor/modules.txt
+@@ -1145,8 +1145,6 @@ k8s.io/utils/ptr
+ ## explicit; go 1.24.0
+ sigs.k8s.io/controller-runtime/pkg/client
+ sigs.k8s.io/controller-runtime/pkg/client/apiutil
+-sigs.k8s.io/controller-runtime/pkg/client/config
+-sigs.k8s.io/controller-runtime/pkg/internal/log
+ sigs.k8s.io/controller-runtime/pkg/log
+ sigs.k8s.io/controller-runtime/pkg/scheme
+ # sigs.k8s.io/json v0.0.0-20250730193827-2d320260d730
+diff --git a/vendor/sigs.k8s.io/controller-runtime/pkg/client/config/config.go b/vendor/sigs.k8s.io/controller-runtime/pkg/client/config/config.go
+deleted file mode 100644
+index 70389dfa90..0000000000
+--- a/vendor/sigs.k8s.io/controller-runtime/pkg/client/config/config.go
++++ /dev/null
+@@ -1,189 +0,0 @@
+-/*
+-Copyright 2017 The Kubernetes Authors.
+-
+-Licensed under the Apache License, Version 2.0 (the "License");
+-you may not use this file except in compliance with the License.
+-You may obtain a copy of the License at
+-
+-    http://www.apache.org/licenses/LICENSE-2.0
+-
+-Unless required by applicable law or agreed to in writing, software
+-distributed under the License is distributed on an "AS IS" BASIS,
+-WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+-See the License for the specific language governing permissions and
+-limitations under the License.
+-*/
+-
+-package config
+-
+-import (
+-	"flag"
+-	"fmt"
+-	"os"
+-	"os/user"
+-	"path/filepath"
+-
+-	"k8s.io/client-go/rest"
+-	"k8s.io/client-go/tools/clientcmd"
+-	clientcmdapi "k8s.io/client-go/tools/clientcmd/api"
+-	logf "sigs.k8s.io/controller-runtime/pkg/internal/log"
+-)
+-
+-// KubeconfigFlagName is the name of the kubeconfig flag
+-const KubeconfigFlagName = "kubeconfig"
+-
+-var (
+-	kubeconfig string
+-	log        = logf.RuntimeLog.WithName("client").WithName("config")
+-)
+-
+-// init registers the "kubeconfig" flag to the default command line FlagSet.
+-// TODO: This should be removed, as it potentially leads to redefined flag errors for users, if they already
+-// have registered the "kubeconfig" flag to the command line FlagSet in other parts of their code.
+-func init() {
+-	RegisterFlags(flag.CommandLine)
+-}
+-
+-// RegisterFlags registers flag variables to the given FlagSet if not already registered.
+-// It uses the default command line FlagSet, if none is provided. Currently, it only registers the kubeconfig flag.
+-func RegisterFlags(fs *flag.FlagSet) {
+-	if fs == nil {
+-		fs = flag.CommandLine
+-	}
+-	if f := fs.Lookup(KubeconfigFlagName); f != nil {
+-		kubeconfig = f.Value.String()
+-	} else {
+-		fs.StringVar(&kubeconfig, KubeconfigFlagName, "", "Paths to a kubeconfig. Only required if out-of-cluster.")
+-	}
+-}
+-
+-// GetConfig creates a *rest.Config for talking to a Kubernetes API server.
+-// If --kubeconfig is set, will use the kubeconfig file at that location.  Otherwise will assume running
+-// in cluster and use the cluster provided kubeconfig.
+-//
+-// The returned `*rest.Config` has client-side ratelimting disabled as we can rely on API priority and
+-// fairness. Set its QPS to a value equal or bigger than 0 to re-enable it.
+-//
+-// It also applies saner defaults for QPS and burst based on the Kubernetes
+-// controller manager defaults (20 QPS, 30 burst)
+-//
+-// Config precedence:
+-//
+-// * --kubeconfig flag pointing at a file
+-//
+-// * KUBECONFIG environment variable pointing at a file
+-//
+-// * In-cluster config if running in cluster
+-//
+-// * $HOME/.kube/config if exists.
+-func GetConfig() (*rest.Config, error) {
+-	return GetConfigWithContext("")
+-}
+-
+-// GetConfigWithContext creates a *rest.Config for talking to a Kubernetes API server with a specific context.
+-// If --kubeconfig is set, will use the kubeconfig file at that location.  Otherwise will assume running
+-// in cluster and use the cluster provided kubeconfig.
+-//
+-// The returned `*rest.Config` has client-side ratelimting disabled as we can rely on API priority and
+-// fairness. Set its QPS to a value equal or bigger than 0 to re-enable it.
+-//
+-// It also applies saner defaults for QPS and burst based on the Kubernetes
+-// controller manager defaults (20 QPS, 30 burst)
+-//
+-// Config precedence:
+-//
+-// * --kubeconfig flag pointing at a file
+-//
+-// * KUBECONFIG environment variable pointing at a file
+-//
+-// * In-cluster config if running in cluster
+-//
+-// * $HOME/.kube/config if exists.
+-func GetConfigWithContext(context string) (*rest.Config, error) {
+-	cfg, err := loadConfig(context)
+-	if err != nil {
+-		return nil, err
+-	}
+-	if cfg.QPS == 0.0 {
+-		// Disable client-side ratelimer by default, we can rely on
+-		// API priority and fairness
+-		cfg.QPS = -1
+-	}
+-	return cfg, nil
+-}
+-
+-// loadInClusterConfig is a function used to load the in-cluster
+-// Kubernetes client config. This variable makes is possible to
+-// test the precedence of loading the config.
+-var loadInClusterConfig = rest.InClusterConfig
+-
+-// loadConfig loads a REST Config as per the rules specified in GetConfig.
+-func loadConfig(context string) (config *rest.Config, configErr error) {
+-	// If a flag is specified with the config location, use that
+-	if len(kubeconfig) > 0 {
+-		return loadConfigWithContext("", &clientcmd.ClientConfigLoadingRules{ExplicitPath: kubeconfig}, context)
+-	}
+-
+-	// If the recommended kubeconfig env variable is not specified,
+-	// try the in-cluster config.
+-	kubeconfigPath := os.Getenv(clientcmd.RecommendedConfigPathEnvVar)
+-	if len(kubeconfigPath) == 0 {
+-		c, err := loadInClusterConfig()
+-		if err == nil {
+-			return c, nil
+-		}
+-
+-		defer func() {
+-			if configErr != nil {
+-				log.Error(err, "unable to load in-cluster config")
+-			}
+-		}()
+-	}
+-
+-	// If the recommended kubeconfig env variable is set, or there
+-	// is no in-cluster config, try the default recommended locations.
+-	//
+-	// NOTE: For default config file locations, upstream only checks
+-	// $HOME for the user's home directory, but we can also try
+-	// os/user.HomeDir when $HOME is unset.
+-	//
+-	// TODO(jlanford): could this be done upstream?
+-	loadingRules := clientcmd.NewDefaultClientConfigLoadingRules()
+-	if _, ok := os.LookupEnv("HOME"); !ok {
+-		u, err := user.Current()
+-		if err != nil {
+-			return nil, fmt.Errorf("could not get current user: %w", err)
+-		}
+-		loadingRules.Precedence = append(loadingRules.Precedence, filepath.Join(u.HomeDir, clientcmd.RecommendedHomeDir, clientcmd.RecommendedFileName))
+-	}
+-
+-	return loadConfigWithContext("", loadingRules, context)
+-}
+-
+-func loadConfigWithContext(apiServerURL string, loader clientcmd.ClientConfigLoader, context string) (*rest.Config, error) {
+-	return clientcmd.NewNonInteractiveDeferredLoadingClientConfig(
+-		loader,
+-		&clientcmd.ConfigOverrides{
+-			ClusterInfo: clientcmdapi.Cluster{
+-				Server: apiServerURL,
+-			},
+-			CurrentContext: context,
+-		}).ClientConfig()
+-}
+-
+-// GetConfigOrDie creates a *rest.Config for talking to a Kubernetes apiserver.
+-// If --kubeconfig is set, will use the kubeconfig file at that location.  Otherwise will assume running
+-// in cluster and use the cluster provided kubeconfig.
+-//
+-// The returned `*rest.Config` has client-side ratelimting disabled as we can rely on API priority and
+-// fairness. Set its QPS to a value equal or bigger than 0 to re-enable it.
+-//
+-// Will log an error and exit if there is an error creating the rest.Config.
+-func GetConfigOrDie() *rest.Config {
+-	config, err := GetConfig()
+-	if err != nil {
+-		log.Error(err, "unable to get kubeconfig")
+-		os.Exit(1)
+-	}
+-	return config
+-}
+diff --git a/vendor/sigs.k8s.io/controller-runtime/pkg/client/config/doc.go b/vendor/sigs.k8s.io/controller-runtime/pkg/client/config/doc.go
+deleted file mode 100644
+index 796c9cf590..0000000000
+--- a/vendor/sigs.k8s.io/controller-runtime/pkg/client/config/doc.go
++++ /dev/null
+@@ -1,18 +0,0 @@
+-/*
+-Copyright 2017 The Kubernetes Authors.
+-
+-Licensed under the Apache License, Version 2.0 (the "License");
+-you may not use this file except in compliance with the License.
+-You may obtain a copy of the License at
+-
+-    http://www.apache.org/licenses/LICENSE-2.0
+-
+-Unless required by applicable law or agreed to in writing, software
+-distributed under the License is distributed on an "AS IS" BASIS,
+-WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+-See the License for the specific language governing permissions and
+-limitations under the License.
+-*/
+-
+-// Package config contains libraries for initializing REST configs for talking to the Kubernetes API
+-package config
+diff --git a/vendor/sigs.k8s.io/controller-runtime/pkg/internal/log/log.go b/vendor/sigs.k8s.io/controller-runtime/pkg/internal/log/log.go
+deleted file mode 100644
+index d91a0ca50c..0000000000
+--- a/vendor/sigs.k8s.io/controller-runtime/pkg/internal/log/log.go
++++ /dev/null
+@@ -1,32 +0,0 @@
+-/*
+-Copyright 2018 The Kubernetes Authors.
+-
+-Licensed under the Apache License, Version 2.0 (the "License");
+-you may not use this file except in compliance with the License.
+-You may obtain a copy of the License at
+-
+-    http://www.apache.org/licenses/LICENSE-2.0
+-
+-Unless required by applicable law or agreed to in writing, software
+-distributed under the License is distributed on an "AS IS" BASIS,
+-WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+-See the License for the specific language governing permissions and
+-limitations under the License.
+-*/
+-
+-package log
+-
+-import (
+-	"github.com/go-logr/logr"
+-
+-	"sigs.k8s.io/controller-runtime/pkg/log"
+-)
+-
+-var (
+-	// RuntimeLog is a base parent logger for use inside controller-runtime.
+-	RuntimeLog logr.Logger
+-)
+-
+-func init() {
+-	RuntimeLog = log.Log.WithName("controller-runtime")
+-}

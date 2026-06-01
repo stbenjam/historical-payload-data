@@ -1,0 +1,111 @@
+diff --git a/pkg/operator/controller/gatewayapi/controller_test.go b/pkg/operator/controller/gatewayapi/controller_test.go
+index ffd4b0a15..a1faca444 100644
+--- a/pkg/operator/controller/gatewayapi/controller_test.go
++++ b/pkg/operator/controller/gatewayapi/controller_test.go
+@@ -228,7 +228,7 @@ func Test_Reconcile(t *testing.T) {
+ 					StatusWriter: fakeClient.Status(),
+ 				},
+ 			}
+-			ctrl := &testutil.FakeController{t, false, nil}
++			ctrl := &testutil.FakeController{T: t, Started: false, StartNotificationChan: nil}
+ 			informer := informertest.FakeInformers{Scheme: scheme}
+ 			cache := &testutil.FakeCache{Informers: &informer, Reader: fakeClient}
+ 			reconciler := &reconciler{
+@@ -304,7 +304,7 @@ func TestReconcileOnlyStartsControllerOnce(t *testing.T) {
+ 		Updated: []client.Object{},
+ 		Deleted: []client.Object{},
+ 	}
+-	ctrl := &testutil.FakeController{t, false, make(chan struct{})}
++	ctrl := &testutil.FakeController{T: t, Started: false, StartNotificationChan: make(chan struct{})}
+ 	informer := informertest.FakeInformers{Scheme: scheme}
+ 	cache := &testutil.FakeCache{Informers: &informer, Reader: fakeClient}
+ 	reconciler := &reconciler{
+diff --git a/pkg/operator/controller/ingress/controller.go b/pkg/operator/controller/ingress/controller.go
+index 177abec10..e422dea48 100644
+--- a/pkg/operator/controller/ingress/controller.go
++++ b/pkg/operator/controller/ingress/controller.go
+@@ -1443,5 +1443,4 @@ func computeUpdatedInfraFromService(service *corev1.Service, infraConfig *config
+ 	default:
+ 		return false, nil
+ 	}
+-	return false, nil
+ }
+diff --git a/pkg/operator/controller/ingress/poddisruptionbudget.go b/pkg/operator/controller/ingress/poddisruptionbudget.go
+index b28b4cec8..21a68103e 100644
+--- a/pkg/operator/controller/ingress/poddisruptionbudget.go
++++ b/pkg/operator/controller/ingress/poddisruptionbudget.go
+@@ -15,6 +15,7 @@ import (
+ 	"k8s.io/apimachinery/pkg/api/errors"
+ 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+ 	"k8s.io/apimachinery/pkg/util/intstr"
++	"k8s.io/utils/ptr"
+ )
+ 
+ // ensureRouterPodDisruptionBudget ensures the pod disruption budget exists for
+@@ -68,14 +69,23 @@ func desiredRouterPodDisruptionBudget(ic *operatorv1.IngressController, deployme
+ 		return false, nil, nil
+ 	}
+ 
+-	maxUnavailable := "50%"
++	// OCPBUGS-25739 - For 2-replica ingress controllers, use an integer MaxUnavailable
++	// of 1 instead of "50%" to provide a deterministic value regardless of topology,
++	// avoiding any dependency on percent-based rounding in the disruption controller.
++	//
+ 	// OCPBUGS-7546 - make sure number of available pods is always 2 when there are only 3 replicas.
+-	if ic.Spec.Replicas != nil && int(*ic.Spec.Replicas) >= 3 {
+-		maxUnavailable = "25%"
++	var maxUnavailable intstr.IntOrString
++	replicas := ptr.Deref(ic.Spec.Replicas, 0)
++	switch {
++	case replicas == 2:
++		maxUnavailable = intstr.FromInt(1)
++	case replicas >= 3:
++		maxUnavailable = intstr.FromString("25%")
++	default:
++		maxUnavailable = intstr.FromString("50%")
+ 	}
+ 
+ 	name := controller.RouterPodDisruptionBudgetName(ic)
+-	pointerTo := func(ios intstr.IntOrString) *intstr.IntOrString { return &ios }
+ 	pdb := policyv1.PodDisruptionBudget{
+ 		ObjectMeta: metav1.ObjectMeta{
+ 			Name:      name.Name,
+@@ -84,7 +94,7 @@ func desiredRouterPodDisruptionBudget(ic *operatorv1.IngressController, deployme
+ 		Spec: policyv1.PodDisruptionBudgetSpec{
+ 			// The disruption controller rounds MaxUnavailable up.
+ 			// https://github.com/kubernetes/kubernetes/blob/65dc445aa2d581b4fa829258e46e4faf44e999b6/pkg/controller/disruption/disruption.go#L539
+-			MaxUnavailable: pointerTo(intstr.FromString(maxUnavailable)),
++			MaxUnavailable: &maxUnavailable,
+ 			Selector:       controller.IngressControllerDeploymentPodSelector(ic),
+ 		},
+ 	}
+diff --git a/pkg/operator/controller/ingress/poddisruptionbudget_test.go b/pkg/operator/controller/ingress/poddisruptionbudget_test.go
+index e47e41952..1336c07f6 100644
+--- a/pkg/operator/controller/ingress/poddisruptionbudget_test.go
++++ b/pkg/operator/controller/ingress/poddisruptionbudget_test.go
+@@ -30,10 +30,10 @@ func Test_desiredRouterPodDisruptionBudget(t *testing.T) {
+ 			expectMaxUnavailable: intstr.FromString("50%"),
+ 		},
+ 		{
+-			description:          "if replicas is 2, PDB should be 50%",
++			description:          "if replicas is 2, PDB should be 1",
+ 			replicas:             pointerTo(2),
+ 			expectPDB:            true,
+-			expectMaxUnavailable: intstr.FromString("50%"),
++			expectMaxUnavailable: intstr.FromInt(1),
+ 		},
+ 		{
+ 			description:          "if replicas is 3, PDB should be 25%",
+@@ -47,12 +47,6 @@ func Test_desiredRouterPodDisruptionBudget(t *testing.T) {
+ 			expectPDB:            true,
+ 			expectMaxUnavailable: intstr.FromString("25%"),
+ 		},
+-		{
+-			description:          "if replicas is 5, PDB should be 25%",
+-			replicas:             pointerTo(5),
+-			expectPDB:            true,
+-			expectMaxUnavailable: intstr.FromString("25%"),
+-		},
+ 	}
+ 	for _, tc := range testCases {
+ 		t.Run(tc.description, func(t *testing.T) {

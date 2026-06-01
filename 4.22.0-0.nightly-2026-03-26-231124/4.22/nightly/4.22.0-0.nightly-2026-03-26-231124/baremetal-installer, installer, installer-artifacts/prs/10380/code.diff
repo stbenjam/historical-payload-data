@@ -1,0 +1,534 @@
+diff --git a/pkg/asset/installconfig/aws/instancetypes.go b/pkg/asset/installconfig/aws/instancetypes.go
+index 7a2a6b11ec6..ded14210634 100644
+--- a/pkg/asset/installconfig/aws/instancetypes.go
++++ b/pkg/asset/installconfig/aws/instancetypes.go
+@@ -19,6 +19,7 @@ type InstanceType struct {
+ 	DefaultVCpus int64
+ 	MemInMiB     int64
+ 	Arches       []string
++	Hypervisor   string
+ 	Networking   Networking
+ 	Features     []string
+ }
+@@ -38,6 +39,7 @@ func instanceTypes(ctx context.Context, client *ec2.Client) (map[string]Instance
+ 			typeInfo := InstanceType{
+ 				DefaultVCpus: int64(aws.ToInt32(sdkTypeInfo.VCpuInfo.DefaultVCpus)),
+ 				MemInMiB:     aws.ToInt64(sdkTypeInfo.MemoryInfo.SizeInMiB),
++				Hypervisor:   string(sdkTypeInfo.Hypervisor),
+ 			}
+ 
+ 			for _, arch := range sdkTypeInfo.ProcessorInfo.SupportedArchitectures {
+diff --git a/pkg/asset/installconfig/aws/subnet.go b/pkg/asset/installconfig/aws/subnet.go
+index bc08321dd9e..a3c4c53213e 100644
+--- a/pkg/asset/installconfig/aws/subnet.go
++++ b/pkg/asset/installconfig/aws/subnet.go
+@@ -41,6 +41,9 @@ type Subnet struct {
+ 	// CIDR is the subnet's CIDR block.
+ 	CIDR string
+ 
++	// IPv6CIDR is the subnet's associated IPv6 CIDR block.
++	IPv6CIDR string
++
+ 	// Public is the flag to define the subnet public.
+ 	Public bool
+ 
+@@ -118,15 +121,26 @@ func subnets(ctx context.Context, client *ec2.Client, subnetIDs []string, vpcID
+ 				return fmt.Errorf("all subnets must belong to the same VPC: %s is from %s, but %s is from %s", *subnet.SubnetId, *subnet.VpcId, vpcFromSubnet, subnetGroups.VpcID)
+ 			}
+ 
++			// We currently can only handle subnets with one associated IPv6 CIDR
++			// Reference: https://github.com/kubernetes-sigs/cluster-api-provider-aws/blob/f7f5cb236fa50b0a7c234d776ebaf27a94476930/pkg/cloud/services/network/subnets.go#L713-L717
++			var ipv6CIDR string
++			for _, snAssoc := range subnet.Ipv6CidrBlockAssociationSet {
++				if snAssoc.Ipv6CidrBlock != nil &&
++					snAssoc.Ipv6CidrBlockState != nil && snAssoc.Ipv6CidrBlockState.State == ec2types.SubnetCidrBlockStateCodeAssociated {
++					ipv6CIDR = aws.ToString(snAssoc.Ipv6CidrBlock)
++				}
++			}
++
+ 			// At this point, we should be safe to dereference these fields.
+ 			metas[*subnet.SubnetId] = Subnet{
+-				ID:     *subnet.SubnetId,
+-				ARN:    *subnet.SubnetArn,
+-				Zone:   &Zone{Name: *subnet.AvailabilityZone},
+-				CIDR:   ptr.Deref(subnet.CidrBlock, ""),
+-				Public: false,
+-				Tags:   FromAWSTags(subnet.Tags),
+-				VPCID:  *subnet.VpcId,
++				ID:       *subnet.SubnetId,
++				ARN:      *subnet.SubnetArn,
++				Zone:     &Zone{Name: *subnet.AvailabilityZone},
++				CIDR:     aws.ToString(subnet.CidrBlock),
++				IPv6CIDR: ipv6CIDR,
++				Public:   false,
++				Tags:     FromAWSTags(subnet.Tags),
++				VPCID:    *subnet.VpcId,
+ 			}
+ 			zoneNames = append(zoneNames, *subnet.AvailabilityZone)
+ 		}
+diff --git a/pkg/asset/installconfig/aws/validation.go b/pkg/asset/installconfig/aws/validation.go
+index add85789139..0d90c7662f1 100644
+--- a/pkg/asset/installconfig/aws/validation.go
++++ b/pkg/asset/installconfig/aws/validation.go
+@@ -42,6 +42,12 @@ var computeReq = resourceRequirements{
+ 	minimumMemory: 8192,
+ }
+ 
++const (
++	subnetTypePrivate = "private"
++	subnetTypePublic  = "public"
++	subnetTypeEdge    = "edge"
++)
++
+ // Validate executes platform-specific validation.
+ func Validate(ctx context.Context, meta *Metadata, config *types.InstallConfig) error {
+ 	allErrs := field.ErrorList{}
+@@ -306,7 +312,6 @@ func (sdg *subnetDataGroups) From(ctx context.Context, meta *Metadata, providedS
+ // validateSubnets ensures BYO subnets are valid.
+ func validateSubnets(ctx context.Context, meta *Metadata, fldPath *field.Path, config *types.InstallConfig) field.ErrorList {
+ 	allErrs := field.ErrorList{}
+-	networking := config.Networking
+ 	providedSubnets := config.AWS.VPC.Subnets
+ 	publish := config.Publish
+ 
+@@ -337,16 +342,16 @@ func validateSubnets(ctx context.Context, meta *Metadata, fldPath *field.Path, c
+ 	}
+ 
+ 	allErrs = append(allErrs, validateSharedSubnets(ctx, meta, fldPath)...)
+-	allErrs = append(allErrs, validateSubnetCIDR(fldPath, subnetDataGroups.Private, networking.MachineNetwork)...)
+-	allErrs = append(allErrs, validateSubnetCIDR(fldPath, subnetDataGroups.Public, networking.MachineNetwork)...)
++	allErrs = append(allErrs, validateSubnetCIDRs(fldPath, subnetDataGroups.Private, config)...)
++	allErrs = append(allErrs, validateSubnetCIDRs(fldPath, subnetDataGroups.Public, config)...)
+ 
+ 	if len(subnetsWithRole) > 0 {
+ 		allErrs = append(allErrs, validateSubnetRoles(fldPath, subnetsWithRole, subnetDataGroups, config)...)
+ 	} else {
+ 		allErrs = append(allErrs, validateUntaggedSubnets(ctx, fldPath, meta, subnetDataGroups)...)
+-		allErrs = append(allErrs, validateDuplicateSubnetZones(fldPath, subnetDataGroups.Private, "private")...)
+-		allErrs = append(allErrs, validateDuplicateSubnetZones(fldPath, subnetDataGroups.Public, "public")...)
+-		allErrs = append(allErrs, validateDuplicateSubnetZones(fldPath, subnetDataGroups.Edge, "edge")...)
++		allErrs = append(allErrs, validateDuplicateSubnetZones(fldPath, subnetDataGroups.Private, subnetTypePrivate)...)
++		allErrs = append(allErrs, validateDuplicateSubnetZones(fldPath, subnetDataGroups.Public, subnetTypePublic)...)
++		allErrs = append(allErrs, validateDuplicateSubnetZones(fldPath, subnetDataGroups.Edge, subnetTypeEdge)...)
+ 	}
+ 
+ 	privateZones := sets.New[string]()
+@@ -373,17 +378,32 @@ func validateMachinePool(ctx context.Context, meta *Metadata, fldPath *field.Pat
+ 	// Edge Compute Pool / AWS Local Zones:
+ 	// - is valid when installing in existing VPC; or
+ 	// - is valid in new VPC when Local Zone name is defined
++	// - in dualstack networking: is valid when using local zones and installing in existing VPC
+ 	if poolName == types.MachinePoolEdgeRoleName {
+ 		if len(platform.VPC.Subnets) > 0 {
++			subnetFp := field.NewPath("platform", "aws", "vpc", "subnets")
++
+ 			edgeSubnets, err := meta.EdgeSubnets(ctx)
+ 			if err != nil {
+ 				errMsg := fmt.Sprintf("%s pool. %v", poolName, err.Error())
+-				return append(allErrs, field.Invalid(field.NewPath("platform", "aws", "vpc", "subnets"), platform.VPC.Subnets, errMsg))
++				return append(allErrs, field.Invalid(subnetFp, platform.VPC.Subnets, errMsg))
+ 			}
+ 			if len(edgeSubnets) == 0 {
+ 				return append(allErrs, field.Required(fldPath, "the provided subnets must include valid subnets for the specified edge zones"))
+ 			}
++
++			if platform.IPFamily.DualStackEnabled() {
++				for _, sn := range edgeSubnets {
++					if sn.Zone.Type == awstypes.WavelengthZoneType {
++						allErrs = append(allErrs, field.Invalid(subnetFp, platform.VPC.Subnets, fmt.Sprintf("ipFamily %s is not supported for subnets in wavelength zones", platform.IPFamily)))
++					}
++				}
++			}
+ 		} else {
++			if platform.IPFamily.DualStackEnabled() {
++				return append(allErrs, field.Forbidden(fldPath, fmt.Sprintf("ipFamily %s is only supported with user-provided subnets for edge machine pools", string(platform.IPFamily))))
++			}
++
+ 			if pool.Zones == nil || len(pool.Zones) == 0 {
+ 				return append(allErrs, field.Required(fldPath, "zone is required when using edge machine pools"))
+ 			}
+@@ -456,12 +476,18 @@ func validateMachinePool(ctx context.Context, meta *Metadata, fldPath *field.Pat
+ 				allErrs = append(allErrs, field.Invalid(fldPath.Child("type"), pool.InstanceType, errMsg))
+ 			}
+ 
+-			// dual-stack: the instance type must support IPv6 networking
+ 			if platform.IPFamily.DualStackEnabled() {
++				// The instance type must support IPv6 networking
+ 				if !typeMeta.Networking.IPv6Supported {
+ 					errMsg := fmt.Sprintf("instance type %s does not support IPv6 networking", pool.InstanceType)
+ 					allErrs = append(allErrs, field.Invalid(fldPath.Child("type"), pool.InstanceType, errMsg))
+ 				}
++
++				// The instance type must be Nitro-based to enable IPv6 IMDS endpoint
++				if typeMeta.Hypervisor != string(ec2types.InstanceTypeHypervisorNitro) {
++					errMsg := fmt.Sprintf("instance type %s is not Nitro-based", pool.InstanceType)
++					allErrs = append(allErrs, field.Invalid(fldPath.Child("type"), pool.InstanceType, errMsg))
++				}
+ 			}
+ 		} else {
+ 			errMsg := fmt.Sprintf("instance type %s not found", pool.InstanceType)
+@@ -633,27 +659,47 @@ func validateSecurityGroupIDs(ctx context.Context, meta *Metadata, fldPath *fiel
+ 	return allErrs
+ }
+ 
+-func validateSubnetCIDR(fldPath *field.Path, subnetDataGroup map[string]subnetData, networks []types.MachineNetworkEntry) field.ErrorList {
++func validateSubnetCIDRs(fldPath *field.Path, subnetDataGroup map[string]subnetData, ic *types.InstallConfig) field.ErrorList {
+ 	allErrs := field.ErrorList{}
++
+ 	for id, subnetData := range subnetDataGroup {
+ 		fp := fldPath.Index(subnetData.Idx)
+-		cidr, _, err := net.ParseCIDR(subnetData.CIDR)
+-		if err != nil {
+-			allErrs = append(allErrs, field.Invalid(fp, id, err.Error()))
+-			continue
++
++		// Validate subnetIPv4 CIDR
++		if len(subnetData.CIDR) == 0 {
++			allErrs = append(allErrs, field.Required(fp, "subnet does not have an associated IPv4 CIDR block"))
++		} else {
++			allErrs = append(allErrs, validateMachineNetworksContainSubnetCIDR(fp, ic.MachineNetwork, id, subnetData.CIDR)...)
++		}
++
++		// If dualstack is enabled, the subnet must also have an IPv6 CIDR
++		if ic.AWS.IPFamily.DualStackEnabled() {
++			if len(subnetData.IPv6CIDR) == 0 {
++				allErrs = append(allErrs, field.Required(fp, "subnet does not have an associated IPv6 CIDR block"))
++			} else {
++				allErrs = append(allErrs, validateMachineNetworksContainSubnetCIDR(fp, ic.MachineNetwork, id, subnetData.IPv6CIDR)...)
++			}
+ 		}
+-		allErrs = append(allErrs, validateMachineNetworksContainIP(fp, networks, id, cidr)...)
+ 	}
++
+ 	return allErrs
+ }
+ 
+-func validateMachineNetworksContainIP(fldPath *field.Path, networks []types.MachineNetworkEntry, subnetName string, ip net.IP) field.ErrorList {
++func validateMachineNetworksContainSubnetCIDR(fldPath *field.Path, networks []types.MachineNetworkEntry, subnetName string, cidr string) field.ErrorList {
++	allErrs := field.ErrorList{}
++
++	cidrIP, _, err := net.ParseCIDR(cidr)
++	if err != nil {
++		return append(allErrs, field.Invalid(fldPath, subnetName, err.Error()))
++	}
++
+ 	for _, network := range networks {
+-		if network.CIDR.Contains(ip) {
++		if network.CIDR.Contains(cidrIP) {
+ 			return nil
+ 		}
+ 	}
+-	return field.ErrorList{field.Invalid(fldPath, subnetName, fmt.Sprintf("subnet's CIDR range start %s is outside of the specified machine networks", ip))}
++
++	return append(allErrs, field.Invalid(fldPath, subnetName, fmt.Sprintf("subnet's CIDR range start %s is outside of the specified machine networks", cidrIP)))
+ }
+ 
+ func validateDuplicateSubnetZones(fldPath *field.Path, subnetDataGroup map[string]subnetData, typ string) field.ErrorList {
+@@ -765,9 +811,9 @@ func validateSubnetRoles(fldPath *field.Path, subnetsWithRole map[awstypes.Subne
+ 		}
+ 
+ 		if ingressSubnet.Public != config.PublicIngress() {
+-			subnetType := "private"
++			subnetType := subnetTypePrivate
+ 			if ingressSubnet.Public {
+-				subnetType = "public"
++				subnetType = subnetTypePublic
+ 			}
+ 			allErrs = append(allErrs, field.Invalid(fldPath.Index(ingressSubnet.Idx), ingressSubnet.ID,
+ 				fmt.Sprintf("subnet %s has role %s and is %s, which is not allowed when publish is set to %s", ingressSubnet.ID, awstypes.IngressControllerLBSubnetRole, subnetType, config.Publish)))
+diff --git a/pkg/asset/installconfig/aws/validation_test.go b/pkg/asset/installconfig/aws/validation_test.go
+index f870e41a1ff..3b59e5f0778 100644
+--- a/pkg/asset/installconfig/aws/validation_test.go
++++ b/pkg/asset/installconfig/aws/validation_test.go
+@@ -5,6 +5,7 @@ import (
+ 	"fmt"
+ 	"net/http"
+ 	"os"
++	"slices"
+ 	"sort"
+ 	"strings"
+ 	"testing"
+@@ -390,6 +391,72 @@ func TestValidate(t *testing.T) {
+ 			instanceTypes: validInstanceTypes(),
+ 			expectErr:     `controlPlane\.platform\.aws\.type: Invalid value: "m1\.xlarge": instance type m1\.xlarge does not support IPv6 networking.*compute\[0\]\.platform\.aws\.type: Invalid value: "m1\.xlarge": instance type m1\.xlarge does not support IPv6 networking`,
+ 		},
++		{
++			name:          "invalid dual-stack control plane instance type is not Nitro-based",
++			installConfig: icBuild.build(icBuild.withInstanceType("m5.xlarge", "t2.small", "m5.large"), icBuild.withIPFamily(network.DualStackIPv4Primary)),
++			availRegions:  validAvailRegions(),
++			availZones:    validAvailZones(),
++			instanceTypes: validInstanceTypes(),
++			expectErr:     `controlPlane\.platform\.aws\.type: Invalid value: "t2\.small": instance type t2\.small is not Nitro-based`,
++		},
++		{
++			name:          "invalid dual-stack compute instance type is not Nitro-based",
++			installConfig: icBuild.build(icBuild.withInstanceType("m5.xlarge", "m5.xlarge", "t2.small"), icBuild.withIPFamily(network.DualStackIPv4Primary)),
++			availRegions:  validAvailRegions(),
++			availZones:    validAvailZones(),
++			instanceTypes: validInstanceTypes(),
++			expectErr:     `compute\[0\]\.platform\.aws\.type: Invalid value: "t2\.small": instance type t2\.small is not Nitro-based`,
++		},
++		{
++			name:          "invalid dual-stack default machine platform instance type is not Nitro-based",
++			installConfig: icBuild.build(icBuild.withInstanceType("t2.small", "", ""), icBuild.withIPFamily(network.DualStackIPv6Primary)),
++			availRegions:  validAvailRegions(),
++			availZones:    validAvailZones(),
++			instanceTypes: validInstanceTypes(),
++			expectErr:     `controlPlane\.platform\.aws\.type: Invalid value: "t2\.small": instance type t2\.small is not Nitro-based.*compute\[0\]\.platform\.aws\.type: Invalid value: "t2\.small": instance type t2\.small is not Nitro-based`,
++		},
++		{
++			name: "valid dual-stack byo subnets with IPv6 CIDRs",
++			installConfig: icBuild.build(
++				icBuild.withBaseBYO(),
++				icBuild.withIPFamily(network.DualStackIPv4Primary),
++				icBuild.withDualStackMachineNetworks(network.DualStackIPv4Primary),
++			),
++			availRegions:  validAvailRegions(),
++			availZones:    validAvailZones(),
++			instanceTypes: validInstanceTypes(),
++			subnets: SubnetGroups{
++				Private: validDualstackSubnets("private"),
++				Public:  validDualstackSubnets("public"),
++				VpcID:   validVPCID,
++			},
++		},
++		{
++			name: "invalid dual-stack byo subnets, some subnets missing IPv6 CIDR",
++			installConfig: icBuild.build(
++				icBuild.withBaseBYO(),
++				icBuild.withVPCSubnetIDs([]string{"invalid-private-cidr-subnet", "invalid-public-cidr-subnet"}, false),
++				icBuild.withIPFamily(network.DualStackIPv4Primary),
++				icBuild.withDualStackMachineNetworks(network.DualStackIPv4Primary),
++			),
++			availRegions:  validAvailRegions(),
++			availZones:    append(validAvailZones(), "zone-for-invalid-cidr-subnet"),
++			instanceTypes: validInstanceTypes(),
++			subnets: SubnetGroups{
++				Private: mergeSubnets(validDualstackSubnets("private"), Subnets{"invalid-private-cidr-subnet": Subnet{
++					ID:   "invalid-private-cidr-subnet",
++					Zone: &Zone{Name: "zone-for-invalid-cidr-subnet"},
++					CIDR: "10.0.7.0/24",
++				}}),
++				Public: mergeSubnets(validDualstackSubnets("public"), Subnets{"invalid-public-cidr-subnet": Subnet{
++					ID:   "invalid-public-cidr-subnet",
++					Zone: &Zone{Name: "zone-for-invalid-cidr-subnet"},
++					CIDR: "10.0.8.0/24",
++				}}),
++				VpcID: validVPCID,
++			},
++			expectErr: `^\Q[platform.aws.vpc.subnets[6]: Required value: subnet does not have an associated IPv6 CIDR block, platform.aws.vpc.subnets[7]: Required value: subnet does not have an associated IPv6 CIDR block]\E$`,
++		},
+ 		{
+ 			name: "invalid edge pool, missing zones",
+ 			installConfig: icBuild.build(
+@@ -431,6 +498,63 @@ func TestValidate(t *testing.T) {
+ 			availRegions: validAvailRegions(),
+ 			expectErr:    `^\[compute\[0\]\.platform\.aws: Required value: edge compute pools are only supported on the AWS platform, compute\[0\].platform.aws: Required value: zone is required when using edge machine pools\]$`,
+ 		},
++		{
++			name: "valid edge pool with dual-stack and local zone byo subnets",
++			installConfig: icBuild.build(
++				icBuild.withBaseBYO(),
++				icBuild.withIPFamily(network.DualStackIPv4Primary),
++				icBuild.withDualStackMachineNetworks(network.DualStackIPv4Primary),
++				icBuild.withVPCEdgeSubnetIDs(validDualstackSubnets("edge-local").IDs(), false),
++			),
++			availRegions:  validAvailRegions(),
++			availZones:    validAvailZones(),
++			instanceTypes: validInstanceTypes(),
++			subnets: SubnetGroups{
++				Private: validDualstackSubnets("private"),
++				Public:  validDualstackSubnets("public"),
++				Edge:    validDualstackSubnets("edge-local"),
++				VpcID:   validVPCID,
++			},
++		},
++		{
++			name: "invalid edge pool with dual-stack and wavelength zone byo subnets",
++			installConfig: icBuild.build(
++				icBuild.withBaseBYO(),
++				icBuild.withIPFamily(network.DualStackIPv4Primary),
++				icBuild.withDualStackMachineNetworks(network.DualStackIPv4Primary),
++				icBuild.withVPCEdgeSubnetIDs(validDualstackSubnets("edge-wavelength").IDs(), false),
++			),
++			availRegions:  validAvailRegions(),
++			availZones:    validAvailZones(),
++			instanceTypes: validInstanceTypes(),
++			subnets: SubnetGroups{
++				Private: validDualstackSubnets("private"),
++				Public:  validDualstackSubnets("public"),
++				Edge:    validDualstackSubnets("edge-wavelength"),
++				VpcID:   validVPCID,
++			},
++			expectErr: `^\Qplatform.aws.vpc.subnets: Invalid value: [{"id":"subnet-valid-private-a"},{"id":"subnet-valid-private-b"},{"id":"subnet-valid-private-c"},{"id":"subnet-valid-public-a"},{"id":"subnet-valid-public-b"},{"id":"subnet-valid-public-c"},{"id":"subnet-valid-edge-wavelength-a"}]: ipFamily DualStackIPv4Primary is not supported for subnets in wavelength zones\E`,
++		},
++		{
++			name: "invalid edge pool with dual-stack without byo subnets",
++			installConfig: icBuild.build(
++				icBuild.withIPFamily(network.DualStackIPv6Primary),
++				icBuild.withComputeMachinePool([]types.MachinePool{{
++					Name:     types.MachinePoolEdgeRoleName,
++					Replicas: ptr.To[int64](1),
++					Platform: types.MachinePoolPlatform{
++						AWS: &aws.MachinePool{
++							InstanceType: "m5.xlarge",
++							Zones:        []string{"nyc-1a"},
++						},
++					},
++				}}, true),
++			),
++			availRegions:  validAvailRegions(),
++			availZones:    validAvailZones(),
++			instanceTypes: validInstanceTypes(),
++			expectErr:     `^\Qcompute[0].platform.aws: Forbidden: ipFamily DualStackIPv6Primary is only supported with user-provided subnets for edge machine pools\E`,
++		},
+ 		{
+ 			name: "valid service endpoints, custom region and no endpoints provided",
+ 			installConfig: icBuild.build(
+@@ -2019,6 +2143,81 @@ func validSubnets(subnetType string) Subnets {
+ 	return nil
+ }
+ 
++// validDualstackSubnets returns subnets with both IPv4 and IPv6 CIDRs for dual-stack testing.
++func validDualstackSubnets(subnetType string) Subnets {
++	switch subnetType {
++	case "public":
++		return Subnets{
++			"subnet-valid-public-a": {
++				ID:       "subnet-valid-public-a",
++				Zone:     &Zone{Name: "a"},
++				CIDR:     "10.0.4.0/24",
++				IPv6CIDR: "2600:1f13:fe4:3::/64",
++				Public:   true,
++			},
++			"subnet-valid-public-b": {
++				ID:       "subnet-valid-public-b",
++				Zone:     &Zone{Name: "b"},
++				CIDR:     "10.0.5.0/24",
++				IPv6CIDR: "2600:1f13:fe4:4::/64",
++				Public:   true,
++			},
++			"subnet-valid-public-c": {
++				ID:       "subnet-valid-public-c",
++				Zone:     &Zone{Name: "c"},
++				CIDR:     "10.0.6.0/24",
++				IPv6CIDR: "2600:1f13:fe4:5::/64",
++				Public:   true,
++			},
++		}
++	case "private":
++		return Subnets{
++			"subnet-valid-private-a": {
++				ID:       "subnet-valid-private-a",
++				Zone:     &Zone{Name: "a"},
++				CIDR:     "10.0.1.0/24",
++				IPv6CIDR: "2600:1f13:fe4:0::/64",
++				Public:   false,
++			},
++			"subnet-valid-private-b": {
++				ID:       "subnet-valid-private-b",
++				Zone:     &Zone{Name: "b"},
++				CIDR:     "10.0.2.0/24",
++				IPv6CIDR: "2600:1f13:fe4:1::/64",
++				Public:   false,
++			},
++			"subnet-valid-private-c": {
++				ID:       "subnet-valid-private-c",
++				Zone:     &Zone{Name: "c"},
++				CIDR:     "10.0.3.0/24",
++				IPv6CIDR: "2600:1f13:fe4:2::/64",
++				Public:   false,
++			},
++		}
++	case "edge-local":
++		return Subnets{
++			"subnet-valid-edge-local-a": {
++				ID:       "subnet-valid-edge-local-a",
++				Zone:     &Zone{Name: "nyc-1a", Type: aws.LocalZoneType},
++				CIDR:     "10.0.128.0/24",
++				IPv6CIDR: "2600:1f13:fe4:10::/64",
++				Public:   true,
++			},
++		}
++	case "edge-wavelength":
++		return Subnets{
++			"subnet-valid-edge-wavelength-a": {
++				ID:       "subnet-valid-edge-wavelength-a",
++				Zone:     &Zone{Name: "wlz-1", Type: aws.WavelengthZoneType},
++				CIDR:     "10.0.129.0/24",
++				IPv6CIDR: "",
++				Public:   true,
++			},
++		}
++	}
++	return nil
++}
++
+ // byoSubnetsWithRoles returns a valid collection of subnets
+ // with assigned roles.
+ func byoSubnetsWithRoles() []aws.Subnet {
+@@ -2202,6 +2401,7 @@ func validInstanceTypes() map[string]InstanceType {
+ 			DefaultVCpus: 1,
+ 			MemInMiB:     2048,
+ 			Arches:       []string{string(ec2types.ArchitectureTypeX8664)},
++			Hypervisor:   string(ec2types.InstanceTypeHypervisorXen),
+ 			Networking: Networking{
+ 				IPv6Supported: true,
+ 			},
+@@ -2210,6 +2410,7 @@ func validInstanceTypes() map[string]InstanceType {
+ 			DefaultVCpus: 2,
+ 			MemInMiB:     8192,
+ 			Arches:       []string{string(ec2types.ArchitectureTypeX8664)},
++			Hypervisor:   string(ec2types.InstanceTypeHypervisorNitro),
+ 			Networking: Networking{
+ 				IPv6Supported: true,
+ 			},
+@@ -2218,6 +2419,7 @@ func validInstanceTypes() map[string]InstanceType {
+ 			DefaultVCpus: 4,
+ 			MemInMiB:     16384,
+ 			Arches:       []string{string(ec2types.ArchitectureTypeX8664)},
++			Hypervisor:   string(ec2types.InstanceTypeHypervisorNitro),
+ 			Networking: Networking{
+ 				IPv6Supported: true,
+ 			},
+@@ -2226,6 +2428,7 @@ func validInstanceTypes() map[string]InstanceType {
+ 			DefaultVCpus: 4,
+ 			MemInMiB:     16384,
+ 			Arches:       []string{string(ec2types.ArchitectureTypeArm64)},
++			Hypervisor:   string(ec2types.InstanceTypeHypervisorNitro),
+ 			Networking: Networking{
+ 				IPv6Supported: true,
+ 			},
+@@ -2234,6 +2437,7 @@ func validInstanceTypes() map[string]InstanceType {
+ 			DefaultVCpus: 4,
+ 			MemInMiB:     15360,
+ 			Arches:       []string{string(ec2types.ArchitectureTypeX8664)},
++			Hypervisor:   string(ec2types.InstanceTypeHypervisorXen),
+ 			Networking: Networking{
+ 				IPv6Supported: false,
+ 			},
+@@ -2242,6 +2446,7 @@ func validInstanceTypes() map[string]InstanceType {
+ 			DefaultVCpus: 4,
+ 			MemInMiB:     16384,
+ 			Arches:       []string{string(ec2types.ArchitectureTypeX8664)},
++			Hypervisor:   string(ec2types.InstanceTypeHypervisorNitro),
+ 			Features:     []string{"amd-sev-snp"},
+ 		},
+ 	}
+@@ -2551,3 +2756,16 @@ func (icBuild icBuildForAWS) withComputeCPUOptions(cpuOptions *aws.CPUOptions, i
+ 		ic.Compute[index].Platform.AWS.CPUOptions = cpuOptions
+ 	}
+ }
++
++func (icBuild icBuildForAWS) withDualStackMachineNetworks(ipFamily network.IPFamily) icOption {
++	return func(ic *types.InstallConfig) {
++		ic.Networking.MachineNetwork = []types.MachineNetworkEntry{
++			{CIDR: *ipnet.MustParseCIDR(validCIDR)},            // IPv4: 10.0.0.0/16
++			{CIDR: *ipnet.MustParseCIDR("2600:1f13:fe4::/56")}, // IPv6
++		}
++
++		if ipFamily == network.DualStackIPv6Primary {
++			slices.Reverse(ic.Networking.MachineNetwork)
++		}
++	}
++}

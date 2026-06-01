@@ -1,0 +1,69 @@
+diff --git a/pkg/controllers/machinesetsync/machineset_sync_controller.go b/pkg/controllers/machinesetsync/machineset_sync_controller.go
+index 97bc6185e..203cf4ce6 100644
+--- a/pkg/controllers/machinesetsync/machineset_sync_controller.go
++++ b/pkg/controllers/machinesetsync/machineset_sync_controller.go
+@@ -1332,6 +1332,8 @@ func compareCAPIInfraMachineTemplates(platform configv1.PlatformType, infraMachi
+ 
+ 	switch platform {
+ 	case configv1.AWSPlatformType:
++		// TODO(OCPCLOUD-2710): httpProtocolIpv6 is not yet supported by MAPI, ignore it until the CAPA CRD includes the field.
++		diffOpts = append(diffOpts, util.WithIgnoreField("spec", "template", "spec", "instanceMetadataOptions", "httpProtocolIpv6"))
+ 	case configv1.OpenStackPlatformType:
+ 	case configv1.PowerVSPlatformType:
+ 	default:
+diff --git a/pkg/controllers/machinesync/machine_sync_mapi2capi_infrastructure.go b/pkg/controllers/machinesync/machine_sync_mapi2capi_infrastructure.go
+index bda95f00d..4219bc8b9 100644
+--- a/pkg/controllers/machinesync/machine_sync_mapi2capi_infrastructure.go
++++ b/pkg/controllers/machinesync/machine_sync_mapi2capi_infrastructure.go
+@@ -253,6 +253,8 @@ func compareCAPIInfraMachines(platform configv1.PlatformType, infraMachine1, inf
+ 	// Make per provider adjustments to the differ.
+ 	switch platform {
+ 	case configv1.AWSPlatformType:
++		// TODO(OCPCLOUD-2710): httpProtocolIpv6 is not yet supported by MAPI, ignore it until the CAPA CRD includes the field.
++		diffOpts = append(diffOpts, util.WithIgnoreField("spec", "instanceMetadataOptions", "httpProtocolIpv6"))
+ 	case configv1.OpenStackPlatformType:
+ 	case configv1.PowerVSPlatformType:
+ 	default:
+diff --git a/pkg/conversion/capi2mapi/aws.go b/pkg/conversion/capi2mapi/aws.go
+index 3114ed8d3..7f3d56d2a 100644
+--- a/pkg/conversion/capi2mapi/aws.go
++++ b/pkg/conversion/capi2mapi/aws.go
+@@ -540,6 +540,12 @@ func convertAWSMetadataOptionsToMAPI(fldPath *field.Path, capiMetadataOpts *awsv
+ 		errors = append(errors, field.Invalid(fldPath.Child("httpPutResponseHopLimit"), capiMetadataOpts.HTTPPutResponseHopLimit, "httpPutResponseHopLimit values other than 1 are not supported"))
+ 	}
+ 
++	if capiMetadataOpts.HTTPProtocolIPv6 != "" && capiMetadataOpts.HTTPProtocolIPv6 != awsv1.InstanceMetadataEndpointStateDisabled {
++		// This defaults to "disabled" in CAPI and on the AWS side, so if it's not "disabled", the user explicitly chose another option.
++		// TODO(OCPCLOUD-2710): We should implement this within MAPI to create feature parity.
++		errors = append(errors, field.Invalid(fldPath.Child("httpProtocolIpv6"), capiMetadataOpts.HTTPProtocolIPv6, fmt.Sprintf("httpProtocolIpv6 values other than %q are not supported", awsv1.InstanceMetadataEndpointStateDisabled)))
++	}
++
+ 	if capiMetadataOpts.InstanceMetadataTags != "" && capiMetadataOpts.InstanceMetadataTags != awsv1.InstanceMetadataEndpointStateDisabled {
+ 		// This defaults to "disabled" in CAPI and on the AWS side, so if it's not "disabled", the user explicitly chose another option.
+ 		// TODO(OCPCLOUD-2710): We should implement this within MAPI to create feature parity.
+diff --git a/pkg/conversion/capi2mapi/aws_fuzz_test.go b/pkg/conversion/capi2mapi/aws_fuzz_test.go
+index d14b3b9c3..973407c45 100644
+--- a/pkg/conversion/capi2mapi/aws_fuzz_test.go
++++ b/pkg/conversion/capi2mapi/aws_fuzz_test.go
+@@ -126,6 +126,7 @@ func awsMachineFuzzerFuncs(codecs runtimeserializer.CodecFactory) []interface{}
+ 
+ 			// TODO(OCPCLOUD-2710): Fields not yet supported by MAPI.
+ 			imdo.HTTPEndpoint = awsv1.InstanceMetadataEndpointStateEnabled
++			imdo.HTTPProtocolIPv6 = ""
+ 			imdo.HTTPPutResponseHopLimit = 0
+ 			imdo.InstanceMetadataTags = awsv1.InstanceMetadataEndpointStateDisabled
+ 		},
+diff --git a/pkg/conversion/mapi2capi/aws.go b/pkg/conversion/mapi2capi/aws.go
+index c9d54d979..aeae8aabd 100644
+--- a/pkg/conversion/mapi2capi/aws.go
++++ b/pkg/conversion/mapi2capi/aws.go
+@@ -624,8 +624,7 @@ func convertMetadataServiceOptionstoCAPI(fldPath *field.Path, metad mapiv1beta1.
+ 	}
+ 
+ 	capiMetadataOpts := &awsv1.InstanceMetadataOptions{
+-		HTTPEndpoint: awsv1.InstanceMetadataEndpointStateEnabled, // not present in MAPI, fallback to CAPI default.
+-		// HTTPPutResponseHopLimit: not present in MAPI, fallback to CAPI default.
++		HTTPEndpoint:            awsv1.InstanceMetadataEndpointStateEnabled,  // not present in MAPI, fallback to CAPI default.
+ 		InstanceMetadataTags:    awsv1.InstanceMetadataEndpointStateDisabled, // not present in MAPI, fallback to CAPI default.
+ 		HTTPTokens:              httpTokens,
+ 		HTTPPutResponseHopLimit: 1, // TODO(docs): CAPA defaults to 1 (in the openAPI spec validation) if the field is empty, lossy translation to document.

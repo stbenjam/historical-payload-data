@@ -1,0 +1,641 @@
+diff --git a/manifests/03-clusterrole.yaml b/manifests/03-clusterrole.yaml
+index d558ea81f8..86cef03e96 100644
+--- a/manifests/03-clusterrole.yaml
++++ b/manifests/03-clusterrole.yaml
+@@ -76,6 +76,7 @@ rules:
+       - clusteroperators
+       - clusteroperators/status
+       - insightsdatagathers
++      - apiservers
+     verbs:
+       - create
+       - get
+diff --git a/pkg/gatherers/workloads/gather_workloads_info.go b/pkg/gatherers/workloads/gather_workloads_info.go
+index 4ae02b7977..b59af2156f 100644
+--- a/pkg/gatherers/workloads/gather_workloads_info.go
++++ b/pkg/gatherers/workloads/gather_workloads_info.go
+@@ -4,6 +4,7 @@ import (
+ 	"context"
+ 	"crypto/sha256"
+ 	"encoding/base64"
++	"errors"
+ 	"fmt"
+ 	"hash"
+ 	"os"
+@@ -11,23 +12,20 @@ import (
+ 	"sync"
+ 	"time"
+ 
+-	kerrors "k8s.io/apimachinery/pkg/api/errors"
+-
+-	"errors"
+-
+-	corev1 "k8s.io/api/core/v1"
+-	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+-	"k8s.io/client-go/kubernetes"
+-	corev1client "k8s.io/client-go/kubernetes/typed/core/v1"
+-	"k8s.io/client-go/rest"
+-	"k8s.io/klog/v2"
+-
+ 	"github.com/golang/groupcache/lru"
+ 	"github.com/openshift/api/image/docker10"
+ 	imagev1 "github.com/openshift/api/image/v1"
++	configv1client "github.com/openshift/client-go/config/clientset/versioned"
+ 	imageclient "github.com/openshift/client-go/image/clientset/versioned/typed/image/v1"
+ 	"github.com/openshift/library-go/pkg/image/imageutil"
+ 	"github.com/openshift/library-go/pkg/image/reference"
++	corev1 "k8s.io/api/core/v1"
++	kerrors "k8s.io/apimachinery/pkg/api/errors"
++	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
++	"k8s.io/client-go/kubernetes"
++	corev1client "k8s.io/client-go/kubernetes/typed/core/v1"
++	"k8s.io/client-go/rest"
++	"k8s.io/klog/v2"
+ 
+ 	"github.com/openshift/insights-operator/pkg/gatherers/common"
+ 	"github.com/openshift/insights-operator/pkg/record"
+@@ -81,6 +79,11 @@ func (g *Gatherer) GatherWorkloadInfo(ctx context.Context) ([]record.Record, []e
+ 		return nil, []error{err}
+ 	}
+ 
++	configClient, err := configv1client.NewForConfig(g.gatherKubeConfig)
++	if err != nil {
++		return nil, []error{err}
++	}
++
+ 	imageConfig := rest.CopyConfig(g.gatherProtoKubeConfig)
+ 	imageConfig.QPS = common.ImageConfigQPS
+ 	imageConfig.Burst = common.ImageConfigBurst
+@@ -90,17 +93,18 @@ func (g *Gatherer) GatherWorkloadInfo(ctx context.Context) ([]record.Record, []e
+ 		return nil, []error{err}
+ 	}
+ 
+-	return gatherWorkloadInfo(ctx, gatherKubeClient.CoreV1(), gatherOpenShiftClient)
++	return gatherWorkloadInfo(ctx, gatherKubeClient.CoreV1(), gatherOpenShiftClient, configClient)
+ }
+ 
+ func gatherWorkloadInfo(
+ 	ctx context.Context,
+ 	coreClient corev1client.CoreV1Interface,
+ 	imageClient imageclient.ImageV1Interface,
++	configClient configv1client.Interface,
+ ) ([]record.Record, []error) {
+-	var errs = []error{}
++	errs := []error{}
+ 
+-	workloadInfos, runtimeInfoErrs := gatherWorkloadRuntimeInfos(ctx, coreClient)
++	workloadInfos, runtimeInfoErrs := gatherWorkloadRuntimeInfos(ctx, coreClient, configClient)
+ 	errs = append(errs, runtimeInfoErrs...)
+ 
+ 	imageCh, imagesDoneCh := gatherWorkloadImageInfo(ctx, imageClient.Images())
+diff --git a/pkg/gatherers/workloads/gather_workloads_runtime_infos.go b/pkg/gatherers/workloads/gather_workloads_runtime_infos.go
+index 3a27738c77..b3434e462d 100644
+--- a/pkg/gatherers/workloads/gather_workloads_runtime_infos.go
++++ b/pkg/gatherers/workloads/gather_workloads_runtime_infos.go
+@@ -2,7 +2,6 @@ package workloads
+ 
+ import (
+ 	"context"
+-	"crypto/tls"
+ 	"encoding/json"
+ 	"fmt"
+ 	"io"
+@@ -13,12 +12,14 @@ import (
+ 	"sync"
+ 	"time"
+ 
+-	"github.com/openshift/insights-operator/pkg/insights/insightsclient"
++	configv1client "github.com/openshift/client-go/config/clientset/versioned"
+ 	corev1 "k8s.io/api/core/v1"
+ 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+ 	corev1client "k8s.io/client-go/kubernetes/typed/core/v1"
+ 	certutil "k8s.io/client-go/util/cert"
+ 	"k8s.io/klog/v2"
++
++	"github.com/openshift/insights-operator/pkg/insights/insightsclient"
+ )
+ 
+ type podWithNodeName struct {
+@@ -29,6 +30,7 @@ type podWithNodeName struct {
+ func gatherWorkloadRuntimeInfos(
+ 	ctx context.Context,
+ 	coreClient corev1client.CoreV1Interface,
++	configClient configv1client.Interface,
+ ) (workloadRuntimes, []error) {
+ 	start := time.Now()
+ 
+@@ -38,7 +40,7 @@ func gatherWorkloadRuntimeInfos(
+ 	}
+ 
+ 	workloadRuntimeInfos := make(workloadRuntimes)
+-	var errors = []error{}
++	errors := []error{}
+ 
+ 	nodeWorkloadCh := make(chan workloadRuntimesResult)
+ 	var receiveWg sync.WaitGroup
+@@ -63,7 +65,7 @@ func gatherWorkloadRuntimeInfos(
+ 			klog.Infof("Gathering workload runtime info for node %s...\n", podInfo.nodeName)
+ 			hostPort := net.JoinHostPort(podInfo.podIP, "8443")
+ 			extractorURL := fmt.Sprintf("https://%s/gather_runtime_info", hostPort)
+-			httpCli, err := createHTTPClient()
++			httpCli, err := createHTTPClient(configClient)
+ 			if err != nil {
+ 				klog.Errorf("Failed to initialize the HTTP client: %v", err)
+ 				return
+@@ -135,23 +137,30 @@ type workloadRuntimesResult struct {
+ 	Error            error
+ }
+ 
+-func createHTTPClient() (*http.Client, error) {
++func createHTTPClient(configClient configv1client.Interface) (*http.Client, error) {
+ 	// Use the certificate authority from the service to verify the TLS connection to the insights-runtime-extractor
+ 	const rootCAFile = "/var/run/configmaps/service-ca-bundle/service-ca.crt"
+ 
++	// Fetch TLS config from API Server
++	tlsConfig, err := insightsclient.GetTLSConfigFromAPIServer(configClient)
++	if err != nil {
++		return nil, fmt.Errorf("failed to get TLS config: %w", err)
++	}
++
++	tlsConfig.ServerName = "exporter.openshift-insights.svc.cluster.local"
++
+ 	caCertPool, err := certutil.NewPool(rootCAFile)
+ 	if err != nil {
+ 		return nil, err
+ 	}
+ 
++	if caCertPool != nil {
++		tlsConfig.RootCAs = caCertPool
++	}
++
+ 	authClient := &http.Client{
+ 		Transport: &http.Transport{
+-			TLSClientConfig: &tls.Config{
+-				InsecureSkipVerify: false,
+-				RootCAs:            caCertPool,
+-				ServerName:         "exporter.openshift-insights.svc.cluster.local",
+-				MinVersion:         tls.VersionTLS12,
+-			},
++			TLSClientConfig: tlsConfig,
+ 		},
+ 	}
+ 	return authClient, nil
+diff --git a/pkg/gatherers/workloads/gather_workloads_runtime_infos_test.go b/pkg/gatherers/workloads/gather_workloads_runtime_infos_test.go
+index 773338e2bc..e060dc6312 100644
+--- a/pkg/gatherers/workloads/gather_workloads_runtime_infos_test.go
++++ b/pkg/gatherers/workloads/gather_workloads_runtime_infos_test.go
+@@ -8,6 +8,7 @@ import (
+ 	"os"
+ 	"testing"
+ 
++	configfake "github.com/openshift/client-go/config/clientset/versioned/fake"
+ 	"github.com/openshift/insights-operator/pkg/utils"
+ 	"github.com/stretchr/testify/assert"
+ 	v1 "k8s.io/api/core/v1"
+@@ -438,11 +439,12 @@ func TestGetInsightsOperatorRuntimePodIPs(t *testing.T) {
+ 
+ func TestGatherWorkloadRuntimeInfos_NoPods(t *testing.T) {
+ 	cli := kubefake.NewSimpleClientset()
++	configCli := configfake.NewSimpleClientset()
+ 	err := os.Setenv("POD_NAMESPACE", "openshift-insights")
+ 	assert.NoError(t, err)
+ 
+ 	ctx := context.Background()
+-	result, errors := gatherWorkloadRuntimeInfos(ctx, cli.CoreV1())
++	result, errors := gatherWorkloadRuntimeInfos(ctx, cli.CoreV1(), configCli)
+ 
+ 	assert.Nil(t, result)
+ 	assert.Len(t, errors, 1)
+diff --git a/pkg/insights/insightsclient/apiserver_config.go b/pkg/insights/insightsclient/apiserver_config.go
+new file mode 100644
+index 0000000000..fd7236379b
+--- /dev/null
++++ b/pkg/insights/insightsclient/apiserver_config.go
+@@ -0,0 +1,101 @@
++package insightsclient
++
++import (
++	"context"
++	"crypto/tls"
++	"fmt"
++
++	configv1 "github.com/openshift/api/config/v1"
++	configclientset "github.com/openshift/client-go/config/clientset/versioned"
++	"github.com/openshift/library-go/pkg/crypto"
++	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
++)
++
++// GetTLSConfigFromAPIServer fetches the TLS profile from the API Server configuration.
++// This is the default source for most components.
++func GetTLSConfigFromAPIServer(configClient configclientset.Interface) (*tls.Config, error) {
++	apiserver, err := configClient.ConfigV1().APIServers().Get(context.Background(), "cluster", metav1.GetOptions{})
++	if err != nil {
++		return nil, fmt.Errorf("failed to get APIServer config: %w", err)
++	}
++
++	profile := apiserver.Spec.TLSSecurityProfile
++	if profile == nil {
++		profile = &configv1.TLSSecurityProfile{
++			Type: configv1.TLSProfileIntermediateType,
++		}
++	}
++
++	return buildTLSConfigFromProfile(profile)
++}
++
++func buildTLSConfigFromProfile(profile *configv1.TLSSecurityProfile) (*tls.Config, error) {
++	profileSpec, err := getTLSProfileSpec(profile)
++	if err != nil {
++		return nil, fmt.Errorf("failed to getTLSProfileSpec: %v", err)
++	}
++
++	minVersion, err := parseTLSVersion(string(profileSpec.MinTLSVersion))
++	if err != nil {
++		return nil, fmt.Errorf("invalid MinTLSVersion: %w", err)
++	}
++
++	config := &tls.Config{
++		MinVersion: minVersion,
++	}
++
++	if minVersion == tls.VersionTLS13 {
++		config.MaxVersion = tls.VersionTLS13
++	} else {
++		cipherNames := crypto.OpenSSLToIANACipherSuites(profileSpec.Ciphers)
++
++		// Validate cipher suite names and collect uint16 values
++		var validCipherSuites []uint16
++		for _, name := range cipherNames {
++			suite, err := crypto.CipherSuite(name)
++			if err != nil {
++				continue
++			}
++			validCipherSuites = append(validCipherSuites, suite)
++		}
++
++		if len(validCipherSuites) == 0 {
++			return nil, fmt.Errorf("no valid cipher suites found")
++		}
++
++		config.CipherSuites = validCipherSuites
++	}
++
++	return config, nil
++}
++
++func getTLSProfileSpec(profile *configv1.TLSSecurityProfile) (*configv1.TLSProfileSpec, error) {
++	switch profile.Type {
++	case configv1.TLSProfileOldType,
++		configv1.TLSProfileIntermediateType,
++		configv1.TLSProfileModernType:
++		return configv1.TLSProfiles[profile.Type], nil
++	case configv1.TLSProfileCustomType:
++		if profile.Custom == nil {
++			return nil, fmt.Errorf("custom TLS profile specified but Custom field is nil")
++		}
++		return &profile.Custom.TLSProfileSpec, nil
++	default:
++		return configv1.TLSProfiles[configv1.TLSProfileIntermediateType], nil
++	}
++}
++
++func parseTLSVersion(version string) (uint16, error) {
++	switch version {
++	case "VersionTLS10", "TLSv1.0":
++		return tls.VersionTLS10, nil
++	case "VersionTLS11", "TLSv1.1":
++		return tls.VersionTLS11, nil
++	case "VersionTLS12", "TLSv1.2":
++		return tls.VersionTLS12, nil
++	case "VersionTLS13", "TLSv1.3":
++		return tls.VersionTLS13, nil
++	default:
++		return 0, fmt.Errorf("unknown TLS version: %s", version)
++	}
++}
+diff --git a/pkg/insights/insightsclient/apiserver_config_test.go b/pkg/insights/insightsclient/apiserver_config_test.go
+new file mode 100644
+index 0000000000..732e8ed6d5
+--- /dev/null
++++ b/pkg/insights/insightsclient/apiserver_config_test.go
+@@ -0,0 +1,169 @@
++package insightsclient
++
++import (
++	"crypto/tls"
++	"testing"
++
++	configv1 "github.com/openshift/api/config/v1"
++	"github.com/stretchr/testify/assert"
++)
++
++func Test_parseTLSVersion(t *testing.T) {
++	tests := []struct {
++		name        string
++		version     string
++		expected    uint16
++		expectError bool
++	}{
++		{
++			name:        "TLS 1.0 with TLSv1.0",
++			version:     "TLSv1.0",
++			expected:    tls.VersionTLS10,
++			expectError: false,
++		},
++		{
++			name:        "TLS 1.3 with TLSv1.3",
++			version:     "TLSv1.3",
++			expected:    tls.VersionTLS13,
++			expectError: false,
++		},
++		{
++			name:        "invalid version",
++			version:     "TLSv9.9",
++			expected:    0,
++			expectError: true,
++		},
++		{
++			name:        "empty version",
++			version:     "",
++			expected:    0,
++			expectError: true,
++		},
++	}
++
++	for _, tt := range tests {
++		t.Run(tt.name, func(t *testing.T) {
++			result, err := parseTLSVersion(tt.version)
++			if tt.expectError {
++				assert.Error(t, err)
++			} else {
++				assert.NoError(t, err)
++				assert.Equal(t, tt.expected, result)
++			}
++		})
++	}
++}
++
++func Test_getTLSProfileSpec(t *testing.T) {
++	tests := []struct {
++		name        string
++		profile     *configv1.TLSSecurityProfile
++		expectError bool
++	}{
++		{
++			name: "Intermediate profile type",
++			profile: &configv1.TLSSecurityProfile{
++				Type: configv1.TLSProfileIntermediateType,
++			},
++			expectError: false,
++		},
++		{
++			name: "Custom profile with spec",
++			profile: &configv1.TLSSecurityProfile{
++				Type: configv1.TLSProfileCustomType,
++				Custom: &configv1.CustomTLSProfile{
++					TLSProfileSpec: configv1.TLSProfileSpec{
++						MinTLSVersion: configv1.VersionTLS12,
++						Ciphers:       []string{"TLS_AES_128_GCM_SHA256"},
++					},
++				},
++			},
++			expectError: false,
++		},
++		{
++			name: "Custom profile without spec - should error",
++			profile: &configv1.TLSSecurityProfile{
++				Type:   configv1.TLSProfileCustomType,
++				Custom: nil,
++			},
++			expectError: true,
++		},
++		{
++			name: "Unknown profile type defaults to Intermediate",
++			profile: &configv1.TLSSecurityProfile{
++				Type: "",
++			},
++			expectError: false,
++		},
++	}
++
++	for _, tt := range tests {
++		t.Run(tt.name, func(t *testing.T) {
++			result, err := getTLSProfileSpec(tt.profile)
++			if tt.expectError {
++				assert.Error(t, err)
++				assert.Nil(t, result)
++			} else {
++				assert.NoError(t, err)
++				assert.NotNil(t, result)
++			}
++		})
++	}
++}
++
++func Test_buildTLSConfigFromProfile(t *testing.T) {
++	tests := []struct {
++		name        string
++		profile     *configv1.TLSSecurityProfile
++		expectError bool
++		checkTLS13  bool
++	}{
++		{
++			name: "Modern profile with TLS 1.3",
++			profile: &configv1.TLSSecurityProfile{
++				Type: configv1.TLSProfileModernType,
++			},
++			expectError: false,
++			checkTLS13:  true,
++		},
++		{
++			name: "Custom profile with TLS 1.2",
++			profile: &configv1.TLSSecurityProfile{
++				Type: configv1.TLSProfileCustomType,
++				Custom: &configv1.CustomTLSProfile{
++					TLSProfileSpec: configv1.TLSProfileSpec{
++						MinTLSVersion: configv1.VersionTLS12,
++						Ciphers: []string{
++							"ECDHE-ECDSA-AES128-GCM-SHA256",
++							"ECDHE-RSA-AES128-GCM-SHA256",
++						},
++					},
++				},
++			},
++			expectError: false,
++			checkTLS13:  false,
++		},
++	}
++
++	for _, tt := range tests {
++		t.Run(tt.name, func(t *testing.T) {
++			result, err := buildTLSConfigFromProfile(tt.profile)
++			if tt.expectError {
++				assert.Error(t, err)
++				assert.Nil(t, result)
++			} else {
++				assert.NoError(t, err)
++				assert.NotNil(t, result)
++				assert.NotZero(t, result.MinVersion)
++
++				if tt.checkTLS13 {
++					assert.Equal(t, uint16(tls.VersionTLS13), result.MinVersion)
++					assert.Equal(t, uint16(tls.VersionTLS13), result.MaxVersion)
++				} else {
++					// For non-TLS 1.3 profiles, cipher suites should be configured
++					assert.NotEmpty(t, result.CipherSuites)
++				}
++			}
++		})
++	}
++}
+diff --git a/pkg/insights/insightsclient/insightsclient.go b/pkg/insights/insightsclient/insightsclient.go
+index 2c2a4781f5..b4a1a3e900 100644
+--- a/pkg/insights/insightsclient/insightsclient.go
++++ b/pkg/insights/insightsclient/insightsclient.go
+@@ -2,7 +2,6 @@ package insightsclient
+ 
+ import (
+ 	"context"
+-	"crypto/tls"
+ 	"crypto/x509"
+ 	"errors"
+ 	"fmt"
+@@ -124,7 +123,7 @@ func getTrustedCABundle() (*x509.CertPool, error) {
+ }
+ 
+ // clientTransport creates new http.Transport with either system or configured Proxy
+-func clientTransport(authorizer Authorizer) http.RoundTripper {
++func clientTransport(authorizer Authorizer, kubeClient configv1client.Interface) http.RoundTripper {
+ 	clientTransport := &http.Transport{
+ 		Proxy: authorizer.NewSystemOrConfiguredProxy(),
+ 		DialContext: (&net.Dialer{
+@@ -135,16 +134,24 @@ func clientTransport(authorizer Authorizer) http.RoundTripper {
+ 		DisableKeepAlives:   true,
+ 	}
+ 
++	// Fetch TLS config from API Server
++	tlsConfig, err := GetTLSConfigFromAPIServer(kubeClient)
++	if err != nil {
++		klog.Errorf("getTLSConfigFromAPIServer: %v", err)
++	}
++
+ 	// get the cluster proxy trusted CA bundle in case the proxy need it
+ 	rootCAs, err := getTrustedCABundle()
+ 	if err != nil {
+ 		klog.Errorf("Failed to get proxy trusted CA: %v", err)
+ 	}
++
+ 	if rootCAs != nil {
+-		clientTransport.TLSClientConfig = &tls.Config{}
+-		clientTransport.TLSClientConfig.RootCAs = rootCAs
++		tlsConfig.RootCAs = rootCAs
+ 	}
+ 
++	clientTransport.TLSClientConfig = tlsConfig
++
+ 	return transport.DebugWrappers(clientTransport)
+ }
+ 
+diff --git a/pkg/insights/insightsclient/insightsclient_test.go b/pkg/insights/insightsclient/insightsclient_test.go
+index 4686779cf3..3ccc9b442c 100644
+--- a/pkg/insights/insightsclient/insightsclient_test.go
++++ b/pkg/insights/insightsclient/insightsclient_test.go
+@@ -7,8 +7,8 @@ import (
+ 	"net/http/httptest"
+ 	"testing"
+ 
+-	"github.com/stretchr/testify/assert"
+ 	configv1 "github.com/openshift/api/config/v1"
++	"github.com/stretchr/testify/assert"
+ 	"k8s.io/apimachinery/pkg/version"
+ )
+ 
+diff --git a/pkg/insights/insightsclient/requests.go b/pkg/insights/insightsclient/requests.go
+index 3a354b7a32..4004333bd1 100644
+--- a/pkg/insights/insightsclient/requests.go
++++ b/pkg/insights/insightsclient/requests.go
+@@ -41,7 +41,7 @@ func (c *Client) SendAndGetID(ctx context.Context, endpoint string, source Sourc
+ 	go c.createAndWriteMIMEHeader(&source, mw, pw, bytesRead)
+ 	req.Body = pr
+ 	// dynamically set the proxy environment
+-	c.client.Transport = clientTransport(c.authorizer)
++	c.client.Transport = clientTransport(c.authorizer, c.configClient)
+ 
+ 	klog.Infof("Uploading %s to %s", source.Type, req.URL.String())
+ 	resp, err := c.client.Do(req)
+@@ -116,7 +116,7 @@ func (c *Client) RecvReport(ctx context.Context, endpoint string) (*http.Respons
+ 	}
+ 
+ 	// dynamically set the proxy environment
+-	c.client.Transport = clientTransport(c.authorizer)
++	c.client.Transport = clientTransport(c.authorizer, c.configClient)
+ 
+ 	klog.Infof("Retrieving report from %s", req.URL.String())
+ 	resp, err := c.client.Do(req)
+@@ -199,7 +199,7 @@ func (c *Client) RecvSCACerts(_ context.Context, endpoint string, architectures
+ 	}
+ 
+ 	req.Header.Set("Content-Type", "application/json")
+-	c.client.Transport = clientTransport(c.authorizer)
++	c.client.Transport = clientTransport(c.authorizer, c.configClient)
+ 	authHeader := fmt.Sprintf("AccessToken %s:%s", cv.Spec.ClusterID, token)
+ 	req.Header.Set("Authorization", authHeader)
+ 	klog.Infof("Asking for SCA certificate with \"%s\" payload", payload)
+@@ -256,7 +256,7 @@ func (c *Client) RecvClusterTransfer(endpoint string) ([]byte, error) {
+ 	q.Add("search", searchQuery)
+ 	req.URL.RawQuery = q.Encode()
+ 	req.Header.Set("Content-Type", "application/json")
+-	c.client.Transport = clientTransport(c.authorizer)
++	c.client.Transport = clientTransport(c.authorizer, c.configClient)
+ 	authHeader := fmt.Sprintf("AccessToken %s:%s", cv.Spec.ClusterID, token)
+ 	req.Header.Set("Authorization", authHeader)
+ 
+@@ -299,7 +299,7 @@ func (c *Client) GetWithPathParam(ctx context.Context, endpoint, param string, i
+ 	}
+ 
+ 	// dynamically set the proxy environment
+-	c.client.Transport = clientTransport(c.authorizer)
++	c.client.Transport = clientTransport(c.authorizer, c.configClient)
+ 
+ 	return c.client.Do(req)
+ }
+diff --git a/pkg/insights/insightsclient/requests_test.go b/pkg/insights/insightsclient/requests_test.go
+index 3ba84dc887..ab35370726 100644
+--- a/pkg/insights/insightsclient/requests_test.go
++++ b/pkg/insights/insightsclient/requests_test.go
+@@ -155,10 +155,10 @@ func TestClient_RecvGatheringRules(t *testing.T) {
+ 
+ func TestClient_RecvSCACerts(t *testing.T) {
+ 	tests := []struct {
+-		name         string
+-		statusCode   int
+-		responseBody string
+-		expectError  bool
++		name          string
++		statusCode    int
++		responseBody  string
++		expectError   bool
+ 		errorContains string
+ 	}{
+ 		{
+@@ -233,13 +233,13 @@ func TestClient_RecvSCACerts(t *testing.T) {
+ 
+ func TestClient_RecvReport(t *testing.T) {
+ 	tests := []struct {
+-		name                 string
+-		statusCode           int
+-		responseBody         string
+-		expectError          bool
+-		errorContains        string
+-		expectHttpError      bool
+-		expectedHttpErrCode  int
++		name                string
++		statusCode          int
++		responseBody        string
++		expectError         bool
++		errorContains       string
++		expectHttpError     bool
++		expectedHttpErrCode int
+ 	}{
+ 		{
+ 			name:         "success",

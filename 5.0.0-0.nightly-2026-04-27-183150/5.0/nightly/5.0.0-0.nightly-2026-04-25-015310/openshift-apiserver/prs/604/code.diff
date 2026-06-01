@@ -1,0 +1,610 @@
+diff --git a/pkg/cmd/openshift-apiserver/cmd.go b/pkg/cmd/openshift-apiserver/cmd.go
+index 3b8fc22c68..16a0ed30ea 100644
+--- a/pkg/cmd/openshift-apiserver/cmd.go
++++ b/pkg/cmd/openshift-apiserver/cmd.go
+@@ -104,7 +104,7 @@ func (o *OpenShiftAPIServer) Validate() error {
+ 
+ // RunAPIServer takes the options, starts the API server and waits until stopCh is closed or initial listening fails.
+ func (o *OpenShiftAPIServer) RunAPIServer(stopCh <-chan struct{}) error {
+-	if err := features.InitializeFeatureGates(feature.DefaultMutableFeatureGate, openshiftfeatures.SelfManaged, openshiftfeatures.FeatureGateRouteExternalCertificate); err != nil {
++	if err := features.InitializeFeatureGates(feature.DefaultMutableFeatureGate, openshiftfeatures.SelfManaged); err != nil {
+ 		return err
+ 	}
+ 
+diff --git a/pkg/cmd/openshift-apiserver/openshiftapiserver/config.go b/pkg/cmd/openshift-apiserver/openshiftapiserver/config.go
+index 22f2419e26..8e395e0d9c 100644
+--- a/pkg/cmd/openshift-apiserver/openshiftapiserver/config.go
++++ b/pkg/cmd/openshift-apiserver/openshiftapiserver/config.go
+@@ -6,7 +6,6 @@ import (
+ 	"net/http"
+ 	"time"
+ 
+-	openshiftfeatures "github.com/openshift/api/features"
+ 	openshiftcontrolplanev1 "github.com/openshift/api/openshiftcontrolplane/v1"
+ 	"github.com/openshift/apiserver-library-go/pkg/configflags"
+ 	"github.com/openshift/library-go/pkg/apiserver/admission/admissiontimeout"
+@@ -35,7 +34,6 @@ import (
+ 	"k8s.io/client-go/kubernetes"
+ 	"k8s.io/client-go/restmapper"
+ 	"k8s.io/component-base/compatibility"
+-	"k8s.io/component-base/featuregate"
+ 	"k8s.io/klog/v2"
+ 	"k8s.io/kubernetes/pkg/api/legacyscheme"
+ )
+@@ -266,7 +264,6 @@ func NewOpenshiftAPIConfig(config *openshiftcontrolplanev1.OpenShiftAPIServerCon
+ 			AdditionalTrustedCA:                caData,
+ 			ImageStreamImportMode:              apisimage.ImportModeType(config.ImagePolicyConfig.ImageStreamImportMode),
+ 			RouteAllocator:                     routeAllocator,
+-			AllowRouteExternalCertificates:     feature.DefaultFeatureGate.Enabled(featuregate.Feature(openshiftfeatures.FeatureGateRouteExternalCertificate)),
+ 			ProjectAuthorizationCache:          projectAuthorizationCache,
+ 			ProjectCache:                       projectCache,
+ 			ProjectRequestTemplate:             config.ProjectConfig.ProjectRequestTemplate,
+diff --git a/pkg/cmd/openshift-apiserver/openshiftapiserver/openshift_apiserver.go b/pkg/cmd/openshift-apiserver/openshiftapiserver/openshift_apiserver.go
+index 58f1421924..6a8e4b249d 100644
+--- a/pkg/cmd/openshift-apiserver/openshiftapiserver/openshift_apiserver.go
++++ b/pkg/cmd/openshift-apiserver/openshiftapiserver/openshift_apiserver.go
+@@ -90,8 +90,7 @@ type OpenshiftAPIExtraConfig struct {
+ 	AdditionalTrustedCA                []byte
+ 	ImageStreamImportMode              apisimage.ImportModeType
+ 
+-	RouteAllocator                 *routehostassignment.SimpleAllocationPlugin
+-	AllowRouteExternalCertificates bool
++	RouteAllocator *routehostassignment.SimpleAllocationPlugin
+ 
+ 	ProjectAuthorizationCache *projectauth.AuthorizationCache
+ 	ProjectCache              *projectcache.ProjectCache
+@@ -328,7 +327,6 @@ func (c *completedConfig) withRouteAPIServer(delegateAPIServer genericapiserver.
+ 		ExtraConfig: routeapiserver.ExtraConfig{
+ 			KubeAPIServerClientConfig: c.ExtraConfig.KubeAPIServerClientConfig,
+ 			RouteAllocator:            c.ExtraConfig.RouteAllocator,
+-			AllowExternalCertificates: c.ExtraConfig.AllowRouteExternalCertificates,
+ 			Codecs:                    legacyscheme.Codecs,
+ 			Scheme:                    legacyscheme.Scheme,
+ 		},
+diff --git a/pkg/route/apiserver/apiserver.go b/pkg/route/apiserver/apiserver.go
+index b2352572b7..b12ce5ebf6 100644
+--- a/pkg/route/apiserver/apiserver.go
++++ b/pkg/route/apiserver/apiserver.go
+@@ -22,8 +22,6 @@ type ExtraConfig struct {
+ 	KubeAPIServerClientConfig *restclient.Config
+ 	RouteAllocator            *routehostassignment.SimpleAllocationPlugin
+ 
+-	AllowExternalCertificates bool
+-
+ 	// TODO these should all become local eventually
+ 	Scheme *runtime.Scheme
+ 	Codecs serializer.CodecFactory
+@@ -111,7 +109,6 @@ func (c *completedConfig) newV1RESTStorage() (map[string]rest.Storage, error) {
+ 		c.ExtraConfig.RouteAllocator,
+ 		authorizationClient.SubjectAccessReviews(),
+ 		kubeClient.CoreV1(),
+-		c.ExtraConfig.AllowExternalCertificates,
+ 	)
+ 	if err != nil {
+ 		return nil, fmt.Errorf("error building REST storage: %v", err)
+diff --git a/pkg/route/apiserver/registry/route/etcd/etcd.go b/pkg/route/apiserver/registry/route/etcd/etcd.go
+index 59b242546e..8eebc8fa66 100644
+--- a/pkg/route/apiserver/registry/route/etcd/etcd.go
++++ b/pkg/route/apiserver/registry/route/etcd/etcd.go
+@@ -38,8 +38,8 @@ type HostnameGenerator interface {
+ }
+ 
+ // NewREST returns a RESTStorage object that will work against routes.
+-func NewREST(optsGetter generic.RESTOptionsGetter, allocator HostnameGenerator, sarClient routeregistry.SubjectAccessReviewInterface, secretsGetter corev1client.SecretsGetter, allowExternalCertificates bool) (*REST, *StatusREST, error) {
+-	strategy := routeregistry.NewStrategy(allocator, sarClient, secretsGetter, allowExternalCertificates)
++func NewREST(optsGetter generic.RESTOptionsGetter, allocator HostnameGenerator, sarClient routeregistry.SubjectAccessReviewInterface, secretsGetter corev1client.SecretsGetter) (*REST, *StatusREST, error) {
++	strategy := routeregistry.NewStrategy(allocator, sarClient, secretsGetter)
+ 
+ 	store := &registry.Store{
+ 		NewFunc:                   func() runtime.Object { return &routeapi.Route{} },
+diff --git a/pkg/route/apiserver/registry/route/etcd/etcd_test.go b/pkg/route/apiserver/registry/route/etcd/etcd_test.go
+index e451bed539..5dcbf871e2 100644
+--- a/pkg/route/apiserver/registry/route/etcd/etcd_test.go
++++ b/pkg/route/apiserver/registry/route/etcd/etcd_test.go
+@@ -58,7 +58,7 @@ func newStorage(t *testing.T, allocator HostnameGenerator) (*REST, *etcdtesting.
+ 	etcdStorageConfigForRoutes := &storagebackend.ConfigForResource{Config: *etcdStorage, GroupResource: schema.GroupResource{Group: "route.openshift.io", Resource: "routes"}}
+ 	restOptions := generic.RESTOptions{StorageConfig: etcdStorageConfigForRoutes, Decorator: generic.UndecoratedStorage, DeleteCollectionWorkers: 1, ResourcePrefix: "routes"}
+ 	fake := fake.NewSimpleClientset(&corev1.SecretList{})
+-	storage, _, err := NewREST(restOptions, allocator, &testSAR{allow: true}, fake.CoreV1(), true)
++	storage, _, err := NewREST(restOptions, allocator, &testSAR{allow: true}, fake.CoreV1())
+ 	if err != nil {
+ 		t.Fatal(err)
+ 	}
+diff --git a/pkg/route/apiserver/registry/route/strategy.go b/pkg/route/apiserver/registry/route/strategy.go
+index 4b55e31ecf..f5b9a8a6c9 100644
+--- a/pkg/route/apiserver/registry/route/strategy.go
++++ b/pkg/route/apiserver/registry/route/strategy.go
+@@ -35,22 +35,20 @@ type HostnameGenerator interface {
+ type routeStrategy struct {
+ 	runtime.ObjectTyper
+ 	names.NameGenerator
+-	hostnameGenerator         HostnameGenerator
+-	sarClient                 SubjectAccessReviewInterface
+-	secretsGetter             corev1client.SecretsGetter
+-	allowExternalCertificates bool
++	hostnameGenerator HostnameGenerator
++	sarClient         SubjectAccessReviewInterface
++	secretsGetter     corev1client.SecretsGetter
+ }
+ 
+ // NewStrategy initializes the default logic that applies when creating and updating
+ // Route objects via the REST API.
+-func NewStrategy(allocator HostnameGenerator, sarClient SubjectAccessReviewInterface, secretsGetter corev1client.SecretsGetter, allowExternalCertificates bool) routeStrategy {
++func NewStrategy(allocator HostnameGenerator, sarClient SubjectAccessReviewInterface, secretsGetter corev1client.SecretsGetter) routeStrategy {
+ 	return routeStrategy{
+-		ObjectTyper:               legacyscheme.Scheme,
+-		NameGenerator:             names.SimpleNameGenerator,
+-		hostnameGenerator:         allocator,
+-		sarClient:                 sarClient,
+-		secretsGetter:             secretsGetter,
+-		allowExternalCertificates: allowExternalCertificates,
++		ObjectTyper:       legacyscheme.Scheme,
++		NameGenerator:     names.SimpleNameGenerator,
++		hostnameGenerator: allocator,
++		sarClient:         sarClient,
++		secretsGetter:     secretsGetter,
+ 	}
+ }
+ 
+@@ -60,7 +58,7 @@ func (routeStrategy) NamespaceScoped() bool {
+ 
+ func (s routeStrategy) routeValidationOptions() routecommon.RouteValidationOptions {
+ 	return routecommon.RouteValidationOptions{
+-		AllowExternalCertificates: s.allowExternalCertificates,
++		AllowExternalCertificates: true,
+ 	}
+ }
+ 
+@@ -69,13 +67,6 @@ func (s routeStrategy) PrepareForCreate(ctx context.Context, obj runtime.Object)
+ 	route.Status = routeapi.RouteStatus{}
+ 	route.Generation = 1
+ 	stripEmptyDestinationCACertificate(route)
+-
+-	// In kube APIs, disabled fields are stripped from inbound objects.
+-	// This provides parity with prior releases and other unknown fields in kube.
+-	// Example of stripping these values in pods: https://github.com/kubernetes/kubernetes/blob/master/pkg/registry/core/pod/strategy.go#L108
+-	if !s.allowExternalCertificates && route.Spec.TLS != nil && route.Spec.TLS.ExternalCertificate != nil {
+-		route.Spec.TLS.ExternalCertificate = nil
+-	}
+ }
+ 
+ func (s routeStrategy) PrepareForUpdate(ctx context.Context, obj, old runtime.Object) {
+@@ -90,15 +81,6 @@ func (s routeStrategy) PrepareForUpdate(ctx context.Context, obj, old runtime.Ob
+ 		route.Spec.Host = oldRoute.Spec.Host
+ 	}
+ 
+-	// strip the field if it wasn't previously set and it was disabled.
+-	// I didn't bother to do this in the initial PR since OCP doesn't allow featuregates to transition back to disabled
+-	// but since I'm in the code adding comments, this an easy thing to fix up now and future-us may allow the transition.
+-	if !s.allowExternalCertificates && (oldRoute.Spec.TLS == nil || oldRoute.Spec.TLS.ExternalCertificate == nil) {
+-		if route.Spec.TLS != nil && route.Spec.TLS.ExternalCertificate != nil {
+-			route.Spec.TLS.ExternalCertificate = nil
+-		}
+-	}
+-
+ 	// Any changes to the spec increment the generation number.
+ 	// Changes to status, or to any metadata field (eg.: labels and annotations)
+ 	// should not impact on the generation
+@@ -150,7 +132,7 @@ type routeStatusStrategy struct {
+ 	routeStrategy
+ }
+ 
+-var StatusStrategy = routeStatusStrategy{NewStrategy(nil, nil, nil, false)}
++var StatusStrategy = routeStatusStrategy{NewStrategy(nil, nil, nil)}
+ 
+ func (routeStatusStrategy) PrepareForUpdate(ctx context.Context, obj, old runtime.Object) {
+ 	newRoute := obj.(*routeapi.Route)
+diff --git a/pkg/route/apiserver/registry/route/strategy_test.go b/pkg/route/apiserver/registry/route/strategy_test.go
+index 001202a871..e358e1a29d 100644
+--- a/pkg/route/apiserver/registry/route/strategy_test.go
++++ b/pkg/route/apiserver/registry/route/strategy_test.go
+@@ -15,7 +15,6 @@ import (
+ 	testclient "k8s.io/client-go/kubernetes/fake"
+ 
+ 	routev1 "github.com/openshift/api/route/v1"
+-	"github.com/openshift/library-go/pkg/route"
+ 	routeapi "github.com/openshift/openshift-apiserver/pkg/route/apis/route"
+ 	corev1client "k8s.io/client-go/kubernetes/typed/core/v1"
+ )
+@@ -53,7 +52,7 @@ func (t *testSecretGetter) Secrets(_ string) corev1client.SecretInterface {
+ 
+ func TestEmptyHostDefaulting(t *testing.T) {
+ 	ctx := apirequest.NewContext()
+-	strategy := NewStrategy(testAllocator{}, &testSAR{allow: true}, &testSecretGetter{}, true)
++	strategy := NewStrategy(testAllocator{}, &testSAR{allow: true}, &testSecretGetter{})
+ 
+ 	hostlessCreatedRoute := &routeapi.Route{}
+ 	strategy.Validate(ctx, hostlessCreatedRoute)
+@@ -82,7 +81,7 @@ func TestEmptyHostDefaulting(t *testing.T) {
+ 
+ func TestEmptyHostDefaultingWhenSubdomainSet(t *testing.T) {
+ 	ctx := apirequest.NewContext()
+-	strategy := NewStrategy(testAllocator{}, &testSAR{allow: true}, &testSecretGetter{}, true)
++	strategy := NewStrategy(testAllocator{}, &testSAR{allow: true}, &testSecretGetter{})
+ 
+ 	hostlessCreatedRoute := &routeapi.Route{}
+ 	strategy.Validate(ctx, hostlessCreatedRoute)
+@@ -169,7 +168,6 @@ func TestHostWithWildcardPolicies(t *testing.T) {
+ 		expectedSubdomain string
+ 
+ 		// field for externalCertificate
+-		opts   route.RouteValidationOptions
+ 		secret *corev1.Secret
+ 
+ 		errs  int
+@@ -460,8 +458,6 @@ func TestHostWithWildcardPolicies(t *testing.T) {
+ 			wildcardPolicy: routeapi.WildcardPolicyNone,
+ 			allow:          false,
+ 			errs:           4,
+-
+-			opts: route.RouteValidationOptions{AllowExternalCertificates: true},
+ 		},
+ 		{
+ 			name:     "create-with-external-certificate-allowed",
+@@ -478,8 +474,6 @@ func TestHostWithWildcardPolicies(t *testing.T) {
+ 			wildcardPolicy: routeapi.WildcardPolicyNone,
+ 			allow:          true,
+ 			errs:           0,
+-
+-			opts: route.RouteValidationOptions{AllowExternalCertificates: true},
+ 		},
+ 		{
+ 			name:           "create-with-external-certificate-allowed-but-missing-secret",
+@@ -490,8 +484,6 @@ func TestHostWithWildcardPolicies(t *testing.T) {
+ 			wildcardPolicy: routeapi.WildcardPolicyNone,
+ 			allow:          true,
+ 			errs:           1,
+-
+-			opts: route.RouteValidationOptions{AllowExternalCertificates: true},
+ 		},
+ 		{
+ 			name:     "create-with-external-certificate-allowed-but-incorrect-secret-type",
+@@ -508,8 +500,6 @@ func TestHostWithWildcardPolicies(t *testing.T) {
+ 			wildcardPolicy: routeapi.WildcardPolicyNone,
+ 			allow:          true,
+ 			errs:           1,
+-
+-			opts: route.RouteValidationOptions{AllowExternalCertificates: true},
+ 		},
+ 		{
+ 			name:           "external-certificate-changed-to-certificate-denied",
+@@ -521,8 +511,6 @@ func TestHostWithWildcardPolicies(t *testing.T) {
+ 			wildcardPolicy: routeapi.WildcardPolicyNone,
+ 			allow:          false,
+ 			errs:           2,
+-
+-			opts: route.RouteValidationOptions{AllowExternalCertificates: true},
+ 		},
+ 		{
+ 			name:           "external-certificate-changed-to-certificate-allowed",
+@@ -534,8 +522,6 @@ func TestHostWithWildcardPolicies(t *testing.T) {
+ 			wildcardPolicy: routeapi.WildcardPolicyNone,
+ 			allow:          true,
+ 			errs:           0,
+-
+-			opts: route.RouteValidationOptions{AllowExternalCertificates: true},
+ 		},
+ 		{
+ 			name:     "certificate-changed-to-external-certificate-denied",
+@@ -554,8 +540,6 @@ func TestHostWithWildcardPolicies(t *testing.T) {
+ 			wildcardPolicy: routeapi.WildcardPolicyNone,
+ 			allow:          false,
+ 			errs:           5,
+-
+-			opts: route.RouteValidationOptions{AllowExternalCertificates: true},
+ 		},
+ 		{
+ 			name:     "certificate-changed-to-external-certificate-allowed",
+@@ -574,8 +558,6 @@ func TestHostWithWildcardPolicies(t *testing.T) {
+ 			wildcardPolicy: routeapi.WildcardPolicyNone,
+ 			allow:          true,
+ 			errs:           0,
+-
+-			opts: route.RouteValidationOptions{AllowExternalCertificates: true},
+ 		},
+ 		{
+ 			name:           "certificate-changed-to-external-certificate-allowed-but-missing-secret",
+@@ -588,8 +570,6 @@ func TestHostWithWildcardPolicies(t *testing.T) {
+ 			wildcardPolicy: routeapi.WildcardPolicyNone,
+ 			allow:          true,
+ 			errs:           1,
+-
+-			opts: route.RouteValidationOptions{AllowExternalCertificates: true},
+ 		},
+ 		{
+ 			name:     "certificate-changed-to-external-certificate-allowed-but-incorrect-secret-type",
+@@ -608,8 +588,6 @@ func TestHostWithWildcardPolicies(t *testing.T) {
+ 			wildcardPolicy: routeapi.WildcardPolicyNone,
+ 			allow:          true,
+ 			errs:           1,
+-
+-			opts: route.RouteValidationOptions{AllowExternalCertificates: true},
+ 		},
+ 		{
+ 			name:     "external-certificate-unchanged-denied",
+@@ -628,8 +606,6 @@ func TestHostWithWildcardPolicies(t *testing.T) {
+ 			wildcardPolicy: routeapi.WildcardPolicyNone,
+ 			allow:          false,
+ 			errs:           4,
+-
+-			opts: route.RouteValidationOptions{AllowExternalCertificates: true},
+ 		},
+ 		{
+ 			name:     "external-certificate-unchanged-allowed",
+@@ -648,8 +624,6 @@ func TestHostWithWildcardPolicies(t *testing.T) {
+ 			wildcardPolicy: routeapi.WildcardPolicyNone,
+ 			allow:          true,
+ 			errs:           0,
+-
+-			opts: route.RouteValidationOptions{AllowExternalCertificates: true},
+ 		},
+ 		{
+ 			name:           "external-certificate-unchanged-allowed-but-missing-secret",
+@@ -662,8 +636,6 @@ func TestHostWithWildcardPolicies(t *testing.T) {
+ 			wildcardPolicy: routeapi.WildcardPolicyNone,
+ 			allow:          true,
+ 			errs:           1,
+-
+-			opts: route.RouteValidationOptions{AllowExternalCertificates: true},
+ 		},
+ 		{
+ 			name:     "external-certificate-unchanged-allowed-but-incorrect-secret-type",
+@@ -682,8 +654,6 @@ func TestHostWithWildcardPolicies(t *testing.T) {
+ 			wildcardPolicy: routeapi.WildcardPolicyNone,
+ 			allow:          true,
+ 			errs:           1,
+-
+-			opts: route.RouteValidationOptions{AllowExternalCertificates: true},
+ 		},
+ 		{
+ 			name:           "external-certificate-changed-denied",
+@@ -702,8 +672,6 @@ func TestHostWithWildcardPolicies(t *testing.T) {
+ 			},
+ 			allow: false,
+ 			errs:  4,
+-
+-			opts: route.RouteValidationOptions{AllowExternalCertificates: true},
+ 		},
+ 		{
+ 			name:           "external-certificate-changed-allowed",
+@@ -722,8 +690,6 @@ func TestHostWithWildcardPolicies(t *testing.T) {
+ 			},
+ 			allow: true,
+ 			errs:  0,
+-
+-			opts: route.RouteValidationOptions{AllowExternalCertificates: true},
+ 		},
+ 		{
+ 			name:           "external-certificate-changed-allowed-but-missing-secret",
+@@ -736,8 +702,6 @@ func TestHostWithWildcardPolicies(t *testing.T) {
+ 			secret:         &corev1.Secret{},
+ 			allow:          true,
+ 			errs:           1,
+-
+-			opts: route.RouteValidationOptions{AllowExternalCertificates: true},
+ 		},
+ 		{
+ 			name:           "external-certificate-changed-allowed-but-incorrect-secret-type",
+@@ -756,8 +720,6 @@ func TestHostWithWildcardPolicies(t *testing.T) {
+ 			},
+ 			allow: true,
+ 			errs:  1,
+-
+-			opts: route.RouteValidationOptions{AllowExternalCertificates: true},
+ 		},
+ 		{
+ 			name:           "external-certificate-removed-denied",
+@@ -770,8 +732,6 @@ func TestHostWithWildcardPolicies(t *testing.T) {
+ 			allow:          false,
+ 			// removing certificate info is allowed
+ 			errs: 0,
+-
+-			opts: route.RouteValidationOptions{AllowExternalCertificates: true},
+ 		},
+ 		{
+ 			name:           "external-certificate-removed-allowed",
+@@ -783,8 +743,6 @@ func TestHostWithWildcardPolicies(t *testing.T) {
+ 			wildcardPolicy: routeapi.WildcardPolicyNone,
+ 			allow:          true,
+ 			errs:           0,
+-
+-			opts: route.RouteValidationOptions{AllowExternalCertificates: true},
+ 		},
+ 		{
+ 			name:           "external-certificate-removed-and-set-nil-tls-denied",
+@@ -797,8 +755,6 @@ func TestHostWithWildcardPolicies(t *testing.T) {
+ 			allow:          false,
+ 			// removing certificate info is allowed
+ 			errs: 0,
+-
+-			opts: route.RouteValidationOptions{AllowExternalCertificates: true},
+ 		},
+ 		{
+ 			name:           "external-certificate-removed-and-set-nil-tls-allowed",
+@@ -810,8 +766,6 @@ func TestHostWithWildcardPolicies(t *testing.T) {
+ 			wildcardPolicy: routeapi.WildcardPolicyNone,
+ 			allow:          true,
+ 			errs:           0,
+-
+-			opts: route.RouteValidationOptions{AllowExternalCertificates: true},
+ 		},
+ 		{
+ 			name:           "external-certificate-added-denied",
+@@ -830,8 +784,6 @@ func TestHostWithWildcardPolicies(t *testing.T) {
+ 			},
+ 			allow: false,
+ 			errs:  4,
+-
+-			opts: route.RouteValidationOptions{AllowExternalCertificates: true},
+ 		},
+ 		{
+ 			name:           "external-certificate-added-allowed",
+@@ -850,8 +802,6 @@ func TestHostWithWildcardPolicies(t *testing.T) {
+ 			},
+ 			allow: true,
+ 			errs:  0,
+-
+-			opts: route.RouteValidationOptions{AllowExternalCertificates: true},
+ 		},
+ 		{
+ 			name:           "external-certificate-added-allowed-but-missing-secret",
+@@ -864,8 +814,6 @@ func TestHostWithWildcardPolicies(t *testing.T) {
+ 			secret:         &corev1.Secret{},
+ 			allow:          true,
+ 			errs:           1,
+-
+-			opts: route.RouteValidationOptions{AllowExternalCertificates: true},
+ 		},
+ 		{
+ 			name:           "external-certificate-added-allowed-but-incorrect-secret-type",
+@@ -884,8 +832,6 @@ func TestHostWithWildcardPolicies(t *testing.T) {
+ 			},
+ 			allow: true,
+ 			errs:  1,
+-
+-			opts: route.RouteValidationOptions{AllowExternalCertificates: true},
+ 		},
+ 		{
+ 			name:           "external-certificate-added-from-nil-tls-denied",
+@@ -904,8 +850,6 @@ func TestHostWithWildcardPolicies(t *testing.T) {
+ 			},
+ 			allow: false,
+ 			errs:  4,
+-
+-			opts: route.RouteValidationOptions{AllowExternalCertificates: true},
+ 		},
+ 		{
+ 			name:           "external-certificate-added-from-nil-tls-allowed",
+@@ -924,8 +868,6 @@ func TestHostWithWildcardPolicies(t *testing.T) {
+ 			},
+ 			allow: true,
+ 			errs:  0,
+-
+-			opts: route.RouteValidationOptions{AllowExternalCertificates: true},
+ 		},
+ 		{
+ 			name:           "external-certificate-added-from-nil-tls-allowed-but-missing-secret",
+@@ -938,8 +880,6 @@ func TestHostWithWildcardPolicies(t *testing.T) {
+ 			secret:         &corev1.Secret{},
+ 			allow:          true,
+ 			errs:           1,
+-
+-			opts: route.RouteValidationOptions{AllowExternalCertificates: true},
+ 		},
+ 		{
+ 			name:           "external-certificate-added-from-nil-tls-allowed-but-incorrect-secret-type",
+@@ -958,38 +898,6 @@ func TestHostWithWildcardPolicies(t *testing.T) {
+ 			},
+ 			allow: true,
+ 			errs:  1,
+-
+-			opts: route.RouteValidationOptions{AllowExternalCertificates: true},
+-		},
+-		{
+-			name:     "certificate-changed-to-external-certificate-denied-and-featuregate-is-not-set",
+-			host:     "host",
+-			expected: "host",
+-			oldHost:  "host",
+-			// if the featuregate was disabled, and ExternalCertificate wasn't previously set, apiserver will strip ExternalCertificate field.
+-			// https://github.com/openshift/openshift-apiserver/blob/1fac5e7e3a6153efae875185af2dba48fbad41ab/pkg/route/apiserver/registry/route/strategy.go#L73-L93
+-			tls:            &routeapi.TLSConfig{Termination: routeapi.TLSTerminationEdge, ExternalCertificate: nil},
+-			oldTLS:         &routeapi.TLSConfig{Termination: routeapi.TLSTerminationEdge, Certificate: "a"},
+-			wildcardPolicy: routeapi.WildcardPolicyNone,
+-			allow:          false,
+-			errs:           0,
+-
+-			opts: route.RouteValidationOptions{AllowExternalCertificates: false},
+-		},
+-		{
+-			name:     "certificate-changed-to-external-certificate-allowed-but-featuregate-is-not-set",
+-			host:     "host",
+-			expected: "host",
+-			oldHost:  "host",
+-			// if the featuregate was disabled, and ExternalCertificate wasn't previously set, apiserver will strip ExternalCertificate field.
+-			// https://github.com/openshift/openshift-apiserver/blob/1fac5e7e3a6153efae875185af2dba48fbad41ab/pkg/route/apiserver/registry/route/strategy.go#L73-L93
+-			tls:            &routeapi.TLSConfig{Termination: routeapi.TLSTerminationEdge, ExternalCertificate: nil},
+-			oldTLS:         &routeapi.TLSConfig{Termination: routeapi.TLSTerminationEdge, Certificate: "a"},
+-			wildcardPolicy: routeapi.WildcardPolicyNone,
+-			allow:          true,
+-			errs:           0,
+-
+-			opts: route.RouteValidationOptions{AllowExternalCertificates: false},
+ 		},
+ 	}
+ 
+@@ -1017,7 +925,7 @@ func TestHostWithWildcardPolicies(t *testing.T) {
+ 
+ 			sar := &testSAR{allow: tc.allow}
+ 			secretGetter := &testSecretGetter{namespace: testNamespace, secret: tc.secret}
+-			strategy := NewStrategy(testAllocator{}, sar, secretGetter, tc.opts.AllowExternalCertificates)
++			strategy := NewStrategy(testAllocator{}, sar, secretGetter)
+ 
+ 			var errs field.ErrorList
+ 			if len(tc.oldHost) > 0 || len(tc.oldSubdomain) > 0 || tc.oldTLS != nil {
+@@ -1058,65 +966,9 @@ func TestHostWithWildcardPolicies(t *testing.T) {
+ 	}
+ }
+ 
+-func TestExternalCertRemoval(t *testing.T) {
+-	ctx := apirequest.NewContext()
+-	ctx = apirequest.WithUser(ctx, &user.DefaultInfo{Name: "bob"})
+-
+-	withExternalCert := &routeapi.Route{
+-		Spec: routeapi.RouteSpec{
+-			TLS: &routeapi.TLSConfig{
+-				ExternalCertificate: &routeapi.LocalObjectReference{
+-					Name: "serving-cert",
+-				},
+-			},
+-		},
+-	}
+-
+-	{
+-		noExternalCertificates := NewStrategy(nil, nil, nil, false)
+-
+-		freshRoute := withExternalCert.DeepCopy()
+-		noExternalCertificates.PrepareForCreate(ctx, freshRoute)
+-		if freshRoute.Spec.TLS.ExternalCertificate != nil {
+-			t.Errorf("still has external cert")
+-		}
+-
+-		// cannot add external certs to routes that don't have them.
+-		freshNoCertRoute := &routeapi.Route{}
+-		freshRoute = withExternalCert.DeepCopy()
+-		noExternalCertificates.PrepareForUpdate(ctx, freshRoute, freshNoCertRoute)
+-		if freshRoute.Spec.TLS.ExternalCertificate != nil {
+-			t.Errorf("still has external cert")
+-		}
+-
+-		// routes with existing external certificates are allowed to keep them
+-		freshRoute = withExternalCert.DeepCopy()
+-		noExternalCertificates.PrepareForUpdate(ctx, freshRoute, freshRoute)
+-		if freshRoute.Spec.TLS.ExternalCertificate == nil {
+-			t.Errorf("should have external cert")
+-		}
+-	}
+-
+-	{
+-		allowExternalCertificates := NewStrategy(nil, nil, nil, true)
+-
+-		freshRoute := withExternalCert.DeepCopy()
+-		allowExternalCertificates.PrepareForCreate(ctx, freshRoute)
+-		if freshRoute.Spec.TLS.ExternalCertificate == nil {
+-			t.Errorf("should have external cert")
+-		}
+-
+-		freshRoute = withExternalCert.DeepCopy()
+-		allowExternalCertificates.PrepareForUpdate(ctx, freshRoute, freshRoute)
+-		if freshRoute.Spec.TLS.ExternalCertificate == nil {
+-			t.Errorf("should have external cert")
+-		}
+-	}
+-}
+-
+ func TestRouteGenerationManagement(t *testing.T) {
+ 	ctx := apirequest.NewContext()
+-	strategy := NewStrategy(testAllocator{}, &testSAR{allow: true}, &testSecretGetter{}, true)
++	strategy := NewStrategy(testAllocator{}, &testSAR{allow: true}, &testSecretGetter{})
+ 
+ 	simpleRoute := &routeapi.Route{}
+ 	strategy.Validate(ctx, simpleRoute)

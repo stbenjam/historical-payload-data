@@ -1,0 +1,902 @@
+diff --git a/Dockerfile.ocp b/Dockerfile.ocp
+index f95d83dcf..7aa885cef 100644
+--- a/Dockerfile.ocp
++++ b/Dockerfile.ocp
+@@ -59,7 +59,7 @@ RUN --mount=from=wheel-builder,source=/wheels,target=/wheels \
+     rm -f /bin/prepare-ipxe.sh
+ 
+ # IRONIC #
+-COPY --from=builder /tmp/uefi_esp_*.img /tmp/
++COPY --from=builder /tmp/uefi_esp_*.img /templates/
+ 
+ COPY ironic-config/ironic.conf.j2 /etc/ironic/
+ 
+@@ -74,7 +74,9 @@ COPY ironic-config/apache2-ipxe.conf.j2 /templates/httpd-ipxe.conf.j2
+ RUN set -euxo pipefail && \
+     mkdir -p /var/lib/ironic && \
+     sqlite3 /var/lib/ironic/ironic.sqlite "pragma journal_mode=wal" && \
+-    dnf remove -y sqlite
++    dnf remove -y sqlite && \
++    dnf clean all && \
++    rm -rf /var/cache/{yum,dnf}/*
+ 
+ # configure non-root user and set relevant permissions
+ RUN set -euxo pipefail && \
+diff --git a/README-OCP.md b/README-OCP.md
+index 38eb41ff6..8c22ba220 100644
+--- a/README-OCP.md
++++ b/README-OCP.md
+@@ -17,5 +17,5 @@ oc registry login
+ 
+ ## Building ironic-image
+ 
+-Once the prerequisites are satisfied, the build can be triggered by running `make` or `podman build .` inside the repo directory.
++Once the prerequisites are satisfied, the build can be triggered by running `make` or `podman build -f Dockerfile.ocp .` inside the repo directory.
+ 
+diff --git a/ironic-config/apache2-ipxe.conf.j2 b/ironic-config/apache2-ipxe.conf.j2
+index 32fb9e458..395443c4d 100644
+--- a/ironic-config/apache2-ipxe.conf.j2
++++ b/ironic-config/apache2-ipxe.conf.j2
+@@ -10,26 +10,17 @@ Listen {{ env.IPXE_TLS_PORT }}
+     SSLCertificateFile {{ env.IPXE_CERT_FILE }}
+     SSLCertificateKeyFile {{ env.IPXE_KEY_FILE }}
+ 
++    DocumentRoot "/shared/html"
+     <Directory "/shared/html">
+-        Order Allow,Deny
+-        Allow from all
++        Options Indexes FollowSymLinks
++        Require all granted
+     </Directory>
+-    <Directory "/shared/html/(redfish|ilo|images)/">
+-        Order Deny,Allow
+-        Deny from all
++    <Directory ~ "/shared/html/(redfish|ilo|images)/?">
++        Require all denied
+     </Directory>
+-</VirtualHost>
+ 
+-<Location ~ "^/grub.*/">
+-    SSLRequireSSL
+-</Location>
+-<Location ~ "^/pxelinux.cfg/">
+-    SSLRequireSSL
+-</Location>
+-<Location ~ "^/.*\.conf/">
+-    SSLRequireSSL
+-</Location>
+-<Location ~ "^/(([0-9]|[a-z]).*-){4}([0-9]|[a-z]).*/">
+-    SSLRequireSSL
+-</Location>
++    <Location ~ "^/.*">
++        SSLRequireSSL
++    </Location>
+ 
++</VirtualHost>
+diff --git a/ironic-config/apache2-vmedia.conf.j2 b/ironic-config/apache2-vmedia.conf.j2
+index a04aa9f2e..da054e27c 100644
+--- a/ironic-config/apache2-vmedia.conf.j2
++++ b/ironic-config/apache2-vmedia.conf.j2
+@@ -24,15 +24,15 @@ Listen {{ env.VMEDIA_TLS_PORT }}
+     {% endif %}
+ 
+     <Directory ~ "/shared/html">
+-         Order deny,allow
+-         deny from all
++        Require all denied
+     </Directory>
+-    <Directory ~ "/shared/html/(redfish|ilo)/">
+-         Order allow,deny
+-         allow from all
++    <Directory ~ "/shared/html/(redfish|ilo)/?">
++        Require all granted
+     </Directory>
++
++    <Location ~ "^/.*">
++        SSLRequireSSL
++    </Location>
++
+ </VirtualHost>
+ 
+-<Location ~ "^/(redfish|ilo)/">
+-    SSLRequireSSL
+-</Location>
+diff --git a/ironic-config/dnsmasq.conf.j2 b/ironic-config/dnsmasq.conf.j2
+index 5147c343e..f22699023 100644
+--- a/ironic-config/dnsmasq.conf.j2
++++ b/ironic-config/dnsmasq.conf.j2
+@@ -10,15 +10,10 @@ port={{ env.DNS_PORT }}
+ 
+ {%- if env.DHCP_RANGE | length %}
+ log-dhcp
+-dhcp-range={{ env.DHCP_RANGE }}
++{%- for item in env.DHCP_RANGE.split(";") %}
++dhcp-range={{ item }}
++{%- endfor %}
+ 
+-# It can be used when setting DNS or GW variables.
+-{%- if env["GATEWAY_IP"] is undefined %}
+-# Disable default router(s)
+-dhcp-option=3
+-{% else %}
+-dhcp-option=option{% if ":" in env["GATEWAY_IP"] %}6{% endif %}:router,{{ env["GATEWAY_IP"] }}
+-{% endif %}
+ {%- if env["DNS_IP"] is undefined %}
+ # Disable DNS over provisioning network
+ dhcp-option=6
+@@ -26,17 +21,18 @@ dhcp-option=6
+ dhcp-option=option{% if ":" in env["DNS_IP"] %}6{% endif %}:dns-server,{{ env["DNS_IP"] }}
+ {% endif %}
+ 
++{# Network boot options for IPv4 and IPv6 #}
+ {%- if env.IPV == "4" or env.IPV is undefined %}
+ # IPv4 Configuration:
+ dhcp-match=ipxe,175
+-# Client is already running iPXE; move to next stage of chainloading
+-{%- if env.IPXE_TLS_SETUP == "true"  %}
+-# iPXE with (U)EFI
+-dhcp-boot=tag:efi,tag:ipxe,http://{{ env.IRONIC_URL_HOST }}:{{ env.HTTP_PORT }}/custom-ipxe/snponly.efi
+-# iPXE with BIOS
+-dhcp-boot=tag:ipxe,http://{{ env.IRONIC_URL_HOST }}:{{ env.HTTP_PORT }}/custom-ipxe/undionly.kpxe
++
++{# Set the router or disable it. Setting router is IPv4 specific, in v6 there #}
++{# are router advertisements that do the same thing. #}
++{%- if env["GATEWAY_IP"] is undefined %}
++# Disable default router(s)
++dhcp-option=3
+ {% else %}
+-dhcp-boot=tag:ipxe,http://{{ env.IRONIC_URL_HOST }}:{{ env.HTTP_PORT }}/boot.ipxe
++dhcp-option=option:router,{{ env["GATEWAY_IP"] }}
+ {% endif %}
+ 
+ # Note: Need to test EFI booting
+@@ -44,17 +40,26 @@ dhcp-match=set:efi,option:client-arch,7
+ dhcp-match=set:efi,option:client-arch,9
+ dhcp-match=set:efi_arm,option:client-arch,11
+ 
+-# Client is PXE booting over EFI without iPXE ROM; send EFI version of iPXE chainloader do the same also if iPXE ROM boots but TLS is enabled
++# Client is PXE booting over EFI without iPXE ROM; send EFI version of iPXE
++# chainloader. Do the same if iPXE ROM boots but TLS is enabled.
+ {%- if env.IPXE_TLS_SETUP == "true"  %}
+ dhcp-boot=tag:efi,tag:ipxe,snponly.efi
+ {% endif %}
+ dhcp-boot=tag:efi,tag:!ipxe,snponly.efi
+ 
+-# Client is PXE booting over EFI without iPXE ROM; send EFI version of iPXE chainloader for aarch64
++# Client is PXE booting over EFI on aarch64 without iPXE ROM; send EFI version
++# of iPXE chainloader. Do the same if iPXE ROM boots but TLS is enabled.
++{%- if env.IPXE_TLS_SETUP == "true"  %}
++dhcp-boot=tag:efi_arm,tag:ipxe,/arm64-efi/snponly.efi
++{% endif %}
+ dhcp-boot=tag:efi_arm,tag:!ipxe,/arm64-efi/snponly.efi
+ 
+ # Client is running PXE over BIOS; send BIOS version of iPXE chainloader
+-dhcp-boot=/undionly.kpxe,{{ env.IRONIC_IP }}
++dhcp-boot=tag:!efi,tag:!efi_arm,/undionly.kpxe,{{ env.IRONIC_IP }}
++{%- if env.IPXE_TLS_SETUP != "true" %}
++# Client already has iPXE and TLS is not used; send boot script over HTTP
++dhcp-boot=tag:ipxe,http://{{ env.IRONIC_URL_HOST }}:{{ env.HTTP_PORT }}/boot.ipxe
++{% endif %}
+ {% endif %}
+ 
+ {% if env.IPV == "6" %}
+diff --git a/ironic-config/httpd-ironic-api.conf.j2 b/ironic-config/httpd-ironic-api.conf.j2
+index fe71bbfe7..9ed247487 100644
+--- a/ironic-config/httpd-ironic-api.conf.j2
++++ b/ironic-config/httpd-ironic-api.conf.j2
+@@ -19,6 +19,19 @@ Listen {{ env.IRONIC_URL_HOST }}:{{ env.IRONIC_LISTEN_PORT }}
+  <VirtualHost {{ env.IRONIC_URL_HOST }}:{{ env.IRONIC_LISTEN_PORT }}>
+ {% endif %}
+ 
++    DocumentRoot "/shared/html"
++
++    <Directory "/shared/html">
++        Require all denied
++    </Directory>
++
++    <Directory "/shared/html/images">
++        Require all granted
++    </Directory>
++
++    # Exclude /images from proxying
++    ProxyPass        "/images" !
++
+     {% if env.IRONIC_PRIVATE_PORT == "unix" %}
+     ProxyPass "/"  "unix:/shared/ironic.sock|http://127.0.0.1/"
+     ProxyPassReverse "/"  "unix:/shared/ironic.sock|http://127.0.0.1/"
+@@ -53,6 +66,7 @@ Listen {{ env.IRONIC_URL_HOST }}:{{ env.IRONIC_LISTEN_PORT }}
+     SSLCertificateKeyFile {{ env.IRONIC_KEY_FILE }}
+ {% endif %}
+ 
++
+     <Location />
+          {% if "IRONIC_HTPASSWD" in env and env.IRONIC_HTPASSWD | length %}
+             AuthType Basic
+@@ -69,4 +83,9 @@ Listen {{ env.IRONIC_URL_HOST }}:{{ env.IRONIC_LISTEN_PORT }}
+     <Location ~ "^/(v1/)?(lookup|heartbeat|continue_inspection)" >
+         Require all granted
+     </Location>
++
++    <Location ~ "^/images(/.*)?$">
++        Require all granted
++    </Location>
++
+ </VirtualHost>
+diff --git a/ironic-config/httpd.conf.j2 b/ironic-config/httpd.conf.j2
+index 1a9835ed1..f78f62a4f 100644
+--- a/ironic-config/httpd.conf.j2
++++ b/ironic-config/httpd.conf.j2
+@@ -16,18 +16,43 @@ Group apache
+ DocumentRoot "/shared/html"
+ 
+ <Directory "/shared/html">
++{%- if env.IPXE_TLS_SETUP | lower == "true" %}
+     Options Indexes FollowSymLinks
+-    AllowOverride None
++    Require all denied
++{%- else %}
++    Options Indexes FollowSymLinks
++    Require all granted
++{%- endif %}
++</Directory>
++
++<Directory ~ "/shared/html/(redfish|ilo)/?">
++{%- if env.IRONIC_VMEDIA_TLS_SETUP | lower == "true" %}
++    Require all denied
++{%- else %}
+     Require all granted
++{%- endif %}
+ </Directory>
+ 
+-{%- if env.HTTPD_SERVE_NODE_IMAGES | lower == "true" %}
++{%- set serve_img = env.HTTPD_SERVE_NODE_IMAGES | lower %}
++{%- set image_tls = env.IRONIC_TLS_SETUP | lower %}
+ <Directory "/shared/html/images">
+     Options Indexes FollowSymLinks
+     AllowOverride None
++{%- if serve_img == "true" and image_tls != "true" %}
+     Require all granted
++{%- else %}
++    Require all denied
++{%- endif %}
++
++    <FilesMatch "^ironic.*">
++{%- if env.IPXE_TLS_SETUP | lower == "true" %}
++        Require all denied
++{%- else %}
++        Require all granted
++{%- endif %}
++    </FilesMatch>
+ </Directory>
+-{% endif %}
++
+ 
+ <IfModule dir_module>
+     DirectoryIndex index.html
+diff --git a/ironic-config/inspector.ipxe.j2 b/ironic-config/inspector.ipxe.j2
+index d03869e42..32071bc3b 100644
+--- a/ironic-config/inspector.ipxe.j2
++++ b/ironic-config/inspector.ipxe.j2
+@@ -1,10 +1,81 @@
+ #!ipxe
+ 
+-:retry_boot
+ echo In inspector.ipxe
++
++{%- macro kernel_cmdline(kernel_path, ramdisk_name) -%}
++kernel --timeout 60000 {{ kernel_path }} ipa-insecure={{ env.IRONIC_IPA_INSECURE | default('1') }} ipa-inspection-collectors={{ env.IRONIC_IPA_COLLECTORS }} systemd.journald.forward_to_console={{ env.IPA_FORWARD_CONSOLE | default('yes') }} BOOTIF=${mac} ipa-debug={{ env.IRONIC_IPA_DEBUG | default('1') }} ipa-enable-vlan-interfaces={{ env.IRONIC_ENABLE_VLAN_INTERFACES }} ipa-inspection-dhcp-all-interfaces={{ env.IRONIC_IPA_INSPECTION_DHCP_ALL_INTERFACES | default('1') }} ipa-collect-lldp={{ env.IRONIC_IPA_COLLECT_LLDP | default('1') }} {{ env.INSPECTOR_EXTRA_ARGS }} initrd={{ ramdisk_name }} {% if env.IRONIC_RAMDISK_SSH_KEY %}sshkey="{{ env.IRONIC_RAMDISK_SSH_KEY|trim }}"{% endif %} {{ env.IRONIC_KERNEL_PARAMS|trim }} || goto retry_boot
++{%- endmacro -%}
++
++{% if env.DEPLOY_KERNEL_BY_ARCH is defined %}
++{#- Parse DEPLOY_KERNEL_BY_ARCH and DEPLOY_RAMDISK_BY_ARCH into dictionaries -#}
++{%- set file_url_prefix = 'file:///shared/html/' -%}
++{%- set kernel_by_arch = {} -%}
++{%- for item in env.DEPLOY_KERNEL_BY_ARCH.split(',') -%}
++{%- set arch = item.split(':')[0] -%}
++{%- set url = item.split(':', 1)[1] | replace(file_url_prefix, env.IRONIC_HTTP_URL + '/') -%}
++{%- set _ = kernel_by_arch.update({arch: url}) -%}
++{%- endfor -%}
++{%- set ramdisk_by_arch = {} -%}
++{%- for item in env.DEPLOY_RAMDISK_BY_ARCH.split(',') -%}
++{%- set arch = item.split(':')[0] -%}
++{%- set url = item.split(':', 1)[1] | replace(file_url_prefix, env.IRONIC_HTTP_URL + '/') -%}
++{%- set _ = ramdisk_by_arch.update({arch: url}) -%}
++{%- endfor -%}
++# Architecture-specific boot selection
++# NOTE: iPXE uses 'arm64' but env vars use 'aarch64'
++iseq ${buildarch} arm64 && goto arm64 ||
++iseq ${buildarch} x86_64 && goto x86_64 ||
++goto fallback
++
++:arm64
++echo Booting aarch64 IPA
++set ipa_kernel {{ kernel_by_arch.get('aarch64', '') }}
++set ipa_ramdisk {{ ramdisk_by_arch.get('aarch64', '') }}
++set ipa_ramdisk_name {{ ramdisk_by_arch.get('aarch64', '').split('/')[-1] }}
++goto boot
++
++:x86_64
++echo Booting x86_64 IPA
++set ipa_kernel {{ kernel_by_arch.get('x86_64', '') }}
++set ipa_ramdisk {{ ramdisk_by_arch.get('x86_64', '') }}
++set ipa_ramdisk_name {{ ramdisk_by_arch.get('x86_64', '').split('/')[-1] }}
++goto boot
++
++:fallback
++echo Booting fallback IPA for ${buildarch}
++{%- if env.DEPLOY_KERNEL_URL is defined %}
++set ipa_kernel {{ env.DEPLOY_KERNEL_URL | replace(file_url_prefix, env.IRONIC_HTTP_URL + '/') }}
++set ipa_ramdisk {{ env.DEPLOY_RAMDISK_URL | replace(file_url_prefix, env.IRONIC_HTTP_URL + '/') }}
++set ipa_ramdisk_name {{ env.DEPLOY_RAMDISK_URL.split('/')[-1] }}
++{%- else %}
++set ipa_kernel {{ env.IRONIC_HTTP_URL }}/images/ironic-python-agent.kernel
++set ipa_ramdisk {{ env.IRONIC_HTTP_URL }}/images/ironic-python-agent.initramfs
++set ipa_ramdisk_name ironic-python-agent.initramfs
++{%- endif %}
++goto boot
++
++:boot
++:retry_boot
++imgfree
++# NOTE(dtantsur): keep inspection kernel params in [mdns]params in
++# ironic-inspector-image and configuration in configure-ironic.sh
++{{ kernel_cmdline('${ipa_kernel}', '${ipa_ramdisk_name}') }}
++initrd --timeout 60000 ${ipa_ramdisk} || goto retry_boot
++boot
++{%- else %}
++{%- set file_url_prefix = 'file:///shared/html/' -%}
++{%- if env.DEPLOY_KERNEL_URL is defined -%}
++{%- set ipa_kernel = env.DEPLOY_KERNEL_URL | replace(file_url_prefix, env.IRONIC_HTTP_URL + '/') -%}
++{%- set ipa_ramdisk = env.DEPLOY_RAMDISK_URL | replace(file_url_prefix, env.IRONIC_HTTP_URL + '/') -%}
++{%- else -%}
++{%- set ipa_kernel = env.IRONIC_HTTP_URL + '/images/ironic-python-agent.kernel' -%}
++{%- set ipa_ramdisk = env.IRONIC_HTTP_URL + '/images/ironic-python-agent.initramfs' -%}
++{%- endif %}
++:retry_boot
+ imgfree
+ # NOTE(dtantsur): keep inspection kernel params in [mdns]params in
+-# ironic-image and configuration in configure-ironic.sh
+-kernel --timeout 60000 {{ env.IRONIC_HTTP_URL }}/images/ironic-python-agent.kernel ipa-insecure=1 ipa-inspection-collectors={{ env.IRONIC_IPA_COLLECTORS }} systemd.journald.forward_to_console=yes BOOTIF=${mac} ipa-debug=1 ipa-enable-vlan-interfaces={{ env.IRONIC_ENABLE_VLAN_INTERFACES }} ipa-inspection-dhcp-all-interfaces=1 ipa-collect-lldp=1 {{ env.INSPECTOR_EXTRA_ARGS }} initrd=ironic-python-agent.initramfs {% if env.IRONIC_RAMDISK_SSH_KEY %}sshkey="{{ env.IRONIC_RAMDISK_SSH_KEY|trim }}"{% endif %} {{ env.IRONIC_KERNEL_PARAMS|trim }} || goto retry_boot
+-initrd --timeout 60000 {{ env.IRONIC_HTTP_URL }}/images/ironic-python-agent.initramfs || goto retry_boot
++# ironic-inspector-image and configuration in configure-ironic.sh
++{{ kernel_cmdline(ipa_kernel, ipa_ramdisk.split('/')[-1]) }}
++initrd --timeout 60000 {{ ipa_ramdisk }} || goto retry_boot
+ boot
++{% endif %}
+diff --git a/ironic-config/ironic.conf.j2 b/ironic-config/ironic.conf.j2
+index 4f151d144..bff558369 100644
+--- a/ironic-config/ironic.conf.j2
++++ b/ironic-config/ironic.conf.j2
+@@ -9,19 +9,19 @@ debug = true
+ default_deploy_interface = direct
+ default_inspect_interface = agent
+ default_network_interface = noop
+-enabled_bios_interfaces = no-bios,redfish,idrac-redfish,irmc,ilo
+-enabled_boot_interfaces = ipxe,ilo-ipxe,pxe,ilo-pxe,fake,redfish-virtual-media,idrac-redfish-virtual-media,ilo-virtual-media,redfish-https
+-enabled_deploy_interfaces = direct,fake,ramdisk,custom-agent
++enabled_bios_interfaces = no-bios,redfish,idrac-redfish
++enabled_boot_interfaces = ipxe,pxe,fake,redfish-virtual-media,idrac-redfish-virtual-media,redfish-https
++enabled_deploy_interfaces = direct,fake,ramdisk,custom-agent,bootc
+ enabled_firmware_interfaces = no-firmware,fake,redfish
+ # NOTE(dtantsur): when changing this, make sure to update the driver
+-# dependencies in Dockerfile.
+-enabled_hardware_types = ipmi,idrac,irmc,fake-hardware,redfish,manual-management,ilo,ilo5
+-enabled_inspect_interfaces = agent,irmc,fake,redfish,ilo
+-enabled_management_interfaces = ipmitool,irmc,fake,redfish,idrac-redfish,ilo,ilo5,noop
++# dependencies in Dockerfile.ocp.
++enabled_hardware_types = ipmi,idrac,fake-hardware,redfish,manual-management
++enabled_inspect_interfaces = agent,fake,redfish
++enabled_management_interfaces = ipmitool,fake,redfish,idrac-redfish,noop
+ enabled_network_interfaces = noop
+-enabled_power_interfaces = ipmitool,irmc,fake,redfish,idrac-redfish,ilo
+-enabled_raid_interfaces = no-raid,irmc,agent,fake,redfish,idrac-redfish,ilo5
+-enabled_vendor_interfaces = no-vendor,ipmitool,idrac-redfish,redfish,ilo,fake
++enabled_power_interfaces = ipmitool,fake,redfish,idrac-redfish
++enabled_raid_interfaces = no-raid,agent,fake,redfish,idrac-redfish
++enabled_vendor_interfaces = no-vendor,ipmitool,idrac-redfish,redfish,fake
+ {% if env.IRONIC_EXPOSE_JSON_RPC | lower == "true" %}
+ rpc_transport = json-rpc
+ {% else %}
+@@ -91,6 +91,10 @@ api_workers = {{ env.NUMWORKERS }}
+ automated_clean = {{ env.IRONIC_AUTOMATED_CLEAN }}
+ # NOTE(dtantsur): keep aligned with [pxe]boot_retry_timeout below.
+ deploy_callback_timeout = 4800
++{% if env.BOOTLOADER is defined %}
++# Fallback bootloader when cpu_arch is not set
++bootloader = {{ env.BOOTLOADER }}
++{% endif %}
+ bootloader_by_arch = {{ env.BOOTLOADER_BY_ARCH }}
+ verify_step_priority_override = management.clear_job_queue:90
+ # We don't use this feature, and it creates an additional load on the database
+@@ -98,12 +102,14 @@ node_history = False
+ # Provide for a timeout longer than 60 seconds for certain vendor's hardware
+ power_state_change_timeout = 120
+ {% if env.DEPLOY_KERNEL_URL is defined %}
++# Fallback deploy_kernel when cpu_arch is not set
+ deploy_kernel = {{ env.DEPLOY_KERNEL_URL }}
+ {% endif %}
+ {% if env.DEPLOY_KERNEL_BY_ARCH is defined %}
+ deploy_kernel_by_arch = {{ env.DEPLOY_KERNEL_BY_ARCH }}
+ {% endif %}
+ {% if env.DEPLOY_RAMDISK_URL is defined %}
++# Fallback deploy_ramdisk when cpu_arch is not set
+ deploy_ramdisk = {{ env.DEPLOY_RAMDISK_URL }}
+ {% endif %}
+ {% if env.DEPLOY_RAMDISK_BY_ARCH is defined %}
+@@ -204,6 +210,7 @@ port = {{ env.IRONIC_JSON_RPC_PORT }}
+ auth_strategy = http_basic
+ http_basic_auth_user_file = {{ env.IRONIC_RPC_HTPASSWD_FILE }}
+ host_ip = {% if env.LISTEN_ALL_INTERFACES | lower == "true" %}::{% else %}{{ env.IRONIC_IP }}{% endif %}
++port = {{ env.IRONIC_JSON_RPC_PORT }}
+ {% if env.IRONIC_TLS_SETUP == "true" %}
+ use_ssl = true
+ cafile = {{ env.IRONIC_CACERT_FILE }}
+@@ -243,9 +250,7 @@ images_path = /shared/html/tmp
+ instance_master_path = /shared/html/master_images
+ tftp_master_path = /shared/tftpboot/master_images
+ tftp_root = /shared/tftpboot
+-# https://issues.redhat.com//browse/OCPBUGS-39536
+-# fips= is only applied it the value is 1 (see below also)
+-kernel_append_params = nofb nomodeset vga=normal ipa-insecure=1 {%if env.ENABLE_FIPS_IPA == "1"%}fips=1 {% endif %}{% if env.IRONIC_RAMDISK_SSH_KEY %}sshkey="{{ env.IRONIC_RAMDISK_SSH_KEY|trim }}"{% endif %} {{ env.IRONIC_KERNEL_PARAMS|trim }} systemd.journald.forward_to_console=yes
++kernel_append_params = nofb nomodeset vga=normal ipa-insecure=1 {% if env.ENABLE_FIPS_IPA %}fips={{ env.ENABLE_FIPS_IPA|trim }}{% endif %} {% if env.IRONIC_RAMDISK_SSH_KEY %}sshkey="{{ env.IRONIC_RAMDISK_SSH_KEY|trim }}"{% endif %} {{ env.IRONIC_KERNEL_PARAMS|trim }} systemd.journald.forward_to_console={{ env.IPA_FORWARD_CONSOLE | default('yes') }}
+ # This makes networking boot templates generated even for nodes using local
+ # boot (the default), ensuring that they boot correctly even if they start
+ # netbooting for some reason (e.g. with the noop management interface).
+@@ -258,25 +263,12 @@ ipxe_config_template = /templates/ipxe_config.template
+ 
+ [redfish]
+ use_swift = false
+-kernel_append_params = nofb nomodeset vga=normal ipa-insecure=1 {%if env.ENABLE_FIPS_IPA == "1"%}fips=1 {% endif %}{% if env.IRONIC_RAMDISK_SSH_KEY %}sshkey="{{ env.IRONIC_RAMDISK_SSH_KEY|trim }}"{% endif %} {{ env.IRONIC_KERNEL_PARAMS|trim }} systemd.journald.forward_to_console=yes
++kernel_append_params = nofb nomodeset vga=normal ipa-insecure=1 {% if env.ENABLE_FIPS_IPA %}fips={{ env.ENABLE_FIPS_IPA|trim }}{% endif %} {% if env.IRONIC_RAMDISK_SSH_KEY %}sshkey="{{ env.IRONIC_RAMDISK_SSH_KEY|trim }}"{% endif %} {{ env.IRONIC_KERNEL_PARAMS|trim }} systemd.journald.forward_to_console={{ env.IPA_FORWARD_CONSOLE | default('yes') }}
+ {% if env.BMC_TLS_ENABLED == "true" %}
+ # idrac uses the same options as the redfish driver
+ verify_ca = {{ env.BMC_CACERT_FILE }}
+ {% endif %}
+ 
+-[ilo]
+-kernel_append_params = nofb nomodeset vga=normal ipa-insecure=1 {%if env.ENABLE_FIPS_IPA == "1"%}fips=1 {% endif %}{% if env.IRONIC_RAMDISK_SSH_KEY %}sshkey="{{ env.IRONIC_RAMDISK_SSH_KEY|trim }}"{% endif %} {{ env.IRONIC_KERNEL_PARAMS|trim }} systemd.journald.forward_to_console=yes
+-use_web_server_for_images = true
+-{% if env.BMC_TLS_ENABLED == "true" %}
+-verify_ca = {{ env.BMC_CACERT_FILE }}
+-{% endif %}
+-
+-[irmc]
+-kernel_append_params = nofb nomodeset vga=normal ipa-insecure=1 {%if env.ENABLE_FIPS_IPA == "1"%}fips=1 {% endif %}{% if env.IRONIC_RAMDISK_SSH_KEY %}sshkey="{{ env.IRONIC_RAMDISK_SSH_KEY|trim }}"{% endif %} {{ env.IRONIC_KERNEL_PARAMS|trim }} systemd.journald.forward_to_console=yes
+-{% if env.BMC_TLS_ENABLED == "true" %}
+-verify_ca = {{ env.BMC_CACERT_FILE }}
+-{% endif %}
+-
+ [service_catalog]
+ endpoint_override = {{ env.IRONIC_BASE_URL }}
+ 
+@@ -285,3 +277,8 @@ endpoint_override = {{ env.IRONIC_BASE_URL }}
+ cert_file = {{ env.IRONIC_CERT_FILE }}
+ key_file = {{ env.IRONIC_KEY_FILE }}
+ {% endif %}
++
++[oci]
++{% if env.IRONIC_OCI_AUTH_CONFIG is defined %}
++authentication_config = {{ env.IRONIC_OCI_AUTH_CONFIG }}
++{% endif %}
+diff --git a/main-packages-list.ocp b/main-packages-list.ocp
+index 0014d410c..8521379b8 100644
+--- a/main-packages-list.ocp
++++ b/main-packages-list.ocp
+@@ -72,6 +72,7 @@ python3.12-pyasn1-modules >= 0.5.1-3.el9
+ python3.12-pycdlib
+ python3.12-pyghmi >= 1.5.14-2.1.el9ost
+ python3.12-pysnmp-lextudio >= 5.0.33-1.el9
++python3.12-pyyaml >= 6.0.2-2.el9ocp
+ python3.12-requests >= 2.32.3-2.el9
+ python3.12-retrying
+ python3.12-setproctitle >= 1.3.7-1
+@@ -80,10 +81,10 @@ python3.12-stevedore >= 5.4.1
+ python3.12-tooz >= 6.3.0-0.20240926164120.734acc4.el9
+ python3.12-typing-extensions >= 4.12.2-2.el9
+ python3.12-waitress >= 3.0.1-1.el9
++python3.12-watchdog
+ python3.12-webob >= 1.8.8-2.el9
+ python3.12-websockify >= 0.9.0
+ python3.12-werkzeug >= 2.2.3-3.el9
+-python3.12-pyyaml >= 6.0.2-2.el9ocp
+ python3.12-zeroconf >= 0.24.4-2.el9
+ python3.12-zipp >= 3.19.1-1.el9
+ qemu-img
+diff --git a/scripts/auth-common.sh b/scripts/auth-common.sh
+index 315038a8b..7c56d77ba 100644
+--- a/scripts/auth-common.sh
++++ b/scripts/auth-common.sh
+@@ -40,6 +40,10 @@ fi
+ 
+ IRONIC_CONFIG="${IRONIC_CONF_DIR}/ironic.conf"
+ 
++if [[ -z "${IRONIC_OCI_AUTH_CONFIG:-}" ]] && [[ -f "/auth/oci.json" ]]; then
++    export IRONIC_OCI_AUTH_CONFIG="/auth/oci.json"
++fi
++
+ configure_json_rpc_auth()
+ {
+     if [[ "${IRONIC_EXPOSE_JSON_RPC}" != "true" ]]; then
+diff --git a/scripts/configure-ironic.sh b/scripts/configure-ironic.sh
+index d1d5df68a..d88a51e1b 100755
+--- a/scripts/configure-ironic.sh
++++ b/scripts/configure-ironic.sh
+@@ -17,8 +17,6 @@ export IRONIC_ENABLE_VLAN_INTERFACES=${IRONIC_ENABLE_VLAN_INTERFACES:-all}
+ # shellcheck disable=SC1091
+ . /bin/auth-common.sh
+ 
+-export HTTP_PORT=${HTTP_PORT:-80}
+-
+ if [[ "${IRONIC_USE_MARIADB}" == true ]]; then
+     if [[ -z "${MARIADB_PASSWORD:-}" ]]; then
+         echo "FATAL: IRONIC_USE_MARIADB requires password, mount a secret under /auth/mariadb"
+@@ -63,42 +61,12 @@ if [[ -n "$IRONIC_EXTERNAL_IP" ]]; then
+     fi
+ fi
+ 
+-IMAGE_CACHE_PREFIX=/shared/html/images/ironic-python-agent
+-if [[ -z "${DEPLOY_KERNEL_URL:-}" ]] && [[ -z "${DEPLOY_RAMDISK_URL:-}" ]] && \
+-       [[ -f "${IMAGE_CACHE_PREFIX}.kernel" ]] && [[ -f "${IMAGE_CACHE_PREFIX}.initramfs" ]]; then
+-    export DEPLOY_KERNEL_URL="file://${IMAGE_CACHE_PREFIX}.kernel"
+-    export DEPLOY_RAMDISK_URL="file://${IMAGE_CACHE_PREFIX}.initramfs"
+-fi
+-
+-declare -A detected_arch
+-for var_arch in "${!DEPLOY_KERNEL_URL_@}"; do
+-    IPA_ARCH="${var_arch#DEPLOY_KERNEL_URL}"
+-    detected_arch["${IPA_ARCH,,}"]=1
+-done
+-for file_arch in "${IMAGE_CACHE_PREFIX}"_*.kernel; do
+-    if [[ -f "${file_arch}" ]]; then
+-        IPA_ARCH="$(basename "${file_arch#"${IMAGE_CACHE_PREFIX}"_}" .kernel)"
+-        detected_arch["${IPA_ARCH}"]=1
+-    fi
+-done
++# Detect IPA images by architecture
++detect_ipa_by_arch
+ 
+-DEPLOY_KERNEL_BY_ARCH=""
+-DEPLOY_RAMDISK_BY_ARCH=""
+-for IPA_ARCH in "${!detected_arch[@]}"; do
+-    kernel_var="DEPLOY_KERNEL_URL_${IPA_ARCH^^}"
+-    ramdisk_var="DEPLOY_RAMDISK_URL_${IPA_ARCH^^}"
+-    if [[ -z "${!kernel_var:-}" ]] && [[ -z "${!ramdisk_var:-}" ]] && \
+-        [[ -f "${IMAGE_CACHE_PREFIX}_${IPA_ARCH}.kernel" ]] && [[ -f "${IMAGE_CACHE_PREFIX}_${IPA_ARCH}.initramfs" ]]; then
+-      export "${kernel_var}"="file://${IMAGE_CACHE_PREFIX}_${IPA_ARCH}.kernel"
+-      export "${ramdisk_var}"="file://${IMAGE_CACHE_PREFIX}_${IPA_ARCH}.initramfs"
+-    fi
+-    DEPLOY_KERNEL_BY_ARCH+="${!kernel_var:+${IPA_ARCH}:${!kernel_var},}"
+-    DEPLOY_RAMDISK_BY_ARCH+="${!ramdisk_var:+${IPA_ARCH}:${!ramdisk_var},}"
+-done
+-if [[ -n "${DEPLOY_KERNEL_BY_ARCH}" ]] && [[ -n "${DEPLOY_RAMDISK_BY_ARCH}" ]]; then
+-    export DEPLOY_KERNEL_BY_ARCH="${DEPLOY_KERNEL_BY_ARCH%?}"
+-    export DEPLOY_RAMDISK_BY_ARCH="${DEPLOY_RAMDISK_BY_ARCH%?}"
+-fi
++# DOWNSTREAM: append CoreOS live rootfs URL to kernel params when rootfs exists
++# shellcheck disable=SC1091
++. /bin/coreos-ipa-common.sh
+ 
+ if [[ -f "${IRONIC_CONF_DIR}/ironic.conf" ]]; then
+     # Make a copy of the original supposed empty configuration file
+@@ -109,6 +77,9 @@ BOOTLOADER_BY_ARCH=""
+ for bootloader in /templates/uefi_esp_*.img; do
+     BOOTLOADER_ARCH="$(basename "${bootloader#/templates/uefi_esp_}" .img)"
+     BOOTLOADER_BY_ARCH+="${BOOTLOADER_ARCH}:file://${bootloader},"
++    if [[ -z "${BOOTLOADER:-}" ]] && [[ "$(uname -m)" == "${BOOTLOADER_ARCH}" ]]; then
++        export BOOTLOADER="file://${bootloader}"
++    fi
+ done
+ export BOOTLOADER_BY_ARCH="${BOOTLOADER_BY_ARCH%?}"
+ 
+@@ -120,10 +91,6 @@ mkdir -p /shared/html
+ mkdir -p /shared/tmp
+ mkdir -p /shared/ironic_prometheus_exporter
+ 
+-configure_json_rpc_auth
+-
+-. /bin/coreos-ipa-common.sh
+-
+ if [[ -f /proc/sys/crypto/fips_enabled ]]; then
+     ENABLE_FIPS_IPA=$(cat /proc/sys/crypto/fips_enabled)
+     export ENABLE_FIPS_IPA
+diff --git a/scripts/ironic-common.sh b/scripts/ironic-common.sh
+old mode 100755
+new mode 100644
+index 12e686000..ec98aa98b
+--- a/scripts/ironic-common.sh
++++ b/scripts/ironic-common.sh
+@@ -24,18 +24,14 @@ export IRONIC_TMP_DATA_DIR="${CUSTOM_DATA_DIR}/tmp"
+ export PROBE_CONF_DIR="${CUSTOM_CONFIG_DIR}/probes"
+ 
+ export HTTP_PORT=${HTTP_PORT:-80}
+-#NOTE(elfosardo): the default port for json_rpc in ironic is 8089, but
+-#we need to use a different port to avoid conflicts with other services
++# NOTE(elfosardo): the default port for json_rpc in ironic is 8089, but
++# we need to use a different port to avoid conflicts with other services
+ export IRONIC_JSON_RPC_PORT=${IRONIC_JSON_RPC_PORT:-6189}
+ 
+-# NOTE(elfosardo): temp hack until we have a proper way to handle the directories
+-# on the proxy container
+-set +e
+ mkdir -p "${IRONIC_CONF_DIR}" "${PROBE_CONF_DIR}" "${HTTPD_CONF_DIR}" \
+     "${HTTPD_CONF_DIR_D}" "${DNSMASQ_CONF_DIR}" "${DNSMASQ_TEMP_DIR}" \
+     "${IRONIC_DB_DIR}" "${IRONIC_GEN_CERT_DIR}" "${DNSMASQ_DATA_DIR}" \
+     "${IRONIC_TMP_DATA_DIR}"
+-set -e
+ 
+ export HTPASSWD_FILE="${IRONIC_CONF_DIR}/htpasswd"
+ export LOCAL_DB_URI="sqlite:///${IRONIC_DB_DIR}/ironic.sqlite"
+@@ -98,7 +94,6 @@ parse_ip_address()
+     ipcalc "${IP_ADDR}" | grep "^Address:" | awk '{print $2}'
+ }
+ 
+-
+ # Wait for the interface or IP to be up, sets $IRONIC_IP
+ wait_for_interface_or_ip()
+ {
+@@ -106,18 +101,28 @@ wait_for_interface_or_ip()
+     # available on an interface, otherwise we look at $PROVISIONING_INTERFACE
+     # for an IP
+     if [[ -n "${PROVISIONING_IP}" ]]; then
+-        # Convert the address using ipcalc which strips out the subnet.
+-        # For IPv6 addresses, this will give the short-form address
+-        IRONIC_IP="$(ipcalc "${PROVISIONING_IP}" | grep "^Address:" | awk '{print $2}')"
+-        export IRONIC_IP
+-        until grep -F " ${IRONIC_IP}/" <(ip -br addr show); do
+-            echo "Waiting for ${IRONIC_IP} to be configured on an interface"
++        local PARSED_IP
++        PARSED_IP="$(parse_ip_address "${PROVISIONING_IP}")"
++        if [[ -z "${PARSED_IP}" ]]; then
++            echo "ERROR: PROVISIONING_IP contains an invalid IP address, failed to start ironic"
++            exit 1
++        fi
++
++        local IFACE_OF_IP=""
++        until [[ -n "${IFACE_OF_IP}" ]]; do
++            echo "Waiting for ${PROVISIONING_IP} to be configured on an interface..."
++            IFACE_OF_IP="$(get_interface_of_ip "${PARSED_IP}")"
+             sleep 1
+         done
++
++        echo "Found ${PROVISIONING_IP} on interface \"${IFACE_OF_IP}\"!"
++
++        export PROVISIONING_INTERFACE="${IFACE_OF_IP}"
++        export IRONIC_IP="${PARSED_IP}"
+     else
+         until [[ -n "$IRONIC_IP" ]]; do
+             echo "Waiting for ${PROVISIONING_INTERFACE} interface to be configured"
+-            IRONIC_IP="$(ip -br add show scope global up dev "${PROVISIONING_INTERFACE}" | awk '{print $3}' | sed -e 's%/.*%%' | head -n 1)"
++            IRONIC_IP="$(ip -br addr show scope global up dev "${PROVISIONING_INTERFACE}" | awk '{print $3}' | sed -e 's%/.*%%' | head -n 1)"
+             export IRONIC_IP
+             sleep 1
+         done
+@@ -174,3 +179,57 @@ export IRONIC_ACCESS_PORT=${IRONIC_ACCESS_PORT:-6385}
+ export IRONIC_LISTEN_PORT=${IRONIC_LISTEN_PORT:-$IRONIC_ACCESS_PORT}
+ 
+ export IRONIC_ENABLE_DISCOVERY=${IRONIC_ENABLE_DISCOVERY:-false}
++
++# Detect and export IPA images by architecture
++# Sets DEPLOY_KERNEL_BY_ARCH and DEPLOY_RAMDISK_BY_ARCH
++detect_ipa_by_arch()
++{
++    local IMAGE_CACHE_PREFIX=/shared/html/images/ironic-python-agent
++
++    # Single-arch fallback: use generic names if no arch-specific config
++    if [[ -z "${DEPLOY_KERNEL_URL:-}" ]] && [[ -z "${DEPLOY_RAMDISK_URL:-}" ]] && \
++           [[ -f "${IMAGE_CACHE_PREFIX}.kernel" ]] && [[ -f "${IMAGE_CACHE_PREFIX}.initramfs" ]]; then
++        export DEPLOY_KERNEL_URL="file://${IMAGE_CACHE_PREFIX}.kernel"
++        export DEPLOY_RAMDISK_URL="file://${IMAGE_CACHE_PREFIX}.initramfs"
++    fi
++
++    # If DEPLOY_KERNEL_BY_ARCH and DEPLOY_RAMDISK_BY_ARCH are already set, preserve them
++    if [[ -n "${DEPLOY_KERNEL_BY_ARCH:-}" ]] && [[ -n "${DEPLOY_RAMDISK_BY_ARCH:-}" ]]; then
++        export DEPLOY_KERNEL_BY_ARCH
++        export DEPLOY_RAMDISK_BY_ARCH
++        return
++    fi
++
++    # Detect architectures from env vars (DEPLOY_KERNEL_URL_<ARCH>) and files
++    declare -A detected_arch
++    for var_arch in "${!DEPLOY_KERNEL_URL_@}"; do
++        local IPA_ARCH="${var_arch#DEPLOY_KERNEL_URL_}"
++        detected_arch["${IPA_ARCH,,}"]=1
++    done
++    for file_arch in "${IMAGE_CACHE_PREFIX}"_*.kernel; do
++        if [[ -f "${file_arch}" ]]; then
++            local IPA_ARCH
++            IPA_ARCH="$(basename "${file_arch#"${IMAGE_CACHE_PREFIX}"_}" .kernel)"
++            detected_arch["${IPA_ARCH}"]=1
++        fi
++    done
++
++    # Build DEPLOY_KERNEL_BY_ARCH and DEPLOY_RAMDISK_BY_ARCH from detected architectures
++    DEPLOY_KERNEL_BY_ARCH=""
++    DEPLOY_RAMDISK_BY_ARCH=""
++    for IPA_ARCH in "${!detected_arch[@]}"; do
++        local kernel_var="DEPLOY_KERNEL_URL_${IPA_ARCH^^}"
++        local ramdisk_var="DEPLOY_RAMDISK_URL_${IPA_ARCH^^}"
++        if [[ -z "${!kernel_var:-}" ]] && [[ -z "${!ramdisk_var:-}" ]] && \
++            [[ -f "${IMAGE_CACHE_PREFIX}_${IPA_ARCH}.kernel" ]] && [[ -f "${IMAGE_CACHE_PREFIX}_${IPA_ARCH}.initramfs" ]]; then
++          export "${kernel_var}"="file://${IMAGE_CACHE_PREFIX}_${IPA_ARCH}.kernel"
++          export "${ramdisk_var}"="file://${IMAGE_CACHE_PREFIX}_${IPA_ARCH}.initramfs"
++        fi
++        DEPLOY_KERNEL_BY_ARCH+="${!kernel_var:+${IPA_ARCH}:${!kernel_var},}"
++        DEPLOY_RAMDISK_BY_ARCH+="${!ramdisk_var:+${IPA_ARCH}:${!ramdisk_var},}"
++    done
++    if [[ -n "${DEPLOY_KERNEL_BY_ARCH}" ]] && [[ -n "${DEPLOY_RAMDISK_BY_ARCH}" ]]; then
++        export DEPLOY_KERNEL_BY_ARCH="${DEPLOY_KERNEL_BY_ARCH%?}"
++        export DEPLOY_RAMDISK_BY_ARCH="${DEPLOY_RAMDISK_BY_ARCH%?}"
++    fi
++}
+diff --git a/scripts/rundnsmasq b/scripts/rundnsmasq
+index 378c0f7c0..d6c4f194e 100755
+--- a/scripts/rundnsmasq
++++ b/scripts/rundnsmasq
+@@ -7,7 +7,6 @@ set -eux
+ # shellcheck disable=SC1091
+ . /bin/tls-common.sh
+ 
+-export HTTP_PORT=${HTTP_PORT:-80}
+ DNSMASQ_EXCEPT_INTERFACE=${DNSMASQ_EXCEPT_INTERFACE:-lo}
+ export DNS_PORT=${DNS_PORT:-0}
+ 
+@@ -23,13 +22,14 @@ fi
+ mkdir -p /shared/tftpboot
+ mkdir -p /shared/tftpboot/arm64-efi
+ mkdir -p /shared/html/images
+-mkdir -p /shared/html/pxelinux.cfg
+ 
+ # Copy files to shared mount
+ if [[ -r "${IPXE_CUSTOM_FIRMWARE_DIR}" ]]; then
+     cp "${IPXE_CUSTOM_FIRMWARE_DIR}/undionly.kpxe" \
+         "${IPXE_CUSTOM_FIRMWARE_DIR}/snponly.efi" \
+         "/shared/tftpboot"
++    cp "${IPXE_CUSTOM_FIRMWARE_DIR}/arm64-efi/snponly.efi" \
++        "/shared/tftpboot/arm64-efi"
+ else
+     cp /tftpboot/undionly.kpxe /tftpboot/snponly.efi /shared/tftpboot
+     cp /tftpboot/arm64-efi/snponly.efi /shared/tftpboot/arm64-efi
+diff --git a/scripts/runhealthcheck b/scripts/runhealthcheck
+deleted file mode 100755
+index bf8233461..000000000
+--- a/scripts/runhealthcheck
++++ /dev/null
+@@ -1,9 +0,0 @@
+-#!/bin/bash
+-set -ex
+-
+-. /bin/ironic-common.sh
+-get_ironic_ip
+-#If the IP is not set, we are not running yet
+-[ -z $IRONIC_IP ] && exit 1
+-
+-curl -s http://${IRONIC_URL_HOST}:5050
+diff --git a/scripts/runhttpd b/scripts/runhttpd
+index d8f9ef9a2..ac096e1bc 100755
+--- a/scripts/runhttpd
++++ b/scripts/runhttpd
+@@ -5,7 +5,6 @@
+ . /bin/ironic-common.sh
+ . /bin/auth-common.sh
+ 
+-export HTTP_PORT=${HTTP_PORT:-80}
+ export VMEDIA_TLS_PORT=${VMEDIA_TLS_PORT:-8083}
+ 
+ export IRONIC_REVERSE_PROXY_SETUP=${IRONIC_REVERSE_PROXY_SETUP:-false}
+@@ -35,6 +34,10 @@ if [[ "$IRONIC_FAST_TRACK" == "true" ]]; then
+ fi
+ export INSPECTOR_EXTRA_ARGS
+ 
++# Detect IPA images by architecture for inspector.ipxe
++detect_ipa_by_arch
++
++# DOWNSTREAM: append CoreOS live rootfs URL to kernel params when rootfs exists
+ # shellcheck disable=SC1091
+ . /bin/coreos-ipa-common.sh
+ 
+diff --git a/scripts/runlogwatch.sh b/scripts/runlogwatch.sh
+index 9dec96c46..95cec2c6e 100755
+--- a/scripts/runlogwatch.sh
++++ b/scripts/runlogwatch.sh
+@@ -1,21 +1,31 @@
+ #!/usr/bin/bash
+ 
+ # Ramdisk logs path
+-LOG_DIR="/shared/log/ironic/deploy"
++export LOG_DIR="/shared/log/ironic/deploy"
+ 
+ mkdir -p "${LOG_DIR}"
+ 
+-# shellcheck disable=SC2034
+-python3.12 -m pyinotify --raw-format -e IN_CLOSE_WRITE -v "${LOG_DIR}" |
+-    while read -r event dir mask maskname filename filepath pathname wd; do
+-        #NOTE(elfosardo): a pyinotify event looks like this:
+-        # <Event dir=False mask=0x8 maskname=IN_CLOSE_WRITE name=mylogs.gzip path=/shared/log/ironic/deploy pathname=/shared/log/ironic/deploy/mylogs.gzip wd=1 >
+-        FILENAME=$(echo "${filename}" | cut -d'=' -f2-)
+-        echo "************ Contents of ${LOG_DIR}/${FILENAME} ramdisk log file bundle **************"
+-        tar -tzf "${LOG_DIR}/${FILENAME}" | while read -r entry; do
+-            echo "${FILENAME}: **** Entry: ${entry} ****"
+-            tar -xOzf "${LOG_DIR}/${FILENAME}" "${entry}" | sed -e "s/^/${FILENAME}: /"
+-            echo
+-        done
+-        rm -f "${LOG_DIR}/${FILENAME}"
++# Function to process log files
++process_log_file() {
++    local FILEPATH="$1"
++    # shellcheck disable=SC2155
++    local FILENAME=$(basename "${FILEPATH}")
++
++    echo "************ Contents of ${LOG_DIR}/${FILENAME} ramdisk log file bundle **************"
++    tar -tzf "${FILEPATH}" | while read -r entry; do
++        echo "${FILENAME}: **** Entry: ${entry} ****"
++        tar -xOzf "${FILEPATH}" "${entry}" | sed -e "s/^/${FILENAME}: /"
++        echo
+     done
++    rm -f "${FILEPATH}"
++}
++
++# Export the function so watchmedo can use it
++export -f process_log_file
++
++# shellcheck disable=SC2016
++watchmedo shell-command \
++    --patterns="*" \
++    --ignore-directories \
++    --command='if [[ "${watch_event_type}" == "closed" ]]; then process_log_file "${watch_src_path}"; fi' \
++    "${LOG_DIR}"
+diff --git a/scripts/tls-common.sh b/scripts/tls-common.sh
+index 20b2d2877..723133e9c 100644
+--- a/scripts/tls-common.sh
++++ b/scripts/tls-common.sh
+@@ -1,13 +1,14 @@
+ #!/bin/bash
+ 
+-export IRONIC_CERT_FILE=/certs/ironic/tls.crt
+-export IRONIC_KEY_FILE=/certs/ironic/tls.key
+-export IRONIC_CACERT_FILE=/certs/ca/ironic/tls.crt
+ export IRONIC_INSECURE=${IRONIC_INSECURE:-false}
+ export IRONIC_SSL_PROTOCOL=${IRONIC_SSL_PROTOCOL:-"-ALL +TLSv1.2 +TLSv1.3"}
+ export IPXE_SSL_PROTOCOL=${IPXE_SSL_PROTOCOL:-"-ALL +TLSv1.2 +TLSv1.3"}
+ export IRONIC_VMEDIA_SSL_PROTOCOL=${IRONIC_VMEDIA_SSL_PROTOCOL:-"ALL"}
+ 
++# Node image storage is using the same cert and port as the API
++export IRONIC_CERT_FILE=/certs/ironic/tls.crt
++export IRONIC_KEY_FILE=/certs/ironic/tls.key
++
+ export IRONIC_VMEDIA_CERT_FILE=/certs/vmedia/tls.crt
+ export IRONIC_VMEDIA_KEY_FILE=/certs/vmedia/tls.key
+ 
+@@ -16,9 +17,12 @@ export IPXE_KEY_FILE=/certs/ipxe/tls.key
+ 
+ export RESTART_CONTAINER_CERTIFICATE_UPDATED=${RESTART_CONTAINER_CERTIFICATE_UPDATED:-"false"}
+ 
++# By default every cert has to be signed with Ironic's
++# CA otherwise node image and IPA verification would fail
+ export MARIADB_CACERT_FILE=/certs/ca/mariadb/tls.crt
+ export BMC_CACERTS_PATH=/certs/ca/bmc
+ export BMC_CACERT_FILE=/conf/bmc-tls.pem
++export IRONIC_CACERT_FILE=/certs/ca/ironic/tls.crt
+ 
+ export IPXE_TLS_PORT="${IPXE_TLS_PORT:-8084}"
+ 
+@@ -105,12 +109,16 @@ configure_restart_on_certificate_update()
+ 
+     if [[ "${enabled}" == "true" ]] && [[ "${RESTART_CONTAINER_CERTIFICATE_UPDATED}" == "true" ]]; then
+         if [[ "${service}" == httpd ]]; then
++            # shellcheck disable=SC2034
+             signal="WINCH"
+         fi
+-        python3.12 -m pyinotify --raw-format -e IN_DELETE_SELF -v "${cert_file}" |
+-            while read -r; do
+-                pkill "-${signal}" "${service}"
+-            done &
++
++        # shellcheck disable=SC2016
++        watchmedo shell-command \
++            --patterns="$(basename "${cert_file}")" \
++            --ignore-directories \
++            --command='if [[ "${watch_event_type}" == "deleted" ]]; then pkill -'"${signal}"' '"${service}"'; fi' \
++            "$(dirname "${cert_file}")" &
+     fi
+ }
+ 

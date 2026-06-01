@@ -1,0 +1,735 @@
+diff --git a/provisioning/baremetal_crypto.go b/provisioning/baremetal_crypto.go
+index e3ff04e24..2d1a40479 100644
+--- a/provisioning/baremetal_crypto.go
++++ b/provisioning/baremetal_crypto.go
+@@ -17,6 +17,7 @@ package provisioning
+ 
+ import (
+ 	"crypto/rand"
++	"fmt"
+ 	"math/big"
+ 	"time"
+ 
+@@ -53,7 +54,11 @@ func generateRandomPassword() (string, error) {
+ 	return string(buf), nil
+ }
+ 
+-func generateTlsCertificate(provisioningIP string) (TlsCertificate, error) {
++func generateTlsCertificate(hosts sets.Set[string]) (TlsCertificate, error) {
++	if hosts.Len() == 0 {
++		return TlsCertificate{}, fmt.Errorf("at least one Subject Alternative Name (SAN) host is required for TLS certificate generation")
++	}
++
+ 	caConfig, err := crypto.MakeSelfSignedCAConfig("metal3-ironic", tlsExpiration)
+ 	if err != nil {
+ 		return TlsCertificate{}, err
+@@ -64,15 +69,7 @@ func generateTlsCertificate(provisioningIP string) (TlsCertificate, error) {
+ 		SerialGenerator: &crypto.RandomSerialGenerator{},
+ 	}
+ 
+-	var host string
+-	if provisioningIP == "" {
+-		host = "localhost"
+-	} else {
+-		host = provisioningIP
+-	}
+-
+-	config, err := ca.MakeServerCert(sets.New(host), tlsExpiration)
+-
++	config, err := ca.MakeServerCert(hosts, tlsExpiration)
+ 	if err != nil {
+ 		return TlsCertificate{}, err
+ 	}
+@@ -103,3 +100,26 @@ func isTlsCertificateExpired(certificate []byte) (bool, error) {
+ 
+ 	return false, nil
+ }
++
++// tlsCertificateSANsMatch checks whether the SANs in the existing certificate
++// match the expected hosts. Returns false if they differ (certificate is stale).
++func tlsCertificateSANsMatch(certificate []byte, expectedHosts sets.Set[string]) (bool, error) {
++	certs, err := cert.ParseCertsPEM(certificate)
++	if err != nil {
++		return false, err
++	}
++	if len(certs) == 0 {
++		return false, nil
++	}
++
++	serverCert := certs[0]
++	certHosts := sets.New[string]()
++	for _, name := range serverCert.DNSNames {
++		certHosts.Insert(name)
++	}
++	for _, ip := range serverCert.IPAddresses {
++		certHosts.Insert(ip.String())
++	}
++
++	return certHosts.Equal(expectedHosts), nil
++}
+diff --git a/provisioning/baremetal_crypto_test.go b/provisioning/baremetal_crypto_test.go
+index bc682971f..bdd9b430d 100644
+--- a/provisioning/baremetal_crypto_test.go
++++ b/provisioning/baremetal_crypto_test.go
+@@ -1,11 +1,27 @@
+ package provisioning
+ 
+ import (
++	"net"
+ 	"testing"
+ 
+ 	"github.com/stretchr/testify/assert"
++	"github.com/stretchr/testify/require"
++	"k8s.io/apimachinery/pkg/util/sets"
++	"k8s.io/client-go/util/cert"
+ )
+ 
++// containsIP checks if the given IP list contains an IP that matches the target,
++// handling the difference between 4-byte and 16-byte IPv4 representations.
++func containsIP(ips []net.IP, target string) bool {
++	targetIP := net.ParseIP(target)
++	for _, ip := range ips {
++		if ip.Equal(targetIP) {
++			return true
++		}
++	}
++	return false
++}
++
+ func TestGenerateRandomPassword(t *testing.T) {
+ 	pwd1, err := generateRandomPassword()
+ 	if err != nil {
+@@ -23,15 +39,15 @@ func TestGenerateRandomPassword(t *testing.T) {
+ }
+ 
+ func TestGenerateTlsCertificate(t *testing.T) {
+-	cert, err := generateTlsCertificate("")
++	tlsCert, err := generateTlsCertificate(sets.New("localhost"))
+ 	if err != nil {
+ 		t.Errorf("Unexpected error while generating a certificate: %s", err)
+ 	} else {
+-		assert.NotEqual(t, cert.certificate, "", "empty certificate")
+-		assert.NotEqual(t, cert.privateKey, "", "empty private key")
++		assert.NotEmpty(t, tlsCert.certificate, "empty certificate")
++		assert.NotEmpty(t, tlsCert.privateKey, "empty private key")
+ 	}
+ 
+-	expired, err := isTlsCertificateExpired(cert.certificate)
++	expired, err := isTlsCertificateExpired(tlsCert.certificate)
+ 	if err != nil {
+ 		t.Errorf("Unexpected error while checking a certificate: %s", err)
+ 	} else {
+@@ -40,18 +56,216 @@ func TestGenerateTlsCertificate(t *testing.T) {
+ }
+ 
+ func TestGenerateTlsCertificateWithHost(t *testing.T) {
+-	cert, err := generateTlsCertificate("127.0.0.1")
++	tlsCert, err := generateTlsCertificate(sets.New("127.0.0.1"))
+ 	if err != nil {
+ 		t.Errorf("Unexpected error while generating a certificate: %s", err)
+ 	} else {
+-		assert.NotEqual(t, cert.certificate, "", "empty certificate")
+-		assert.NotEqual(t, cert.privateKey, "", "empty private key")
++		assert.NotEmpty(t, tlsCert.certificate, "empty certificate")
++		assert.NotEmpty(t, tlsCert.privateKey, "empty private key")
+ 	}
+ 
+-	expired, err := isTlsCertificateExpired(cert.certificate)
++	expired, err := isTlsCertificateExpired(tlsCert.certificate)
+ 	if err != nil {
+ 		t.Errorf("Unexpected error while checking a certificate: %s", err)
+ 	} else {
+ 		assert.False(t, expired, "new certificate is already expired")
+ 	}
+ }
++
++func TestGenerateTlsCertificateEmptyHosts(t *testing.T) {
++	_, err := generateTlsCertificate(sets.New[string]())
++	require.Error(t, err, "expected error for empty hosts")
++	assert.Contains(t, err.Error(), "at least one Subject Alternative Name (SAN) host is required")
++}
++
++func TestGenerateTlsCertificateServiceHostnames(t *testing.T) {
++	hosts := sets.New(
++		"metal3-state.openshift-machine-api.svc",
++		"metal3-state.openshift-machine-api.svc.cluster.local",
++	)
++
++	tlsCert, err := generateTlsCertificate(hosts)
++	require.NoError(t, err)
++
++	certs, err := cert.ParseCertsPEM(tlsCert.certificate)
++	require.NoError(t, err)
++	require.NotEmpty(t, certs, "expected at least one certificate")
++
++	serverCert := certs[0]
++
++	assert.Contains(t, serverCert.DNSNames, "metal3-state.openshift-machine-api.svc",
++		"certificate should contain short service hostname")
++	assert.Contains(t, serverCert.DNSNames, "metal3-state.openshift-machine-api.svc.cluster.local",
++		"certificate should contain FQDN service hostname")
++}
++
++func TestGenerateTlsCertificateWithProvisioningIP(t *testing.T) {
++	hosts := sets.New(
++		"metal3-state.openshift-machine-api.svc",
++		"metal3-state.openshift-machine-api.svc.cluster.local",
++		"172.22.0.3",
++	)
++
++	tlsCert, err := generateTlsCertificate(hosts)
++	require.NoError(t, err)
++
++	certs, err := cert.ParseCertsPEM(tlsCert.certificate)
++	require.NoError(t, err)
++	require.NotEmpty(t, certs)
++
++	serverCert := certs[0]
++
++	assert.True(t, containsIP(serverCert.IPAddresses, "172.22.0.3"),
++		"certificate should contain provisioning IP")
++	assert.Contains(t, serverCert.DNSNames, "metal3-state.openshift-machine-api.svc",
++		"certificate should contain short service hostname")
++	assert.Contains(t, serverCert.DNSNames, "metal3-state.openshift-machine-api.svc.cluster.local",
++		"certificate should contain FQDN service hostname")
++}
++
++func TestGenerateTlsCertificateWithExternalIPs(t *testing.T) {
++	hosts := sets.New(
++		"metal3-state.openshift-machine-api.svc",
++		"metal3-state.openshift-machine-api.svc.cluster.local",
++		"172.22.0.3",
++		"10.0.0.5",
++		"10.0.0.6",
++	)
++
++	tlsCert, err := generateTlsCertificate(hosts)
++	require.NoError(t, err)
++
++	certs, err := cert.ParseCertsPEM(tlsCert.certificate)
++	require.NoError(t, err)
++	require.NotEmpty(t, certs)
++
++	serverCert := certs[0]
++
++	assert.True(t, containsIP(serverCert.IPAddresses, "172.22.0.3"),
++		"certificate should contain provisioning IP")
++	assert.True(t, containsIP(serverCert.IPAddresses, "10.0.0.5"),
++		"certificate should contain first external IP")
++	assert.True(t, containsIP(serverCert.IPAddresses, "10.0.0.6"),
++		"certificate should contain second external IP")
++}
++
++func TestGenerateTlsCertificateWithAPIVIPs(t *testing.T) {
++	hosts := sets.New(
++		"metal3-state.openshift-machine-api.svc",
++		"metal3-state.openshift-machine-api.svc.cluster.local",
++		"localhost",
++		"192.168.1.100",
++	)
++
++	tlsCert, err := generateTlsCertificate(hosts)
++	require.NoError(t, err)
++
++	certs, err := cert.ParseCertsPEM(tlsCert.certificate)
++	require.NoError(t, err)
++	require.NotEmpty(t, certs)
++
++	serverCert := certs[0]
++
++	assert.True(t, containsIP(serverCert.IPAddresses, "192.168.1.100"),
++		"certificate should contain API VIP")
++	assert.Contains(t, serverCert.DNSNames, "localhost",
++		"certificate should contain localhost")
++	assert.Contains(t, serverCert.DNSNames, "metal3-state.openshift-machine-api.svc",
++		"certificate should contain short service hostname")
++}
++
++func TestGenerateTlsCertificateAllSANs(t *testing.T) {
++	hosts := sets.New(
++		"metal3-state.openshift-machine-api.svc",
++		"metal3-state.openshift-machine-api.svc.cluster.local",
++		"172.22.0.3",
++		"10.0.0.5",
++		"192.168.1.100",
++		"192.168.1.101",
++	)
++
++	tlsCert, err := generateTlsCertificate(hosts)
++	require.NoError(t, err)
++
++	certs, err := cert.ParseCertsPEM(tlsCert.certificate)
++	require.NoError(t, err)
++	require.NotEmpty(t, certs)
++
++	serverCert := certs[0]
++
++	// Verify DNS SANs
++	assert.Contains(t, serverCert.DNSNames, "metal3-state.openshift-machine-api.svc",
++		"certificate should contain short service hostname")
++	assert.Contains(t, serverCert.DNSNames, "metal3-state.openshift-machine-api.svc.cluster.local",
++		"certificate should contain FQDN service hostname")
++
++	// Verify IP SANs
++	assert.True(t, containsIP(serverCert.IPAddresses, "172.22.0.3"),
++		"certificate should contain provisioning IP")
++	assert.True(t, containsIP(serverCert.IPAddresses, "10.0.0.5"),
++		"certificate should contain external IP")
++	assert.True(t, containsIP(serverCert.IPAddresses, "192.168.1.100"),
++		"certificate should contain first API VIP")
++	assert.True(t, containsIP(serverCert.IPAddresses, "192.168.1.101"),
++		"certificate should contain second API VIP")
++
++	// Verify the certificate is not expired
++	expired, err := isTlsCertificateExpired(tlsCert.certificate)
++	require.NoError(t, err)
++	assert.False(t, expired, "new certificate should not be expired")
++}
++
++func TestTlsCertificateSANsMatch(t *testing.T) {
++	hosts := sets.New(
++		"metal3-state.openshift-machine-api.svc",
++		"metal3-state.openshift-machine-api.svc.cluster.local",
++		"172.22.0.3",
++	)
++
++	tlsCert, err := generateTlsCertificate(hosts)
++	require.NoError(t, err)
++
++	match, err := tlsCertificateSANsMatch(tlsCert.certificate, hosts)
++	require.NoError(t, err)
++	assert.True(t, match, "SANs should match the hosts used to generate the certificate")
++}
++
++func TestTlsCertificateSANsMismatchExtraHost(t *testing.T) {
++	originalHosts := sets.New(
++		"metal3-state.openshift-machine-api.svc",
++		"172.22.0.3",
++	)
++
++	tlsCert, err := generateTlsCertificate(originalHosts)
++	require.NoError(t, err)
++
++	newHosts := sets.New(
++		"metal3-state.openshift-machine-api.svc",
++		"172.22.0.3",
++		"10.0.0.5",
++	)
++
++	match, err := tlsCertificateSANsMatch(tlsCert.certificate, newHosts)
++	require.NoError(t, err)
++	assert.False(t, match, "SANs should not match when new hosts are added")
++}
++
++func TestTlsCertificateSANsMismatchRemovedHost(t *testing.T) {
++	originalHosts := sets.New(
++		"metal3-state.openshift-machine-api.svc",
++		"172.22.0.3",
++		"10.0.0.5",
++	)
++
++	tlsCert, err := generateTlsCertificate(originalHosts)
++	require.NoError(t, err)
++
++	reducedHosts := sets.New(
++		"metal3-state.openshift-machine-api.svc",
++		"172.22.0.3",
++	)
++
++	match, err := tlsCertificateSANsMatch(tlsCert.certificate, reducedHosts)
++	require.NoError(t, err)
++	assert.False(t, match, "SANs should not match when hosts are removed")
++}
+diff --git a/provisioning/baremetal_secrets.go b/provisioning/baremetal_secrets.go
+index 655660f9a..ffcb38639 100644
+--- a/provisioning/baremetal_secrets.go
++++ b/provisioning/baremetal_secrets.go
+@@ -15,6 +15,8 @@ import (
+ 	"sigs.k8s.io/controller-runtime/pkg/client"
+ 	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
+ 
++	"k8s.io/apimachinery/pkg/util/sets"
++
+ 	"github.com/openshift/api/annotations"
+ 	"github.com/openshift/library-go/pkg/operator/events"
+ 	"github.com/openshift/library-go/pkg/operator/resource/resourceapply"
+@@ -176,10 +178,58 @@ func DeleteAllSecrets(info *ProvisioningInfo) error {
+ 	return utilerrors.NewAggregate(secretErrors)
+ }
+ 
++// defaultClusterDomain is the default Kubernetes cluster domain suffix.
++const defaultClusterDomain = "cluster.local"
++
++// buildTlsHosts builds the complete set of Subject Alternative Names (SANs)
++// for the Ironic TLS certificate based on the cluster topology.
++func buildTlsHosts(info *ProvisioningInfo) (sets.Set[string], error) {
++	hosts := sets.New[string]()
++
++	// Service hostnames (always included for in-cluster access)
++	hosts.Insert(fmt.Sprintf("%s.%s.svc", stateService, info.Namespace))
++	hosts.Insert(fmt.Sprintf("%s.%s.svc.%s", stateService, info.Namespace, defaultClusterDomain))
++
++	// Provisioning IP
++	if info.ProvConfig.Spec.ProvisioningIP != "" {
++		hosts.Insert(info.ProvConfig.Spec.ProvisioningIP)
++	}
++
++	// External IPs for external access
++	for _, ip := range info.ProvConfig.Spec.ExternalIPs {
++		if ip != "" {
++			hosts.Insert(ip)
++		}
++	}
++
++	// Ironic-proxy service hostnames and API server internal IPs
++	if UseIronicProxy(info) {
++		hosts.Insert(fmt.Sprintf("%s.%s.svc", ironicProxyService, info.Namespace))
++		hosts.Insert(fmt.Sprintf("%s.%s.svc.%s", ironicProxyService, info.Namespace, defaultClusterDomain))
++
++		if info.OSClient != nil {
++			apiVIPs, err := getServerInternalIPs(info.OSClient)
++			if err != nil {
++				return nil, fmt.Errorf("failed to get API server internal IPs for TLS SANs: %w", err)
++			}
++			for _, ip := range apiVIPs {
++				hosts.Insert(ip)
++			}
++		}
++	}
++
++	return hosts, nil
++}
++
+ // createOrUpdateTlsSecret creates a Secret for the Ironic TLS.
+ // It updates the secret if the existing certificate is close to expiration.
+ func createOrUpdateTlsSecret(info *ProvisioningInfo) error {
+-	cert, err := generateTlsCertificate(info.ProvConfig.Spec.ProvisioningIP)
++	hosts, err := buildTlsHosts(info)
++	if err != nil {
++		return err
++	}
++
++	cert, err := generateTlsCertificate(hosts)
+ 	if err != nil {
+ 		return err
+ 	}
+@@ -207,6 +257,14 @@ func createOrUpdateTlsSecret(info *ProvisioningInfo) error {
+ 		if err != nil {
+ 			return false, err
+ 		}
+-		return expired, nil
++		if expired {
++			return true, nil
++		}
++
++		sansMatch, err := tlsCertificateSANsMatch(existing.Data[corev1.TLSCertKey], hosts)
++		if err != nil {
++			return false, err
++		}
++		return !sansMatch, nil
+ 	})
+ }
+diff --git a/provisioning/baremetal_secrets_test.go b/provisioning/baremetal_secrets_test.go
+index a6fe3b037..9afabaf79 100644
+--- a/provisioning/baremetal_secrets_test.go
++++ b/provisioning/baremetal_secrets_test.go
+@@ -10,6 +10,7 @@ import (
+ 	"testing"
+ 
+ 	"github.com/stretchr/testify/assert"
++	"github.com/stretchr/testify/require"
+ 	corev1 "k8s.io/api/core/v1"
+ 	apierrors "k8s.io/apimachinery/pkg/api/errors"
+ 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+@@ -21,6 +22,8 @@ import (
+ 	"k8s.io/utils/clock"
+ 	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
+ 
++	osconfigv1 "github.com/openshift/api/config/v1"
++	fakeconfigclientset "github.com/openshift/client-go/config/clientset/versioned/fake"
+ 	metal3iov1alpha1 "github.com/openshift/cluster-baremetal-operator/api/v1alpha1"
+ 	"github.com/openshift/library-go/pkg/operator/events"
+ )
+@@ -390,3 +393,252 @@ func secretStringDataToData(secret *corev1.Secret) {
+ 		delete(secret.StringData, k)
+ 	}
+ }
++
++func TestBuildTlsHosts(t *testing.T) {
++	cases := []struct {
++		name          string
++		info          *ProvisioningInfo
++		expectedHosts []string
++		expectError   bool
++	}{
++		{
++			name: "no-provisioning-ip",
++			info: &ProvisioningInfo{
++				Namespace: "openshift-machine-api",
++				ProvConfig: &metal3iov1alpha1.Provisioning{
++					Spec: metal3iov1alpha1.ProvisioningSpec{},
++				},
++			},
++			expectedHosts: []string{
++				"metal3-state.openshift-machine-api.svc",
++				"metal3-state.openshift-machine-api.svc.cluster.local",
++			},
++		},
++		{
++			name: "with-provisioning-ip",
++			info: &ProvisioningInfo{
++				Namespace: "openshift-machine-api",
++				ProvConfig: &metal3iov1alpha1.Provisioning{
++					Spec: metal3iov1alpha1.ProvisioningSpec{
++						ProvisioningIP:      "172.22.0.3",
++						ProvisioningNetwork: metal3iov1alpha1.ProvisioningNetworkManaged,
++					},
++				},
++			},
++			expectedHosts: []string{
++				"metal3-state.openshift-machine-api.svc",
++				"metal3-state.openshift-machine-api.svc.cluster.local",
++				"172.22.0.3",
++			},
++		},
++		{
++			name: "with-external-ips",
++			info: &ProvisioningInfo{
++				Namespace: "openshift-machine-api",
++				ProvConfig: &metal3iov1alpha1.Provisioning{
++					Spec: metal3iov1alpha1.ProvisioningSpec{
++						ProvisioningIP:      "172.22.0.3",
++						ProvisioningNetwork: metal3iov1alpha1.ProvisioningNetworkManaged,
++						ExternalIPs:         []string{"10.0.0.5", "10.0.0.6"},
++					},
++				},
++			},
++			expectedHosts: []string{
++				"metal3-state.openshift-machine-api.svc",
++				"metal3-state.openshift-machine-api.svc.cluster.local",
++				"172.22.0.3",
++				"10.0.0.5",
++				"10.0.0.6",
++			},
++		},
++		{
++			name: "disabled-network-with-api-vips",
++			info: &ProvisioningInfo{
++				Namespace: "openshift-machine-api",
++				ProvConfig: &metal3iov1alpha1.Provisioning{
++					Spec: metal3iov1alpha1.ProvisioningSpec{
++						ProvisioningIP:      "172.22.0.3",
++						ProvisioningNetwork: metal3iov1alpha1.ProvisioningNetworkDisabled,
++					},
++				},
++				OSClient: fakeconfigclientset.NewSimpleClientset(
++					&osconfigv1.Infrastructure{
++						TypeMeta: metav1.TypeMeta{
++							Kind:       "Infrastructure",
++							APIVersion: "config.openshift.io/v1",
++						},
++						ObjectMeta: metav1.ObjectMeta{
++							Name: "cluster",
++						},
++						Status: osconfigv1.InfrastructureStatus{
++							PlatformStatus: &osconfigv1.PlatformStatus{
++								Type: osconfigv1.BareMetalPlatformType,
++								BareMetal: &osconfigv1.BareMetalPlatformStatus{
++									APIServerInternalIPs: []string{"192.168.1.100"},
++								},
++							},
++						},
++					},
++				),
++			},
++			expectedHosts: []string{
++				"metal3-state.openshift-machine-api.svc",
++				"metal3-state.openshift-machine-api.svc.cluster.local",
++				"ironic-proxy.openshift-machine-api.svc",
++				"ironic-proxy.openshift-machine-api.svc.cluster.local",
++				"172.22.0.3",
++				"192.168.1.100",
++			},
++		},
++		{
++			name: "virtual-media-via-external-network-with-api-vips",
++			info: &ProvisioningInfo{
++				Namespace: "openshift-machine-api",
++				ProvConfig: &metal3iov1alpha1.Provisioning{
++					Spec: metal3iov1alpha1.ProvisioningSpec{
++						ProvisioningIP:                 "172.22.0.3",
++						ProvisioningNetwork:            metal3iov1alpha1.ProvisioningNetworkManaged,
++						VirtualMediaViaExternalNetwork: true,
++					},
++				},
++				OSClient: fakeconfigclientset.NewSimpleClientset(
++					&osconfigv1.Infrastructure{
++						TypeMeta: metav1.TypeMeta{
++							Kind:       "Infrastructure",
++							APIVersion: "config.openshift.io/v1",
++						},
++						ObjectMeta: metav1.ObjectMeta{
++							Name: "cluster",
++						},
++						Status: osconfigv1.InfrastructureStatus{
++							PlatformStatus: &osconfigv1.PlatformStatus{
++								Type: osconfigv1.BareMetalPlatformType,
++								BareMetal: &osconfigv1.BareMetalPlatformStatus{
++									APIServerInternalIPs: []string{"192.168.1.100", "fd00::100"},
++								},
++							},
++						},
++					},
++				),
++			},
++			expectedHosts: []string{
++				"metal3-state.openshift-machine-api.svc",
++				"metal3-state.openshift-machine-api.svc.cluster.local",
++				"ironic-proxy.openshift-machine-api.svc",
++				"ironic-proxy.openshift-machine-api.svc.cluster.local",
++				"172.22.0.3",
++				"192.168.1.100",
++				"fd00::100",
++			},
++		},
++		{
++			name: "all-sans-combined",
++			info: &ProvisioningInfo{
++				Namespace: "openshift-machine-api",
++				ProvConfig: &metal3iov1alpha1.Provisioning{
++					Spec: metal3iov1alpha1.ProvisioningSpec{
++						ProvisioningIP:                 "172.22.0.3",
++						ProvisioningNetwork:            metal3iov1alpha1.ProvisioningNetworkDisabled,
++						ExternalIPs:                    []string{"10.0.0.5"},
++						VirtualMediaViaExternalNetwork: true,
++					},
++				},
++				OSClient: fakeconfigclientset.NewSimpleClientset(
++					&osconfigv1.Infrastructure{
++						TypeMeta: metav1.TypeMeta{
++							Kind:       "Infrastructure",
++							APIVersion: "config.openshift.io/v1",
++						},
++						ObjectMeta: metav1.ObjectMeta{
++							Name: "cluster",
++						},
++						Status: osconfigv1.InfrastructureStatus{
++							PlatformStatus: &osconfigv1.PlatformStatus{
++								Type: osconfigv1.BareMetalPlatformType,
++								BareMetal: &osconfigv1.BareMetalPlatformStatus{
++									APIServerInternalIPs: []string{"192.168.1.100"},
++								},
++							},
++						},
++					},
++				),
++			},
++			expectedHosts: []string{
++				"metal3-state.openshift-machine-api.svc",
++				"metal3-state.openshift-machine-api.svc.cluster.local",
++				"ironic-proxy.openshift-machine-api.svc",
++				"ironic-proxy.openshift-machine-api.svc.cluster.local",
++				"172.22.0.3",
++				"10.0.0.5",
++				"192.168.1.100",
++			},
++		},
++		{
++			name: "hypershift-no-api-vips",
++			info: &ProvisioningInfo{
++				Namespace:    "openshift-machine-api",
++				IsHyperShift: true,
++				ProvConfig: &metal3iov1alpha1.Provisioning{
++					Spec: metal3iov1alpha1.ProvisioningSpec{
++						ProvisioningIP:      "172.22.0.3",
++						ProvisioningNetwork: metal3iov1alpha1.ProvisioningNetworkDisabled,
++					},
++				},
++			},
++			expectedHosts: []string{
++				"metal3-state.openshift-machine-api.svc",
++				"metal3-state.openshift-machine-api.svc.cluster.local",
++				"172.22.0.3",
++			},
++		},
++		{
++			name: "empty-external-ips-ignored",
++			info: &ProvisioningInfo{
++				Namespace: "openshift-machine-api",
++				ProvConfig: &metal3iov1alpha1.Provisioning{
++					Spec: metal3iov1alpha1.ProvisioningSpec{
++						ProvisioningIP:      "172.22.0.3",
++						ProvisioningNetwork: metal3iov1alpha1.ProvisioningNetworkManaged,
++						ExternalIPs:         []string{"", "10.0.0.5", ""},
++					},
++				},
++			},
++			expectedHosts: []string{
++				"metal3-state.openshift-machine-api.svc",
++				"metal3-state.openshift-machine-api.svc.cluster.local",
++				"172.22.0.3",
++				"10.0.0.5",
++			},
++		},
++		{
++			name: "custom-namespace",
++			info: &ProvisioningInfo{
++				Namespace: "custom-namespace",
++				ProvConfig: &metal3iov1alpha1.Provisioning{
++					Spec: metal3iov1alpha1.ProvisioningSpec{},
++				},
++			},
++			expectedHosts: []string{
++				"metal3-state.custom-namespace.svc",
++				"metal3-state.custom-namespace.svc.cluster.local",
++			},
++		},
++	}
++
++	for _, tc := range cases {
++		t.Run(tc.name, func(t *testing.T) {
++			hosts, err := buildTlsHosts(tc.info)
++			if tc.expectError {
++				require.Error(t, err)
++				return
++			}
++			require.NoError(t, err)
++
++			for _, expected := range tc.expectedHosts {
++				assert.True(t, hosts.Has(expected), "expected host %q to be in the SAN set, got: %v", expected, hosts.UnsortedList())
++			}
++			assert.Equal(t, len(tc.expectedHosts), hosts.Len(),
++				"expected %d hosts but got %d: %v", len(tc.expectedHosts), hosts.Len(), hosts.UnsortedList())
++		})
++	}
++}
+diff --git a/provisioning/utils.go b/provisioning/utils.go
+index 9ee2e1366..76b7476fa 100644
+--- a/provisioning/utils.go
++++ b/provisioning/utils.go
+@@ -83,19 +83,22 @@ func getServerInternalIPs(osclient osclientset.Interface) ([]string, error) {
+ 		err = fmt.Errorf("cannot get the 'cluster' object from infrastructure API: %w", err)
+ 		return nil, err
+ 	}
++	if infra.Status.PlatformStatus == nil {
++		return nil, nil
++	}
+ 	switch infra.Status.PlatformStatus.Type {
+ 	case osconfigv1.BareMetalPlatformType:
+-		if infra.Status.PlatformStatus == nil || infra.Status.PlatformStatus.BareMetal == nil {
++		if infra.Status.PlatformStatus.BareMetal == nil {
+ 			return nil, nil
+ 		}
+ 		return infra.Status.PlatformStatus.BareMetal.APIServerInternalIPs, nil
+ 	case osconfigv1.OpenStackPlatformType:
+-		if infra.Status.PlatformStatus == nil || infra.Status.PlatformStatus.OpenStack == nil {
++		if infra.Status.PlatformStatus.OpenStack == nil {
+ 			return nil, nil
+ 		}
+ 		return infra.Status.PlatformStatus.OpenStack.APIServerInternalIPs, nil
+ 	case osconfigv1.VSpherePlatformType:
+-		if infra.Status.PlatformStatus == nil || infra.Status.PlatformStatus.VSphere == nil {
++		if infra.Status.PlatformStatus.VSphere == nil {
+ 			return nil, nil
+ 		}
+ 		return infra.Status.PlatformStatus.VSphere.APIServerInternalIPs, nil

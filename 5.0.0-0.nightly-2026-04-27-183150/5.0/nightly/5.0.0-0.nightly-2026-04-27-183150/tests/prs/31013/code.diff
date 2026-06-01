@@ -1,0 +1,322 @@
+diff --git a/test/extended/node/crio_goroutinedump.go b/test/extended/node/crio_goroutinedump.go
+new file mode 100644
+index 000000000000..f101fd5ea46f
+--- /dev/null
++++ b/test/extended/node/crio_goroutinedump.go
+@@ -0,0 +1,167 @@
++package node
++
++import (
++	"fmt"
++	"regexp"
++	"strconv"
++	"strings"
++
++	g "github.com/onsi/ginkgo/v2"
++	o "github.com/onsi/gomega"
++	ote "github.com/openshift-eng/openshift-tests-extension/pkg/ginkgo"
++	exutil "github.com/openshift/origin/test/extended/util"
++)
++
++// goroutineHeaderRe matches Go goroutine dump headers, e.g.:
++//
++//	goroutine 64418 [IO wait, 189 minutes]:
++//	goroutine 1 [running]:
++var goroutineHeaderRe = regexp.MustCompile(`goroutine \d+ \[`)
++
++// ioWaitDurationRe extracts the wait duration in minutes from an IO wait goroutine header, e.g.:
++//
++//	goroutine 64418 [IO wait, 189 minutes]:
++var ioWaitDurationRe = regexp.MustCompile(`goroutine \d+ \[IO wait, (\d+) minutes\]:`)
++
++// findStuckImagePulls checks a goroutine dump for goroutines that indicate
++// a stuck image pull: IO wait > 30 minutes with net.(*conn).Read called by
++// docker.(*bodyReader).Read.
++func findStuckImagePulls(dump string) []string {
++	// Split the dump into individual goroutine blocks.
++	// Each block starts with "goroutine <id> [".
++	blocks := goroutineHeaderRe.Split(dump, -1)
++	headers := goroutineHeaderRe.FindAllString(dump, -1)
++
++	var stuck []string
++	for i, header := range headers {
++		block := header + blocks[i+1]
++
++		// Check: state is "IO wait" with duration > 30 minutes
++		match := ioWaitDurationRe.FindStringSubmatch(block)
++		if match == nil {
++			continue
++		}
++		minutes, err := strconv.Atoi(match[1])
++		if err != nil || minutes <= 30 {
++			continue
++		}
++
++		// Check: stack contains net.(*conn).Read
++		connReadIdx := strings.Index(block, "net.(*conn).Read")
++		if connReadIdx < 0 {
++			continue
++		}
++
++		// Check: docker.(*bodyReader).Read appears as an ascendant
++		// (caller) of net.(*conn).Read. In a goroutine dump callers
++		// appear below callees, so bodyReader must come after
++		// conn.Read in the text. The match is version-agnostic so
++		// it keeps working across containers/image version bumps.
++		bodyReaderIdx := strings.Index(block, "docker.(*bodyReader).Read")
++		if bodyReaderIdx < 0 || bodyReaderIdx <= connReadIdx {
++			continue
++		}
++
++		stuck = append(stuck, strings.TrimSpace(block))
++	}
++	return stuck
++}
++
++var _ = g.Describe("[sig-node][Late]", func() {
++	defer g.GinkgoRecover()
++	oc := exutil.NewCLIWithoutNamespace("crio-goroutine-dump")
++
++	g.It("CRI-O goroutine dump via SIGUSR1 should contain no stuck image pulls on any node",
++		ote.Informing(), func(ctx g.SpecContext) {
++
++			nodes, err := exutil.GetAllClusterNodes(oc)
++			o.Expect(err).NotTo(o.HaveOccurred())
++			o.Expect(nodes).NotTo(o.BeEmpty(), "expected at least one node")
++
++			// Send SIGUSR1 to CRI-O and read the newly created dump file.
++			// CRI-O writes goroutine stacks to /tmp/crio-goroutine-stacks-<timestamp>.log.
++			//
++			// We access CRI-O's /tmp through /proc/<pid>/root/tmp rather than
++			// the host /tmp so that the dump is visible even when CRI-O's
++			// systemd unit uses PrivateTmp=yes (as observed on MicroShift).
++			//
++			// The script snapshots the latest dump file before signalling and
++			// polls until a newer, non-empty (-s) file appears to avoid
++			// reading a file that CRI-O has created but not yet finished writing.
++			shellCmd := `CRIO_PID=$(pgrep -x crio 2>/dev/null)
++if [ -z "$CRIO_PID" ]; then echo "CRIO_NOT_FOUND"; exit 0; fi
++CRIO_TMP=/proc/$CRIO_PID/root/tmp
++BEFORE=$(ls -t "$CRIO_TMP"/crio-goroutine-stacks-*.log 2>/dev/null | head -1)
++kill -USR1 $CRIO_PID
++for i in $(seq 1 30); do
++  LATEST=$(ls -t "$CRIO_TMP"/crio-goroutine-stacks-*.log 2>/dev/null | head -1)
++  if [ -n "$LATEST" ] && [ "$LATEST" != "$BEFORE" ] && [ -s "$LATEST" ]; then
++    cat "$LATEST"; exit 0
++  fi
++  sleep 1
++done
++echo "DUMP_TIMEOUT"; exit 1`
++
++			// nodeResult holds the output from a single node's goroutine dump.
++			type nodeResult struct {
++				name   string
++				output string
++				err    error
++			}
++
++			// Create debug pods serially to avoid putting resource pressure on the API server.
++			results := make([]nodeResult, len(nodes))
++			for i, node := range nodes {
++				g.By(fmt.Sprintf("Sending SIGUSR1 to CRI-O on node %s", node.Name))
++
++				output, err := exutil.DebugNodeRetryWithOptionsAndChroot(
++					oc, node.Name, "default",
++					"sh", "-c", shellCmd,
++				)
++				results[i] = nodeResult{name: node.Name, output: output, err: err}
++			}
++
++			var stuckPulls []string
++			var failedNodes []string
++			for _, r := range results {
++				// Check output-based diagnostics before the generic error
++				// because DebugNodeRetryWithOptionsAndChroot may return
++				// both output and an error (e.g. non-zero exit from the
++				// DUMP_TIMEOUT branch).
++				if strings.Contains(r.output, "CRIO_NOT_FOUND") {
++					failedNodes = append(failedNodes,
++						fmt.Sprintf("%s: CRI-O process not found", r.name))
++					continue
++				}
++
++				if strings.Contains(r.output, "DUMP_TIMEOUT") {
++					failedNodes = append(failedNodes,
++						fmt.Sprintf("%s: timed out waiting for new goroutine dump file", r.name))
++					continue
++				}
++
++				if r.err != nil {
++					failedNodes = append(failedNodes,
++						fmt.Sprintf("%s: debug pod failed: %v", r.name, r.err))
++					continue
++				}
++
++				o.Expect(goroutineHeaderRe.MatchString(r.output)).To(o.BeTrue(),
++					"expected goroutine stacks in CRI-O dump from node %s, output length=%d, got:\n%s", r.name, len(r.output), r.output)
++
++				for _, goroutine := range findStuckImagePulls(r.output) {
++					stuckPulls = append(stuckPulls, fmt.Sprintf("node/%s:\n%s", r.name, goroutine))
++				}
++			}
++
++			// Fail if any node did not produce a dump
++			o.Expect(failedNodes).To(o.BeEmpty(),
++				"failed to collect CRI-O goroutine dump from nodes:\n%s",
++				strings.Join(failedNodes, "\n"))
++
++			// Fail hard if any goroutine is stuck in an image pull
++			o.Expect(stuckPulls).To(o.BeEmpty(),
++				"found CRI-O goroutines stuck in image pull (IO wait > 30 min):\n%s",
++				strings.Join(stuckPulls, "\n\n"))
++		})
++})
+diff --git a/test/extended/node/crio_goroutinedump_test.go b/test/extended/node/crio_goroutinedump_test.go
+new file mode 100644
+index 000000000000..9dea51a38e7e
+--- /dev/null
++++ b/test/extended/node/crio_goroutinedump_test.go
+@@ -0,0 +1,143 @@
++package node
++
++import (
++	"testing"
++)
++
++func TestFindStuckImagePulls(t *testing.T) {
++	stuckGoroutine := `goroutine 64418 [IO wait, 189 minutes]:
++internal/poll.runtime_pollWait(0x7ff92406ec00, 0x72)
++	/usr/lib/golang/src/runtime/netpoll.go:351 +0x85
++internal/poll.(*pollDesc).wait(0xc0006db180?, 0xc003d54000?, 0x0)
++	/usr/lib/golang/src/internal/poll/fd_poll_runtime.go:84 +0x27
++internal/poll.(*pollDesc).waitRead(...)
++	/usr/lib/golang/src/internal/poll/fd_poll_runtime.go:89
++internal/poll.(*FD).Read(0xc0006db180, {0xc003d54000, 0xa000, 0xa000})
++	/usr/lib/golang/src/internal/poll/fd_unix.go:165 +0x279
++net.(*netFD).Read(0xc0006db180, {0xc003d54000?, 0xc003d58f6a?, 0x5?})
++	/usr/lib/golang/src/net/fd_posix.go:68 +0x25
++net.(*conn).Read(0xc0021faec0, {0xc003d54000?, 0x7ff924940130?, 0x7ff97c78f5c0?})
++	/usr/lib/golang/src/net/net.go:196 +0x45
++crypto/tls.(*atLeastReader).Read(0xc003835698, {0xc003d54000?, 0x5091?, 0x55a992a076bc?})
++	/usr/lib/golang/src/crypto/tls/conn.go:819 +0x3b
++bytes.(*Buffer).ReadFrom(0xc001cfe628, {0x55a994d32820, 0xc003835698})
++	/usr/lib/golang/src/bytes/buffer.go:217 +0x98
++crypto/tls.(*Conn).readFromUntil(0xc001cfe388, {0x55a994d32240, 0xc0021faec0}, 0xc0028e5228?)
++	/usr/lib/golang/src/crypto/tls/conn.go:841 +0xde
++crypto/tls.(*Conn).readRecordOrCCS(0xc001cfe388, 0x0)
++	/usr/lib/golang/src/crypto/tls/conn.go:630 +0x3db
++crypto/tls.(*Conn).readRecord(...)
++	/usr/lib/golang/src/crypto/tls/conn.go:592
++crypto/tls.(*Conn).Read(0xc001cfe388, {0xc003bc8000, 0x8000, 0x7ff97c78f108?})
++	/usr/lib/golang/src/crypto/tls/conn.go:1397 +0x145
++net/http.(*persistConn).Read(0xc002974ea0, {0xc003bc8000?, 0x55a99287cdc5?, 0x0?})
++	/usr/lib/golang/src/net/http/transport.go:2125 +0x47
++bufio.(*Reader).Read(0xc002366ba0, {0xc003bc8000, 0x8000, 0xc0021ce210?})
++	/usr/lib/golang/src/bufio/bufio.go:231 +0xe2
++io.(*LimitedReader).Read(0xc003b05050, {0xc003bc8000?, 0x55a994d2f788?, 0x55a994d58100?})
++	/usr/lib/golang/src/io/io.go:479 +0x43
++net/http.(*body).readLocked(0xc004224ac0, {0xc003bc8000?, 0x55a99287c394?, 0xc0028e5628?})
++	/usr/lib/golang/src/net/http/transfer.go:845 +0x3b
++net/http.(*body).Read(0x55a9942d3237?, {0xc003bc8000?, 0x2?, 0x0?})
++	/usr/lib/golang/src/net/http/transfer.go:837 +0xff
++net/http.(*bodyEOFSignal).Read(0xc004224b00, {0xc003bc8000, 0x8000, 0x8000})
++	/usr/lib/golang/src/net/http/transport.go:3000 +0x13e
++github.com/cri-o/cri-o/vendor/go.podman.io/image/v5/docker.(*bodyReader).Read(0xc003f3a0a0, {0xc003bc8000?, 0x0?, 0x0?})
++	/builddir/build/BUILD/cri-o-804ec103e65c2d3766fbd81b2d215fbc00350768/_output/src/github.com/cri-o/cri-o/vendor/go.podman.io/image/v5/docker/body_reader.go:143 +0x67
++github.com/cri-o/cri-o/vendor/go.podman.io/image/v5/copy.(*digestingReader).Read(0xc0032e7b80, {0xc003bc8000, 0xc0028e5b00?, 0x8000})
++	/builddir/build/BUILD/cri-o-804ec103e65c2d3766fbd81b2d215fbc00350768/_output/src/github.com/cri-o/cri-o/vendor/go.podman.io/image/v5/copy/digesting_reader.go:44 +0x3f
++github.com/cri-o/cri-o/vendor/github.com/vbauerster/mpb/v8.ewmaProxyReader.Read({{0x55a994d3b728?, 0xc001c1d200?}, 0xc003262ff0?}, {0xc003bc8000, 0x8000, 0x8000})
++	/builddir/build/BUILD/cri-o-804ec103e65c2d3766fbd81b2d215fbc00350768/_output/src/github.com/cri-o/cri-o/vendor/github.com/vbauerster/mpb/v8/proxyreader.go:36 +0x8d
++io.(*multiReader).Read(0xc003b051a0, {0xc003bc8000, 0x8000, 0x8000})
++	/usr/lib/golang/src/io/multi.go:26 +0x93
++github.com/cri-o/cri-o/vendor/go.podman.io/image/v5/copy.errorAnnotationReader.Read({{0x55a994d301e0?, 0xc003b051a0?}}, {0xc003bc8000?, 0x8000?, 0x0?})
++	/builddir/build/BUILD/cri-o-804ec103e65c2d3766fbd81b2d215fbc00350768/_output/src/github.com/cri-o/cri-o/vendor/go.podman.io/image/v5/copy/blob.go:165 +0x33`
++
++	normalRunning := `goroutine 1 [running]:
++main.main()
++	/src/main.go:10 +0x25`
++
++	ioWaitShort := `goroutine 100 [IO wait, 5 minutes]:
++net.(*conn).Read(0xc000a1c010, {0xc002000000, 0x1000, 0x1000})
++	net/net.go:179 +0x45
++github.com/containers/image/v5/docker.(*bodyReader).Read(0xc000b1e5c0, {0xc002000000, 0x1000, 0x1000})
++	github.com/containers/image/v5/docker/body_reader.go:52 +0x78`
++
++	ioWaitNoBodyReader := `goroutine 200 [IO wait, 60 minutes]:
++net.(*conn).Read(0xc000a1c010, {0xc002000000, 0x1000, 0x1000})
++	net/net.go:179 +0x45
++bufio.(*Reader).Read(0xc000b1e5c0, {0xc002000000, 0x1000, 0x1000})
++	bufio/bufio.go:237 +0x78`
++
++	ioWaitNoConnRead := `goroutine 300 [IO wait, 60 minutes]:
++github.com/containers/image/v5/docker.(*bodyReader).Read(0xc000b1e5c0, {0xc002000000, 0x1000, 0x1000})
++	github.com/containers/image/v5/docker/body_reader.go:52 +0x78`
++
++	// v6 version of containers/image — should still match with version-agnostic pattern
++	stuckV6 := `goroutine 500 [IO wait, 45 minutes]:
++net.(*conn).Read(0xc000a1c010, {0xc002000000, 0x1000, 0x1000})
++	net/net.go:179 +0x45
++github.com/containers/image/v6/docker.(*bodyReader).Read(0xc000b1e5c0, {0xc002000000, 0x1000, 0x1000})
++	github.com/containers/image/v6/docker/body_reader.go:52 +0x78`
++
++	tests := []struct {
++		name      string
++		dump      string
++		wantCount int
++	}{
++		{
++			name:      "single stuck goroutine",
++			dump:      stuckGoroutine,
++			wantCount: 1,
++		},
++		{
++			name:      "no stuck goroutines in running state",
++			dump:      normalRunning,
++			wantCount: 0,
++		},
++		{
++			name:      "IO wait under 30 minutes is not stuck",
++			dump:      ioWaitShort,
++			wantCount: 0,
++		},
++		{
++			name:      "IO wait without bodyReader is not stuck",
++			dump:      ioWaitNoBodyReader,
++			wantCount: 0,
++		},
++		{
++			name:      "IO wait without conn.Read is not stuck",
++			dump:      ioWaitNoConnRead,
++			wantCount: 0,
++		},
++		{
++			name:      "version-agnostic match works with v6",
++			dump:      stuckV6,
++			wantCount: 1,
++		},
++		{
++			name:      "mixed dump returns only stuck goroutines",
++			dump:      stuckGoroutine + "\n\n" + normalRunning + "\n\n" + ioWaitShort + "\n\n" + stuckV6,
++			wantCount: 2,
++		},
++		{
++			name:      "empty dump",
++			dump:      "",
++			wantCount: 0,
++		},
++		{
++			name:      "exactly 30 minutes is not stuck",
++			dump:      "goroutine 400 [IO wait, 30 minutes]:\nnet.(*conn).Read(0xc0, {0xc0, 0x1})\n\tnet/net.go:179 +0x45\ngithub.com/containers/image/v5/docker.(*bodyReader).Read(0xc0, {0xc0, 0x1})\n\tbody_reader.go:52 +0x78",
++			wantCount: 0,
++		},
++	}
++
++	for _, tt := range tests {
++		t.Run(tt.name, func(t *testing.T) {
++			got := findStuckImagePulls(tt.dump)
++			if len(got) != tt.wantCount {
++				t.Errorf("findStuckImagePulls() returned %d results, want %d.\nGot: %v", len(got), tt.wantCount, got)
++			}
++		})
++	}
++}

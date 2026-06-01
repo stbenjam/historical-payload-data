@@ -1,0 +1,1537 @@
+diff --git a/test/extended-priv/const.go b/test/extended-priv/const.go
+index 1d524f7805..9667bbdec2 100644
+--- a/test/extended-priv/const.go
++++ b/test/extended-priv/const.go
+@@ -23,6 +23,9 @@ const (
+ 	// ControllerLabelValue value used to identify the controller pod
+ 	ControllerLabelValue = "machine-config-controller"
+ 
++	// EnvVarLayeringTestImageRepository environment variable to define the image repository used by layering test cases
++	EnvVarLayeringTestImageRepository = "LAYERING_TEST_IMAGE_REPOSITORY"
++
+ 	// DefaultLayeringQuayRepository the quay repository that will be used by default to push auxiliary layering images
+ 	DefaultLayeringQuayRepository = "quay.io/mcoqe/layering"
+ 	// InternalRegistrySvcURL is the url to reach the internal registry service from inside a cluster
+@@ -30,6 +33,8 @@ const (
+ 
+ 	// LayeringBaseImageReleaseInfo is the name of the layering base image in release info
+ 	LayeringBaseImageReleaseInfo = "rhel-coreos"
++	// LayeringBaseImageReleaseInfoRhel10 is the name of the RHEL10 layering base image in release info
++	LayeringBaseImageReleaseInfoRhel10 = "rhel-coreos-10"
+ 	// GenericMCTemplate is the name of a MachineConfig template that can be fully configured by parameters
+ 	GenericMCTemplate = "generic-machine-config-template.yml"
+ 
+@@ -48,6 +53,9 @@ const (
+ 	// ExpirationDockerfileLabel Expiration label in Dockerfile
+ 	ExpirationDockerfileLabel = `LABEL maintainer="mco-qe-team" quay.expires-after=24h`
+ 
++	layeringTestsTmpNamespace   = "layering-tests-imagestreams"
++	layeringRegistryAdminSAName = "test-registry-sa"
++
+ 	// DefaultExpectTimeout is the default timeout for expect operations
+ 	DefaultExpectTimeout = 10 * time.Second
+ 
+diff --git a/test/extended-priv/containers.go b/test/extended-priv/containers.go
+index 21c35d1a61..22560f4486 100644
+--- a/test/extended-priv/containers.go
++++ b/test/extended-priv/containers.go
+@@ -1,10 +1,33 @@
+ package extended
+ 
+ import (
++	"fmt"
++	"os"
++	"path/filepath"
++	"strings"
++	"time"
++
++	"github.com/google/uuid"
+ 	exutil "github.com/openshift/machine-config-operator/test/extended-priv/util"
+ 	logger "github.com/openshift/machine-config-operator/test/extended-priv/util/logext"
+ )
+ 
++func prepareDockerfileDirectory(baseDir, dockerFileContent string) (string, error) {
++	layout := "2006_01_02T15-04-05Z"
++
++	directory := filepath.Join(baseDir, fmt.Sprintf("containerbuild-%s", time.Now().Format(layout)))
++	if err := os.Mkdir(directory, os.ModePerm); err != nil {
++		return "", err
++	}
++
++	dockerFile := filepath.Join(directory, "Dockerfile")
++	if err := os.WriteFile(dockerFile, []byte(dockerFileContent), 0o644); err != nil {
++		return "", err
++	}
++
++	return directory, nil
++}
++
+ func getImageFromReleaseInfo(oc *exutil.CLI, imageName, dockerConfigFile string) (string, error) {
+ 	stdout, stderr, err := oc.Run("adm").Args("release", "info", "--insecure", "--image-for", imageName,
+ 		"--registry-config", dockerConfigFile).Outputs()
+@@ -16,3 +39,61 @@ func getImageFromReleaseInfo(oc *exutil.CLI, imageName, dockerConfigFile string)
+ 
+ 	return stdout, nil
+ }
++
++// GetLayeringBaseImageByStream returns the full base image for layering resolved from release info for the given stream.
++func GetLayeringBaseImageByStream(oc *exutil.CLI, stream, dockerConfigFile string) (string, error) {
++	releaseInfoName := LayeringBaseImageReleaseInfo
++	if stream == OSImageStreamRHEL10 {
++		releaseInfoName = LayeringBaseImageReleaseInfoRhel10
++	}
++	return getImageFromReleaseInfo(oc.AsAdmin(), releaseInfoName, dockerConfigFile)
++}
++
++func getLayeringTestImageRepository(defaultTag string) string {
++	layeringImageRepo, exists := os.LookupEnv(EnvVarLayeringTestImageRepository)
++
++	if !exists {
++		layeringImageRepo = DefaultLayeringQuayRepository
++	}
++
++	// If no tag is provided for the image, we add one
++	if !strings.Contains(layeringImageRepo, ":") && defaultTag != "" {
++		layeringImageRepo = layeringImageRepo + ":" + defaultTag
++	}
++
++	return layeringImageRepo
++}
++
++// generateUniqueTag creates a string that can be used as an unique tag for an image
++func generateUniqueTag(oc *exutil.CLI) (string, error) {
++	const maxDockerTagLength = 128
++
++	clusterName, err := exutil.GetInfraID(oc)
++	if err != nil {
++		return "", err
++	}
++
++	testCaseID := GetCurrentTestPolarionIDNumber()
++	if testCaseID == "" {
++		testCaseID = "unknown"
++	}
++
++	uniqueID := strings.ReplaceAll(uuid.NewString(), "-", "")
++	uniqueTag := fmt.Sprintf("%s-%s-%s", uniqueID, testCaseID, clusterName)
++
++	// Sanitize the full tag to keep only valid Docker tag characters [a-zA-Z0-9_.-]
++	var sanitized strings.Builder
++	for _, r := range uniqueTag {
++		if (r >= 'a' && r <= 'z') || (r >= 'A' && r <= 'Z') || (r >= '0' && r <= '9') || r == '_' || r == '.' || r == '-' {
++			sanitized.WriteRune(r)
++		}
++	}
++	uniqueTag = sanitized.String()
++
++	if len(uniqueTag) > maxDockerTagLength {
++		uniqueTag = uniqueTag[:maxDockerTagLength]
++	}
++
++	logger.Infof("Using unique tag %s", uniqueTag)
++	return uniqueTag, nil
++}
+diff --git a/test/extended-priv/inside_node_containers.go b/test/extended-priv/inside_node_containers.go
+new file mode 100644
+index 0000000000..3747f1e6f4
+--- /dev/null
++++ b/test/extended-priv/inside_node_containers.go
+@@ -0,0 +1,390 @@
++package extended
++
++import (
++	"fmt"
++	"net/url"
++	"path/filepath"
++	"strings"
++
++	exutil "github.com/openshift/machine-config-operator/test/extended-priv/util"
++	logger "github.com/openshift/machine-config-operator/test/extended-priv/util/logext"
++	e2e "k8s.io/kubernetes/test/e2e/framework"
++)
++
++// sanitizeProxy redacts userinfo (credentials) from a proxy URL for safe logging.
++// If the value is not a valid URL it is returned as-is.
++func sanitizeProxy(proxy string) string {
++	u, err := url.Parse(proxy)
++	if err != nil || u.User == nil {
++		return proxy
++	}
++	u.User = url.User("<redacted>")
++	return u.String()
++}
++
++// sanitizeCommand returns the command string with proxy credentials redacted for logging.
++func (b *OsImageBuilderInNode) sanitizeCommand(cmd string) string {
++	var oldnew []string
++	for _, p := range []string{b.httpProxy, b.httpsProxy, b.noProxy} {
++		if p != "" && sanitizeProxy(p) != p {
++			oldnew = append(oldnew, p, sanitizeProxy(p))
++		}
++	}
++	if len(oldnew) == 0 {
++		return cmd
++	}
++	return strings.NewReplacer(oldnew...).Replace(cmd)
++}
++
++// OsImageBuilderInNode encapsulates the functionality to build custom osImages inside a cluster node
++type OsImageBuilderInNode struct {
++	node *Node
++	baseImage,
++	osImage,
++	dockerFileCommands, // Full docker file but the "FROM basOsImage..." that will be calculated
++	dockerConfig,
++	httpProxy,
++	httpsProxy,
++	noProxy,
++	tmpDir,
++	remoteTmpDir,
++	remoteDockerConfig,
++	remoteDockerfile string
++	UseInternalRegistry,
++	BuildAsManifest bool // If true, build as manifest; if false, build as single image
++}
++
++// prepareEnvironment sets up the build environment on the node by performing the following tasks:
++// - Extracts pull secrets if no docker config is provided
++// - Creates a temporary directory on the remote node
++// - Sets up remote paths for kubeconfig and docker config
++// - Copies the kubelet config.json to the remote location
++// - Retrieves the base image from release info
++// - Generates a unique tag for the new image
++// - Configures the target OS image name (either internal registry or external repository)
++// - Gathers cluster proxy settings
++// Returns an error if any preparation step fails.
++func (b *OsImageBuilderInNode) prepareEnvironment() error {
++	var err error
++
++	if b.dockerConfig == "" {
++		logger.Infof("No docker config file was provided to the osImage builder. Generating a new docker config file")
++		exutil.By("Extract pull-secret")
++		pullSecret := GetPullSecret(b.node.oc.AsAdmin())
++		tokenDir, err := pullSecret.Extract()
++		if err != nil {
++			return fmt.Errorf("Error extracting pull-secret. Error: %s", err)
++		}
++		logger.Infof("Pull secret has been extracted to: %s\n", tokenDir)
++		b.dockerConfig = filepath.Join(tokenDir, ".dockerconfigjson")
++	}
++	logger.Infof("Using docker config file: %s\n", b.dockerConfig)
++
++	b.remoteTmpDir = filepath.Join("/root", e2e.TestContext.OutputDir, fmt.Sprintf("mco-test-%s", exutil.GetRandomString()))
++	_, err = b.node.DebugNodeWithChroot("mkdir", "-p", b.remoteTmpDir)
++	if err != nil {
++		return fmt.Errorf("Error creating tmp dir %s in node %s. Error: %s", b.remoteTmpDir, b.node.GetName(), err)
++	}
++
++	if b.remoteDockerConfig == "" {
++		b.remoteDockerConfig = filepath.Join(b.remoteTmpDir, ".dockerconfigjson")
++	}
++	if b.remoteDockerfile == "" {
++		b.remoteDockerfile = filepath.Join(b.remoteTmpDir, "Dockerfile")
++	}
++
++	exutil.By("Prepare remote docker config file")
++	logger.Infof("Copy cluster config.json file")
++	_, cpErr := b.node.DebugNodeWithChroot("cp", "/var/lib/kubelet/config.json", b.remoteDockerConfig)
++	if cpErr != nil {
++		logger.Errorf("Error copying cluster config.json file to a temporary directory")
++		return cpErr
++	}
++
++	pool, poolErr := b.node.GetPrimaryPool()
++	if poolErr != nil {
++		return fmt.Errorf("Error getting the primary pool for node %s. Error: %s", b.node.GetName(), poolErr)
++	}
++
++	stream, streamErr := GetEffectiveOsImageStream(pool)
++	if streamErr != nil {
++		return fmt.Errorf("Error getting the effective osImageStream for pool %s. Error: %s", pool.GetName(), streamErr)
++	}
++	logger.Infof("Builder node %s stream: %s", b.node.GetName(), stream)
++
++	b.baseImage, err = GetLayeringBaseImageByStream(b.node.oc.AsAdmin(), stream, b.dockerConfig)
++	if err != nil {
++		return fmt.Errorf("Error getting the base image to build new osImages. Error: %s", err)
++	}
++
++	uniqueTag, err := generateUniqueTag(b.node.oc.AsAdmin())
++	if err != nil {
++		return err
++	}
++
++	if b.UseInternalRegistry {
++		// The images must be created inside the MCO namespace or MCO will not have permissions to pull them
++		b.osImage = fmt.Sprintf("%s/%s/%s:%s", InternalRegistrySvcURL, MachineConfigNamespace, "layering", uniqueTag)
++		if err := b.preparePushToInternalRegistry(); err != nil {
++			return err
++		}
++	} else if b.osImage == "" {
++		b.osImage = getLayeringTestImageRepository(uniqueTag)
++	}
++	logger.Infof("Building image: %s", b.osImage)
++
++	if b.tmpDir == "" {
++		b.tmpDir = e2e.TestContext.OutputDir
++	}
++
++	logger.Infof("Gathering proxy information")
++	proxy := NewResource(b.node.oc, "proxy", "cluster")
++	if proxy.Exists() {
++		b.httpProxy = proxy.GetOrFail(`{.status.httpProxy}`)
++		b.httpsProxy = proxy.GetOrFail(`{.status.httpsProxy}`)
++		b.noProxy = proxy.GetOrFail(`{.status.noProxy}`)
++	}
++
++	logger.Infof("OK!\n")
++
++	return nil
++}
++
++// preparePushToInternalRegistry configures access to the cluster's internal registry by:
++// - Creating a temporary namespace if it doesn't exist
++// - Creating a service account with registry-admin permissions
++// - Generating a token for the service account
++// - Authenticating podman to the internal registry using the token and remote docker config
++// Returns an error if namespace, service account creation, or registry login fails.
++func (b *OsImageBuilderInNode) preparePushToInternalRegistry() error {
++	logger.Infof("Create namespace to store the service account to access the internal registry")
++	nsExistsErr := b.node.oc.Run("get").Args("namespace", layeringTestsTmpNamespace).Execute()
++	if nsExistsErr != nil {
++		err := b.node.oc.Run("create").Args("namespace", layeringTestsTmpNamespace).Execute()
++		if err != nil {
++			return fmt.Errorf("Error creating namespace %s to store the tmp SAs. Error: %s",
++				layeringTestsTmpNamespace, err)
++		}
++	} else {
++		logger.Infof("Namespace %s already exists. Skip namespace creation", layeringTestsTmpNamespace)
++	}
++
++	logger.Infof("Create service account with registry admin permissions to store the imagestream")
++	saExistsErr := b.node.oc.Run("get").Args("-n", layeringTestsTmpNamespace, "serviceaccount", layeringRegistryAdminSAName).Execute()
++	if saExistsErr != nil {
++		cErr := b.node.oc.Run("create").Args("-n", layeringTestsTmpNamespace, "serviceaccount", layeringRegistryAdminSAName).Execute()
++		if cErr != nil {
++			return fmt.Errorf("Error creating ServiceAccount %s/%s: %s", layeringTestsTmpNamespace, layeringRegistryAdminSAName, cErr)
++		}
++	} else {
++		logger.Infof("SA %s/%s already exists. Skip SA creation", layeringTestsTmpNamespace, layeringRegistryAdminSAName)
++	}
++
++	admErr := b.node.oc.Run("adm").Args("-n", layeringTestsTmpNamespace, "policy", "add-cluster-role-to-user", "registry-admin", "-z", layeringRegistryAdminSAName).Execute()
++	if admErr != nil {
++		return fmt.Errorf("Error creating ServiceAccount %s: %s", layeringRegistryAdminSAName, admErr)
++	}
++
++	logger.Infof("Get SA token")
++	saToken, err := b.node.oc.Run("create").Args("-n", layeringTestsTmpNamespace, "token", layeringRegistryAdminSAName).Output()
++	if err != nil {
++		logger.Errorf("Error getting token for SA %s", layeringRegistryAdminSAName)
++		return err
++	}
++	logger.Infof("OK!\n")
++
++	logger.Infof("Loging as registry admin to internal registry")
++	b.node.GetOC().NotShowInfo()
++	defer b.node.GetOC().SetShowInfo()
++	loginOut, loginErr := b.node.DebugNodeWithChroot("podman", "login", InternalRegistrySvcURL, "-u", layeringRegistryAdminSAName, "-p", saToken, "--authfile", b.remoteDockerConfig)
++	if loginErr != nil {
++		return fmt.Errorf("Error trying to login to internal registry:\nOutput:%s\nError:%s", loginOut, loginErr)
++	}
++	logger.Infof("OK!\n")
++
++	return nil
++}
++
++// CleanUp will clean up all the helper resources created by the builder
++func (b *OsImageBuilderInNode) CleanUp() error {
++	logger.Infof("Cleanup image builder resources")
++	if b.UseInternalRegistry {
++		logger.Infof("Removing namespace %s", layeringTestsTmpNamespace)
++		err := b.node.oc.Run("delete").Args("namespace", layeringTestsTmpNamespace, "--ignore-not-found").Execute()
++		if err != nil {
++			return fmt.Errorf("Error deleting namespace %s. Error: %s",
++				layeringTestsTmpNamespace, err)
++		}
++
++	} else {
++		logger.Infof("Not using internal registry, nothing to clean")
++	}
++	return nil
++}
++
++// buildImage builds a custom OS image on a cluster node using podman by:
++// - Creating a Dockerfile by combining the base image with custom commands
++// - Copying the Dockerfile to the remote node
++// - Copying the CA bundle to the build directory if needed
++// - Executing either a manifest build or single image build based on BuildAsManifest flag
++// - Respecting cluster proxy settings and using the configured authentication file
++// Returns an error if the Dockerfile creation, copy, or podman build fails.
++func (b *OsImageBuilderInNode) buildImage() error {
++	exutil.By("Get base osImage locally")
++
++	logger.Infof("Base image: %s\n", b.baseImage)
++
++	exutil.By("Prepare remote dockerFile directory")
++	dockerFile := "FROM " + b.baseImage + "\n" + b.dockerFileCommands + "\n" + ExpirationDockerfileLabel
++	logger.Infof(" Using Dockerfile:\n%s", dockerFile)
++
++	localBuildDir, err := prepareDockerfileDirectory(b.tmpDir, dockerFile)
++	if err != nil {
++		return fmt.Errorf("Error creating the build directory with the Dockerfile. Error: %s", err)
++	}
++
++	cpErr := b.node.CopyFromLocal(filepath.Join(localBuildDir, "Dockerfile"), b.remoteDockerfile)
++	if cpErr != nil {
++		return fmt.Errorf("Error creating the Dockerfile in the remote node. Error: %s", cpErr)
++	}
++	logger.Infof("OK!\n")
++
++	exutil.By("Build osImage")
++	buildPath := filepath.Dir(b.remoteDockerfile)
++
++	logger.Infof("Copy the /etc/pki/ca-trust/source/anchors/openshift-config-user-ca-bundle.crt file to the build dir, so that it can be used if needed")
++	_, err = b.node.DebugNodeWithChroot("cp", "/etc/pki/ca-trust/source/anchors/openshift-config-user-ca-bundle.crt", buildPath)
++	if err != nil {
++		return err
++	}
++
++	var buildCommand string
++	if b.BuildAsManifest {
++		buildCommand = "NO_PROXY=" + b.noProxy + " HTTPS_PROXY=" + b.httpsProxy + " HTTP_PROXY=" + b.httpProxy + " podman build  --network host " + buildPath + " --manifest " + b.osImage + " --authfile " + b.remoteDockerConfig
++		logger.Infof("Building as manifest")
++	} else {
++		buildCommand = "NO_PROXY=" + b.noProxy + " HTTPS_PROXY=" + b.httpsProxy + " HTTP_PROXY=" + b.httpProxy + " podman build  --network host " + buildPath + " --tag " + b.osImage + " --authfile " + b.remoteDockerConfig
++		logger.Infof("Building as single image")
++	}
++	logger.Infof("Executing build command: %s", b.sanitizeCommand(buildCommand))
++
++	b.node.GetOC().NotShowInfo()
++	defer b.node.GetOC().SetShowInfo()
++	output, err := b.node.DebugNodeWithChroot("bash", "-c", buildCommand)
++	if err != nil {
++		msg := fmt.Sprintf("Podman failed building image %s:\n%s\n%s", b.osImage, output, err)
++		logger.Errorf(msg)
++		return fmt.Errorf("%s", msg)
++	}
++
++	logger.Debugf(output)
++	logger.Infof("OK!\n")
++
++	return nil
++}
++
++// pushImage pushes the built OS image to the registry by:
++// - Executing "podman manifest push" for manifest builds or "podman push" for single image builds
++// - Respecting cluster proxy settings and using the authentication file
++// - Validating that the push was authorized by checking for unauthorized errors in the output
++// Returns an error if the push command fails or if the push is unauthorized.
++func (b *OsImageBuilderInNode) pushImage() error {
++	exutil.By("Push osImage")
++	var pushCommand string
++	if b.BuildAsManifest {
++		pushCommand = "NO_PROXY=" + b.noProxy + " HTTPS_PROXY=" + b.httpsProxy + " HTTP_PROXY=" + b.httpProxy + " podman manifest push " + b.osImage + " docker://" + b.osImage + " --authfile " + b.remoteDockerConfig
++		logger.Infof("Pushing as manifest")
++	} else {
++		pushCommand = "NO_PROXY=" + b.noProxy + " HTTPS_PROXY=" + b.httpsProxy + " HTTP_PROXY=" + b.httpProxy + " podman push " + b.osImage + " --authfile " + b.remoteDockerConfig
++		logger.Infof("Pushing as single image")
++	}
++	logger.Infof("Executing push command: %s", b.sanitizeCommand(pushCommand))
++
++	b.node.GetOC().NotShowInfo()
++	defer b.node.GetOC().SetShowInfo()
++	output, err := b.node.DebugNodeWithChroot("bash", "-c", pushCommand)
++	if err != nil {
++		msg := fmt.Sprintf("Podman failed pushing image %s:\n%s\n%s", b.osImage, output, err)
++		logger.Errorf(msg)
++		return fmt.Errorf("%s", msg)
++	}
++
++	// If we don't have permissions to push the image, the `oc debug` command will not return an error
++	//  so we need to check manually that there is no unauthorized error
++	if strings.Contains(output, "unauthorized: access to the requested resource is not authorized") {
++		msg := fmt.Sprintf("Podman was not authorized to push the image %s:\n%s\n", b.osImage, output)
++		logger.Errorf(msg)
++		return fmt.Errorf("%s", msg)
++	}
++
++	logger.Debugf(output)
++	logger.Infof("OK!\n")
++	return nil
++}
++
++// removeImage removes the built OS image from the node to free up space
++func (b *OsImageBuilderInNode) removeImage() error {
++	exutil.By("Remove osImage")
++	var rmOutput string
++	var err error
++	if b.BuildAsManifest {
++		logger.Infof("Removing manifest")
++		rmOutput, err = b.node.DebugNodeWithChroot("podman", "manifest", "rm", b.osImage)
++	} else {
++		logger.Infof("Removing single image")
++		rmOutput, err = b.node.DebugNodeWithChroot("podman", "rmi", b.osImage)
++	}
++	if err != nil {
++		msg := fmt.Sprintf("Podman failed removing image %s:\n%s\n%s", b.osImage, rmOutput, err)
++		logger.Errorf(msg)
++		return fmt.Errorf("%s", msg)
++	}
++
++	logger.Debugf(rmOutput)
++	logger.Infof("OK!\n")
++	return nil
++}
++
++// digestImage inspects the pushed image and returns its digest reference
++func (b *OsImageBuilderInNode) digestImage() (string, error) {
++	exutil.By("Digest osImage")
++	skopeoCommand := "NO_PROXY=" + b.noProxy + " HTTPS_PROXY=" + b.httpsProxy + " HTTP_PROXY=" + b.httpProxy + " skopeo inspect docker://" + b.osImage + " --authfile " + b.remoteDockerConfig
++	logger.Infof("Executing skopeo command: %s", b.sanitizeCommand(skopeoCommand))
++
++	b.node.GetOC().NotShowInfo()
++	defer b.node.GetOC().SetShowInfo()
++	inspectInfo, _, err := b.node.DebugNodeWithChrootStd("bash", "-c", skopeoCommand)
++	if err != nil {
++		msg := fmt.Sprintf("Skopeo failed inspecting image %s:\n%s\n%s", b.osImage, inspectInfo, err)
++		logger.Errorf(msg)
++		return "", fmt.Errorf("%s", msg)
++	}
++
++	logger.Debugf(inspectInfo)
++
++	inspectJSON := JSON(inspectInfo)
++	digestedImage := inspectJSON.Get("Name").ToString() + "@" + inspectJSON.Get("Digest").ToString()
++
++	logger.Infof("Image %s was built and pushed properly", b.osImage)
++	logger.Infof("Image %s was digested as %s", b.osImage, digestedImage)
++
++	logger.Infof("OK!\n")
++	return digestedImage, nil
++}
++
++// CreateAndDigestOsImage create the osImage and returns the image digested
++func (b *OsImageBuilderInNode) CreateAndDigestOsImage() (string, error) {
++	if err := b.prepareEnvironment(); err != nil {
++		return "", err
++	}
++	if err := b.buildImage(); err != nil {
++		return "", err
++	}
++	if err := b.pushImage(); err != nil {
++		return "", err
++	}
++	if err := b.removeImage(); err != nil {
++		return "", err
++	}
++	return b.digestImage()
++}
+diff --git a/test/extended-priv/machineconfigpool.go b/test/extended-priv/machineconfigpool.go
+index 40e05cefeb..5eeaf3e281 100644
+--- a/test/extended-priv/machineconfigpool.go
++++ b/test/extended-priv/machineconfigpool.go
+@@ -1155,6 +1155,21 @@ func GetCompactCompatiblePool(oc *exutil.CLI) *MachineConfigPool {
+ 	return nil
+ }
+ 
++// GetCoreOsCompatiblePool returns worker pool if it has CoreOs nodes. If there is no CoreOs node in the worker pool, then it returns master pool.
++func GetCoreOsCompatiblePool(oc *exutil.CLI) *MachineConfigPool {
++	var (
++		wMcp = NewMachineConfigPool(oc.AsAdmin(), MachineConfigPoolWorker)
++		mMcp = NewMachineConfigPool(oc.AsAdmin(), MachineConfigPoolMaster)
++	)
++
++	if len(wMcp.GetCoreOsNodesOrFail()) == 0 {
++		logger.Infof("No CoreOs nodes in the worker pool. Using master pool for testing")
++		return mMcp
++	}
++
++	return wMcp
++}
++
+ // GetCompactCompatibleOrCustomPool returns compact compatible pool or creates custom pool that will use the same stream as the worker pool
+ func GetCompactCompatibleOrCustomPool(oc *exutil.CLI, numNodes int) (*MachineConfigPool, func() error, error) {
+ 	osstream, err := GetEffectiveOsImageStream(NewMachineConfigPool(oc.AsAdmin(), MachineConfigPoolWorker))
+diff --git a/test/extended-priv/mco_alerts.go b/test/extended-priv/mco_alerts.go
+new file mode 100644
+index 0000000000..bc958ec0f2
+--- /dev/null
++++ b/test/extended-priv/mco_alerts.go
+@@ -0,0 +1,530 @@
++package extended
++
++import (
++	"fmt"
++	"regexp"
++	"time"
++
++	"github.com/onsi/gomega/types"
++
++	g "github.com/onsi/ginkgo/v2"
++	o "github.com/onsi/gomega"
++	exutil "github.com/openshift/machine-config-operator/test/extended-priv/util"
++	logger "github.com/openshift/machine-config-operator/test/extended-priv/util/logext"
++)
++
++var _ = g.Describe("[sig-mco][Suite:openshift/machine-config-operator/longduration][Serial][Disruptive] MCO alerts", func() {
++	defer g.GinkgoRecover()
++
++	var (
++		oc = exutil.NewCLI("mco-alerts", exutil.KubeConfigPath())
++		// CoreOs compatible MachineConfigPool (if worker pool has CoreOs nodes, then it is worker pool, else it is master pool because mater nodes are always CoreOs)
++		coMcp *MachineConfigPool
++		// Compact compatible MCP. If the node is compact/SNO this variable will be the master pool, else it will be the worker pool
++		mcp *MachineConfigPool
++		// master MCP
++		mMcp *MachineConfigPool
++	)
++
++	g.JustBeforeEach(func() {
++		coMcp = GetCoreOsCompatiblePool(oc.AsAdmin())
++		mcp = GetCompactCompatiblePool(oc.AsAdmin())
++		mMcp = NewMachineConfigPool(oc.AsAdmin(), MachineConfigPoolMaster)
++
++		PreChecks(oc)
++	})
++
++	g.It("[PolarionID:63865][OTP] MCDRebootError alert [Disruptive]", func() {
++		var (
++			mcName                 = "mco-tc-63865-reboot-alert"
++			filePath               = "/etc/mco-tc-63865-test.test"
++			fileContent            = "test"
++			fileMode               = 420 // decimal 0644
++			expectedAlertName      = "MCDRebootError"
++			expectedAlertSeverity  = "critical"
++			alertFiredAfter        = 5 * time.Minute
++			alertStillPresentAfter = 10 * time.Minute
++		)
++
++		exutil.By("Break the reboot process in a node")
++		node := mcp.GetSortedNodesOrFail()[0]
++		defer func() {
++			_ = FixRebootInNode(node)
++			mcp.WaitForUpdatedStatus()
++		}()
++		o.Expect(BreakRebootInNode(node)).To(o.Succeed(),
++			"Error breaking the reboot process in node %s", node.GetName())
++		logger.Infof("OK!\n")
++
++		exutil.By("Create a MC to force a reboot")
++		file := ign32File{
++			Path: filePath,
++			Contents: ign32Contents{
++				Source: GetBase64EncodedFileSourceContent(fileContent),
++			},
++			Mode: PtrInt(fileMode),
++		}
++
++		mc := NewMachineConfig(oc.AsAdmin(), mcName, mcp.GetName())
++		mc.skipWaitForMcp = true
++		defer mc.Delete()
++
++		mc.parameters = []string{fmt.Sprintf("FILES=[%s]", MarshalOrFail(file))}
++		mc.create()
++		logger.Infof("OK!\n")
++
++		// Check that the expected alert is fired with the right values
++		expectedDegradedMessage := fmt.Sprintf(`Node %s is reporting: "reboot command failed, something is seriously wrong"`,
++			node.GetName())
++
++		expectedAlertLabels := expectedAlertValues{"severity": o.Equal(expectedAlertSeverity)}
++
++		expectedAlertAnnotationDescription := fmt.Sprintf("Reboot failed on %s , update may be blocked. For more details:  oc logs -f -n openshift-machine-config-operator machine-config-daemon",
++			node.GetName())
++		expectedAlertAnnotationSummary := "Alerts the user that a node failed to reboot one or more times over a span of 5 minutes."
++
++		expectedAlertAnnotations := expectedAlertValues{
++			"description": o.ContainSubstring(expectedAlertAnnotationDescription),
++			"summary":     o.Equal(expectedAlertAnnotationSummary),
++		}
++
++		params := checkFiredAlertParams{
++			expectedAlertName:        expectedAlertName,
++			expectedDegradedMessage:  regexp.QuoteMeta(expectedDegradedMessage),
++			expectedAlertLabels:      expectedAlertLabels,
++			expectedAlertAnnotations: expectedAlertAnnotations,
++			pendingDuration:          alertFiredAfter,
++			// Because of OCPBUGS-5497, we need to check that the alert is already present after 15 minutes.
++			// We have waited 5 minutes to test the "firing" state, so we only have to wait 10 minutes more to test the 15 minutes needed since OCPBUGS-5497
++			stillPresentDuration: alertStillPresentAfter,
++		}
++		checkFiredAlert(oc, mcp, params)
++
++		exutil.By("Fix the reboot process in the node")
++		o.Expect(FixRebootInNode(node)).To(o.Succeed(),
++			"Error fixing the reboot process in node %s", node.GetName())
++		logger.Infof("OK!\n")
++
++		checkFixedAlert(oc, mcp, expectedAlertName)
++	})
++
++	g.It("[PolarionID:63866][OTP] MCDPivotError alert [Disruptive]", func() {
++		var (
++			mcName                = "mco-tc-63866-pivot-alert"
++			expectedAlertName     = "MCDPivotError"
++			alertFiredAfter       = 2 * time.Minute
++			dockerFileCommands    = `RUN echo 'Hello world' >  /etc/hello-world-file`
++			expectedAlertSeverity = "warning"
++		)
++		// We use master MCP because like that we make sure that we are using a CoreOs node
++		exutil.By("Break the reboot process in a node")
++		// We sort the coreOs list to make sure that we break the first updated not to make the test faster
++		node := sortNodeList(coMcp.GetCoreOsNodesOrFail())[0]
++		defer func() {
++			_ = FixRebaseInNode(node)
++			coMcp.WaitForUpdatedStatus()
++		}()
++		o.Expect(BreakRebaseInNode(node)).To(o.Succeed(),
++			"Error breaking the rpm-ostree rebase process in node %s", node.GetName())
++		logger.Infof("OK!\n")
++
++		// Build a new osImage that we will use to force a rebase in the broken node
++		exutil.By("Build new OSImage")
++		osImageBuilder := OsImageBuilderInNode{node: node, dockerFileCommands: dockerFileCommands}
++		digestedImage, err := osImageBuilder.CreateAndDigestOsImage()
++		o.Expect(err).NotTo(o.HaveOccurred(),
++			"Error creating the new osImage")
++		logger.Infof("OK\n")
++
++		// Create MC to force the rebase operation
++		exutil.By("Create a MC to deploy the new osImage")
++		mc := NewMachineConfig(oc.AsAdmin(), mcName, coMcp.GetName())
++		mc.parameters = []string{"OS_IMAGE=" + digestedImage}
++
++		mc.skipWaitForMcp = true
++		defer mc.Delete()
++		mc.create()
++		logger.Infof("OK\n")
++
++		// Check that the expected alert is fired with the right values
++		expectedDegradedMessage := fmt.Sprintf(`Node %s .*[Ff]ailed to update OS to %s`,
++			regexp.QuoteMeta(node.GetName()), regexp.QuoteMeta(digestedImage))
++
++		expectedAlertLabels := expectedAlertValues{"severity": o.Equal(expectedAlertSeverity)}
++
++		expectedAlertAnnotationDescription := fmt.Sprintf("Error detected in pivot logs on %s , upgrade may be blocked. For more details:  oc logs -f -n openshift-machine-config-operator machine-config-daemon-",
++			node.GetName())
++		expectedAlertAnnotationSummary := "Alerts the user when an error is detected upon pivot. This triggers if the pivot errors are above zero for 2 minutes."
++
++		expectedAlertAnnotations := expectedAlertValues{
++			"description": o.ContainSubstring(expectedAlertAnnotationDescription),
++			"summary":     o.Equal(expectedAlertAnnotationSummary),
++		}
++
++		params := checkFiredAlertParams{
++			expectedAlertName:        expectedAlertName,
++			expectedDegradedMessage:  expectedDegradedMessage,
++			expectedAlertLabels:      expectedAlertLabels,
++			expectedAlertAnnotations: expectedAlertAnnotations,
++			pendingDuration:          alertFiredAfter,
++			stillPresentDuration:     0, // We skip this validation to make the test faster
++		}
++		checkFiredAlert(oc, coMcp, params)
++
++		exutil.By("Fix the rpm-ostree rebase process in the node")
++		o.Expect(FixRebaseInNode(node)).To(o.Succeed(),
++			"Error fixing the rpm-ostree rebase process in node %s", node.GetName())
++		logger.Infof("OK!\n")
++
++		checkFixedAlert(oc, coMcp, expectedAlertName)
++	})
++
++	g.It("[PolarionID:62075][OTP] MCCPoolAlert. Test support for a node pool hierarchy [Disruptive]", func() {
++
++		var (
++			iMcpName              = "infra"
++			expectedAlertName     = "MCCPoolAlert"
++			expectedAlertSeverity = "warning"
++
++			masterNode = mMcp.GetNodesOrFail()[0]
++			mcc        = NewController(oc.AsAdmin())
++		)
++
++		numMasterNodes, err := mMcp.getMachineCount()
++		o.Expect(err).NotTo(o.HaveOccurred(), "Cannot get the machinecount field in % MCP", mMcp.GetName())
++
++		exutil.By("Add label as infra to the existing master node")
++		infraLabel := "node-role.kubernetes.io/infra"
++		defer func() {
++			// ignore output, just focus on error handling, if error is occurred, fail this case
++			_, deletefailure := masterNode.DeleteLabel(infraLabel)
++			o.Expect(deletefailure).NotTo(o.HaveOccurred())
++		}()
++		err = masterNode.AddLabel(infraLabel, "")
++		o.Expect(err).NotTo(o.HaveOccurred(),
++			"Could not add the label %s to node %s", infraLabel, masterNode)
++		logger.Infof("OK!\n")
++
++		exutil.By("Create custom infra mcp")
++		iMcpTemplate := generateTemplateAbsolutePath("custom-machine-config-pool.yaml")
++		iMcp := NewMachineConfigPool(oc.AsAdmin(), iMcpName)
++		iMcp.template = iMcpTemplate
++		// We need to wait for the label to be delete before removing the MCP. Otherwise the worker pool
++		// becomes Degraded.
++		defer func() {
++			_, deletefailure := masterNode.DeleteLabel(infraLabel)
++
++			// We don't fail if there is a problem because we need to delete the infra MCP
++			// We will try to remove the label again in the next defer section
++			if deletefailure != nil {
++				logger.Errorf("Error deleting label '%s' in node '%s'", infraLabel, masterNode.GetName())
++			}
++
++			_ = masterNode.WaitForLabelRemoved(infraLabel)
++
++			iMcp.delete()
++		}()
++		iMcp.create()
++		logger.Infof("OK!\n")
++
++		exutil.By("Check that the controller logs are reporting the conflict")
++		o.Eventually(
++			mcc.GetLogs, "5m", "10s",
++		).Should(o.ContainSubstring("Found master node that matches selector for custom pool %s, defaulting to master. This node will not have any custom role configuration as a result. Please review the node to make sure this is intended", iMcpName),
++			"The MCO controller is not reporting a machine config pool conflict in the logs")
++		logger.Infof("OK!\n")
++
++		exutil.By(`Check that the master node remains in master pool and is moved to "infra" pool or simply removed from master pool`)
++		o.Consistently(mMcp.getMachineCount, "30s", "10s").Should(o.Equal(numMasterNodes),
++			"The number of machines in the MCP has changed!\n%s", mMcp.PrettyString())
++
++		o.Consistently(iMcp.getMachineCount, "30s", "10s").Should(o.Equal(0),
++			"No node should be added to the custom pool!\n%s", iMcp.PrettyString())
++		logger.Infof("OK!\n")
++
++		// Check that the expected alert is fired with the right values
++		exutil.By(`Check that the right alert was triggered`)
++
++		expectedAlertLabels := expectedAlertValues{"severity": o.Equal(expectedAlertSeverity)}
++
++		expectedAlertAnnotationDescription := fmt.Sprintf("Node .* has triggered a pool alert due to a label change")
++		expectedAlertAnnotationSummary := "Triggers when nodes in a pool have overlapping labels such as master, worker, and a custom label therefore a choice must be made as to which is honored."
++
++		expectedAlertAnnotations := expectedAlertValues{
++			"description": o.MatchRegexp(expectedAlertAnnotationDescription),
++			"summary":     o.Equal(expectedAlertAnnotationSummary),
++		}
++
++		params := checkFiredAlertParams{
++			expectedAlertName:        expectedAlertName,
++			expectedAlertLabels:      expectedAlertLabels,
++			expectedAlertAnnotations: expectedAlertAnnotations,
++			pendingDuration:          0,
++			stillPresentDuration:     0, // We skip this validation to make the test faster
++		}
++		checkFiredAlert(oc, nil, params)
++		logger.Infof("OK!\n")
++
++		exutil.By("Remove the label from the master node in order to fix the problem")
++		_, err = masterNode.DeleteLabel(infraLabel)
++		o.Expect(err).NotTo(o.HaveOccurred(),
++			"Could not delete the %s label in node %s", infraLabel, masterNode)
++
++		o.Expect(
++			masterNode.WaitForLabelRemoved(infraLabel),
++		).To(o.Succeed(),
++			"The label %s was not removed from node %s", infraLabel, masterNode)
++		logger.Infof("OK!\n")
++
++		exutil.By("Check that the alert is not triggered anymore")
++		checkFixedAlert(oc, coMcp, expectedAlertName)
++		logger.Infof("OK!\n")
++	})
++
++	g.It("[PolarionID:73841][OTP] KubeletHealthState alert [Disruptive]", func() {
++		var (
++			node                               = mcp.GetSortedNodesOrFail()[0]
++			fixed                              = false
++			expectedAlertName                  = "KubeletHealthState"
++			expectedAlertSeverity              = "warning"
++			expectedAlertAnnotationDescription = "Kubelet health failure threshold reached"
++			expectedAlertAnnotationSummary     = "This keeps track of Kubelet health failures, and tallies them. The warning is triggered if 2 or more failures occur."
++		)
++
++		exutil.By("Break kubelet")
++		// We stop the kubelet service to break the node and after 5 minutes we start it again to fix the node
++		go func() {
++			defer g.GinkgoRecover()
++			_, err := node.DebugNodeWithChroot("sh", "-c", "systemctl stop kubelet.service; sleep 300; systemctl start kubelet.service")
++			o.Expect(err).NotTo(o.HaveOccurred(),
++				"Error stopping and restarting kubelet in %s", node)
++			logger.Infof("Kubelet service has been restarted again")
++			fixed = true
++		}()
++		logger.Infof("OK!\n")
++
++		expectedAlertLabels := expectedAlertValues{
++			"severity": o.Equal(expectedAlertSeverity),
++		}
++
++		expectedAlertAnnotations := expectedAlertValues{
++			"description": o.MatchRegexp(expectedAlertAnnotationDescription),
++			"summary":     o.Equal(expectedAlertAnnotationSummary),
++		}
++
++		params := checkFiredAlertParams{
++			expectedAlertName:        expectedAlertName,
++			expectedAlertLabels:      expectedAlertLabels,
++			expectedAlertAnnotations: expectedAlertAnnotations,
++			pendingDuration:          0,
++			stillPresentDuration:     0, // We skip this validation to make the test faster
++		}
++		checkFiredAlert(oc, nil, params)
++
++		exutil.By("Wait for the kubelet service to be restarted")
++		o.Eventually(func() bool { return fixed }, "6m", "20s").Should(o.BeTrue(), "Kubelet service was not restarted")
++		o.Eventually(node).Should(HaveConditionField("Ready", "status", TrueString), "Node %s didn't become ready after kubelet was restarted", node)
++		logger.Infof("OK!\n")
++
++		exutil.By("Check that the alert is not triggered anymore")
++		checkFixedAlert(oc, mcp, expectedAlertName)
++		logger.Infof("OK!\n")
++	})
++
++	g.It("[PolarionID:88061][OTP] Verify when skew is disabled, machine-config-operator shows alert in prometheus", func() {
++		var (
++			expectedAlertName                  = "MCCBootImageSkewEnforcementNone"
++			expectedAlertSeverity              = "info"
++			expectedAlertAnnotationSummary     = "Boot image skew enforcement is disabled. Scaling operations may not be successful."
++			expectedAlertAnnotationDescription = "Boot image skew enforcement mode is set to None"
++			machineConfiguration               = GetMachineConfiguration(oc.AsAdmin())
++		)
++
++		// Define expected alert validation parameters
++		expectedAlertLabels := expectedAlertValues{
++			"severity": o.Equal(expectedAlertSeverity),
++		}
++		expectedAlertAnnotations := expectedAlertValues{
++			"summary":     o.Equal(expectedAlertAnnotationSummary),
++			"description": o.ContainSubstring(expectedAlertAnnotationDescription),
++		}
++		exutil.By("Save the initial MachineConfiguration spec for cleanup")
++		initialSpec := machineConfiguration.GetSpecOrFail()
++		defer func() {
++			exutil.By("Restoring initial MachineConfiguration spec")
++			o.Expect(machineConfiguration.SetSpec(initialSpec)).To(o.Succeed(),
++				"Error restoring initial MachineConfiguration spec")
++			o.Eventually(machineConfiguration.IsGenerationUpToDate, "2m", "10s").Should(o.BeTrue(),
++				"MachineConfiguration observedGeneration did not catch up to generation")
++			logger.Infof("OK!\n")
++		}()
++
++		exutil.By("Get the RHCOS version from a worker node for later use")
++		node := mcp.GetSortedNodesOrFail()[0]
++		rhcosVersion, err := node.GetRHCOSVersion()
++		o.Expect(err).NotTo(o.HaveOccurred(),
++			"Error getting the RHCOS version from node %s", node.GetName())
++		logger.Infof("RHCOS version from node %s: %s\n", node.GetName(), rhcosVersion)
++
++		exutil.By("Set the bootImageSkewEnforcement to None")
++		o.Expect(machineConfiguration.SetNoneSkew()).To(o.Succeed(),
++			"Error setting bootImageSkewEnforcement to None mode")
++		logger.Infof("OK!\n")
++
++		exutil.By("Verify the MCCBootImageSkewEnforcementNone alert is triggered")
++		params := checkFiredAlertParams{
++			expectedAlertName:        expectedAlertName,
++			expectedAlertLabels:      expectedAlertLabels,
++			expectedAlertAnnotations: expectedAlertAnnotations,
++			pendingDuration:          0,
++			stillPresentDuration:     0,
++		}
++		checkFiredAlert(oc, nil, params)
++		logger.Infof("OK!\n")
++
++		exutil.By("Set the bootImageSkewEnforcement to Manual")
++		o.Expect(machineConfiguration.SetManualSkew(RHCOSVersionMode, rhcosVersion)).To(o.Succeed(),
++			"Error setting bootImageSkewEnforcement to Manual mode")
++		logger.Infof("OK!\n")
++
++		exutil.By("Verify the MCCBootImageSkewEnforcementNone alert is no longer triggered")
++		o.Eventually(getAlertsByName, "5m", "20s").WithArguments(oc, expectedAlertName).
++			Should(o.HaveLen(0),
++				"Expected %s alert to be removed after setting Manual mode!", expectedAlertName)
++		logger.Infof("OK!\n")
++	})
++})
++
++type expectedAlertValues map[string]types.GomegaMatcher
++
++type checkFiredAlertParams struct {
++	expectedAlertLabels      expectedAlertValues
++	expectedAlertAnnotations expectedAlertValues
++	// regexp that should match the MCP degraded message
++	expectedDegradedMessage string
++	expectedAlertName       string
++	pendingDuration         time.Duration
++	stillPresentDuration    time.Duration
++}
++
++func checkFiredAlert(oc *exutil.CLI, mcp *MachineConfigPool, params checkFiredAlertParams) {
++	if mcp != nil {
++		exutil.By("Wait for MCP to be degraded")
++		o.Eventually(mcp,
++			"15m", "30s").Should(BeDegraded(),
++			"The %s MCP should be degraded when the reboot process is broken. But it didn't.", mcp.GetName())
++		logger.Infof("OK!\n")
++
++		exutil.By("Verify that the pool reports the right error message")
++		o.Expect(mcp).To(HaveNodeDegradedMessage(o.MatchRegexp(params.expectedDegradedMessage)),
++			"The %s MCP is not reporting the right error message", mcp.GetName())
++		logger.Infof("OK!\n")
++	}
++
++	exutil.By("Verify that the alert is triggered")
++	var alertJSON []map[string]interface{}
++	var alertErr error
++	o.Eventually(func() ([]map[string]interface{}, error) {
++		alertJSON, alertErr = getAlertsByName(oc, params.expectedAlertName)
++		return alertJSON, alertErr
++	}, "10m", "20s").Should(o.HaveLen(1),
++		"Expected 1 %s alert and only 1 to be triggered!", params.expectedAlertName)
++
++	logger.Infof("Found %s alerts: %v", params.expectedAlertName, alertJSON)
++	alert := alertJSON[0]
++	annotationsVal, ok := alert["annotations"]
++	o.Expect(ok).To(o.BeTrue(), "Alert does not contain 'annotations' key")
++	annotationsMap, ok := annotationsVal.(map[string]interface{})
++	o.Expect(ok).To(o.BeTrue(), "Alert 'annotations' is not a map[string]interface{}")
++	logger.Infof("OK!\n")
++
++	if params.expectedAlertAnnotations != nil {
++		exutil.By("Verify alert's annotations")
++
++		// Check all expected annotations
++		for annotation, expectedMatcher := range params.expectedAlertAnnotations {
++			logger.Infof("Verifying annotation: %s", annotation)
++			o.Expect(annotationsMap).To(o.HaveKeyWithValue(annotation, expectedMatcher),
++				"The alert is reporting a wrong '%s' annotation value", annotation)
++		}
++		logger.Infof("OK!\n")
++	} else {
++		logger.Infof("No annotations checks needed!")
++	}
++
++	exutil.By("Verify alert's labels")
++	labelsVal, ok := alert["labels"]
++	o.Expect(ok).To(o.BeTrue(), "Alert does not contain 'labels' key")
++	labelsMap, ok := labelsVal.(map[string]interface{})
++	o.Expect(ok).To(o.BeTrue(), "Alert 'labels' is not a map[string]interface{}")
++
++	// Since OCPBUGS-904 we need to check that the namespace is reported properly in all the alerts
++	o.Expect(labelsMap).To(o.HaveKeyWithValue("namespace", MachineConfigNamespace),
++		"Expected the alert to report the MCO namespace")
++
++	if params.expectedAlertLabels != nil {
++		// Check all expected labels
++		for label, expectedMatcher := range params.expectedAlertLabels {
++			logger.Infof("Verifying label: %s", label)
++			o.Expect(labelsMap).To(o.HaveKeyWithValue(label, expectedMatcher),
++				"The alert is reporting a wrong '%s' label value", label)
++		}
++	} else {
++		logger.Infof("No extra labels checks needed!")
++	}
++
++	logger.Infof("OK!\n")
++
++	if params.pendingDuration != 0 {
++		exutil.By("Verify that the alert is pending")
++		o.Expect(alert).To(o.HaveKeyWithValue("state", "pending"),
++			"Expected the alert's state to be 'pending', but it is not.")
++		logger.Infof("OK!\n")
++	}
++
++	exutil.By("Verify that the alert is in firing state")
++	if params.pendingDuration != 0 {
++		logger.Infof("Wait %s minutes until the alert is fired", params.pendingDuration)
++		time.Sleep(params.pendingDuration)
++	}
++
++	logger.Infof("Checking alert's state")
++	o.Eventually(func() ([]map[string]interface{}, error) {
++		alertJSON, alertErr = getAlertsByName(oc, params.expectedAlertName)
++		return alertJSON, alertErr
++	}, "15m", "20s").Should(o.HaveLen(1),
++		"Expected 1 %s alert and only 1 to be triggered!", params.expectedAlertName)
++
++	logger.Infof("Found %s alerts: %v", params.expectedAlertName, alertJSON)
++
++	alert = alertJSON[0]
++	o.Expect(alert).To(o.HaveKeyWithValue("state", "firing"),
++		"Expected the alert to report 'firing' state")
++
++	logger.Infof("OK!\n")
++
++	if params.stillPresentDuration.Minutes() != 0 {
++		exutil.By(fmt.Sprintf("Verify that the alert is not removed after %s", params.stillPresentDuration))
++		o.Consistently(getAlertsByName, params.stillPresentDuration, params.stillPresentDuration/3).WithArguments(oc, params.expectedAlertName).
++			Should(o.HaveLen(1),
++				"Expected %s alert to be present, but the alert was removed for no reason!", params.expectedAlertName)
++		logger.Infof("OK!\n")
++	}
++
++}
++
++func checkFixedAlert(oc *exutil.CLI, mcp *MachineConfigPool, expectedAlertName string) {
++	if mcp != nil {
++		exutil.By("Verify that the pool stops being degraded")
++		o.Eventually(mcp,
++			"10m", "30s").ShouldNot(BeDegraded(),
++			"After fixing the reboot process the %s MCP should stop being degraded", mcp.GetName())
++		logger.Infof("OK!\n")
++	}
++
++	exutil.By("Verify that the alert is not triggered anymore")
++	o.Eventually(getAlertsByName, "5m", "20s").WithArguments(oc, expectedAlertName).
++		Should(o.HaveLen(0),
++			"Expected %s alert to be removed after the problem is fixed!", expectedAlertName)
++	logger.Infof("OK!\n")
++}
+diff --git a/test/extended-priv/mco_machineconfignode.go b/test/extended-priv/mco_machineconfignode.go
+index c6e04cceda..74ff79353a 100644
+--- a/test/extended-priv/mco_machineconfignode.go
++++ b/test/extended-priv/mco_machineconfignode.go
+@@ -22,15 +22,6 @@ var _ = g.Describe("[sig-mco][Suite:openshift/machine-config-operator/longdurati
+ 		PreChecks(oc)
+ 	})
+ 
+-	g.It("[PolarionID:69184][OTP] Enable feature gate MachineConfigNodes [apigroup:machineconfiguration.openshift.io]", func() {
+-		// need to check whether featureGate MachineConfigNodes is in enabled list
+-		exutil.By("Check whether featureGate: MachineConfigNodes is enabled")
+-		featureGate := NewResource(oc.AsAdmin(), "featuregate", "cluster")
+-		enabled := featureGate.GetOrFail(`{.status.featureGates[*].enabled}`)
+-		logger.Infof("enabled featuregates: %s", enabled)
+-		o.Expect(enabled).Should(o.ContainSubstring("MachineConfigNodes"), "featureGate: MachineConfigNodes cannot be found")
+-	})
+-
+ 	g.It("[PolarionID:69187][OTP] Validate MachineConfigNodes properties [apigroup:machineconfiguration.openshift.io]", func() {
+ 
+ 		nodes := NewNodeList(oc.AsAdmin()).GetAllLinuxWorkerNodesOrFail()
+diff --git a/test/extended-priv/node.go b/test/extended-priv/node.go
+index 6f684fd0e0..cb0628d874 100644
+--- a/test/extended-priv/node.go
++++ b/test/extended-priv/node.go
+@@ -15,6 +15,7 @@ import (
+ 	exutil "github.com/openshift/machine-config-operator/test/extended-priv/util"
+ 	"github.com/openshift/machine-config-operator/test/extended-priv/util/architecture"
+ 	logger "github.com/openshift/machine-config-operator/test/extended-priv/util/logext"
++	"github.com/tidwall/gjson"
+ 	"k8s.io/apimachinery/pkg/util/sets"
+ 	"k8s.io/apimachinery/pkg/util/wait"
+ )
+@@ -1306,13 +1307,6 @@ func (nl NodeList) GetAllMasterNodes() ([]*Node, error) {
+ 	return nl.GetAll()
+ }
+ 
+-// GetAllMasterNodesOrFail returns a list of master Nodes
+-func (nl NodeList) GetAllMasterNodesOrFail() []*Node {
+-	masters, err := nl.GetAllMasterNodes()
+-	o.Expect(err).NotTo(o.HaveOccurred())
+-	return masters
+-}
+-
+ // GetAllWorkerNodes returns a list of worker Nodes
+ func (nl NodeList) GetAllWorkerNodes() ([]*Node, error) {
+ 	nl.ByLabel("node-role.kubernetes.io/worker=")
+@@ -1320,6 +1314,13 @@ func (nl NodeList) GetAllWorkerNodes() ([]*Node, error) {
+ 	return nl.GetAll()
+ }
+ 
++// GetAllMasterNodesOrFail returns a list of master Nodes
++func (nl NodeList) GetAllMasterNodesOrFail() []*Node {
++	masters, err := nl.GetAllMasterNodes()
++	o.Expect(err).NotTo(o.HaveOccurred())
++	return masters
++}
++
+ // GetAllLinuxWorkerNodes returns a list of linux worker Nodes
+ func (nl NodeList) GetAllLinuxWorkerNodes() ([]*Node, error) {
+ 	nl.ByLabel("node-role.kubernetes.io/worker=,kubernetes.io/os=linux")
+@@ -1377,6 +1378,43 @@ func quietRecoverNamespaceRestricted(oc *exutil.CLI, namespace string) error {
+ 	return exutil.RecoverNamespaceRestricted(oc, namespace)
+ }
+ 
++// BreakRebootInNode breaks the reboot process in a node
++func BreakRebootInNode(node *Node) error {
++	logger.Infof("Breaking reboot process in node %s", node.GetName())
++	_, err := node.DebugNodeWithChroot("sh", "-c", "touch /tmp/dummy-systemd-run; nsenter --mount=/proc/1/ns/mnt mount --bind /tmp/dummy-systemd-run /usr/bin/systemd-run")
++	return err
++}
++
++// FixRebootInNode fixes the reboot process in a node
++func FixRebootInNode(node *Node) error {
++	logger.Infof("Fixing reboot process in node %s", node.GetName())
++	_, err := node.DebugNodeWithChroot("sh", "-c", "nsenter --mount=/proc/1/ns/mnt umount /usr/bin/systemd-run")
++	return err
++}
++
++// BreakRebaseInNode breaks the rpm-ostree rebase process in a node
++func BreakRebaseInNode(node *Node) error {
++	logger.Infof("Breaking rpm-ostree rebase process in node %s", node.GetName())
++	brokenRpmOstree := generateTemplateAbsolutePath("rpm-ostree-force-pivot-error.sh")
++	if err := node.CopyFromLocal(brokenRpmOstree, "/tmp/rpm-ostree.broken"); err != nil {
++		return fmt.Errorf("Error copying %s to node %s: %w", brokenRpmOstree, node, err)
++	}
++	_, err := node.DebugNodeWithChroot("sh", "-c",
++		"chmod +x /tmp/rpm-ostree.broken; "+
++			"cp /usr/bin/rpm-ostree /tmp/rpm-ostree; "+
++			"nsenter --mount=/proc/1/ns/mnt mount --bind /tmp/rpm-ostree.broken /usr/bin/rpm-ostree; "+
++			"restorecon -v /usr/bin/rpm-ostree")
++	return err
++}
++
++// FixRebaseInNode fixes the rpm-ostree rebase process in a node
++func FixRebaseInNode(node *Node) error {
++	logger.Infof("Fixing rpm-ostree rebase process in node %s", node.GetName())
++
++	_, err := node.DebugNodeWithChroot("sh", "-c", "pkill -9 rpm-ostree; nsenter --mount=/proc/1/ns/mnt umount /usr/bin/rpm-ostree")
++	return err
++}
++
+ // GetOperatorNode returns the node running the MCO operator pod
+ func GetOperatorNode(oc *exutil.CLI) (*Node, error) {
+ 	podsList := NewNamespacedResourceList(oc.AsAdmin(), "pods", MachineConfigNamespace)
+@@ -1438,3 +1476,18 @@ func (n *Node) GetIrreconcilableChanges() (string, error) {
+ 	}
+ 	return irreconcilableChanges, nil
+ }
++
++// GetRHCOSVersion returns the RHCOS version of the node
++func (n *Node) GetRHCOSVersion() (string, error) {
++	deployment, err := n.GetBootedOsTreeDeployment(true)
++	if err != nil {
++		return "", fmt.Errorf("failed to get booted ostree deployment from node %s: %w", n.GetName(), err)
++	}
++
++	rhcosVersion := gjson.Get(deployment, "version").String()
++	if rhcosVersion == "" {
++		return "", fmt.Errorf("RHCOS version is empty for node %s", n.GetName())
++	}
++
++	return rhcosVersion, nil
++}
+diff --git a/test/extended-priv/testdata/files/rpm-ostree-force-pivot-error.sh b/test/extended-priv/testdata/files/rpm-ostree-force-pivot-error.sh
+new file mode 100644
+index 0000000000..acd54ca949
+--- /dev/null
++++ b/test/extended-priv/testdata/files/rpm-ostree-force-pivot-error.sh
+@@ -0,0 +1,12 @@
++#!/bin/bash
++
++# To force a rebase error, we move the original rpm-ostree exec file to /usr/bin/rpm-ostree2, and we replace it with this script
++# Remember to use the right selinux type when you replace the orinal rpm-ostree file
++if [ "$1" == "rebase" ];
++then
++exit 255
++else
++/tmp/rpm-ostree "$@"
++fi
++exit $?
++
+diff --git a/test/extended-priv/util.go b/test/extended-priv/util.go
+index 1c844bba76..89c05fa9d2 100644
+--- a/test/extended-priv/util.go
++++ b/test/extended-priv/util.go
+@@ -1193,3 +1193,46 @@ func skipTestIfNotSupportedPlatform(oc *exutil.CLI, notsupported ...string) {
+ 		}
+ 	}
+ }
++
++func getAlertsByName(oc *exutil.CLI, alertName string) ([]map[string]interface{}, error) {
++
++	mon, monErr := exutil.NewPrometheusMonitor(oc.AsAdmin())
++	if monErr != nil {
++		return nil, monErr
++	}
++
++	allAlerts, allAlertsErr := mon.GetAlerts()
++
++	if allAlertsErr != nil {
++		return nil, allAlertsErr
++	}
++
++	logger.Infof("get all alerts: %s\n", allAlerts)
++
++	// Validate JSON
++	if !gjson.Valid(allAlerts) {
++		return nil, fmt.Errorf("Cannot parse json string: %s", allAlerts)
++	}
++
++	// Use gjson to filter alerts by name - translate JSONPath to gjson syntax
++	// Original JSONPath: {.data.alerts[?(@.labels.alertname=="%s")]}
++	// gjson syntax: data.alerts.#(labels.alertname=="%s")#
++	gjsonPath := fmt.Sprintf(`data.alerts.#(labels.alertname=="%s")#`, alertName)
++	filteredAlertsResult := gjson.Get(allAlerts, gjsonPath)
++
++	if !filteredAlertsResult.IsArray() {
++		return nil, fmt.Errorf("Expected filtered alerts to be an array, but got: %s", filteredAlertsResult.String())
++	}
++
++	// Convert gjson.Result array to []map[string]interface{} using Value()
++	filteredAlerts := []map[string]interface{}{}
++	for _, alert := range filteredAlertsResult.Array() {
++		alertMap, ok := alert.Value().(map[string]interface{})
++		if !ok {
++			return nil, fmt.Errorf("Error converting alert to map: %v", alert)
++		}
++		filteredAlerts = append(filteredAlerts, alertMap)
++	}
++
++	return filteredAlerts, nil
++}
+diff --git a/test/extended-priv/util/pods.go b/test/extended-priv/util/pods.go
+index 2e70bc5091..5eae814cf7 100644
+--- a/test/extended-priv/util/pods.go
++++ b/test/extended-priv/util/pods.go
+@@ -155,6 +155,11 @@ func remoteShPod(oc *CLI, namespace, podName string, needBash, needChroot bool,
+ 	return oc.AsAdmin().WithoutNamespace().Run("rsh").Args(containerArgs...).Output()
+ }
+ 
++// RemoteShPod creates a remote shell of the given pod
++func RemoteShPod(oc *CLI, namespace, podName string, cmd ...string) (string, error) {
++	return remoteShPod(oc, namespace, podName, false, false, "", cmd...)
++}
++
+ // RemoteShContainer creates a remote shell of the given container inside the pod
+ func RemoteShContainer(oc *CLI, namespace, podName, container string, cmd ...string) (string, error) {
+ 	return remoteShPod(oc, namespace, podName, false, false, container, cmd...)
+diff --git a/test/extended-priv/util/prometheus_monitoring.go b/test/extended-priv/util/prometheus_monitoring.go
+new file mode 100644
+index 0000000000..02904a80b5
+--- /dev/null
++++ b/test/extended-priv/util/prometheus_monitoring.go
+@@ -0,0 +1,232 @@
++package util
++
++import (
++	"context"
++	"fmt"
++	"strings"
++	"time"
++
++	"k8s.io/apimachinery/pkg/util/wait"
++	e2e "k8s.io/kubernetes/test/e2e/framework"
++)
++
++const (
++	prometheusURL       = "https://prometheus-k8s.openshift-monitoring.svc:9091"
++	thanosURL           = "https://thanos-querier.openshift-monitoring.svc:9091"
++	monitorInstantQuery = "/api/v1/query"
++	monitorRangeQuery   = "/api/v1/query_range"
++	monitorAlerts       = "/api/v1/alerts"
++	monitorRules        = "/api/v1/rules"
++	monitorNamespace    = "openshift-monitoring"
++	prometheusK8s       = "prometheus-k8s"
++)
++
++// MonitorInstantQueryParams API doc
++// query parameters:
++//
++//	query=<string>: Prometheus expression query string.
++//	time=<rfc3339 | unix_timestamp>: Evaluation timestamp. Optional.
++//	timeout=<duration>: Evaluation timeout. Optional. Defaults to and is capped by the value of the -query.timeout flag.
++type MonitorInstantQueryParams struct {
++	Query   string
++	Time    string
++	Timeout string
++}
++
++// MonitorRangeQueryParams API doc
++// query range parameters
++//
++//	query=<string>: Prometheus expression query string.
++//	start=<rfc3339 | unix_timestamp>: Start timestamp, inclusive.
++//	end=<rfc3339 | unix_timestamp>: End timestamp, inclusive.
++//	step=<duration | float>: Query resolution step width in duration format or float number of seconds.
++//	timeout=<duration>: Evaluation timeout. Optional. Defaults to and is capped by the value of the -query.timeout flag.
++type MonitorRangeQueryParams struct {
++	Query   string
++	Start   string
++	End     string
++	Step    string
++	Timeout string
++}
++
++// Monitorer interface represents all funcs of monitoring
++type Monitorer interface {
++	SimpleQuery(query string) (string, error)
++	InstantQuery(queryParams MonitorInstantQueryParams) (string, error)
++	RangeQuery(queryParams MonitorRangeQueryParams) (string, error)
++	queryRules(query string) (string, error)
++	GetAllRules() (string, error)
++	GetAlertRules() (string, error)
++	GetRecordRules() (string, error)
++}
++
++// Monitor define a monitor object. It will query thanos
++type Monitor struct {
++	url      string
++	Token    string
++	ocClient *CLI
++}
++
++// PrometheusMonitor define a monitor object. It will query prometheus directly instead of thanos
++type PrometheusMonitor struct {
++	Monitor
++}
++
++// NewMonitor create a monitor using thanos URL
++func NewMonitor(oc *CLI) (*Monitor, error) {
++	var mo Monitor
++	var err error
++	mo.url = thanosURL
++	mo.ocClient = oc
++	mo.Token, err = GetSAToken(oc)
++	return &mo, err
++}
++
++// NewPrometheusMonitor create a monitor using prometheus url
++func NewPrometheusMonitor(oc *CLI) (*PrometheusMonitor, error) {
++	var mo Monitor
++	var err error
++	mo.url = prometheusURL
++	mo.ocClient = oc
++	mo.Token, err = GetSAToken(oc)
++	return &PrometheusMonitor{Monitor: mo}, err
++}
++
++// SimpleQuery query executes a query in prometheus. .../query?query=$query_to_execute
++func (mo *Monitor) SimpleQuery(query string) (string, error) {
++	queryParams := MonitorInstantQueryParams{Query: query}
++	return mo.InstantQuery(queryParams)
++}
++
++// InstantQuery query executes a query in prometheus with time and timeout.
++//
++//	Example:  curl 'http://host:port/api/v1/query?query=up&time=2015-07-01T20:10:51.781Z'
++func (mo *Monitor) InstantQuery(queryParams MonitorInstantQueryParams) (string, error) {
++	queryArgs := []string{"curl", "-k", "-s", "-H", fmt.Sprintf("Authorization: Bearer %v", mo.Token)}
++
++	if queryParams.Query != "" {
++		queryArgs = append(queryArgs, []string{"--data-urlencode", "query=" + queryParams.Query}...)
++	}
++	if queryParams.Time != "" {
++		queryArgs = append(queryArgs, []string{"--data-urlencode", "time=" + queryParams.Time}...)
++	}
++	if queryParams.Timeout != "" {
++		queryArgs = append(queryArgs, []string{"--data-urlencode", "timeout=" + queryParams.Timeout}...)
++	}
++
++	queryArgs = append(queryArgs, mo.url+monitorInstantQuery)
++
++	// We don't want to print the token
++	mo.ocClient.NotShowInfo()
++	defer mo.ocClient.SetShowInfo()
++
++	return RemoteShPod(mo.ocClient, monitorNamespace, "statefulsets/"+prometheusK8s, queryArgs...)
++}
++
++// RangeQuery executes a query range in prometheus with start, end, step and timeout
++//
++//	Example: curl 'http://host:port/api/v1/query_range?query=metricname&start=2015-07-01T20:10:30.781Z&end=2015-07-01T20:11:00.781Z&step=15s'
++func (mo *Monitor) RangeQuery(queryParams MonitorRangeQueryParams) (string, error) {
++	queryArgs := []string{"curl", "-k", "-s", "-H", fmt.Sprintf("Authorization: Bearer %v", mo.Token)}
++
++	if queryParams.Query != "" {
++		queryArgs = append(queryArgs, []string{"--data-urlencode", "query=" + queryParams.Query}...)
++	}
++	if queryParams.Start != "" {
++		queryArgs = append(queryArgs, []string{"--data-urlencode", "start=" + queryParams.Start}...)
++	}
++	if queryParams.End != "" {
++		queryArgs = append(queryArgs, []string{"--data-urlencode", "end=" + queryParams.End}...)
++	}
++	if queryParams.Step != "" {
++		queryArgs = append(queryArgs, []string{"--data-urlencode", "step=" + queryParams.Step}...)
++	}
++	if queryParams.Timeout != "" {
++		queryArgs = append(queryArgs, []string{"--data-urlencode", "timeout=" + queryParams.Timeout}...)
++	}
++
++	queryArgs = append(queryArgs, mo.url+monitorRangeQuery)
++
++	// We don't want to print the token
++	mo.ocClient.NotShowInfo()
++	defer mo.ocClient.SetShowInfo()
++
++	return RemoteShPod(mo.ocClient, monitorNamespace, "statefulsets/"+prometheusK8s, queryArgs...)
++}
++
++func (mo *Monitor) queryRules(query string) (string, error) {
++	queryArgs := []string{"curl", "-k", "-s", "-H", fmt.Sprintf("Authorization: Bearer %v", mo.Token)}
++	queryString := ""
++	if query != "" {
++		queryString = "?" + query
++	}
++
++	queryArgs = append(queryArgs, mo.url+monitorRules+queryString)
++
++	// We don't want to print the token
++	mo.ocClient.NotShowInfo()
++	defer mo.ocClient.SetShowInfo()
++
++	return RemoteShPod(mo.ocClient, monitorNamespace, "statefulsets/"+prometheusK8s, queryArgs...)
++}
++
++// GetAllRules returns all rules
++func (mo *Monitor) GetAllRules() (string, error) {
++	return mo.queryRules("")
++}
++
++// GetAlertRules returns all alerting rules
++func (mo *Monitor) GetAlertRules() (string, error) {
++	return mo.queryRules("type=alert")
++}
++
++// GetRecordRules returns all recording rules
++func (mo *Monitor) GetRecordRules() (string, error) {
++	return mo.queryRules("type=record")
++}
++
++// GetAlerts returns all alerts. It doesn't use the alermanager, and it returns alerts in 'pending' state too
++func (pmo *PrometheusMonitor) GetAlerts() (string, error) {
++
++	// We don't want to print the token
++	pmo.ocClient.NotShowInfo()
++	defer pmo.ocClient.SetShowInfo()
++
++	getCmd := "curl -k -s -H \"" + fmt.Sprintf("Authorization: Bearer %v", pmo.Token) + "\" " + pmo.url + monitorAlerts
++	return RemoteShPod(pmo.ocClient, monitorNamespace, "statefulsets/"+prometheusK8s, "sh", "-c", getCmd)
++}
++
++// GetSAToken get a token assigned to prometheus-k8s from openshift-monitoring namespace
++// According to 2093780, the secret prometheus-k8s-token is removed from sa prometheus-k8s.
++// So from 4.11, command <oc sa get-token prometheus-k8s -n openshift-monitoring> won't work
++// Please install oc client and cluster with same major version.
++func GetSAToken(oc *CLI) (string, error) {
++	e2e.Logf("Getting a token assgined to prometheus-k8s from %s namespace...", monitorNamespace)
++	token, err := oc.AsAdmin().WithoutNamespace().Run("create").Args("token", prometheusK8s, "-n", monitorNamespace).Output()
++	if err != nil {
++		if strings.Contains(token, "unknown command") { // oc client is old version, create token is not supported
++			e2e.Logf("oc create token is not supported by current client, use oc sa get-token instead")
++			token, err = oc.AsAdmin().WithoutNamespace().Run("sa").Args("get-token", prometheusK8s, "-n", monitorNamespace).Output()
++		} else {
++			return "", err
++		}
++	}
++
++	return token, err
++}
++
++// InstantQueryWithRetry passes QueryParams to InstantQuery and polls it until it succeeds or times out.
++func (mo *Monitor) InstantQueryWithRetry(queryParams MonitorInstantQueryParams, timeDurationSec int) string {
++	var res string
++	var err error
++	err = wait.PollUntilContextTimeout(context.TODO(), time.Duration(timeDurationSec/5)*time.Second, time.Duration(timeDurationSec)*time.Second, true, func(_ context.Context) (bool, error) {
++		res, err = mo.InstantQuery(queryParams)
++		if err != nil {
++			e2e.Logf("Error sending InstantQuery: %v", err)
++			return false, nil
++		}
++		return true, nil
++	})
++	AssertWaitPollNoErr(err, fmt.Sprintf("Timed out polling for metric %s", queryParams.Query))
++	return res
++}

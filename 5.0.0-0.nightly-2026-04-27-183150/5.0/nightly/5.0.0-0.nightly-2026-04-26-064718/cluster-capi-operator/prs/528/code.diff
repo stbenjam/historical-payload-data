@@ -1,0 +1,262 @@
+diff --git a/pkg/controllers/machinesync/machine_sync_controller_test.go b/pkg/controllers/machinesync/machine_sync_controller_test.go
+index 1b1d76636..5badedc6c 100644
+--- a/pkg/controllers/machinesync/machine_sync_controller_test.go
++++ b/pkg/controllers/machinesync/machine_sync_controller_test.go
+@@ -525,6 +525,58 @@ var _ = Describe("With a running MachineSync Reconciler", func() {
+ 					)
+ 				})
+ 			})
++
++			Context("when the CAPI infra machine is deleted and the MAPI machine providerSpec gets updated", func() {
++				BeforeEach(func() {
++					By("Waiting for initial synchronization to complete")
++					Eventually(k.Object(mapiMachine), timeout).Should(
++						HaveField("Status.Conditions", ContainElement(
++							SatisfyAll(
++								HaveField("Type", Equal(consts.SynchronizedCondition)),
++								HaveField("Status", Equal(corev1.ConditionTrue)),
++							))),
++					)
++
++					By("Removing finalizers and deleting the CAPI infra machine out-of-band")
++					Eventually(k.Update(capaMachine, func() {
++						capaMachine.SetFinalizers(nil)
++					})).Should(Succeed())
++					Expect(k8sClient.Delete(ctx, capaMachine)).To(Succeed())
++
++					By("Updating the MAPI machine providerSpec")
++
++					modifiedMAPIMachineBuilder := machinev1resourcebuilder.Machine().
++						WithNamespace(mapiNamespace.GetName()).
++						WithName(mapiMachine.Name).
++						WithProviderSpecBuilder(machinev1resourcebuilder.AWSProviderSpec().WithLoadBalancers(nil).WithInstanceType("m6i.2xlarge")).Build()
++
++					Eventually(k.Update(mapiMachine, func() {
++						mapiMachine.Spec.ProviderSpec = modifiedMAPIMachineBuilder.Spec.ProviderSpec
++					})).Should(Succeed(), "mapi machine providerSpec should be able to be updated")
++				})
++
++				It("should recreate the CAPI infra machine with updated spec", func() {
++					capiInfraMachine := awsv1resourcebuilder.AWSMachine().
++						WithNamespace(capiNamespace.GetName()).
++						WithName(mapiMachine.Name).Build()
++
++					Eventually(k.Object(capiInfraMachine), timeout).Should(
++						HaveField("Spec.InstanceType", Equal("m6i.2xlarge")),
++					)
++				})
++
++				It("should update the synchronized condition on the MAPI machine to True", func() {
++					Eventually(k.Object(mapiMachine), timeout).Should(
++						HaveField("Status.Conditions", ContainElement(
++							SatisfyAll(
++								HaveField("Type", Equal(consts.SynchronizedCondition)),
++								HaveField("Status", Equal(corev1.ConditionTrue)),
++								HaveField("Reason", Equal("ResourceSynchronized")),
++								HaveField("Message", Equal("Successfully synchronized MAPI Machine to CAPI")),
++							))),
++					)
++				})
++			})
+ 		})
+ 	})
+ 
+diff --git a/pkg/controllers/machinesync/machine_sync_controller_unit_test.go b/pkg/controllers/machinesync/machine_sync_controller_unit_test.go
+new file mode 100644
+index 000000000..c76a68e54
+--- /dev/null
++++ b/pkg/controllers/machinesync/machine_sync_controller_unit_test.go
+@@ -0,0 +1,163 @@
++/*
++Copyright 2024 Red Hat, Inc.
++
++Licensed under the Apache License, Version 2.0 (the "License");
++you may not use this file except in compliance with the License.
++You may obtain a copy of the License at
++
++	http://www.apache.org/licenses/LICENSE-2.0
++
++Unless required by applicable law or agreed to in writing, software
++distributed under the License is distributed on an "AS IS" BASIS,
++WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++See the License for the specific language governing permissions and
++limitations under the License.
++*/
++
++package machinesync
++
++import (
++	"context"
++	"fmt"
++
++	. "github.com/onsi/ginkgo/v2"
++	. "github.com/onsi/gomega"
++	configv1 "github.com/openshift/api/config/v1"
++	mapiv1beta1 "github.com/openshift/api/machine/v1beta1"
++	apierrors "k8s.io/apimachinery/pkg/api/errors"
++	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
++	"k8s.io/apimachinery/pkg/runtime/schema"
++	awsv1 "sigs.k8s.io/cluster-api-provider-aws/v2/api/v1beta2"
++	"sigs.k8s.io/controller-runtime/pkg/client"
++	"sigs.k8s.io/controller-runtime/pkg/client/fake"
++	"sigs.k8s.io/controller-runtime/pkg/client/interceptor"
++)
++
++var _ = Describe("Unit tests for ensureCAPIInfraMachineDeleted", func() {
++	var (
++		reconciler    *MachineSyncReconciler
++		mapiMachine   *mapiv1beta1.Machine
++		awsMachine    *awsv1.AWSMachine
++		notFoundError *apierrors.StatusError
++	)
++
++	BeforeEach(func() {
++		mapiMachine = &mapiv1beta1.Machine{
++			ObjectMeta: metav1.ObjectMeta{
++				Name:      "test-machine",
++				Namespace: "openshift-machine-api",
++			},
++		}
++
++		awsMachine = &awsv1.AWSMachine{
++			ObjectMeta: metav1.ObjectMeta{
++				Name:       "test-machine",
++				Namespace:  "openshift-cluster-api",
++				Finalizers: []string{"awsmachine.infrastructure.cluster.x-k8s.io"},
++			},
++		}
++
++		notFoundError = apierrors.NewNotFound(
++			schema.GroupResource{Group: "infrastructure.cluster.x-k8s.io", Resource: "awsmachines"},
++			"test-machine",
++		)
++
++		reconciler = &MachineSyncReconciler{
++			Scheme:   testEnv.Scheme,
++			Platform: configv1.AWSPlatformType,
++		}
++	})
++
++	Context("when delete and update both succeed", func() {
++		It("should return progressing true and no error", func() {
++			// Use an AWSMachine without finalizers so that Delete removes
++			// it immediately and the subsequent Update returns NotFound,
++			// which is the tolerated success path.
++			awsMachineNoFinalizers := awsMachine.DeepCopy()
++			awsMachineNoFinalizers.Finalizers = nil
++
++			reconciler.Client = fake.NewClientBuilder().
++				WithScheme(testEnv.Scheme).
++				WithObjects(mapiMachine, awsMachineNoFinalizers).
++				Build()
++
++			progressing, err := reconciler.ensureCAPIInfraMachineDeleted(ctx, mapiMachine, awsMachineNoFinalizers)
++			Expect(err).ToNot(HaveOccurred())
++			Expect(progressing).To(BeTrue())
++		})
++	})
++
++	Context("when the infrastructure machine is already deleted", func() {
++		It("should treat delete NotFound as success", func() {
++			reconciler.Client = fake.NewClientBuilder().
++				WithScheme(testEnv.Scheme).
++				WithObjects(mapiMachine).
++				WithInterceptorFuncs(interceptor.Funcs{
++					Delete: func(_ context.Context, _ client.WithWatch, _ client.Object, _ ...client.DeleteOption) error {
++						return notFoundError
++					},
++				}).
++				Build()
++
++			progressing, err := reconciler.ensureCAPIInfraMachineDeleted(ctx, mapiMachine, awsMachine)
++			Expect(err).ToNot(HaveOccurred())
++			Expect(progressing).To(BeTrue())
++		})
++	})
++
++	Context("when the infrastructure machine is garbage collected between delete and update", func() {
++		It("should treat update NotFound as success", func() {
++			reconciler.Client = fake.NewClientBuilder().
++				WithScheme(testEnv.Scheme).
++				WithObjects(mapiMachine, awsMachine).
++				WithInterceptorFuncs(interceptor.Funcs{
++					Update: func(_ context.Context, _ client.WithWatch, _ client.Object, _ ...client.UpdateOption) error {
++						return notFoundError
++					},
++				}).
++				Build()
++
++			progressing, err := reconciler.ensureCAPIInfraMachineDeleted(ctx, mapiMachine, awsMachine)
++			Expect(err).ToNot(HaveOccurred())
++			Expect(progressing).To(BeTrue())
++		})
++	})
++
++	Context("when delete fails with a non-NotFound error", func() {
++		It("should return the error", func() {
++			reconciler.Client = fake.NewClientBuilder().
++				WithScheme(testEnv.Scheme).
++				WithObjects(mapiMachine).
++				WithInterceptorFuncs(interceptor.Funcs{
++					Delete: func(_ context.Context, _ client.WithWatch, _ client.Object, _ ...client.DeleteOption) error {
++						return fmt.Errorf("connection refused")
++					},
++				}).
++				Build()
++
++			progressing, err := reconciler.ensureCAPIInfraMachineDeleted(ctx, mapiMachine, awsMachine)
++			Expect(err).To(HaveOccurred())
++			Expect(err.Error()).To(ContainSubstring("failed to delete Cluster API Infrastructure machine"))
++			Expect(progressing).To(BeFalse())
++		})
++	})
++
++	Context("when update fails with a non-NotFound error", func() {
++		It("should return the error", func() {
++			reconciler.Client = fake.NewClientBuilder().
++				WithScheme(testEnv.Scheme).
++				WithObjects(mapiMachine, awsMachine).
++				WithInterceptorFuncs(interceptor.Funcs{
++					Update: func(_ context.Context, _ client.WithWatch, _ client.Object, _ ...client.UpdateOption) error {
++						return fmt.Errorf("connection refused")
++					},
++				}).
++				Build()
++
++			progressing, err := reconciler.ensureCAPIInfraMachineDeleted(ctx, mapiMachine, awsMachine)
++			Expect(err).To(HaveOccurred())
++			Expect(err.Error()).To(ContainSubstring("failed to remove finalizer for deleting Cluster API Infrastructure machine"))
++			Expect(progressing).To(BeFalse())
++		})
++	})
++})
+diff --git a/pkg/controllers/machinesync/machine_sync_mapi2capi_infrastructure.go b/pkg/controllers/machinesync/machine_sync_mapi2capi_infrastructure.go
+index 76cca9269..bda95f00d 100644
+--- a/pkg/controllers/machinesync/machine_sync_mapi2capi_infrastructure.go
++++ b/pkg/controllers/machinesync/machine_sync_mapi2capi_infrastructure.go
+@@ -25,6 +25,7 @@ import (
+ 	"github.com/openshift/cluster-capi-operator/pkg/util"
+ 
+ 	corev1 "k8s.io/api/core/v1"
++	apierrors "k8s.io/apimachinery/pkg/api/errors"
+ 	utilerrors "k8s.io/apimachinery/pkg/util/errors"
+ 	awsv1 "sigs.k8s.io/cluster-api-provider-aws/v2/api/v1beta2"
+ 	ibmpowervsv1 "sigs.k8s.io/cluster-api-provider-ibmcloud/api/v1beta2"
+@@ -209,7 +210,7 @@ func (r *MachineSyncReconciler) ensureCAPIInfraMachineDeleted(ctx context.Contex
+ 	logger := logf.FromContext(ctx)
+ 
+ 	// Trigger deletion
+-	if err := r.Delete(ctx, existingCAPIInfraMachine); err != nil {
++	if err := r.Delete(ctx, existingCAPIInfraMachine); err != nil && !apierrors.IsNotFound(err) {
+ 		logger.Error(err, "Failed to delete Cluster API Infrastructure machine")
+ 
+ 		deleteErr := fmt.Errorf("failed to delete Cluster API Infrastructure machine: %w", err)
+@@ -225,7 +226,7 @@ func (r *MachineSyncReconciler) ensureCAPIInfraMachineDeleted(ctx context.Contex
+ 	// Remove finalizers from the deleting Cluster API infraMachine, it is not authoritative.
+ 	existingCAPIInfraMachine.SetFinalizers(nil)
+ 
+-	if err := r.Update(ctx, existingCAPIInfraMachine); err != nil {
++	if err := r.Update(ctx, existingCAPIInfraMachine); err != nil && !apierrors.IsNotFound(err) {
+ 		logger.Error(err, "Failed to remove finalizer for deleting Cluster API Infrastructure machine")
+ 
+ 		deleteErr := fmt.Errorf("failed to remove finalizer for deleting Cluster API Infrastructure machine: %w", err)

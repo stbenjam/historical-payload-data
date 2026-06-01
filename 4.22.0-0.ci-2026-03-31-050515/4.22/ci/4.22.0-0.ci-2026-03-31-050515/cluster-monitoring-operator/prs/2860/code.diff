@@ -1,0 +1,950 @@
+diff --git a/pkg/configvalidate/configvalidate.go b/pkg/configvalidate/configvalidate.go
+index 8e19a23504..01300f66c1 100644
+--- a/pkg/configvalidate/configvalidate.go
++++ b/pkg/configvalidate/configvalidate.go
+@@ -32,22 +32,6 @@ const (
+ 	monitoringUWMConfigmap      = "user-workload-monitoring-config"
+ )
+ 
+-type parseConfig func(c *corev1.ConfigMap) error
+-
+-func configParser() parseConfig {
+-	return func(c *corev1.ConfigMap) error {
+-		_, err := manifests.NewConfigFromConfigMap(c)
+-		return err
+-	}
+-}
+-
+-func uwmConfigParser() parseConfig {
+-	return func(c *corev1.ConfigMap) error {
+-		_, err := manifests.NewUserWorkloadConfigFromConfigMap(c)
+-		return err
+-	}
+-}
+-
+ type configmapsValidator struct {
+ 	d admission.Decoder
+ }
+@@ -69,12 +53,18 @@ func MustNewConfigmapsValidatorHandler() *http.Handler {
+ }
+ 
+ func (v *configmapsValidator) Handle(ctx context.Context, req admission.Request) admission.Response {
+-	var parser parseConfig
++	var configLoader func(c *corev1.ConfigMap) error
+ 	switch {
+ 	case req.Namespace == monitoringPlatformNamespace && req.Name == monitoringPlatformConfigmap:
+-		parser = configParser()
++		configLoader = func(c *corev1.ConfigMap) error {
++			_, err := manifests.NewConfigFromConfigMap(c)
++			return err
++		}
+ 	case req.Namespace == monitoringUWMNamespace && req.Name == monitoringUWMConfigmap:
+-		parser = uwmConfigParser()
++		configLoader = func(c *corev1.ConfigMap) error {
++			_, err := manifests.NewUserWorkloadConfigFromConfigMap(c)
++			return err
++		}
+ 	default:
+ 		return admission.Allowed("")
+ 	}
+@@ -84,7 +74,7 @@ func (v *configmapsValidator) Handle(ctx context.Context, req admission.Request)
+ 		return admission.Errored(http.StatusBadRequest, err)
+ 	}
+ 
+-	err := parser(&configmap)
++	err := configLoader(&configmap)
+ 	if err != nil {
+ 		return admission.Denied(err.Error())
+ 	}
+diff --git a/pkg/configvalidate/configvalidate_test.go b/pkg/configvalidate/configvalidate_test.go
+index 30bdc9f173..d8718c720e 100644
+--- a/pkg/configvalidate/configvalidate_test.go
++++ b/pkg/configvalidate/configvalidate_test.go
+@@ -62,7 +62,7 @@ func TestHandle(t *testing.T) {
+ 			allowed: true,
+ 		},
+ 		{
+-			name: "invalid platform config",
++			name: "configuration with unknown field",
+ 			req: admission.Request{
+ 				AdmissionRequest: admissionv1.AdmissionRequest{
+ 					Name:      "cluster-monitoring-config",
+@@ -90,6 +90,35 @@ func TestHandle(t *testing.T) {
+ 			allowed: false,
+ 			message: "failed to parse data at key \"config.yaml\": error unmarshaling: unknown field \"prometheus_operator\"",
+ 		},
++		{
++			name: "configuration with invalid YAML",
++			req: admission.Request{
++				AdmissionRequest: admissionv1.AdmissionRequest{
++					Name:      "cluster-monitoring-config",
++					Namespace: "openshift-monitoring",
++					Resource: metav1.GroupVersionResource{
++						Group:    "",
++						Version:  "v1",
++						Resource: "configmaps",
++					},
++					Object: runtime.RawExtension{
++						Raw: []byte(`{
++							"apiVersion": "v1",
++							"kind": "ConfigMap",
++							"metadata": {
++								"name": "cluster-monitoring-config",
++								"namespace": "openshift-monitoring"
++							},
++							"data": {
++								"config.yaml": "{"
++							}
++						}`),
++					},
++				},
++			},
++			allowed: false,
++			message: "failed to parse data at key \"config.yaml\": yaml: line 1: did not find expected node content",
++		},
+ 		{
+ 			name: "non monitoring configmap",
+ 			req: admission.Request{
+diff --git a/pkg/manifests/config.go b/pkg/manifests/config.go
+index ef9900a7ce..7b92ee664a 100644
+--- a/pkg/manifests/config.go
++++ b/pkg/manifests/config.go
+@@ -285,16 +285,6 @@ func (cfg *TelemeterClientConfig) IsEnabled() bool {
+ 	return true
+ }
+ 
+-func (cps CollectionProfiles) String() string {
+-	var sb strings.Builder
+-	for i := 0; i < len(cps)-1; i++ {
+-		sb.WriteString(string(cps[i]))
+-		sb.WriteString(", ")
+-	}
+-	sb.WriteString(string(cps[len(cps)-1]))
+-	return sb.String()
+-}
+-
+ // Copied from k8s.io/apimachinery/pkg/util/yaml.UnmarshalStrict but using
+ // sigs.k8s.io/json.UnmarshalStrict instead of encoding/json.UnmarshalStrict
+ // to enforce case-sensitive unmarshalling and provide more detailed error context.
+@@ -336,24 +326,8 @@ func UnmarshalStrict(data []byte, v interface{}) error {
+ 	}
+ }
+ 
+-func newConfig(content []byte) (*Config, error) {
+-	c := Config{}
+-
+-	cmc := defaultClusterMonitoringConfiguration()
+-	err := UnmarshalStrict(content, &cmc)
+-	if err != nil {
+-		return nil, err
+-	}
+-
+-	c.ClusterMonitoringConfiguration = &cmc
+-	c.applyDefaults()
+-	c.UserWorkloadConfiguration = NewDefaultUserWorkloadMonitoringConfig()
+-
+-	return &c, nil
+-}
+-
+-func defaultClusterMonitoringConfiguration() ClusterMonitoringConfiguration {
+-	return ClusterMonitoringConfiguration{
++func NewConfigFromString(content string) (*Config, error) {
++	cmc := ClusterMonitoringConfiguration{
+ 		NodeExporterConfig: NodeExporterConfig{
+ 			Collectors: NodeExporterCollectorConfig{
+ 				NetDev: NodeExporterCollectorNetDevConfig{
+@@ -369,6 +343,27 @@ func defaultClusterMonitoringConfiguration() ClusterMonitoringConfiguration {
+ 			},
+ 		},
+ 	}
++	err := UnmarshalStrict([]byte(content), &cmc)
++	if err != nil {
++		return nil, err
++	}
++
++	c := Config{
++		ClusterMonitoringConfiguration: &cmc,
++		UserWorkloadConfiguration:      NewDefaultUserWorkloadMonitoringConfig(),
++	}
++	c.applyDefaults()
++
++	// Validate the configured collection profile.
++	if !slices.Contains(SupportedCollectionProfiles, c.ClusterMonitoringConfiguration.PrometheusK8sConfig.CollectionProfile) {
++		return nil, fmt.Errorf("%w: %q is not supported, supported collection profiles are [%s]",
++			ErrConfigValidation,
++			c.ClusterMonitoringConfiguration.PrometheusK8sConfig.CollectionProfile,
++			strings.Join(SupportedCollectionProfiles.StringSlice(), ", "),
++		)
++	}
++
++	return &c, nil
+ }
+ 
+ func (c *Config) applyDefaults() {
+@@ -588,31 +583,18 @@ func (c *Config) LoadEnforcedBodySizeLimit(pcr PodCapacityReader, ctx context.Co
+ 	return nil
+ }
+ 
+-func (c *Config) Precheck() (*InvalidConfigWarning, error) {
+-	// Validate the configured collection profile.
+-	for _, profile := range SupportedCollectionProfiles {
+-		var v float64
+-		if profile == c.ClusterMonitoringConfiguration.PrometheusK8sConfig.CollectionProfile {
+-			v = 1
+-		}
+-		metrics.CollectionProfile.WithLabelValues(string(profile)).Set(v)
+-	}
+-	if !slices.Contains(SupportedCollectionProfiles, c.ClusterMonitoringConfiguration.PrometheusK8sConfig.CollectionProfile) {
+-		return nil, fmt.Errorf(`%q is not supported, supported collection profiles are: %q: %w`, c.ClusterMonitoringConfiguration.PrometheusK8sConfig.CollectionProfile, SupportedCollectionProfiles.String(), ErrConfigValidation)
+-	}
+-
+-	// Highlight deprecated config fields.
++func (c *Config) CheckDeprecatedFields() []InvalidConfigWarning {
++	// Prometheus-Adapter is replaced with Metrics Server by default from 4.16
+ 	var d float64
+-	var warn *InvalidConfigWarning
++	var warnings []InvalidConfigWarning
+ 	if c.ClusterMonitoringConfiguration.K8sPrometheusAdapter != nil {
+ 		klog.Infof("k8sPrometheusAdapter is a deprecated config use metricsServer instead")
+ 		d = 1
+-		warn = &InvalidConfigWarning{ConfigMap: "openshift-monitoring/cluster-monitoring-config", Err: errPrometheusAdapterDeprecated}
++		warnings = append(warnings, InvalidConfigWarning{ConfigMap: "openshift-monitoring/cluster-monitoring-config", Err: errPrometheusAdapterDeprecated})
+ 	}
+-	// Prometheus-Adapter is replaced with Metrics Server by default from 4.16
+ 	metrics.DeprecatedConfig.WithLabelValues("openshift-monitoring/cluster-monitoring-config", "k8sPrometheusAdapter", "4.16").Set(d)
+ 
+-	return warn, nil
++	return warnings
+ }
+ 
+ func calculateBodySizeLimit(podCapacity int) string {
+@@ -628,26 +610,17 @@ func calculateBodySizeLimit(podCapacity int) string {
+ 	return fmt.Sprintf("%dMB", int(math.Ceil(float64(bodySize)/(1024*1024))))
+ }
+ 
+-// NewConfigFromString transforms a string containing configuration in the
+-// openshift-monitoring/cluster-monitoring-configuration format into a data
+-// structure that facilitates programmatical checks of that configuration. The
+-// content of the data structure might change if TechPreview is enabled (tp), as
+-// some features are only meant for TechPreview.
+-func NewConfigFromString(content string) (*Config, error) {
+-	if content == "" {
+-		return NewDefaultConfig(), nil
+-	}
+-
+-	return newConfig([]byte(content))
+-}
+-
+ func NewConfigFromConfigMap(c *v1.ConfigMap) (*Config, error) {
+ 	configContent, found := c.Data[configKey]
+-
+ 	if !found {
+ 		return nil, fmt.Errorf("%q key not found in the configmap", configKey)
+ 	}
+ 
++	if configContent == "" {
++		// Consider an empty string to be equivalent to an empty map.
++		configContent = "{}"
++	}
++
+ 	cParsed, err := NewConfigFromString(configContent)
+ 	if err != nil {
+ 		return nil, fmt.Errorf("failed to parse data at key %q: %w", configKey, err)
+@@ -655,15 +628,6 @@ func NewConfigFromConfigMap(c *v1.ConfigMap) (*Config, error) {
+ 	return cParsed, nil
+ }
+ 
+-func NewDefaultConfig() *Config {
+-	c := &Config{}
+-	cmc := defaultClusterMonitoringConfiguration()
+-	c.ClusterMonitoringConfiguration = &cmc
+-	c.UserWorkloadConfiguration = NewDefaultUserWorkloadMonitoringConfig()
+-	c.applyDefaults()
+-	return c
+-}
+-
+ func (u *UserWorkloadConfiguration) applyDefaults() {
+ 	if u.PrometheusOperator == nil {
+ 		u.PrometheusOperator = &PrometheusOperatorConfig{}
+diff --git a/pkg/manifests/config_test.go b/pkg/manifests/config_test.go
+index 0599a3744b..979002115f 100644
+--- a/pkg/manifests/config_test.go
++++ b/pkg/manifests/config_test.go
+@@ -706,7 +706,7 @@ func TestEvaluationIntervalUWM(t *testing.T) {
+ 	}
+ }
+ 
+-func TestCollectionProfilePreCheck(t *testing.T) {
++func TestCollectionProfileValues(t *testing.T) {
+ 	for _, tc := range []struct {
+ 		name          string
+ 		config        string
+@@ -714,43 +714,39 @@ func TestCollectionProfilePreCheck(t *testing.T) {
+ 		expectedError bool
+ 	}{
+ 		{
+-			name:          "default",
+-			config:        "",
+-			expected:      CollectionProfile("full"),
+-			expectedError: false,
++			name:     "default",
++			config:   "",
++			expected: CollectionProfile("full"),
+ 		},
+ 		{
+-			name: "full_profile",
++			name: "full profile",
+ 			config: `prometheusK8s:
+   collectionProfile: full
+   `,
+-			expected:      CollectionProfile("full"),
+-			expectedError: false,
++			expected: CollectionProfile("full"),
+ 		},
+ 		{
+-			name: "minimal_profile",
++			name: "minimal profile",
+ 			config: `prometheusK8s:
+   collectionProfile: minimal
+   `,
+-			expected:      CollectionProfile("minimal"),
+-			expectedError: false,
++			expected: CollectionProfile("minimal"),
+ 		},
+ 		{
+-			name: "incorrect_profile",
++			name: "incorrect profile",
+ 			config: `prometheusK8s:
+   collectionProfile: foo
+   `,
+-			expected:      "",
+ 			expectedError: true,
+ 		},
+ 	} {
+ 		t.Run(tc.name, func(t *testing.T) {
+ 			c, err := NewConfigFromString(tc.config)
+-			require.NoError(t, err)
+-			_, err = c.Precheck()
+ 			if err != nil && tc.expectedError {
++				require.Error(t, err)
+ 				return
+ 			}
++
+ 			require.NoError(t, err)
+ 			require.Equal(t, tc.expected, c.ClusterMonitoringConfiguration.PrometheusK8sConfig.CollectionProfile)
+ 		})
+@@ -790,11 +786,11 @@ func TestDeprecatedConfig(t *testing.T) {
+ 		t.Run(tc.name, func(t *testing.T) {
+ 			c, err := NewConfigFromString(tc.config)
+ 			require.NoError(t, err)
+-			warning, err := c.Precheck()
++			warnings := c.CheckDeprecatedFields()
+ 			if tc.warning != "" {
+-				require.Equal(t, tc.warning, warning.Warning())
++				require.Len(t, warnings, 1)
++				require.Equal(t, tc.warning, warnings[0].Warning())
+ 			}
+-			require.NoError(t, err)
+ 			require.Equal(t, tc.expectedMetricValue, prom_testutil.ToFloat64(metrics.DeprecatedConfig))
+ 		})
+ 	}
+diff --git a/pkg/manifests/manifests_test.go b/pkg/manifests/manifests_test.go
+index f381123123..21c39312be 100644
+--- a/pkg/manifests/manifests_test.go
++++ b/pkg/manifests/manifests_test.go
+@@ -141,7 +141,7 @@ func TestHashSecret(t *testing.T) {
+ 		},
+ 	} {
+ 		t.Run(tt.name, func(t *testing.T) {
+-			f := NewFactory("openshift-monitoring", "openshift-user-workload-monitoring", NewDefaultConfig(), defaultInfrastructureReader(), &fakeProxyReader{}, NewAssets(assetsPath), &APIServerConfig{}, &configv1.Console{})
++			f := NewFactory("openshift-monitoring", "openshift-user-workload-monitoring", mustDefaultConfig(), defaultInfrastructureReader(), &fakeProxyReader{}, NewAssets(assetsPath), &APIServerConfig{}, &configv1.Console{})
+ 			s, err := f.HashSecret(tt.given, tt.data...)
+ 			if got := err != nil; got != tt.errExpected {
+ 				t.Errorf("expected error %t, got %t, err %v", tt.errExpected, got, err)
+@@ -156,7 +156,7 @@ func TestHashSecret(t *testing.T) {
+ }
+ 
+ func TestUnconfiguredManifests(t *testing.T) {
+-	f := NewFactory("openshift-monitoring", "openshift-user-workload-monitoring", NewDefaultConfig(), defaultInfrastructureReader(), &fakeProxyReader{}, NewAssets(assetsPath), &APIServerConfig{}, &configv1.Console{})
++	f := NewFactory("openshift-monitoring", "openshift-user-workload-monitoring", mustDefaultConfig(), defaultInfrastructureReader(), &fakeProxyReader{}, NewAssets(assetsPath), &APIServerConfig{}, &configv1.Console{})
+ 	_, err := f.AlertmanagerConfig()
+ 	if err != nil {
+ 		t.Fatal(err)
+@@ -620,7 +620,7 @@ func TestSharingConfig(t *testing.T) {
+ 		},
+ 	} {
+ 		t.Run(tc.name, func(t *testing.T) {
+-			f := NewFactory("openshift-monitoring", "openshift-user-workload-monitoring", NewDefaultConfig(), defaultInfrastructureReader(), &fakeProxyReader{}, NewAssets(assetsPath), &APIServerConfig{}, &configv1.Console{})
++			f := NewFactory("openshift-monitoring", "openshift-user-workload-monitoring", mustDefaultConfig(), defaultInfrastructureReader(), &fakeProxyReader{}, NewAssets(assetsPath), &APIServerConfig{}, &configv1.Console{})
+ 			u, err := url.Parse("http://example.com/")
+ 			if err != nil {
+ 				t.Fatal(err)
+@@ -972,10 +972,7 @@ func TestPrometheusK8sRemoteWriteClusterIDRelabel(t *testing.T) {
+ 			name: "simple remote write",
+ 
+ 			config: func() *Config {
+-				c, err := NewConfigFromString("")
+-				if err != nil {
+-					t.Fatal(err)
+-				}
++				c := mustDefaultConfig()
+ 
+ 				c.ClusterMonitoringConfiguration.PrometheusK8sConfig.RemoteWrite = []RemoteWriteSpec{{URL: "http://custom"}}
+ 
+@@ -999,10 +996,7 @@ func TestPrometheusK8sRemoteWriteClusterIDRelabel(t *testing.T) {
+ 			name: "simple remote write with relabel config",
+ 
+ 			config: func() *Config {
+-				c, err := NewConfigFromString("")
+-				if err != nil {
+-					t.Fatal(err)
+-				}
++				c := mustDefaultConfig()
+ 
+ 				c.ClusterMonitoringConfiguration.PrometheusK8sConfig.RemoteWrite = []RemoteWriteSpec{
+ 					{
+@@ -1040,10 +1034,7 @@ func TestPrometheusK8sRemoteWriteClusterIDRelabel(t *testing.T) {
+ 			name: "multiple remote write with relabel config",
+ 
+ 			config: func() *Config {
+-				c, err := NewConfigFromString("")
+-				if err != nil {
+-					t.Fatal(err)
+-				}
++				c := mustDefaultConfig()
+ 
+ 				c.ClusterMonitoringConfiguration.PrometheusK8sConfig.RemoteWrite = []RemoteWriteSpec{
+ 					{
+@@ -1150,7 +1141,7 @@ func TestPrometheusK8sRemoteWriteURLs(t *testing.T) {
+ 			name: "default config",
+ 
+ 			config: func() *Config {
+-				c := NewDefaultConfig()
++				c := mustDefaultConfig()
+ 				c.ClusterMonitoringConfiguration.TelemeterClientConfig.ClusterID = "123"
+ 				c.ClusterMonitoringConfiguration.TelemeterClientConfig.Token = "secret"
+ 
+@@ -1163,7 +1154,7 @@ func TestPrometheusK8sRemoteWriteURLs(t *testing.T) {
+ 			name: "legacy telemetry and custom remote write",
+ 
+ 			config: func() *Config {
+-				c := NewDefaultConfig()
++				c := mustDefaultConfig()
+ 				c.ClusterMonitoringConfiguration.PrometheusK8sConfig.RemoteWrite = []RemoteWriteSpec{{URL: "http://custom"}}
+ 				c.ClusterMonitoringConfiguration.TelemeterClientConfig.ClusterID = "123"
+ 				c.ClusterMonitoringConfiguration.TelemeterClientConfig.Token = "secret"
+@@ -1179,7 +1170,7 @@ func TestPrometheusK8sRemoteWriteURLs(t *testing.T) {
+ 			name: "remote write telemetry",
+ 
+ 			config: func() *Config {
+-				c := NewDefaultConfig()
++				c := mustDefaultConfig()
+ 				c.SetRemoteWrite(true)
+ 				c.ClusterMonitoringConfiguration.TelemeterClientConfig.ClusterID = "123"
+ 				c.ClusterMonitoringConfiguration.TelemeterClientConfig.Token = "secret"
+@@ -1196,7 +1187,7 @@ func TestPrometheusK8sRemoteWriteURLs(t *testing.T) {
+ 			name: "remote write telemetry and custom remote write",
+ 
+ 			config: func() *Config {
+-				c := NewDefaultConfig()
++				c := mustDefaultConfig()
+ 				c.SetRemoteWrite(true)
+ 				c.ClusterMonitoringConfiguration.PrometheusK8sConfig.RemoteWrite = []RemoteWriteSpec{{URL: "http://custom"}}
+ 				c.ClusterMonitoringConfiguration.TelemeterClientConfig.ClusterID = "123"
+@@ -1215,7 +1206,7 @@ func TestPrometheusK8sRemoteWriteURLs(t *testing.T) {
+ 			name: "remote write telemetry with custom url and custom remote write",
+ 
+ 			config: func() *Config {
+-				c := NewDefaultConfig()
++				c := mustDefaultConfig()
+ 				c.SetRemoteWrite(true)
+ 				c.ClusterMonitoringConfiguration.TelemeterClientConfig.TelemeterServerURL = "http://custom-telemeter"
+ 				c.ClusterMonitoringConfiguration.PrometheusK8sConfig.RemoteWrite = []RemoteWriteSpec{{URL: "http://custom-remote-write"}}
+@@ -1686,7 +1677,7 @@ func TestPrometheusK8sConfiguration(t *testing.T) {
+ }
+ 
+ func TestPrometheusUserWorkloadConfiguration(t *testing.T) {
+-	c := NewDefaultConfig()
++	c := mustDefaultConfig()
+ 
+ 	uwc, err := NewUserConfigFromString(`prometheus:
+   scrapeInterval: 15s
+@@ -1829,7 +1820,7 @@ func TestPrometheusQueryLogFileConfig(t *testing.T) {
+ 		},
+ 	} {
+ 		t.Run(tc.name, func(t *testing.T) {
+-			c := NewDefaultConfig()
++			c := mustDefaultConfig()
+ 			c.ClusterMonitoringConfiguration.PrometheusK8sConfig.QueryLogFile = tc.queryLogFilePath
+ 			f := NewFactory("openshift-monitoring", "openshift-user-workload-monitoring", c, defaultInfrastructureReader(), &fakeProxyReader{}, NewAssets(assetsPath), &APIServerConfig{}, &configv1.Console{})
+ 			p, err := f.PrometheusK8s(
+@@ -1904,7 +1895,7 @@ func TestPrometheusCollectionProfile(t *testing.T) {
+ 		},
+ 	} {
+ 		t.Run(tc.name, func(t *testing.T) {
+-			c := NewDefaultConfig()
++			c := mustDefaultConfig()
+ 			c.ClusterMonitoringConfiguration.PrometheusK8sConfig.CollectionProfile = tc.collectionProfile
+ 			f := NewFactory("openshift-monitoring", "openshift-user-workload-monitoring", c, defaultInfrastructureReader(), &fakeProxyReader{}, NewAssets(assetsPath), &APIServerConfig{}, &configv1.Console{})
+ 			p, err := f.PrometheusK8s(
+@@ -1959,7 +1950,7 @@ func TestPrometheusRetentionConfigs(t *testing.T) {
+ 		},
+ 	} {
+ 		t.Run(tc.name, func(t *testing.T) {
+-			c := NewDefaultConfig()
++			c := mustDefaultConfig()
+ 			c.ClusterMonitoringConfiguration.PrometheusK8sConfig.Retention = tc.retention
+ 			c.ClusterMonitoringConfiguration.PrometheusK8sConfig.RetentionSize = tc.retentionSize
+ 
+@@ -2804,10 +2795,7 @@ metricsServer:
+ }
+ 
+ func TestMetricsServerReadinessProbe(t *testing.T) {
+-	c, err := NewConfigFromString("")
+-	if err != nil {
+-		t.Fatal(err)
+-	}
++	c := mustDefaultConfig()
+ 
+ 	c.SetImages(map[string]string{
+ 		"kube-metrics-server": "docker.io/openshift/origin-kube-metrics-server:latest",
+@@ -3261,7 +3249,7 @@ func TestAlertmanagerMainConfiguration(t *testing.T) {
+ }
+ 
+ func TestAlertManagerUserWorkloadConfiguration(t *testing.T) {
+-	c := NewDefaultConfig()
++	c := mustDefaultConfig()
+ 	uwc, err := NewUserConfigFromString(`alertmanager:
+   resources:
+     requests:
+@@ -3945,7 +3933,7 @@ func TestPrometheusK8sControlPlaneRulesFiltered(t *testing.T) {
+ 	}
+ 
+ 	for _, tc := range tests {
+-		f := NewFactory("openshift-monitoring", "openshift-user-workload-monitoring", NewDefaultConfig(), tc.infrastructure, &fakeProxyReader{}, NewAssets(assetsPath), &APIServerConfig{}, &configv1.Console{})
++		f := NewFactory("openshift-monitoring", "openshift-user-workload-monitoring", mustDefaultConfig(), tc.infrastructure, &fakeProxyReader{}, NewAssets(assetsPath), &APIServerConfig{}, &configv1.Console{})
+ 		r, err := f.ControlPlanePrometheusRule()
+ 		if err != nil {
+ 			t.Fatal(err)
+@@ -4353,7 +4341,7 @@ func TestThanosRulerConfiguration(t *testing.T) {
+ }
+ 
+ func TestThanosRulerRetentionConfig(t *testing.T) {
+-	c := NewDefaultConfig()
++	c := mustDefaultConfig()
+ 	c.UserWorkloadConfiguration.ThanosRuler.Retention = "30d"
+ 
+ 	f := NewFactory("openshift-monitoring", "openshift-user-workload-monitoring", c, defaultInfrastructureReader(), &fakeProxyReader{}, NewAssets(assetsPath), &APIServerConfig{}, &configv1.Console{})
+@@ -4383,7 +4371,7 @@ prometheus:
+ `)
+ 	require.NoError(t, err)
+ 
+-	c := NewDefaultConfig()
++	c := mustDefaultConfig()
+ 	c.UserWorkloadConfiguration = uwc
+ 
+ 	f := NewFactory("openshift-monitoring", "openshift-user-workload-monitoring", c, defaultInfrastructureReader(), &fakeProxyReader{}, NewAssets(assetsPath), &APIServerConfig{}, &configv1.Console{})
+@@ -4447,7 +4435,7 @@ func TestPrometheusGoGCRelatedConfig(t *testing.T) {
+ 		},
+ 	} {
+ 		t.Run("", func(t *testing.T) {
+-			f := NewFactory("openshift-monitoring", "openshift-user-workload-monitoring", NewDefaultConfig(), tc.ir, &fakeProxyReader{}, NewAssets(assetsPath), &APIServerConfig{}, &configv1.Console{})
++			f := NewFactory("openshift-monitoring", "openshift-user-workload-monitoring", mustDefaultConfig(), tc.ir, &fakeProxyReader{}, NewAssets(assetsPath), &APIServerConfig{}, &configv1.Console{})
+ 
+ 			p, err := tc.promf(f)
+ 			require.NoError(t, err)
+@@ -4558,7 +4546,7 @@ func TestNonHighlyAvailableInfrastructure(t *testing.T) {
+ 	}
+ 
+ 	for _, tc := range tests {
+-		f := NewFactory("openshift-monitoring", "openshift-user-workload-monitoring", NewDefaultConfig(), &fakeInfrastructureReader{highlyAvailableInfrastructure: false}, &fakeProxyReader{}, NewAssets(assetsPath), &APIServerConfig{}, &configv1.Console{})
++		f := NewFactory("openshift-monitoring", "openshift-user-workload-monitoring", mustDefaultConfig(), &fakeInfrastructureReader{highlyAvailableInfrastructure: false}, &fakeProxyReader{}, NewAssets(assetsPath), &APIServerConfig{}, &configv1.Console{})
+ 		spec, err := tc.getSpec(f)
+ 		if err != nil {
+ 			t.Error(err)
+@@ -4661,12 +4649,12 @@ func TestNonHighlyAvailableInfrastructureServiceMonitors(t *testing.T) {
+ 		},
+ 	}
+ 	for _, tc := range tests {
+-		nonHAFac := NewFactory("openshift-monitoring", "openshift-user-workload-monitoring", NewDefaultConfig(), &fakeInfrastructureReader{highlyAvailableInfrastructure: false}, &fakeProxyReader{}, NewAssets(assetsPath), &APIServerConfig{}, &configv1.Console{})
++		nonHAFac := NewFactory("openshift-monitoring", "openshift-user-workload-monitoring", mustDefaultConfig(), &fakeInfrastructureReader{highlyAvailableInfrastructure: false}, &fakeProxyReader{}, NewAssets(assetsPath), &APIServerConfig{}, &configv1.Console{})
+ 		noHAEndpoints, err := tc.getEndpoints(nonHAFac)
+ 		if err != nil {
+ 			t.Error(err)
+ 		}
+-		HAFac := NewFactory("openshift-monitoring", "openshift-user-workload-monitoring", NewDefaultConfig(), &fakeInfrastructureReader{highlyAvailableInfrastructure: true}, &fakeProxyReader{}, NewAssets(assetsPath), &APIServerConfig{}, &configv1.Console{})
++		HAFac := NewFactory("openshift-monitoring", "openshift-user-workload-monitoring", mustDefaultConfig(), &fakeInfrastructureReader{highlyAvailableInfrastructure: true}, &fakeProxyReader{}, NewAssets(assetsPath), &APIServerConfig{}, &configv1.Console{})
+ 		HAEndpoints, err := tc.getEndpoints(HAFac)
+ 		if err != nil {
+ 			t.Error(err)
+@@ -4775,7 +4763,7 @@ func TestPodDisruptionBudget(t *testing.T) {
+ 	}
+ 
+ 	for _, tc := range tests {
+-		f := NewFactory("openshift-monitoring", "openshift-user-workload-monitoring", NewDefaultConfig(), &fakeInfrastructureReader{highlyAvailableInfrastructure: tc.ha}, &fakeProxyReader{}, NewAssets(assetsPath), &APIServerConfig{}, &configv1.Console{})
++		f := NewFactory("openshift-monitoring", "openshift-user-workload-monitoring", mustDefaultConfig(), &fakeInfrastructureReader{highlyAvailableInfrastructure: tc.ha}, &fakeProxyReader{}, NewAssets(assetsPath), &APIServerConfig{}, &configv1.Console{})
+ 		pdb, err := tc.getPDB(f)
+ 		if err != nil {
+ 			t.Error(err)
+@@ -4791,7 +4779,7 @@ func TestPodDisruptionBudget(t *testing.T) {
+ }
+ 
+ func TestPrometheusOperatorUserWorkloadConfiguration(t *testing.T) {
+-	c := NewDefaultConfig()
++	c := mustDefaultConfig()
+ 	uwc, err := NewUserConfigFromString(`prometheusOperator:
+   topologySpreadConstraints:
+   - maxSkew: 1
+@@ -5094,7 +5082,7 @@ func TestAlertmanagerProxy(t *testing.T) {
+ 				return nil
+ 			}
+ 
+-			f := NewFactory("openshift-monitoring", "openshift-user-workload-monitoring", NewDefaultConfig(), defaultInfrastructureReader(), tc.proxyReader, NewAssets(assetsPath), &APIServerConfig{}, &configv1.Console{})
++			f := NewFactory("openshift-monitoring", "openshift-user-workload-monitoring", mustDefaultConfig(), defaultInfrastructureReader(), tc.proxyReader, NewAssets(assetsPath), &APIServerConfig{}, &configv1.Console{})
+ 
+ 			t.Run("main", func(t *testing.T) {
+ 				am, err := f.AlertmanagerMain()
+@@ -5163,7 +5151,7 @@ func TestPrometheusProxy(t *testing.T) {
+ 				return nil
+ 			}
+ 
+-			f := NewFactory("openshift-monitoring", "openshift-user-workload-monitoring", NewDefaultConfig(), defaultInfrastructureReader(), tc.proxyReader, NewAssets(assetsPath), &APIServerConfig{}, &configv1.Console{})
++			f := NewFactory("openshift-monitoring", "openshift-user-workload-monitoring", mustDefaultConfig(), defaultInfrastructureReader(), tc.proxyReader, NewAssets(assetsPath), &APIServerConfig{}, &configv1.Console{})
+ 
+ 			t.Run("main", func(t *testing.T) {
+ 				p, err := f.PrometheusK8s(
+@@ -5293,7 +5281,7 @@ func TestSetTLSSecurityConfiguration(t *testing.T) {
+ 			f := NewFactory(
+ 				"openshift-monitoring",
+ 				"openshift-user-workload-monitoring",
+-				NewDefaultConfig(),
++				mustDefaultConfig(),
+ 				defaultInfrastructureReader(),
+ 				&fakeProxyReader{},
+ 				NewAssets(assetsPath),
+@@ -5377,3 +5365,12 @@ func TestPromConfigurationExternalLabels(t *testing.T) {
+ 		})
+ 	}
+ }
++
++func mustDefaultConfig() *Config {
++	cfg, err := NewConfigFromString("{}")
++	if err != nil {
++		panic(err)
++	}
++
++	return cfg
++}
+diff --git a/pkg/manifests/tls_test.go b/pkg/manifests/tls_test.go
+index 2baa3b7160..6d1ae61089 100644
+--- a/pkg/manifests/tls_test.go
++++ b/pkg/manifests/tls_test.go
+@@ -95,7 +95,7 @@ func TestNeedsNewCert(t *testing.T) {
+ }
+ 
+ func TestRotateGrpcTLSSecret(t *testing.T) {
+-	f := NewFactory("openshift-monitoring", "openshift-user-workload-monitoring", NewDefaultConfig(), defaultInfrastructureReader(), &fakeProxyReader{}, NewAssets(assetsPath), &APIServerConfig{}, &configv1.Console{})
++	f := NewFactory("openshift-monitoring", "openshift-user-workload-monitoring", mustDefaultConfig(), defaultInfrastructureReader(), &fakeProxyReader{}, NewAssets(assetsPath), &APIServerConfig{}, &configv1.Console{})
+ 
+ 	for _, tc := range []struct {
+ 		name  string
+@@ -213,7 +213,7 @@ func TestRotateGrpcTLSSecret(t *testing.T) {
+ }
+ 
+ func TestUnconfiguredGRPCManifests(t *testing.T) {
+-	f := NewFactory("openshift-monitoring", "openshift-user-workload-monitoring", NewDefaultConfig(), defaultInfrastructureReader(), &fakeProxyReader{}, NewAssets(assetsPath), &APIServerConfig{}, &configv1.Console{})
++	f := NewFactory("openshift-monitoring", "openshift-user-workload-monitoring", mustDefaultConfig(), defaultInfrastructureReader(), &fakeProxyReader{}, NewAssets(assetsPath), &APIServerConfig{}, &configv1.Console{})
+ 	_, err := f.AlertmanagerConfig()
+ 	if err != nil {
+ 		t.Fatal(err)
+@@ -226,7 +226,7 @@ func TestUnconfiguredGRPCManifests(t *testing.T) {
+ }
+ 
+ func TestCrossSigningAfterRotation(t *testing.T) {
+-	f := NewFactory("openshift-monitoring", "openshift-user-workload-monitoring", NewDefaultConfig(), defaultInfrastructureReader(), &fakeProxyReader{}, NewAssets(assetsPath), &APIServerConfig{}, &configv1.Console{})
++	f := NewFactory("openshift-monitoring", "openshift-user-workload-monitoring", mustDefaultConfig(), defaultInfrastructureReader(), &fakeProxyReader{}, NewAssets(assetsPath), &APIServerConfig{}, &configv1.Console{})
+ 
+ 	for _, tc := range []struct {
+ 		name string
+diff --git a/pkg/manifests/types.go b/pkg/manifests/types.go
+index 49400491d8..dd920285d0 100644
+--- a/pkg/manifests/types.go
++++ b/pkg/manifests/types.go
+@@ -15,21 +15,39 @@
+ package manifests
+ 
+ import (
++	"slices"
++
+ 	monv1 "github.com/prometheus-operator/prometheus-operator/pkg/apis/monitoring/v1"
+ 	v1 "k8s.io/api/core/v1"
+ )
+ 
++type ExternalLabels map[string]string
++
+ type CollectionProfile string
+ type CollectionProfiles []CollectionProfile
+-type ExternalLabels map[string]string
+ 
+ const (
+-	FullCollectionProfile    = "full"
++	// FullCollectionProfile collects all metrics.
++	FullCollectionProfile = "full"
++
++	// MinimalCollectionProfile collects only metrics used by recording/alerting, dashboards and Telemetry.
+ 	MinimalCollectionProfile = "minimal"
+ )
+ 
++// SupportedCollectionProfiles is the list of collection profiles supported by CMO.
+ var SupportedCollectionProfiles = CollectionProfiles{FullCollectionProfile, MinimalCollectionProfile}
+ 
++// StringSlice returns the list of collection profiles as []string.
++func (cps CollectionProfiles) StringSlice() []string {
++	return slices.Collect(func(yield func(string) bool) {
++		for _, cp := range cps {
++			if !yield(string(cp)) {
++				return
++			}
++		}
++	})
++}
++
+ // The `ClusterMonitoringConfiguration` resource defines settings that
+ // customize the default platform monitoring stack through the
+ // `cluster-monitoring-config` config map in the `openshift-monitoring`
+diff --git a/pkg/metrics/metrics.go b/pkg/metrics/metrics.go
+index 69197da531..4ad5e2d7d9 100644
+--- a/pkg/metrics/metrics.go
++++ b/pkg/metrics/metrics.go
+@@ -42,3 +42,14 @@ func init() {
+ 	legacyregistry.MustRegister(CollectionProfile)
+ 	legacyregistry.MustRegister(DeprecatedConfig)
+ }
++
++// SetCollectionProfileMetrics updates the collection profile metric with the current profile.
++func SetCollectionProfileMetrics(current string, profiles []string) {
++	for _, profile := range profiles {
++		var v float64
++		if profile == current {
++			v = 1
++		}
++		CollectionProfile.WithLabelValues(profile).Set(v)
++	}
++}
+diff --git a/pkg/operator/operator.go b/pkg/operator/operator.go
+index ebf87270d8..93bb0c1531 100644
+--- a/pkg/operator/operator.go
++++ b/pkg/operator/operator.go
+@@ -541,6 +541,14 @@ func New(
+ 	return o, nil
+ }
+ 
++func (o *Operator) cmoConfigMap() string {
++	return fmt.Sprintf("%s/%s", o.namespace, o.configMapName)
++}
++
++func (o *Operator) uwmConfigMap() string {
++	return fmt.Sprintf("%s/%s", o.namespaceUserWorkload, o.userWorkloadConfigMapName)
++}
++
+ // Run the controller.
+ func (o *Operator) Run(ctx context.Context) error {
+ 	stopc := ctx.Done()
+@@ -603,11 +611,10 @@ func (o *Operator) Run(ctx context.Context) error {
+ 	ticker := time.NewTicker(reconciliationPeriod)
+ 	defer ticker.Stop()
+ 
+-	key := o.namespace + "/" + o.configMapName
+-	_, exists, _ := o.cmapInf.GetStore().GetByKey(key)
++	_, exists, _ := o.cmapInf.GetStore().GetByKey(o.cmoConfigMap())
+ 	if !exists {
+ 		klog.Infof("ConfigMap to configure stack does not exist. Reconciling with default config every %s.", reconciliationPeriod)
+-		o.enqueue(key)
++		o.enqueue()
+ 	}
+ 
+ 	for {
+@@ -615,10 +622,10 @@ func (o *Operator) Run(ctx context.Context) error {
+ 		case <-stopc:
+ 			return nil
+ 		case <-ticker.C:
+-			_, exists, _ := o.cmapInf.GetStore().GetByKey(key)
++			_, exists, _ := o.cmapInf.GetStore().GetByKey(o.cmoConfigMap())
+ 			if !exists {
+ 				klog.Infof("ConfigMap to configure stack does not exist. Reconciling with default config every %s.", reconciliationPeriod)
+-				o.enqueue(key)
++				o.enqueue()
+ 			}
+ 		}
+ 	}
+@@ -634,8 +641,6 @@ func (o *Operator) keyFunc(obj interface{}) (string, bool) {
+ }
+ 
+ func (o *Operator) handleEvent(obj interface{}) {
+-	cmoConfigMap := o.namespace + "/" + o.configMapName
+-
+ 	switch v := obj.(type) {
+ 	case *configv1.APIServer:
+ 		if !o.apiServerConfig.Equal(manifests.NewAPIServerConfig(v)) {
+@@ -664,7 +669,7 @@ func (o *Operator) handleEvent(obj interface{}) {
+ 			objKind = fmt.Sprintf("%T", obj)
+ 		}
+ 		klog.Infof("Triggering an update due to a change in %s/%s", objKind, name)
+-		o.enqueue(cmoConfigMap)
++		o.enqueue()
+ 		return
+ 	}
+ 
+@@ -676,10 +681,8 @@ func (o *Operator) handleEvent(obj interface{}) {
+ 
+ 	klog.V(5).Infof("ConfigMap or Secret updated: %s", key)
+ 
+-	uwmConfigMap := o.namespaceUserWorkload + "/" + o.userWorkloadConfigMapName
+-
+ 	switch key {
+-	case cmoConfigMap:
++	case o.cmoConfigMap():
+ 	case apiAuthenticationConfigMap:
+ 	case kubeletServingCAConfigMap:
+ 	case metricsServerClientCerts:
+@@ -688,7 +691,7 @@ func (o *Operator) handleEvent(obj interface{}) {
+ 	case grpcTLS:
+ 	case metricsClientCerts:
+ 	case federateClientCerts:
+-	case uwmConfigMap:
++	case o.uwmConfigMap():
+ 	default:
+ 		klog.V(5).Infof("ConfigMap or Secret (%s) not triggering an update.", key)
+ 		return
+@@ -696,9 +699,7 @@ func (o *Operator) handleEvent(obj interface{}) {
+ 
+ 	klog.Infof("Triggering an update due to ConfigMap or Secret: %s", key)
+ 
+-	// Always enqueue the cluster monitoring operator configmap.
+-	// That way we reuse the same synchronization logic for all triggering object changes.
+-	o.enqueue(cmoConfigMap)
++	o.enqueue()
+ }
+ 
+ func (o *Operator) worker(ctx context.Context) {
+@@ -714,7 +715,7 @@ func (o *Operator) processNextWorkItem(ctx context.Context) bool {
+ 	defer o.queue.Done(key)
+ 
+ 	metrics.ReconcileAttempts.Inc()
+-	err := o.sync(ctx, key)
++	err := o.sync(ctx)
+ 	if err == nil {
+ 		metrics.ReconcileStatus.Set(1)
+ 		o.queue.Forget(key)
+@@ -722,27 +723,17 @@ func (o *Operator) processNextWorkItem(ctx context.Context) bool {
+ 	}
+ 
+ 	metrics.ReconcileStatus.Set(0)
+-	klog.Errorf("Syncing %q failed", key)
+-	utilruntime.HandleError(fmt.Errorf("sync %q failed: %w", key, err))
++	klog.Error("Syncing failed")
++	utilruntime.HandleError(fmt.Errorf("sync failed: %w", err))
+ 	o.queue.AddRateLimited(key)
+ 
+ 	return true
+ }
+ 
+-func (o *Operator) enqueue(obj interface{}) {
+-	if obj == nil {
+-		return
+-	}
+-
+-	key, ok := obj.(string)
+-	if !ok {
+-		key, ok = o.keyFunc(obj)
+-		if !ok {
+-			return
+-		}
+-	}
+-
+-	o.queue.Add(key)
++func (o *Operator) enqueue() {
++	// We use a unique key value here because the synchronization logic is the
++	// same for all triggering object changes.
++	o.queue.Add("reconcile")
+ }
+ 
+ type proxyConfigSupplier func(context.Context) (*ProxyConfig, error)
+@@ -776,8 +767,8 @@ func (o *Operator) setUpgradeable(ctx context.Context, status configv1.Condition
+ 	}
+ }
+ 
+-func (o *Operator) sync(ctx context.Context, key string) error {
+-	config, warnings, err := o.Config(ctx, key)
++func (o *Operator) sync(ctx context.Context) error {
++	config, warnings, err := o.Config(ctx)
+ 
+ 	reason := "InvalidConfiguration"
+ 	if warnings != nil {
+@@ -957,51 +948,51 @@ func (o *Operator) loadConsoleConfig(ctx context.Context) (*configv1.Console, er
+ }
+ 
+ func (o *Operator) loadUserWorkloadConfig(ctx context.Context) (*manifests.UserWorkloadConfiguration, error) {
+-	cmKey := fmt.Sprintf("%s/%s", o.namespaceUserWorkload, o.userWorkloadConfigMapName)
+-
+ 	userCM, err := o.client.GetConfigmap(ctx, o.namespaceUserWorkload, o.userWorkloadConfigMapName)
+ 	if err != nil {
++		cm := o.uwmConfigMap()
+ 		if apierrors.IsNotFound(err) {
+-			klog.Warningf("User Workload Monitoring %q ConfigMap not found. Using defaults.", cmKey)
++			klog.Warningf("User Workload Monitoring %q ConfigMap not found. Using defaults.", cm)
+ 			return manifests.NewDefaultUserWorkloadMonitoringConfig(), nil
+ 		}
+-		klog.Warningf("Error loading User Workload Monitoring %q ConfigMap. Error: %v", cmKey, err)
+-		return nil, fmt.Errorf("the User Workload Monitoring %q ConfigMap could not be loaded: %w", cmKey, err)
++		klog.Warningf("Error loading User Workload Monitoring %q ConfigMap. Error: %v", cm, err)
++		return nil, fmt.Errorf("the User Workload Monitoring %q ConfigMap could not be loaded: %w", cm, err)
+ 	}
+ 
+ 	return manifests.NewUserWorkloadConfigFromConfigMap(userCM)
+ }
+ 
+-func (o *Operator) loadConfig(key string) (*manifests.Config, error) {
+-	obj, found, err := o.cmapInf.GetStore().GetByKey(key)
++func (o *Operator) loadConfig() (*manifests.Config, error) {
++	obj, found, err := o.cmapInf.GetStore().GetByKey(o.cmoConfigMap())
+ 	if err != nil {
+ 		return nil, fmt.Errorf("an error occurred when retrieving the Cluster Monitoring ConfigMap: %w", err)
+ 	}
+ 
+ 	if !found {
+ 		klog.Warning("No Cluster Monitoring ConfigMap was found. Using defaults.")
+-		return manifests.NewDefaultConfig(), nil
++		return manifests.NewConfigFromString("{}")
+ 	}
+ 
+ 	cmap := obj.(*v1.ConfigMap)
+ 	return manifests.NewConfigFromConfigMap(cmap)
+ }
+ 
+-func (o *Operator) Config(ctx context.Context, key string) (*manifests.Config, []string, error) {
++func (o *Operator) Config(ctx context.Context) (*manifests.Config, []string, error) {
+ 	var warnings []string
+ 
+-	c, err := o.loadConfig(key)
++	c, err := o.loadConfig()
+ 	if err != nil {
+ 		return nil, warnings, err
+ 	}
+ 
+-	warning, err := c.Precheck()
+-	if warning != nil {
++	for _, warning := range c.CheckDeprecatedFields() {
+ 		warnings = append(warnings, warning.Warning())
+ 	}
+-	if err != nil {
+-		return nil, warnings, err
+-	}
++
++	metrics.SetCollectionProfileMetrics(
++		string(c.ClusterMonitoringConfiguration.PrometheusK8sConfig.CollectionProfile),
++		manifests.SupportedCollectionProfiles.StringSlice(),
++	)
+ 
+ 	// Merge ClusterMonitoring CRD configuration if feature gate is enabled
+ 	if o.ClusterMonitoringConfigEnabled {

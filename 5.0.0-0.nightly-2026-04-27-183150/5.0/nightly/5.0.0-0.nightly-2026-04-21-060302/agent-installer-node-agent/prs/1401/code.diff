@@ -1,0 +1,1159 @@
+diff --git a/src/agent/main/main.go b/src/agent/main/main.go
+index a6629a28e..e42e1071d 100644
+--- a/src/agent/main/main.go
++++ b/src/agent/main/main.go
+@@ -52,7 +52,6 @@ func getMapKeysSorted(binaries map[string]func()) []string {
+ 
+ func Main() {
+ 	agentConfig := config.ProcessArgs()
+-	config.ProcessDryRunArgs(&agentConfig.DryRunConfig)
+ 	util.SetLogging("agent_registration", agentConfig.TextLogging, agentConfig.JournalLogging, agentConfig.StdoutLogging, agentConfig.ForcedHostID)
+ 	nextStepRunnerFactory := agent.NewNextStepRunnerFactory()
+ 	agent.RunAgent(agentConfig, nextStepRunnerFactory, logrus.StandardLogger())
+diff --git a/src/apivip_check/main/main.go b/src/apivip_check/main/main.go
+index 01c6777d4..d61639233 100644
+--- a/src/apivip_check/main/main.go
++++ b/src/apivip_check/main/main.go
+@@ -13,8 +13,7 @@ import (
+ )
+ 
+ func main() {
+-	subprocessConfig := config.ProcessSubprocessArgs(config.DefaultLoggingConfig)
+-	config.ProcessDryRunArgs(&subprocessConfig.DryRunConfig)
++	subprocessConfig := config.ProcessSubprocessArgs()
+ 	util.SetLogging("apivip_check", subprocessConfig.TextLogging, subprocessConfig.JournalLogging, subprocessConfig.StdoutLogging, subprocessConfig.ForcedHostID)
+ 	if flag.NArg() != 1 {
+ 		log.Warnf("Expecting exactly single argument to apivip_check. Received %d", len(os.Args)-1)
+diff --git a/src/config/agent_config.go b/src/config/agent_config.go
+index 1488853fc..8e374dfde 100644
+--- a/src/config/agent_config.go
++++ b/src/config/agent_config.go
+@@ -22,13 +22,18 @@ func printHelpAndExit() {
+ 
+ func ProcessArgs() *AgentConfig {
+ 	ret := &AgentConfig{}
++
++	err := RegisterDryRunArgs(&ret.DryRunConfig)
++	if err != nil {
++		log.Fatalf("Failed to register dry run arguments: %v", err)
++	}
++
++	RegisterLoggingArgs(&ret.LoggingConfig)
++
+ 	flag.StringVar(&ret.TargetURL, "url", "", "The target URL, including a scheme and optionally a port (overrides the host and port arguments")
+ 	flag.StringVar(&ret.InfraEnvID, "infra-env-id", "", "The value of infra-env-id")
+ 	flag.StringVar(&ret.AgentVersion, "agent-version", "", "Full image reference of the agent, for example 'quay.io/edge-infrastructure/assisted-installer-agent:v2.5.2'")
+ 	flag.IntVar(&ret.IntervalSecs, "interval", 60, "Interval between steps polling in seconds")
+-	flag.BoolVar(&ret.JournalLogging, "with-journal-logging", true, "Use journal logging")
+-	flag.BoolVar(&ret.TextLogging, "with-text-logging", false, "Output log to file")
+-	flag.BoolVar(&ret.StdoutLogging, "with-stdout-logging", false, "Output log to stdout")
+ 	flag.StringVar(&ret.CACertificatePath, "cacert", "", "Path to custom CA certificate in PEM format")
+ 	flag.BoolVar(&ret.InsecureConnection, "insecure", false, "Do not validate TLS certificate")
+ 	flag.StringVar(&ret.HostID, "host-id", "", "Host identification")
+diff --git a/src/config/dry_run_config.go b/src/config/dry_run_config.go
+index b094e1c18..7d69d2ee9 100644
+--- a/src/config/dry_run_config.go
++++ b/src/config/dry_run_config.go
+@@ -3,7 +3,6 @@ package config
+ import (
+ 	"flag"
+ 	"fmt"
+-	"os"
+ 
+ 	"github.com/kelseyhightower/envconfig"
+ )
+@@ -18,27 +17,22 @@ type DryRunConfig struct {
+ 	FakeRebootMarkerPath string `envconfig:"DRY_FAKE_REBOOT_MARKER_PATH"`
+ }
+ 
+-var DefaultDryRunConfig = DryRunConfig{
+-	DryRunEnabled:        false,
+-	ForcedHostID:         "",
+-	ForcedHostIPv4:       "",
+-	ForcedMacAddress:     "",
+-	ForcedHostname:       "",
+-	FakeRebootMarkerPath: "",
+-}
++// RegisterDryRunArgs must not be called more than once per process.
++// Subsequent calls will panic.
++func RegisterDryRunArgs(dryRunConfig *DryRunConfig) error {
++	defaultValues := DryRunConfig{}
+ 
+-func ProcessDryRunArgs(dryRunConfig *DryRunConfig) {
+-	err := envconfig.Process("dryconfig", &DefaultDryRunConfig)
++	err := envconfig.Process("dryconfig", &defaultValues)
+ 	if err != nil {
+-		fmt.Printf("envconfig error: %v", err)
+-		os.Exit(1)
++		return fmt.Errorf("envconfig error: %v", err)
+ 	}
+ 
+-	flag.BoolVar(&dryRunConfig.DryRunEnabled, "dry-run", DefaultDryRunConfig.DryRunEnabled, "Dry run avoids/fakes certain actions while communicating with the service")
+-	flag.StringVar(&dryRunConfig.ForcedHostID, "force-id", DefaultDryRunConfig.ForcedHostID, "The fake host ID to give to the host")
+-	flag.StringVar(&dryRunConfig.ForcedMacAddress, "force-mac", DefaultDryRunConfig.ForcedMacAddress, "The fake mac address to give to the first network interface")
+-	flag.StringVar(&dryRunConfig.ForcedHostname, "force-hostname", DefaultDryRunConfig.ForcedHostname, "The fake hostname to give to this host")
+-	flag.StringVar(&dryRunConfig.ForcedHostIPv4, "forced-ipv4", DefaultDryRunConfig.ForcedHostIPv4, "The fake ip address to give to the host's network interface")
+-	flag.StringVar(&dryRunConfig.FakeRebootMarkerPath, "fake-reboot-marker-path", DefaultDryRunConfig.FakeRebootMarkerPath, "A path whose existence indicates a fake reboot happened")
+-	flag.Parse()
++	flag.BoolVar(&dryRunConfig.DryRunEnabled, "dry-run", defaultValues.DryRunEnabled, "Dry run avoids/fakes certain actions while communicating with the service")
++	flag.StringVar(&dryRunConfig.ForcedHostID, "force-id", defaultValues.ForcedHostID, "The fake host ID to give to the host")
++	flag.StringVar(&dryRunConfig.ForcedMacAddress, "force-mac", defaultValues.ForcedMacAddress, "The fake mac address to give to the first network interface")
++	flag.StringVar(&dryRunConfig.ForcedHostname, "force-hostname", defaultValues.ForcedHostname, "The fake hostname to give to this host")
++	flag.StringVar(&dryRunConfig.ForcedHostIPv4, "forced-ipv4", defaultValues.ForcedHostIPv4, "The fake ip address to give to the host's network interface")
++	flag.StringVar(&dryRunConfig.FakeRebootMarkerPath, "fake-reboot-marker-path", defaultValues.FakeRebootMarkerPath, "A path whose existence indicates a fake reboot happened")
++
++	return nil
+ }
+diff --git a/src/config/inventory_config.go b/src/config/inventory_config.go
+new file mode 100644
+index 000000000..88b912ee4
+--- /dev/null
++++ b/src/config/inventory_config.go
+@@ -0,0 +1,35 @@
++package config
++
++import (
++	"flag"
++
++	log "github.com/sirupsen/logrus"
++)
++
++// Inventory command configuration
++type InventoryConfig struct {
++	DryRunConfig
++	LoggingConfig
++	GPUConfigFile string
++}
++
++func ProcessInventoryConfigArgs() *InventoryConfig {
++	ret := &InventoryConfig{}
++
++	RegisterLoggingArgs(&ret.LoggingConfig)
++
++	err := RegisterDryRunArgs(&ret.DryRunConfig)
++	if err != nil {
++		log.Fatalf("Failed to register dry run arguments: %v", err)
++	}
++
++	flag.StringVar(&ret.GPUConfigFile, "gpu-config-file", "", "Configuration file for GPU discovery")
++	h := flag.Bool("help", false, "Help message")
++	flag.Parse()
++
++	if h != nil && *h {
++		printHelpAndExit()
++	}
++
++	return ret
++}
+diff --git a/src/config/logs_sender_config.go b/src/config/logs_sender_config.go
+index 99581ed5f..5e3cdf6d7 100644
+--- a/src/config/logs_sender_config.go
++++ b/src/config/logs_sender_config.go
+@@ -4,6 +4,8 @@ import (
+ 	"flag"
+ 	"fmt"
+ 	"os"
++
++	log "github.com/sirupsen/logrus"
+ )
+ 
+ type LogsSenderConfig struct {
+@@ -26,6 +28,12 @@ type LogsSenderConfig struct {
+ func ProcessLogsSenderConfigArgs(defaultTextLogging, defaultJournalLogging bool) *LogsSenderConfig {
+ 	var leaveFiles bool
+ 	loggingConfig := &LogsSenderConfig{}
++
++	err := RegisterDryRunArgs(&loggingConfig.DryRunConfig)
++	if err != nil {
++		log.Fatalf("Failed to register dry run arguments: %v", err)
++	}
++
+ 	flag.BoolVar(&loggingConfig.JournalLogging, "with-journal-logging", defaultJournalLogging, "Use journal logging")
+ 	flag.BoolVar(&loggingConfig.TextLogging, "with-text-logging", defaultTextLogging, "Use text logging")
+ 	flag.StringVar(&loggingConfig.Since, "since", "", "Journalctl since flag, same format")
+diff --git a/src/config/subprocess_config.go b/src/config/subprocess_config.go
+index 7f2d99a54..100d617bf 100644
+--- a/src/config/subprocess_config.go
++++ b/src/config/subprocess_config.go
+@@ -1,6 +1,10 @@
+ package config
+ 
+-import "flag"
++import (
++	"flag"
++
++	log "github.com/sirupsen/logrus"
++)
+ 
+ // LoggingConfig defines logging for agent processes
+ type LoggingConfig struct {
+@@ -13,27 +17,32 @@ type LoggingConfig struct {
+ type SubprocessConfig struct {
+ 	LoggingConfig
+ 	DryRunConfig
+-	GPUConfigFile string
+ }
+ 
+-// DefaultLoggingConfig pre-defined most commonly used defaults
+-var DefaultLoggingConfig = LoggingConfig{
+-	TextLogging:    false,
+-	JournalLogging: true,
+-	StdoutLogging:  false,
++// RegisterLoggingArgs must not be called more than once per process.
++// Subsequent calls will panic.
++func RegisterLoggingArgs(loggingConfig *LoggingConfig) {
++	flag.BoolVar(&loggingConfig.JournalLogging, "with-journal-logging", true, "Use journal logging")
++	flag.BoolVar(&loggingConfig.TextLogging, "with-text-logging", false, "Use text logging")
++	flag.BoolVar(&loggingConfig.StdoutLogging, "with-stdout-logging", false, "Use stdout logging")
+ }
+ 
+ // ProcessSubprocessArgs parses arguments
+-func ProcessSubprocessArgs(loggingDefaults LoggingConfig) *SubprocessConfig {
++func ProcessSubprocessArgs() *SubprocessConfig {
+ 	subprocessConfig := &SubprocessConfig{}
+-	flag.BoolVar(&subprocessConfig.JournalLogging, "with-journal-logging", loggingDefaults.JournalLogging, "Use journal logging")
+-	flag.BoolVar(&subprocessConfig.TextLogging, "with-text-logging", loggingDefaults.TextLogging, "Use text logging")
+-	flag.BoolVar(&subprocessConfig.StdoutLogging, "with-stdout-logging", loggingDefaults.StdoutLogging, "Use stdout logging")
+-	flag.StringVar(&subprocessConfig.GPUConfigFile, "gpu-config-file", "", "Configuration file for GPU discovery")
++
++	RegisterLoggingArgs(&subprocessConfig.LoggingConfig)
++
++	err := RegisterDryRunArgs(&subprocessConfig.DryRunConfig)
++	if err != nil {
++		log.Fatalf("Failed to register dry run arguments: %v", err)
++	}
++
+ 	h := flag.Bool("help", false, "Help message")
+ 	flag.Parse()
+ 	if h != nil && *h {
+ 		printHelpAndExit()
+ 	}
++
+ 	return subprocessConfig
+ }
+diff --git a/src/connectivity_check/main/main.go b/src/connectivity_check/main/main.go
+index c5047c258..e5d36f5e8 100644
+--- a/src/connectivity_check/main/main.go
++++ b/src/connectivity_check/main/main.go
+@@ -13,8 +13,7 @@ import (
+ )
+ 
+ func main() {
+-	subprocessConfig := config.ProcessSubprocessArgs(config.DefaultLoggingConfig)
+-	config.ProcessDryRunArgs(&subprocessConfig.DryRunConfig)
++	subprocessConfig := config.ProcessSubprocessArgs()
+ 	util.SetLogging("connectivity-check", subprocessConfig.TextLogging, subprocessConfig.JournalLogging, subprocessConfig.StdoutLogging, subprocessConfig.ForcedHostID)
+ 	if flag.NArg() != 1 {
+ 		log.Warnf("Expecting exactly single argument to connectivity check. Received %d", len(os.Args)-1)
+diff --git a/src/container_image_availability/main/main.go b/src/container_image_availability/main/main.go
+index 10d3734fc..45eb1ed9f 100644
+--- a/src/container_image_availability/main/main.go
++++ b/src/container_image_availability/main/main.go
+@@ -11,31 +11,21 @@ import (
+ 	log "github.com/sirupsen/logrus"
+ )
+ 
+-type Config struct {
+-	Request string
+-}
+-
+-var executableConfig Config
++var request string
+ 
+-func processArgs() {
+-	ret := &executableConfig
+-	flag.StringVar(&ret.Request, "request", "", "The request details. See models.ContainerImageAvailabilityRequest")
++func main() {
++	flag.StringVar(&request, "request", "", "The request details. See models.ContainerImageAvailabilityRequest")
+ 
+-	flag.Parse()
++	subprocessConfig := config.ProcessSubprocessArgs()
+ 
+-	if executableConfig.Request == "" {
++	if request == "" {
+ 		flag.CommandLine.Usage()
+ 		os.Exit(1)
+ 	}
+-}
+ 
+-func main() {
+-	processArgs()
+-	subprocessConfig := config.ProcessSubprocessArgs(config.DefaultLoggingConfig)
+-	config.ProcessDryRunArgs(&subprocessConfig.DryRunConfig)
+ 	util.SetLogging("container_image_availability", subprocessConfig.TextLogging, subprocessConfig.JournalLogging, subprocessConfig.StdoutLogging, subprocessConfig.ForcedHostID)
+-	log.StandardLogger().Infof("Checking image availability, requested images: %s", executableConfig.Request)
+-	stdout, stderr, exitCode := container_image_availability.Run(subprocessConfig, executableConfig.Request,
++	log.StandardLogger().Infof("Checking image availability, requested images: %s", request)
++	stdout, stderr, exitCode := container_image_availability.Run(subprocessConfig, request,
+ 		&container_image_availability.ProcessExecuter{}, log.StandardLogger())
+ 	fmt.Fprint(os.Stdout, stdout)
+ 	fmt.Fprint(os.Stderr, stderr)
+diff --git a/src/dhcp_lease_allocate/main/main.go b/src/dhcp_lease_allocate/main/main.go
+index 1fe608662..ff48bf212 100644
+--- a/src/dhcp_lease_allocate/main/main.go
++++ b/src/dhcp_lease_allocate/main/main.go
+@@ -12,8 +12,8 @@ import (
+ )
+ 
+ func main() {
+-	subprocessConfig := config.ProcessSubprocessArgs(config.DefaultLoggingConfig)
+-	config.ProcessDryRunArgs(&subprocessConfig.DryRunConfig)
++	subprocessConfig := config.ProcessSubprocessArgs()
++
+ 	util.SetLogging("dhcp_lease_allocate", subprocessConfig.TextLogging, subprocessConfig.JournalLogging, subprocessConfig.StdoutLogging, subprocessConfig.ForcedHostID)
+ 	if flag.NArg() != 1 {
+ 		log.Warnf("Expecting exactly single argument to dhcp_lease_allocate. Received %d", len(os.Args)-1)
+diff --git a/src/disk_speed_check/main.go b/src/disk_speed_check/main.go
+index c3f94d287..353bddd3d 100644
+--- a/src/disk_speed_check/main.go
++++ b/src/disk_speed_check/main.go
+@@ -11,8 +11,7 @@ import (
+ )
+ 
+ func Main() {
+-	subprocessConfig := config.ProcessSubprocessArgs(config.DefaultLoggingConfig)
+-	config.ProcessDryRunArgs(&subprocessConfig.DryRunConfig)
++	subprocessConfig := config.ProcessSubprocessArgs()
+ 	util.SetLogging("disk-speed-check", subprocessConfig.TextLogging, subprocessConfig.JournalLogging, subprocessConfig.StdoutLogging, subprocessConfig.ForcedHostID)
+ 
+ 	req := flag.Arg(flag.NArg() - 1)
+diff --git a/src/domain_resolution/main/main.go b/src/domain_resolution/main/main.go
+index ad2f8014d..6b36e4513 100644
+--- a/src/domain_resolution/main/main.go
++++ b/src/domain_resolution/main/main.go
+@@ -11,28 +11,16 @@ import (
+ 	log "github.com/sirupsen/logrus"
+ )
+ 
+-type Config struct {
+-	Request string
+-}
++var request string
+ 
+-func processRequestArg() string {
+-	var executableConfig Config
+-	ret := &executableConfig
+-	flag.StringVar(&ret.Request, "request", "",
+-		"The request details. See models.DomainResolutionRequest")
+-	flag.Parse()
++func main() {
++	flag.StringVar(&request, "request", "", "The request details. See models.DomainResolutionRequest")
++	subprocessConfig := config.ProcessSubprocessArgs()
+ 
+-	if executableConfig.Request == "" {
++	if request == "" {
+ 		flag.CommandLine.Usage()
+ 		os.Exit(1)
+ 	}
+-	return executableConfig.Request
+-}
+-
+-func main() {
+-	request := processRequestArg()
+-	subprocessConfig := config.ProcessSubprocessArgs(config.DefaultLoggingConfig)
+-	config.ProcessDryRunArgs(&subprocessConfig.DryRunConfig)
+ 
+ 	util.SetLogging("domain_resolution",
+ 		subprocessConfig.TextLogging,
+diff --git a/src/free_addresses/main.go b/src/free_addresses/main.go
+index 48b318808..6ed862ad4 100644
+--- a/src/free_addresses/main.go
++++ b/src/free_addresses/main.go
+@@ -12,8 +12,7 @@ import (
+ )
+ 
+ func Main() {
+-	subprocessConfig := config.ProcessSubprocessArgs(config.DefaultLoggingConfig)
+-	config.ProcessDryRunArgs(&subprocessConfig.DryRunConfig)
++	subprocessConfig := config.ProcessSubprocessArgs()
+ 	util.SetLogging("free_addresses", subprocessConfig.TextLogging, subprocessConfig.JournalLogging, subprocessConfig.StdoutLogging, subprocessConfig.ForcedHostID)
+ 	if flag.NArg() != 1 {
+ 		log.Warnf("Expecting exactly single argument to free_addresses. Received %d", len(os.Args)-1)
+diff --git a/src/inventory/bmc.go b/src/inventory/bmc.go
+index f360ab178..a61092879 100644
+--- a/src/inventory/bmc.go
++++ b/src/inventory/bmc.go
+@@ -14,16 +14,16 @@ import (
+ const MaxIpmiChannel = 12
+ 
+ type bmc struct {
+-	dependicies      util.IDependencies
+-	subprocessConfig *config.SubprocessConfig
++	dependencies    util.IDependencies
++	inventoryConfig *config.InventoryConfig
+ }
+ 
+-func newBMC(subprocessConfig *config.SubprocessConfig, dependencies util.IDependencies) *bmc {
+-	return &bmc{dependicies: dependencies, subprocessConfig: subprocessConfig}
++func newBMC(inventoryConfig *config.InventoryConfig, dependencies util.IDependencies) *bmc {
++	return &bmc{dependencies: dependencies, inventoryConfig: inventoryConfig}
+ }
+ 
+ func (b *bmc) getIpForChannnel(ch int) string {
+-	o, e, exitCode := b.dependicies.Execute("ipmitool", "lan", "print", strconv.FormatInt(int64(ch), 10))
++	o, e, exitCode := b.dependencies.Execute("ipmitool", "lan", "print", strconv.FormatInt(int64(ch), 10))
+ 	if exitCode != 0 || strings.HasPrefix(e, "Invalid channel") {
+ 		return ""
+ 	}
+@@ -42,7 +42,7 @@ func (b *bmc) getIsEnabled(value interface{}) bool {
+ }
+ 
+ func (b *bmc) getBmcAddress() string {
+-	if b.subprocessConfig.DryRunEnabled {
++	if b.inventoryConfig.DryRunEnabled {
+ 		// This action is too slow and unnecessary, so skip it in dry run
+ 		return "0.0.0.0"
+ 	}
+@@ -63,12 +63,12 @@ func (b *bmc) getBmcAddress() string {
+ 	return "0.0.0.0"
+ }
+ 
+-func GetBmcAddress(subprocessConfig *config.SubprocessConfig, dependencies util.IDependencies) string {
+-	return newBMC(subprocessConfig, dependencies).getBmcAddress()
++func GetBmcAddress(inventoryConfig *config.InventoryConfig, dependencies util.IDependencies) string {
++	return newBMC(inventoryConfig, dependencies).getBmcAddress()
+ }
+ 
+ func (b *bmc) getV6Address(ch int, addressType string) string {
+-	o, _, exitCode := b.dependicies.Execute("ipmitool", "lan6", "print", strconv.FormatInt(int64(ch), 10), addressType+"_addr")
++	o, _, exitCode := b.dependencies.Execute("ipmitool", "lan6", "print", strconv.FormatInt(int64(ch), 10), addressType+"_addr")
+ 	if exitCode != 0 {
+ 		return ""
+ 	}
+@@ -112,7 +112,7 @@ func (b *bmc) getV6Address(ch int, addressType string) string {
+ }
+ 
+ func (b *bmc) getAddrMode(ch int) string {
+-	o, _, exitCode := b.dependicies.Execute("ipmitool", "lan6", "print", strconv.FormatInt(int64(ch), 10), "enables")
++	o, _, exitCode := b.dependencies.Execute("ipmitool", "lan6", "print", strconv.FormatInt(int64(ch), 10), "enables")
+ 	if exitCode != 0 {
+ 		return ""
+ 	}
+@@ -127,7 +127,7 @@ func (b *bmc) getAddrMode(ch int) string {
+ }
+ 
+ func (b *bmc) getBmcV6Address() string {
+-	if b.subprocessConfig.DryRunEnabled {
++	if b.inventoryConfig.DryRunEnabled {
+ 		// This action is too slow and unnecessary, so skip it in dry run
+ 		return "::/0"
+ 	}
+@@ -153,6 +153,6 @@ func (b *bmc) getBmcV6Address() string {
+ 	return "::/0"
+ }
+ 
+-func GetBmcV6Address(subprocessConfig *config.SubprocessConfig, dependencies util.IDependencies) string {
+-	return newBMC(subprocessConfig, dependencies).getBmcV6Address()
++func GetBmcV6Address(inventoryConfig *config.InventoryConfig, dependencies util.IDependencies) string {
++	return newBMC(inventoryConfig, dependencies).getBmcV6Address()
+ }
+diff --git a/src/inventory/bmc_test.go b/src/inventory/bmc_test.go
+index 664c96c69..0eb52e354 100644
+--- a/src/inventory/bmc_test.go
++++ b/src/inventory/bmc_test.go
+@@ -250,11 +250,11 @@ IPv6 ND/SLAAC Timing Configuration Support: not supported
+ 
+ var _ = Describe("bmc", func() {
+ 	var dependencies *util.MockIDependencies
+-	var subprocessConfig *config.SubprocessConfig
++	var inventoryConfig *config.InventoryConfig
+ 
+ 	BeforeEach(func() {
+ 		dependencies = newDependenciesMock()
+-		subprocessConfig = &config.SubprocessConfig{}
++		inventoryConfig = &config.InventoryConfig{}
+ 	})
+ 
+ 	AfterEach(func() {
+@@ -267,7 +267,7 @@ var _ = Describe("bmc", func() {
+ 			dependencies.On("Execute", "ipmitool", "lan", "print", ch).Return("", "Invalid channel 10", 0).Once()
+ 		}
+ 		dependencies.On("Execute", "ipmitool", "lan", "print", "5").Return(bmcV4OkAnswer, "", 0).Once()
+-		addr := GetBmcAddress(subprocessConfig, dependencies)
++		addr := GetBmcAddress(inventoryConfig, dependencies)
+ 		Expect(addr).To(Equal("10.16.218.144"))
+ 	})
+ 	It("ipv4 not found", func() {
+@@ -275,7 +275,7 @@ var _ = Describe("bmc", func() {
+ 			ch := strconv.FormatInt(int64(i), 10)
+ 			dependencies.On("Execute", "ipmitool", "lan", "print", ch).Return("", "Invalid channel 10", 0).Once()
+ 		}
+-		addr := GetBmcAddress(subprocessConfig, dependencies)
++		addr := GetBmcAddress(inventoryConfig, dependencies)
+ 		Expect(addr).To(Equal("0.0.0.0"))
+ 	})
+ 
+@@ -289,7 +289,7 @@ var _ = Describe("bmc", func() {
+ 			ch := strconv.FormatInt(int64(i), 10)
+ 			dependencies.On("Execute", "ipmitool", "lan6", "print", ch, "enables").Return("", "Failed to get IPv6/IPv4 Addressing Enables: Invalid data field in request", -1).Once()
+ 		}
+-		addr := GetBmcV6Address(subprocessConfig, dependencies)
++		addr := GetBmcV6Address(inventoryConfig, dependencies)
+ 		Expect(addr).To(Equal("::/0"))
+ 	})
+ 
+@@ -303,7 +303,7 @@ var _ = Describe("bmc", func() {
+ 		for i := 6; i != 13; i++ {
+ 			dependencies.On("Execute", "ipmitool", "lan6", "print", strconv.FormatInt(int64(i), 10), "enables").Return("", "Failed to get IPv6/IPv4 Addressing Enables: Invalid data field in request", -1).Once()
+ 		}
+-		addr := GetBmcV6Address(subprocessConfig, dependencies)
++		addr := GetBmcV6Address(inventoryConfig, dependencies)
+ 		Expect(addr).To(Equal("::/0"))
+ 	})
+ 
+@@ -314,7 +314,7 @@ var _ = Describe("bmc", func() {
+ 		}
+ 		dependencies.On("Execute", "ipmitool", "lan6", "print", "5", "enables").Return("IPv6/IPv4 Addressing Enables: both", "", 0).Once()
+ 		dependencies.On("Execute", "ipmitool", "lan6", "print", "5", "dynamic_addr").Return(bmcV6Dynamic, "", 0).Once()
+-		addr := GetBmcV6Address(subprocessConfig, dependencies)
++		addr := GetBmcV6Address(inventoryConfig, dependencies)
+ 		Expect(addr).To(Equal("fe80::779e:a22f:dc5e:ca41"))
+ 	})
+ 	It("ipv6 static found", func() {
+@@ -325,7 +325,7 @@ var _ = Describe("bmc", func() {
+ 		dependencies.On("Execute", "ipmitool", "lan6", "print", "5", "enables").Return("IPv6/IPv4 Addressing Enables: both", "", 0).Once()
+ 		dependencies.On("Execute", "ipmitool", "lan6", "print", "5", "dynamic_addr").Return(bmcV6NoAddress, "", 0).Once()
+ 		dependencies.On("Execute", "ipmitool", "lan6", "print", "5", "static_addr").Return(bmcV6Static, "", 0).Once()
+-		addr := GetBmcV6Address(subprocessConfig, dependencies)
++		addr := GetBmcV6Address(inventoryConfig, dependencies)
+ 		Expect(addr).To(Equal("fe80::779e:a22f:dc5e:ca42"))
+ 	})
+ })
+diff --git a/src/inventory/disks.go b/src/inventory/disks.go
+index c5948f7f6..e173a7e35 100644
+--- a/src/inventory/disks.go
++++ b/src/inventory/disks.go
+@@ -25,12 +25,12 @@ const (
+ )
+ 
+ type disks struct {
+-	dependencies     util.IDependencies
+-	subprocessConfig *config.SubprocessConfig
++	dependencies    util.IDependencies
++	inventoryConfig *config.InventoryConfig
+ }
+ 
+-func newDisks(subprocessConfig *config.SubprocessConfig, dependencies util.IDependencies) *disks {
+-	return &disks{dependencies: dependencies, subprocessConfig: subprocessConfig}
++func newDisks(inventoryConfig *config.InventoryConfig, dependencies util.IDependencies) *disks {
++	return &disks{dependencies: dependencies, inventoryConfig: inventoryConfig}
+ }
+ 
+ func getPureWWN(wwn string, byId string) string {
+@@ -550,8 +550,8 @@ func (d *disks) getISCSIHostIPAddress(diskName string) string {
+ 	return ipAddress
+ }
+ 
+-func GetDisks(subprocessConfig *config.SubprocessConfig, dependencies util.IDependencies) []*models.Disk {
+-	return newDisks(subprocessConfig, dependencies).getDisks()
++func GetDisks(inventoryConfig *config.InventoryConfig, dependencies util.IDependencies) []*models.Disk {
++	return newDisks(inventoryConfig, dependencies).getDisks()
+ }
+ 
+ // Check if the state of the iSCSI disk is running
+diff --git a/src/inventory/disks_test.go b/src/inventory/disks_test.go
+index a977b1cd7..3dd663868 100644
+--- a/src/inventory/disks_test.go
++++ b/src/inventory/disks_test.go
+@@ -418,7 +418,7 @@ func mockAllForSuccess(dependencies *util.MockIDependencies, disks ...*ghw.Disk)
+ 			hiddenText = "1\n"
+ 		}
+ 		dependencies.On("ReadFile", fmt.Sprintf("/sys/block/%s/hidden", name)).Return([]byte(hiddenText), nil)
+-		if !newDisks(&config.SubprocessConfig{}, dependencies).shouldReturnDisk(disk) {
++		if !newDisks(&config.InventoryConfig{}, dependencies).shouldReturnDisk(disk) {
+ 			continue
+ 		}
+ 
+@@ -481,13 +481,13 @@ var _ = Describe("Disks test", func() {
+ 
+ 	It("Execute error", func() {
+ 		mockFetchDisks(dependencies, fmt.Errorf("just an error"))
+-		ret := GetDisks(&config.SubprocessConfig{}, dependencies)
++		ret := GetDisks(&config.InventoryConfig{}, dependencies)
+ 		Expect(ret).To(Equal([]*models.Disk{}))
+ 	})
+ 
+ 	It("Empty", func() {
+ 		mockFetchDisks(dependencies, nil)
+-		ret := GetDisks(&config.SubprocessConfig{}, dependencies)
++		ret := GetDisks(&config.InventoryConfig{}, dependencies)
+ 		Expect(ret).To(Equal([]*models.Disk{}))
+ 	})
+ 
+@@ -499,7 +499,7 @@ var _ = Describe("Disks test", func() {
+ 		mockReadDir(dependencies, "/dev/disk/by-id", "fetching the by-id disk failed")
+ 		mockAllForSuccess(dependencies, createSDADisk(), createSDBDisk(), zramDisk, loopDisk, hiddenDisk)
+ 
+-		ret := GetDisks(&config.SubprocessConfig{}, dependencies)
++		ret := GetDisks(&config.InventoryConfig{}, dependencies)
+ 		Expect(ret).Should(HaveLen(2))
+ 	})
+ 
+@@ -525,7 +525,7 @@ var _ = Describe("Disks test", func() {
+ 		})
+ 
+ 		AfterEach(func() {
+-			ret := GetDisks(&config.SubprocessConfig{}, dependencies)
++			ret := GetDisks(&config.InventoryConfig{}, dependencies)
+ 			Expect(ret).To(Equal(expectation))
+ 		})
+ 	})
+@@ -533,7 +533,7 @@ var _ = Describe("Disks test", func() {
+ 	It("Multiple disks", func() {
+ 		blockInfo, expectedDisks := prepareDisksTest(dependencies, 2)
+ 		mockFetchDisks(dependencies, nil, blockInfo.Disks...)
+-		ret := GetDisks(&config.SubprocessConfig{}, dependencies)
++		ret := GetDisks(&config.InventoryConfig{}, dependencies)
+ 		Expect(ret).To(Equal(expectedDisks))
+ 	})
+ 
+@@ -545,7 +545,7 @@ var _ = Describe("Disks test", func() {
+ 		expectedDisks[0].InstallationEligibility.Eligible = true
+ 
+ 		mockFetchDisks(dependencies, nil, blockInfo.Disks...)
+-		ret := GetDisks(&config.SubprocessConfig{}, dependencies)
++		ret := GetDisks(&config.InventoryConfig{}, dependencies)
+ 		Expect(ret).To(Equal(expectedDisks))
+ 	})
+ 
+@@ -574,7 +574,7 @@ var _ = Describe("Disks test", func() {
+ 		expectedDisks[1].IsInstallationMedia = false
+ 
+ 		mockFetchDisks(dependencies, nil, blockInfo.Disks...)
+-		ret := GetDisks(&config.SubprocessConfig{}, dependencies)
++		ret := GetDisks(&config.InventoryConfig{}, dependencies)
+ 		Expect(ret).To(Equal(expectedDisks))
+ 	})
+ 
+@@ -619,7 +619,7 @@ var _ = Describe("Disks test", func() {
+ 		}
+ 
+ 		mockFetchDisks(dependencies, nil, blockInfo.Disks...)
+-		ret := GetDisks(&config.SubprocessConfig{}, dependencies)
++		ret := GetDisks(&config.InventoryConfig{}, dependencies)
+ 		Expect(ret).To(Equal(expectedDisks))
+ 	})
+ 
+@@ -637,7 +637,7 @@ var _ = Describe("Disks test", func() {
+ 		expectedDisks[1].DriveType = models.DriveTypeHDD
+ 
+ 		mockFetchDisks(dependencies, nil, blockInfo.Disks...)
+-		ret := GetDisks(&config.SubprocessConfig{}, dependencies)
++		ret := GetDisks(&config.InventoryConfig{}, dependencies)
+ 		Expect(ret).To(Equal(expectedDisks))
+ 	})
+ 
+@@ -667,7 +667,7 @@ var _ = Describe("Disks test", func() {
+ 		mockNoUUID(dependencies, path)
+ 		mockReadDir(dependencies, fmt.Sprintf("/sys/block/%s/holders", disk.Name), "")
+ 		dependencies.On("ReadFile", fmt.Sprintf("/sys/block/%s/hidden", disk.Name)).Return([]byte("0\n"), nil)
+-		ret := GetDisks(&config.SubprocessConfig{}, dependencies)
++		ret := GetDisks(&config.InventoryConfig{}, dependencies)
+ 
+ 		Expect(ret).To(Equal([]*models.Disk{
+ 			{
+@@ -730,7 +730,7 @@ var _ = Describe("Disks test", func() {
+ 		mockNoUUID(dependencies, path)
+ 		mockReadDir(dependencies, fmt.Sprintf("/sys/block/%s/holders", disk.Name), "")
+ 		dependencies.On("ReadFile", fmt.Sprintf("/sys/block/%s/hidden", disk.Name)).Return([]byte("0\n"), nil)
+-		ret := GetDisks(&config.SubprocessConfig{}, dependencies)
++		ret := GetDisks(&config.InventoryConfig{}, dependencies)
+ 		Expect(ret).To(Equal([]*models.Disk{
+ 			{
+ 				ID:        "/dev/disk/by-path/pci-0000:3d:00.0-nvme-1",
+@@ -765,7 +765,7 @@ var _ = Describe("Disks test", func() {
+ 		}
+ 
+ 		mockFetchDisks(dependencies, nil, blockInfo.Disks...)
+-		ret := GetDisks(&config.SubprocessConfig{}, dependencies)
++		ret := GetDisks(&config.InventoryConfig{}, dependencies)
+ 		Expect(ret).To(Equal(expectation))
+ 	})
+ 
+@@ -810,7 +810,7 @@ var _ = Describe("Disks test", func() {
+ 
+ 			mockReadDir(dependencies, ibftBasePath, "", &ignoredFileMock, &ignoredDirMock, &targetMock)
+ 
+-			ret := GetDisks(&config.SubprocessConfig{}, dependencies)
++			ret := GetDisks(&config.InventoryConfig{}, dependencies)
+ 			Expect(ret).To(Equal([]*models.Disk{
+ 				{
+ 					ID:        "/dev/disk/by-path/ip-192.168.130.10:3260-iscsi-iqn.2022-01.com.redhat.foo:disk0-lun-0",
+@@ -848,7 +848,7 @@ var _ = Describe("Disks test", func() {
+ 			dependencies.On("ReadFile", "/sys/firmware/ibft/target0/target-name").Return([]byte("iqn.2023-01.com.example:tm1"), nil)
+ 			mockReadDir(dependencies, ibftBasePath, "", &targetMock)
+ 
+-			ret := GetDisks(&config.SubprocessConfig{}, dependencies)
++			ret := GetDisks(&config.InventoryConfig{}, dependencies)
+ 			Expect(ret[0].InstallationEligibility.Eligible).To(BeFalse())
+ 			Expect(ret[0].InstallationEligibility.NotEligibleReasons).To(HaveLen(1))
+ 			Expect(ret[0].InstallationEligibility.NotEligibleReasons).To(ContainElement("iSCSI disk is not in running state"))
+@@ -866,7 +866,7 @@ var _ = Describe("Disks test", func() {
+ 			dependencies.On("ReadFile", "/sys/firmware/ibft/target0/target-name").Return([]byte("iqn.2023-01.com.example:tm1"), nil)
+ 			mockReadDir(dependencies, ibftBasePath, "", &targetMock)
+ 
+-			ret := GetDisks(&config.SubprocessConfig{}, dependencies)
++			ret := GetDisks(&config.InventoryConfig{}, dependencies)
+ 			Expect(ret[0].InstallationEligibility.Eligible).To(BeFalse())
+ 			Expect(ret[0].InstallationEligibility.NotEligibleReasons).To(HaveLen(1))
+ 			Expect(ret[0].InstallationEligibility.NotEligibleReasons).To(ContainElement("Failed to read state of iSCSI disk"))
+@@ -884,7 +884,7 @@ var _ = Describe("Disks test", func() {
+ 			dependencies.On("ReadFile", "/sys/firmware/ibft/target0/target-name").Return([]byte("iqn.2023-01.com.example:tm1"), nil)
+ 			mockReadDir(dependencies, ibftBasePath, "", &targetMock)
+ 
+-			ret := GetDisks(&config.SubprocessConfig{}, dependencies)
++			ret := GetDisks(&config.InventoryConfig{}, dependencies)
+ 			Expect(ret[0].InstallationEligibility.Eligible).To(BeFalse())
+ 			Expect(ret[0].InstallationEligibility.NotEligibleReasons).To(HaveLen(1))
+ 			Expect(ret[0].InstallationEligibility.NotEligibleReasons).To(ContainElement("iSCSI disk is missing from iBFT"))
+@@ -899,7 +899,7 @@ var _ = Describe("Disks test", func() {
+ 			// iBFT target validation
+ 			dependencies.On("ReadFile", "/sys/class/iscsi_session/session1/targetname").Return([]byte(""), fmt.Errorf("file not found"))
+ 
+-			ret := GetDisks(&config.SubprocessConfig{}, dependencies)
++			ret := GetDisks(&config.InventoryConfig{}, dependencies)
+ 			Expect(ret[0].InstallationEligibility.Eligible).To(BeFalse())
+ 			Expect(ret[0].InstallationEligibility.NotEligibleReasons).To(HaveLen(1))
+ 			Expect(ret[0].InstallationEligibility.NotEligibleReasons).To(ContainElement("Cannot find iSCSI target name"))
+@@ -915,7 +915,7 @@ var _ = Describe("Disks test", func() {
+ 			dependencies.On("ReadFile", "/sys/class/iscsi_session/session1/targetname").Return([]byte("iqn.2023-01.com.example:tm1"), nil)
+ 			mockReadDir(dependencies, ibftBasePath, "no directory found")
+ 
+-			ret := GetDisks(&config.SubprocessConfig{}, dependencies)
++			ret := GetDisks(&config.InventoryConfig{}, dependencies)
+ 			Expect(ret[0].InstallationEligibility.Eligible).To(BeFalse())
+ 			Expect(ret[0].InstallationEligibility.NotEligibleReasons).To(HaveLen(1))
+ 			Expect(ret[0].InstallationEligibility.NotEligibleReasons).To(ContainElement("iBFT firmware is missing"))
+@@ -932,7 +932,7 @@ var _ = Describe("Disks test", func() {
+ 			dependencies.On("ReadFile", "/sys/firmware/ibft/target0/target-name").Return([]byte(""), fmt.Errorf("file not found"))
+ 			mockReadDir(dependencies, ibftBasePath, "", &targetMock)
+ 
+-			ret := GetDisks(&config.SubprocessConfig{}, dependencies)
++			ret := GetDisks(&config.InventoryConfig{}, dependencies)
+ 			Expect(ret[0].InstallationEligibility.Eligible).To(BeFalse())
+ 			Expect(ret[0].InstallationEligibility.NotEligibleReasons).To(HaveLen(1))
+ 			Expect(ret[0].InstallationEligibility.NotEligibleReasons).To(ContainElement("iSCSI disk is missing from iBFT"))
+@@ -943,7 +943,7 @@ var _ = Describe("Disks test", func() {
+ 			// iSCSI state validation
+ 			dependencies.On("ReadFile", "/sys/block/sda/device/state").Return([]byte("running"), nil)
+ 
+-			ret := GetDisks(&config.SubprocessConfig{}, dependencies)
++			ret := GetDisks(&config.InventoryConfig{}, dependencies)
+ 			Expect(ret[0].InstallationEligibility.Eligible).To(BeFalse())
+ 			Expect(ret[0].InstallationEligibility.NotEligibleReasons).To(HaveLen(1))
+ 			Expect(ret[0].InstallationEligibility.NotEligibleReasons).To(ContainElement("Cannot find iSCSI session"))
+@@ -954,7 +954,7 @@ var _ = Describe("Disks test", func() {
+ 			// iSCSI state validation
+ 			dependencies.On("ReadFile", "/sys/block/sda/device/state").Return([]byte("running"), nil)
+ 
+-			ret := GetDisks(&config.SubprocessConfig{}, dependencies)
++			ret := GetDisks(&config.InventoryConfig{}, dependencies)
+ 			Expect(ret[0].InstallationEligibility.Eligible).To(BeFalse())
+ 			Expect(ret[0].InstallationEligibility.NotEligibleReasons).To(HaveLen(1))
+ 			Expect(ret[0].InstallationEligibility.NotEligibleReasons).To(ContainElement("Cannot find iSCSI session"))
+@@ -982,7 +982,7 @@ var _ = Describe("Disks test", func() {
+ 		dependencies.On("ReadDir", "/sys/block/sda/holders").Return(holderInfos, nil).Times(1)
+ 		dependencies.On("ReadFile", fmt.Sprintf("/sys/block/%s/hidden", disk.Name)).Return([]byte("0\n"), nil)
+ 
+-		ret := GetDisks(&config.SubprocessConfig{}, dependencies)
++		ret := GetDisks(&config.InventoryConfig{}, dependencies)
+ 
+ 		Expect(ret).To(Equal([]*models.Disk{
+ 			{
+@@ -1028,7 +1028,7 @@ var _ = Describe("Disks test", func() {
+ 		dependencies.On("ReadDir", "/sys/block/sda/holders").Return(holderInfos, nil).Times(1)
+ 		dependencies.On("ReadFile", fmt.Sprintf("/sys/block/%s/hidden", disk.Name)).Return([]byte("0\n"), nil)
+ 
+-		ret := GetDisks(&config.SubprocessConfig{}, dependencies)
++		ret := GetDisks(&config.InventoryConfig{}, dependencies)
+ 
+ 		Expect(ret).To(Equal([]*models.Disk{
+ 			{
+@@ -1067,7 +1067,7 @@ var _ = Describe("Disks test", func() {
+ 		dependencies.On("ReadFile", fmt.Sprintf("/sys/block/%s/dm/name", disk.Name)).Return([]byte(""), nil)
+ 
+ 		dependencies.On("ReadFile", "/sys/block/dm-2/dm/uuid").Return([]byte("mpath-36001405961d8b6f55cf48beb0de296b2\n"), nil)
+-		ret := GetDisks(&config.SubprocessConfig{}, dependencies)
++		ret := GetDisks(&config.InventoryConfig{}, dependencies)
+ 
+ 		Expect(ret).To(Equal([]*models.Disk{
+ 			{
+@@ -1106,7 +1106,7 @@ var _ = Describe("Disks test", func() {
+ 		dependencies.On("ReadFile", fmt.Sprintf("/sys/block/%s/dm/name", disk.Name)).Return([]byte(""), nil)
+ 
+ 		dependencies.On("ReadFile", "/sys/block/dm-2/dm/uuid").Return([]byte("mpath-36001405961d8b6f55cf48beb0de296b2\n"), nil)
+-		ret := GetDisks(&config.SubprocessConfig{}, dependencies)
++		ret := GetDisks(&config.InventoryConfig{}, dependencies)
+ 
+ 		Expect(ret).To(Equal([]*models.Disk{
+ 			{
+@@ -1141,7 +1141,7 @@ var _ = Describe("Disks test", func() {
+ 		mockHasUUID(dependencies, "/dev/dm-0", "")
+ 		dependencies.On("ReadFile", fmt.Sprintf("/sys/block/%s/dm/name", disk.Name)).Return([]byte(applianceAgentPrefix), nil)
+ 
+-		ret := GetDisks(&config.SubprocessConfig{}, dependencies)
++		ret := GetDisks(&config.InventoryConfig{}, dependencies)
+ 		Expect(ret).To(Equal([]*models.Disk{
+ 			{
+ 				ByPath:    "",
+@@ -1177,7 +1177,7 @@ var _ = Describe("Disks test", func() {
+ 		mockReadDir(dependencies, fmt.Sprintf("/sys/block/%s/holders", disk.Name), "")
+ 		dependencies.On("ReadFile", fmt.Sprintf("/sys/block/%s/hidden", disk.Name)).Return([]byte("0\n"), nil)
+ 
+-		ret := GetDisks(&config.SubprocessConfig{}, dependencies)
++		ret := GetDisks(&config.InventoryConfig{}, dependencies)
+ 
+ 		Expect(ret).To(Equal([]*models.Disk{
+ 			{
+@@ -1216,7 +1216,7 @@ var _ = Describe("Disks test", func() {
+ 		dependencies.On("ReadFile", fmt.Sprintf("/sys/block/%s/dm/name", disk.Name)).Return([]byte(""), nil)
+ 
+ 		dependencies.On("ReadFile", "/sys/block/dm-2/dm/uuid").Return([]byte("LVM-Uq2y4MzaRpGE1XwVHSYDU5VAuHXXOA4gCkn9flYIZlS7UEfwlYPMyzHwx2R6VQoJ2\n"), nil)
+-		ret := GetDisks(&config.SubprocessConfig{}, dependencies)
++		ret := GetDisks(&config.InventoryConfig{}, dependencies)
+ 
+ 		Expect(ret).To(Equal([]*models.Disk{
+ 			{
+@@ -1273,7 +1273,7 @@ var _ = Describe("Disks test", func() {
+ 		mockGetWWNCallForSuccess(dependencies, make(map[string]string))
+ 		mockAllForSuccess(dependencies, dasdaDisk, dasdbDisk, dasdcDisk, dasddDisk, dasdeDisk, dasdfDisk)
+ 
+-		ret := GetDisks(&config.SubprocessConfig{}, dependencies)
++		ret := GetDisks(&config.InventoryConfig{}, dependencies)
+ 		Expect(ret).Should(HaveLen(6))
+ 		for _, disk := range ret {
+ 			if disk.Name == "dasda" {
+@@ -1292,7 +1292,7 @@ var _ = Describe("Disks test", func() {
+ 		Specify("GetDisk does not affect from failures while fetching the disk WWN - Read dir failed", func() {
+ 			mockReadDir(dependencies, "/dev/disk/by-id", "fetching the by-id disk failed")
+ 			mockAllForSuccess(dependencies, createSDADisk(), createSDBDisk())
+-			ret := GetDisks(&config.SubprocessConfig{}, dependencies)
++			ret := GetDisks(&config.InventoryConfig{}, dependencies)
+ 			Ω(ret).Should(HaveLen(2))
+ 
+ 			for _, disk := range ret {
+@@ -1319,7 +1319,7 @@ var _ = Describe("Disks test", func() {
+ 			})
+ 
+ 			mockAllForSuccess(dependencies, createSDADisk(), createSDBDisk())
+-			ret := GetDisks(&config.SubprocessConfig{}, dependencies)
++			ret := GetDisks(&config.InventoryConfig{}, dependencies)
+ 			Ω(ret).Should(HaveLen(2))
+ 
+ 			for _, disk := range ret {
+@@ -1350,7 +1350,7 @@ var _ = Describe("Disks test", func() {
+ 			})
+ 
+ 			mockAllForSuccess(dependencies, createSDADisk(), createSDBDisk())
+-			ret := GetDisks(&config.SubprocessConfig{}, dependencies)
++			ret := GetDisks(&config.InventoryConfig{}, dependencies)
+ 
+ 			Ω(ret).Should(HaveLen(2))
+ 
+@@ -1369,7 +1369,7 @@ var _ = Describe("Disks test", func() {
+ 			byidmapping["path"] = "id"
+ 			mockGetWWNCallForSuccess(dependencies, byidmapping)
+ 			mockAllForSuccess(dependencies, createSDADisk(), createSDBDisk())
+-			ret := GetDisks(&config.SubprocessConfig{}, dependencies)
++			ret := GetDisks(&config.InventoryConfig{}, dependencies)
+ 			Ω(ret).Should(HaveLen(2))
+ 
+ 			for _, disk := range ret {
+@@ -1380,7 +1380,7 @@ var _ = Describe("Disks test", func() {
+ 		It("Should have the by-id information", func() {
+ 			mockGetWWNCallForSuccess(dependencies, createWWNResults())
+ 			mockAllForSuccess(dependencies, createSDADisk())
+-			ret := GetDisks(&config.SubprocessConfig{}, dependencies)
++			ret := GetDisks(&config.InventoryConfig{}, dependencies)
+ 			Ω(ret).Should(HaveLen(1))
+ 			disk := ret[0]
+ 			Ω(disk.ByID).Should(Equal(sdaIdFullPath))
+@@ -1391,7 +1391,7 @@ var _ = Describe("Disks test", func() {
+ 			delete(results, sdbPath)
+ 			mockGetWWNCallForSuccess(dependencies, results)
+ 			mockAllForSuccess(dependencies, createSDADisk(), createSDBDisk())
+-			ret := GetDisks(&config.SubprocessConfig{}, dependencies)
++			ret := GetDisks(&config.InventoryConfig{}, dependencies)
+ 			Ω(ret).Should(HaveLen(2))
+ 
+ 			for _, disk := range ret {
+@@ -1406,7 +1406,7 @@ var _ = Describe("Disks test", func() {
+ 		It("Should have the by-id information for all the disks", func() {
+ 			mockGetWWNCallForSuccess(dependencies, createWWNResults())
+ 			mockAllForSuccess(dependencies, createSDADisk(), createSDBDisk())
+-			ret := GetDisks(&config.SubprocessConfig{}, dependencies)
++			ret := GetDisks(&config.InventoryConfig{}, dependencies)
+ 			Ω(ret).Should(HaveLen(2))
+ 
+ 			for _, disk := range ret {
+@@ -1424,7 +1424,7 @@ var _ = Describe("Disks test", func() {
+ 			byidmapping["/dev/nvme0n1"] = nvmeById
+ 			mockGetWWNCallForSuccess(dependencies, byidmapping)
+ 			mockAllForSuccess(dependencies, createNVMEDisk())
+-			ret := GetDisks(&config.SubprocessConfig{}, dependencies)
++			ret := GetDisks(&config.InventoryConfig{}, dependencies)
+ 			Ω(ret).Should(HaveLen(1))
+ 			disk := ret[0]
+ 			Ω(disk.ByID).Should(Equal(filepath.Join(devDiskByIdLocation, nvmeById)))
+@@ -1433,7 +1433,7 @@ var _ = Describe("Disks test", func() {
+ 		It("All the other fields are the same", func() {
+ 			mockGetWWNCallForSuccess(dependencies, createWWNResults())
+ 			mockAllForSuccess(dependencies, createSDADisk(), createSDBDisk())
+-			ret := GetDisks(&config.SubprocessConfig{}, dependencies)
++			ret := GetDisks(&config.InventoryConfig{}, dependencies)
+ 			Ω(ret).Should(HaveLen(2))
+ 			Expect(ret).Should(ConsistOf(createExpectedSDAModelDisk(), createExpectedSDBModelDisk()))
+ 		})
+@@ -1444,7 +1444,7 @@ var _ = Describe("Disks test", func() {
+ 			mockAllForSuccess(dependencies, sdaDisk)
+ 			remockGetByPath(dependencies, sdaDisk.BusPath, "Error")
+ 
+-			ret := GetDisks(&config.SubprocessConfig{}, dependencies)
++			ret := GetDisks(&config.InventoryConfig{}, dependencies)
+ 			Ω(ret).Should(HaveLen(1))
+ 			disk := ret[0]
+ 			Ω(disk.ByID).Should(BeEmpty())
+@@ -1454,7 +1454,7 @@ var _ = Describe("Disks test", func() {
+ 		It("Id equals to the disk by-path field", func() {
+ 			mockGetWWNCallForSuccess(dependencies, make(map[string]string))
+ 			mockAllForSuccess(dependencies, createSDADisk())
+-			ret := GetDisks(&config.SubprocessConfig{}, dependencies)
++			ret := GetDisks(&config.InventoryConfig{}, dependencies)
+ 			Ω(ret).Should(HaveLen(1))
+ 			disk := ret[0]
+ 			Ω(disk.ByID).Should(BeEmpty())
+@@ -1470,7 +1470,7 @@ var _ = Describe("Disks test", func() {
+ 			path := fmt.Sprintf("/dev/disk/by-path/%s", sda.BusPath)
+ 			util.DeleteExpectedMethod(&dependencies.Mock, "Stat", path)
+ 			util.DeleteExpectedMethod(&dependencies.Mock, "Stat", path)
+-			ret := GetDisks(&config.SubprocessConfig{}, dependencies)
++			ret := GetDisks(&config.InventoryConfig{}, dependencies)
+ 			Ω(ret).Should(HaveLen(2))
+ 			disk := ret[0]
+ 			Ω(disk.ByID).Should(BeEmpty())
+@@ -1503,7 +1503,7 @@ var _ = Describe("Disks test", func() {
+ 			},
+ 		}
+ 		mockAllForSuccess(dependencies, disk)
+-		disks := GetDisks(&config.SubprocessConfig{}, dependencies)
++		disks := GetDisks(&config.InventoryConfig{}, dependencies)
+ 		Expect(disks).To(HaveLen(1))
+ 		Expect(disks[0].InstallationEligibility.Eligible).To(BeFalse())
+ 		Expect(disks[0].InstallationEligibility.NotEligibleReasons).To(ContainElements(
+diff --git a/src/inventory/dry_inventory.go b/src/inventory/dry_inventory.go
+index 14b712973..eca4de803 100644
+--- a/src/inventory/dry_inventory.go
++++ b/src/inventory/dry_inventory.go
+@@ -7,15 +7,15 @@ import (
+ 	"github.com/openshift/assisted-service/models"
+ )
+ 
+-func applyDryRunConfig(subprocessConfig *config.SubprocessConfig, inventory *models.Inventory) {
++func applyDryRunConfig(inventoryConfig *config.InventoryConfig, inventory *models.Inventory) {
+ 	targetInterface, err := findRelevantInterface(inventory)
+ 	if err != nil {
+ 		return
+ 	}
+ 
+ 	// Override the mac address & IPv4 address to the user requested one
+-	inventory.Interfaces[targetInterface].MacAddress = subprocessConfig.ForcedMacAddress
+-	inventory.Interfaces[targetInterface].IPV4Addresses[0] = subprocessConfig.ForcedHostIPv4
++	inventory.Interfaces[targetInterface].MacAddress = inventoryConfig.ForcedMacAddress
++	inventory.Interfaces[targetInterface].IPV4Addresses[0] = inventoryConfig.ForcedHostIPv4
+ 
+ 	// Throw away other interfaces to avoid some exotic bugs relating to duplicate mac addreses from two different hosts
+ 	inventory.Interfaces = []*models.Interface{inventory.Interfaces[targetInterface]}
+diff --git a/src/inventory/gpu.go b/src/inventory/gpu.go
+index 741a4d401..ca64d6f66 100644
+--- a/src/inventory/gpu.go
++++ b/src/inventory/gpu.go
+@@ -104,7 +104,7 @@ func isSupportedModel(deviceID string) bool {
+ }
+ 
+ // GetGPUs discovers GPU devices on the system
+-func GetGPUs(subprocessConfig *config.SubprocessConfig, dependencies util.IDependencies) []*models.Gpu {
++func GetGPUs(inventoryConfig *config.InventoryConfig, dependencies util.IDependencies) []*models.Gpu {
+ 	gpus := make([]*models.Gpu, 0)
+ 
+ 	pciInfo, err := dependencies.PCI()
+@@ -113,7 +113,7 @@ func GetGPUs(subprocessConfig *config.SubprocessConfig, dependencies util.IDepen
+ 		return gpus
+ 	}
+ 
+-	supportedConfig, err = readGpuConfiguration(subprocessConfig.GPUConfigFile)
++	supportedConfig, err = readGpuConfiguration(inventoryConfig.GPUConfigFile)
+ 	if err != nil {
+ 		logrus.Warnf("Error getting GPU configuration: %s", err)
+ 		logrus.Info("Using default GPU discovery configuration")
+diff --git a/src/inventory/gpu_test.go b/src/inventory/gpu_test.go
+index ca9cc873e..15090f1de 100644
+--- a/src/inventory/gpu_test.go
++++ b/src/inventory/gpu_test.go
+@@ -155,11 +155,11 @@ var (
+ var _ = Describe("GPUs information discovery", func() {
+ 
+ 	var dependencies *util.MockIDependencies
+-	var subprocessConfig *config.SubprocessConfig
++	var inventoryConfig *config.InventoryConfig
+ 
+ 	BeforeEach(func() {
+ 		dependencies = newDependenciesMock()
+-		subprocessConfig = &config.SubprocessConfig{}
++		inventoryConfig = &config.InventoryConfig{}
+ 	})
+ 
+ 	AfterEach(func() {
+@@ -169,7 +169,7 @@ var _ = Describe("GPUs information discovery", func() {
+ 	It("should load information about one GPU", func() {
+ 		dependencies.On("PCI").Return(&ghw.PCIInfo{Devices: []*ghw.PCIDevice{&card1}}, nil).Once()
+ 
+-		gpus := GetGPUs(subprocessConfig, dependencies)
++		gpus := GetGPUs(inventoryConfig, dependencies)
+ 
+ 		Expect(gpus).ToNot(BeNil())
+ 		Expect(gpus).To(ConsistOf(&gpu1))
+@@ -178,7 +178,7 @@ var _ = Describe("GPUs information discovery", func() {
+ 	It("should load information about multiple GPUs", func() {
+ 		dependencies.On("PCI").Return(&ghw.PCIInfo{Devices: []*ghw.PCIDevice{&card1, &card2, &card3, &card4}}, nil).Once()
+ 
+-		gpus := GetGPUs(subprocessConfig, dependencies)
++		gpus := GetGPUs(inventoryConfig, dependencies)
+ 
+ 		Expect(gpus).ToNot(BeNil())
+ 		Expect(gpus).To(ConsistOf(&gpu1, &gpu2, &gpu3, &gpu4))
+@@ -197,8 +197,8 @@ var _ = Describe("GPUs information discovery", func() {
+ 		Expect(err).NotTo(HaveOccurred())
+ 		tmpFile.Close()
+ 
+-		subprocessConfig.GPUConfigFile = tmpFile.Name()
+-		gpus := GetGPUs(subprocessConfig, dependencies)
++		inventoryConfig.GPUConfigFile = tmpFile.Name()
++		gpus := GetGPUs(inventoryConfig, dependencies)
+ 
+ 		Expect(gpus).ToNot(BeNil())
+ 		Expect(gpus).To(ConsistOf(&gpu3))
+@@ -217,8 +217,8 @@ var _ = Describe("GPUs information discovery", func() {
+ 		Expect(err).NotTo(HaveOccurred())
+ 		tmpFile.Close()
+ 
+-		subprocessConfig.GPUConfigFile = tmpFile.Name()
+-		gpus := GetGPUs(subprocessConfig, dependencies)
++		inventoryConfig.GPUConfigFile = tmpFile.Name()
++		gpus := GetGPUs(inventoryConfig, dependencies)
+ 
+ 		Expect(gpus).ToNot(BeNil())
+ 		Expect(gpus).To(ConsistOf(&gpu2))
+@@ -229,7 +229,7 @@ var _ = Describe("GPUs information discovery", func() {
+ 	It("should detect PCI cards con several functions", func() {
+ 		dependencies.On("PCI").Return(&ghw.PCIInfo{Devices: []*ghw.PCIDevice{&card1, &card2, &card3, &card3a}}, nil).Once()
+ 
+-		gpus := GetGPUs(subprocessConfig, dependencies)
++		gpus := GetGPUs(inventoryConfig, dependencies)
+ 
+ 		Expect(gpus).ToNot(BeNil())
+ 		Expect(gpus).To(ConsistOf(&gpu1, &gpu2, &gpu3, &gpu3a))
+@@ -238,7 +238,7 @@ var _ = Describe("GPUs information discovery", func() {
+ 	It("should handle error gracefully", func() {
+ 		dependencies.On("PCI").Return(nil, errors.New("boom")).Once()
+ 
+-		gpus := GetGPUs(subprocessConfig, dependencies)
++		gpus := GetGPUs(inventoryConfig, dependencies)
+ 
+ 		Expect(gpus).ToNot(BeNil())
+ 		Expect(gpus).To(BeEmpty())
+diff --git a/src/inventory/inventory.go b/src/inventory/inventory.go
+index ae9e36df7..e2d5626a9 100644
+--- a/src/inventory/inventory.go
++++ b/src/inventory/inventory.go
+@@ -13,15 +13,15 @@ import (
+ 	"github.com/sirupsen/logrus"
+ )
+ 
+-func ReadInventory(subprocessConfig *config.SubprocessConfig, c *Options) *models.Inventory {
+-	d := util.NewDependencies(&subprocessConfig.DryRunConfig, c.GhwChrootRoot)
++func ReadInventory(inventoryConfig *config.InventoryConfig, c *Options) *models.Inventory {
++	d := util.NewDependencies(&inventoryConfig.DryRunConfig, c.GhwChrootRoot)
+ 	ret := models.Inventory{
+-		BmcAddress:   GetBmcAddress(subprocessConfig, d),
+-		BmcV6address: GetBmcV6Address(subprocessConfig, d),
++		BmcAddress:   GetBmcAddress(inventoryConfig, d),
++		BmcV6address: GetBmcV6Address(inventoryConfig, d),
+ 		Boot:         GetBoot(d),
+ 		CPU:          GetCPU(d),
+-		Disks:        GetDisks(subprocessConfig, d),
+-		Gpus:         GetGPUs(subprocessConfig, d),
++		Disks:        GetDisks(inventoryConfig, d),
++		Gpus:         GetGPUs(inventoryConfig, d),
+ 		Hostname:     GetHostname(d),
+ 		Interfaces:   GetInterfaces(d),
+ 		Memory:       GetMemory(d),
+@@ -33,11 +33,11 @@ func ReadInventory(subprocessConfig *config.SubprocessConfig, c *Options) *model
+ 	return &ret
+ }
+ 
+-func CreateInventoryInfo(subprocessConfig *config.SubprocessConfig) []byte {
+-	in := ReadInventory(subprocessConfig, &Options{GhwChrootRoot: "/host"})
++func CreateInventoryInfo(inventoryConfig *config.InventoryConfig) []byte {
++	in := ReadInventory(inventoryConfig, &Options{GhwChrootRoot: "/host"})
+ 
+-	if subprocessConfig.DryRunEnabled {
+-		applyDryRunConfig(subprocessConfig, in)
++	if inventoryConfig.DryRunEnabled {
++		applyDryRunConfig(inventoryConfig, in)
+ 	}
+ 
+ 	b, _ := json.Marshal(&in)
+diff --git a/src/inventory/main.go b/src/inventory/main.go
+index 8fab4c58b..88522042e 100644
+--- a/src/inventory/main.go
++++ b/src/inventory/main.go
+@@ -8,8 +8,7 @@ import (
+ )
+ 
+ func Main() {
+-	subprocessConfig := config.ProcessSubprocessArgs(config.DefaultLoggingConfig)
+-	config.ProcessDryRunArgs(&subprocessConfig.DryRunConfig)
+-	util.SetLogging("inventory", subprocessConfig.TextLogging, subprocessConfig.JournalLogging, subprocessConfig.StdoutLogging, subprocessConfig.ForcedHostID)
+-	fmt.Print(string(CreateInventoryInfo(subprocessConfig)))
++	inventoryConfig := config.ProcessInventoryConfigArgs()
++	util.SetLogging("inventory", inventoryConfig.TextLogging, inventoryConfig.JournalLogging, inventoryConfig.StdoutLogging, inventoryConfig.ForcedHostID)
++	fmt.Print(string(CreateInventoryInfo(inventoryConfig)))
+ }
+diff --git a/src/logs_sender/main.go b/src/logs_sender/main.go
+index 87225ed3c..c2548791c 100644
+--- a/src/logs_sender/main.go
++++ b/src/logs_sender/main.go
+@@ -10,7 +10,6 @@ import (
+ 
+ func Main() {
+ 	loggingConfig := config.ProcessLogsSenderConfigArgs(true, true)
+-	config.ProcessDryRunArgs(&loggingConfig.DryRunConfig)
+ 	util.SetLogging("logs-sender", loggingConfig.TextLogging, loggingConfig.JournalLogging, loggingConfig.StdoutLogging, loggingConfig.ForcedHostID)
+ 	err, report := SendLogs(loggingConfig, NewLogsSenderExecuter(loggingConfig, loggingConfig.TargetURL,
+ 		loggingConfig.PullSecretToken,
+diff --git a/src/next_step_runner/main.go b/src/next_step_runner/main.go
+index d903e77ee..6fe6cd6bd 100644
+--- a/src/next_step_runner/main.go
++++ b/src/next_step_runner/main.go
+@@ -13,7 +13,6 @@ import (
+ 
+ func Main() {
+ 	agentConfig := config.ProcessArgs()
+-	config.ProcessDryRunArgs(&agentConfig.DryRunConfig)
+ 	util.SetLogging("agent_next_step_runner", agentConfig.TextLogging, agentConfig.JournalLogging, agentConfig.StdoutLogging, agentConfig.ForcedHostID)
+ 
+ 	ctx := context.Background()
+diff --git a/src/ntp_synchronizer/main/main.go b/src/ntp_synchronizer/main/main.go
+index c368b6ea5..3adcef36c 100644
+--- a/src/ntp_synchronizer/main/main.go
++++ b/src/ntp_synchronizer/main/main.go
+@@ -16,8 +16,7 @@ func DryRunNtp() (string, string, int) {
+ }
+ 
+ func main() {
+-	subprocessConfig := config.ProcessSubprocessArgs(config.DefaultLoggingConfig)
+-	config.ProcessDryRunArgs(&subprocessConfig.DryRunConfig)
++	subprocessConfig := config.ProcessSubprocessArgs()
+ 	util.SetLogging("ntp_synchronizer", subprocessConfig.TextLogging, subprocessConfig.JournalLogging, subprocessConfig.StdoutLogging, subprocessConfig.ForcedHostID)
+ 	if flag.NArg() != 1 {
+ 		log.Fatalf("Expecting exactly single argument to ntp_synchronizer. Received %d", len(os.Args)-1)

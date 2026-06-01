@@ -1,0 +1,1734 @@
+diff --git a/api/hypershift/v1beta1/gcp.go b/api/hypershift/v1beta1/gcp.go
+index e4ec6cac96d..ea22d5ea433 100644
+--- a/api/hypershift/v1beta1/gcp.go
++++ b/api/hypershift/v1beta1/gcp.go
+@@ -105,6 +105,7 @@ type GCPNetworkConfig struct {
+ // +kubebuilder:validation:XValidation:rule="self.workloadIdentity.serviceAccountsEmails.cloudController.contains('@') && self.workloadIdentity.serviceAccountsEmails.cloudController.endsWith('@' + self.project + '.iam.gserviceaccount.com')",message="cloudController service account must belong to the same project"
+ // +kubebuilder:validation:XValidation:rule="self.workloadIdentity.serviceAccountsEmails.storage.contains('@') && self.workloadIdentity.serviceAccountsEmails.storage.endsWith('@' + self.project + '.iam.gserviceaccount.com')",message="storage service account must belong to the same project"
+ // +kubebuilder:validation:XValidation:rule="self.workloadIdentity.serviceAccountsEmails.imageRegistry.contains('@') && self.workloadIdentity.serviceAccountsEmails.imageRegistry.endsWith('@' + self.project + '.iam.gserviceaccount.com')",message="imageRegistry service account must belong to the same project"
++// +kubebuilder:validation:XValidation:rule="self.workloadIdentity.serviceAccountsEmails.network.endsWith('@' + self.project + '.iam.gserviceaccount.com')",message="network service account must belong to the same project"
+ type GCPPlatformSpec struct {
+ 	// project is the GCP project ID.
+ 	// A valid project ID must satisfy the following rules:
+@@ -357,6 +358,22 @@ type GCPServiceAccountsEmails struct {
+ 	// +immutable
+ 	// +kubebuilder:validation:XValidation:rule="self == oldSelf",message="ImageRegistry is immutable"
+ 	ImageRegistry GCPServiceAccountEmail `json:"imageRegistry,omitempty"`
++
++	// network is the Google Service Account email for the Cloud Network Config Controller
++	// that manages cloud-level network configurations (egress IPs, subnets).
++	// This GSA requires the following IAM roles:
++	// - roles/compute.instanceAdmin.v1 (Compute Instance Admin - for managing network interfaces)
++	// - roles/compute.networkUser (Compute Network User - for using subnets)
++	// See cmd/infra/gcp/iam-bindings.json for the authoritative role definitions.
++	// Format: service-account-name@project-id.iam.gserviceaccount.com
++	//
++	// This is a user-provided value referencing a pre-created Google Service Account.
++	// Typically obtained from the output of `hypershift infra create gcp` which creates
++	// the required service accounts with appropriate IAM roles and WIF bindings.
++	//
++	// +required
++	// +kubebuilder:validation:XValidation:rule="self == oldSelf",message="Network is immutable"
++	Network GCPServiceAccountEmail `json:"network,omitempty"`
+ }
+ 
+ // GCPOnHostMaintenance defines the behavior when a host maintenance event occurs.
+diff --git a/api/hypershift/v1beta1/zz_generated.featuregated-crd-manifests/hostedclusters.hypershift.openshift.io/GCPPlatform.yaml b/api/hypershift/v1beta1/zz_generated.featuregated-crd-manifests/hostedclusters.hypershift.openshift.io/GCPPlatform.yaml
+index 6c6fdc61639..551a58fd76f 100644
+--- a/api/hypershift/v1beta1/zz_generated.featuregated-crd-manifests/hostedclusters.hypershift.openshift.io/GCPPlatform.yaml
++++ b/api/hypershift/v1beta1/zz_generated.featuregated-crd-manifests/hostedclusters.hypershift.openshift.io/GCPPlatform.yaml
+@@ -5515,6 +5515,28 @@ spec:
+                                 - message: 'email must be a valid GCP service account
+                                     email (format: name@project.iam.gserviceaccount.com)'
+                                   rule: self.matches('^[a-z][a-z0-9-]{4,28}[a-z0-9]@[a-z][a-z0-9-]{4,28}[a-z0-9]\\.iam\\.gserviceaccount\\.com$')
++                              network:
++                                description: |-
++                                  network is the Google Service Account email for the Cloud Network Config Controller
++                                  that manages cloud-level network configurations (egress IPs, subnets).
++                                  This GSA requires the following IAM roles:
++                                  - roles/compute.instanceAdmin.v1 (Compute Instance Admin - for managing network interfaces)
++                                  - roles/compute.networkUser (Compute Network User - for using subnets)
++                                  See cmd/infra/gcp/iam-bindings.json for the authoritative role definitions.
++                                  Format: service-account-name@project-id.iam.gserviceaccount.com
++
++                                  This is a user-provided value referencing a pre-created Google Service Account.
++                                  Typically obtained from the output of `hypershift infra create gcp` which creates
++                                  the required service accounts with appropriate IAM roles and WIF bindings.
++                                maxLength: 85
++                                minLength: 37
++                                type: string
++                                x-kubernetes-validations:
++                                - message: Network is immutable
++                                  rule: self == oldSelf
++                                - message: 'email must be a valid GCP service account
++                                    email (format: name@project.iam.gserviceaccount.com)'
++                                  rule: self.matches('^[a-z][a-z0-9-]{4,28}[a-z0-9]@[a-z][a-z0-9-]{4,28}[a-z0-9]\\.iam\\.gserviceaccount\\.com$')
+                               nodePool:
+                                 description: |-
+                                   nodePool is the Google Service Account email for CAPG controllers
+@@ -5566,6 +5588,7 @@ spec:
+                             - cloudController
+                             - controlPlane
+                             - imageRegistry
++                            - network
+                             - nodePool
+                             - storage
+                             type: object
+@@ -5608,6 +5631,9 @@ spec:
+                       rule: self.workloadIdentity.serviceAccountsEmails.imageRegistry.contains('@')
+                         && self.workloadIdentity.serviceAccountsEmails.imageRegistry.endsWith('@'
+                         + self.project + '.iam.gserviceaccount.com')
++                    - message: network service account must belong to the same project
++                      rule: self.workloadIdentity.serviceAccountsEmails.network.endsWith('@'
++                        + self.project + '.iam.gserviceaccount.com')
+                   ibmcloud:
+                     description: ibmcloud defines IBMCloud specific settings for components
+                     properties:
+diff --git a/api/hypershift/v1beta1/zz_generated.featuregated-crd-manifests/hostedcontrolplanes.hypershift.openshift.io/GCPPlatform.yaml b/api/hypershift/v1beta1/zz_generated.featuregated-crd-manifests/hostedcontrolplanes.hypershift.openshift.io/GCPPlatform.yaml
+index c859a25b2c1..8fef1acc67d 100644
+--- a/api/hypershift/v1beta1/zz_generated.featuregated-crd-manifests/hostedcontrolplanes.hypershift.openshift.io/GCPPlatform.yaml
++++ b/api/hypershift/v1beta1/zz_generated.featuregated-crd-manifests/hostedcontrolplanes.hypershift.openshift.io/GCPPlatform.yaml
+@@ -5393,6 +5393,28 @@ spec:
+                                 - message: 'email must be a valid GCP service account
+                                     email (format: name@project.iam.gserviceaccount.com)'
+                                   rule: self.matches('^[a-z][a-z0-9-]{4,28}[a-z0-9]@[a-z][a-z0-9-]{4,28}[a-z0-9]\\.iam\\.gserviceaccount\\.com$')
++                              network:
++                                description: |-
++                                  network is the Google Service Account email for the Cloud Network Config Controller
++                                  that manages cloud-level network configurations (egress IPs, subnets).
++                                  This GSA requires the following IAM roles:
++                                  - roles/compute.instanceAdmin.v1 (Compute Instance Admin - for managing network interfaces)
++                                  - roles/compute.networkUser (Compute Network User - for using subnets)
++                                  See cmd/infra/gcp/iam-bindings.json for the authoritative role definitions.
++                                  Format: service-account-name@project-id.iam.gserviceaccount.com
++
++                                  This is a user-provided value referencing a pre-created Google Service Account.
++                                  Typically obtained from the output of `hypershift infra create gcp` which creates
++                                  the required service accounts with appropriate IAM roles and WIF bindings.
++                                maxLength: 85
++                                minLength: 37
++                                type: string
++                                x-kubernetes-validations:
++                                - message: Network is immutable
++                                  rule: self == oldSelf
++                                - message: 'email must be a valid GCP service account
++                                    email (format: name@project.iam.gserviceaccount.com)'
++                                  rule: self.matches('^[a-z][a-z0-9-]{4,28}[a-z0-9]@[a-z][a-z0-9-]{4,28}[a-z0-9]\\.iam\\.gserviceaccount\\.com$')
+                               nodePool:
+                                 description: |-
+                                   nodePool is the Google Service Account email for CAPG controllers
+@@ -5444,6 +5466,7 @@ spec:
+                             - cloudController
+                             - controlPlane
+                             - imageRegistry
++                            - network
+                             - nodePool
+                             - storage
+                             type: object
+@@ -5486,6 +5509,9 @@ spec:
+                       rule: self.workloadIdentity.serviceAccountsEmails.imageRegistry.contains('@')
+                         && self.workloadIdentity.serviceAccountsEmails.imageRegistry.endsWith('@'
+                         + self.project + '.iam.gserviceaccount.com')
++                    - message: network service account must belong to the same project
++                      rule: self.workloadIdentity.serviceAccountsEmails.network.endsWith('@'
++                        + self.project + '.iam.gserviceaccount.com')
+                   ibmcloud:
+                     description: ibmcloud defines IBMCloud specific settings for components
+                     properties:
+diff --git a/client/applyconfiguration/hypershift/v1beta1/gcpserviceaccountsemails.go b/client/applyconfiguration/hypershift/v1beta1/gcpserviceaccountsemails.go
+index 7e906aa004a..4a56a638163 100644
+--- a/client/applyconfiguration/hypershift/v1beta1/gcpserviceaccountsemails.go
++++ b/client/applyconfiguration/hypershift/v1beta1/gcpserviceaccountsemails.go
+@@ -29,6 +29,7 @@ type GCPServiceAccountsEmailsApplyConfiguration struct {
+ 	CloudController *hypershiftv1beta1.GCPServiceAccountEmail `json:"cloudController,omitempty"`
+ 	Storage         *hypershiftv1beta1.GCPServiceAccountEmail `json:"storage,omitempty"`
+ 	ImageRegistry   *hypershiftv1beta1.GCPServiceAccountEmail `json:"imageRegistry,omitempty"`
++	Network         *hypershiftv1beta1.GCPServiceAccountEmail `json:"network,omitempty"`
+ }
+ 
+ // GCPServiceAccountsEmailsApplyConfiguration constructs a declarative configuration of the GCPServiceAccountsEmails type for use with
+@@ -76,3 +77,11 @@ func (b *GCPServiceAccountsEmailsApplyConfiguration) WithImageRegistry(value hyp
+ 	b.ImageRegistry = &value
+ 	return b
+ }
++
++// WithNetwork sets the Network field in the declarative configuration to the given value
++// and returns the receiver, so that objects can be built by chaining "With" function invocations.
++// If called multiple times, the Network field is set to the value of the last call.
++func (b *GCPServiceAccountsEmailsApplyConfiguration) WithNetwork(value hypershiftv1beta1.GCPServiceAccountEmail) *GCPServiceAccountsEmailsApplyConfiguration {
++	b.Network = &value
++	return b
++}
+diff --git a/cmd/cluster/gcp/create.go b/cmd/cluster/gcp/create.go
+index f45d0138f60..c527a28a832 100644
+--- a/cmd/cluster/gcp/create.go
++++ b/cmd/cluster/gcp/create.go
+@@ -36,6 +36,7 @@ const (
+ 	flagCloudControllerServiceAccount = "cloud-controller-service-account"
+ 	flagStorageServiceAccount         = "storage-service-account"
+ 	flagImageRegistryServiceAccount   = "image-registry-service-account"
++	flagNetworkServiceAccount         = "network-service-account"
+ 	flagServiceAccountSigningKeyPath  = "service-account-signing-key-path"
+ 	flagEndpointAccess                = "endpoint-access"
+ 	flagIssuerURL                     = "oidc-issuer-url"
+@@ -83,6 +84,9 @@ type RawCreateOptions struct {
+ 	// ImageRegistryServiceAccount is the Google Service Account email for the Image Registry Operator
+ 	ImageRegistryServiceAccount string
+ 
++	// NetworkServiceAccount is the Google Service Account email for the Cloud Network Config Controller
++	NetworkServiceAccount string
++
+ 	// ServiceAccountSigningKeyPath is the path to the private key file for the service account token issuer
+ 	ServiceAccountSigningKeyPath string
+ 
+@@ -119,6 +123,7 @@ func BindOptions(opts *RawCreateOptions, flags *pflag.FlagSet) {
+ 	flags.StringVar(&opts.CloudControllerServiceAccount, flagCloudControllerServiceAccount, opts.CloudControllerServiceAccount, "Google Service Account email for Cloud Controller Manager (from `hypershift create iam gcp` output)")
+ 	flags.StringVar(&opts.StorageServiceAccount, flagStorageServiceAccount, opts.StorageServiceAccount, "Google Service Account email for GCP PD CSI Driver (from `hypershift create iam gcp` output)")
+ 	flags.StringVar(&opts.ImageRegistryServiceAccount, flagImageRegistryServiceAccount, opts.ImageRegistryServiceAccount, "Google Service Account email for Image Registry Operator (from `hypershift create iam gcp` output)")
++	flags.StringVar(&opts.NetworkServiceAccount, flagNetworkServiceAccount, opts.NetworkServiceAccount, "Google Service Account email for Cloud Network Config Controller (from `hypershift create iam gcp` output)")
+ 	flags.StringVar(&opts.ServiceAccountSigningKeyPath, flagServiceAccountSigningKeyPath, "", "The file to the private key for the service account token issuer")
+ 	flags.StringVar(&opts.EndpointAccess, flagEndpointAccess, string(hyperv1.GCPEndpointAccessPrivate), "Endpoint access type (Private or PublicAndPrivate)")
+ 	flags.StringVar(&opts.IssuerURL, flagIssuerURL, "", "The OIDC provider issuer URL")
+@@ -178,6 +183,9 @@ func (o *RawCreateOptions) Validate(_ context.Context, _ *core.CreateOptions) (c
+ 	if err := util.ValidateRequiredOption(flagImageRegistryServiceAccount, o.ImageRegistryServiceAccount); err != nil {
+ 		return nil, err
+ 	}
++	if err := util.ValidateRequiredOption(flagNetworkServiceAccount, o.NetworkServiceAccount); err != nil {
++		return nil, err
++	}
+ 	return &ValidatedCreateOptions{
+ 		validatedCreateOptions: &validatedCreateOptions{
+ 			RawCreateOptions: o,
+@@ -283,6 +291,7 @@ func (o *CreateOptions) ApplyPlatformSpecifics(hostedCluster *hyperv1.HostedClus
+ 				CloudController: hyperv1.GCPServiceAccountEmail(o.CloudControllerServiceAccount),
+ 				Storage:         hyperv1.GCPServiceAccountEmail(o.StorageServiceAccount),
+ 				ImageRegistry:   hyperv1.GCPServiceAccountEmail(o.ImageRegistryServiceAccount),
++				Network:         hyperv1.GCPServiceAccountEmail(o.NetworkServiceAccount),
+ 			},
+ 		},
+ 		EndpointAccess: hyperv1.GCPEndpointAccessType(o.EndpointAccess),
+diff --git a/cmd/cluster/gcp/create_test.go b/cmd/cluster/gcp/create_test.go
+index ac8ab8f4d5e..2720c446fc1 100644
+--- a/cmd/cluster/gcp/create_test.go
++++ b/cmd/cluster/gcp/create_test.go
+@@ -39,6 +39,7 @@ func TestCreateOptionsApplyPlatformSpecifics(t *testing.T) {
+ 						CloudControllerServiceAccount: "cloudcontroller@test-project-123.iam.gserviceaccount.com",
+ 						StorageServiceAccount:         "storage@test-project-123.iam.gserviceaccount.com",
+ 						ImageRegistryServiceAccount:   "imageregistry@test-project-123.iam.gserviceaccount.com",
++						NetworkServiceAccount:         "network@test-project-123.iam.gserviceaccount.com",
+ 					},
+ 				},
+ 			},
+@@ -63,6 +64,7 @@ func TestCreateOptionsApplyPlatformSpecifics(t *testing.T) {
+ 	g.Expect(hostedCluster.Spec.Platform.GCP.WorkloadIdentity.ServiceAccountsEmails.CloudController).To(Equal(hyperv1.GCPServiceAccountEmail("cloudcontroller@test-project-123.iam.gserviceaccount.com")))
+ 	g.Expect(hostedCluster.Spec.Platform.GCP.WorkloadIdentity.ServiceAccountsEmails.Storage).To(Equal(hyperv1.GCPServiceAccountEmail("storage@test-project-123.iam.gserviceaccount.com")))
+ 	g.Expect(hostedCluster.Spec.Platform.GCP.WorkloadIdentity.ServiceAccountsEmails.ImageRegistry).To(Equal(hyperv1.GCPServiceAccountEmail("imageregistry@test-project-123.iam.gserviceaccount.com")))
++	g.Expect(hostedCluster.Spec.Platform.GCP.WorkloadIdentity.ServiceAccountsEmails.Network).To(Equal(hyperv1.GCPServiceAccountEmail("network@test-project-123.iam.gserviceaccount.com")))
+ }
+ 
+ func TestValidateGCPOptions(t *testing.T) {
+@@ -81,6 +83,7 @@ func TestValidateGCPOptions(t *testing.T) {
+ 		CloudControllerServiceAccount: "cloudcontroller@test-project-123.iam.gserviceaccount.com",
+ 		StorageServiceAccount:         "storage@test-project-123.iam.gserviceaccount.com",
+ 		ImageRegistryServiceAccount:   "imageregistry@test-project-123.iam.gserviceaccount.com",
++		NetworkServiceAccount:         "network@test-project-123.iam.gserviceaccount.com",
+ 	}
+ 
+ 	tests := map[string]struct {
+@@ -89,35 +92,40 @@ func TestValidateGCPOptions(t *testing.T) {
+ 		expectSubstr string
+ 	}{
+ 		"missing project": {
+-			opts:         RawCreateOptions{Region: validOpts.Region, Network: validOpts.Network, PrivateServiceConnectSubnet: validOpts.PrivateServiceConnectSubnet, WorkloadIdentityProjectNumber: validOpts.WorkloadIdentityProjectNumber, WorkloadIdentityPoolID: validOpts.WorkloadIdentityPoolID, WorkloadIdentityProviderID: validOpts.WorkloadIdentityProviderID, NodePoolServiceAccount: validOpts.NodePoolServiceAccount, ControlPlaneServiceAccount: validOpts.ControlPlaneServiceAccount, CloudControllerServiceAccount: validOpts.CloudControllerServiceAccount, StorageServiceAccount: validOpts.StorageServiceAccount, ImageRegistryServiceAccount: validOpts.ImageRegistryServiceAccount},
++			opts:         RawCreateOptions{Region: validOpts.Region, Network: validOpts.Network, PrivateServiceConnectSubnet: validOpts.PrivateServiceConnectSubnet, WorkloadIdentityProjectNumber: validOpts.WorkloadIdentityProjectNumber, WorkloadIdentityPoolID: validOpts.WorkloadIdentityPoolID, WorkloadIdentityProviderID: validOpts.WorkloadIdentityProviderID, NodePoolServiceAccount: validOpts.NodePoolServiceAccount, ControlPlaneServiceAccount: validOpts.ControlPlaneServiceAccount, CloudControllerServiceAccount: validOpts.CloudControllerServiceAccount, StorageServiceAccount: validOpts.StorageServiceAccount, ImageRegistryServiceAccount: validOpts.ImageRegistryServiceAccount, NetworkServiceAccount: validOpts.NetworkServiceAccount},
+ 			expectErr:    true,
+ 			expectSubstr: "required flag(s) \"project\" not set",
+ 		},
+ 		"missing region": {
+-			opts:         RawCreateOptions{Project: validOpts.Project, Network: validOpts.Network, PrivateServiceConnectSubnet: validOpts.PrivateServiceConnectSubnet, WorkloadIdentityProjectNumber: validOpts.WorkloadIdentityProjectNumber, WorkloadIdentityPoolID: validOpts.WorkloadIdentityPoolID, WorkloadIdentityProviderID: validOpts.WorkloadIdentityProviderID, NodePoolServiceAccount: validOpts.NodePoolServiceAccount, ControlPlaneServiceAccount: validOpts.ControlPlaneServiceAccount, CloudControllerServiceAccount: validOpts.CloudControllerServiceAccount, StorageServiceAccount: validOpts.StorageServiceAccount, ImageRegistryServiceAccount: validOpts.ImageRegistryServiceAccount},
++			opts:         RawCreateOptions{Project: validOpts.Project, Network: validOpts.Network, PrivateServiceConnectSubnet: validOpts.PrivateServiceConnectSubnet, WorkloadIdentityProjectNumber: validOpts.WorkloadIdentityProjectNumber, WorkloadIdentityPoolID: validOpts.WorkloadIdentityPoolID, WorkloadIdentityProviderID: validOpts.WorkloadIdentityProviderID, NodePoolServiceAccount: validOpts.NodePoolServiceAccount, ControlPlaneServiceAccount: validOpts.ControlPlaneServiceAccount, CloudControllerServiceAccount: validOpts.CloudControllerServiceAccount, StorageServiceAccount: validOpts.StorageServiceAccount, ImageRegistryServiceAccount: validOpts.ImageRegistryServiceAccount, NetworkServiceAccount: validOpts.NetworkServiceAccount},
+ 			expectErr:    true,
+ 			expectSubstr: "required flag(s) \"region\" not set",
+ 		},
+ 		"missing network": {
+-			opts:         RawCreateOptions{Project: validOpts.Project, Region: validOpts.Region, PrivateServiceConnectSubnet: validOpts.PrivateServiceConnectSubnet, WorkloadIdentityProjectNumber: validOpts.WorkloadIdentityProjectNumber, WorkloadIdentityPoolID: validOpts.WorkloadIdentityPoolID, WorkloadIdentityProviderID: validOpts.WorkloadIdentityProviderID, NodePoolServiceAccount: validOpts.NodePoolServiceAccount, ControlPlaneServiceAccount: validOpts.ControlPlaneServiceAccount, CloudControllerServiceAccount: validOpts.CloudControllerServiceAccount, StorageServiceAccount: validOpts.StorageServiceAccount, ImageRegistryServiceAccount: validOpts.ImageRegistryServiceAccount},
++			opts:         RawCreateOptions{Project: validOpts.Project, Region: validOpts.Region, PrivateServiceConnectSubnet: validOpts.PrivateServiceConnectSubnet, WorkloadIdentityProjectNumber: validOpts.WorkloadIdentityProjectNumber, WorkloadIdentityPoolID: validOpts.WorkloadIdentityPoolID, WorkloadIdentityProviderID: validOpts.WorkloadIdentityProviderID, NodePoolServiceAccount: validOpts.NodePoolServiceAccount, ControlPlaneServiceAccount: validOpts.ControlPlaneServiceAccount, CloudControllerServiceAccount: validOpts.CloudControllerServiceAccount, StorageServiceAccount: validOpts.StorageServiceAccount, ImageRegistryServiceAccount: validOpts.ImageRegistryServiceAccount, NetworkServiceAccount: validOpts.NetworkServiceAccount},
+ 			expectErr:    true,
+ 			expectSubstr: "required flag(s) \"network\" not set",
+ 		},
+ 		"missing cloud-controller-service-account": {
+-			opts:         RawCreateOptions{Project: validOpts.Project, Region: validOpts.Region, Network: validOpts.Network, PrivateServiceConnectSubnet: validOpts.PrivateServiceConnectSubnet, WorkloadIdentityProjectNumber: validOpts.WorkloadIdentityProjectNumber, WorkloadIdentityPoolID: validOpts.WorkloadIdentityPoolID, WorkloadIdentityProviderID: validOpts.WorkloadIdentityProviderID, NodePoolServiceAccount: validOpts.NodePoolServiceAccount, ControlPlaneServiceAccount: validOpts.ControlPlaneServiceAccount, StorageServiceAccount: validOpts.StorageServiceAccount, ImageRegistryServiceAccount: validOpts.ImageRegistryServiceAccount},
++			opts:         RawCreateOptions{Project: validOpts.Project, Region: validOpts.Region, Network: validOpts.Network, PrivateServiceConnectSubnet: validOpts.PrivateServiceConnectSubnet, WorkloadIdentityProjectNumber: validOpts.WorkloadIdentityProjectNumber, WorkloadIdentityPoolID: validOpts.WorkloadIdentityPoolID, WorkloadIdentityProviderID: validOpts.WorkloadIdentityProviderID, NodePoolServiceAccount: validOpts.NodePoolServiceAccount, ControlPlaneServiceAccount: validOpts.ControlPlaneServiceAccount, StorageServiceAccount: validOpts.StorageServiceAccount, ImageRegistryServiceAccount: validOpts.ImageRegistryServiceAccount, NetworkServiceAccount: validOpts.NetworkServiceAccount},
+ 			expectErr:    true,
+ 			expectSubstr: "required flag(s) \"cloud-controller-service-account\" not set",
+ 		},
+ 		"missing storage service account": {
+-			opts:         RawCreateOptions{Project: validOpts.Project, Region: validOpts.Region, Network: validOpts.Network, PrivateServiceConnectSubnet: validOpts.PrivateServiceConnectSubnet, WorkloadIdentityProjectNumber: validOpts.WorkloadIdentityProjectNumber, WorkloadIdentityPoolID: validOpts.WorkloadIdentityPoolID, WorkloadIdentityProviderID: validOpts.WorkloadIdentityProviderID, NodePoolServiceAccount: validOpts.NodePoolServiceAccount, ControlPlaneServiceAccount: validOpts.ControlPlaneServiceAccount, CloudControllerServiceAccount: validOpts.CloudControllerServiceAccount, ImageRegistryServiceAccount: validOpts.ImageRegistryServiceAccount},
++			opts:         RawCreateOptions{Project: validOpts.Project, Region: validOpts.Region, Network: validOpts.Network, PrivateServiceConnectSubnet: validOpts.PrivateServiceConnectSubnet, WorkloadIdentityProjectNumber: validOpts.WorkloadIdentityProjectNumber, WorkloadIdentityPoolID: validOpts.WorkloadIdentityPoolID, WorkloadIdentityProviderID: validOpts.WorkloadIdentityProviderID, NodePoolServiceAccount: validOpts.NodePoolServiceAccount, ControlPlaneServiceAccount: validOpts.ControlPlaneServiceAccount, CloudControllerServiceAccount: validOpts.CloudControllerServiceAccount, ImageRegistryServiceAccount: validOpts.ImageRegistryServiceAccount, NetworkServiceAccount: validOpts.NetworkServiceAccount},
+ 			expectErr:    true,
+ 			expectSubstr: "required flag(s) \"storage-service-account\" not set",
+ 		},
+ 		"missing image-registry-service-account": {
+-			opts:         RawCreateOptions{Project: validOpts.Project, Region: validOpts.Region, Network: validOpts.Network, PrivateServiceConnectSubnet: validOpts.PrivateServiceConnectSubnet, WorkloadIdentityProjectNumber: validOpts.WorkloadIdentityProjectNumber, WorkloadIdentityPoolID: validOpts.WorkloadIdentityPoolID, WorkloadIdentityProviderID: validOpts.WorkloadIdentityProviderID, NodePoolServiceAccount: validOpts.NodePoolServiceAccount, ControlPlaneServiceAccount: validOpts.ControlPlaneServiceAccount, CloudControllerServiceAccount: validOpts.CloudControllerServiceAccount, StorageServiceAccount: validOpts.StorageServiceAccount},
++			opts:         RawCreateOptions{Project: validOpts.Project, Region: validOpts.Region, Network: validOpts.Network, PrivateServiceConnectSubnet: validOpts.PrivateServiceConnectSubnet, WorkloadIdentityProjectNumber: validOpts.WorkloadIdentityProjectNumber, WorkloadIdentityPoolID: validOpts.WorkloadIdentityPoolID, WorkloadIdentityProviderID: validOpts.WorkloadIdentityProviderID, NodePoolServiceAccount: validOpts.NodePoolServiceAccount, ControlPlaneServiceAccount: validOpts.ControlPlaneServiceAccount, CloudControllerServiceAccount: validOpts.CloudControllerServiceAccount, StorageServiceAccount: validOpts.StorageServiceAccount, NetworkServiceAccount: validOpts.NetworkServiceAccount},
+ 			expectErr:    true,
+ 			expectSubstr: "required flag(s) \"image-registry-service-account\" not set",
+ 		},
++		"missing network-service-account": {
++			opts:         RawCreateOptions{Project: validOpts.Project, Region: validOpts.Region, Network: validOpts.Network, PrivateServiceConnectSubnet: validOpts.PrivateServiceConnectSubnet, WorkloadIdentityProjectNumber: validOpts.WorkloadIdentityProjectNumber, WorkloadIdentityPoolID: validOpts.WorkloadIdentityPoolID, WorkloadIdentityProviderID: validOpts.WorkloadIdentityProviderID, NodePoolServiceAccount: validOpts.NodePoolServiceAccount, ControlPlaneServiceAccount: validOpts.ControlPlaneServiceAccount, CloudControllerServiceAccount: validOpts.CloudControllerServiceAccount, StorageServiceAccount: validOpts.StorageServiceAccount, ImageRegistryServiceAccount: validOpts.ImageRegistryServiceAccount},
++			expectErr:    true,
++			expectSubstr: "required flag(s) \"network-service-account\" not set",
++		},
+ 		"all required fields provided": {
+ 			opts:      validOpts,
+ 			expectErr: false,
+@@ -170,6 +178,7 @@ func TestCreateCluster(t *testing.T) {
+ 				"--cloud-controller-service-account=cloudcontroller@test-project-123.iam.gserviceaccount.com",
+ 				"--storage-service-account=storage@test-project-123.iam.gserviceaccount.com",
+ 				"--image-registry-service-account=imageregistry@test-project-123.iam.gserviceaccount.com",
++				"--network-service-account=network@test-project-123.iam.gserviceaccount.com",
+ 				"--node-pool-replicas=-1",
+ 				"--name=example",
+ 				"--pull-secret=" + pullSecretFile,
+diff --git a/cmd/cluster/gcp/testdata/zz_fixture_TestCreateCluster_minimal_flags_necessary_to_render.yaml b/cmd/cluster/gcp/testdata/zz_fixture_TestCreateCluster_minimal_flags_necessary_to_render.yaml
+index 63112729112..148277c944c 100644
+--- a/cmd/cluster/gcp/testdata/zz_fixture_TestCreateCluster_minimal_flags_necessary_to_render.yaml
++++ b/cmd/cluster/gcp/testdata/zz_fixture_TestCreateCluster_minimal_flags_necessary_to_render.yaml
+@@ -51,6 +51,7 @@ spec:
+           cloudController: cloudcontroller@test-project-123.iam.gserviceaccount.com
+           controlPlane: controlplane@test-project-123.iam.gserviceaccount.com
+           imageRegistry: imageregistry@test-project-123.iam.gserviceaccount.com
++          network: network@test-project-123.iam.gserviceaccount.com
+           nodePool: nodepool@test-project-123.iam.gserviceaccount.com
+           storage: storage@test-project-123.iam.gserviceaccount.com
+     type: GCP
+diff --git a/cmd/infra/gcp/iam-bindings.json b/cmd/infra/gcp/iam-bindings.json
+index b5a87ef2890..4ff2193711f 100644
+--- a/cmd/infra/gcp/iam-bindings.json
++++ b/cmd/infra/gcp/iam-bindings.json
+@@ -66,6 +66,19 @@
+         "namespace": "openshift-image-registry",
+         "name": "cluster-image-registry-operator"
+       }
++    },
++    {
++      "name": "cloud-network",
++      "displayName": "Cloud Network Config Controller Service Account",
++      "description": "Service account for cloud network configuration (egress IP, subnet management)",
++      "roles": [
++        "roles/compute.instanceAdmin.v1",
++        "roles/compute.networkUser"
++      ],
++      "k8sServiceAccount": {
++        "namespace": "openshift-cloud-network-config-controller",
++        "name": "cloud-network-config-controller"
++      }
+     }
+   ]
+-}
+\ No newline at end of file
++}
+diff --git a/cmd/infra/gcp/iam.go b/cmd/infra/gcp/iam.go
+index 57e800c08cf..61f775bd96f 100644
+--- a/cmd/infra/gcp/iam.go
++++ b/cmd/infra/gcp/iam.go
+@@ -68,25 +68,11 @@ type ServiceAccountsConfig struct {
+ 	ServiceAccounts []ServiceAccountDefinition `json:"serviceAccounts"`
+ }
+ 
+-// loadServiceAccountDefinitions loads and parses the service accounts configuration.
+-// It uses the embedded JSON file by default, or can load from a custom file if provided.
+-func loadServiceAccountDefinitions(customConfigPath string) ([]ServiceAccountDefinition, error) {
+-	var data []byte
+-	var err error
+-
+-	if customConfigPath != "" {
+-		// Load from custom file path
+-		data, err = os.ReadFile(customConfigPath)
+-		if err != nil {
+-			return nil, fmt.Errorf("failed to read custom service accounts config: %w", err)
+-		}
+-	} else {
+-		// Use embedded default configuration
+-		data = defaultServiceAccountsJSON
+-	}
+-
++// loadServiceAccountDefinitions loads and parses the service accounts configuration
++// from the embedded JSON file.
++func loadServiceAccountDefinitions() ([]ServiceAccountDefinition, error) {
+ 	var config ServiceAccountsConfig
+-	if err := json.Unmarshal(data, &config); err != nil {
++	if err := json.Unmarshal(defaultServiceAccountsJSON, &config); err != nil {
+ 		return nil, fmt.Errorf("failed to parse service accounts configuration: %w", err)
+ 	}
+ 
+@@ -345,7 +331,7 @@ func (c *IAMManager) ensureProviderUsable(ctx context.Context, providerID string
+ func (c *IAMManager) CreateServiceAccounts(ctx context.Context) (map[string]string, error) {
+ 	serviceAccountEmails := make(map[string]string)
+ 
+-	definitions, err := loadServiceAccountDefinitions("")
++	definitions, err := loadServiceAccountDefinitions()
+ 	if err != nil {
+ 		return nil, fmt.Errorf("failed to load service account definitions: %w", err)
+ 	}
+@@ -973,7 +959,7 @@ func (c *IAMManager) DeleteOIDCProvider(ctx context.Context) error {
+ 
+ // DeleteServiceAccounts deletes all Google Service Accounts created for this cluster.
+ func (c *IAMManager) DeleteServiceAccounts(ctx context.Context) error {
+-	definitions, err := loadServiceAccountDefinitions("")
++	definitions, err := loadServiceAccountDefinitions()
+ 	if err != nil {
+ 		return fmt.Errorf("failed to load service account definitions: %w", err)
+ 	}
+diff --git a/cmd/infra/gcp/iam_test.go b/cmd/infra/gcp/iam_test.go
+index 9b843f653b6..16f9dc21596 100644
+--- a/cmd/infra/gcp/iam_test.go
++++ b/cmd/infra/gcp/iam_test.go
+@@ -362,7 +362,7 @@ func TestAddMemberToServiceAccountRoleBinding(t *testing.T) {
+ func TestLoadServiceAccountDefinitions(t *testing.T) {
+ 	// Test loading the embedded default configuration
+ 	t.Run("When loading embedded default configuration it should return valid definitions", func(t *testing.T) {
+-		definitions, err := loadServiceAccountDefinitions("")
++		definitions, err := loadServiceAccountDefinitions()
+ 		if err != nil {
+ 			t.Fatalf("expected no error, got %v", err)
+ 		}
+@@ -381,6 +381,26 @@ func TestLoadServiceAccountDefinitions(t *testing.T) {
+ 			}
+ 		}
+ 	})
++
++	t.Run("When loading cloud-network definition it should have roles populated", func(t *testing.T) {
++		definitions, err := loadServiceAccountDefinitions()
++		if err != nil {
++			t.Fatalf("expected no error, got %v", err)
++		}
++
++		found := false
++		for _, def := range definitions {
++			if def.Name == "cloud-network" {
++				found = true
++				if len(def.Roles) == 0 {
++					t.Error("expected cloud-network to have non-empty Roles")
++				}
++			}
++		}
++		if !found {
++			t.Error("expected to find cloud-network service account definition")
++		}
++	})
+ }
+ 
+ func TestIsAlreadyExistsError(t *testing.T) {
+diff --git a/cmd/install/assets/crds/hypershift-operator/tests/hostedclusters.hypershift.openshift.io/techpreview.hostedclusters.gcp.testsuite.yaml b/cmd/install/assets/crds/hypershift-operator/tests/hostedclusters.hypershift.openshift.io/techpreview.hostedclusters.gcp.testsuite.yaml
+index 3665c6689cf..c95b09ea81a 100644
+--- a/cmd/install/assets/crds/hypershift-operator/tests/hostedclusters.hypershift.openshift.io/techpreview.hostedclusters.gcp.testsuite.yaml
++++ b/cmd/install/assets/crds/hypershift-operator/tests/hostedclusters.hypershift.openshift.io/techpreview.hostedclusters.gcp.testsuite.yaml
+@@ -34,6 +34,7 @@ tests:
+                 cloudController: cloudcontroller@my-project-123.iam.gserviceaccount.com
+                 storage: storage@my-project-123.iam.gserviceaccount.com
+                 imageRegistry: imageregistry@my-project-123.iam.gserviceaccount.com
++                network: cnccsa@my-project-123.iam.gserviceaccount.com
+         pullSecret:
+           name: secret
+         release:
+@@ -89,6 +90,7 @@ tests:
+                 cloudController: cloudcontroller@my-project-123.iam.gserviceaccount.com
+                 storage: storage@my-project-123.iam.gserviceaccount.com
+                 imageRegistry: imageregistry@my-project-123.iam.gserviceaccount.com
++                network: cnccsa@my-project-123.iam.gserviceaccount.com
+         pullSecret:
+           name: secret
+         release:
+@@ -144,6 +146,7 @@ tests:
+                 cloudController: cloudcontroller@my-project-123.iam.gserviceaccount.com
+                 storage: storage@my-project-123.iam.gserviceaccount.com
+                 imageRegistry: imageregistry@my-project-123.iam.gserviceaccount.com
++                network: cnccsa@my-project-123.iam.gserviceaccount.com
+         pullSecret:
+           name: secret
+         release:
+@@ -199,6 +202,7 @@ tests:
+                 cloudController: cloudcontroller@my-project-123.iam.gserviceaccount.com
+                 storage: storage@my-project-123.iam.gserviceaccount.com
+                 imageRegistry: imageregistry@my-project-123.iam.gserviceaccount.com
++                network: cnccsa@my-project-123.iam.gserviceaccount.com
+         pullSecret:
+           name: secret
+         release:
+@@ -254,6 +258,7 @@ tests:
+                 cloudController: cloudcontroller@my-project-123.iam.gserviceaccount.com
+                 storage: storage@my-project-123.iam.gserviceaccount.com
+                 imageRegistry: imageregistry@my-project-123.iam.gserviceaccount.com
++                network: cnccsa@my-project-123.iam.gserviceaccount.com
+         pullSecret:
+           name: secret
+         release:
+@@ -309,6 +314,7 @@ tests:
+                 cloudController: cloudcontroller@my-project-123.iam.gserviceaccount.com
+                 storage: storage@my-project-123.iam.gserviceaccount.com
+                 imageRegistry: imageregistry@my-project-123.iam.gserviceaccount.com
++                network: cnccsa@my-project-123.iam.gserviceaccount.com
+         pullSecret:
+           name: secret
+         release:
+@@ -364,6 +370,7 @@ tests:
+                 cloudController: cloudcontroller@my-project-123.iam.gserviceaccount.com
+                 storage: storage@my-project-123.iam.gserviceaccount.com
+                 imageRegistry: imageregistry@my-project-123.iam.gserviceaccount.com
++                network: cnccsa@my-project-123.iam.gserviceaccount.com
+         pullSecret:
+           name: secret
+         release:
+@@ -420,6 +427,7 @@ tests:
+                 cloudController: cloudcontroller@my-project-123.iam.gserviceaccount.com
+                 storage: storage@my-project-123.iam.gserviceaccount.com
+                 imageRegistry: imageregistry@my-project-123.iam.gserviceaccount.com
++                network: cnccsa@my-project-123.iam.gserviceaccount.com
+         pullSecret:
+           name: secret
+         release:
+@@ -476,6 +484,7 @@ tests:
+                 cloudController: cloudcontroller@my-project-123.iam.gserviceaccount.com
+                 storage: storage@my-project-123.iam.gserviceaccount.com
+                 imageRegistry: imageregistry@my-project-123.iam.gserviceaccount.com
++                network: cnccsa@my-project-123.iam.gserviceaccount.com
+         pullSecret:
+           name: secret
+         release:
+@@ -531,6 +540,7 @@ tests:
+                 cloudController: cloudcontroller@my-project-123.iam.gserviceaccount.com
+                 storage: storage@my-project-123.iam.gserviceaccount.com
+                 imageRegistry: imageregistry@my-project-123.iam.gserviceaccount.com
++                network: cnccsa@my-project-123.iam.gserviceaccount.com
+         pullSecret:
+           name: secret
+         release:
+@@ -586,6 +596,7 @@ tests:
+                 cloudController: cloudcontroller@my-project-123.iam.gserviceaccount.com
+                 storage: storage@my-project-123.iam.gserviceaccount.com
+                 imageRegistry: imageregistry@my-project-123.iam.gserviceaccount.com
++                network: cnccsa@my-project-123.iam.gserviceaccount.com
+         pullSecret:
+           name: secret
+         release:
+@@ -641,6 +652,7 @@ tests:
+                 cloudController: cloudcontroller@my-project-123.iam.gserviceaccount.com
+                 storage: storage@my-project-123.iam.gserviceaccount.com
+                 imageRegistry: imageregistry@my-project-123.iam.gserviceaccount.com
++                network: cnccsa@my-project-123.iam.gserviceaccount.com
+         pullSecret:
+           name: secret
+         release:
+@@ -667,3 +679,673 @@ tests:
+           servicePublishingStrategy:
+             type: Route
+             route: {}
++
++  # --- GCP network service account (CNCC) validation ---
++  - name: When GCP network service account has invalid email format it should fail
++    initial: |
++      apiVersion: hypershift.openshift.io/v1beta1
++      kind: HostedCluster
++      spec:
++        dns:
++          baseDomain: example.com
++        platform:
++          type: GCP
++          gcp:
++            project: my-project-123
++            region: us-central1
++            networkConfig:
++              network:
++                name: my-network
++              privateServiceConnectSubnet:
++                name: my-psc-subnet
++            workloadIdentity:
++              projectNumber: "123456789012"
++              poolID: my-wif-pool
++              providerID: my-wif-provider
++              serviceAccountsEmails:
++                nodePool: nodepool@my-project-123.iam.gserviceaccount.com
++                controlPlane: controlplane@my-project-123.iam.gserviceaccount.com
++                cloudController: cloudcontroller@my-project-123.iam.gserviceaccount.com
++                storage: storage@my-project-123.iam.gserviceaccount.com
++                imageRegistry: imageregistry@my-project-123.iam.gserviceaccount.com
++                network: INVALID-EMAIL
++        pullSecret:
++          name: secret
++        release:
++          image: quay.io/openshift-release-dev/ocp-release:4.15.11-x86_64
++        secretEncryption:
++          aescbc:
++            activeKey:
++              name: key
++          type: aescbc
++        services:
++        - service: APIServer
++          servicePublishingStrategy:
++            type: Route
++            route: {}
++        - service: OAuthServer
++          servicePublishingStrategy:
++            type: Route
++            route: {}
++        - service: Konnectivity
++          servicePublishingStrategy:
++            type: Route
++            route: {}
++        - service: Ignition
++          servicePublishingStrategy:
++            type: Route
++            route: {}
++    expectedError: "network"
++
++  - name: When GCP network service account belongs to different project it should fail
++    initial: |
++      apiVersion: hypershift.openshift.io/v1beta1
++      kind: HostedCluster
++      spec:
++        dns:
++          baseDomain: example.com
++        platform:
++          type: GCP
++          gcp:
++            project: my-project-123
++            region: us-central1
++            networkConfig:
++              network:
++                name: my-network
++              privateServiceConnectSubnet:
++                name: my-psc-subnet
++            workloadIdentity:
++              projectNumber: "123456789012"
++              poolID: my-wif-pool
++              providerID: my-wif-provider
++              serviceAccountsEmails:
++                nodePool: nodepool@my-project-123.iam.gserviceaccount.com
++                controlPlane: controlplane@my-project-123.iam.gserviceaccount.com
++                cloudController: cloudcontroller@my-project-123.iam.gserviceaccount.com
++                storage: storage@my-project-123.iam.gserviceaccount.com
++                imageRegistry: imageregistry@my-project-123.iam.gserviceaccount.com
++                network: cnccsa@wrong-project.iam.gserviceaccount.com
++        pullSecret:
++          name: secret
++        release:
++          image: quay.io/openshift-release-dev/ocp-release:4.15.11-x86_64
++        secretEncryption:
++          aescbc:
++            activeKey:
++              name: key
++          type: aescbc
++        services:
++        - service: APIServer
++          servicePublishingStrategy:
++            type: Route
++            route: {}
++        - service: OAuthServer
++          servicePublishingStrategy:
++            type: Route
++            route: {}
++        - service: Konnectivity
++          servicePublishingStrategy:
++            type: Route
++            route: {}
++        - service: Ignition
++          servicePublishingStrategy:
++            type: Route
++            route: {}
++    expectedError: "network service account must belong to the same project"
++
++  - name: When GCP network service account is provided and valid it should pass
++    initial: |
++      apiVersion: hypershift.openshift.io/v1beta1
++      kind: HostedCluster
++      spec:
++        dns:
++          baseDomain: example.com
++        platform:
++          type: GCP
++          gcp:
++            project: my-project-123
++            region: us-central1
++            networkConfig:
++              network:
++                name: my-network
++              privateServiceConnectSubnet:
++                name: my-psc-subnet
++            workloadIdentity:
++              projectNumber: "123456789012"
++              poolID: my-wif-pool
++              providerID: my-wif-provider
++              serviceAccountsEmails:
++                nodePool: nodepool@my-project-123.iam.gserviceaccount.com
++                controlPlane: controlplane@my-project-123.iam.gserviceaccount.com
++                cloudController: cloudcontroller@my-project-123.iam.gserviceaccount.com
++                storage: storage@my-project-123.iam.gserviceaccount.com
++                imageRegistry: imageregistry@my-project-123.iam.gserviceaccount.com
++                network: cnccsa@my-project-123.iam.gserviceaccount.com
++        pullSecret:
++          name: secret
++        release:
++          image: quay.io/openshift-release-dev/ocp-release:4.15.11-x86_64
++        secretEncryption:
++          aescbc:
++            activeKey:
++              name: key
++          type: aescbc
++        services:
++        - service: APIServer
++          servicePublishingStrategy:
++            type: Route
++            route: {}
++        - service: OAuthServer
++          servicePublishingStrategy:
++            type: Route
++            route: {}
++        - service: Konnectivity
++          servicePublishingStrategy:
++            type: Route
++            route: {}
++        - service: Ignition
++          servicePublishingStrategy:
++            type: Route
++            route: {}
++
++  - name: When GCP network service account is omitted it should fail
++    initial: |
++      apiVersion: hypershift.openshift.io/v1beta1
++      kind: HostedCluster
++      spec:
++        dns:
++          baseDomain: example.com
++        platform:
++          type: GCP
++          gcp:
++            project: my-project-123
++            region: us-central1
++            networkConfig:
++              network:
++                name: my-network
++              privateServiceConnectSubnet:
++                name: my-psc-subnet
++            workloadIdentity:
++              projectNumber: "123456789012"
++              poolID: my-wif-pool
++              providerID: my-wif-provider
++              serviceAccountsEmails:
++                nodePool: nodepool@my-project-123.iam.gserviceaccount.com
++                controlPlane: controlplane@my-project-123.iam.gserviceaccount.com
++                cloudController: cloudcontroller@my-project-123.iam.gserviceaccount.com
++                storage: storage@my-project-123.iam.gserviceaccount.com
++                imageRegistry: imageregistry@my-project-123.iam.gserviceaccount.com
++        pullSecret:
++          name: secret
++        release:
++          image: quay.io/openshift-release-dev/ocp-release:4.15.11-x86_64
++        secretEncryption:
++          aescbc:
++            activeKey:
++              name: key
++          type: aescbc
++        services:
++        - service: APIServer
++          servicePublishingStrategy:
++            type: Route
++            route: {}
++        - service: OAuthServer
++          servicePublishingStrategy:
++            type: Route
++            route: {}
++        - service: Konnectivity
++          servicePublishingStrategy:
++            type: Route
++            route: {}
++        - service: Ignition
++          servicePublishingStrategy:
++            type: Route
++            route: {}
++    expectedError: "network: Required value"
++
++  onUpdate:
++  # --- GCP network service account immutability ---
++  - name: When GCP network service account is changed it should fail
++    initial: |
++      apiVersion: hypershift.openshift.io/v1beta1
++      kind: HostedCluster
++      spec:
++        dns:
++          baseDomain: example.com
++        platform:
++          type: GCP
++          gcp:
++            project: my-project-123
++            region: us-central1
++            networkConfig:
++              network:
++                name: my-network
++              privateServiceConnectSubnet:
++                name: my-psc-subnet
++            workloadIdentity:
++              projectNumber: "123456789012"
++              poolID: my-wif-pool
++              providerID: my-wif-provider
++              serviceAccountsEmails:
++                nodePool: nodepool@my-project-123.iam.gserviceaccount.com
++                controlPlane: controlplane@my-project-123.iam.gserviceaccount.com
++                cloudController: cloudcontroller@my-project-123.iam.gserviceaccount.com
++                storage: storage@my-project-123.iam.gserviceaccount.com
++                imageRegistry: imageregistry@my-project-123.iam.gserviceaccount.com
++                network: cnccsa@my-project-123.iam.gserviceaccount.com
++        pullSecret:
++          name: secret
++        release:
++          image: quay.io/openshift-release-dev/ocp-release:4.15.11-x86_64
++        secretEncryption:
++          aescbc:
++            activeKey:
++              name: key
++          type: aescbc
++        services:
++        - service: APIServer
++          servicePublishingStrategy:
++            type: Route
++            route: {}
++        - service: OAuthServer
++          servicePublishingStrategy:
++            type: Route
++            route: {}
++        - service: Konnectivity
++          servicePublishingStrategy:
++            type: Route
++            route: {}
++        - service: Ignition
++          servicePublishingStrategy:
++            type: Route
++            route: {}
++    updated: |
++      apiVersion: hypershift.openshift.io/v1beta1
++      kind: HostedCluster
++      spec:
++        dns:
++          baseDomain: example.com
++        platform:
++          type: GCP
++          gcp:
++            project: my-project-123
++            region: us-central1
++            networkConfig:
++              network:
++                name: my-network
++              privateServiceConnectSubnet:
++                name: my-psc-subnet
++            workloadIdentity:
++              projectNumber: "123456789012"
++              poolID: my-wif-pool
++              providerID: my-wif-provider
++              serviceAccountsEmails:
++                nodePool: nodepool@my-project-123.iam.gserviceaccount.com
++                controlPlane: controlplane@my-project-123.iam.gserviceaccount.com
++                cloudController: cloudcontroller@my-project-123.iam.gserviceaccount.com
++                storage: storage@my-project-123.iam.gserviceaccount.com
++                imageRegistry: imageregistry@my-project-123.iam.gserviceaccount.com
++                network: different@my-project-123.iam.gserviceaccount.com
++        pullSecret:
++          name: secret
++        release:
++          image: quay.io/openshift-release-dev/ocp-release:4.15.11-x86_64
++        secretEncryption:
++          aescbc:
++            activeKey:
++              name: key
++          type: aescbc
++        services:
++        - service: APIServer
++          servicePublishingStrategy:
++            type: Route
++            route: {}
++        - service: OAuthServer
++          servicePublishingStrategy:
++            type: Route
++            route: {}
++        - service: Konnectivity
++          servicePublishingStrategy:
++            type: Route
++            route: {}
++        - service: Ignition
++          servicePublishingStrategy:
++            type: Route
++            route: {}
++    expectedError: "Network is immutable"
++
++  - name: When updating release image while GCP network service account is unchanged it should pass
++    initial: |
++      apiVersion: hypershift.openshift.io/v1beta1
++      kind: HostedCluster
++      spec:
++        dns:
++          baseDomain: example.com
++        platform:
++          type: GCP
++          gcp:
++            project: my-project-123
++            region: us-central1
++            networkConfig:
++              network:
++                name: my-network
++              privateServiceConnectSubnet:
++                name: my-psc-subnet
++            workloadIdentity:
++              projectNumber: "123456789012"
++              poolID: my-wif-pool
++              providerID: my-wif-provider
++              serviceAccountsEmails:
++                nodePool: nodepool@my-project-123.iam.gserviceaccount.com
++                controlPlane: controlplane@my-project-123.iam.gserviceaccount.com
++                cloudController: cloudcontroller@my-project-123.iam.gserviceaccount.com
++                storage: storage@my-project-123.iam.gserviceaccount.com
++                imageRegistry: imageregistry@my-project-123.iam.gserviceaccount.com
++                network: cnccsa@my-project-123.iam.gserviceaccount.com
++        pullSecret:
++          name: secret
++        release:
++          image: quay.io/openshift-release-dev/ocp-release:4.15.11-x86_64
++        secretEncryption:
++          aescbc:
++            activeKey:
++              name: key
++          type: aescbc
++        services:
++        - service: APIServer
++          servicePublishingStrategy:
++            type: Route
++            route: {}
++        - service: OAuthServer
++          servicePublishingStrategy:
++            type: Route
++            route: {}
++        - service: Konnectivity
++          servicePublishingStrategy:
++            type: Route
++            route: {}
++        - service: Ignition
++          servicePublishingStrategy:
++            type: Route
++            route: {}
++    updated: |
++      apiVersion: hypershift.openshift.io/v1beta1
++      kind: HostedCluster
++      spec:
++        dns:
++          baseDomain: example.com
++        platform:
++          type: GCP
++          gcp:
++            project: my-project-123
++            region: us-central1
++            networkConfig:
++              network:
++                name: my-network
++              privateServiceConnectSubnet:
++                name: my-psc-subnet
++            workloadIdentity:
++              projectNumber: "123456789012"
++              poolID: my-wif-pool
++              providerID: my-wif-provider
++              serviceAccountsEmails:
++                nodePool: nodepool@my-project-123.iam.gserviceaccount.com
++                controlPlane: controlplane@my-project-123.iam.gserviceaccount.com
++                cloudController: cloudcontroller@my-project-123.iam.gserviceaccount.com
++                storage: storage@my-project-123.iam.gserviceaccount.com
++                imageRegistry: imageregistry@my-project-123.iam.gserviceaccount.com
++                network: cnccsa@my-project-123.iam.gserviceaccount.com
++        pullSecret:
++          name: secret
++        release:
++          image: quay.io/openshift-release-dev/ocp-release:4.16.0-x86_64
++        secretEncryption:
++          aescbc:
++            activeKey:
++              name: key
++          type: aescbc
++        services:
++        - service: APIServer
++          servicePublishingStrategy:
++            type: Route
++            route: {}
++        - service: OAuthServer
++          servicePublishingStrategy:
++            type: Route
++            route: {}
++        - service: Konnectivity
++          servicePublishingStrategy:
++            type: Route
++            route: {}
++        - service: Ignition
++          servicePublishingStrategy:
++            type: Route
++            route: {}
++
++  # --- GCP network service account ratcheting ---
++  - name: When updating a previously invalid network SA to a new invalid value it should fail
++    initialCRDPatches:
++      # Remove the network SA project membership validation so the initial object can be
++      # created with a cross-project network service account that would normally be rejected.
++      - op: remove
++        path: /spec/versions/0/schema/openAPIV3Schema/properties/spec/properties/platform/properties/gcp/x-kubernetes-validations/5
++    initial: |
++      apiVersion: hypershift.openshift.io/v1beta1
++      kind: HostedCluster
++      spec:
++        dns:
++          baseDomain: example.com
++        platform:
++          type: GCP
++          gcp:
++            project: my-project-123
++            region: us-central1
++            networkConfig:
++              network:
++                name: my-network
++              privateServiceConnectSubnet:
++                name: my-psc-subnet
++            workloadIdentity:
++              projectNumber: "123456789012"
++              poolID: my-wif-pool
++              providerID: my-wif-provider
++              serviceAccountsEmails:
++                nodePool: nodepool@my-project-123.iam.gserviceaccount.com
++                controlPlane: controlplane@my-project-123.iam.gserviceaccount.com
++                cloudController: cloudcontroller@my-project-123.iam.gserviceaccount.com
++                storage: storage@my-project-123.iam.gserviceaccount.com
++                imageRegistry: imageregistry@my-project-123.iam.gserviceaccount.com
++                network: cnccsa@wrong-project.iam.gserviceaccount.com
++        pullSecret:
++          name: secret
++        release:
++          image: quay.io/openshift-release-dev/ocp-release:4.15.11-x86_64
++        secretEncryption:
++          aescbc:
++            activeKey:
++              name: key
++          type: aescbc
++        services:
++        - service: APIServer
++          servicePublishingStrategy:
++            type: Route
++            route: {}
++        - service: OAuthServer
++          servicePublishingStrategy:
++            type: Route
++            route: {}
++        - service: Konnectivity
++          servicePublishingStrategy:
++            type: Route
++            route: {}
++        - service: Ignition
++          servicePublishingStrategy:
++            type: Route
++            route: {}
++    updated: |
++      apiVersion: hypershift.openshift.io/v1beta1
++      kind: HostedCluster
++      spec:
++        dns:
++          baseDomain: example.com
++        platform:
++          type: GCP
++          gcp:
++            project: my-project-123
++            region: us-central1
++            networkConfig:
++              network:
++                name: my-network
++              privateServiceConnectSubnet:
++                name: my-psc-subnet
++            workloadIdentity:
++              projectNumber: "123456789012"
++              poolID: my-wif-pool
++              providerID: my-wif-provider
++              serviceAccountsEmails:
++                nodePool: nodepool@my-project-123.iam.gserviceaccount.com
++                controlPlane: controlplane@my-project-123.iam.gserviceaccount.com
++                cloudController: cloudcontroller@my-project-123.iam.gserviceaccount.com
++                storage: storage@my-project-123.iam.gserviceaccount.com
++                imageRegistry: imageregistry@my-project-123.iam.gserviceaccount.com
++                network: cnccsa@other-wrong-project.iam.gserviceaccount.com
++        pullSecret:
++          name: secret
++        release:
++          image: quay.io/openshift-release-dev/ocp-release:4.15.11-x86_64
++        secretEncryption:
++          aescbc:
++            activeKey:
++              name: key
++          type: aescbc
++        services:
++        - service: APIServer
++          servicePublishingStrategy:
++            type: Route
++            route: {}
++        - service: OAuthServer
++          servicePublishingStrategy:
++            type: Route
++            route: {}
++        - service: Konnectivity
++          servicePublishingStrategy:
++            type: Route
++            route: {}
++        - service: Ignition
++          servicePublishingStrategy:
++            type: Route
++            route: {}
++    expectedError: "network service account must belong to the same project"
++
++  - name: When updating a legit field while a previously invalid network SA is unchanged it should pass
++    initialCRDPatches:
++      # Remove the network SA project membership validation so the initial object can be
++      # created with a cross-project network service account that would normally be rejected.
++      - op: remove
++        path: /spec/versions/0/schema/openAPIV3Schema/properties/spec/properties/platform/properties/gcp/x-kubernetes-validations/5
++    initial: |
++      apiVersion: hypershift.openshift.io/v1beta1
++      kind: HostedCluster
++      spec:
++        dns:
++          baseDomain: example.com
++        platform:
++          type: GCP
++          gcp:
++            project: my-project-123
++            region: us-central1
++            networkConfig:
++              network:
++                name: my-network
++              privateServiceConnectSubnet:
++                name: my-psc-subnet
++            workloadIdentity:
++              projectNumber: "123456789012"
++              poolID: my-wif-pool
++              providerID: my-wif-provider
++              serviceAccountsEmails:
++                nodePool: nodepool@my-project-123.iam.gserviceaccount.com
++                controlPlane: controlplane@my-project-123.iam.gserviceaccount.com
++                cloudController: cloudcontroller@my-project-123.iam.gserviceaccount.com
++                storage: storage@my-project-123.iam.gserviceaccount.com
++                imageRegistry: imageregistry@my-project-123.iam.gserviceaccount.com
++                network: cnccsa@wrong-project.iam.gserviceaccount.com
++        pullSecret:
++          name: secret
++        release:
++          image: quay.io/openshift-release-dev/ocp-release:4.15.11-x86_64
++        secretEncryption:
++          aescbc:
++            activeKey:
++              name: key
++          type: aescbc
++        services:
++        - service: APIServer
++          servicePublishingStrategy:
++            type: Route
++            route: {}
++        - service: OAuthServer
++          servicePublishingStrategy:
++            type: Route
++            route: {}
++        - service: Konnectivity
++          servicePublishingStrategy:
++            type: Route
++            route: {}
++        - service: Ignition
++          servicePublishingStrategy:
++            type: Route
++            route: {}
++    updated: |
++      apiVersion: hypershift.openshift.io/v1beta1
++      kind: HostedCluster
++      spec:
++        dns:
++          baseDomain: example.com
++        platform:
++          type: GCP
++          gcp:
++            project: my-project-123
++            region: us-central1
++            networkConfig:
++              network:
++                name: my-network
++              privateServiceConnectSubnet:
++                name: my-psc-subnet
++            workloadIdentity:
++              projectNumber: "123456789012"
++              poolID: my-wif-pool
++              providerID: my-wif-provider
++              serviceAccountsEmails:
++                nodePool: nodepool@my-project-123.iam.gserviceaccount.com
++                controlPlane: controlplane@my-project-123.iam.gserviceaccount.com
++                cloudController: cloudcontroller@my-project-123.iam.gserviceaccount.com
++                storage: storage@my-project-123.iam.gserviceaccount.com
++                imageRegistry: imageregistry@my-project-123.iam.gserviceaccount.com
++                network: cnccsa@wrong-project.iam.gserviceaccount.com
++        pullSecret:
++          name: secret
++        release:
++          image: quay.io/openshift-release-dev/ocp-release:4.16.0-x86_64
++        secretEncryption:
++          aescbc:
++            activeKey:
++              name: key
++          type: aescbc
++        services:
++        - service: APIServer
++          servicePublishingStrategy:
++            type: Route
++            route: {}
++        - service: OAuthServer
++          servicePublishingStrategy:
++            type: Route
++            route: {}
++        - service: Konnectivity
++          servicePublishingStrategy:
++            type: Route
++            route: {}
++        - service: Ignition
++          servicePublishingStrategy:
++            type: Route
++            route: {}
+diff --git a/cmd/install/assets/crds/hypershift-operator/zz_generated.crd-manifests/hostedclusters-Hypershift-CustomNoUpgrade.crd.yaml b/cmd/install/assets/crds/hypershift-operator/zz_generated.crd-manifests/hostedclusters-Hypershift-CustomNoUpgrade.crd.yaml
+index a3663b2d3ca..e2f709e355a 100644
+--- a/cmd/install/assets/crds/hypershift-operator/zz_generated.crd-manifests/hostedclusters-Hypershift-CustomNoUpgrade.crd.yaml
++++ b/cmd/install/assets/crds/hypershift-operator/zz_generated.crd-manifests/hostedclusters-Hypershift-CustomNoUpgrade.crd.yaml
+@@ -6453,6 +6453,28 @@ spec:
+                                 - message: 'email must be a valid GCP service account
+                                     email (format: name@project.iam.gserviceaccount.com)'
+                                   rule: self.matches('^[a-z][a-z0-9-]{4,28}[a-z0-9]@[a-z][a-z0-9-]{4,28}[a-z0-9]\\.iam\\.gserviceaccount\\.com$')
++                              network:
++                                description: |-
++                                  network is the Google Service Account email for the Cloud Network Config Controller
++                                  that manages cloud-level network configurations (egress IPs, subnets).
++                                  This GSA requires the following IAM roles:
++                                  - roles/compute.instanceAdmin.v1 (Compute Instance Admin - for managing network interfaces)
++                                  - roles/compute.networkUser (Compute Network User - for using subnets)
++                                  See cmd/infra/gcp/iam-bindings.json for the authoritative role definitions.
++                                  Format: service-account-name@project-id.iam.gserviceaccount.com
++
++                                  This is a user-provided value referencing a pre-created Google Service Account.
++                                  Typically obtained from the output of `hypershift infra create gcp` which creates
++                                  the required service accounts with appropriate IAM roles and WIF bindings.
++                                maxLength: 85
++                                minLength: 37
++                                type: string
++                                x-kubernetes-validations:
++                                - message: Network is immutable
++                                  rule: self == oldSelf
++                                - message: 'email must be a valid GCP service account
++                                    email (format: name@project.iam.gserviceaccount.com)'
++                                  rule: self.matches('^[a-z][a-z0-9-]{4,28}[a-z0-9]@[a-z][a-z0-9-]{4,28}[a-z0-9]\\.iam\\.gserviceaccount\\.com$')
+                               nodePool:
+                                 description: |-
+                                   nodePool is the Google Service Account email for CAPG controllers
+@@ -6504,6 +6526,7 @@ spec:
+                             - cloudController
+                             - controlPlane
+                             - imageRegistry
++                            - network
+                             - nodePool
+                             - storage
+                             type: object
+@@ -6546,6 +6569,9 @@ spec:
+                       rule: self.workloadIdentity.serviceAccountsEmails.imageRegistry.contains('@')
+                         && self.workloadIdentity.serviceAccountsEmails.imageRegistry.endsWith('@'
+                         + self.project + '.iam.gserviceaccount.com')
++                    - message: network service account must belong to the same project
++                      rule: self.workloadIdentity.serviceAccountsEmails.network.endsWith('@'
++                        + self.project + '.iam.gserviceaccount.com')
+                   ibmcloud:
+                     description: ibmcloud defines IBMCloud specific settings for components
+                     properties:
+diff --git a/cmd/install/assets/crds/hypershift-operator/zz_generated.crd-manifests/hostedclusters-Hypershift-TechPreviewNoUpgrade.crd.yaml b/cmd/install/assets/crds/hypershift-operator/zz_generated.crd-manifests/hostedclusters-Hypershift-TechPreviewNoUpgrade.crd.yaml
+index 72f606f53dc..b8694cb6c50 100644
+--- a/cmd/install/assets/crds/hypershift-operator/zz_generated.crd-manifests/hostedclusters-Hypershift-TechPreviewNoUpgrade.crd.yaml
++++ b/cmd/install/assets/crds/hypershift-operator/zz_generated.crd-manifests/hostedclusters-Hypershift-TechPreviewNoUpgrade.crd.yaml
+@@ -6364,6 +6364,28 @@ spec:
+                                 - message: 'email must be a valid GCP service account
+                                     email (format: name@project.iam.gserviceaccount.com)'
+                                   rule: self.matches('^[a-z][a-z0-9-]{4,28}[a-z0-9]@[a-z][a-z0-9-]{4,28}[a-z0-9]\\.iam\\.gserviceaccount\\.com$')
++                              network:
++                                description: |-
++                                  network is the Google Service Account email for the Cloud Network Config Controller
++                                  that manages cloud-level network configurations (egress IPs, subnets).
++                                  This GSA requires the following IAM roles:
++                                  - roles/compute.instanceAdmin.v1 (Compute Instance Admin - for managing network interfaces)
++                                  - roles/compute.networkUser (Compute Network User - for using subnets)
++                                  See cmd/infra/gcp/iam-bindings.json for the authoritative role definitions.
++                                  Format: service-account-name@project-id.iam.gserviceaccount.com
++
++                                  This is a user-provided value referencing a pre-created Google Service Account.
++                                  Typically obtained from the output of `hypershift infra create gcp` which creates
++                                  the required service accounts with appropriate IAM roles and WIF bindings.
++                                maxLength: 85
++                                minLength: 37
++                                type: string
++                                x-kubernetes-validations:
++                                - message: Network is immutable
++                                  rule: self == oldSelf
++                                - message: 'email must be a valid GCP service account
++                                    email (format: name@project.iam.gserviceaccount.com)'
++                                  rule: self.matches('^[a-z][a-z0-9-]{4,28}[a-z0-9]@[a-z][a-z0-9-]{4,28}[a-z0-9]\\.iam\\.gserviceaccount\\.com$')
+                               nodePool:
+                                 description: |-
+                                   nodePool is the Google Service Account email for CAPG controllers
+@@ -6415,6 +6437,7 @@ spec:
+                             - cloudController
+                             - controlPlane
+                             - imageRegistry
++                            - network
+                             - nodePool
+                             - storage
+                             type: object
+@@ -6457,6 +6480,9 @@ spec:
+                       rule: self.workloadIdentity.serviceAccountsEmails.imageRegistry.contains('@')
+                         && self.workloadIdentity.serviceAccountsEmails.imageRegistry.endsWith('@'
+                         + self.project + '.iam.gserviceaccount.com')
++                    - message: network service account must belong to the same project
++                      rule: self.workloadIdentity.serviceAccountsEmails.network.endsWith('@'
++                        + self.project + '.iam.gserviceaccount.com')
+                   ibmcloud:
+                     description: ibmcloud defines IBMCloud specific settings for components
+                     properties:
+diff --git a/cmd/install/assets/crds/hypershift-operator/zz_generated.crd-manifests/hostedcontrolplanes-Hypershift-CustomNoUpgrade.crd.yaml b/cmd/install/assets/crds/hypershift-operator/zz_generated.crd-manifests/hostedcontrolplanes-Hypershift-CustomNoUpgrade.crd.yaml
+index 67a307c95f3..18267a306a5 100644
+--- a/cmd/install/assets/crds/hypershift-operator/zz_generated.crd-manifests/hostedcontrolplanes-Hypershift-CustomNoUpgrade.crd.yaml
++++ b/cmd/install/assets/crds/hypershift-operator/zz_generated.crd-manifests/hostedcontrolplanes-Hypershift-CustomNoUpgrade.crd.yaml
+@@ -6333,6 +6333,28 @@ spec:
+                                 - message: 'email must be a valid GCP service account
+                                     email (format: name@project.iam.gserviceaccount.com)'
+                                   rule: self.matches('^[a-z][a-z0-9-]{4,28}[a-z0-9]@[a-z][a-z0-9-]{4,28}[a-z0-9]\\.iam\\.gserviceaccount\\.com$')
++                              network:
++                                description: |-
++                                  network is the Google Service Account email for the Cloud Network Config Controller
++                                  that manages cloud-level network configurations (egress IPs, subnets).
++                                  This GSA requires the following IAM roles:
++                                  - roles/compute.instanceAdmin.v1 (Compute Instance Admin - for managing network interfaces)
++                                  - roles/compute.networkUser (Compute Network User - for using subnets)
++                                  See cmd/infra/gcp/iam-bindings.json for the authoritative role definitions.
++                                  Format: service-account-name@project-id.iam.gserviceaccount.com
++
++                                  This is a user-provided value referencing a pre-created Google Service Account.
++                                  Typically obtained from the output of `hypershift infra create gcp` which creates
++                                  the required service accounts with appropriate IAM roles and WIF bindings.
++                                maxLength: 85
++                                minLength: 37
++                                type: string
++                                x-kubernetes-validations:
++                                - message: Network is immutable
++                                  rule: self == oldSelf
++                                - message: 'email must be a valid GCP service account
++                                    email (format: name@project.iam.gserviceaccount.com)'
++                                  rule: self.matches('^[a-z][a-z0-9-]{4,28}[a-z0-9]@[a-z][a-z0-9-]{4,28}[a-z0-9]\\.iam\\.gserviceaccount\\.com$')
+                               nodePool:
+                                 description: |-
+                                   nodePool is the Google Service Account email for CAPG controllers
+@@ -6384,6 +6406,7 @@ spec:
+                             - cloudController
+                             - controlPlane
+                             - imageRegistry
++                            - network
+                             - nodePool
+                             - storage
+                             type: object
+@@ -6426,6 +6449,9 @@ spec:
+                       rule: self.workloadIdentity.serviceAccountsEmails.imageRegistry.contains('@')
+                         && self.workloadIdentity.serviceAccountsEmails.imageRegistry.endsWith('@'
+                         + self.project + '.iam.gserviceaccount.com')
++                    - message: network service account must belong to the same project
++                      rule: self.workloadIdentity.serviceAccountsEmails.network.endsWith('@'
++                        + self.project + '.iam.gserviceaccount.com')
+                   ibmcloud:
+                     description: ibmcloud defines IBMCloud specific settings for components
+                     properties:
+diff --git a/cmd/install/assets/crds/hypershift-operator/zz_generated.crd-manifests/hostedcontrolplanes-Hypershift-TechPreviewNoUpgrade.crd.yaml b/cmd/install/assets/crds/hypershift-operator/zz_generated.crd-manifests/hostedcontrolplanes-Hypershift-TechPreviewNoUpgrade.crd.yaml
+index 42063effc66..9e455dcaf3b 100644
+--- a/cmd/install/assets/crds/hypershift-operator/zz_generated.crd-manifests/hostedcontrolplanes-Hypershift-TechPreviewNoUpgrade.crd.yaml
++++ b/cmd/install/assets/crds/hypershift-operator/zz_generated.crd-manifests/hostedcontrolplanes-Hypershift-TechPreviewNoUpgrade.crd.yaml
+@@ -6244,6 +6244,28 @@ spec:
+                                 - message: 'email must be a valid GCP service account
+                                     email (format: name@project.iam.gserviceaccount.com)'
+                                   rule: self.matches('^[a-z][a-z0-9-]{4,28}[a-z0-9]@[a-z][a-z0-9-]{4,28}[a-z0-9]\\.iam\\.gserviceaccount\\.com$')
++                              network:
++                                description: |-
++                                  network is the Google Service Account email for the Cloud Network Config Controller
++                                  that manages cloud-level network configurations (egress IPs, subnets).
++                                  This GSA requires the following IAM roles:
++                                  - roles/compute.instanceAdmin.v1 (Compute Instance Admin - for managing network interfaces)
++                                  - roles/compute.networkUser (Compute Network User - for using subnets)
++                                  See cmd/infra/gcp/iam-bindings.json for the authoritative role definitions.
++                                  Format: service-account-name@project-id.iam.gserviceaccount.com
++
++                                  This is a user-provided value referencing a pre-created Google Service Account.
++                                  Typically obtained from the output of `hypershift infra create gcp` which creates
++                                  the required service accounts with appropriate IAM roles and WIF bindings.
++                                maxLength: 85
++                                minLength: 37
++                                type: string
++                                x-kubernetes-validations:
++                                - message: Network is immutable
++                                  rule: self == oldSelf
++                                - message: 'email must be a valid GCP service account
++                                    email (format: name@project.iam.gserviceaccount.com)'
++                                  rule: self.matches('^[a-z][a-z0-9-]{4,28}[a-z0-9]@[a-z][a-z0-9-]{4,28}[a-z0-9]\\.iam\\.gserviceaccount\\.com$')
+                               nodePool:
+                                 description: |-
+                                   nodePool is the Google Service Account email for CAPG controllers
+@@ -6295,6 +6317,7 @@ spec:
+                             - cloudController
+                             - controlPlane
+                             - imageRegistry
++                            - network
+                             - nodePool
+                             - storage
+                             type: object
+@@ -6337,6 +6360,9 @@ spec:
+                       rule: self.workloadIdentity.serviceAccountsEmails.imageRegistry.contains('@')
+                         && self.workloadIdentity.serviceAccountsEmails.imageRegistry.endsWith('@'
+                         + self.project + '.iam.gserviceaccount.com')
++                    - message: network service account must belong to the same project
++                      rule: self.workloadIdentity.serviceAccountsEmails.network.endsWith('@'
++                        + self.project + '.iam.gserviceaccount.com')
+                   ibmcloud:
+                     description: ibmcloud defines IBMCloud specific settings for components
+                     properties:
+diff --git a/control-plane-operator/controllers/hostedcontrolplane/testdata/cluster-network-operator/GCP/zz_fixture_TestControlPlaneComponents_cluster_network_operator_deployment.yaml b/control-plane-operator/controllers/hostedcontrolplane/testdata/cluster-network-operator/GCP/zz_fixture_TestControlPlaneComponents_cluster_network_operator_deployment.yaml
+index ca8e4f005c7..fd972784ad8 100644
+--- a/control-plane-operator/controllers/hostedcontrolplane/testdata/cluster-network-operator/GCP/zz_fixture_TestControlPlaneComponents_cluster_network_operator_deployment.yaml
++++ b/control-plane-operator/controllers/hostedcontrolplane/testdata/cluster-network-operator/GCP/zz_fixture_TestControlPlaneComponents_cluster_network_operator_deployment.yaml
+@@ -154,6 +154,8 @@ spec:
+           value: metallb-frr
+         - name: PROXY_INTERNAL_APISERVER_ADDRESS
+           value: "true"
++        - name: GCP_CNCC_CREDENTIALS_FILE
++          value: application_default_credentials.json
+         image: cluster-network-operator
+         imagePullPolicy: IfNotPresent
+         name: cluster-network-operator
+diff --git a/control-plane-operator/controllers/hostedcontrolplane/v2/cno/deployment.go b/control-plane-operator/controllers/hostedcontrolplane/v2/cno/deployment.go
+index f216a5f5195..696805426e8 100644
+--- a/control-plane-operator/controllers/hostedcontrolplane/v2/cno/deployment.go
++++ b/control-plane-operator/controllers/hostedcontrolplane/v2/cno/deployment.go
+@@ -159,5 +159,14 @@ func buildCNOEnvVars(cpContext component.WorkloadContext) []corev1.EnvVar {
+ 		)
+ 	}
+ 
++	// For GCP deployments, we pass the credentials filename for the Cloud Network Config Controller.
++	// The CNO uses this to configure the CNCC deployment it manages in the management cluster.
++	if hcp.Spec.Platform.Type == hyperv1.GCPPlatform {
++		cnoEnv = append(cnoEnv, corev1.EnvVar{
++			Name:  "GCP_CNCC_CREDENTIALS_FILE",
++			Value: "application_default_credentials.json",
++		})
++	}
++
+ 	return cnoEnv
+ }
+diff --git a/docs/content/how-to/gcp/create-gcp-hosted-cluster.md b/docs/content/how-to/gcp/create-gcp-hosted-cluster.md
+index 47128ad4f53..ef738232267 100644
+--- a/docs/content/how-to/gcp/create-gcp-hosted-cluster.md
++++ b/docs/content/how-to/gcp/create-gcp-hosted-cluster.md
+@@ -33,6 +33,7 @@ hypershift create cluster gcp \
+   --cloud-controller-service-account=<cloud-controller-sa-email> \
+   --storage-service-account=<storage-sa-email> \
+   --image-registry-service-account=<image-registry-sa-email> \
++  --network-service-account=<network-sa-email> \
+   --service-account-signing-key-path=<path-to-sa-signer.key> \
+   --oidc-issuer-url=<oidc-issuer-url> \
+   --base-domain=<your-dns-domain> \
+@@ -72,6 +73,7 @@ hypershift create cluster gcp \
+ | `--cloud-controller-service-account` | Yes | Cloud Controller Manager SA email |
+ | `--storage-service-account` | Yes | GCP PD CSI Driver SA email |
+ | `--image-registry-service-account` | Yes | Image Registry Operator SA email |
++| `--network-service-account` | Yes | Cloud Network Config Controller SA email |
+ | `--service-account-signing-key-path` | Yes | Path to RSA private key for OIDC token signing |
+ | `--oidc-issuer-url` | Yes | OIDC issuer URL |
+ | `--node-pool-replicas` | Yes | Number of worker nodes (default: 0) |
+diff --git a/docs/content/how-to/gcp/create-gcp-iam.md b/docs/content/how-to/gcp/create-gcp-iam.md
+index e98122b7b90..88b181de045 100644
+--- a/docs/content/how-to/gcp/create-gcp-iam.md
++++ b/docs/content/how-to/gcp/create-gcp-iam.md
+@@ -58,6 +58,7 @@ The `hypershift create iam gcp` command creates WIF resources in the hosted clus
+   - `cloud-controller` — Cloud Controller Manager (load balancer admin, security admin, compute viewer)
+   - `storage` — GCP PD CSI Driver (storage admin, instance admin)
+   - `image-registry` — Image Registry Operator (storage admin)
++  - `cloud-network` — Cloud Network Config Controller (instance admin, network user)
+ 
+ ```bash
+ hypershift create iam gcp \
+@@ -108,7 +109,8 @@ The command outputs JSON with the WIF configuration:
+     "nodepool-mgmt": "my-cluster-nodepool-mgmt@my-hc-project.iam.gserviceaccount.com",
+     "cloud-controller": "my-cluster-cloud-controller@my-hc-project.iam.gserviceaccount.com",
+     "gcp-pd-csi": "my-cluster-gcp-pd-csi@my-hc-project.iam.gserviceaccount.com",
+-    "image-registry": "my-cluster-image-registry@my-hc-project.iam.gserviceaccount.com"
++    "image-registry": "my-cluster-image-registry@my-hc-project.iam.gserviceaccount.com",
++    "cloud-network": "my-cluster-cloud-network@my-hc-project.iam.gserviceaccount.com"
+   }
+ }
+ ```
+diff --git a/docs/content/reference/aggregated-docs.md b/docs/content/reference/aggregated-docs.md
+index 859d54d39b4..2d0e156e11d 100644
+--- a/docs/content/reference/aggregated-docs.md
++++ b/docs/content/reference/aggregated-docs.md
+@@ -17669,6 +17669,7 @@ hypershift create cluster gcp \
+   --cloud-controller-service-account=<cloud-controller-sa-email> \
+   --storage-service-account=<storage-sa-email> \
+   --image-registry-service-account=<image-registry-sa-email> \
++  --network-service-account=<network-sa-email> \
+   --service-account-signing-key-path=<path-to-sa-signer.key> \
+   --oidc-issuer-url=<oidc-issuer-url> \
+   --base-domain=<your-dns-domain> \
+@@ -17708,6 +17709,7 @@ hypershift create cluster gcp \
+ | `--cloud-controller-service-account` | Yes | Cloud Controller Manager SA email |
+ | `--storage-service-account` | Yes | GCP PD CSI Driver SA email |
+ | `--image-registry-service-account` | Yes | Image Registry Operator SA email |
++| `--network-service-account` | Yes | Cloud Network Config Controller SA email |
+ | `--service-account-signing-key-path` | Yes | Path to RSA private key for OIDC token signing |
+ | `--oidc-issuer-url` | Yes | OIDC issuer URL |
+ | `--node-pool-replicas` | Yes | Number of worker nodes (default: 0) |
+@@ -17859,6 +17861,7 @@ The `hypershift create iam gcp` command creates WIF resources in the hosted clus
+   - `cloud-controller` — Cloud Controller Manager (load balancer admin, security admin, compute viewer)
+   - `storage` — GCP PD CSI Driver (storage admin, instance admin)
+   - `image-registry` — Image Registry Operator (storage admin)
++  - `cloud-network` — Cloud Network Config Controller (instance admin, network user)
+ 
+ ```bash
+ hypershift create iam gcp \
+@@ -17909,7 +17912,8 @@ The command outputs JSON with the WIF configuration:
+     "nodepool-mgmt": "my-cluster-nodepool-mgmt@my-hc-project.iam.gserviceaccount.com",
+     "cloud-controller": "my-cluster-cloud-controller@my-hc-project.iam.gserviceaccount.com",
+     "gcp-pd-csi": "my-cluster-gcp-pd-csi@my-hc-project.iam.gserviceaccount.com",
+-    "image-registry": "my-cluster-image-registry@my-hc-project.iam.gserviceaccount.com"
++    "image-registry": "my-cluster-image-registry@my-hc-project.iam.gserviceaccount.com",
++    "cloud-network": "my-cluster-cloud-network@my-hc-project.iam.gserviceaccount.com"
+   }
+ }
+ ```
+@@ -38921,6 +38925,28 @@ Typically obtained from the output of <code>hypershift infra create gcp</code> w
+ the required service accounts with appropriate IAM roles and WIF bindings.</p>
+ </td>
+ </tr>
++<tr>
++<td>
++<code>network</code></br>
++<em>
++<a href="#hypershift.openshift.io/v1beta1.GCPServiceAccountEmail">
++GCPServiceAccountEmail
++</a>
++</em>
++</td>
++<td>
++<p>network is the Google Service Account email for the Cloud Network Config Controller
++that manages cloud-level network configurations (egress IPs, subnets).
++This GSA requires the following IAM roles:
++- roles/compute.instanceAdmin.v1 (Compute Instance Admin - for managing network interfaces)
++- roles/compute.networkUser (Compute Network User - for using subnets)
++See cmd/infra/gcp/iam-bindings.json for the authoritative role definitions.
++Format: service-account-name@project-id.iam.gserviceaccount.com</p>
++<p>This is a user-provided value referencing a pre-created Google Service Account.
++Typically obtained from the output of <code>hypershift infra create gcp</code> which creates
++the required service accounts with appropriate IAM roles and WIF bindings.</p>
++</td>
++</tr>
+ </tbody>
+ </table>
+ ###GCPWorkloadIdentityConfig { #hypershift.openshift.io/v1beta1.GCPWorkloadIdentityConfig }
+diff --git a/docs/content/reference/api.md b/docs/content/reference/api.md
+index 1d6c5b273a4..b430388c941 100644
+--- a/docs/content/reference/api.md
++++ b/docs/content/reference/api.md
+@@ -7963,6 +7963,28 @@ Typically obtained from the output of <code>hypershift infra create gcp</code> w
+ the required service accounts with appropriate IAM roles and WIF bindings.</p>
+ </td>
+ </tr>
++<tr>
++<td>
++<code>network</code></br>
++<em>
++<a href="#hypershift.openshift.io/v1beta1.GCPServiceAccountEmail">
++GCPServiceAccountEmail
++</a>
++</em>
++</td>
++<td>
++<p>network is the Google Service Account email for the Cloud Network Config Controller
++that manages cloud-level network configurations (egress IPs, subnets).
++This GSA requires the following IAM roles:
++- roles/compute.instanceAdmin.v1 (Compute Instance Admin - for managing network interfaces)
++- roles/compute.networkUser (Compute Network User - for using subnets)
++See cmd/infra/gcp/iam-bindings.json for the authoritative role definitions.
++Format: service-account-name@project-id.iam.gserviceaccount.com</p>
++<p>This is a user-provided value referencing a pre-created Google Service Account.
++Typically obtained from the output of <code>hypershift infra create gcp</code> which creates
++the required service accounts with appropriate IAM roles and WIF bindings.</p>
++</td>
++</tr>
+ </tbody>
+ </table>
+ ###GCPWorkloadIdentityConfig { #hypershift.openshift.io/v1beta1.GCPWorkloadIdentityConfig }
+diff --git a/hypershift-operator/controllers/hostedcluster/internal/platform/gcp/gcp.go b/hypershift-operator/controllers/hostedcluster/internal/platform/gcp/gcp.go
+index 1b8b0cf2432..6dcac87cd04 100644
+--- a/hypershift-operator/controllers/hostedcluster/internal/platform/gcp/gcp.go
++++ b/hypershift-operator/controllers/hostedcluster/internal/platform/gcp/gcp.go
+@@ -344,6 +344,7 @@ func (p GCP) ReconcileCredentials(ctx context.Context, c client.Client, createOr
+ 		hcluster.Spec.Platform.GCP.WorkloadIdentity.ServiceAccountsEmails.CloudController: CloudControllerCredsSecret(controlPlaneNamespace),
+ 		hcluster.Spec.Platform.GCP.WorkloadIdentity.ServiceAccountsEmails.Storage:         GCPPDCloudCredentialsSecret(controlPlaneNamespace),
+ 		hcluster.Spec.Platform.GCP.WorkloadIdentity.ServiceAccountsEmails.ImageRegistry:   ImageRegistryCredsSecret(controlPlaneNamespace),
++		hcluster.Spec.Platform.GCP.WorkloadIdentity.ServiceAccountsEmails.Network:         CNCCCredsSecret(controlPlaneNamespace),
+ 	}
+ 
+ 	for email, secret := range credentialSecrets {
+@@ -426,6 +427,19 @@ func ImageRegistryCredsSecret(controlPlaneNamespace string) *corev1.Secret {
+ 	}
+ }
+ 
++// CNCCCredsSecret returns the secret containing Workload Identity Federation credentials
++// for the Cloud Network Config Controller to manage cloud-level network configurations.
++// The secret name is hardcoded in the CNO managed template:
++// https://github.com/openshift/cluster-network-operator/blob/bc5af87/bindata/cloud-network-config-controller/managed/controller.yaml#L253
++func CNCCCredsSecret(controlPlaneNamespace string) *corev1.Secret {
++	return &corev1.Secret{
++		ObjectMeta: metav1.ObjectMeta{
++			Namespace: controlPlaneNamespace,
++			Name:      "cloud-network-config-controller-creds",
++		},
++	}
++}
++
+ // gcpCredentialSource represents the credential source configuration for GCP external account credentials.
+ type gcpCredentialSource struct {
+ 	File   string                    `json:"file"`
+@@ -574,6 +588,10 @@ func (p GCP) validateWorkloadIdentityConfiguration(hcluster *hyperv1.HostedClust
+ 		return fmt.Errorf("image registry service account email is required")
+ 	}
+ 
++	if wif.ServiceAccountsEmails.Network == "" {
++		return fmt.Errorf("network service account email is required")
++	}
++
+ 	return nil
+ }
+ 
+diff --git a/hypershift-operator/controllers/hostedcluster/internal/platform/gcp/gcp_test.go b/hypershift-operator/controllers/hostedcluster/internal/platform/gcp/gcp_test.go
+index d06e495209a..d35a8f35d52 100644
+--- a/hypershift-operator/controllers/hostedcluster/internal/platform/gcp/gcp_test.go
++++ b/hypershift-operator/controllers/hostedcluster/internal/platform/gcp/gcp_test.go
+@@ -28,6 +28,7 @@ const (
+ 	testCloudControllerGSA hyperv1.GCPServiceAccountEmail = "test-cloud-controller@test-project.iam.gserviceaccount.com"
+ 	testStorageGSA         hyperv1.GCPServiceAccountEmail = "test-storage@test-project.iam.gserviceaccount.com"
+ 	testImageRegistryGSA   hyperv1.GCPServiceAccountEmail = "test-image-registry@test-project.iam.gserviceaccount.com"
++	testNetworkGSA         hyperv1.GCPServiceAccountEmail = "test-network-sa@test-project.iam.gserviceaccount.com"
+ )
+ 
+ // testCreateOrUpdate is a test helper that implements createOrUpdate functionality
+@@ -93,6 +94,7 @@ func validHostedCluster() *hyperv1.HostedCluster {
+ 							CloudController: testCloudControllerGSA,
+ 							Storage:         testStorageGSA,
+ 							ImageRegistry:   testImageRegistryGSA,
++							Network:         testNetworkGSA,
+ 						},
+ 					},
+ 				},
+@@ -306,6 +308,7 @@ func TestBuildGCPWorkloadIdentityCredentials(t *testing.T) {
+ 			CloudController: testCloudControllerGSA,
+ 			Storage:         testStorageGSA,
+ 			ImageRegistry:   testImageRegistryGSA,
++			Network:         testNetworkGSA,
+ 		},
+ 	}
+ 
+@@ -336,6 +339,7 @@ func TestBuildGCPWorkloadIdentityCredentialsValidation(t *testing.T) {
+ 				CloudController: testCloudControllerGSA,
+ 				Storage:         testStorageGSA,
+ 				ImageRegistry:   testImageRegistryGSA,
++				Network:         testNetworkGSA,
+ 			},
+ 		}
+ 	}
+@@ -439,6 +443,13 @@ func TestValidateWorkloadIdentityConfiguration(t *testing.T) {
+ 			},
+ 			errorMsg: "image registry service account email is required",
+ 		},
++		{
++			name: "missing network service account email",
++			mutate: func(hc *hyperv1.HostedCluster) {
++				hc.Spec.Platform.GCP.WorkloadIdentity.ServiceAccountsEmails.Network = ""
++			},
++			errorMsg: "network service account email is required",
++		},
+ 	}
+ 
+ 	for _, tt := range tests {
+diff --git a/test/e2e/e2e_test.go b/test/e2e/e2e_test.go
+index e1dd60dbb2c..a8928aaca5b 100644
+--- a/test/e2e/e2e_test.go
++++ b/test/e2e/e2e_test.go
+@@ -177,6 +177,7 @@ func TestMain(m *testing.M) {
+ 	flag.StringVar(&globalOpts.ConfigurableClusterOptions.GCPCloudControllerServiceAccount, "e2e.gcp-cloudcontroller-sa", "", "Service Account for Cloud Controller Manager")
+ 	flag.StringVar(&globalOpts.ConfigurableClusterOptions.GCPStorageServiceAccount, "e2e.gcp-storage-sa", "", "Service Account for GCP PD CSI Driver")
+ 	flag.StringVar(&globalOpts.ConfigurableClusterOptions.GCPImageRegistryServiceAccount, "e2e.gcp-imageregistry-sa", "", "Service Account for Image Registry Operator")
++	flag.StringVar(&globalOpts.ConfigurableClusterOptions.GCPNetworkServiceAccount, "e2e.gcp-network-sa", "", "Service Account for Cloud Network Config Controller")
+ 	flag.StringVar(&globalOpts.ConfigurableClusterOptions.GCPServiceAccountSigningKeyPath, "e2e.gcp-sa-signing-key-path", "", "Path to the private key file for the GCP service account token issuer")
+ 	flag.StringVar(&globalOpts.ConfigurableClusterOptions.GCPEndpointAccess, "e2e.gcp-endpoint-access", string(hyperv1.GCPEndpointAccessPrivate), "GCP endpoint access type: Private or PublicAndPrivate")
+ 	flag.StringVar(&globalOpts.ConfigurableClusterOptions.GCPIssuerURL, "e2e.gcp-oidc-issuer-url", "", "The OIDC provider issuer URL for GCP")
+diff --git a/test/e2e/util/options.go b/test/e2e/util/options.go
+index 7e540124bcc..fe8a3c4f487 100644
+--- a/test/e2e/util/options.go
++++ b/test/e2e/util/options.go
+@@ -196,6 +196,7 @@ type ConfigurableClusterOptions struct {
+ 	GCPCloudControllerServiceAccount string
+ 	GCPStorageServiceAccount         string
+ 	GCPImageRegistryServiceAccount   string
++	GCPNetworkServiceAccount         string
+ 	GCPServiceAccountSigningKeyPath  string
+ 	GCPEndpointAccess                string
+ 	GCPIssuerURL                     string
+@@ -457,6 +458,7 @@ func (o *Options) DefaultGCPOptions() hypershiftgcp.RawCreateOptions {
+ 		CloudControllerServiceAccount: o.ConfigurableClusterOptions.GCPCloudControllerServiceAccount,
+ 		StorageServiceAccount:         o.ConfigurableClusterOptions.GCPStorageServiceAccount,
+ 		ImageRegistryServiceAccount:   o.ConfigurableClusterOptions.GCPImageRegistryServiceAccount,
++		NetworkServiceAccount:         o.ConfigurableClusterOptions.GCPNetworkServiceAccount,
+ 		ServiceAccountSigningKeyPath:  o.ConfigurableClusterOptions.GCPServiceAccountSigningKeyPath,
+ 		EndpointAccess:                o.ConfigurableClusterOptions.GCPEndpointAccess,
+ 		IssuerURL:                     o.ConfigurableClusterOptions.GCPIssuerURL,
+diff --git a/vendor/github.com/openshift/hypershift/api/hypershift/v1beta1/gcp.go b/vendor/github.com/openshift/hypershift/api/hypershift/v1beta1/gcp.go
+index e4ec6cac96d..ea22d5ea433 100644
+--- a/vendor/github.com/openshift/hypershift/api/hypershift/v1beta1/gcp.go
++++ b/vendor/github.com/openshift/hypershift/api/hypershift/v1beta1/gcp.go
+@@ -105,6 +105,7 @@ type GCPNetworkConfig struct {
+ // +kubebuilder:validation:XValidation:rule="self.workloadIdentity.serviceAccountsEmails.cloudController.contains('@') && self.workloadIdentity.serviceAccountsEmails.cloudController.endsWith('@' + self.project + '.iam.gserviceaccount.com')",message="cloudController service account must belong to the same project"
+ // +kubebuilder:validation:XValidation:rule="self.workloadIdentity.serviceAccountsEmails.storage.contains('@') && self.workloadIdentity.serviceAccountsEmails.storage.endsWith('@' + self.project + '.iam.gserviceaccount.com')",message="storage service account must belong to the same project"
+ // +kubebuilder:validation:XValidation:rule="self.workloadIdentity.serviceAccountsEmails.imageRegistry.contains('@') && self.workloadIdentity.serviceAccountsEmails.imageRegistry.endsWith('@' + self.project + '.iam.gserviceaccount.com')",message="imageRegistry service account must belong to the same project"
++// +kubebuilder:validation:XValidation:rule="self.workloadIdentity.serviceAccountsEmails.network.endsWith('@' + self.project + '.iam.gserviceaccount.com')",message="network service account must belong to the same project"
+ type GCPPlatformSpec struct {
+ 	// project is the GCP project ID.
+ 	// A valid project ID must satisfy the following rules:
+@@ -357,6 +358,22 @@ type GCPServiceAccountsEmails struct {
+ 	// +immutable
+ 	// +kubebuilder:validation:XValidation:rule="self == oldSelf",message="ImageRegistry is immutable"
+ 	ImageRegistry GCPServiceAccountEmail `json:"imageRegistry,omitempty"`
++
++	// network is the Google Service Account email for the Cloud Network Config Controller
++	// that manages cloud-level network configurations (egress IPs, subnets).
++	// This GSA requires the following IAM roles:
++	// - roles/compute.instanceAdmin.v1 (Compute Instance Admin - for managing network interfaces)
++	// - roles/compute.networkUser (Compute Network User - for using subnets)
++	// See cmd/infra/gcp/iam-bindings.json for the authoritative role definitions.
++	// Format: service-account-name@project-id.iam.gserviceaccount.com
++	//
++	// This is a user-provided value referencing a pre-created Google Service Account.
++	// Typically obtained from the output of `hypershift infra create gcp` which creates
++	// the required service accounts with appropriate IAM roles and WIF bindings.
++	//
++	// +required
++	// +kubebuilder:validation:XValidation:rule="self == oldSelf",message="Network is immutable"
++	Network GCPServiceAccountEmail `json:"network,omitempty"`
+ }
+ 
+ // GCPOnHostMaintenance defines the behavior when a host maintenance event occurs.

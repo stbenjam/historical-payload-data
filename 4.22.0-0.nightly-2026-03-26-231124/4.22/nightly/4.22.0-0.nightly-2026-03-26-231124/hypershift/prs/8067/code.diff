@@ -1,0 +1,187 @@
+diff --git a/support/supportedversion/version.go b/support/supportedversion/version.go
+index 4394fc67ba9..84c7262c133 100644
+--- a/support/supportedversion/version.go
++++ b/support/supportedversion/version.go
+@@ -300,6 +300,23 @@ func GetSupportedOCPVersions(ctx context.Context, namespace string, client crcli
+ 	}
+ }
+ 
++// GetLatestSupportedOCPVersion returns the latest supported OCP version advertised
++// by the HyperShift operator's supported-versions ConfigMap in the "hypershift" namespace.
++func GetLatestSupportedOCPVersion(ctx context.Context, client crclient.Client) (semver.Version, error) {
++	supportedVersions, _, err := GetSupportedOCPVersions(ctx, "hypershift", client, nil)
++	if err != nil {
++		return semver.Version{}, err
++	}
++	if len(supportedVersions.Versions) == 0 {
++		return semver.Version{}, fmt.Errorf("no supported OCP versions found")
++	}
++	latest, err := semver.Parse(supportedVersions.Versions[0] + ".0")
++	if err != nil {
++		return semver.Version{}, fmt.Errorf("failed to parse version %q: %w", supportedVersions.Versions[0], err)
++	}
++	return latest, nil
++}
++
+ type ocpTags struct {
+ 	Name string       `json:"name"`
+ 	Tags []ocpVersion `json:"tags"`
+diff --git a/support/supportedversion/version_test.go b/support/supportedversion/version_test.go
+index 1d7f11b623d..e3cea91ade3 100644
+--- a/support/supportedversion/version_test.go
++++ b/support/supportedversion/version_test.go
+@@ -985,3 +985,125 @@ func TestFindLatestSupportedVersionWithSorting(t *testing.T) {
+ 		})
+ 	}
+ }
++
++func TestGetLatestSupportedOCPVersion(t *testing.T) {
++	validVersions := SupportedVersions{
++		Versions: []string{"4.22", "4.21", "4.20"},
++	}
++	validVersionsJSON, err := json.Marshal(validVersions)
++	if err != nil {
++		t.Fatalf("failed to marshal valid versions: %v", err)
++	}
++
++	validCM := func(namespace string) *corev1.ConfigMap {
++		return &corev1.ConfigMap{
++			ObjectMeta: metav1.ObjectMeta{
++				Name:      "supported-versions",
++				Namespace: namespace,
++				Labels:    map[string]string{"hypershift.openshift.io/supported-versions": "true"},
++			},
++			Data: map[string]string{
++				config.ConfigMapVersionsKey:      string(validVersionsJSON),
++				config.ConfigMapServerVersionKey: "test-server-version",
++			},
++		}
++	}
++
++	testCases := []struct {
++		name            string
++		objects         []client.Object
++		expectErr       bool
++		expectedErrMsg  string
++		expectedVersion string
++	}{
++		{
++			name:            "When a valid ConfigMap exists it should return the latest version",
++			objects:         []client.Object{validCM("hypershift")},
++			expectedVersion: "4.22.0",
++		},
++		{
++			name:           "When the ConfigMap is in a non-default namespace it should return an error",
++			objects:        []client.Object{validCM("custom-namespace")},
++			expectErr:      true,
++			expectedErrMsg: "failed to find supported versions on the server",
++		},
++		{
++			name:           "When no ConfigMap exists it should return an error",
++			objects:        []client.Object{},
++			expectErr:      true,
++			expectedErrMsg: "failed to find supported versions on the server",
++		},
++		{
++			name: "When the versions list is empty it should return an error",
++			objects: []client.Object{
++				&corev1.ConfigMap{
++					ObjectMeta: metav1.ObjectMeta{
++						Name:      "supported-versions",
++						Namespace: "hypershift",
++						Labels:    map[string]string{"hypershift.openshift.io/supported-versions": "true"},
++					},
++					Data: map[string]string{
++						config.ConfigMapVersionsKey:      `{"versions": []}`,
++						config.ConfigMapServerVersionKey: "test-server-version",
++					},
++				},
++			},
++			expectErr:      true,
++			expectedErrMsg: "no supported OCP versions found",
++		},
++		{
++			name: "When the version string is unparsable it should return an error",
++			objects: []client.Object{
++				&corev1.ConfigMap{
++					ObjectMeta: metav1.ObjectMeta{
++						Name:      "supported-versions",
++						Namespace: "hypershift",
++						Labels:    map[string]string{"hypershift.openshift.io/supported-versions": "true"},
++					},
++					Data: map[string]string{
++						config.ConfigMapVersionsKey:      `{"versions": ["not-a-version"]}`,
++						config.ConfigMapServerVersionKey: "test-server-version",
++					},
++				},
++			},
++			expectErr:      true,
++			expectedErrMsg: "failed to parse version",
++		},
++		{
++			name: "When the ConfigMap has no label it should still be found by name and namespace",
++			objects: []client.Object{
++				&corev1.ConfigMap{
++					ObjectMeta: metav1.ObjectMeta{
++						Name:      "supported-versions",
++						Namespace: "hypershift",
++					},
++					Data: map[string]string{
++						config.ConfigMapVersionsKey:      string(validVersionsJSON),
++						config.ConfigMapServerVersionKey: "test-server-version",
++					},
++				},
++			},
++			expectedVersion: "4.22.0",
++		},
++	}
++
++	for _, tc := range testCases {
++		t.Run(tc.name, func(t *testing.T) {
++			g := NewGomegaWithT(t)
++
++			scheme := api.Scheme
++			g.Expect(corev1.AddToScheme(scheme)).To(Succeed())
++			fakeClient := fake.NewClientBuilder().WithScheme(scheme).WithObjects(tc.objects...).Build()
++
++			version, err := GetLatestSupportedOCPVersion(t.Context(), fakeClient)
++
++			if tc.expectErr {
++				g.Expect(err).To(HaveOccurred())
++				g.Expect(err.Error()).To(ContainSubstring(tc.expectedErrMsg))
++			} else {
++				g.Expect(err).ToNot(HaveOccurred())
++				g.Expect(version.String()).To(Equal(tc.expectedVersion))
++			}
++		})
++	}
++}
+diff --git a/test/e2e/v2/tests/backup_restore_test.go b/test/e2e/v2/tests/backup_restore_test.go
+index 12bc30d8ff8..7adcbf6933d 100644
+--- a/test/e2e/v2/tests/backup_restore_test.go
++++ b/test/e2e/v2/tests/backup_restore_test.go
+@@ -26,6 +26,7 @@ import (
+ 	hyperv1 "github.com/openshift/hypershift/api/hypershift/v1beta1"
+ 	"github.com/openshift/hypershift/cmd/oadp"
+ 	"github.com/openshift/hypershift/support/conditions"
++	"github.com/openshift/hypershift/support/supportedversion"
+ 	"github.com/openshift/hypershift/test/e2e/util"
+ 	"github.com/openshift/hypershift/test/e2e/v2/backuprestore"
+ 	"github.com/openshift/hypershift/test/e2e/v2/internal"
+@@ -135,7 +136,15 @@ var _ = Describe("BackupRestore", Label("backup-restore"), Ordered, Serial, func
+ 			nodePool, err := getNodePool(testCtx)
+ 			Expect(err).NotTo(HaveOccurred())
+ 			Expect(nodePool).NotTo(BeNil())
+-			for conditionType, conditionStatus := range conditions.ExpectedNodePoolConditions(nodePool) {
++			npConditions := conditions.ExpectedNodePoolConditions(nodePool)
++
++			latestVersion, err := supportedversion.GetLatestSupportedOCPVersion(testCtx.Context, testCtx.MgmtClient)
++			Expect(err).NotTo(HaveOccurred())
++			if latestVersion.LT(util.Version421) {
++				delete(npConditions, hyperv1.NodePoolSupportedVersionSkewConditionType)
++			}
++
++			for conditionType, conditionStatus := range npConditions {
+ 				expectedConditions = append(expectedConditions, util.Condition{
+ 					Type:   conditionType,
+ 					Status: metav1.ConditionStatus(conditionStatus),

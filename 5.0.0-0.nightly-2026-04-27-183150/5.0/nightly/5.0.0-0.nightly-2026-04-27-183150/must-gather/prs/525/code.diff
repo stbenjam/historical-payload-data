@@ -1,0 +1,1176 @@
+diff --git a/Makefile b/Makefile
+index dd5a82b6..2cb03f5d 100644
+--- a/Makefile
++++ b/Makefile
+@@ -39,7 +39,7 @@ SCRIPT_DIRS := collection-scripts/ hack/ tests/
+ 
+ .PHONY: lint
+ lint: shellcheck
+-	$(SHELLCHECK) -x ./**/*.sh
++	find $(SCRIPT_DIRS) -type f -exec grep -Eq '^#!/' {} \; -exec $(SHELLCHECK) -x {} +
+ 
+ .PHONY: fmt
+ fmt: shfmt
+diff --git a/collection-scripts/gather b/collection-scripts/gather
+index dadeb1cc..e844711b 100755
+--- a/collection-scripts/gather
++++ b/collection-scripts/gather
+@@ -1,11 +1,13 @@
+ #!/bin/bash
+ 
+ # generate /must-gather/version file
++# shellcheck disable=SC1091
+ . version
+ echo "openshift/must-gather" >/must-gather/version
+ version >>/must-gather/version
+ 
+-source $(dirname "$0")/common.sh
++# shellcheck source=collection-scripts/common.sh
++source "$(dirname "$0")/common.sh"
+ get_log_collection_args
+ 
+ # Store PIDs of all the subprocesses
+@@ -61,12 +63,14 @@ group_resources+=(clusterresourcequotas.quota.openshift.io)
+ 
+ # Run the Collection of Resources using inspect
+ # running across all-namespaces for the few "Autoscaler" resources.
++# shellcheck disable=SC2086
+ oc adm inspect ${log_collection_args} --dest-dir must-gather ${rotated_pod_logs_arg} "${named_resources[@]}" &
+ pids+=($!)
+ 
+ filtered_group_resources=()
+ for gr in "${group_resources[@]}"; do
+ 	oc get "$gr" >/dev/null 2>&1
++	# shellcheck disable=SC2181
+ 	if [[ "$?" -eq 0 ]]; then
+ 		filtered_group_resources+=("$gr")
+ 	fi
+@@ -75,6 +79,7 @@ group_resources_text=$(
+ 	IFS=,
+ 	echo "${filtered_group_resources[*]}"
+ )
++# shellcheck disable=SC2086
+ oc adm inspect ${log_collection_args} --dest-dir must-gather ${rotated_pod_logs_arg} "${group_resources_text}" &
+ pids+=($!)
+ 
+@@ -82,6 +87,7 @@ all_ns_resources_text=$(
+ 	IFS=,
+ 	echo "${all_ns_resources[*]}"
+ )
++# shellcheck disable=SC2086
+ oc adm inspect ${log_collection_args} --dest-dir must-gather ${rotated_pod_logs_arg} "${all_ns_resources_text}" --all-namespaces &
+ pids+=($!)
+ 
+diff --git a/collection-scripts/gather_apirequestcounts b/collection-scripts/gather_apirequestcounts
+index 7ee3f92d..8d520bbc 100755
+--- a/collection-scripts/gather_apirequestcounts
++++ b/collection-scripts/gather_apirequestcounts
+@@ -2,13 +2,13 @@
+ BASE_COLLECTION_PATH=${BASE_COLLECTION_PATH:-"/must-gather"}
+ TARGET_PATH="${BASE_COLLECTION_PATH}/requests/"
+ 
+-mkdir -p ${TARGET_PATH}
++mkdir -p "${TARGET_PATH}"
+ 
+ echo "Getting apirequestcounts"
+-oc get apirequestcounts -o json >${TARGET_PATH}/apirequestscounts.json
++oc get apirequestcounts -o json >"${TARGET_PATH}/apirequestscounts.json"
+ 
+ echo "Calculating top20 resources"
+-jq -r '.items | map({"name":.metadata.name, "requestCount": .status.requestCount}) | sort_by(-.requestCount)[:20][] | "\(.requestCount): \(.name)"' ${TARGET_PATH}/apirequestscounts.json >${TARGET_PATH}/top20-resources-last24h
++jq -r '.items | map({"name":.metadata.name, "requestCount": .status.requestCount}) | sort_by(-.requestCount)[:20][] | "\(.requestCount): \(.name)"' "${TARGET_PATH}/apirequestscounts.json" >"${TARGET_PATH}/top20-resources-last24h"
+ 
+ echo "Calculating top20 users"
+ jq -r '.items | map(
+@@ -18,4 +18,4 @@ jq -r '.items | map(
+     reduce .[] as $username ({"requestCount":0}; {"username":$username.username, "requestCount":(.requestCount + $username.requestCount)})
+   ) | map(. + {"resource":$resource})) | flatten |
+   sort_by(-.requestCount)[:20][] |
+-  "\(.requestCount): \(.username) \(.resource)"' ${TARGET_PATH}/apirequestscounts.json >${TARGET_PATH}/top20-users-last24h
++  "\(.requestCount): \(.username) \(.resource)"' "${TARGET_PATH}/apirequestscounts.json" >"${TARGET_PATH}/top20-users-last24h"
+diff --git a/collection-scripts/gather_aro b/collection-scripts/gather_aro
+index 4b2a2f9d..4c991677 100755
+--- a/collection-scripts/gather_aro
++++ b/collection-scripts/gather_aro
+@@ -9,7 +9,7 @@ fi
+ 
+ function gather_aro() {
+ 	echo "INFO: Collecting ARO Cluster Data"
+-	declare -a INSPECT_TARGETS=(${ARO_CR_NAME} "ns/openshift-azure-operator" "ns/openshift-azure-logging")
++	declare -a INSPECT_TARGETS=("${ARO_CR_NAME}" "ns/openshift-azure-operator" "ns/openshift-azure-logging")
+ 
+ 	for TARGET in "${INSPECT_TARGETS[@]}"; do
+ 		oc adm inspect --dest-dir "${BASE_COLLECTION_PATH}" "${TARGET}"
+diff --git a/collection-scripts/gather_audit_logs b/collection-scripts/gather_audit_logs
+index 9284ed35..87e5a275 100755
+--- a/collection-scripts/gather_audit_logs
++++ b/collection-scripts/gather_audit_logs
+@@ -3,7 +3,8 @@
+ # /var/logs/{kube-apiserver,openshift-apiserver} on each
+ # master node.
+ 
+-source $(dirname "$0")/common.sh
++# shellcheck source=collection-scripts/common.sh
++source "$(dirname "$0")/common.sh"
+ get_log_collection_args
+ 
+ BASE_COLLECTION_PATH="${BASE_COLLECTION_PATH:-/must-gather}"
+@@ -38,6 +39,7 @@ echo "WARNING: Collecting one or more audit logs on ALL masters in your cluster.
+ # $4 - log file name
+ # $5 - --since=ISO time, if provided via MUST_GATHER_SINCE_TIME
+ paths=(openshift-apiserver kube-apiserver oauth-apiserver etcd oauth-server)
++# shellcheck disable=SC2016
+ for path in "${paths[@]}"; do
+ 	output_dir="${BASE_COLLECTION_PATH}/audit_logs/$path"
+ 	mkdir -p "$output_dir"
+diff --git a/collection-scripts/gather_core_dumps b/collection-scripts/gather_core_dumps
+index c25d6996..6870f8aa 100755
+--- a/collection-scripts/gather_core_dumps
++++ b/collection-scripts/gather_core_dumps
+@@ -22,7 +22,7 @@ function get_dump_off_node {
+ 	else
+ 		#Copy Core Dumps out of Nodes suppress Stdout
+ 		echo "Copying core dumps on node ""$1"""
+-		oc cp --loglevel 1 -n "default" "$debugPod":/host/var/lib/systemd/coredump "${CORE_DUMP_PATH}"/"$1"_core_dump >/dev/null 2>&1 && PIDS+=($!)
++		oc cp --loglevel 1 -n "default" "$debugPod":/host/var/lib/systemd/coredump "${CORE_DUMP_PATH}/${1}_core_dump" >/dev/null 2>&1 && PIDS+=($!)
+ 
+ 		#clean up debug pod after we are done using them
+ 		oc delete pod "$debugPod" -n "default"
+diff --git a/collection-scripts/gather_etcd b/collection-scripts/gather_etcd
+index 5846d54d..f58668fc 100755
+--- a/collection-scripts/gather_etcd
++++ b/collection-scripts/gather_etcd
+@@ -62,7 +62,7 @@ PIDS+=($!)
+ 
+ # object count and size
+ echo "INFO: Getting object count and size"
+-ocp4etcd "etcdctl get / --prefix --keys-only | grep -oE \"^/[a-z|.]+/[a-z|.|8]*\" | sort | uniq -c | sort -rn | while read KEY; do printf \"\$KEY\\t\" && etcdctl get \${KEY##* } --prefix --print-value-only | wc -c | numfmt --to=iec ; done | sort -k3 -hr | column -J -n \"etcd_resources\" -N \"object_count,object_name,object_size\"" | jq -c > ${ETCD_LOG_PATH}/object_count.json &
++ocp4etcd "etcdctl get / --prefix --keys-only | grep -oE \"^/[a-z|.]+/[a-z|.|8]*\" | sort | uniq -c | sort -rn | while read KEY; do printf \"\$KEY\\t\" && etcdctl get \${KEY##* } --prefix --print-value-only | wc -c | numfmt --to=iec ; done | sort -k3 -hr | column -J -n \"etcd_resources\" -N \"object_count,object_name,object_size\"" | jq -c >${ETCD_LOG_PATH}/object_count.json &
+ PIDS+=($!)
+ 
+ echo "INFO: Waiting for etcd info collection to complete ..."
+diff --git a/collection-scripts/gather_etcd_more b/collection-scripts/gather_etcd_more
+index 5bbe43bc..f406a75f 100755
+--- a/collection-scripts/gather_etcd_more
++++ b/collection-scripts/gather_etcd_more
+@@ -5,7 +5,8 @@ set -o nounset
+ set -o errexit
+ set -o pipefail
+ 
+-source "$(dirname "$0")"/monitoring_common.sh
++# shellcheck source=collection-scripts/monitoring_common.sh
++source "$(dirname "$0")/monitoring_common.sh"
+ 
+ MIN_TIME="$(date -d '24 hours ago' +%s%3N)"
+ 
+@@ -17,13 +18,14 @@ ETCDCTL_CONTAINER='etcdctl'
+ ALL_RUNNING_ETCD_PODS=$(oc get pod -n openshift-etcd --no-headers -l app=etcd | grep Running | grep -o '\S*etcd\S*')
+ CEO_POD=$(oc get pods -n openshift-etcd-operator -l app=etcd-operator --no-headers | awk '{print $1}')
+ 
+-mkdir -p ${ETCD_LOG_PATH}
++mkdir -p "${ETCD_LOG_PATH}"
+ 
++# shellcheck disable=SC2120
+ function ocp4ip {
+ 	for pod in ${ALL_RUNNING_ETCD_PODS}; do
+-		mkdir -p ${ETCD_LOG_PATH}/${pod}
++		mkdir -p "${ETCD_LOG_PATH}/${pod}"
+ 		echo "INFO: Gathering interface stats from pod ${pod}"
+-		oc -n openshift-etcd exec -c "${ETCDCTL_CONTAINER}" "${pod}" -- ip -s link show "$@" >${ETCD_LOG_PATH}/${pod}/interface_stats.txt || true
++		oc -n openshift-etcd exec -c "${ETCDCTL_CONTAINER}" "${pod}" -- ip -s link show "$@" >"${ETCD_LOG_PATH}/${pod}/interface_stats.txt" || true
+ 	done
+ }
+ 
+@@ -47,6 +49,7 @@ PIDS+=($!)
+ 
+ # interface stats
+ echo "INFO: Getting interface stats"
++# shellcheck disable=SC2119
+ ocp4ip &
+ PIDS+=($!)
+ 
+diff --git a/collection-scripts/gather_frrk8s b/collection-scripts/gather_frrk8s
+index 15357a2b..d4c5c25f 100755
+--- a/collection-scripts/gather_frrk8s
++++ b/collection-scripts/gather_frrk8s
+@@ -1,6 +1,7 @@
+ #!/bin/bash
+ 
+-source $(dirname "$0")/common.sh
++# shellcheck source=collection-scripts/common.sh
++source "$(dirname "$0")/common.sh"
+ BASE_COLLECTION_PATH="must-gather"
+ get_log_collection_args
+ FRRK8S_NS="openshift-frr-k8s"
+@@ -10,6 +11,7 @@ function get_frrk8s_crs() {
+ 	declare -a FRRK8S_CRDS=("frrconfiguration" "frrnodestate")
+ 
+ 	for CRD in "${FRRK8S_CRDS[@]}"; do
++		# shellcheck disable=SC2086
+ 		oc adm inspect ${log_collection_args} --dest-dir "${BASE_COLLECTION_PATH}" -n ${FRRK8S_NS} "${CRD}"
+ 	done
+ }
+@@ -20,12 +22,13 @@ function gather_frr_logs() {
+ 	LOGS_DIR="${FRRK8S_PODS_PATH}/${1}/frr/frr/logs"
+ 
+ 	for FILE in "${FILES_TO_GATHER[@]}"; do
+-		oc -n ${FRRK8S_NS} exec ${1} -c frr -- sh -c "cat /etc/frr/${FILE}" >${LOGS_DIR}/${FILE}
++		oc -n ${FRRK8S_NS} exec "${1}" -c frr -- sh -c "cat /etc/frr/${FILE}" >"${LOGS_DIR}/${FILE}"
+ 	done
+ 
+ 	for COMMAND in "${COMMANDS[@]}"; do
+-		echo "###### ${COMMAND}" >>${LOGS_DIR}/dump_frr
+-		echo "$(timeout -v 20s oc -n ${FRRK8S_NS} exec ${1} -c frr -- vtysh -c "${COMMAND}")" >>${LOGS_DIR}/dump_frr
++		echo "###### ${COMMAND}" >>"${LOGS_DIR}/dump_frr"
++		# shellcheck disable=SC2005
++		echo "$(timeout -v 20s oc -n ${FRRK8S_NS} exec "${1}" -c frr -- vtysh -c "${COMMAND}")" >>"${LOGS_DIR}/dump_frr"
+ 	done
+ }
+ 
+@@ -34,20 +37,25 @@ if ! oc get ns "${FRRK8S_NS}" &>/dev/null; then
+ 	exit
+ fi
+ 
++# shellcheck disable=SC2086
+ oc adm inspect ${log_collection_args} --dest-dir "${BASE_COLLECTION_PATH}" "ns/${FRRK8S_NS}"
+ get_frrk8s_crs
+ 
+-FRR_PODS="${@:-$(oc -n ${FRRK8S_NS} get pods -l component=frr-k8s -o jsonpath='{.items[*].metadata.name}')}"
++if [ $# -gt 0 ]; then
++	FRR_PODS=("$@")
++else
++	read -ra FRR_PODS <<<"$(oc -n ${FRRK8S_NS} get pods -l component=frr-k8s -o jsonpath='{.items[*].metadata.name}')"
++fi
+ PIDS=()
+ 
+-for POD in ${FRR_PODS[@]}; do
+-	gather_frr_logs ${POD} &
++for POD in "${FRR_PODS[@]}"; do
++	gather_frr_logs "${POD}" &
+ 	PIDS+=($!)
+-	oc -n ${FRRK8S_NS} exec ${POD} -c reloader -- sh -c "cat /etc/frr_reloader/reloader.pid" > \
+-		${FRRK8S_PODS_PATH}/${POD}/reloader/reloader/logs/reloader.pid &
++	oc -n ${FRRK8S_NS} exec "${POD}" -c reloader -- sh -c "cat /etc/frr_reloader/reloader.pid" > \
++		"${FRRK8S_PODS_PATH}/${POD}/reloader/reloader/logs/reloader.pid" &
+ 	PIDS+=($!)
+ done
+-wait ${PIDS[@]}
++wait "${PIDS[@]}"
+ 
+ # force disk flush to ensure that all data gathered is accessible in the copy container
+ sync
+diff --git a/collection-scripts/gather_haproxy_config b/collection-scripts/gather_haproxy_config
+index 628f409c..aa861046 100755
+--- a/collection-scripts/gather_haproxy_config
++++ b/collection-scripts/gather_haproxy_config
+@@ -11,7 +11,7 @@ function gather_haproxy_config {
+ 	for IC in ${INGRESS_CONTROLLERS}; do
+ 		PODS=$(oc get pods -n openshift-ingress --no-headers -o custom-columns=":metadata.name" --selector ingresscontroller.operator.openshift.io/deployment-ingresscontroller="${IC}")
+ 		for POD in ${PODS}; do
+-			timeout -v 3m oc cp openshift-ingress/"${POD}":/var/lib/haproxy/conf/haproxy.config "${HAPROXY_CONFIG_PATH}"/"${IC}"/"${POD}"/haproxy.config &
++			timeout -v 3m oc cp openshift-ingress/"${POD}":/var/lib/haproxy/conf/haproxy.config "${HAPROXY_CONFIG_PATH}/${IC}/${POD}/haproxy.config" &
+ 			PIDS+=($!)
+ 		done
+ 	done
+diff --git a/collection-scripts/gather_ingress_node_firewall b/collection-scripts/gather_ingress_node_firewall
+index 484a5d7a..06180af0 100755
+--- a/collection-scripts/gather_ingress_node_firewall
++++ b/collection-scripts/gather_ingress_node_firewall
+@@ -1,6 +1,7 @@
+ #!/bin/bash
+ 
+-source $(dirname "$0")/common.sh
++# shellcheck source=collection-scripts/common.sh
++source "$(dirname "$0")/common.sh"
+ BASE_COLLECTION_PATH="must-gather"
+ get_operator_ns "ingress-node-firewall"
+ get_log_collection_args
+@@ -9,7 +10,8 @@ function get_ingress_node_firewall_namespaced_crs() {
+ 	declare -a INGRESS_NODE_FIREWALL_NAMESPACED_CRDS=("ingressnodefirewallconfigs" "ingressnodefirewallnodestates")
+ 
+ 	for CRD in "${INGRESS_NODE_FIREWALL_NAMESPACED_CRDS[@]}"; do
+-		oc adm inspect ${log_collection_args} --dest-dir "${BASE_COLLECTION_PATH}" -n ${operator_ns} "${CRD}"
++		# shellcheck disable=SC2086
++		oc adm inspect ${log_collection_args} --dest-dir "${BASE_COLLECTION_PATH}" -n "${operator_ns}" "${CRD}"
+ 	done
+ }
+ 
+@@ -17,10 +19,12 @@ function get_ingress_node_firewall_cluster_crs() {
+ 	declare -a INGRESS_NODE_FIREWALL_CLUSTER_CRDS=("ingressnodefirewalls")
+ 
+ 	for CRD in "${INGRESS_NODE_FIREWALL_CLUSTER_CRDS[@]}"; do
++		# shellcheck disable=SC2086
+ 		oc adm inspect ${log_collection_args} --dest-dir "${BASE_COLLECTION_PATH}" "${CRD}"
+ 	done
+ }
+ 
++# shellcheck disable=SC2086
+ oc adm inspect ${log_collection_args} --dest-dir "${BASE_COLLECTION_PATH}" "ns/${operator_ns}"
+ get_ingress_node_firewall_namespaced_crs
+ get_ingress_node_firewall_cluster_crs
+diff --git a/collection-scripts/gather_insights b/collection-scripts/gather_insights
+index 38d1d0a5..3ca45bc9 100755
+--- a/collection-scripts/gather_insights
++++ b/collection-scripts/gather_insights
+@@ -10,6 +10,7 @@ COLLECTOR=${1:-rsync} #Define what oc collector to use (oc rsync or oc cp)
+ INSIGHTS_OPERATOR_POD=$(oc get pods --namespace=openshift-insights -o custom-columns=:metadata.name --no-headers --field-selector=status.phase=Running)
+ 
+ echo "INFO: Collecting Insights Archives from $INSIGHTS_OPERATOR_POD"
++# shellcheck disable=SC2086
+ oc $COLLECTOR --namespace=openshift-insights openshift-insights/$INSIGHTS_OPERATOR_POD:/var/lib/insights-operator $INSIGHTS_DATA_PATH
+ 
+ #TODO: Prune or Limit the data that is collected/synced (as this might be a lot to add to the archive).
+diff --git a/collection-scripts/gather_istio b/collection-scripts/gather_istio
+index bdaaab81..09ccc53c 100755
+--- a/collection-scripts/gather_istio
++++ b/collection-scripts/gather_istio
+@@ -13,7 +13,8 @@
+ # See the License for the specific language governing permissions and
+ # limitations under the License.
+ 
+-source $(dirname "$0")/common.sh
++# shellcheck source=collection-scripts/common.sh
++source "$(dirname "$0")/common.sh"
+ BASE_COLLECTION_PATH="/must-gather/istio"
+ 
+ # Get Istio, sail operator, kiali, gateway.networking.k8s.io, inference.networking.x-k8s.io and inference.networking.k8s.io group CRDs
+@@ -155,6 +156,7 @@ function main() {
+ 	crds="$(getCRDs)"
+ 	for crd in ${crds}; do
+ 		inspect "crd/${crd}"
++		# shellcheck disable=SC2086
+ 		oc adm inspect ${log_collection_args} --dest-dir "${BASE_COLLECTION_PATH}" "${crd}" --all-namespaces
+ 	done
+ 
+@@ -167,21 +169,21 @@ function main() {
+ 		inspect "${vwc}"
+ 	done
+ 
+-	if [ -n "$(oc get crd | grep istiocnis.sailoperator.io)" ]; then
++	if oc get crd | grep -q istiocnis.sailoperator.io; then
+ 		istioCniNamespace=$(oc get IstioCNI -A -o custom-columns=NAMESPACE:spec.namespace --no-headers | head -n 1)
+ 		if [ -n "$istioCniNamespace" ]; then
+ 			inspectNamespace "${istioCniNamespace}"
+ 		fi
+ 	fi
+ 
+-	if [ -n "$(oc get crd | grep ztunnels.sailoperator.io)" ]; then
++	if oc get crd | grep -q ztunnels.sailoperator.io; then
+ 		ztunnelNamespace=$(oc get ZTunnel -A -o custom-columns=NAMESPACE:spec.namespace --no-headers | head -n 1)
+ 		if [ -n "$ztunnelNamespace" ]; then
+ 			inspectNamespace "${ztunnelNamespace}"
+ 		fi
+ 	fi
+ 
+-	if [ -n "$(oc get crd | grep istiorevisions.sailoperator.io)" ]; then
++	if oc get crd | grep -q istiorevisions.sailoperator.io; then
+ 		# iterate over all Istio revisions
+ 		for ir in $(oc get IstioRevision -o jsonpath="{.items[*].metadata.name}"); do
+ 			echo "Inspecting ${ir} IstioRevision"
+diff --git a/collection-scripts/gather_kas_startup_termination_logs b/collection-scripts/gather_kas_startup_termination_logs
+index 57ddbef1..e0e8f3c2 100755
+--- a/collection-scripts/gather_kas_startup_termination_logs
++++ b/collection-scripts/gather_kas_startup_termination_logs
+@@ -5,7 +5,8 @@ set -o nounset
+ set -o errexit
+ set -o pipefail
+ 
+-source $(dirname "$0")/common.sh
++# shellcheck source=collection-scripts/common.sh
++source "$(dirname "$0")/common.sh"
+ get_log_collection_args
+ 
+ BASE_COLLECTION_PATH="${BASE_COLLECTION_PATH:-/must-gather}"
+@@ -19,6 +20,7 @@ echo "WARNING: Collecting one or more kube-apiserver related logs on ALL masters
+ # $4 - log file name
+ # $5 - --since=ISO time, if provided via MUST_GATHER_SINCE_TIME
+ paths=(kube-apiserver)
++# shellcheck disable=SC2016
+ for path in "${paths[@]}"; do
+ 	output_dir="${BASE_COLLECTION_PATH}/static-pods/$path"
+ 	mkdir -p "$output_dir"
+diff --git a/collection-scripts/gather_machineconfig_ondisk b/collection-scripts/gather_machineconfig_ondisk
+index 77bef970..8eec96be 100755
+--- a/collection-scripts/gather_machineconfig_ondisk
++++ b/collection-scripts/gather_machineconfig_ondisk
+@@ -13,10 +13,10 @@ function gather_machineconfig_ondisk {
+ 	MACHINECONFIG_DEGRADED_NODES=$(oc get node -o jsonpath='{.items[?(@.metadata.annotations.machineconfiguration\.openshift\.io/state=="Degraded")].metadata.name}')
+ 	for NODE in ${MACHINECONFIG_DEGRADED_NODES}; do
+ 		# use the existing MCD pod on the node to get the files
+-		DAEMONPOD=$(oc get pods -n openshift-machine-config-operator --field-selector spec.nodeName=${NODE} --selector k8s-app=machine-config-daemon -o custom-columns=:metadata.name --no-headers)
++		DAEMONPOD=$(oc get pods -n openshift-machine-config-operator --field-selector "spec.nodeName=${NODE}" --selector k8s-app=machine-config-daemon -o custom-columns=:metadata.name --no-headers)
+ 		# collect the boostrap config that the Node got from the MCS
+-		timeout -v 1m oc cp -c machine-config-daemon openshift-machine-config-operator/"${DAEMONPOD}":rootfs/etc/mcs-machine-config-content.json "${MACHINECONFIG_CONFIG_PATH}"/"${NODE}"/mcs-machine-config-content.json &
+-		timeout -v 1m oc cp -c machine-config-daemon openshift-machine-config-operator/"${DAEMONPOD}":rootfs/etc/machine-config-daemon/bootstrapconfigdiff "${MACHINECONFIG_CONFIG_PATH}"/"${NODE}"/bootstrapconfigdiff &
++		timeout -v 1m oc cp -c machine-config-daemon openshift-machine-config-operator/"${DAEMONPOD}":rootfs/etc/mcs-machine-config-content.json "${MACHINECONFIG_CONFIG_PATH}/${NODE}/mcs-machine-config-content.json" &
++		timeout -v 1m oc cp -c machine-config-daemon openshift-machine-config-operator/"${DAEMONPOD}":rootfs/etc/machine-config-daemon/bootstrapconfigdiff "${MACHINECONFIG_CONFIG_PATH}/${NODE}/bootstrapconfigdiff" &
+ 		PIDS+=($!)
+ 	done
+ 
+diff --git a/collection-scripts/gather_machineconfigdaemon_termination_logs b/collection-scripts/gather_machineconfigdaemon_termination_logs
+index 5d7c87c2..1ac0088e 100755
+--- a/collection-scripts/gather_machineconfigdaemon_termination_logs
++++ b/collection-scripts/gather_machineconfigdaemon_termination_logs
+@@ -12,12 +12,12 @@ function gather_machineconfigdaemon_termination_logs {
+ 	NODES=$(oc get nodes -o jsonpath='{.items[?(@.kind=="Node")].metadata.name}')
+ 	for NODE in ${NODES}; do
+ 		# use the existing MCD pod on the node to get the files
+-		DAEMONPOD=$(oc get pods -n openshift-machine-config-operator --field-selector spec.nodeName=${NODE} --selector k8s-app=machine-config-daemon -o custom-columns=:metadata.name --no-headers)
++		DAEMONPOD=$(oc get pods -n openshift-machine-config-operator --field-selector "spec.nodeName=${NODE}" --selector k8s-app=machine-config-daemon -o custom-columns=:metadata.name --no-headers)
+ 		# Check if the 'previous-logs' folder exists on the MCD pod
+ 		FOLDER_EXISTS=$(oc exec -n openshift-machine-config-operator "${DAEMONPOD}" -c machine-config-daemon -- sh -c '[ -d "/rootfs/etc/machine-config-daemon/previous-logs" ] && echo "exists"' 2>/dev/null)
+ 		# collect the logs from the location that MCD saves to prior to shutdown
+ 		if [ "${FOLDER_EXISTS}" == "exists" ]; then
+-			timeout -v 1m oc cp -c machine-config-daemon openshift-machine-config-operator/"${DAEMONPOD}":rootfs/etc/machine-config-daemon/previous-logs "${MACHINECONFIG_DAEMON_LOG_PATH}"/"${NODE}"/ &
++			timeout -v 1m oc cp -c machine-config-daemon openshift-machine-config-operator/"${DAEMONPOD}":rootfs/etc/machine-config-daemon/previous-logs "${MACHINECONFIG_DAEMON_LOG_PATH}/${NODE}/" &
+ 			PIDS+=($!)
+ 		else
+ 			echo "INFO: 'previous-logs' folder not found on ${NODE}, skipping..."
+diff --git a/collection-scripts/gather_metallb b/collection-scripts/gather_metallb
+index a61af31b..9e165219 100755
+--- a/collection-scripts/gather_metallb
++++ b/collection-scripts/gather_metallb
+@@ -1,24 +1,28 @@
+ #!/bin/bash
+ 
+-source $(dirname "$0")/common.sh
++# shellcheck source=collection-scripts/common.sh
++source "$(dirname "$0")/common.sh"
+ BASE_COLLECTION_PATH="must-gather"
+ get_operator_ns "metallb-operator"
+ get_log_collection_args
++# shellcheck disable=SC2034
+ METALLB_PODS_PATH="${BASE_COLLECTION_PATH}/namespaces/${operator_ns}/pods"
+ 
+ function get_metallb_crs() {
+ 	declare -a METALLB_CRDS=("bgppeers" "bfdprofiles" "bgpAdvertisements" "ipaddresspools" "l2advertisements" "communities")
+ 
+ 	for CRD in "${METALLB_CRDS[@]}"; do
+-		oc adm inspect ${log_collection_args} --dest-dir "${BASE_COLLECTION_PATH}" -n ${operator_ns} "${CRD}"
++		# shellcheck disable=SC2086
++		oc adm inspect ${log_collection_args} --dest-dir "${BASE_COLLECTION_PATH}" -n "${operator_ns}" "${CRD}"
+ 	done
+ }
+ 
++# shellcheck disable=SC2086
+ oc adm inspect ${log_collection_args} --dest-dir "${BASE_COLLECTION_PATH}" "ns/${operator_ns}"
+ 
+ get_metallb_crs
+ 
+-if ! oc get metallb metallb -n ${operator_ns} >/dev/null 2>&1; then
++if ! oc get metallb metallb -n "${operator_ns}" >/dev/null 2>&1; then
+ 	echo "metallb not started"
+ 	exit 0
+ fi
+diff --git a/collection-scripts/gather_metrics b/collection-scripts/gather_metrics
+index 1d269537..1fccfe1d 100755
+--- a/collection-scripts/gather_metrics
++++ b/collection-scripts/gather_metrics
+@@ -5,6 +5,7 @@ set -o nounset
+ set -o errexit
+ set -o pipefail
+ 
+-source $(dirname "$0")/monitoring_common.sh
++# shellcheck source=collection-scripts/monitoring_common.sh
++source "$(dirname "$0")/monitoring_common.sh"
+ 
+ metrics_gather "$@"
+diff --git a/collection-scripts/gather_monitoring b/collection-scripts/gather_monitoring
+index adedc8e9..bfaaf146 100755
+--- a/collection-scripts/gather_monitoring
++++ b/collection-scripts/gather_monitoring
+@@ -9,7 +9,8 @@ set -o pipefail
+ declare -r BASE_COLLECTION_PATH="../must-gather"
+ declare -r MONITORING_PATH="${BASE_COLLECTION_PATH}/monitoring"
+ 
+-source "$(dirname "$0")"/monitoring_common.sh
++# shellcheck source=collection-scripts/monitoring_common.sh
++source "$(dirname "$0")/monitoring_common.sh"
+ 
+ # init initializes global variables that need to be computed.
+ # E.g. get token of the default ServiceAccount
+diff --git a/collection-scripts/gather_network_logs b/collection-scripts/gather_network_logs
+index 67b6b5b0..97090ce6 100755
+--- a/collection-scripts/gather_network_logs
++++ b/collection-scripts/gather_network_logs
+@@ -11,11 +11,12 @@ mkdir -p "${NETWORK_LOG_PATH}"/
+ 
+ function gather_extra_ovn_kubernetes_data_interconnect_mode {
+ 	echo "INFO: Gathering ovn-kubernetes extra logs"
++	# shellcheck disable=SC2207
+ 	OVNKUBE_CONTROLLER_PODS=($(oc -n openshift-ovn-kubernetes get pods -l app=ovnkube-node -o=jsonpath='{.items[*].metadata.name}'))
+ 	# collect additional ovnkube logs from each ovnkube-node
+ 	CONTAINER="ovnkube-controller"
+ 	for OVNKUBE_CONTROLLER_POD in "${OVNKUBE_CONTROLLER_PODS[@]}"; do
+-		echo "INFO: Gathering "${CONTAINER}" extra logs from "${OVNKUBE_CONTROLLER_POD}"..."
++		echo "INFO: Gathering ${CONTAINER} extra logs from ${OVNKUBE_CONTROLLER_POD}..."
+ 		DEST_DIR="${NETWORK_LOG_PATH}/${OVNK_EXTRAS_STORE_PATH}/${OVNKUBE_CONTROLLER_POD}/${CONTAINER}"
+ 		mkdir -p "${DEST_DIR}"
+ 
+@@ -24,9 +25,9 @@ function gather_extra_ovn_kubernetes_data_interconnect_mode {
+ 		# This tarball is then untarred while stripping the top 3 directories (var, log, ovnkube),
+ 		# and the contents are placed into the destination directory for the specified pod and container.
+ 		# All of this is done in the background.
+-		oc exec -n openshift-ovn-kubernetes -c ${CONTAINER} ${OVNKUBE_CONTROLLER_POD} -- \
++		oc exec -n openshift-ovn-kubernetes -c "${CONTAINER}" "${OVNKUBE_CONTROLLER_POD}" -- \
+ 			bash -c 'find /var/log/ovnkube -type f -name "libovsdb*log*" | tar czf - -T -' |
+-			tar xzf - -C ${DEST_DIR} --strip-components=3 2>&1 &
++			tar xzf - -C "${DEST_DIR}" --strip-components=3 2>&1 &
+ 		PIDS+=($!)
+ 	done
+ }
+diff --git a/collection-scripts/gather_network_logs_basics b/collection-scripts/gather_network_logs_basics
+index baf27bfb..19bb6169 100755
+--- a/collection-scripts/gather_network_logs_basics
++++ b/collection-scripts/gather_network_logs_basics
+@@ -1,6 +1,7 @@
+ #!/bin/bash
+ 
+-source $(dirname "$0")/common.sh
++# shellcheck source=collection-scripts/common.sh
++source "$(dirname "$0")/common.sh"
+ get_log_collection_args
+ 
+ BASE_COLLECTION_PATH="must-gather"
+@@ -15,15 +16,17 @@ function gather_multus_data {
+ 		net-attach-def multi-networkpolicy)
+ 
+ 	for resource in "${resources[@]}"; do
++		# shellcheck disable=SC2086
+ 		oc adm inspect ${log_collection_args} --dest-dir "${BASE_COLLECTION_PATH}" "${resource}" --all-namespaces 2>&1 || true &
+ 		PIDS+=($!)
+-		oc describe "${resource}" -A >"${NETWORK_LOG_PATH}"/"${resource}" 2>&1 || true &
++		oc describe "${resource}" -A >"${NETWORK_LOG_PATH}/${resource}" 2>&1 || true &
+ 		PIDS+=($!)
+ 	done
+ }
+ 
+ function gather_ovn_kubernetes_data_interconnect_mode {
+ 	echo "INFO: Gathering ovn-kubernetes DBs"
++	# shellcheck disable=SC2207
+ 	OVNKUBE_CONTROLLER_PODS=($(oc -n openshift-ovn-kubernetes get pods -l app=ovnkube-node -o=jsonpath='{.items[*].metadata.name}'))
+ 	# collect dbs from each node
+ 	for DB in "n" "s"; do
+@@ -35,7 +38,7 @@ function gather_ovn_kubernetes_data_interconnect_mode {
+ 			CONTAINER="sbdb"
+ 		fi
+ 		for OVNKUBE_CONTROLLER_POD in "${OVNKUBE_CONTROLLER_PODS[@]}"; do
+-			echo "INFO: Gathering "${DB_NAME}" from "${OVNKUBE_CONTROLLER_POD}"..."
++			echo "INFO: Gathering ${DB_NAME} from ${OVNKUBE_CONTROLLER_POD}..."
+ 			oc cp openshift-ovn-kubernetes/"${OVNKUBE_CONTROLLER_POD}":/etc/ovn/ovn"${DB}"b_db.db -c "${CONTAINER}" \
+ 				"${NETWORK_LOG_PATH}/${OVNK_DATABASE_STORE_PATH}/${OVNKUBE_CONTROLLER_POD}_${DB}bdb" 2>&1 &
+ 			PIDSDB+=($!)
+@@ -45,6 +48,7 @@ function gather_ovn_kubernetes_data_interconnect_mode {
+ 
+ function gather_ovn_kubernetes_data_legacy_mode {
+ 	echo "INFO: Gathering ovn-kubernetes master data"
++	# shellcheck disable=SC2207
+ 	OVNKUBE_MASTER_PODS=($(oc -n openshift-ovn-kubernetes get pods -l app=ovnkube-master -o=jsonpath='{.items[*].metadata.name}'))
+ 	# collect only leader dbs to reduce result size
+ 	for DB in "n" "s"; do
+@@ -82,6 +86,7 @@ function gather_ovn_kubernetes_data_legacy_mode {
+ 
+ function gather_ovn_kubernetes_ipsec_data {
+ 	echo "INFO: Gathering ovn-kubernetes IPsec data"
++	# shellcheck disable=SC2207
+ 	OVNKUBE_IPSEC_PODS=($(oc -n openshift-ovn-kubernetes get pods -l app=ovn-ipsec -o=jsonpath='{.items[*].metadata.name}'))
+ 	CONTAINER="ovn-ipsec"
+ 	mkdir -p "${NETWORK_LOG_PATH}/${OVNK_IPSEC_PATH}/xfrm" "${NETWORK_LOG_PATH}/${OVNK_IPSEC_PATH}/status" "${NETWORK_LOG_PATH}/${OVNK_IPSEC_PATH}/trafficstatus"
+@@ -137,16 +142,16 @@ function gather_ovn_kubernetes_data {
+ 
+ function gather_scale_data {
+ 	touch "${NETWORK_LOG_PATH}"/cluster_scale
+-	echo services amount: $(oc get svc --no-headers -A | wc -l) >>"${NETWORK_LOG_PATH}"/cluster_scale &
++	echo "services amount: $(oc get svc --no-headers -A | wc -l)" >>"${NETWORK_LOG_PATH}"/cluster_scale &
+ 	PIDS+=($!)
+-	echo endpoints amount: $(oc get ep --no-headers -A | wc -l) >>"${NETWORK_LOG_PATH}"/cluster_scale &
++	echo "endpoints amount: $(oc get ep --no-headers -A | wc -l)" >>"${NETWORK_LOG_PATH}"/cluster_scale &
+ 	PIDS+=($!)
+-	echo pods amount: $(oc get pods --no-headers -A | wc -l) >>"${NETWORK_LOG_PATH}"/cluster_scale &
++	echo "pods amount: $(oc get pods --no-headers -A | wc -l)" >>"${NETWORK_LOG_PATH}"/cluster_scale &
+ 	PIDS+=($!)
+-	echo network policies amount: $(oc get networkpolicies --no-headers -A | wc -l) >>"${NETWORK_LOG_PATH}"/cluster_scale &
++	echo "network policies amount: $(oc get networkpolicies --no-headers -A | wc -l)" >>"${NETWORK_LOG_PATH}"/cluster_scale &
+ 	PIDS+=($!)
+ 	if [[ "${NETWORK_TYPE}" == "ovnkubernetes" ]]; then
+-		echo egress firewalls amount: $(oc get egressfirewalls --no-headers -A | wc -l) >>"${NETWORK_LOG_PATH}"/cluster_scale &
++		echo "egress firewalls amount: $(oc get egressfirewalls --no-headers -A | wc -l)" >>"${NETWORK_LOG_PATH}"/cluster_scale &
+ 		PIDS+=($!)
+ 	fi
+ }
+@@ -159,22 +164,29 @@ gather_multus_data
+ gather_scale_data
+ 
+ if [[ "${NETWORK_TYPE}" == "ovnkubernetes" ]]; then
++	# shellcheck disable=SC2086
+ 	oc adm inspect ${log_collection_args} --dest-dir must-gather egressips.k8s.ovn.org
++	# shellcheck disable=SC2086
+ 	oc adm inspect ${log_collection_args} --dest-dir must-gather clusteruserdefinednetworks.k8s.ovn.org
++	# shellcheck disable=SC2086
+ 	oc adm inspect ${log_collection_args} --dest-dir must-gather adminnetworkpolicies.policy.networking.k8s.io
++	# shellcheck disable=SC2086
+ 	oc adm inspect ${log_collection_args} --dest-dir must-gather baselineadminnetworkpolicies.policy.networking.k8s.io
+ 	gather_ovn_kubernetes_data
+ elif [[ "${NETWORK_TYPE}" == "openshiftsdn" ]]; then
++	# shellcheck disable=SC2086
+ 	oc adm inspect ${log_collection_args} --dest-dir must-gather hostsubnets.network.openshift.io
+ fi
+ 
+ CNCC_DEPLOYMENT=$(oc get deployment -n openshift-cloud-network-config-controller --no-headers -o custom-columns=":metadata.name")
+ if [[ "${CNCC_DEPLOYMENT}" == "cloud-network-config-controller" ]]; then
++	# shellcheck disable=SC2086
+ 	oc adm inspect ${log_collection_args} --dest-dir must-gather cloudprivateipconfigs.cloud.network.openshift.io
+ fi
+ 
+ ROUTE_ADVERTISEMENTS=$(oc get network.operator.openshift.io cluster -o=jsonpath='{.spec.defaultNetwork.ovnKubernetesConfig.routeAdvertisements}')
+ if [[ "${ROUTE_ADVERTISEMENTS}" == "Enabled" ]]; then
++	# shellcheck disable=SC2086
+ 	oc adm inspect ${log_collection_args} --dest-dir must-gather routeadvertisements.k8s.ovn.org
+ fi
+ 
+diff --git a/collection-scripts/gather_nmstate b/collection-scripts/gather_nmstate
+index 2806484a..e3665fca 100755
+--- a/collection-scripts/gather_nmstate
++++ b/collection-scripts/gather_nmstate
+@@ -1,6 +1,7 @@
+ #!/bin/bash
+ 
+-source $(dirname "$0")/common.sh
++# shellcheck source=collection-scripts/common.sh
++source "$(dirname "$0")/common.sh"
+ BASE_COLLECTION_PATH="must-gather"
+ get_operator_ns "kubernetes-nmstate-operator"
+ get_log_collection_args
+@@ -9,10 +10,12 @@ function get_nmstate_crs() {
+ 	declare -a NMSTATE_CRDS=("nmstates" "nodenetworkconfigurationenactments" "nodenetworkconfigurationpolicies" "nodenetworkstates")
+ 
+ 	for CRD in "${NMSTATE_CRDS[@]}"; do
++		# shellcheck disable=SC2086
+ 		oc adm inspect ${log_collection_args} --dest-dir "${BASE_COLLECTION_PATH}" "${CRD}"
+ 	done
+ }
+ 
++# shellcheck disable=SC2086
+ oc adm inspect ${log_collection_args} --dest-dir "${BASE_COLLECTION_PATH}" "ns/${operator_ns}"
+ get_nmstate_crs
+ 
+diff --git a/collection-scripts/gather_olm b/collection-scripts/gather_olm
+index b2eff1d0..89ec2977 100755
+--- a/collection-scripts/gather_olm
++++ b/collection-scripts/gather_olm
+@@ -1,6 +1,8 @@
+ #!/usr/bin/env bash
+ 
+-source $(dirname "$0")/common.sh
++# shellcheck source=collection-scripts/common.sh
++source "$(dirname "$0")/common.sh"
+ get_log_collection_args
+ 
++# shellcheck disable=SC2086
+ oc adm inspect ${log_collection_args} --dest-dir=must-gather -A olm
+diff --git a/collection-scripts/gather_olm_v1 b/collection-scripts/gather_olm_v1
+index 838ad04d..9ed72a26 100755
+--- a/collection-scripts/gather_olm_v1
++++ b/collection-scripts/gather_olm_v1
+@@ -4,7 +4,8 @@
+ # OLM v1 uses the olm.operatorframework.io API group and provides a new declarative
+ # installation and management experience for cluster extensions.
+ 
+-source $(dirname "$0")/common.sh
++# shellcheck source=collection-scripts/common.sh
++source "$(dirname "$0")/common.sh"
+ get_log_collection_args
+ BASE_COLLECTION_PATH="must-gather"
+ 
+@@ -33,6 +34,7 @@ echo "INFO: Collecting OLM v1 resources from olm.operatorframework.io API group"
+ for crd in ${OLMV1_CRDS}; do
+ 	echo "INFO: Collecting ${crd}"
+ 	# Use --all-namespaces to collect both cluster-scoped and namespace-scoped resources
++	# shellcheck disable=SC2086
+ 	oc adm inspect ${log_collection_args} --dest-dir="${BASE_COLLECTION_PATH}" "${crd}" --all-namespaces 2>/dev/null || {
+ 		echo "WARNING: Failed to collect ${crd}, skipping..."
+ 	}
+diff --git a/collection-scripts/gather_osus b/collection-scripts/gather_osus
+index 35c32152..3bef65cf 100755
+--- a/collection-scripts/gather_osus
++++ b/collection-scripts/gather_osus
+@@ -1,6 +1,7 @@
+ #!/bin/bash
+ 
+-source $(dirname "$0")/common.sh
++# shellcheck source=collection-scripts/common.sh
++source "$(dirname "$0")/common.sh"
+ BASE_COLLECTION_PATH="must-gather"
+ OSUS_OPERATOR_NAME="update-service-operator"
+ get_log_collection_args
+@@ -12,9 +13,10 @@ fi
+ 
+ function gather_osus() {
+ 	echo "INFO: Collecting OSUS Data"
+-	declare -a OSUS_NAMESPACES=(${HAS_OSUS})
++	read -ra OSUS_NAMESPACES <<<"${HAS_OSUS}"
+ 
+ 	for OSUS_NAMESPACE in "${OSUS_NAMESPACES[@]}"; do
++		# shellcheck disable=SC2086
+ 		oc adm inspect ${log_collection_args} --dest-dir "${BASE_COLLECTION_PATH}" "ns/${OSUS_NAMESPACE}"
+ 		oc adm inspect --dest-dir "${BASE_COLLECTION_PATH}" updateservices --namespace "${OSUS_NAMESPACE}"
+ 	done
+diff --git a/collection-scripts/gather_ppc b/collection-scripts/gather_ppc
+index 7d6cb0b9..77e51ef6 100755
+--- a/collection-scripts/gather_ppc
++++ b/collection-scripts/gather_ppc
+@@ -1,6 +1,7 @@
+ #!/bin/bash
+ 
+-source $(dirname "$0")/common.sh
++# shellcheck source=collection-scripts/common.sh
++source "$(dirname "$0")/common.sh"
+ get_log_collection_args
+ 
+ BASE_COLLECTION_PATH="must-gather"
+@@ -14,15 +15,15 @@ POD_NAME=${HOSTNAME}
+ POD_IP=$(hostname -I | tr -d "[:blank:]")
+ 
+ function is_hosted_cluster() {
+-  topology=$(oc get infrastructures.config.openshift.io cluster -o jsonpath="{.status.controlPlaneTopology}")
+-  [[ "$topology" == "External" ]]
++	topology=$(oc get infrastructures.config.openshift.io cluster -o jsonpath="{.status.controlPlaneTopology}")
++	[[ "$topology" == "External" ]]
+ }
+ 
+ function check_node_gather_pods_ready() {
+-	line=$(oc get ds perf-node-gather-daemonset -o=custom-columns=DESIRED:.status.desiredNumberScheduled,READY:.status.numberReady --no-headers -n $NAMESPACE)
++	line=$(oc get ds perf-node-gather-daemonset -o=custom-columns=DESIRED:.status.desiredNumberScheduled,READY:.status.numberReady --no-headers -n "$NAMESPACE")
+ 
+ 	IFS=$' '
+-	read desired ready <<<$line
++	read -r desired ready <<<"$line"
+ 	IFS=$'\n'
+ 
+ 	if [[ "$desired" != "0" ]] && [[ "$ready" == "$desired" ]]; then
+@@ -38,11 +39,11 @@ function ppc_nodes() {
+ 	IFS=$'\n'
+ 
+ 	# Create the destination
+-	mkdir -p ${NODES_PATH}
++	mkdir -p "${NODES_PATH}"
+ 
+ 	# Save the debug pod info
+-	echo "[$NAMESPACE/$POD_IP/$POD_NAME]" >>${NODES_PATH}/debug
+-	oc get pod -n $NAMESPACE $POD_NAME -o json >>${NODES_PATH}/debug
++	echo "[$NAMESPACE/$POD_IP/$POD_NAME]" >>"${NODES_PATH}/debug"
++	oc get pod -n "$NAMESPACE" "$POD_NAME" -o json >>"${NODES_PATH}/debug"
+ 
+ 	# Find the NTO image reference
+ 	# NTO contains all the tools needed here
+@@ -53,9 +54,11 @@ function ppc_nodes() {
+ 		echo "INFO: Hosted cluster detected, get NTO container image from the TuneD pod"
+ 		NTO=$(oc get pods -n openshift-cluster-node-tuning-operator --selector openshift-app=tuned -o jsonpath="{.items[0].spec.containers[0].image}")
+ 	fi
++	# shellcheck disable=SC2181
+ 	if [ $? -ne 0 ]; then
+ 		echo "INFO: Fallback to identify the container image from release info"
+ 		NTO=$(oc adm release info --image-for=cluster-node-tuning-operator)
++		# shellcheck disable=SC2181
+ 		if [ $? -ne 0 ]; then
+ 			echo "ERROR: Failed to identify the container image with node tools."
+ 			echo "INFO: Node performance data collection will not contain node level data."
+@@ -149,19 +152,19 @@ EOF
+ 		sleep 1
+ 	done
+ 
+-	for line in $(oc get pod -o=custom-columns=NODE:.spec.nodeName --no-headers -l name=perf-node-gather-daemonset --field-selector=status.phase!=Running -n $NAMESPACE); do
+-		echo "Failed to collect performance data from node ${line} due to pod scheduling failure." >>${NODES_PATH}/skipped_nodes.txt
++	for line in $(oc get pod -o=custom-columns=NODE:.spec.nodeName --no-headers -l name=perf-node-gather-daemonset --field-selector=status.phase!=Running -n "$NAMESPACE"); do
++		echo "Failed to collect performance data from node ${line} due to pod scheduling failure." >>"${NODES_PATH}/skipped_nodes.txt"
+ 	done
+ 
+ 	COLLECTABLE_NODES=()
+ 	NODE_PIDS=()
+-	for line in $(oc get pod -o=custom-columns=NODE:.spec.nodeName,NAME:.metadata.name --no-headers -l name=perf-node-gather-daemonset --field-selector=status.phase=Running -n $NAMESPACE); do
+-		node=$(echo $line | awk -F ' ' '{print $1}')
+-		pod=$(echo $line | awk -F ' ' '{print $2}')
++	for line in $(oc get pod -o=custom-columns=NODE:.spec.nodeName,NAME:.metadata.name --no-headers -l name=perf-node-gather-daemonset --field-selector=status.phase=Running -n "$NAMESPACE"); do
++		node=$(echo "$line" | awk -F ' ' '{print $1}')
++		pod=$(echo "$line" | awk -F ' ' '{print $2}')
+ 		NODE_PATH=${NODES_PATH}/$node
+ 		mkdir -p "${NODE_PATH}"
+ 
+-		COLLECTABLE_NODES+=($node)
++		COLLECTABLE_NODES+=("$node")
+ 
+ 		# Run per node data collection in parallel
+ 		timeout -k 1m 5m /usr/bin/gather_ppc_single_node "${pod}" "${NAMESPACE}" "${node}" "${NODE_PATH}" &
+@@ -172,18 +175,19 @@ EOF
+ 	# Collect journal logs for specified units for all nodes
+ 	NODE_UNITS=(kubelet)
+ 	ADM_PIDS=()
+-	for NODE in ${COLLECTABLE_NODES[@]}; do
++	for NODE in "${COLLECTABLE_NODES[@]}"; do
+ 		NODE_PATH=${NODES_PATH}/$NODE
+-		mkdir -p ${NODE_PATH}
+-		for UNIT in ${NODE_UNITS[@]}; do
++		mkdir -p "${NODE_PATH}"
++		for UNIT in "${NODE_UNITS[@]}"; do
+ 			echo "Collecting ${UNIT} logs for node ${NODE}"
+-			timeout -k 5m 30m bash -c "oc adm node-logs \"${node_log_collection_args:---since=-8h}\" $NODE -u $UNIT | gzip" >${NODE_PATH}/${NODE}_logs_$UNIT.gz &
++			# shellcheck disable=SC2086
++			timeout -k 5m 30m bash -c "oc adm node-logs \"${node_log_collection_args:---since=-8h}\" $NODE -u $UNIT | gzip" >"${NODE_PATH}/${NODE}_logs_${UNIT}.gz" &
+ 			ADM_PIDS+=($!)
+ 		done
+ 	done
+ 	wait "${ADM_PIDS[@]}"
+ 
+-	oc delete ds perf-node-gather-daemonset -n $NAMESPACE
++	oc delete ds perf-node-gather-daemonset -n "$NAMESPACE"
+ }
+ 
+ #
+@@ -206,8 +210,9 @@ resources+=(machineconfigs machineconfigpools featuregates kubeletconfigs tuneds
+ echo "INFO: Waiting for node performance related collection to complete ..."
+ 
+ # run the collection of resources using must-gather
+-for resource in ${resources[@]}; do
+-	oc adm inspect ${log_collection_args} --dest-dir must-gather --all-namespaces ${resource}
++for resource in "${resources[@]}"; do
++	# shellcheck disable=SC2086
++	oc adm inspect ${log_collection_args} --dest-dir must-gather --all-namespaces "${resource}"
+ done
+ 
+ # Collect nodes details
+diff --git a/collection-scripts/gather_ppc_single_node b/collection-scripts/gather_ppc_single_node
+index c3628bc1..f1426057 100755
+--- a/collection-scripts/gather_ppc_single_node
++++ b/collection-scripts/gather_ppc_single_node
+@@ -10,16 +10,16 @@ NODE_PATH=$4
+ 
+ echo "Collecting performance related data for node $node"
+ 
+-oc exec $pod -n $NAMESPACE -- lspci -nvv >$NODE_PATH/lspci
+-oc exec $pod -n $NAMESPACE -- lscpu -e >$NODE_PATH/lscpu
+-oc exec $pod -n $NAMESPACE -- cat /proc/cmdline >$NODE_PATH/proc_cmdline
+-oc exec $pod -n $NAMESPACE -- dmesg >$NODE_PATH/dmesg
+-oc exec $pod -n $NAMESPACE -- ethtool -k eth0 >$NODE_PATH/ethtool_features
+-oc exec $pod -n $NAMESPACE -- ethtool -l eth0 >$NODE_PATH/ethtool_channels
++oc exec "$pod" -n "$NAMESPACE" -- lspci -nvv >"$NODE_PATH"/lspci
++oc exec "$pod" -n "$NAMESPACE" -- lscpu -e >"$NODE_PATH"/lscpu
++oc exec "$pod" -n "$NAMESPACE" -- cat /proc/cmdline >"$NODE_PATH"/proc_cmdline
++oc exec "$pod" -n "$NAMESPACE" -- dmesg >"$NODE_PATH"/dmesg
++oc exec "$pod" -n "$NAMESPACE" -- ethtool -k eth0 >"$NODE_PATH"/ethtool_features
++oc exec "$pod" -n "$NAMESPACE" -- ethtool -l eth0 >"$NODE_PATH"/ethtool_channels
+ 
+-oc exec $pod -n $NAMESPACE -- gather-sysinfo --json cpuaff --procfs=/host/proc --sysfs=/host/sys >$NODE_PATH/cpu_affinities.json
+-oc exec $pod -n $NAMESPACE -- gather-sysinfo --json irqaff --procfs=/host/proc --sysfs=/host/sys >$NODE_PATH/irq_affinities.json
+-oc exec $pod -n $NAMESPACE -- gather-sysinfo --json podres --socket-path=unix:///host/podresources/kubelet.sock >$NODE_PATH/podresources.json
++oc exec "$pod" -n "$NAMESPACE" -- gather-sysinfo --json cpuaff --procfs=/host/proc --sysfs=/host/sys >"$NODE_PATH"/cpu_affinities.json
++oc exec "$pod" -n "$NAMESPACE" -- gather-sysinfo --json irqaff --procfs=/host/proc --sysfs=/host/sys >"$NODE_PATH"/irq_affinities.json
++oc exec "$pod" -n "$NAMESPACE" -- gather-sysinfo --json podres --socket-path=unix:///host/podresources/kubelet.sock >"$NODE_PATH"/podresources.json
+ 
+-oc exec $pod -n $NAMESPACE -- gather-sysinfo snapshot --debug --root=/host --output=- >$NODE_PATH/sysinfo.tgz 2>$NODE_PATH/sysinfo.log
+-oc exec $pod -n $NAMESPACE -- gather-sysinfo podinfo --node-name $node >$NODE_PATH/pods_info.json
++oc exec "$pod" -n "$NAMESPACE" -- gather-sysinfo snapshot --debug --root=/host --output=- >"$NODE_PATH"/sysinfo.tgz 2>"$NODE_PATH"/sysinfo.log
++oc exec "$pod" -n "$NAMESPACE" -- gather-sysinfo podinfo --node-name "$node" >"$NODE_PATH"/pods_info.json
+diff --git a/collection-scripts/gather_profiling_node b/collection-scripts/gather_profiling_node
+index 24a49ae2..730262e0 100755
+--- a/collection-scripts/gather_profiling_node
++++ b/collection-scripts/gather_profiling_node
+@@ -78,7 +78,7 @@ _gather_profiling_node_collect_crio_data() {
+ 	local extract_timeout=$((PROFILING_NODE_SECONDS + 300))
+ 
+ 	_gather_profiling_node_start_crio_collection_pod "$node" "$pod_name"
+-	if oc wait --for=condition=Ready pod/${pod_name} --timeout=${extract_timeout}s; then
++	if oc wait --for=condition=Ready "pod/${pod_name}" --timeout=${extract_timeout}s; then
+ 		oc cp -c crio-prof-expose "${pod_name}:/tmp/pprof/" "$PROFILING_NODE_CRIO_LOG_PATH"
+ 		oc delete pod "$pod_name"
+ 	else
+@@ -119,12 +119,12 @@ _gather_profiling_node_collect_data_loop() {
+ 		fi
+ 	done
+ 
+-	[ -z "$pids" ] && return
++	[ ${#pids[@]} -eq 0 ] && return
+ 	echo "INFO: wait for crio/kubelet profiling tasks"
+-	wait ${pids[@]}
++	wait "${pids[@]}"
+ }
+ 
+-NODES="${@}"
++NODES="$*"
+ if [ -z "$NODES" ]; then
+ 	echo -e "\nWARNING: since no nodes have been specified for the profiling task, data will\n" \
+ 		"be collected on ALL the nodes in the cluster. This may take quite some time.\n"
+@@ -134,6 +134,7 @@ fi
+ DO_PROF_CRIO=true
+ DO_PROF_KUBELET=true
+ 
++# shellcheck disable=SC2288
+ case "$PROFILING_NODE_TARGET" in
+ all | ALL) ;;
+ crio | CRIO | CRI-O) DO_PROF_KUBELET=false ;;
+diff --git a/collection-scripts/gather_service_logs b/collection-scripts/gather_service_logs
+index 0bcb8e14..91a06fe2 100755
+--- a/collection-scripts/gather_service_logs
++++ b/collection-scripts/gather_service_logs
+@@ -1,7 +1,9 @@
+ #!/bin/bash
+ 
+-source $(dirname "$0")/common.sh
++# shellcheck source=collection-scripts/common.sh
++source "$(dirname "$0")/common.sh"
+ get_log_collection_args
++# shellcheck source=collection-scripts/gather_service_logs_util
+ . gather_service_logs_util
+ 
+ BASE_COLLECTION_PATH="/must-gather"
+@@ -10,23 +12,26 @@ ROLES=${1:-master} ### Defaults to only collecting things from Masters
+ # Service Lists
+ GENERAL_SERVICES=(crio kubelet rpm-ostreed ostree-finalize-staged machine-config-daemon-firstboot machine-config-daemon-host NetworkManager openvswitch
+ 	ovs-configuration ovsdb-server ovs-vswitchd)
++# shellcheck disable=SC2206
+ MASTER_SERVICES+=(${2:-"${GENERAL_SERVICES[@]}"})
+ MASTER_SERVICES+=() ### Placeholder to extend Master only services
++# shellcheck disable=SC2206
+ NODE_SERVICES+=(${2:-"${GENERAL_SERVICES[@]}"})
+ NODE_SERVICES+=() ### Placeholder to extend Node only services
+ 
+ # Collect System Service Logs
++# shellcheck disable=SC2034
+ SERVICE_LOG_PATH="${BASE_COLLECTION_PATH}/host_service_logs/"
+ 
+ # collect service logs expects PIDS to be an already defined array
+ PIDS=()
+ if [[ $ROLES == "master" ]]; then
+-	collect_service_logs --role=master ${MASTER_SERVICES[@]}
++	collect_service_logs --role=master "${MASTER_SERVICES[@]}"
+ elif [[ $ROLES == "worker" ]]; then
+-	collect_service_logs --role=worker ${NODE_SERVICES[@]}
++	collect_service_logs --role=worker "${NODE_SERVICES[@]}"
+ elif [[ $ROLES == "master,worker" ]] || [[ $ROLES == "worker,master" ]]; then
+-	collect_service_logs --role=master ${MASTER_SERVICES[@]}
+-	collect_service_logs --role=worker ${NODE_SERVICES[@]}
++	collect_service_logs --role=master "${MASTER_SERVICES[@]}"
++	collect_service_logs --role=worker "${NODE_SERVICES[@]}"
+ else
+ 	echo "Error: no selector supplied or an invalid selector was supplied." >&2
+ 	echo "Error: valid selectors are '--role=master', '--role=worker', '--rolemaster,worker', '--role=worker,master' the node name." >&2
+diff --git a/collection-scripts/gather_service_logs_util b/collection-scripts/gather_service_logs_util
+index 2a781a88..4e319935 100644
+--- a/collection-scripts/gather_service_logs_util
++++ b/collection-scripts/gather_service_logs_util
+@@ -25,10 +25,10 @@ function collect_service_logs {
+ 	for service in "${@}"; do
+ 		echo "INFO: Collecting host service logs for $service"
+ 		if [[ ${selector} =~ '--role=' ]]; then
+-			oc adm node-logs "${node_log_collection_args:---since=${SINCE_TIMEFRAME:--7d}}" ${selector} -l kubernetes.io/os=linux -u "${service}" >"${DIR_PATH}/${service}_service.log" &
++			oc adm node-logs "${node_log_collection_args:---since=${SINCE_TIMEFRAME:--7d}}" "${selector}" -l kubernetes.io/os=linux -u "${service}" >"${DIR_PATH}/${service}_service.log" &
+ 			PIDS+=($!)
+ 		else
+-			oc adm node-logs "${node_log_collection_args:---since=${SINCE_TIMEFRAME:--7d}}" ${selector} -u "${service}" >"${DIR_PATH}/${service}_service.log" &
++			oc adm node-logs "${node_log_collection_args:---since=${SINCE_TIMEFRAME:--7d}}" "${selector}" -u "${service}" >"${DIR_PATH}/${service}_service.log" &
+ 			PIDS+=($!)
+ 		fi
+ 	done
+diff --git a/collection-scripts/gather_sriov b/collection-scripts/gather_sriov
+index 537a62bc..50afaf39 100755
+--- a/collection-scripts/gather_sriov
++++ b/collection-scripts/gather_sriov
+@@ -1,6 +1,7 @@
+ #!/bin/bash
+ 
+-source $(dirname "$0")/common.sh
++# shellcheck source=collection-scripts/common.sh
++source "$(dirname "$0")/common.sh"
+ BASE_COLLECTION_PATH="must-gather"
+ get_operator_ns "sriov-network-operator"
+ get_log_collection_args
+@@ -10,17 +11,22 @@ SRIOV_LOG_PATH="${BASE_COLLECTION_PATH}/namespaces/${operator_ns}"
+ resources=()
+ 
+ # sriov network operator namespace
+-resources+=(ns/${operator_ns})
++resources+=("ns/${operator_ns}")
+ 
+ # sriovnetwork.openshift.io
+ resources+=(sriovnetworknodepolicies sriovnetworknodestates sriovnetworkpoolconfigs sriovnetworks sriovoperatorconfigs sriovibnetworks)
+ 
+ # run the collection of resources using must-gather
+-for resource in ${resources[@]}; do
+-	oc adm inspect ${log_collection_args} --dest-dir must-gather --all-namespaces ${resource}
++for resource in "${resources[@]}"; do
++	# shellcheck disable=SC2086
++	oc adm inspect ${log_collection_args} --dest-dir must-gather --all-namespaces "${resource}"
+ done
+ 
+-CONFIG_DAEMON_PODS="${@:-$(oc -n ${operator_ns} get pods -l app=sriov-network-config-daemon -o jsonpath='{.items[*].metadata.name}')}"
++if [ $# -gt 0 ]; then
++	CONFIG_DAEMON_PODS=("$@")
++else
++	read -ra CONFIG_DAEMON_PODS <<<"$(oc -n "${operator_ns}" get pods -l app=sriov-network-config-daemon -o jsonpath='{.items[*].metadata.name}')"
++fi
+ PIDS=()
+ 
+ # gather_netns_ip_a runs ip netns, and for every net namespace runs `ip netns exec <id> ip a`
+@@ -30,11 +36,11 @@ function gather_netns_ip_a() {
+ 	NETNS_IP_A_LOG_PATH="${CONFIG_DAEMON_POD_LOG_PATH}/netns_ip_a"
+ 
+ 	# Filter out everything after network namespace name
+-	oc exec -n ${operator_ns} ${1} -c sriov-network-config-daemon -- chroot /host /bin/bash -c "ip netns | sed "s/ .*//"" >"${NETNS_LOG_PATH}" 2>&1
++	oc exec -n "${operator_ns}" "${1}" -c sriov-network-config-daemon -- chroot /host /bin/bash -c "ip netns | sed 's/ .*//' " >"${NETNS_LOG_PATH}" 2>&1
+ 
+ 	while IFS= read -r id; do
+ 		echo "> ip netns exec ${id} ip a" >>"${NETNS_IP_A_LOG_PATH}" &&
+-			oc exec -n ${operator_ns} "${1}" -c sriov-network-config-daemon -- chroot /host \
++			oc exec -n "${operator_ns}" "${1}" -c sriov-network-config-daemon -- chroot /host \
+ 				/bin/bash -c "ip netns exec ${id} ip a" >>"${NETNS_IP_A_LOG_PATH}" 2>&1
+ 	done <"${NETNS_LOG_PATH}"
+ }
+@@ -44,7 +50,7 @@ function gather_ethtool() {
+ 	ETHTOOL_LOG_PATH="${CONFIG_DAEMON_POD_LOG_PATH}/ethtool"
+ 
+ 	# Get ip -o link show output.
+-	OUT="$(oc exec -n ${operator_ns} ${1} -c sriov-network-config-daemon -- chroot /host \
++	OUT="$(oc exec -n "${operator_ns}" "${1}" -c sriov-network-config-daemon -- chroot /host \
+ 		/bin/bash -c "ip -o link show 2>/dev/null")"
+ 
+ 	# Cut long interfaces names.
+@@ -56,7 +62,7 @@ function gather_ethtool() {
+ 			continue
+ 		fi
+ 		echo "> ethtool -i ${interface}" >>"${ETHTOOL_LOG_PATH}"
+-		oc exec -n ${operator_ns} ${1} -c sriov-network-config-daemon -- chroot /host \
++		oc exec -n "${operator_ns}" "${1}" -c sriov-network-config-daemon -- chroot /host \
+ 			/bin/bash -c "ethtool -i ${interface}" >>"${ETHTOOL_LOG_PATH}"
+ 	done <<<"$INTERFACES"
+ }
+@@ -66,21 +72,21 @@ function gather_bf_info() {
+ 	MSTCONFIG_LOG_PATH="${CONFIG_DAEMON_POD_LOG_PATH}/mstconfig"
+ 	MSTFLINT_LOG_PATH="${CONFIG_DAEMON_POD_LOG_PATH}/mstflint"
+ 
+-	devices=$(oc exec -n openshift-sriov-network-operator ${1} -c sriov-network-config-daemon -- mstconfig q 2>/dev/null | grep "Device:" | awk 'BEGIN {FS="/";} { print $6 }')
++	devices=$(oc exec -n openshift-sriov-network-operator "${1}" -c sriov-network-config-daemon -- mstconfig q 2>/dev/null | grep "Device:" | awk 'BEGIN {FS="/";} { print $6 }')
+ 	if [ -z "${devices}" ]; then
+ 		echo "No Mellanox devices detected by mstconfig" | tee -a "${MSTCONFIG_LOG_PATH}" "${MSTFLINT_LOG_PATH}" >/dev/null
+ 		return
+ 	fi
+ 	for device in $devices; do
+-		oc exec -n ${operator_ns} ${1} -c sriov-network-config-daemon -- \
++		oc exec -n "${operator_ns}" "${1}" -c sriov-network-config-daemon -- \
+ 			/bin/bash -c "mstconfig -e -d $device q" >>"${MSTCONFIG_LOG_PATH}"
+ 
+-		oc exec -n ${operator_ns} ${1} -c sriov-network-config-daemon -- \
++		oc exec -n "${operator_ns}" "${1}" -c sriov-network-config-daemon -- \
+ 			/bin/bash -c "mstflint -d $device q" >>"${MSTFLINT_LOG_PATH}"
+ 	done
+ }
+ 
+-for CONFIG_DAEMON_POD in ${CONFIG_DAEMON_PODS[@]}; do
++for CONFIG_DAEMON_POD in "${CONFIG_DAEMON_PODS[@]}"; do
+ 
+ 	CONFIG_DAEMON_POD_LOG_PATH="${SRIOV_LOG_PATH}/pods/${CONFIG_DAEMON_POD}"
+ 	SNO_INITIAL_NODE_STATE_LOG_PATH="${CONFIG_DAEMON_POD_LOG_PATH}/sno-initial-node-state.json"
+@@ -91,32 +97,32 @@ for CONFIG_DAEMON_POD in ${CONFIG_DAEMON_PODS[@]}; do
+ 	VAR_LIB_CNI_SRIOV_PATH="${CONFIG_DAEMON_POD_LOG_PATH}/var-lib-cni-sriov"
+ 
+ 	# Collect sno-initial-node-state.json.
+-	oc exec -n ${operator_ns} "${CONFIG_DAEMON_POD}" -c sriov-network-config-daemon -- chroot /host \
+-		/bin/bash -c "cat /tmp/sno-initial-node-state.json" >${SNO_INITIAL_NODE_STATE_LOG_PATH} &
++	oc exec -n "${operator_ns}" "${CONFIG_DAEMON_POD}" -c sriov-network-config-daemon -- chroot /host \
++		/bin/bash -c "cat /tmp/sno-initial-node-state.json" >"${SNO_INITIAL_NODE_STATE_LOG_PATH}" &
+ 	PIDS+=($!)
+ 
+ 	# Collect kernel cmdline.
+-	oc exec -n ${operator_ns} "${CONFIG_DAEMON_POD}" -c sriov-network-config-daemon -- chroot /host \
++	oc exec -n "${operator_ns}" "${CONFIG_DAEMON_POD}" -c sriov-network-config-daemon -- chroot /host \
+ 		/bin/bash -c "cat /proc/cmdline" >"${KERNEL_CMDLINE_LOG_PATH}" &
+ 	PIDS+=($!)
+ 
+ 	# Collect ip link.
+-	oc exec -n ${operator_ns} "${CONFIG_DAEMON_POD}" -c sriov-network-config-daemon -- chroot /host \
++	oc exec -n "${operator_ns}" "${CONFIG_DAEMON_POD}" -c sriov-network-config-daemon -- chroot /host \
+ 		/bin/bash -c "ip link" >"${IP_LINK_LOG_PATH}" 2>&1 &
+ 	PIDS+=($!)
+ 
+ 	# Collect dmesg.
+-	oc exec -n ${operator_ns} "${CONFIG_DAEMON_POD}" -c sriov-network-config-daemon -- chroot /host \
++	oc exec -n "${operator_ns}" "${CONFIG_DAEMON_POD}" -c sriov-network-config-daemon -- chroot /host \
+ 		/bin/bash -c "journalctl -k" >"${DMESG_LOG_PATH}" &
+ 	PIDS+=($!)
+ 
+ 	# Collect var/log/multus.log if exists.
+-	out=$(oc exec -n ${operator_ns} "${CONFIG_DAEMON_POD}" -c sriov-network-config-daemon -- chroot /host \
++	out=$(oc exec -n "${operator_ns}" "${CONFIG_DAEMON_POD}" -c sriov-network-config-daemon -- chroot /host \
+ 		/bin/bash -c "cat var/log/multus.log" 2>/dev/null) && echo "$out" 1>"${MULTUS_LOG_PATH}" &
+ 	PIDS+=($!)
+ 
+ 	# Collect /var/lib/cni/sriov contents.
+-	oc cp -n ${operator_ns} -c sriov-network-config-daemon "${CONFIG_DAEMON_POD}":/host/var/lib/cni/sriov "${VAR_LIB_CNI_SRIOV_PATH}" &
++	oc cp -n "${operator_ns}" -c sriov-network-config-daemon "${CONFIG_DAEMON_POD}":/host/var/lib/cni/sriov "${VAR_LIB_CNI_SRIOV_PATH}" &
+ 	PIDS+=($!)
+ 
+ 	gather_netns_ip_a "${CONFIG_DAEMON_POD}" &
+diff --git a/collection-scripts/gather_vsphere b/collection-scripts/gather_vsphere
+index 65010b21..3626bc17 100755
+--- a/collection-scripts/gather_vsphere
++++ b/collection-scripts/gather_vsphere
+@@ -1,6 +1,7 @@
+ #!/bin/bash
+ 
+-source $(dirname "$0")/common.sh
++# shellcheck source=collection-scripts/common.sh
++source "$(dirname "$0")/common.sh"
+ get_log_collection_args
+ 
+ BASE_COLLECTION_PATH="must-gather"
+@@ -12,7 +13,9 @@ if [ -z "$CSIDRIVER" ]; then
+ fi
+ 
+ echo "INFO: Collecting vSphere CSI driver CRDs"
++# shellcheck disable=SC2086
+ oc adm inspect ${log_collection_args} --dest-dir "${BASE_COLLECTION_PATH}" ${rotated_pod_logs_arg} csinodetopologies.cns.vmware.com,cnsvspherevolumemigrations.cns.vmware.com
++# shellcheck disable=SC2086
+ oc adm inspect ${log_collection_args} --dest-dir "${BASE_COLLECTION_PATH}" ${rotated_pod_logs_arg} --all-namespaces cnsvolumeoperationrequests.cns.vmware.com
+ 
+ echo "INFO: Collecting vSphere CSI driver CRDs complete"
+diff --git a/collection-scripts/gather_windows_node_logs b/collection-scripts/gather_windows_node_logs
+index 00bdd687..a7bb9552 100755
+--- a/collection-scripts/gather_windows_node_logs
++++ b/collection-scripts/gather_windows_node_logs
+@@ -1,6 +1,7 @@
+ #!/bin/bash
+ 
+-source $(dirname "$0")/common.sh
++# shellcheck source=collection-scripts/common.sh
++source "$(dirname "$0")/common.sh"
+ get_log_collection_args
+ 
+ BASE_COLLECTION_PATH="/must-gather"
+@@ -22,13 +23,13 @@ fi
+ 
+ PIDS=()
+ echo INFO: Collecting logs for all Windows nodes
+-for log in ${LOGS[@]}; do
+-	LOG_FILE_DIR=${WINDOWS_NODE_LOGS}/log_files/$(dirname $log)
+-	mkdir -p ${LOG_FILE_DIR}
+-	/usr/bin/oc adm node-logs ${node_log_collection_args:+"$node_log_collection_args"} -l kubernetes.io/os=windows --path=$log >${LOG_FILE_DIR}/$(basename $log) &
++for log in "${LOGS[@]}"; do
++	LOG_FILE_DIR=${WINDOWS_NODE_LOGS}/log_files/$(dirname "$log")
++	mkdir -p "${LOG_FILE_DIR}"
++	/usr/bin/oc adm node-logs ${node_log_collection_args:+"$node_log_collection_args"} -l kubernetes.io/os=windows --path="$log" >"${LOG_FILE_DIR}/$(basename "$log")" &
+ 	PIDS+=($!)
+ done
+-wait ${PIDS[@]}
++wait "${PIDS[@]}"
+ 
+ # force disk flush to ensure that all data gathered is accessible in the copy container
+ sync
+diff --git a/collection-scripts/openshift-must-gather b/collection-scripts/openshift-must-gather
+index 5a4a648d..947bff45 100755
+--- a/collection-scripts/openshift-must-gather
++++ b/collection-scripts/openshift-must-gather
+@@ -1,5 +1,6 @@
+ #!/usr/bin/env bash
+ echo "WARNING: openshift-must-gather has been DEPRECATED. Use \`oc adm inspect\` instead."
++# shellcheck disable=SC2093
+ exec oc adm inspect "$@"
+ 
+ # force disk flush to ensure that all data gathered is accessible in the copy container

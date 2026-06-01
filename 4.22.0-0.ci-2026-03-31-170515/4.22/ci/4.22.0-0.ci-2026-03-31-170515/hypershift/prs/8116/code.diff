@@ -1,0 +1,193 @@
+diff --git a/.github/workflows/docs-preview.yaml b/.github/workflows/docs-preview.yaml
+index f64d0c3dfd5..f36d64a763d 100644
+--- a/.github/workflows/docs-preview.yaml
++++ b/.github/workflows/docs-preview.yaml
+@@ -1,7 +1,7 @@
+ name: Docs Preview
+ 
+ on:
+-  pull_request:
++  pull_request_target:
+     branches: [main]
+     paths:
+       - 'docs/**'
+@@ -11,27 +11,53 @@ permissions:
+   deployments: write
+ 
+ jobs:
+-  docs-preview:
+-    name: Docs Preview
++  build:
++    name: Build Docs
+     runs-on: arc-runner-set
+     timeout-minutes: 10
+-    environment:
+-      name: docs-preview
+-      url: https://pr-${{ github.event.pull_request.number }}.hypershift.pages.dev
+     steps:
+       - uses: actions/checkout@v6
++        with:
++          ref: ${{ github.event.pull_request.head.sha }}
+       - uses: actions/setup-python@v5
+         with:
+           python-version: '3.x'
+-          cache: pip
+-          cache-dependency-path: docs/requirements.txt
++        env:
++          PIP_CACHE_DIR: ${{ runner.temp }}/.pip-cache
+       - run: pip install -r docs/requirements.txt
++        env:
++          PIP_CACHE_DIR: ${{ runner.temp }}/.pip-cache
+       - name: Build documentation
+         run: mkdocs build --strict
+         working-directory: docs
++      - uses: actions/upload-artifact@v4
++        with:
++          name: docs-site
++          path: docs/site
++
++  deploy:
++    name: Deploy Preview
++    needs: build
++    runs-on: arc-runner-set
++    timeout-minutes: 5
++    environment:
++      name: docs-preview
++      url: https://pr-${{ github.event.pull_request.number }}.hypershift.pages.dev
++    steps:
++      - uses: actions/download-artifact@v4
++        with:
++          name: docs-site
++          path: site
++      - uses: actions/setup-node@v4
++        with:
++          node-version: '20'
++        env:
++          npm_config_cache: ${{ runner.temp }}/.npm
+       - name: Deploy to Cloudflare Pages
++        env:
++          npm_config_cache: ${{ runner.temp }}/.npm
+         uses: cloudflare/wrangler-action@v3
+         with:
+           apiToken: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+           accountId: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+-          command: pages deploy docs/site --project-name=hypershift --branch=pr-${{ github.event.pull_request.number }} --commit-dirty=true
++          command: pages deploy site --project-name=hypershift --branch=pr-${{ github.event.pull_request.number }} --commit-dirty=true
+diff --git a/docs/content/how-to/ci/docs-preview.md b/docs/content/how-to/ci/docs-preview.md
+new file mode 100644
+index 00000000000..3a272c50a04
+--- /dev/null
++++ b/docs/content/how-to/ci/docs-preview.md
+@@ -0,0 +1,37 @@
++# Documentation Preview
++
++When a pull request modifies files under `docs/`, a GitHub Actions workflow automatically builds the documentation and deploys a preview to Cloudflare Pages.
++
++## How It Works
++
++The workflow uses `pull_request_target` with two jobs to securely handle fork PRs:
++
++1. **Build** — checks out the PR code and builds the docs with MkDocs in strict mode. This job has no access to secrets.
++2. **Deploy** — downloads the built artifact and deploys it to Cloudflare Pages. This job has access to the `docs-preview` environment secrets but never executes PR code.
++
++GitHub shows a **View deployment** link in the PR timeline via the `docs-preview` environment.
++
++The preview is available at `https://pr-<number>.hypershift.pages.dev`.
++
++## Configuration
++
++The workflow is defined in `.github/workflows/docs-preview.yaml` and runs on self-hosted ARC runners.
++
++It requires two secrets configured on the `docs-preview` GitHub Environment:
++
++| Secret | Description |
++|--------|-------------|
++| `CLOUDFLARE_ACCOUNT_ID` | Cloudflare account ID |
++| `CLOUDFLARE_API_TOKEN` | API token with Cloudflare Pages edit permissions |
++
++## Local Preview
++
++To preview documentation locally:
++
++```bash
++cd docs
++pip install -r requirements.txt
++mkdocs serve
++```
++
++Then open [http://127.0.0.1:8000](http://127.0.0.1:8000).
+diff --git a/docs/content/reference/aggregated-docs.md b/docs/content/reference/aggregated-docs.md
+index e895208cfcf..4aea9c3d417 100644
+--- a/docs/content/reference/aggregated-docs.md
++++ b/docs/content/reference/aggregated-docs.md
+@@ -3,7 +3,7 @@
+ This file contains all HyperShift documentation aggregated into a single file
+ for use with AI tools like NotebookLM.
+ 
+-Total documents: 263
++Total documents: 264
+ 
+ ---
+ 
+@@ -10669,6 +10669,49 @@ Understanding the CI infrastructure helps when:
+ - CI Dashboard
+ 
+ 
++---
++
++## Source: docs/content/how-to/ci/docs-preview.md
++
++# Documentation Preview
++
++When a pull request modifies files under `docs/`, a GitHub Actions workflow automatically builds the documentation and deploys a preview to Cloudflare Pages.
++
++## How It Works
++
++The workflow uses `pull_request_target` with two jobs to securely handle fork PRs:
++
++1. **Build** — checks out the PR code and builds the docs with MkDocs in strict mode. This job has no access to secrets.
++2. **Deploy** — downloads the built artifact and deploys it to Cloudflare Pages. This job has access to the `docs-preview` environment secrets but never executes PR code.
++
++GitHub shows a **View deployment** link in the PR timeline via the `docs-preview` environment.
++
++The preview is available at `https://pr-<number>.hypershift.pages.dev`.
++
++## Configuration
++
++The workflow is defined in `.github/workflows/docs-preview.yaml` and runs on self-hosted ARC runners.
++
++It requires two secrets configured on the `docs-preview` GitHub Environment:
++
++| Secret | Description |
++|--------|-------------|
++| `CLOUDFLARE_ACCOUNT_ID` | Cloudflare account ID |
++| `CLOUDFLARE_API_TOKEN` | API token with Cloudflare Pages edit permissions |
++
++## Local Preview
++
++To preview documentation locally:
++
++```bash
++cd docs
++pip install -r requirements.txt
++mkdocs serve
++```
++
++Then open http://127.0.0.1:8000.
++
++
+ ---
+ 
+ ## Source: docs/content/how-to/common/exposing-services-from-hcp.md
+diff --git a/docs/mkdocs.yml b/docs/mkdocs.yml
+index 6e742a51ddd..612a36abd1f 100644
+--- a/docs/mkdocs.yml
++++ b/docs/mkdocs.yml
+@@ -82,6 +82,7 @@ nav:
+     - how-to/ci/checking-ci.md
+     - how-to/ci/ci-infrastructure.md
+     - 'AI-Assisted CI Jobs': how-to/ci/ai-assisted-ci-jobs.md
++    - 'Documentation Preview': how-to/ci/docs-preview.md
+   - 'HyperShift Operator Install':
+     - how-to/install/index.md
+   - 'PKI and Certificates':

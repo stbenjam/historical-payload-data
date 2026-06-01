@@ -1,0 +1,628 @@
+diff --git a/pkg/azuredisk/azure_controller_common.go b/pkg/azuredisk/azure_controller_common.go
+index 20b69df153..bc3fc42654 100644
+--- a/pkg/azuredisk/azure_controller_common.go
++++ b/pkg/azuredisk/azure_controller_common.go
+@@ -26,6 +26,7 @@ import (
+ 	"sync"
+ 	"time"
+ 
++	"github.com/Azure/azure-sdk-for-go/sdk/azcore"
+ 	"github.com/Azure/azure-sdk-for-go/sdk/azcore/to"
+ 	"github.com/Azure/azure-sdk-for-go/sdk/resourcemanager/compute/armcompute/v7"
+ 
+@@ -374,7 +375,7 @@ func (c *controllerCommon) DetachDisk(ctx context.Context, diskName, diskURI str
+ 			// if host doesn't exist, no need to detach
+ 			klog.Warningf("azureDisk - failed to get azure instance id(%s), DetachDisk(%s) will assume disk is already detached",
+ 				nodeName, diskURI)
+-			return nil
++			return c.waitForDiskManagedByTobeRemoved(ctx, diskURI, nodeName)
+ 		}
+ 		klog.Warningf("failed to get azure instance id (%v)", err)
+ 		return fmt.Errorf("failed to get azure instance id for node %q: %w", nodeName, err)
+@@ -413,7 +414,7 @@ func (c *controllerCommon) DetachDisk(ctx context.Context, diskName, diskURI str
+ 				// if host doesn't exist, no need to detach
+ 				klog.Warningf("azureDisk - got InstanceNotFoundError(%v), DetachDisk(%s) will assume disk is already detached",
+ 					err, diskURI)
+-				return nil
++				return c.waitForDiskManagedByTobeRemoved(ctx, diskURI, nodeName)
+ 			}
+ 			if c.ForceDetachBackoff && !azureutils.IsThrottlingError(err) {
+ 				klog.Errorf("azureDisk - DetachDisk(%s) from node %s failed with error: %v, retry with force detach", diskURI, nodeName, err)
+@@ -427,6 +428,12 @@ func (c *controllerCommon) DetachDisk(ctx context.Context, diskName, diskURI str
+ 		return err
+ 	}
+ 
++	err = c.waitForDiskManagedByTobeRemoved(ctx, diskURI, nodeName)
++	if err != nil {
++		klog.Errorf("azureDisk - waitForDiskManagedByTobeRemoved(%s) failed, err: %v", diskURI, err)
++		return err
++	}
++
+ 	if !c.DisableDiskLunCheck {
+ 		// always check disk lun after disk detach complete
+ 		lun, vmState, errGetLun := c.GetDiskLun(ctx, diskName, diskURI, nodeName)
+@@ -635,6 +642,52 @@ func (c *controllerCommon) isMaxDataDiskCountExceeded(ctx context.Context, nodeN
+ 	return true
+ }
+ 
++// For cases where an instance is deleted, we assume the disk is detached, but it actually
++// takes a while for disk property to be updated. We do not want to presume such disks to be detached
++// without waiting for disk to be actually detached.
++func (c *controllerCommon) waitForDiskManagedByTobeRemoved(ctx context.Context, diskURI string, nodeName types.NodeName) error {
++	subsID, resourceGroup, diskName, err := azureutils.GetInfoFromURI(diskURI)
++	if err != nil {
++		return err
++	}
++	klog.V(2).Infof("azureDisk - waitForDiskManagedByTobeRemoved: diskURI(%s)", diskURI)
++	var disk *armcompute.Disk
++	waitFunc := func(ctx context.Context) (bool, error) {
++		diskclient, err := c.clientFactory.GetDiskClientForSub(subsID)
++		if err != nil {
++			return false, fmt.Errorf("error making diskClient while verifying detach: %w", err)
++		}
++		disk, err = diskclient.Get(ctx, resourceGroup, diskName)
++		if err != nil {
++			return false, fmt.Errorf("error getting disk: %w", err)
++		}
++
++		if disk.ManagedBy == nil {
++			return true, nil
++		}
++		attachedNode, err := c.cloud.VMSet.GetNodeNameByProviderID(ctx, *disk.ManagedBy)
++		if err != nil {
++			if errors.Is(err, cloudprovider.InstanceNotFound) || isInstanceNotFoundError(err) {
++				klog.V(2).Infof("disk %s is still marked as attached to %s, but instance is not found; waiting for ManagedBy to be cleared", diskURI, *disk.ManagedBy)
++				return false, nil
++			}
++			return false, fmt.Errorf("error resolving node name from providerID %s: %w", *disk.ManagedBy, err)
++		}
++
++		if !strings.EqualFold(string(attachedNode), string(nodeName)) {
++			klog.Warningf("expected to be detached from node %s, but found attached to %s, assuming as detached from original node", nodeName, attachedNode)
++			return true, nil
++		}
++
++		return false, nil
++	}
++	err = kwait.ExponentialBackoffWithContext(ctx, defaultBackOff, waitFunc)
++	if err != nil && disk != nil && disk.ManagedBy != nil {
++		klog.Errorf("error in - waitForDiskManagedByTobeRemoved, disk %s still has ManagedBy (VM resource ID) %s", diskURI, *disk.ManagedBy)
++	}
++	return err
++}
++
+ func getValidCreationData(subscriptionID, resourceGroup string, options *ManagedDiskOptions) (armcompute.CreationData, error) {
+ 	if options.SourceResourceID == "" {
+ 		return armcompute.CreationData{
+@@ -676,6 +729,14 @@ func getValidCreationData(subscriptionID, resourceGroup string, options *Managed
+ }
+ 
+ func isInstanceNotFoundError(err error) bool {
++	var responseErr *azcore.ResponseError
++	if errors.As(err, &responseErr) {
++		// Azure SDK "not found" shape.
++		if responseErr.StatusCode == 404 {
++			return true
++		}
++	}
++
+ 	errMsg := strings.ToLower(err.Error())
+ 	if strings.Contains(errMsg, strings.ToLower(consts.VmssVMNotActiveErrorMessage)) {
+ 		return true
+diff --git a/pkg/azuredisk/azure_controller_common_test.go b/pkg/azuredisk/azure_controller_common_test.go
+index 4fffd167e8..724f09b87c 100644
+--- a/pkg/azuredisk/azure_controller_common_test.go
++++ b/pkg/azuredisk/azure_controller_common_test.go
+@@ -26,6 +26,7 @@ import (
+ 	"testing"
+ 	"time"
+ 
++	"github.com/Azure/azure-sdk-for-go/sdk/azcore"
+ 	"github.com/Azure/azure-sdk-for-go/sdk/azcore/to"
+ 	armcompute "github.com/Azure/azure-sdk-for-go/sdk/resourcemanager/compute/armcompute/v7"
+ 	autorestmocks "github.com/Azure/go-autorest/autorest/mocks"
+@@ -33,14 +34,19 @@ import (
+ 	"go.uber.org/mock/gomock"
+ 	"k8s.io/apimachinery/pkg/types"
+ 	"k8s.io/apimachinery/pkg/util/wait"
++	cloudprovider "k8s.io/cloud-provider"
+ 	"k8s.io/utils/ptr"
+ 
++	"sigs.k8s.io/cloud-provider-azure/pkg/azclient/diskclient/mock_diskclient"
++	"sigs.k8s.io/cloud-provider-azure/pkg/azclient/mock_azclient"
+ 	mockvmclient "sigs.k8s.io/cloud-provider-azure/pkg/azclient/virtualmachineclient/mock_virtualmachineclient"
+ 	azcache "sigs.k8s.io/cloud-provider-azure/pkg/cache"
+ 	"sigs.k8s.io/cloud-provider-azure/pkg/consts"
+ 	"sigs.k8s.io/cloud-provider-azure/pkg/provider"
+ )
+ 
++const testManagedByValue = "some-vm"
++
+ func TestCommonAttachDisk(t *testing.T) {
+ 	ctrl := gomock.NewController(t)
+ 	defer ctrl.Finish()
+@@ -241,9 +247,10 @@ func TestCommonDetachDisk(t *testing.T) {
+ 	for i, test := range testCases {
+ 		testCloud := provider.GetTestCloud(ctrl)
+ 		common := &controllerCommon{
+-			cloud:              testCloud,
+-			lockMap:            newLockMap(),
++			cloud:                              testCloud,
++			lockMap:                            newLockMap(),
+ 			ForceDetachBackoff: true,
++			clientFactory:      testCloud.ComputeClientFactory,
+ 		}
+ 		diskURI := fmt.Sprintf("/subscriptions/%s/resourceGroups/%s/providers/Microsoft.Compute/disks/disk-name",
+ 			testCloud.SubscriptionID, testCloud.ResourceGroup)
+@@ -257,11 +264,115 @@ func TestCommonDetachDisk(t *testing.T) {
+ 		}
+ 		mockVMClient.EXPECT().CreateOrUpdate(gomock.Any(), testCloud.ResourceGroup, gomock.Any(), gomock.Any()).Return(nil, nil).AnyTimes()
+ 
++		diskClient := mock_diskclient.NewMockInterface(ctrl)
++		testCloud.ComputeClientFactory.(*mock_azclient.MockClientFactory).EXPECT().GetDiskClientForSub(gomock.Any()).Return(diskClient, nil).AnyTimes()
++		diskClient.EXPECT().Get(gomock.Any(), gomock.Any(), gomock.Any()).Return(&armcompute.Disk{
++			ManagedBy: nil,
++		}, nil).AnyTimes()
++
+ 		err := common.DetachDisk(ctx, test.diskName, diskURI, test.nodeName)
+ 		assert.Equal(t, test.expectedErr, err != nil, "TestCase[%d]: %s, err: %v", i, test.desc, err)
+ 	}
+ }
+ 
++func TestCommonDetachDiskInstanceNotFoundWaitForDiskManagedByRemoved(t *testing.T) {
++	oldBackOff := defaultBackOff
++	defaultBackOff = wait.Backoff{
++		Steps:    2,
++		Duration: 10 * time.Millisecond,
++		Factor:   1.0,
++		Jitter:   0.0,
++	}
++	defer func() {
++		defaultBackOff = oldBackOff
++	}()
++
++	managedBy := testManagedByValue
++	testCases := []struct {
++		desc               string
++		nodeName           types.NodeName
++		managedBy          *string
++		attachedNodeName   types.NodeName
++		getNodeNameByIDErr error
++		getErr             error
++		expectedErr        bool
++	}{
++		{
++			desc:        "no error when ManagedBy cleared",
++			nodeName:    "vm1",
++			managedBy:   nil,
++			expectedErr: false,
++		},
++		{
++			desc:        "error when disk get fails",
++			nodeName:    "vm1",
++			managedBy:   nil,
++			getErr:      errors.New("get disk error"),
++			expectedErr: true,
++		},
++		{
++			desc:             "error when ManagedBy remains set and resolves to same node",
++			nodeName:         "vm1",
++			managedBy:        &managedBy,
++			attachedNodeName: "vm1",
++			expectedErr:      true,
++		},
++		{
++			desc:             "error when ManagedBy remains set and resolves to same node with different casing",
++			nodeName:         "VM1",
++			managedBy:        &managedBy,
++			attachedNodeName: "vm1",
++			expectedErr:      true,
++		},
++		{
++			desc:             "no error when ManagedBy resolves to different node",
++			nodeName:         "vm1",
++			managedBy:        &managedBy,
++			attachedNodeName: "vm2",
++			expectedErr:      false,
++		},
++		{
++			desc:               "error when ManagedBy remains set and instance cannot be resolved",
++			nodeName:           "vm1",
++			managedBy:          &managedBy,
++			getNodeNameByIDErr: cloudprovider.InstanceNotFound,
++			expectedErr:        true,
++		},
++	}
++
++	for _, test := range testCases {
++		t.Run(test.desc, func(t *testing.T) {
++			ctrl := gomock.NewController(t)
++			defer ctrl.Finish()
++
++			testCloud := provider.GetTestCloud(ctrl)
++			testCloud.UseInstanceMetadata = false
++			mockVMSet := provider.NewMockVMSet(ctrl)
++			testCloud.VMSet = mockVMSet
++			mockVMSet.EXPECT().GetInstanceIDByNodeName(gomock.Any(), gomock.Any()).Return("", cloudprovider.InstanceNotFound).AnyTimes()
++			if test.managedBy != nil && test.getErr == nil {
++				mockVMSet.EXPECT().GetNodeNameByProviderID(gomock.Any(), *test.managedBy).Return(test.attachedNodeName, test.getNodeNameByIDErr).AnyTimes()
++			}
++
++			diskClient := mock_diskclient.NewMockInterface(ctrl)
++			testCloud.ComputeClientFactory.(*mock_azclient.MockClientFactory).EXPECT().GetDiskClientForSub(gomock.Any()).Return(diskClient, nil).AnyTimes()
++			diskClient.EXPECT().Get(gomock.Any(), gomock.Any(), gomock.Any()).Return(&armcompute.Disk{
++				ManagedBy: test.managedBy,
++			}, test.getErr).AnyTimes()
++
++			common := &controllerCommon{
++				cloud:         testCloud,
++				lockMap:       newLockMap(),
++				clientFactory: testCloud.ComputeClientFactory,
++			}
++			diskURI := fmt.Sprintf("/subscriptions/%s/resourceGroups/%s/providers/Microsoft.Compute/disks/disk-name",
++				testCloud.SubscriptionID, testCloud.ResourceGroup)
++			err := common.DetachDisk(t.Context(), "disk-name", diskURI, test.nodeName)
++			assert.Equal(t, test.expectedErr, err != nil, "err: %v", err)
++		})
++	}
++}
++
+ func TestCommonUpdateVM(t *testing.T) {
+ 	ctrl := gomock.NewController(t)
+ 	defer ctrl.Finish()
+@@ -580,30 +691,55 @@ func TestGetValidCreationData(t *testing.T) {
+ 
+ func TestIsInstanceNotFoundError(t *testing.T) {
+ 	testCases := []struct {
+-		errMsg         string
++		desc           string
++		err            error
+ 		expectedResult bool
+ 	}{
+ 		{
+-			errMsg:         "",
++			desc:           "empty error message",
++			err:            fmt.Errorf(""),
+ 			expectedResult: false,
+ 		},
+ 		{
+-			errMsg:         "other error",
++			desc:           "unrelated error message",
++			err:            fmt.Errorf("other error"),
+ 			expectedResult: false,
+ 		},
+ 		{
+-			errMsg:         "The provided instanceId 857 is not an active Virtual Machine Scale Set VM instanceId.",
++			desc:           "VMSS instance not active error message",
++			err:            fmt.Errorf("the provided instanceId 857 is not an active Virtual Machine Scale Set VM instanceId"),
++			expectedResult: true,
++		},
++		{
++			desc:           "VMSS instance not active error wrapped in request failure",
++			err:            fmt.Errorf(`compute.VirtualMachineScaleSetVMsClient#Update: Failure sending request: StatusCode=400 -- Original Error: Code="InvalidParameter" Message="The provided instanceId 1181 is not an active Virtual Machine Scale Set VM instanceId." Target="instanceIds"`),
+ 			expectedResult: true,
+ 		},
+ 		{
+-			errMsg:         `compute.VirtualMachineScaleSetVMsClient#Update: Failure sending request: StatusCode=400 -- Original Error: Code="InvalidParameter" Message="The provided instanceId 1181 is not an active Virtual Machine Scale Set VM instanceId." Target="instanceIds"`,
++			desc: "Azure SDK ResponseError with 404 status code",
++			err: &azcore.ResponseError{
++				StatusCode: http.StatusNotFound,
++				RawResponse: &http.Response{
++					StatusCode: http.StatusNotFound,
++				},
++			},
+ 			expectedResult: true,
+ 		},
++		{
++			desc: "Azure SDK ResponseError with non-404 status code",
++			err: &azcore.ResponseError{
++				StatusCode: http.StatusBadRequest,
++				RawResponse: &http.Response{
++					StatusCode: http.StatusBadRequest,
++				},
++			},
++			expectedResult: false,
++		},
+ 	}
+ 
+ 	for i, test := range testCases {
+-		result := isInstanceNotFoundError(fmt.Errorf("%v", test.errMsg))
+-		assert.Equal(t, test.expectedResult, result, "TestCase[%d]", i, result)
++		result := isInstanceNotFoundError(test.err)
++		assert.Equal(t, test.expectedResult, result, "TestCase[%d]: %s", i, test.desc)
+ 	}
+ }
+ 
+diff --git a/pkg/azuredisk/azuredisk.go b/pkg/azuredisk/azuredisk.go
+index 4ef357f35d..0239b4854c 100644
+--- a/pkg/azuredisk/azuredisk.go
++++ b/pkg/azuredisk/azuredisk.go
+@@ -71,6 +71,10 @@ var (
+ 	}
+ )
+ 
++const (
++	volumeAttachmentListTimeoutSeconds = 2
++)
++
+ // CSIDriver defines the interface for a CSI driver.
+ type CSIDriver interface {
+ 	csi.ControllerServer
+@@ -560,7 +564,7 @@ func (d *DriverCore) getUsedLunsFromVolumeAttachments(ctx context.Context, nodeN
+ 	}
+ 
+ 	volumeAttachments, err := kubeClient.StorageV1().VolumeAttachments().List(ctx, metav1.ListOptions{
+-		TimeoutSeconds: ptr.To(int64(2))})
++		TimeoutSeconds: ptr.To(int64(volumeAttachmentListTimeoutSeconds))})
+ 	if err != nil {
+ 		return nil, err
+ 	}
+diff --git a/pkg/azuredisk/controllerserver.go b/pkg/azuredisk/controllerserver.go
+index 182bd922fe..c6a46e620b 100644
+--- a/pkg/azuredisk/controllerserver.go
++++ b/pkg/azuredisk/controllerserver.go
+@@ -39,6 +39,7 @@ import (
+ 	"k8s.io/klog/v2"
+ 	"k8s.io/utils/ptr"
+ 
++	storagev1 "k8s.io/api/storage/v1"
+ 	consts "sigs.k8s.io/azuredisk-csi-driver/pkg/azureconstants"
+ 	"sigs.k8s.io/azuredisk-csi-driver/pkg/azureutils"
+ 	"sigs.k8s.io/azuredisk-csi-driver/pkg/optimization"
+@@ -558,6 +559,15 @@ func (d *Driver) ControllerPublishVolume(ctx context.Context, req *csi.Controlle
+ 					klog.Warningf("%v", err)
+ 					return nil, err
+ 				}
++				hasVA, checkErr := d.hasVolumeAttachmentForDiskOnNode(ctx, string(derr.CurrentNode), diskURI)
++				if checkErr != nil {
++					return nil, status.Errorf(codes.Internal, "failed to check VolumeAttachments for volume %s on node %s: %v", diskURI, derr.CurrentNode, checkErr)
++				}
++				if hasVA {
++					err := status.Errorf(codes.FailedPrecondition, "volume %s still has VolumeAttachments on node %s, refusing dangling detach", diskURI, derr.CurrentNode)
++					klog.Warningf("%v", err)
++					return nil, err
++				}
+ 				klog.Warningf("volume %s is already attached to node %s, try detach first", diskURI, derr.CurrentNode)
+ 				if err = d.diskController.DetachDisk(ctx, diskName, diskURI, derr.CurrentNode); err != nil {
+ 					return nil, status.Errorf(codes.Internal, "Could not detach volume %s from node %s: %v", diskURI, derr.CurrentNode, err)
+@@ -700,6 +710,49 @@ func (d *Driver) getOccupiedLunsFromNode(ctx context.Context, nodeName types.Nod
+ 	return occupiedLuns
+ }
+ 
++// hasVolumeAttachmentForDiskOnNode checks if a VolumeAttachment exists for the given disk on the specified node.
++func (d *Driver) hasVolumeAttachmentForDiskOnNode(ctx context.Context, nodeName, diskURI string) (bool, error) {
++	kubeClient := d.cloud.KubeClient
++	if kubeClient == nil || kubeClient.StorageV1() == nil || kubeClient.StorageV1().VolumeAttachments() == nil {
++		return false, fmt.Errorf("kubeClient or kubeClient.StorageV1() or kubeClient.StorageV1().VolumeAttachments() is nil")
++	}
++	if kubeClient.CoreV1() == nil || kubeClient.CoreV1().PersistentVolumes() == nil {
++		return false, fmt.Errorf("kubeClient.CoreV1() or kubeClient.CoreV1().PersistentVolumes() is nil")
++	}
++
++	volumeAttachments, err := kubeClient.StorageV1().VolumeAttachments().List(ctx, metav1.ListOptions{
++		TimeoutSeconds: ptr.To(int64(volumeAttachmentListTimeoutSeconds)),
++	})
++	if err != nil {
++		return false, err
++	}
++
++	for _, va := range volumeAttachments.Items {
++		if va.Spec.Attacher != d.Name {
++			continue
++		}
++		// some clients such as fake clients may not honor the FieldSelector
++		if va.Spec.NodeName != nodeName {
++			continue
++		}
++		if va.Spec.Source.PersistentVolumeName != nil {
++			pvName := *va.Spec.Source.PersistentVolumeName
++			pv, err := kubeClient.CoreV1().PersistentVolumes().Get(ctx, pvName, metav1.GetOptions{})
++			if err != nil {
++				return false, err
++			}
++			if pv.Spec.CSI != nil && pv.Spec.CSI.Driver == d.Name &&
++				strings.EqualFold(pv.Spec.CSI.VolumeHandle, diskURI) {
++				return true, nil
++			}
++		}
++		if inlineVolumeSpecMatchesDisk(d.Name, diskURI, &va) {
++			return true, nil
++		}
++	}
++	return false, nil
++}
++
+ // ControllerGetCapabilities returns the capabilities of the Controller plugin
+ func (d *Driver) ControllerGetCapabilities(_ context.Context, _ *csi.ControllerGetCapabilitiesRequest) (*csi.ControllerGetCapabilitiesResponse, error) {
+ 	return &csi.ControllerGetCapabilitiesResponse{
+@@ -1323,3 +1376,12 @@ func (d *Driver) GetSourceDiskSize(ctx context.Context, subsID, resourceGroup, d
+ 	}
+ 	return (*result.Properties).DiskSizeGB, result, nil
+ }
++
++func inlineVolumeSpecMatchesDisk(driverName, diskURI string, va *storagev1.VolumeAttachment) bool {
++	if va.Spec.Source.InlineVolumeSpec != nil && va.Spec.Source.InlineVolumeSpec.CSI != nil &&
++		strings.EqualFold(va.Spec.Source.InlineVolumeSpec.CSI.VolumeHandle, diskURI) &&
++		strings.EqualFold(va.Spec.Source.InlineVolumeSpec.CSI.Driver, driverName) {
++		return true
++	}
++	return false
++}
+diff --git a/pkg/azuredisk/controllerserver_test.go b/pkg/azuredisk/controllerserver_test.go
+index bf0b0d108c..629db7ec38 100644
+--- a/pkg/azuredisk/controllerserver_test.go
++++ b/pkg/azuredisk/controllerserver_test.go
+@@ -28,11 +28,16 @@ import (
+ 	"github.com/Azure/azure-sdk-for-go/sdk/resourcemanager/compute/armcompute/v7"
+ 	"github.com/container-storage-interface/spec/lib/go/csi"
+ 	"github.com/stretchr/testify/assert"
++	"github.com/stretchr/testify/require"
+ 	"go.uber.org/mock/gomock"
+ 	"google.golang.org/grpc/codes"
+ 	"google.golang.org/grpc/status"
+ 	"google.golang.org/protobuf/types/known/timestamppb"
+ 	v1 "k8s.io/api/core/v1"
++
++	storagev1 "k8s.io/api/storage/v1"
++	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
++	"k8s.io/client-go/kubernetes/fake"
+ 	"k8s.io/utils/ptr"
+ 	consts "sigs.k8s.io/azuredisk-csi-driver/pkg/azureconstants"
+ 	"sigs.k8s.io/azuredisk-csi-driver/pkg/azuredisk/mockcorev1"
+@@ -3378,3 +3383,156 @@ func getFakeDriverWithKubeClient(ctrl *gomock.Controller) FakeDriver {
+ 	d.getCloud().KubeClient.CoreV1().(*mockcorev1.MockInterface).EXPECT().PersistentVolumes().Return(persistentvolume).AnyTimes()
+ 	return d
+ }
++
++func TestHasVolumeAttachmentForDiskOnNode(t *testing.T) {
++	ctrl := gomock.NewController(t)
++	defer ctrl.Finish()
++
++	d, _ := NewFakeDriver(ctrl)
++	client := fake.NewSimpleClientset()
++	d.getCloud().KubeClient = client
++
++	type vaChecker interface {
++		hasVolumeAttachmentForDiskOnNode(ctx context.Context, nodeName, diskURI string) (bool, error)
++	}
++	checker, ok := d.(vaChecker)
++	if !ok {
++		t.Skip("hasVolumeAttachmentForDiskOnNode is only available on Driver V1")
++	}
++
++	nodeName := "node-1"
++	otherNode := "node-2"
++	diskURI := testVolumeID
++	otherDiskURI := fmt.Sprintf(consts.ManagedDiskPath, "subs", "rg", "other-disk")
++	inlineDiskURI := fmt.Sprintf(consts.ManagedDiskPath, "subs", "rg", "inline-disk")
++	pvName := "pv-1"
++
++	_, err := client.CoreV1().PersistentVolumes().Create(context.Background(), &v1.PersistentVolume{
++		ObjectMeta: metav1.ObjectMeta{Name: pvName},
++		Spec: v1.PersistentVolumeSpec{
++			PersistentVolumeSource: v1.PersistentVolumeSource{
++				CSI: &v1.CSIPersistentVolumeSource{
++					Driver:       fakeDriverName,
++					VolumeHandle: diskURI,
++				},
++			},
++		},
++	}, metav1.CreateOptions{})
++	require.NoError(t, err)
++
++	_, err = client.StorageV1().VolumeAttachments().Create(context.Background(), &storagev1.VolumeAttachment{
++		ObjectMeta: metav1.ObjectMeta{Name: "va-1"},
++		Spec: storagev1.VolumeAttachmentSpec{
++			Attacher: fakeDriverName,
++			NodeName: nodeName,
++			Source: storagev1.VolumeAttachmentSource{
++				PersistentVolumeName: ptr.To(pvName),
++			},
++		},
++	}, metav1.CreateOptions{})
++	require.NoError(t, err)
++
++	_, err = client.CoreV1().PersistentVolumes().Create(context.Background(), &v1.PersistentVolume{
++		ObjectMeta: metav1.ObjectMeta{Name: "pv-2"},
++		Spec: v1.PersistentVolumeSpec{
++			PersistentVolumeSource: v1.PersistentVolumeSource{
++				CSI: &v1.CSIPersistentVolumeSource{
++					Driver:       fakeDriverName,
++					VolumeHandle: otherDiskURI,
++				},
++			},
++		},
++	}, metav1.CreateOptions{})
++	require.NoError(t, err)
++
++	_, err = client.StorageV1().VolumeAttachments().Create(context.Background(), &storagev1.VolumeAttachment{
++		ObjectMeta: metav1.ObjectMeta{Name: "va-2"},
++		Spec: storagev1.VolumeAttachmentSpec{
++			Attacher: fakeDriverName,
++			NodeName: nodeName,
++			Source: storagev1.VolumeAttachmentSource{
++				PersistentVolumeName: ptr.To("pv-2"),
++			},
++		},
++	}, metav1.CreateOptions{})
++	require.NoError(t, err)
++
++	_, err = client.StorageV1().VolumeAttachments().Create(context.Background(), &storagev1.VolumeAttachment{
++		ObjectMeta: metav1.ObjectMeta{Name: "va-inline"},
++		Spec: storagev1.VolumeAttachmentSpec{
++			Attacher: fakeDriverName,
++			NodeName: otherNode,
++			Source: storagev1.VolumeAttachmentSource{
++				InlineVolumeSpec: &v1.PersistentVolumeSpec{
++					PersistentVolumeSource: v1.PersistentVolumeSource{
++						CSI: &v1.CSIPersistentVolumeSource{
++							Driver:       fakeDriverName,
++							VolumeHandle: diskURI,
++						},
++					},
++				},
++			},
++		},
++	}, metav1.CreateOptions{})
++	require.NoError(t, err)
++
++	_, err = client.StorageV1().VolumeAttachments().Create(context.Background(), &storagev1.VolumeAttachment{
++		ObjectMeta: metav1.ObjectMeta{Name: "va-line"},
++		Spec: storagev1.VolumeAttachmentSpec{
++			Attacher: fakeDriverName,
++			NodeName: nodeName,
++			Source: storagev1.VolumeAttachmentSource{
++				InlineVolumeSpec: &v1.PersistentVolumeSpec{
++					PersistentVolumeSource: v1.PersistentVolumeSource{
++						CSI: &v1.CSIPersistentVolumeSource{
++							Driver:       fakeDriverName,
++							VolumeHandle: inlineDiskURI,
++						},
++					},
++				},
++			},
++		},
++	}, metav1.CreateOptions{})
++	require.NoError(t, err)
++
++	missingDiskURI := fmt.Sprintf(consts.ManagedDiskPath, "subs", "rg", "missing-disk")
++	tests := []struct {
++		name    string
++		node    string
++		diskURI string
++		want    bool
++	}{
++		{
++			name:    "returns true when VA on node matches disk",
++			node:    nodeName,
++			diskURI: diskURI,
++			want:    true,
++		},
++		{
++			name:    "returns false when no VA on node matches disk",
++			node:    nodeName,
++			diskURI: missingDiskURI,
++			want:    false,
++		},
++		{
++			name:    "ignores VA on other node",
++			node:    otherNode,
++			diskURI: otherDiskURI,
++			want:    false,
++		},
++		{
++			name:    "returns true when inline VA matches node",
++			node:    nodeName,
++			diskURI: inlineDiskURI,
++			want:    true,
++		},
++	}
++
++	for _, tc := range tests {
++		t.Run(tc.name, func(t *testing.T) {
++			hasVA, err := checker.hasVolumeAttachmentForDiskOnNode(context.Background(), tc.node, tc.diskURI)
++			require.NoError(t, err)
++			require.Equal(t, tc.want, hasVA)
++		})
++	}
++}

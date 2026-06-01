@@ -1,0 +1,166 @@
+diff --git a/provisioning/baremetal_crypto.go b/provisioning/baremetal_crypto.go
+index 2d1a40479..02d0004e1 100644
+--- a/provisioning/baremetal_crypto.go
++++ b/provisioning/baremetal_crypto.go
+@@ -28,8 +28,9 @@ import (
+ )
+ 
+ type TlsCertificate struct {
+-	privateKey  []byte
+-	certificate []byte
++	privateKey    []byte
++	certificate   []byte
++	caCertificate []byte
+ }
+ 
+ const (
+@@ -79,9 +80,15 @@ func generateTlsCertificate(hosts sets.Set[string]) (TlsCertificate, error) {
+ 		return TlsCertificate{}, err
+ 	}
+ 
++	caCertBytes, _, err := ca.Config.GetPEMBytes()
++	if err != nil {
++		return TlsCertificate{}, err
++	}
++
+ 	return TlsCertificate{
+-		privateKey:  keyBytes,
+-		certificate: certBytes,
++		privateKey:    keyBytes,
++		certificate:   certBytes,
++		caCertificate: caCertBytes,
+ 	}, nil
+ }
+ 
+diff --git a/provisioning/baremetal_secrets.go b/provisioning/baremetal_secrets.go
+index ffcb38639..3cd6ce033 100644
+--- a/provisioning/baremetal_secrets.go
++++ b/provisioning/baremetal_secrets.go
+@@ -245,6 +245,7 @@ func createOrUpdateTlsSecret(info *ProvisioningInfo) error {
+ 		Data: map[string][]byte{
+ 			corev1.TLSCertKey:       cert.certificate,
+ 			corev1.TLSPrivateKeyKey: cert.privateKey,
++			"ca.crt":                cert.caCertificate,
+ 		},
+ 	}
+ 
+diff --git a/provisioning/image_cache.go b/provisioning/image_cache.go
+index a5b020a9c..ae7cac725 100644
+--- a/provisioning/image_cache.go
++++ b/provisioning/image_cache.go
+@@ -76,6 +76,14 @@ func getImageVolumes() []corev1.Volume {
+ 				EmptyDir: &corev1.EmptyDirVolumeSource{},
+ 			},
+ 		},
++		{
++			Name: ironicTlsVolume,
++			VolumeSource: corev1.VolumeSource{
++				Secret: &corev1.SecretVolumeSource{
++					SecretName: tlsSecretName,
++				},
++			},
++		},
+ 	}
+ 
+ 	return volumes
+@@ -107,14 +115,16 @@ func transformURL(targetNamespace, URL string) (string, error) {
+ 	// and makes it available to this second-level cache.
+ 	// e.g. ProvisioningOSDownloadURL: https://releases-art-rhcos.svc.ci.openshift.org/art/storage/releases/rhcos-4.2/42.80.20190725.1/rhcos-42.80.20190725.1-openstack.qcow2.gz?sha256sum=123
+ 	// The first level cache transforms the URL and makes it available for the second level cache at:
+-	// http://metal3-state.openshift-machine-api:6180/images/rhcos-42.80.20190725.1-openstack.qcow2/cached-rhcos-42.80.20190725.1-openstack.qcow2
++	// https://metal3-state.openshift-machine-api:6388/images/rhcos-42.80.20190725.1-openstack.qcow2/cached-rhcos-42.80.20190725.1-openstack.qcow2
+ 	// Finally, the second-level cache will make it available at:
+ 	// http://cluster.local:6181/images/rhcos-42.80.20190725.1-openstack.qcow2/cached-rhcos-42.80.20190725.1-openstack.qcow2
+ 	// See https://github.com/openshift/ironic-rhcos-downloader for more details
++	// NOTE: Uses HTTPS and ironicPrivatePort (6388) because TLS is always enabled in OpenShift.
++	// Plain HTTP access to /images on port 6180 is blocked when TLS is enabled.
+ 	cacheURL := url.URL{
+-		Scheme: "http",
++		Scheme: "https",
+ 		Host: net.JoinHostPort(fmt.Sprintf("%s.%s.svc.cluster.local", stateService, targetNamespace),
+-			baremetalHttpPort),
++			fmt.Sprint(ironicPrivatePort)),
+ 		Path: fmt.Sprintf("/images/%s/%s", imageName, imageName),
+ 	}
+ 	return cacheURL.String(), nil
+@@ -183,9 +193,18 @@ func newImageCacheInitContainers(info *ProvisioningInfo) ([]corev1.Container, er
+ 		return nil, err
+ 	}
+ 
+-	return []corev1.Container{
+-		createInitContainerMachineOsDownloader(info, newURL, false, false),
+-	}, nil
++	initContainer := createInitContainerMachineOsDownloader(info, newURL, false, false)
++
++	// Add TLS volume mount for HTTPS access to metal3-state service
++	initContainer.VolumeMounts = append(initContainer.VolumeMounts, ironicTlsMount)
++
++	// Add CA cert path for curl to verify TLS
++	initContainer.Env = append(initContainer.Env, corev1.EnvVar{
++		Name:  ironicCertEnvVar,
++		Value: metal3TlsRootDir + "/ironic/ca.crt",
++	})
++
++	return []corev1.Container{initContainer}, nil
+ }
+ 
+ func newImageCacheContainers(images *Images, proxy *osconfigv1.Proxy) []corev1.Container {
+diff --git a/provisioning/image_cache_test.go b/provisioning/image_cache_test.go
+index 99e3aaa69..2c386b0fe 100644
+--- a/provisioning/image_cache_test.go
++++ b/provisioning/image_cache_test.go
+@@ -33,6 +33,7 @@ func TestGetImageVolumes(t *testing.T) {
+ 		ironicDataVolume,
+ 		baremetalSharedVolume, // emptyDir for /shared (needed for /shared/tmp)
+ 		ironicTmpVolume,       // emptyDir for /tmp (needed by libguestfs)
++		ironicTlsVolume,       // secret for TLS CA cert
+ 	}
+ 
+ 	actualVolumeNames := make([]string, len(volumes))
+@@ -81,3 +82,46 @@ func TestCreateContainerImageCache(t *testing.T) {
+ 	assert.True(t, *container.SecurityContext.ReadOnlyRootFilesystem,
+ 		"ReadOnlyRootFilesystem should be true")
+ }
++
++func TestTransformURL(t *testing.T) {
++	testCases := []struct {
++		name          string
++		namespace     string
++		inputURL      string
++		expectedURL   string
++		expectedError bool
++	}{
++		{
++			name:        "RHCOS image URL",
++			namespace:   "openshift-machine-api",
++			inputURL:    "https://releases-art-rhcos.svc.ci.openshift.org/art/storage/releases/rhcos-4.2/42.80.20190725.1/rhcos-42.80.20190725.1-openstack.qcow2.gz",
++			expectedURL: "https://metal3-state.openshift-machine-api.svc.cluster.local:6388/images/rhcos-42.80.20190725.1-openstack.qcow2/rhcos-42.80.20190725.1-openstack.qcow2",
++		},
++		{
++			name:        "RHCOS image URL with different namespace",
++			namespace:   "test-namespace",
++			inputURL:    "https://example.com/rhcos-9.8.20260403-0-openstack.x86_64.qcow2",
++			expectedURL: "https://metal3-state.test-namespace.svc.cluster.local:6388/images/rhcos-9.8.20260403-0-openstack.x86_64.qcow2/rhcos-9.8.20260403-0-openstack.x86_64.qcow2",
++		},
++		{
++			name:          "Invalid URL",
++			namespace:     "openshift-machine-api",
++			inputURL:      "://invalid-url",
++			expectedError: true,
++		},
++	}
++
++	for _, tc := range testCases {
++		t.Run(tc.name, func(t *testing.T) {
++			result, err := transformURL(tc.namespace, tc.inputURL)
++
++			if tc.expectedError {
++				assert.Error(t, err)
++				return
++			}
++
++			assert.NoError(t, err)
++			assert.Equal(t, tc.expectedURL, result)
++		})
++	}
++}

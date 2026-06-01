@@ -1,0 +1,629 @@
+diff --git a/control-plane-operator/controllers/hostedcontrolplane/hostedcontrolplane_controller.go b/control-plane-operator/controllers/hostedcontrolplane/hostedcontrolplane_controller.go
+index f6a9bc62a9c..fa9aa8f88e1 100644
+--- a/control-plane-operator/controllers/hostedcontrolplane/hostedcontrolplane_controller.go
++++ b/control-plane-operator/controllers/hostedcontrolplane/hostedcontrolplane_controller.go
+@@ -153,6 +153,8 @@ const (
+ type HostedControlPlaneReconciler struct {
+ 	client.Client
+ 
++	GVKAccessChecker component.GVKAccessChecker
++
+ 	components []component.ControlPlaneComponent
+ 
+ 	// ManagementClusterCapabilities can be asked for support of optional management cluster capabilities
+@@ -1172,6 +1174,7 @@ func (r *HostedControlPlaneReconciler) reconcileCPOV2(ctx context.Context, hcp *
+ 	cpContext := component.ControlPlaneContext{
+ 		Context:                   ctx,
+ 		Client:                    r.Client,
++		GVKAccessChecker:          r.GVKAccessChecker,
+ 		HCP:                       hcp,
+ 		ApplyProvider:             upsert.NewApplyProvider(r.EnableCIDebugOutput),
+ 		InfraStatus:               infraStatus,
+diff --git a/control-plane-operator/main.go b/control-plane-operator/main.go
+index 2ac5bdbfe1a..b67ced8fec0 100644
+--- a/control-plane-operator/main.go
++++ b/control-plane-operator/main.go
+@@ -30,6 +30,7 @@ import (
+ 	hyperapi "github.com/openshift/hypershift/support/api"
+ 	"github.com/openshift/hypershift/support/capabilities"
+ 	"github.com/openshift/hypershift/support/config"
++	component "github.com/openshift/hypershift/support/controlplane-component"
+ 	"github.com/openshift/hypershift/support/events"
+ 	"github.com/openshift/hypershift/support/metrics"
+ 	"github.com/openshift/hypershift/support/releaseinfo"
+@@ -469,6 +470,7 @@ func NewStartCommand() *cobra.Command {
+ 
+ 		if err := (&hostedcontrolplane.HostedControlPlaneReconciler{
+ 			Client:                                  mgr.GetClient(),
++			GVKAccessChecker:                        component.NewGVKAccessCache(mgr.GetAPIReader()),
+ 			ManagementClusterCapabilities:           mgmtClusterCaps,
+ 			ReleaseProvider:                         cpReleaseProvider,
+ 			UserReleaseProvider:                     userReleaseProvider,
+diff --git a/support/controlplane-component/controlplane-component.go b/support/controlplane-component/controlplane-component.go
+index 98b27470215..885cbf70336 100644
+--- a/support/controlplane-component/controlplane-component.go
++++ b/support/controlplane-component/controlplane-component.go
+@@ -60,6 +60,10 @@ type ControlPlaneContext struct {
+ 	// This is useful when the component is not managed by the same HostedControlPlane controller like capi and the CPO itself.
+ 	OmitOwnerReference bool
+ 
++	// GVKAccessChecker caches GVK accessibility to avoid repeated probes.
++	// It uses an uncached reader internally to probe without creating informers.
++	GVKAccessChecker GVKAccessChecker
++
+ 	// SkipPredicate is used for the generic unit test, so we can always generate a fixture for the components deployment/statefulset.
+ 	SkipPredicate bool
+ 	// SkipCertificateSigning is used for the generic unit test to skip the signing of certificates and maintain a stable output.
+@@ -209,6 +213,16 @@ func (c *controlPlaneWorkload[T]) delete(cpContext ControlPlaneContext) error {
+ 		}
+ 		obj.SetNamespace(cpContext.HCP.Namespace)
+ 
++		if cpContext.GVKAccessChecker != nil {
++			accessible, err := cpContext.GVKAccessChecker.GetOrProbe(cpContext, obj)
++			if err != nil {
++				return err
++			}
++			if !accessible {
++				return nil
++			}
++		}
++
+ 		_, err = util.DeleteIfNeeded(cpContext, cpContext.Client, obj)
+ 		return err
+ 	}); err != nil {
+diff --git a/support/controlplane-component/generic-adapter.go b/support/controlplane-component/generic-adapter.go
+index 144c4fafb34..b5c72a58545 100644
+--- a/support/controlplane-component/generic-adapter.go
++++ b/support/controlplane-component/generic-adapter.go
+@@ -48,6 +48,16 @@ func (ga *genericAdapter) reconcile(cpContext ControlPlaneContext, obj client.Ob
+ 	workloadContext := cpContext.workloadContext()
+ 
+ 	if ga.predicate != nil && !ga.predicate(workloadContext) {
++		if cpContext.GVKAccessChecker != nil {
++			accessible, err := cpContext.GVKAccessChecker.GetOrProbe(cpContext, obj)
++			if err != nil {
++				return err
++			}
++			if !accessible {
++				return nil
++			}
++		}
++
+ 		// get the existing object to read its ownerRefs
+ 		existing := obj.DeepCopyObject().(client.Object)
+ 		err := cpContext.Client.Get(cpContext, client.ObjectKeyFromObject(obj), existing)
+diff --git a/support/controlplane-component/generic-adapter_test.go b/support/controlplane-component/generic-adapter_test.go
+new file mode 100644
+index 00000000000..34898ccb863
+--- /dev/null
++++ b/support/controlplane-component/generic-adapter_test.go
+@@ -0,0 +1,260 @@
++package controlplanecomponent
++
++import (
++	"context"
++	"fmt"
++	"testing"
++
++	. "github.com/onsi/gomega"
++
++	hyperv1 "github.com/openshift/hypershift/api/hypershift/v1beta1"
++	"github.com/openshift/hypershift/support/upsert"
++
++	corev1 "k8s.io/api/core/v1"
++	apierrors "k8s.io/apimachinery/pkg/api/errors"
++	"k8s.io/apimachinery/pkg/api/meta"
++	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
++	"k8s.io/apimachinery/pkg/runtime"
++	"k8s.io/apimachinery/pkg/runtime/schema"
++
++	"sigs.k8s.io/controller-runtime/pkg/client"
++	"sigs.k8s.io/controller-runtime/pkg/client/fake"
++)
++
++func testScheme() *runtime.Scheme {
++	s := runtime.NewScheme()
++	_ = corev1.AddToScheme(s)
++	_ = hyperv1.AddToScheme(s)
++	return s
++}
++
++func testCPContext(t *testing.T, checker GVKAccessChecker, objects ...client.Object) ControlPlaneContext {
++	t.Helper()
++	return ControlPlaneContext{
++		Context:       t.Context(),
++		ApplyProvider: upsert.NewApplyProvider(false),
++		HCP: &hyperv1.HostedControlPlane{
++			ObjectMeta: metav1.ObjectMeta{
++				Name:      "test-hcp",
++				Namespace: "test-ns",
++			},
++		},
++		Client: fake.NewClientBuilder().WithScheme(testScheme()).
++			WithObjects(objects...).Build(),
++		GVKAccessChecker: checker,
++	}
++}
++
++func testObjWithGVK(gvk schema.GroupVersionKind) client.Object {
++	obj := &corev1.ConfigMap{
++		ObjectMeta: metav1.ObjectMeta{
++			Name:      "test-resource",
++			Namespace: "test-ns",
++		},
++	}
++	obj.SetGroupVersionKind(gvk)
++	return obj
++}
++
++var inaccessibleGVK = schema.GroupVersionKind{Group: "secrets-store.csi.x-k8s.io", Version: "v1", Kind: "SecretProviderClass"}
++
++func TestGenericAdapterReconcile(t *testing.T) {
++	t.Run("When predicate is false and GVK is inaccessible it should skip without error", func(t *testing.T) {
++		g := NewWithT(t)
++
++		reader := &fakeReader{err: apierrors.NewForbidden(
++			schema.GroupResource{Group: inaccessibleGVK.Group, Resource: "secretproviderclasses"},
++			"test-resource", fmt.Errorf("forbidden"),
++		)}
++		checker := NewGVKAccessCache(reader)
++
++		cpCtx := testCPContext(t, checker)
++
++		ga := &genericAdapter{
++			predicate: func(_ WorkloadContext) bool { return false },
++		}
++
++		obj := testObjWithGVK(inaccessibleGVK)
++		err := ga.reconcile(cpCtx, obj)
++		g.Expect(err).ToNot(HaveOccurred())
++		// Probe should have been called exactly once.
++		g.Expect(reader.callCount.Load()).To(Equal(int32(1)))
++	})
++
++	t.Run("When predicate is false and GVK is accessible it should attempt cleanup", func(t *testing.T) {
++		g := NewWithT(t)
++
++		// NotFound means GVK is accessible (CRD exists, resource just doesn't exist yet).
++		reader := &fakeReader{err: apierrors.NewNotFound(
++			schema.GroupResource{Group: "apps", Resource: "deployments"},
++			"test-resource",
++		)}
++		checker := NewGVKAccessCache(reader)
++
++		cpCtx := testCPContext(t, checker)
++
++		ga := &genericAdapter{
++			predicate: func(_ WorkloadContext) bool { return false },
++		}
++
++		// Use a ConfigMap with a known GVK (accessible). The object doesn't exist
++		// on the fake client so the Get in the predicate-false path returns NotFound → returns nil.
++		obj := testObjWithGVK(schema.GroupVersionKind{Group: "", Version: "v1", Kind: "ConfigMap"})
++		err := ga.reconcile(cpCtx, obj)
++		g.Expect(err).ToNot(HaveOccurred())
++		g.Expect(reader.callCount.Load()).To(Equal(int32(1)))
++	})
++
++	t.Run("When predicate is false and GVK checker is nil it should proceed with existing logic", func(t *testing.T) {
++		g := NewWithT(t)
++
++		// No checker — backward compatibility.
++		cpCtx := testCPContext(t, nil)
++
++		ga := &genericAdapter{
++			predicate: func(_ WorkloadContext) bool { return false },
++		}
++
++		obj := testObjWithGVK(inaccessibleGVK)
++		// Without a checker the code falls through to Client.Get which will
++		// return an error or NotFound depending on the fake client setup.
++		// Since the object doesn't exist and the GVK is registered (ConfigMap used in fake),
++		// we use a ConfigMap to avoid scheme issues.
++		cmObj := &corev1.ConfigMap{
++			ObjectMeta: metav1.ObjectMeta{
++				Name:      "test-resource",
++				Namespace: "test-ns",
++			},
++		}
++		_ = obj // unused in this path
++		err := ga.reconcile(cpCtx, cmObj)
++		// Should succeed (object not found → no deletion needed).
++		g.Expect(err).ToNot(HaveOccurred())
++	})
++
++	t.Run("When predicate is false and GVK probe returns transient error it should propagate error", func(t *testing.T) {
++		g := NewWithT(t)
++
++		reader := &fakeReader{err: fmt.Errorf("connection refused")}
++		checker := NewGVKAccessCache(reader)
++
++		cpCtx := testCPContext(t, checker)
++
++		ga := &genericAdapter{
++			predicate: func(_ WorkloadContext) bool { return false },
++		}
++
++		obj := testObjWithGVK(inaccessibleGVK)
++		err := ga.reconcile(cpCtx, obj)
++		g.Expect(err).To(HaveOccurred())
++		g.Expect(err.Error()).To(ContainSubstring("connection refused"))
++	})
++
++	t.Run("When predicate is false and GVK is NoMatch it should skip without error", func(t *testing.T) {
++		g := NewWithT(t)
++
++		reader := &fakeReader{err: &meta.NoKindMatchError{
++			GroupKind: schema.GroupKind{Group: inaccessibleGVK.Group, Kind: inaccessibleGVK.Kind},
++		}}
++		checker := NewGVKAccessCache(reader)
++
++		cpCtx := testCPContext(t, checker)
++
++		ga := &genericAdapter{
++			predicate: func(_ WorkloadContext) bool { return false },
++		}
++
++		obj := testObjWithGVK(inaccessibleGVK)
++		err := ga.reconcile(cpCtx, obj)
++		g.Expect(err).ToNot(HaveOccurred())
++	})
++
++	t.Run("When predicate is true it should not check GVK access", func(t *testing.T) {
++		g := NewWithT(t)
++
++		reader := &fakeReader{err: fmt.Errorf("should not be called")}
++		checker := NewGVKAccessCache(reader)
++
++		cpCtx := testCPContext(t, checker)
++
++		adapted := false
++		ga := &genericAdapter{
++			predicate: func(_ WorkloadContext) bool { return true },
++			adapt: func(_ WorkloadContext, _ client.Object) error {
++				adapted = true
++				return nil
++			},
++		}
++
++		obj := &corev1.ConfigMap{
++			ObjectMeta: metav1.ObjectMeta{
++				Name:      "test-resource",
++				Namespace: "test-ns",
++			},
++		}
++		err := ga.reconcile(cpCtx, obj)
++		g.Expect(err).ToNot(HaveOccurred())
++		g.Expect(adapted).To(BeTrue())
++		// Reader should not have been called since predicate was true.
++		g.Expect(reader.callCount.Load()).To(Equal(int32(0)))
++	})
++
++	t.Run("When predicate is false and accessible resource has HCP owner ref it should delete it", func(t *testing.T) {
++		g := NewWithT(t)
++
++		reader := &fakeReader{err: nil} // OK → accessible
++		checker := NewGVKAccessCache(reader)
++
++		hcp := &hyperv1.HostedControlPlane{
++			ObjectMeta: metav1.ObjectMeta{
++				Name:      "test-hcp",
++				Namespace: "test-ns",
++				UID:       "test-uid",
++			},
++		}
++
++		// Create an existing resource with HCP owner reference.
++		existingCM := &corev1.ConfigMap{
++			ObjectMeta: metav1.ObjectMeta{
++				Name:      "test-resource",
++				Namespace: "test-ns",
++				OwnerReferences: []metav1.OwnerReference{
++					{
++						APIVersion: hyperv1.GroupVersion.String(),
++						Kind:       "HostedControlPlane",
++						Name:       hcp.Name,
++						UID:        hcp.UID,
++					},
++				},
++			},
++		}
++
++		cpCtx := ControlPlaneContext{
++			Context:          t.Context(),
++			ApplyProvider:    upsert.NewApplyProvider(false),
++			HCP:              hcp,
++			Client:           fake.NewClientBuilder().WithScheme(testScheme()).WithObjects(existingCM).Build(),
++			GVKAccessChecker: checker,
++		}
++
++		ga := &genericAdapter{
++			predicate: func(_ WorkloadContext) bool { return false },
++		}
++
++		obj := &corev1.ConfigMap{
++			ObjectMeta: metav1.ObjectMeta{
++				Name:      "test-resource",
++				Namespace: "test-ns",
++			},
++		}
++		obj.SetGroupVersionKind(schema.GroupVersionKind{Version: "v1", Kind: "ConfigMap"})
++
++		err := ga.reconcile(cpCtx, obj)
++		g.Expect(err).ToNot(HaveOccurred())
++
++		// Verify the resource was deleted.
++		got := &corev1.ConfigMap{}
++		err = cpCtx.Client.Get(context.Background(), client.ObjectKeyFromObject(obj), got)
++		g.Expect(apierrors.IsNotFound(err)).To(BeTrue())
++	})
++}
+diff --git a/support/controlplane-component/gvk_cache.go b/support/controlplane-component/gvk_cache.go
+new file mode 100644
+index 00000000000..c57ac8a8fc6
+--- /dev/null
++++ b/support/controlplane-component/gvk_cache.go
+@@ -0,0 +1,92 @@
++package controlplanecomponent
++
++import (
++	"context"
++	"sync"
++
++	apierrors "k8s.io/apimachinery/pkg/api/errors"
++	"k8s.io/apimachinery/pkg/api/meta"
++	"k8s.io/apimachinery/pkg/runtime/schema"
++
++	ctrl "sigs.k8s.io/controller-runtime"
++	"sigs.k8s.io/controller-runtime/pkg/client"
++)
++
++type gvkAccessibility int
++
++const (
++	gvkAccessible gvkAccessibility = iota
++
++	gvkInaccessible
++)
++
++// GVKAccessChecker determines if a resource type is accessible (i.e. the controller
++// has RBAC and the CRD exists). Implementations may cache probe results.
++type GVKAccessChecker interface {
++	// GetOrProbe checks the cache for the given object's GVK. On a cache miss it
++	// performs a single uncached Get to probe accessibility. The result is:
++	//   - 403 Forbidden  → inaccessible (cached, returns false, nil)
++	//   - NoMatch        → inaccessible (cached, returns false, nil)
++	//   - 404 NotFound   → accessible   (cached, returns true, nil)
++	//   - success        → accessible   (cached, returns true, nil)
++	//   - other error    → not cached   (returns false, err)
++	GetOrProbe(ctx context.Context, obj client.Object) (accessible bool, err error)
++}
++
++// gvkAccessCache caches whether a GVK is accessible. This avoids creating
++// informers via the cached client for resource types the CPO cannot access,
++// which would otherwise retry LIST/WATCH forever and block reconciliation.
++type gvkAccessCache struct {
++	uncachedReader client.Reader
++	cache          sync.Map // schema.GroupVersionKind -> gvkAccessibility
++}
++
++// NewGVKAccessCache returns a GVKAccessChecker that probes GVK accessibility
++// using the given uncached reader and caches the results.
++func NewGVKAccessCache(uncachedReader client.Reader) GVKAccessChecker {
++	return &gvkAccessCache{
++		uncachedReader: uncachedReader,
++	}
++}
++
++func (c *gvkAccessCache) GetOrProbe(ctx context.Context, obj client.Object) (bool, error) {
++	gvk := obj.GetObjectKind().GroupVersionKind()
++	if gvk.Empty() {
++		// If GVK is not set, we can't probe – fall through to the cached client.
++		return true, nil
++	}
++
++	if val, ok := c.cache.Load(gvk); ok {
++		return val.(gvkAccessibility) == gvkAccessible, nil
++	}
++
++	probe := obj.DeepCopyObject().(client.Object)
++	err := c.uncachedReader.Get(ctx, client.ObjectKeyFromObject(obj), probe)
++	accessible, probeErr := c.handleProbeResult(gvk, err)
++	if probeErr == nil && !accessible {
++		log := ctrl.LoggerFrom(ctx)
++		log.Info("Skipping inaccessible resource type: no RBAC permission or CRD not installed",
++			"gvk", gvk, "reason", err.Error())
++	}
++	return accessible, probeErr
++}
++
++func (c *gvkAccessCache) handleProbeResult(gvk schema.GroupVersionKind, err error) (bool, error) {
++	if err == nil {
++		c.cache.Store(gvk, gvkAccessible)
++		return true, nil
++	}
++
++	if apierrors.IsNotFound(err) {
++		c.cache.Store(gvk, gvkAccessible)
++		return true, nil
++	}
++
++	if apierrors.IsForbidden(err) || meta.IsNoMatchError(err) {
++		c.cache.Store(gvk, gvkInaccessible)
++		return false, nil
++	}
++
++	// Transient error – don't cache, let caller retry.
++	return false, err
++}
+diff --git a/support/controlplane-component/gvk_cache_test.go b/support/controlplane-component/gvk_cache_test.go
+new file mode 100644
+index 00000000000..9d7146890cc
+--- /dev/null
++++ b/support/controlplane-component/gvk_cache_test.go
+@@ -0,0 +1,165 @@
++package controlplanecomponent
++
++import (
++	"context"
++	"fmt"
++	"sync/atomic"
++	"testing"
++
++	. "github.com/onsi/gomega"
++
++	corev1 "k8s.io/api/core/v1"
++	apierrors "k8s.io/apimachinery/pkg/api/errors"
++	"k8s.io/apimachinery/pkg/api/meta"
++	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
++	"k8s.io/apimachinery/pkg/runtime/schema"
++
++	"sigs.k8s.io/controller-runtime/pkg/client"
++)
++
++// fakeReader is a minimal client.Reader for testing GVKAccessCache.
++type fakeReader struct {
++	err       error
++	callCount atomic.Int32
++}
++
++func (f *fakeReader) Get(_ context.Context, _ client.ObjectKey, _ client.Object, _ ...client.GetOption) error {
++	f.callCount.Add(1)
++	return f.err
++}
++
++func (f *fakeReader) List(_ context.Context, _ client.ObjectList, _ ...client.ListOption) error {
++	return nil
++}
++
++func newObj(gvk schema.GroupVersionKind) client.Object {
++	obj := &corev1.ConfigMap{
++		ObjectMeta: metav1.ObjectMeta{
++			Name:      "test",
++			Namespace: "test-ns",
++		},
++	}
++	obj.SetGroupVersionKind(gvk)
++	return obj
++}
++
++var testGVK = schema.GroupVersionKind{Group: "secrets-store.csi.x-k8s.io", Version: "v1", Kind: "SecretProviderClass"}
++
++func TestGVKAccessCache(t *testing.T) {
++	t.Run("When uncached reader returns Forbidden it should skip and cache", func(t *testing.T) {
++		g := NewWithT(t)
++		reader := &fakeReader{err: apierrors.NewForbidden(schema.GroupResource{Group: testGVK.Group, Resource: "secretproviderclasses"}, "test", fmt.Errorf("forbidden"))}
++		cache := NewGVKAccessCache(reader)
++
++		accessible, err := cache.GetOrProbe(t.Context(), newObj(testGVK))
++		g.Expect(err).ToNot(HaveOccurred())
++		g.Expect(accessible).To(BeFalse())
++
++		// Second call should not hit the reader.
++		accessible, err = cache.GetOrProbe(t.Context(), newObj(testGVK))
++		g.Expect(err).ToNot(HaveOccurred())
++		g.Expect(accessible).To(BeFalse())
++		g.Expect(reader.callCount.Load()).To(Equal(int32(1)))
++	})
++
++	t.Run("When uncached reader returns NoMatch it should skip and cache", func(t *testing.T) {
++		g := NewWithT(t)
++		reader := &fakeReader{err: &meta.NoKindMatchError{GroupKind: schema.GroupKind{Group: testGVK.Group, Kind: testGVK.Kind}}}
++		cache := NewGVKAccessCache(reader)
++
++		accessible, err := cache.GetOrProbe(t.Context(), newObj(testGVK))
++		g.Expect(err).ToNot(HaveOccurred())
++		g.Expect(accessible).To(BeFalse())
++
++		// Second call should not hit the reader.
++		accessible, err = cache.GetOrProbe(t.Context(), newObj(testGVK))
++		g.Expect(err).ToNot(HaveOccurred())
++		g.Expect(accessible).To(BeFalse())
++		g.Expect(reader.callCount.Load()).To(Equal(int32(1)))
++	})
++
++	t.Run("When uncached reader returns NotFound it should mark accessible", func(t *testing.T) {
++		g := NewWithT(t)
++		reader := &fakeReader{err: apierrors.NewNotFound(schema.GroupResource{Group: testGVK.Group, Resource: "secretproviderclasses"}, "test")}
++		cache := NewGVKAccessCache(reader)
++
++		accessible, err := cache.GetOrProbe(t.Context(), newObj(testGVK))
++		g.Expect(err).ToNot(HaveOccurred())
++		g.Expect(accessible).To(BeTrue())
++
++		// Second call should not hit the reader.
++		accessible, err = cache.GetOrProbe(t.Context(), newObj(testGVK))
++		g.Expect(err).ToNot(HaveOccurred())
++		g.Expect(accessible).To(BeTrue())
++		g.Expect(reader.callCount.Load()).To(Equal(int32(1)))
++	})
++
++	t.Run("When uncached reader returns OK it should mark accessible", func(t *testing.T) {
++		g := NewWithT(t)
++		reader := &fakeReader{err: nil}
++		cache := NewGVKAccessCache(reader)
++
++		accessible, err := cache.GetOrProbe(t.Context(), newObj(testGVK))
++		g.Expect(err).ToNot(HaveOccurred())
++		g.Expect(accessible).To(BeTrue())
++
++		// Second call should not hit the reader.
++		accessible, err = cache.GetOrProbe(t.Context(), newObj(testGVK))
++		g.Expect(err).ToNot(HaveOccurred())
++		g.Expect(accessible).To(BeTrue())
++		g.Expect(reader.callCount.Load()).To(Equal(int32(1)))
++	})
++
++	t.Run("When uncached reader returns other error it should not cache", func(t *testing.T) {
++		g := NewWithT(t)
++		reader := &fakeReader{err: fmt.Errorf("network timeout")}
++		cache := NewGVKAccessCache(reader)
++
++		accessible, err := cache.GetOrProbe(t.Context(), newObj(testGVK))
++		g.Expect(err).To(HaveOccurred())
++		g.Expect(accessible).To(BeFalse())
++
++		// Second call should hit the reader again since result was not cached.
++		accessible, err = cache.GetOrProbe(t.Context(), newObj(testGVK))
++		g.Expect(err).To(HaveOccurred())
++		g.Expect(accessible).To(BeFalse())
++		g.Expect(reader.callCount.Load()).To(Equal(int32(2)))
++	})
++
++	t.Run("When cache is populated it should not call uncached reader", func(t *testing.T) {
++		g := NewWithT(t)
++		// First call with a successful reader to populate the cache.
++		successReader := &fakeReader{err: nil}
++		cache := NewGVKAccessCache(successReader)
++
++		accessible, err := cache.GetOrProbe(t.Context(), newObj(testGVK))
++		g.Expect(err).ToNot(HaveOccurred())
++		g.Expect(accessible).To(BeTrue())
++		g.Expect(successReader.callCount.Load()).To(Equal(int32(1)))
++
++		// Second call should use the cache and not call the reader again.
++		accessible, err = cache.GetOrProbe(t.Context(), newObj(testGVK))
++		g.Expect(err).ToNot(HaveOccurred())
++		g.Expect(accessible).To(BeTrue())
++		g.Expect(successReader.callCount.Load()).To(Equal(int32(1)))
++	})
++
++	t.Run("When GVK is empty it should return accessible without probing", func(t *testing.T) {
++		g := NewWithT(t)
++		reader := &fakeReader{err: fmt.Errorf("should not be called")}
++		cache := NewGVKAccessCache(reader)
++
++		obj := &corev1.ConfigMap{
++			ObjectMeta: metav1.ObjectMeta{
++				Name:      "test",
++				Namespace: "test-ns",
++			},
++		}
++		// Don't set GVK - it will be empty.
++
++		accessible, err := cache.GetOrProbe(t.Context(), obj)
++		g.Expect(err).ToNot(HaveOccurred())
++		g.Expect(accessible).To(BeTrue())
++		g.Expect(reader.callCount.Load()).To(Equal(int32(0)))
++	})
++}

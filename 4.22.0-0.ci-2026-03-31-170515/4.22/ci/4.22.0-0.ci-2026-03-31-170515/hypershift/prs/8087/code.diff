@@ -1,0 +1,140 @@
+diff --git a/control-plane-operator/controllers/hostedcontrolplane/infra/infra.go b/control-plane-operator/controllers/hostedcontrolplane/infra/infra.go
+index 78efcd80a0d..f55f8289936 100644
+--- a/control-plane-operator/controllers/hostedcontrolplane/infra/infra.go
++++ b/control-plane-operator/controllers/hostedcontrolplane/infra/infra.go
+@@ -27,6 +27,7 @@ import (
+ 	"k8s.io/apimachinery/pkg/api/equality"
+ 	apierrors "k8s.io/apimachinery/pkg/api/errors"
+ 	utilerrors "k8s.io/apimachinery/pkg/util/errors"
++	"k8s.io/apimachinery/pkg/util/intstr"
+ 
+ 	"sigs.k8s.io/controller-runtime/pkg/client"
+ )
+@@ -451,6 +452,20 @@ func (r *Reconciler) reconcileHCPRouterServices(ctx context.Context, hcp *hyperv
+ 		return nil
+ 	}
+ 
++	// ARO HCP doesn't need LB services; Swift handles connectivity.
++	// Only reconcile a ClusterIP private router service.
++	if hyperazureutil.IsAroHCP() {
++		if _, err := util.DeleteIfNeeded(ctx, r.Client, pubSvc); err != nil {
++			return fmt.Errorf("failed to delete public router service: %w", err)
++		}
++		if _, err := createOrUpdate(ctx, r.Client, privSvc, func() error {
++			return reconcileAROPrivateRouterService(privSvc, hcp)
++		}); err != nil {
++			return fmt.Errorf("failed to reconcile private router service: %w", err)
++		}
++		return nil
++	}
++
+ 	// Create the Service type LB internal for private endpoints.
+ 	if util.IsPrivateHCP(hcp) {
+ 		if _, err := createOrUpdate(ctx, r.Client, privSvc, func() error {
+@@ -480,6 +495,30 @@ func (r *Reconciler) reconcileHCPRouterServices(ctx context.Context, hcp *hyperv
+ 	return nil
+ }
+ 
++func reconcileAROPrivateRouterService(svc *corev1.Service, hcp *hyperv1.HostedControlPlane) error {
++	svc.Labels = map[string]string{"app": "private-router"}
++	svc.Spec.Type = corev1.ServiceTypeClusterIP
++	svc.Spec.Selector = map[string]string{"app": "private-router"}
++	foundHTTPS := false
++	for i, port := range svc.Spec.Ports {
++		if port.Name == "https" {
++			svc.Spec.Ports[i].Port = 443
++			svc.Spec.Ports[i].TargetPort = intstr.FromString("https")
++			svc.Spec.Ports[i].Protocol = corev1.ProtocolTCP
++			foundHTTPS = true
++		}
++	}
++	if !foundHTTPS {
++		svc.Spec.Ports = append(svc.Spec.Ports, corev1.ServicePort{
++			Name:       "https",
++			Port:       443,
++			TargetPort: intstr.FromString("https"),
++			Protocol:   corev1.ProtocolTCP,
++		})
++	}
++	return nil
++}
++
+ func (r *Reconciler) reconcileAPIServerServiceStatus(ctx context.Context, hcp *hyperv1.HostedControlPlane) (host string, port int32, message string, err error) {
+ 	serviceStrategy := util.ServicePublishingStrategyByTypeForHCP(hcp, hyperv1.APIServer)
+ 	if serviceStrategy == nil {
+diff --git a/control-plane-operator/controllers/hostedcontrolplane/infra/infra_test.go b/control-plane-operator/controllers/hostedcontrolplane/infra/infra_test.go
+index b95c5fd9fb3..c196df9aa1a 100644
+--- a/control-plane-operator/controllers/hostedcontrolplane/infra/infra_test.go
++++ b/control-plane-operator/controllers/hostedcontrolplane/infra/infra_test.go
+@@ -1474,6 +1474,42 @@ func TestReconcileHCPRouterServices(t *testing.T) {
+ 				hcp.Spec.Platform.AWS = nil
+ 			},
+ 		},
++		{
++			name:                         "When ARO with Swift is enabled it should create only a ClusterIP private router service",
++			endpointAccess:               hyperv1.Public,
++			exposeAPIServerThroughRouter: true,
++			expectedServices: []corev1.Service{
++				{
++					ObjectMeta: metav1.ObjectMeta{
++						Name:      "private-router",
++						Namespace: namespace,
++						Labels:    map[string]string{"app": "private-router"},
++					},
++					Spec: corev1.ServiceSpec{
++						Type:     corev1.ServiceTypeClusterIP,
++						Selector: map[string]string{"app": "private-router"},
++						Ports: []corev1.ServicePort{
++							{
++								Name:       "https",
++								Port:       443,
++								TargetPort: intstr.FromString("https"),
++								Protocol:   corev1.ProtocolTCP,
++							},
++						},
++					},
++				},
++			},
++			setupEnv: func(t *testing.T) {
++				t.Setenv("MANAGED_SERVICE", hyperv1.AroHCP)
++			},
++			hcpModifier: func(hcp *hyperv1.HostedControlPlane) {
++				hcp.Spec.Platform.Type = hyperv1.AzurePlatform
++				hcp.Spec.Platform.AWS = nil
++				hcp.Annotations = map[string]string{
++					hyperv1.SwiftPodNetworkInstanceAnnotation: "swift-network-instance",
++				}
++			},
++		},
+ 	}
+ 	for _, tc := range tests {
+ 		t.Run(tc.name, func(t *testing.T) {
+diff --git a/control-plane-operator/controllers/hostedcontrolplane/infra/testdata/zz_fixture_TestReconcileInfrastructure_ARO_Route_SharedIngress_And_Swift.yaml b/control-plane-operator/controllers/hostedcontrolplane/infra/testdata/zz_fixture_TestReconcileInfrastructure_ARO_Route_SharedIngress_And_Swift.yaml
+index a7b03e7a753..b343e2bfb91 100644
+--- a/control-plane-operator/controllers/hostedcontrolplane/infra/testdata/zz_fixture_TestReconcileInfrastructure_ARO_Route_SharedIngress_And_Swift.yaml
++++ b/control-plane-operator/controllers/hostedcontrolplane/infra/testdata/zz_fixture_TestReconcileInfrastructure_ARO_Route_SharedIngress_And_Swift.yaml
+@@ -274,23 +274,7 @@ services:
+         targetPort: https
+       selector:
+         app: private-router
+-      type: LoadBalancer
+-    status:
+-      loadBalancer: {}
+-  - metadata:
+-      labels:
+-        app: private-router
+-      name: router
+-      namespace: test-namespace
+-    spec:
+-      ports:
+-      - name: https
+-        port: 443
+-        protocol: TCP
+-        targetPort: https
+-      selector:
+-        app: private-router
+-      type: LoadBalancer
++      type: ClusterIP
+     status:
+       loadBalancer: {}
+   metadata: {}

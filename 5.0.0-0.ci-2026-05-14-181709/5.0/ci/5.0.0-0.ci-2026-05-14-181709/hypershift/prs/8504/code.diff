@@ -1,0 +1,190 @@
+diff --git a/hypershift-operator/controllers/webhookcerts/webhookcerts_controller.go b/hypershift-operator/controllers/webhookcerts/webhookcerts_controller.go
+index c58f21a1bec..b2d3c7652b4 100644
+--- a/hypershift-operator/controllers/webhookcerts/webhookcerts_controller.go
++++ b/hypershift-operator/controllers/webhookcerts/webhookcerts_controller.go
+@@ -53,6 +53,11 @@ const (
+ 	// service-ca annotations placed on secrets it creates.
+ 	originatingServiceBetaAnnotation  = "service.beta.openshift.io/originating-service-name"
+ 	originatingServiceAlphaAnnotation = "service.alpha.openshift.io/originating-service-name"
++
++	// service-ca annotation on webhook configs that triggers CA bundle injection.
++	injectCABundleAnnotation = "service.beta.openshift.io/inject-cabundle"
++
++	webhookConfigName = "hypershift.openshift.io"
+ )
+ 
+ // WebhookCertReconciler reconciles the self-managed webhook CA and serving cert.
+@@ -172,14 +177,44 @@ func (r *WebhookCertReconciler) patchCRDsCABundle(ctx context.Context, caBundle
+ 	return nil
+ }
+ 
++// removeInjectCABundleAnnotation removes the service-ca inject-cabundle annotation from
++// webhook configurations so the service-ca operator stops overwriting our self-managed caBundle.
++func (r *WebhookCertReconciler) removeInjectCABundleAnnotation(ctx context.Context, log logr.Logger) error {
++	mwc := &admissionregistrationv1.MutatingWebhookConfiguration{}
++	if err := r.Client.Get(ctx, client.ObjectKey{Name: webhookConfigName}, mwc); err != nil {
++		if !apierrors.IsNotFound(err) {
++			return fmt.Errorf("failed to get MutatingWebhookConfiguration: %w", err)
++		}
++	} else if _, ok := mwc.Annotations[injectCABundleAnnotation]; ok {
++		delete(mwc.Annotations, injectCABundleAnnotation)
++		if err := r.Client.Update(ctx, mwc); err != nil {
++			return fmt.Errorf("failed to remove %s annotation from MutatingWebhookConfiguration: %w", injectCABundleAnnotation, err)
++		}
++		log.Info("Removed inject-cabundle annotation from MutatingWebhookConfiguration")
++	}
++
++	vwc := &admissionregistrationv1.ValidatingWebhookConfiguration{}
++	if err := r.Client.Get(ctx, client.ObjectKey{Name: webhookConfigName}, vwc); err != nil {
++		if !apierrors.IsNotFound(err) {
++			return fmt.Errorf("failed to get ValidatingWebhookConfiguration: %w", err)
++		}
++	} else if _, ok := vwc.Annotations[injectCABundleAnnotation]; ok {
++		delete(vwc.Annotations, injectCABundleAnnotation)
++		if err := r.Client.Update(ctx, vwc); err != nil {
++			return fmt.Errorf("failed to remove %s annotation from ValidatingWebhookConfiguration: %w", injectCABundleAnnotation, err)
++		}
++		log.Info("Removed inject-cabundle annotation from ValidatingWebhookConfiguration")
++	}
++
++	return nil
++}
++
+ // patchWebhookConfigsCABundle patches the caBundle on MutatingWebhookConfiguration and ValidatingWebhookConfiguration
+ // resources named hypershift.openshift.io.
+ func (r *WebhookCertReconciler) patchWebhookConfigsCABundle(ctx context.Context, caBundle []byte) error {
+-	webhookName := "hypershift.openshift.io"
+-
+ 	// Patch MutatingWebhookConfiguration
+ 	mwc := &admissionregistrationv1.MutatingWebhookConfiguration{}
+-	if err := r.Client.Get(ctx, client.ObjectKey{Name: webhookName}, mwc); err != nil {
++	if err := r.Client.Get(ctx, client.ObjectKey{Name: webhookConfigName}, mwc); err != nil {
+ 		if !apierrors.IsNotFound(err) {
+ 			return fmt.Errorf("failed to get MutatingWebhookConfiguration: %w", err)
+ 		}
+@@ -200,7 +235,7 @@ func (r *WebhookCertReconciler) patchWebhookConfigsCABundle(ctx context.Context,
+ 
+ 	// Patch ValidatingWebhookConfiguration
+ 	vwc := &admissionregistrationv1.ValidatingWebhookConfiguration{}
+-	if err := r.Client.Get(ctx, client.ObjectKey{Name: webhookName}, vwc); err != nil {
++	if err := r.Client.Get(ctx, client.ObjectKey{Name: webhookConfigName}, vwc); err != nil {
+ 		if !apierrors.IsNotFound(err) {
+ 			return fmt.Errorf("failed to get ValidatingWebhookConfiguration: %w", err)
+ 		}
+@@ -247,6 +282,12 @@ func (r *WebhookCertReconciler) removeServiceCAResources(ctx context.Context, lo
+ 		}
+ 	}
+ 
++	// Remove the inject-cabundle annotation from webhook configurations so the
++	// service-ca operator stops overwriting the caBundle we manage ourselves.
++	if err := r.removeInjectCABundleAnnotation(ctx, log); err != nil {
++		return err
++	}
++
+ 	// If the existing serving cert secret was created by service-ca, delete it
+ 	// so we can recreate it signed by our self-managed CA.
+ 	existingSecret := &corev1.Secret{}
+diff --git a/hypershift-operator/controllers/webhookcerts/webhookcerts_controller_test.go b/hypershift-operator/controllers/webhookcerts/webhookcerts_controller_test.go
+index 662fd793c05..ec96cf3dd5b 100644
+--- a/hypershift-operator/controllers/webhookcerts/webhookcerts_controller_test.go
++++ b/hypershift-operator/controllers/webhookcerts/webhookcerts_controller_test.go
+@@ -92,7 +92,7 @@ func TestReconcile(t *testing.T) {
+ 		crd := &apiextensionsv1.CustomResourceDefinition{
+ 			ObjectMeta: metav1.ObjectMeta{Name: "hostedclusters.hypershift.openshift.io"},
+ 			Spec: apiextensionsv1.CustomResourceDefinitionSpec{
+-				Group: "hypershift.openshift.io",
++				Group: webhookConfigName,
+ 				Names: apiextensionsv1.CustomResourceDefinitionNames{
+ 					Plural:   "hostedclusters",
+ 					Singular: "hostedcluster",
+@@ -181,7 +181,7 @@ func TestReconcile(t *testing.T) {
+ 		g := NewWithT(t)
+ 
+ 		mwc := &admissionregistrationv1.MutatingWebhookConfiguration{
+-			ObjectMeta: metav1.ObjectMeta{Name: "hypershift.openshift.io"},
++			ObjectMeta: metav1.ObjectMeta{Name: webhookConfigName},
+ 			Webhooks: []admissionregistrationv1.MutatingWebhook{
+ 				{
+ 					Name:                    "defaulting.hypershift.openshift.io",
+@@ -192,7 +192,7 @@ func TestReconcile(t *testing.T) {
+ 			},
+ 		}
+ 		vwc := &admissionregistrationv1.ValidatingWebhookConfiguration{
+-			ObjectMeta: metav1.ObjectMeta{Name: "hypershift.openshift.io"},
++			ObjectMeta: metav1.ObjectMeta{Name: webhookConfigName},
+ 			Webhooks: []admissionregistrationv1.ValidatingWebhook{
+ 				{
+ 					Name:                    "validating.hypershift.openshift.io",
+@@ -210,12 +210,12 @@ func TestReconcile(t *testing.T) {
+ 		g.Expect(err).ToNot(HaveOccurred())
+ 
+ 		updatedMWC := &admissionregistrationv1.MutatingWebhookConfiguration{}
+-		g.Expect(cl.Get(t.Context(), client.ObjectKey{Name: "hypershift.openshift.io"}, updatedMWC)).To(Succeed())
++		g.Expect(cl.Get(t.Context(), client.ObjectKey{Name: webhookConfigName}, updatedMWC)).To(Succeed())
+ 		g.Expect(updatedMWC.Webhooks[0].ClientConfig.CABundle).ToNot(Equal([]byte("old")))
+ 		g.Expect(updatedMWC.Webhooks[0].ClientConfig.CABundle).ToNot(BeEmpty())
+ 
+ 		updatedVWC := &admissionregistrationv1.ValidatingWebhookConfiguration{}
+-		g.Expect(cl.Get(t.Context(), client.ObjectKey{Name: "hypershift.openshift.io"}, updatedVWC)).To(Succeed())
++		g.Expect(cl.Get(t.Context(), client.ObjectKey{Name: webhookConfigName}, updatedVWC)).To(Succeed())
+ 		g.Expect(updatedVWC.Webhooks[0].ClientConfig.CABundle).ToNot(Equal([]byte("old")))
+ 		g.Expect(updatedVWC.Webhooks[0].ClientConfig.CABundle).ToNot(BeEmpty())
+ 	})
+@@ -314,6 +314,57 @@ func TestReconcile(t *testing.T) {
+ 		g.Expect(caSecret.Data).To(HaveKey(certs.CASignerCertMapKey))
+ 	})
+ 
++	t.Run("When upgrading from service-ca it should remove inject-cabundle annotation from webhook configurations", func(t *testing.T) {
++		g := NewWithT(t)
++
++		mwc := &admissionregistrationv1.MutatingWebhookConfiguration{
++			ObjectMeta: metav1.ObjectMeta{
++				Name: webhookConfigName,
++				Annotations: map[string]string{
++					injectCABundleAnnotation: "true",
++				},
++			},
++			Webhooks: []admissionregistrationv1.MutatingWebhook{
++				{
++					Name:                    "defaulting.hypershift.openshift.io",
++					ClientConfig:            admissionregistrationv1.WebhookClientConfig{CABundle: []byte("old")},
++					SideEffects:             sideEffectNone(),
++					AdmissionReviewVersions: []string{"v1"},
++				},
++			},
++		}
++		vwc := &admissionregistrationv1.ValidatingWebhookConfiguration{
++			ObjectMeta: metav1.ObjectMeta{
++				Name: webhookConfigName,
++				Annotations: map[string]string{
++					injectCABundleAnnotation: "true",
++				},
++			},
++			Webhooks: []admissionregistrationv1.ValidatingWebhook{
++				{
++					Name:                    "validating.hypershift.openshift.io",
++					ClientConfig:            admissionregistrationv1.WebhookClientConfig{CABundle: []byte("old")},
++					SideEffects:             sideEffectNone(),
++					AdmissionReviewVersions: []string{"v1"},
++				},
++			},
++		}
++
++		cl := fake.NewClientBuilder().WithScheme(newScheme(t)).WithObjects(mwc, vwc).Build()
++		r := newReconciler(cl)
++
++		_, err := r.Reconcile(t.Context(), caRequest())
++		g.Expect(err).ToNot(HaveOccurred())
++
++		updatedMWC := &admissionregistrationv1.MutatingWebhookConfiguration{}
++		g.Expect(cl.Get(t.Context(), client.ObjectKey{Name: webhookConfigName}, updatedMWC)).To(Succeed())
++		g.Expect(updatedMWC.Annotations).ToNot(HaveKey(injectCABundleAnnotation))
++
++		updatedVWC := &admissionregistrationv1.ValidatingWebhookConfiguration{}
++		g.Expect(cl.Get(t.Context(), client.ObjectKey{Name: webhookConfigName}, updatedVWC)).To(Succeed())
++		g.Expect(updatedVWC.Annotations).ToNot(HaveKey(injectCABundleAnnotation))
++	})
++
+ 	t.Run("When the serving cert was not created by service-ca it should not delete it", func(t *testing.T) {
+ 		g := NewWithT(t)
+ 

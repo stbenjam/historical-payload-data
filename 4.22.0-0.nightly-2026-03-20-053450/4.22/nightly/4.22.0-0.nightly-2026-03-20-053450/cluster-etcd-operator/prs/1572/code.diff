@@ -1,0 +1,239 @@
+diff --git a/pkg/tnf/operator/nodehandler.go b/pkg/tnf/operator/nodehandler.go
+index b2f78915a0..ad72bba084 100644
+--- a/pkg/tnf/operator/nodehandler.go
++++ b/pkg/tnf/operator/nodehandler.go
+@@ -11,6 +11,7 @@ import (
+ 	"github.com/openshift/library-go/pkg/controller/controllercmd"
+ 	"github.com/openshift/library-go/pkg/operator/v1helpers"
+ 	corev1 "k8s.io/api/core/v1"
++	v1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+ 	"k8s.io/apimachinery/pkg/labels"
+ 	"k8s.io/apimachinery/pkg/util/wait"
+ 	"k8s.io/client-go/kubernetes"
+@@ -140,32 +141,27 @@ func handleNodes(
+ 
+ 	klog.Infof("found 2 control plane nodes (%q, %q)", nodeList[0].GetName(), nodeList[1].GetName())
+ 
+-	// Use operator condition to decide if we've completed transition to external etcd (Pacemaker).
+-	// This is durable (not tied to job objects) and drives whether we run updateSetup first and
+-	// skip waiting for stable revision (e.g. node replacement scenario).
+-	// Return lookup failures so handleNodesWithRetry's ExponentialBackoffWithContext loop can
+-	// retry; the condition must be read successfully to choose the correct path.
+-	transitionCompleted, err := ceohelpers.HasExternalEtcdCompletedTransition(ctx, operatorClient)
++	// check if TNF was already set up, by looking for existing jobs
++	jobsExist, err := tnfSetupJobsExist(ctx, kubeClient)
+ 	if err != nil {
+-		return fmt.Errorf("failed to check external etcd transition status: %w", err)
++		return fmt.Errorf("failed to check for existing TNF jobs: %w", err)
+ 	}
+ 
+-	if transitionCompleted {
+-		// Transition to external etcd is complete (e.g. node replacement scenario). Run updateSetup
+-		// first so the survivor can add the replacement node to Pacemaker and start corosync/pacemaker
+-		// without blocking on the replacement node reaching latest etcd revision.
+-		err = updateSetupFunc(nodeList, ctx, controllerContext, operatorClient, kubeClient, kubeInformersForNamespaces)
+-		if err != nil {
+-			return fmt.Errorf("failed to update pacemaker setup: %w", err)
+-		}
++	// always start job controllers, otherwise jobs won't be recreated after a CEO restart
++	err = startTnfJobcontrollersFunc(nodeList, ctx, controllerContext, operatorClient, kubeClient, kubeInformersForNamespaces, etcdInformer)
++	if err != nil {
++		return fmt.Errorf("failed to start TNF job controllers: %w", err)
++	}
++
++	// in case TNF was not setup yet, we are done here
++	if !jobsExist {
++		return nil
+ 	}
+ 
+-	// always start job controllers, otherwise jobs won't be recreated after a CEO restart.
+-	// When transitionCompleted, skip waiting for stable revision so we don't block node replacement
+-	// on the new node's etcd rollout (updateSetup above already ran).
+-	err = startTnfJobcontrollersFunc(nodeList, ctx, controllerContext, operatorClient, kubeClient, kubeInformersForNamespaces, etcdInformer, transitionCompleted)
++	// if TNF was already set up, we might need to update
++	err = updateSetupFunc(nodeList, ctx, controllerContext, operatorClient, kubeClient, kubeInformersForNamespaces)
+ 	if err != nil {
+-		return fmt.Errorf("failed to start TNF job controllers: %w", err)
++		return fmt.Errorf("failed to update pacemaker setup: %w", err)
+ 	}
+ 
+ 	return nil
+@@ -178,8 +174,7 @@ func startTnfJobcontrollers(
+ 	operatorClient v1helpers.StaticPodOperatorClient,
+ 	kubeClient kubernetes.Interface,
+ 	kubeInformersForNamespaces v1helpers.KubeInformersForNamespaces,
+-	etcdInformer operatorv1informers.EtcdInformer,
+-	externalEtcdTransitionCompleted bool) error {
++	etcdInformer operatorv1informers.EtcdInformer) error {
+ 
+ 	klog.Infof("Running TNF setup procedure. Waiting for etcd bootstrap to complete")
+ 
+@@ -195,20 +190,14 @@ func startTnfJobcontrollers(
+ 		return fmt.Errorf("failed to wait for etcd bootstrap: %w", err)
+ 	}
+ 
+-	if !externalEtcdTransitionCompleted {
+-		// Wait for all nodes to have their installers complete (creates /var/lib/etcd)
+-		// before creating TNF job controllers. Skip when transition to external etcd is
+-		// already complete (e.g. node replacement) so we don't block on the replacement
+-		// node reaching latest revision.
+-		klog.Infof("bootstrap completed, waiting for all nodes to reach latest revision")
+-		if err := etcd.WaitForStableRevision(ctx, operatorClient); err != nil {
+-			return fmt.Errorf("failed to wait for all nodes at latest revision: %w", err)
+-		}
+-		klog.Infof("all nodes at latest revision, creating TNF job controllers")
+-	} else {
+-		klog.Infof("bootstrap completed, external etcd transition already complete (e.g. node replacement), ensuring job controllers are running without waiting for stable revision")
++	// Wait for all nodes to have their installers complete (creates /var/lib/etcd)
++	klog.Infof("bootstrap completed, waiting for all nodes to reach latest revision")
++	if err := etcd.WaitForStableRevision(ctx, operatorClient); err != nil {
++		return fmt.Errorf("failed to wait for all nodes at latest revision: %w", err)
+ 	}
+ 
++	klog.Infof("all nodes at latest revision, creating TNF job controllers")
++
+ 	// the order of job creation does not matter, the jobs wait on each other as needed
+ 	for _, node := range nodeList {
+ 		jobs.RunTNFJobController(ctx, tools.JobTypeAuth, &node.Name, controllerContext, operatorClient, kubeClient, kubeInformersForNamespaces, jobs.DefaultConditions)
+@@ -218,10 +207,6 @@ func startTnfJobcontrollers(
+ 	jobs.RunTNFJobController(ctx, tools.JobTypeSetup, nil, controllerContext, operatorClient, kubeClient, kubeInformersForNamespaces, jobs.AllConditions)
+ 	jobs.RunTNFJobController(ctx, tools.JobTypeFencing, nil, controllerContext, operatorClient, kubeClient, kubeInformersForNamespaces, jobs.DefaultConditions)
+ 
+-	if externalEtcdTransitionCompleted {
+-		// updateSetup already ran and drove the jobs; don't block on after-setup completion here.
+-		return nil
+-	}
+ 	// wait until the after-setup jobs finished,
+ 	// in order to avoid races with update jobs
+ 	return waitForTnfAfterSetupJobsCompletion(ctx, kubeClient, nodeList)
+@@ -310,6 +295,19 @@ func updateSetup(
+ 	return nil
+ }
+ 
++// tnfSetupJobsExist checks if TNF was already set up by checking for any existing TNF jobs
++func tnfSetupJobsExist(ctx context.Context, kubeClient kubernetes.Interface) (bool, error) {
++	// Check if any TNF jobs exist in the target namespace
++	jobsClient := kubeClient.BatchV1().Jobs(operatorclient.TargetNamespace)
++	list, err := jobsClient.List(ctx, v1.ListOptions{
++		LabelSelector: "app.kubernetes.io/component=two-node-fencing-setup",
++	})
++	if err != nil {
++		return false, err
++	}
++	return len(list.Items) > 0, nil
++}
++
+ func waitForTnfAfterSetupJobsCompletion(ctx context.Context, kubeClient kubernetes.Interface, nodeList []*corev1.Node) error {
+ 	for _, node := range nodeList {
+ 		jobName := tools.JobTypeAfterSetup.GetJobName(&node.Name)
+diff --git a/pkg/tnf/operator/nodehandler_test.go b/pkg/tnf/operator/nodehandler_test.go
+index 270b561a4b..93187b2e46 100644
+--- a/pkg/tnf/operator/nodehandler_test.go
++++ b/pkg/tnf/operator/nodehandler_test.go
+@@ -35,7 +35,6 @@ func TestHandleNodes(t *testing.T) {
+ 	tests := []struct {
+ 		name                   string
+ 		nodes                  []*corev1.Node
+-		transitionCompleted    bool // operator condition ExternalEtcdHasCompletedTransition (replaces fragile job-existence check)
+ 		existingJobs           []runtime.Object
+ 		mockStartControllers   func() error
+ 		mockUpdateSetup        func() error
+@@ -89,13 +88,12 @@ func TestHandleNodes(t *testing.T) {
+ 			expectUpdateSetup:      false,
+ 		},
+ 		{
+-			name: "2 ready nodes, transition not completed - starts controllers only",
++			name: "2 ready nodes, no existing jobs - starts controllers only",
+ 			nodes: []*corev1.Node{
+ 				createReadyNode("master-0"),
+ 				createReadyNode("master-1"),
+ 			},
+-			transitionCompleted: false,
+-			existingJobs:        []runtime.Object{},
++			existingJobs: []runtime.Object{},
+ 			mockStartControllers: func() error {
+ 				return nil
+ 			},
+@@ -104,13 +102,14 @@ func TestHandleNodes(t *testing.T) {
+ 			expectUpdateSetup:      false,
+ 		},
+ 		{
+-			name: "2 ready nodes, transition completed - starts controllers and updates setup",
++			name: "2 ready nodes, existing jobs - starts controllers and updates setup",
+ 			nodes: []*corev1.Node{
+ 				createReadyNode("master-0"),
+ 				createReadyNode("master-1"),
+ 			},
+-			transitionCompleted: true,
+-			existingJobs:        []runtime.Object{},
++			existingJobs: []runtime.Object{
++				createTNFJob("tnf-setup"),
++			},
+ 			mockStartControllers: func() error {
+ 				return nil
+ 			},
+@@ -137,13 +136,14 @@ func TestHandleNodes(t *testing.T) {
+ 			errorContains:          "failed to start TNF job controllers",
+ 		},
+ 		{
+-			name: "2 ready nodes, transition completed - error updating setup",
++			name: "2 ready nodes, existing jobs - error updating setup",
+ 			nodes: []*corev1.Node{
+ 				createReadyNode("master-0"),
+ 				createReadyNode("master-1"),
+ 			},
+-			transitionCompleted: true,
+-			existingJobs:        []runtime.Object{},
++			existingJobs: []runtime.Object{
++				createTNFJob("tnf-setup"),
++			},
+ 			mockStartControllers: func() error {
+ 				return nil
+ 			},
+@@ -151,7 +151,7 @@ func TestHandleNodes(t *testing.T) {
+ 				return errors.New("failed to update")
+ 			},
+ 			expectError:            true,
+-			expectStartControllers: false, // updateSetup runs first and fails, so startControllers is never called
++			expectStartControllers: true,
+ 			expectUpdateSetup:      true,
+ 			errorContains:          "failed to update pacemaker setup",
+ 		},
+@@ -165,18 +165,14 @@ func TestHandleNodes(t *testing.T) {
+ 			// Create fake kubernetes client with jobs
+ 			fakeKubeClient := fake.NewSimpleClientset(tt.existingJobs...)
+ 
+-			// Create fake operator client (condition ExternalEtcdHasCompletedTransition drives updateSetup + skip-revision path)
+-			statusConfigs := []func(*operatorv1.StaticPodOperatorStatus){
+-				u.WithLatestRevision(1),
+-				u.WithNodeStatusAtCurrentRevision(1),
+-				u.WithNodeStatusAtCurrentRevision(1),
+-			}
+-			if tt.transitionCompleted {
+-				statusConfigs = append(statusConfigs, u.WithOperatorCondition(ceohelpers.OperatorConditionExternalEtcdHasCompletedTransition, operatorv1.ConditionTrue))
+-			}
++			// Create fake operator client
+ 			fakeOperatorClient := v1helpers.NewFakeStaticPodOperatorClient(
+ 				&operatorv1.StaticPodOperatorSpec{},
+-				u.StaticPodOperatorStatus(statusConfigs...),
++				u.StaticPodOperatorStatus(
++					u.WithLatestRevision(1),
++					u.WithNodeStatusAtCurrentRevision(1),
++					u.WithNodeStatusAtCurrentRevision(1),
++				),
+ 				nil,
+ 				nil,
+ 			)
+@@ -244,12 +240,8 @@ func TestHandleNodes(t *testing.T) {
+ 					kubeClient kubernetes.Interface,
+ 					kubeInformersForNamespaces v1helpers.KubeInformersForNamespaces,
+ 					etcdInformer operatorv1informers.EtcdInformer,
+-					externalEtcdTransitionCompleted bool,
+ 				) error {
+ 					startControllersCalled = true
+-					if externalEtcdTransitionCompleted != tt.transitionCompleted {
+-						t.Errorf("startTnfJobcontrollersFunc called with externalEtcdTransitionCompleted=%v, want %v (tt.transitionCompleted)", externalEtcdTransitionCompleted, tt.transitionCompleted)
+-					}
+ 					return tt.mockStartControllers()
+ 				}
+ 			}

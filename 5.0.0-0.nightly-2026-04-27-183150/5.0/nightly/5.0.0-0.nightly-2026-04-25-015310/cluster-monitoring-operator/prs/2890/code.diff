@@ -1,0 +1,640 @@
+diff --git a/pkg/manifests/config.go b/pkg/manifests/config.go
+index 9371af739c..0a59a643bb 100644
+--- a/pkg/manifests/config.go
++++ b/pkg/manifests/config.go
+@@ -25,6 +25,7 @@ import (
+ 
+ 	"github.com/alecthomas/units"
+ 	configv1 "github.com/openshift/api/config/v1"
++	configv1alpha1 "github.com/openshift/api/config/v1alpha1"
+ 	"github.com/prometheus/common/model"
+ 	v1 "k8s.io/api/core/v1"
+ 	jsonutil "k8s.io/apimachinery/pkg/util/json"
+@@ -326,7 +327,15 @@ func UnmarshalStrict(data []byte, v interface{}) error {
+ 	}
+ }
+ 
++// NewConfigFromString returns the Config initialized from the provided string.
+ func NewConfigFromString(content string) (*Config, error) {
++	return NewConfigFromStringAndClusterMonitoringResource(content, nil)
++}
++
++// NewConfigFromStringAndClusterMonitoringResource returns the Config
++// initialized from the provided string and merged with the ClusterMonitoring
++// resource.
++func NewConfigFromStringAndClusterMonitoringResource(content string, cmr *configv1alpha1.ClusterMonitoring) (*Config, error) {
+ 	cmc := ClusterMonitoringConfiguration{
+ 		NodeExporterConfig: NodeExporterConfig{
+ 			Collectors: NodeExporterCollectorConfig{
+@@ -352,6 +361,8 @@ func NewConfigFromString(content string) (*Config, error) {
+ 		ClusterMonitoringConfiguration: &cmc,
+ 		UserWorkloadConfiguration:      NewDefaultUserWorkloadMonitoringConfig(),
+ 	}
++	c.mergeClusterMonitoringCRD(cmr)
++
+ 	c.applyDefaults()
+ 
+ 	// Validate the configured collection profile.
+@@ -411,29 +422,39 @@ func (c *Config) applyDefaults() {
+ 	if c.Images == nil {
+ 		c.Images = &Images{}
+ 	}
++
+ 	if c.ClusterMonitoringConfiguration == nil {
+ 		c.ClusterMonitoringConfiguration = &ClusterMonitoringConfiguration{}
+ 	}
++
++	if c.ClusterMonitoringConfiguration.UserWorkloadEnabled == nil {
++		c.ClusterMonitoringConfiguration.UserWorkloadEnabled = ptr.To(false)
++	}
++
+ 	if c.ClusterMonitoringConfiguration.PrometheusOperatorConfig == nil {
+ 		c.ClusterMonitoringConfiguration.PrometheusOperatorConfig = &PrometheusOperatorConfig{}
+ 	}
++
+ 	if c.ClusterMonitoringConfiguration.PrometheusOperatorAdmissionWebhookConfig == nil {
+ 		c.ClusterMonitoringConfiguration.PrometheusOperatorAdmissionWebhookConfig = &PrometheusOperatorAdmissionWebhookConfig{}
+ 	}
++
+ 	if c.ClusterMonitoringConfiguration.PrometheusK8sConfig == nil {
+ 		c.ClusterMonitoringConfiguration.PrometheusK8sConfig = &PrometheusK8sConfig{}
+ 	}
++
+ 	if c.ClusterMonitoringConfiguration.PrometheusK8sConfig.Retention == "" && c.ClusterMonitoringConfiguration.PrometheusK8sConfig.RetentionSize == "" {
+ 		c.ClusterMonitoringConfiguration.PrometheusK8sConfig.Retention = DefaultRetentionValue
+ 	}
++
++	if c.ClusterMonitoringConfiguration.PrometheusK8sConfig.CollectionProfile == "" {
++		c.ClusterMonitoringConfiguration.PrometheusK8sConfig.CollectionProfile = FullCollectionProfile
++	}
++
+ 	if c.ClusterMonitoringConfiguration.AlertmanagerMainConfig == nil {
+ 		c.ClusterMonitoringConfiguration.AlertmanagerMainConfig = &AlertmanagerMainConfig{}
+ 	}
+ 
+-	// UserWorkloadEnabled is left nil when not set by ConfigMap so the operator can
+-	// apply ClusterMonitoring CRD merge (UserDefined mode) when the feature gate is on.
+-	// The operator defaults it to false after merge when still nil.
+-
+ 	if c.ClusterMonitoringConfiguration.UserWorkload == nil {
+ 		c.ClusterMonitoringConfiguration.UserWorkload = &UserWorkloadConfig{}
+ 	}
+@@ -445,34 +466,33 @@ func (c *Config) applyDefaults() {
+ 	if c.ClusterMonitoringConfiguration.ThanosQuerierConfig == nil {
+ 		c.ClusterMonitoringConfiguration.ThanosQuerierConfig = &ThanosQuerierConfig{}
+ 	}
++
+ 	if c.ClusterMonitoringConfiguration.KubeStateMetricsConfig == nil {
+ 		c.ClusterMonitoringConfiguration.KubeStateMetricsConfig = &KubeStateMetricsConfig{}
+ 	}
++
+ 	if c.ClusterMonitoringConfiguration.OpenShiftMetricsConfig == nil {
+ 		c.ClusterMonitoringConfiguration.OpenShiftMetricsConfig = &OpenShiftStateMetricsConfig{}
+ 	}
++
+ 	if c.ClusterMonitoringConfiguration.HTTPConfig == nil {
+ 		c.ClusterMonitoringConfiguration.HTTPConfig = &HTTPConfig{}
+ 	}
++
+ 	if c.ClusterMonitoringConfiguration.TelemeterClientConfig == nil {
+ 		c.ClusterMonitoringConfiguration.TelemeterClientConfig = &TelemeterClientConfig{
+ 			TelemeterServerURL: "https://infogw.api.openshift.com/",
+ 		}
+ 	}
+ 
+-	// MetricsServerConfig is left nil when not set by ConfigMap so the operator can
+-	// apply ClusterMonitoring CRD merge (MetricsServerConfig from CR) when the feature gate is on.
+-
+-	if c.ClusterMonitoringConfiguration.MetricsServerConfig != nil {
+-		if c.ClusterMonitoringConfiguration.MetricsServerConfig.Audit == nil {
+-			c.ClusterMonitoringConfiguration.MetricsServerConfig.Audit = &Audit{}
+-		}
+-		if c.ClusterMonitoringConfiguration.MetricsServerConfig.Audit.Profile == "" {
+-			c.ClusterMonitoringConfiguration.MetricsServerConfig.Audit.Profile = auditv1.LevelMetadata
+-		}
++	if c.ClusterMonitoringConfiguration.MetricsServerConfig == nil {
++		c.ClusterMonitoringConfiguration.MetricsServerConfig = &MetricsServerConfig{}
+ 	}
+-	if c.ClusterMonitoringConfiguration.PrometheusK8sConfig.CollectionProfile == "" {
+-		c.ClusterMonitoringConfiguration.PrometheusK8sConfig.CollectionProfile = FullCollectionProfile
++	if c.ClusterMonitoringConfiguration.MetricsServerConfig.Audit == nil {
++		c.ClusterMonitoringConfiguration.MetricsServerConfig.Audit = &Audit{}
++	}
++	if c.ClusterMonitoringConfiguration.MetricsServerConfig.Audit.Profile == "" {
++		c.ClusterMonitoringConfiguration.MetricsServerConfig.Audit.Profile = auditv1.LevelMetadata
+ 	}
+ 
+ 	if c.ClusterMonitoringConfiguration.NodeExporterConfig.IgnoredNetworkDevices == nil {
+@@ -653,7 +673,15 @@ func calculateBodySizeLimit(podCapacity int) string {
+ 	return fmt.Sprintf("%dMB", int(math.Ceil(float64(bodySize)/(1024*1024))))
+ }
+ 
++// NewConfigFromConfigMap returns the Config initialized from the provided ConfigMap.
+ func NewConfigFromConfigMap(c *v1.ConfigMap) (*Config, error) {
++	return NewConfigFromConfigMapAndClusterMonitoringResource(c, nil)
++}
++
++// NewConfigFromConfigMapAndClusterMonitoringResource returns the Config
++// initialized from the provided ConfigMap and merged with the
++// ClusterMonitoring resource.
++func NewConfigFromConfigMapAndClusterMonitoringResource(c *v1.ConfigMap, cmr *configv1alpha1.ClusterMonitoring) (*Config, error) {
+ 	configContent, found := c.Data[configKey]
+ 	if !found {
+ 		return nil, fmt.Errorf("%q key not found in the configmap", configKey)
+@@ -664,7 +692,7 @@ func NewConfigFromConfigMap(c *v1.ConfigMap) (*Config, error) {
+ 		configContent = "{}"
+ 	}
+ 
+-	cParsed, err := NewConfigFromString(configContent)
++	cParsed, err := NewConfigFromStringAndClusterMonitoringResource(configContent, cmr)
+ 	if err != nil {
+ 		return nil, fmt.Errorf("failed to parse data at key %q: %w", configKey, err)
+ 	}
+diff --git a/pkg/manifests/config_merge.go b/pkg/manifests/config_merge.go
+index e205af6ea0..7b773b27cc 100644
+--- a/pkg/manifests/config_merge.go
++++ b/pkg/manifests/config_merge.go
+@@ -21,88 +21,46 @@ import (
+ 	"k8s.io/utils/ptr"
+ )
+ 
+-// MergeClusterMonitoringCRD merges the ClusterMonitoring CR spec into the ConfigMap-derived
++// mergeClusterMonitoringCRD merges the ClusterMonitoring CR spec into the ConfigMap-derived
+ // config when clusterMonitoring is non-nil. Phase 1 (pre-GA): for each top-level field, if the
+ // ConfigMap did not set it, use the CR; otherwise keep the ConfigMap and ignore the CR for that field.
+-//
+-// The operator should always call this with nil when the feature gate is off or the CR is missing.
+-// EnsureSafeDefaults runs at the end here so callers do not need to invoke it separately.
+-func (c *Config) MergeClusterMonitoringCRD(clusterMonitoring *configv1alpha1.ClusterMonitoring) {
+-	if clusterMonitoring != nil {
+-		if c.ClusterMonitoringConfiguration == nil {
+-			c.ClusterMonitoringConfiguration = &ClusterMonitoringConfiguration{}
+-		}
+-
+-		// User workload: use the CR only if the ConfigMap did not set enableUserWorkload.
+-		if c.ClusterMonitoringConfiguration.UserWorkloadEnabled == nil && clusterMonitoring.Spec.UserDefined.Mode != "" {
+-			if v := applyUserDefinedMode(clusterMonitoring.Spec.UserDefined); v != nil {
+-				c.ClusterMonitoringConfiguration.UserWorkloadEnabled = v
+-			}
+-		}
+-
+-		// Metrics Server (Phase 1): if the ConfigMap already has metricsServer, mergeMetricsServerConfiguration
+-		// is a no-op. Spec.MetricsServerConfig is a struct value—unset in YAML is a zero struct in Go, not nil—
+-		// so only merge when the CR author set at least one field (avoids allocating an empty MetricsServerConfig).
+-		if clusterMonitoringMetricsServerSpecNonEmpty(clusterMonitoring.Spec.MetricsServerConfig) {
+-			c.mergeMetricsServerConfiguration(clusterMonitoring.Spec.MetricsServerConfig)
+-		}
+-	}
+-	c.EnsureSafeDefaults()
+-}
+-
+-// EnsureSafeDefaults sets safe defaults for fields that may be nil when neither ConfigMap nor CR
+-// set them. MergeClusterMonitoringCRD invokes this at the end; direct use is for tests or special cases.
+-func (c *Config) EnsureSafeDefaults() {
+-	if c.ClusterMonitoringConfiguration == nil {
++func (c *Config) mergeClusterMonitoringCRD(clusterMonitoring *configv1alpha1.ClusterMonitoring) {
++	if clusterMonitoring == nil {
+ 		return
+ 	}
+-	if c.ClusterMonitoringConfiguration.UserWorkloadEnabled == nil {
+-		c.ClusterMonitoringConfiguration.UserWorkloadEnabled = ptr.To(false)
+-	}
+-	if c.ClusterMonitoringConfiguration.MetricsServerConfig == nil {
+-		c.ClusterMonitoringConfiguration.MetricsServerConfig = &MetricsServerConfig{
+-			Audit: &Audit{Profile: auditv1.LevelMetadata},
+-		}
+-	} else if c.ClusterMonitoringConfiguration.MetricsServerConfig.Audit == nil {
+-		c.ClusterMonitoringConfiguration.MetricsServerConfig.Audit = &Audit{Profile: auditv1.LevelMetadata}
+-	} else if c.ClusterMonitoringConfiguration.MetricsServerConfig.Audit.Profile == "" {
+-		c.ClusterMonitoringConfiguration.MetricsServerConfig.Audit.Profile = auditv1.LevelMetadata
+-	}
+-}
+ 
+-func applyUserDefinedMode(udm configv1alpha1.UserDefinedMonitoring) *bool {
+-	switch udm.Mode {
+-	case configv1alpha1.UserDefinedDisabled:
+-		return ptr.To(false)
+-	case configv1alpha1.UserDefinedNamespaceIsolated:
+-		return ptr.To(true)
+-	default:
+-		return nil
++	// User workload: use the CR only if the ConfigMap did not set enableUserWorkload.
++	if c.ClusterMonitoringConfiguration.UserWorkloadEnabled == nil && clusterMonitoring.Spec.UserDefined.Mode != "" {
++		c.ClusterMonitoringConfiguration.UserWorkloadEnabled = ptr.To(clusterMonitoring.Spec.UserDefined.Mode == configv1alpha1.UserDefinedNamespaceIsolated)
+ 	}
++
++	c.mergeMetricsServerConfiguration(clusterMonitoring.Spec.MetricsServerConfig)
+ }
+ 
+-// clusterMonitoringMetricsServerSpecNonEmpty reports whether the CR's metricsServer stanza contains any
+-// user-set field. The API uses a value type, so omitted in the manifest is always the zero struct here.
+-func clusterMonitoringMetricsServerSpecNonEmpty(msc configv1alpha1.MetricsServerConfig) bool {
++// clusterMonitoringMetricsServerSpecEmpty reports whether the CR's
++// metricsServer stanza contains no user-set field. The API uses a value type,
++// so omitted in the manifest is always the zero struct here.
++func clusterMonitoringMetricsServerSpecEmpty(msc configv1alpha1.MetricsServerConfig) bool {
+ 	if msc.Verbosity != "" {
+-		return true
++		return false
+ 	}
+ 	if len(msc.NodeSelector) > 0 {
+-		return true
++		return false
+ 	}
+ 	if len(msc.Tolerations) > 0 {
+-		return true
++		return false
+ 	}
+ 	if len(msc.Resources) > 0 {
+-		return true
++		return false
+ 	}
+ 	if msc.Audit.Profile != "" {
+-		return true
++		return false
+ 	}
+ 	if len(msc.TopologySpreadConstraints) > 0 {
+-		return true
++		return false
+ 	}
+-	return false
++
++	return true
+ }
+ 
+ func verbosityLevelToNumeric(level configv1alpha1.VerbosityLevel) uint8 {
+@@ -121,17 +79,28 @@ func verbosityLevelToNumeric(level configv1alpha1.VerbosityLevel) uint8 {
+ }
+ 
+ func (c *Config) mergeMetricsServerConfiguration(msc configv1alpha1.MetricsServerConfig) {
++	// Metrics Server (Phase 1): if the ConfigMap already has metricsServer, mergeMetricsServerConfiguration
++	// is a no-op.
+ 	if c.ClusterMonitoringConfiguration.MetricsServerConfig != nil {
+ 		return
+ 	}
+-	c.ClusterMonitoringConfiguration.MetricsServerConfig = &MetricsServerConfig{}
+-	cfg := c.ClusterMonitoringConfiguration.MetricsServerConfig
++
++	// Spec.MetricsServerConfig is a struct value—unset in YAML is a zero
++	// struct in Go, not nil— so only merge when the CR author defined at least
++	// one field.
++	if clusterMonitoringMetricsServerSpecEmpty(msc) {
++		return
++	}
++
++	cfg := &MetricsServerConfig{}
+ 
+ 	if msc.Verbosity != "" {
+ 		cfg.Verbosity = verbosityLevelToNumeric(msc.Verbosity)
+ 	}
++
+ 	cfg.NodeSelector = msc.NodeSelector
+ 	cfg.Tolerations = msc.Tolerations
++
+ 	if len(msc.Resources) > 0 {
+ 		resources := &v1.ResourceRequirements{
+ 			Requests: v1.ResourceList{},
+@@ -147,11 +116,14 @@ func (c *Config) mergeMetricsServerConfiguration(msc configv1alpha1.MetricsServe
+ 		}
+ 		cfg.Resources = resources
+ 	}
++
+ 	if msc.Audit.Profile != "" {
+-		if cfg.Audit == nil {
+-			cfg.Audit = &Audit{}
++		cfg.Audit = &Audit{
++			Profile: auditv1.Level(string(msc.Audit.Profile)),
+ 		}
+-		cfg.Audit.Profile = auditv1.Level(string(msc.Audit.Profile))
+ 	}
++
+ 	cfg.TopologySpreadConstraints = msc.TopologySpreadConstraints
++
++	c.ClusterMonitoringConfiguration.MetricsServerConfig = cfg
+ }
+diff --git a/pkg/manifests/config_merge_test.go b/pkg/manifests/config_merge_test.go
+index 989422ff73..1d69744cf5 100644
+--- a/pkg/manifests/config_merge_test.go
++++ b/pkg/manifests/config_merge_test.go
+@@ -19,138 +19,78 @@ import (
+ 
+ 	configv1alpha1 "github.com/openshift/api/config/v1alpha1"
+ 	"github.com/stretchr/testify/require"
+-	"k8s.io/utils/ptr"
+ )
+ 
+-func TestApplyUserDefinedMode(t *testing.T) {
+-	for _, tc := range []struct {
+-		name     string
+-		udm      configv1alpha1.UserDefinedMonitoring
+-		expected *bool
+-	}{
+-		{
+-			name:     "Disabled",
+-			udm:      configv1alpha1.UserDefinedMonitoring{Mode: configv1alpha1.UserDefinedDisabled},
+-			expected: ptr.To(false),
+-		},
+-		{
+-			name:     "NamespaceIsolated",
+-			udm:      configv1alpha1.UserDefinedMonitoring{Mode: configv1alpha1.UserDefinedNamespaceIsolated},
+-			expected: ptr.To(true),
+-		},
+-		{
+-			name:     "empty mode",
+-			udm:      configv1alpha1.UserDefinedMonitoring{},
+-			expected: nil,
+-		},
+-		{
+-			name:     "unknown mode",
+-			udm:      configv1alpha1.UserDefinedMonitoring{Mode: "Unknown"},
+-			expected: nil,
+-		},
+-	} {
+-		t.Run(tc.name, func(t *testing.T) {
+-			got := applyUserDefinedMode(tc.udm)
+-			if tc.expected == nil {
+-				require.Nil(t, got)
+-				return
+-			}
+-			require.NotNil(t, got)
+-			require.Equal(t, *tc.expected, *got)
+-		})
+-	}
+-}
+-
+ func TestConfig_MergeClusterMonitoringCRD(t *testing.T) {
+-	ptrFalse := ptr.To(false)
+-	ptrTrue := ptr.To(true)
+-
+ 	for _, tc := range []struct {
+-		name        string
+-		c           *Config
+-		cm          *configv1alpha1.ClusterMonitoring
+-		expectValue *bool
++		name     string
++		c        string
++		cm       *configv1alpha1.ClusterMonitoring
++		expected bool
+ 	}{
+ 		{
+-			name: "cm nil leaves config unchanged",
+-			c:    &Config{},
+-			cm:   nil,
+-		},
+-		{
+-			name: "cm with empty UserDefined Mode",
+-			c:    &Config{},
++			name: "cm with invalid UserDefined Mode defaults to false",
++			c:    "{}",
+ 			cm: &configv1alpha1.ClusterMonitoring{
+ 				Spec: configv1alpha1.ClusterMonitoringSpec{
+-					UserDefined: configv1alpha1.UserDefinedMonitoring{Mode: ""},
++					UserDefined: configv1alpha1.UserDefinedMonitoring{Mode: "FooBar"},
+ 				},
+ 			},
++			expected: false,
+ 		},
+ 		{
+ 			name: "UserDefinedDisabled sets UserWorkloadEnabled to false",
+-			c:    &Config{},
++			c:    "{}",
+ 			cm: &configv1alpha1.ClusterMonitoring{
+ 				Spec: configv1alpha1.ClusterMonitoringSpec{
+ 					UserDefined: configv1alpha1.UserDefinedMonitoring{Mode: configv1alpha1.UserDefinedDisabled},
+ 				},
+ 			},
+-			expectValue: ptrFalse,
++			expected: false,
+ 		},
+ 		{
+ 			name: "UserDefinedNamespaceIsolated sets UserWorkloadEnabled to true",
+-			c:    &Config{},
++			c:    "{}",
+ 			cm: &configv1alpha1.ClusterMonitoring{
+ 				Spec: configv1alpha1.ClusterMonitoringSpec{
+ 					UserDefined: configv1alpha1.UserDefinedMonitoring{Mode: configv1alpha1.UserDefinedNamespaceIsolated},
+ 				},
+ 			},
+-			expectValue: ptrTrue,
++			expected: true,
+ 		},
+ 		{
+ 			name: "ConfigMap UserWorkloadEnabled wins over CRD",
+-			c: &Config{
+-				ClusterMonitoringConfiguration: &ClusterMonitoringConfiguration{
+-					UserWorkloadEnabled: ptrTrue,
+-				},
+-			},
++			c:    "{enableUserWorkload: true}",
+ 			cm: &configv1alpha1.ClusterMonitoring{
+ 				Spec: configv1alpha1.ClusterMonitoringSpec{
+ 					UserDefined: configv1alpha1.UserDefinedMonitoring{Mode: configv1alpha1.UserDefinedDisabled},
+ 				},
+ 			},
+-			expectValue: ptrTrue,
++			expected: true,
+ 		},
+ 	} {
+ 		t.Run(tc.name, func(t *testing.T) {
+-			tc.c.MergeClusterMonitoringCRD(tc.cm)
+-			if tc.expectValue == nil {
+-				// Only a nil CR skips merge and leaves ClusterMonitoringConfiguration unset (EnsureSafeDefaults no-ops).
+-				if tc.cm == nil {
+-					require.Nil(t, tc.c.ClusterMonitoringConfiguration)
+-				}
+-				return
+-			}
+-			require.NotNil(t, tc.c.ClusterMonitoringConfiguration)
+-			require.NotNil(t, tc.c.ClusterMonitoringConfiguration.UserWorkloadEnabled)
+-			require.Equal(t, *tc.expectValue, *tc.c.ClusterMonitoringConfiguration.UserWorkloadEnabled)
++			c, err := NewConfigFromStringAndClusterMonitoringResource(tc.c, tc.cm)
++			require.NoError(t, err)
++			require.NotNil(t, c.ClusterMonitoringConfiguration)
++			require.NotNil(t, c.ClusterMonitoringConfiguration.UserWorkloadEnabled)
++			require.Equal(t, tc.expected, *c.ClusterMonitoringConfiguration.UserWorkloadEnabled)
+ 		})
+ 	}
+ }
+ 
+-func TestClusterMonitoringMetricsServerSpecNonEmpty(t *testing.T) {
+-	require.False(t, clusterMonitoringMetricsServerSpecNonEmpty(configv1alpha1.MetricsServerConfig{}))
+-	require.True(t, clusterMonitoringMetricsServerSpecNonEmpty(configv1alpha1.MetricsServerConfig{
++func TestClusterMonitoringMetricsServerSpecEmpty(t *testing.T) {
++	require.True(t, clusterMonitoringMetricsServerSpecEmpty(configv1alpha1.MetricsServerConfig{}))
++	require.False(t, clusterMonitoringMetricsServerSpecEmpty(configv1alpha1.MetricsServerConfig{
+ 		Verbosity: configv1alpha1.VerbosityLevelInfo,
+ 	}))
+-	require.True(t, clusterMonitoringMetricsServerSpecNonEmpty(configv1alpha1.MetricsServerConfig{
++	require.False(t, clusterMonitoringMetricsServerSpecEmpty(configv1alpha1.MetricsServerConfig{
+ 		Audit: configv1alpha1.Audit{Profile: configv1alpha1.AuditProfileMetadata},
+ 	}))
+ }
+ 
+ func TestConfig_MergeClusterMonitoringCRD_MetricsServerConfigPhase1(t *testing.T) {
+ 	t.Run("CR applies when ConfigMap left MetricsServerConfig nil", func(t *testing.T) {
+-		c := &Config{
+-			ClusterMonitoringConfiguration: &ClusterMonitoringConfiguration{},
+-		}
+ 		cm := &configv1alpha1.ClusterMonitoring{
+ 			Spec: configv1alpha1.ClusterMonitoringSpec{
+ 				MetricsServerConfig: configv1alpha1.MetricsServerConfig{
+@@ -158,18 +98,12 @@ func TestConfig_MergeClusterMonitoringCRD_MetricsServerConfigPhase1(t *testing.T
+ 				},
+ 			},
+ 		}
+-		c.MergeClusterMonitoringCRD(cm)
++		c, err := NewConfigFromStringAndClusterMonitoringResource("{}", cm)
++		require.NoError(t, err)
+ 		require.NotNil(t, c.ClusterMonitoringConfiguration.MetricsServerConfig)
+ 		require.Equal(t, uint8(2), c.ClusterMonitoringConfiguration.MetricsServerConfig.Verbosity)
+ 	})
+ 	t.Run("CR ignored when ConfigMap already set MetricsServerConfig", func(t *testing.T) {
+-		c := &Config{
+-			ClusterMonitoringConfiguration: &ClusterMonitoringConfiguration{
+-				MetricsServerConfig: &MetricsServerConfig{
+-					Verbosity: 1,
+-				},
+-			},
+-		}
+ 		cm := &configv1alpha1.ClusterMonitoring{
+ 			Spec: configv1alpha1.ClusterMonitoringSpec{
+ 				MetricsServerConfig: configv1alpha1.MetricsServerConfig{
+@@ -177,28 +111,8 @@ func TestConfig_MergeClusterMonitoringCRD_MetricsServerConfigPhase1(t *testing.T
+ 				},
+ 			},
+ 		}
+-		c.MergeClusterMonitoringCRD(cm)
++		c, err := NewConfigFromStringAndClusterMonitoringResource("{metricsServer: {verbosity: 1}}", cm)
++		require.NoError(t, err)
+ 		require.Equal(t, uint8(1), c.ClusterMonitoringConfiguration.MetricsServerConfig.Verbosity)
+ 	})
+ }
+-
+-func TestConfig_EnsureSafeDefaults(t *testing.T) {
+-	t.Run("sets UserWorkloadEnabled to false when nil", func(t *testing.T) {
+-		c := &Config{ClusterMonitoringConfiguration: &ClusterMonitoringConfiguration{}}
+-		c.EnsureSafeDefaults()
+-		require.NotNil(t, c.ClusterMonitoringConfiguration.UserWorkloadEnabled)
+-		require.False(t, *c.ClusterMonitoringConfiguration.UserWorkloadEnabled)
+-	})
+-	t.Run("sets MetricsServerConfig with Audit default when nil", func(t *testing.T) {
+-		c := &Config{ClusterMonitoringConfiguration: &ClusterMonitoringConfiguration{}}
+-		c.EnsureSafeDefaults()
+-		require.NotNil(t, c.ClusterMonitoringConfiguration.MetricsServerConfig)
+-		require.NotNil(t, c.ClusterMonitoringConfiguration.MetricsServerConfig.Audit)
+-		require.NotEmpty(t, c.ClusterMonitoringConfiguration.MetricsServerConfig.Audit.Profile)
+-	})
+-	t.Run("no-op when ClusterMonitoringConfiguration is nil", func(t *testing.T) {
+-		c := &Config{}
+-		c.EnsureSafeDefaults()
+-		require.Nil(t, c.ClusterMonitoringConfiguration)
+-	})
+-}
+diff --git a/pkg/operator/operator.go b/pkg/operator/operator.go
+index 21b478b6eb..61edc701c6 100644
+--- a/pkg/operator/operator.go
++++ b/pkg/operator/operator.go
+@@ -171,13 +171,13 @@ const (
+ type Operator struct {
+ 	namespace, namespaceUserWorkload string
+ 
+-	configMapName                  string
+-	userWorkloadConfigMapName      string
+-	images                         map[string]string
+-	telemetryMatches               []string
+-	remoteWrite                    bool
+-	ClusterMonitoringConfigEnabled bool
+-	pkiProfileProvider             pki.PKIProfileProvider
++	configMapName             string
++	userWorkloadConfigMapName string
++	images                    map[string]string
++	telemetryMatches          []string
++	remoteWrite               bool
++	clusterMonitoringConfig   bool
++	pkiProfileProvider        pki.PKIProfileProvider
+ 
+ 	apiServerConfig *manifests.APIServerConfig
+ 
+@@ -437,7 +437,7 @@ func New(
+ 		if err != nil {
+ 			return nil, err
+ 		}
+-		o.ClusterMonitoringConfigEnabled = featureGates.Enabled(features.FeatureGateClusterMonitoringConfig)
++		o.clusterMonitoringConfig = featureGates.Enabled(features.FeatureGateClusterMonitoringConfig)
+ 		if featureGates.Enabled(features.FeatureGateConfigurablePKI) {
+ 			// Only register the PKI informer when the feature gate is enabled, since the PKI
+ 			// CRD only exists when the feature gate is active.
+@@ -454,8 +454,8 @@ func New(
+ 		return nil, fmt.Errorf("timed out waiting for FeatureGate detection")
+ 	}
+ 
+-	// Watch the ClusterMonitoring config resource if the feature gate is enabled
+-	if o.ClusterMonitoringConfigEnabled {
++	// Watch the ClusterMonitoring config resource if the feature gate is enabled.
++	if o.clusterMonitoringConfig {
+ 		informer = cache.NewSharedIndexInformer(
+ 			o.client.ClusterMonitoringListWatch(),
+ 			&configv1alpha1.ClusterMonitoring{},
+@@ -975,7 +975,7 @@ func (o *Operator) loadUserWorkloadConfig(ctx context.Context) (*manifests.UserW
+ 	return manifests.NewUserWorkloadConfigFromConfigMap(userCM)
+ }
+ 
+-func (o *Operator) loadConfig() (*manifests.Config, error) {
++func (o *Operator) loadConfig(cm *configv1alpha1.ClusterMonitoring) (*manifests.Config, error) {
+ 	obj, found, err := o.cmapInf.GetStore().GetByKey(o.cmoConfigMap())
+ 	if err != nil {
+ 		return nil, fmt.Errorf("an error occurred when retrieving the Cluster Monitoring ConfigMap: %w", err)
+@@ -983,17 +983,31 @@ func (o *Operator) loadConfig() (*manifests.Config, error) {
+ 
+ 	if !found {
+ 		klog.Warning("No Cluster Monitoring ConfigMap was found. Using defaults.")
+-		return manifests.NewConfigFromString("{}")
++		return manifests.NewConfigFromStringAndClusterMonitoringResource("{}", cm)
+ 	}
+ 
+ 	cmap := obj.(*v1.ConfigMap)
+-	return manifests.NewConfigFromConfigMap(cmap)
++	return manifests.NewConfigFromConfigMapAndClusterMonitoringResource(cmap, cm)
+ }
+ 
++// Config returns the final configuration which is aggregated from
++// - the openshift-monitoring/cluster-monitoring-config configmap.
++// - the openshift-user-workload-monitoring/user-workload-monitoring-config configmap.
++// - the ClusterMonitoring custom resource (when the ClusterMonitoringConfig feature gate is enabled).
+ func (o *Operator) Config(ctx context.Context) (*manifests.Config, []string, error) {
+ 	var warnings []string
+ 
+-	c, err := o.loadConfig()
++	// Always merge ClusterMonitoring CR (nil when FG is off or CR is missing).
++	var cm *configv1alpha1.ClusterMonitoring
++	if o.clusterMonitoringConfig {
++		var getErr error
++		cm, getErr = o.client.GetClusterMonitoring(ctx, "cluster")
++		if getErr != nil && !apierrors.IsNotFound(getErr) {
++			return nil, warnings, fmt.Errorf("failed to get ClusterMonitoring CRD: %w", getErr)
++		}
++	}
++
++	c, err := o.loadConfig(cm)
+ 	if err != nil {
+ 		return nil, warnings, err
+ 	}
+@@ -1007,18 +1021,6 @@ func (o *Operator) Config(ctx context.Context) (*manifests.Config, []string, err
+ 		manifests.SupportedCollectionProfiles.StringSlice(),
+ 	)
+ 
+-	// Always merge ClusterMonitoring CR (nil when FG is off or CR is missing).
+-	// manifests.Config applies safe defaults inside MergeClusterMonitoringCRD.
+-	var cm *configv1alpha1.ClusterMonitoring
+-	if o.ClusterMonitoringConfigEnabled {
+-		var getErr error
+-		cm, getErr = o.client.GetClusterMonitoring(ctx, "cluster")
+-		if getErr != nil && !apierrors.IsNotFound(getErr) {
+-			return nil, warnings, fmt.Errorf("failed to get ClusterMonitoring CRD: %w", getErr)
+-		}
+-	}
+-	c.MergeClusterMonitoringCRD(cm)
+-
+ 	// Only use User Workload Monitoring ConfigMap from user ns and populate if
+ 	// it's enabled by admin via Cluster Monitoring ConfigMap.  The above
+ 	// loadConfig() already initializes the structs with nil values for

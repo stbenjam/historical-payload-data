@@ -1,0 +1,139 @@
+diff --git a/docs/user-guide/multiarch-and-heterogeneous-openshift.md b/docs/user-guide/multiarch-and-heterogeneous-openshift.md
+index bbd673193416..245600ea71ca 100644
+--- a/docs/user-guide/multiarch-and-heterogeneous-openshift.md
++++ b/docs/user-guide/multiarch-and-heterogeneous-openshift.md
+@@ -83,6 +83,8 @@ aicli create infraenv ${CLUSTER_NAME}-arm \
+ -P cpu_architecture=arm64
+ ```
+ 
++**IMPORTANT:** The `cpu_architecture` field is immutable after InfraEnv creation. If you need to change the architecture, delete the InfraEnv and create a new one with the desired architecture.
++
+ ## Boot the nodes
+ 
+ Once cluster and InfraEnv is created, the nodes can be booted using the generated ISO. This process is no different from the regular host discovery known from single-arch topologies. Once the hosts are discovered, the installation can begin as usual.
+diff --git a/pkg/webhooks/agentinstall/v1beta1/infraenv_admission_hook.go b/pkg/webhooks/agentinstall/v1beta1/infraenv_admission_hook.go
+index ea31eb5e7bc2..2cc08afb3973 100644
+--- a/pkg/webhooks/agentinstall/v1beta1/infraenv_admission_hook.go
++++ b/pkg/webhooks/agentinstall/v1beta1/infraenv_admission_hook.go
+@@ -26,6 +26,10 @@ const (
+ 
+ 	infraEnvAdmissionGroup   = "admission.agentinstall.openshift.io"
+ 	infraEnvAdmissionVersion = "v1"
++
++	// defaultCPUArchitecture matches the kubebuilder default in
++	// api/v1beta1/infraenv_types.go and the CRD schema
++	defaultCPUArchitecture = "x86_64"
+ )
+ 
+ // InfraEnvValidatingAdmissionHook is a struct that is used to reference what code should be run by the generic-admission-server.
+@@ -162,6 +166,16 @@ func areClusterRefsEqual(clusterRef1 *v1beta1.ClusterReference, clusterRef2 *v1b
+ 	}
+ }
+ 
++func areCpuArchsEqual(oldArch, newArch string) bool {
++	if oldArch == "" {
++		oldArch = defaultCPUArchitecture
++	}
++	if newArch == "" {
++		newArch = defaultCPUArchitecture
++	}
++	return oldArch == newArch
++}
++
+ // validateUpdate specifically validates create operations for InfraEnv objects.
+ func (a *InfraEnvValidatingAdmissionHook) validateCreate(admissionSpec *admissionv1.AdmissionRequest) *admissionv1.AdmissionResponse {
+ 	contextLogger := log.WithFields(log.Fields{
+@@ -254,6 +268,19 @@ func (a *InfraEnvValidatingAdmissionHook) validateUpdate(admissionSpec *admissio
+ 		}
+ 	}
+ 
++	if !areCpuArchsEqual(oldObject.Spec.CpuArchitecture, newObject.Spec.CpuArchitecture) {
++		message := "Attempted to change Spec.CpuArchitecture which is immutable after InfraEnv creation."
++		contextLogger.Infof("Failed validation: %v", message)
++
++		return &admissionv1.AdmissionResponse{
++			Allowed: false,
++			Result: &metav1.Status{
++				Status: metav1.StatusFailure, Code: http.StatusBadRequest, Reason: metav1.StatusReasonBadRequest,
++				Message: message,
++			},
++		}
++	}
++
+ 	if !a.osImageVersionValid(contextLogger, oldObject, newObject) {
+ 		message := "spec.OSImageVersion is not valid. It can't be added alongside with a clusterRef when the cluster is not installed yet."
+ 		contextLogger.Infof("Failed validation: %v", message)
+diff --git a/pkg/webhooks/agentinstall/v1beta1/infraenv_admission_hook_test.go b/pkg/webhooks/agentinstall/v1beta1/infraenv_admission_hook_test.go
+index 42faf5fd4cdd..3aa2765cdad0 100644
+--- a/pkg/webhooks/agentinstall/v1beta1/infraenv_admission_hook_test.go
++++ b/pkg/webhooks/agentinstall/v1beta1/infraenv_admission_hook_test.go
+@@ -7,6 +7,7 @@ import (
+ 	. "github.com/onsi/gomega"
+ 	hiveext "github.com/openshift/assisted-service/api/hiveextension/v1beta1"
+ 	v1beta1 "github.com/openshift/assisted-service/api/v1beta1"
++	"github.com/openshift/assisted-service/models"
+ 	apiserver "github.com/openshift/generic-admission-server/pkg/apiserver"
+ 	hivev1 "github.com/openshift/hive/apis/hive/v1"
+ 	admissionv1 "k8s.io/api/admission/v1"
+@@ -214,6 +215,61 @@ var _ = Describe("infraenv web validate", func() {
+ 			operation:       admissionv1.Update,
+ 			expectedAllowed: true,
+ 		},
++		{
++			name: "Test InfraEnv.Spec.CpuArchitecture is immutable",
++			newSpec: v1beta1.InfraEnvSpec{
++				CpuArchitecture: models.ClusterCPUArchitectureS390x,
++			},
++			oldSpec: v1beta1.InfraEnvSpec{
++				CpuArchitecture: models.ClusterCPUArchitectureX8664,
++			},
++			operation:       admissionv1.Update,
++			expectedAllowed: false,
++		},
++		{
++			name: "Test InfraEnv update fails when CpuArchitecture is set from empty to non-default",
++			newSpec: v1beta1.InfraEnvSpec{
++				CpuArchitecture: models.ClusterCPUArchitectureS390x,
++			},
++			oldSpec: v1beta1.InfraEnvSpec{
++				CpuArchitecture: "",
++			},
++			operation:       admissionv1.Update,
++			expectedAllowed: false,
++		},
++		{
++			name: "Test InfraEnv update does not fail when CpuArchitecture is set from empty to default",
++			newSpec: v1beta1.InfraEnvSpec{
++				CpuArchitecture: defaultCPUArchitecture,
++			},
++			oldSpec: v1beta1.InfraEnvSpec{
++				CpuArchitecture: "",
++			},
++			operation:       admissionv1.Update,
++			expectedAllowed: true,
++		},
++		{
++			name: "Test InfraEnv update does not fail when CpuArchitecture is set from default to empty",
++			newSpec: v1beta1.InfraEnvSpec{
++				CpuArchitecture: "",
++			},
++			oldSpec: v1beta1.InfraEnvSpec{
++				CpuArchitecture: defaultCPUArchitecture,
++			},
++			operation:       admissionv1.Update,
++			expectedAllowed: true,
++		},
++		{
++			name: "Test InfraEnv update does not fail when CpuArchitecture is set and remains the same",
++			newSpec: v1beta1.InfraEnvSpec{
++				CpuArchitecture: models.ClusterCPUArchitectureX8664,
++			},
++			oldSpec: v1beta1.InfraEnvSpec{
++				CpuArchitecture: models.ClusterCPUArchitectureX8664,
++			},
++			operation:       admissionv1.Update,
++			expectedAllowed: true,
++		},
+ 		{
+ 			name: "Test can't specify both Spec.ClusterRef and Spec.OSImageVersion",
+ 			newSpec: v1beta1.InfraEnvSpec{

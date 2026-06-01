@@ -1,0 +1,1388 @@
+diff --git a/frontend/packages/dev-console/integration-tests/support/pages/modal.ts b/frontend/packages/dev-console/integration-tests/support/pages/modal.ts
+index ca381e99865..e22f0a04f08 100644
+--- a/frontend/packages/dev-console/integration-tests/support/pages/modal.ts
++++ b/frontend/packages/dev-console/integration-tests/support/pages/modal.ts
+@@ -78,7 +78,7 @@ export const deleteApplication = {
+ };
+ 
+ export const deleteRevision = {
+-  verifyMessage: (message: string) => cy.get('form p').should('contain.text', message),
++  verifyMessage: (message: string) => cy.get('[role="dialog"] p').should('contain.text', message),
+   clickOK: () => cy.byLegacyTestID('modal-cancel-action').click(),
+ };
+ 
+diff --git a/frontend/packages/knative-plugin/integration-tests/support/step-definitions/eventing/eventing-broker-actions.ts b/frontend/packages/knative-plugin/integration-tests/support/step-definitions/eventing/eventing-broker-actions.ts
+index 17fa9b7cb56..53c535c16bf 100644
+--- a/frontend/packages/knative-plugin/integration-tests/support/step-definitions/eventing/eventing-broker-actions.ts
++++ b/frontend/packages/knative-plugin/integration-tests/support/step-definitions/eventing/eventing-broker-actions.ts
+@@ -130,7 +130,7 @@ When('user adds new label {string}', (labelName: string) => {
+ 
+ When('user clicks on the Save button on the modal', () => {
+   cy.get(topologyPO.graph.saveModal).click();
+-  cy.get(topologyPO.graph.modalContent).should('not.exist');
++  cy.byLegacyTestID('modal-title').should('not.exist');
+   cy.reload();
+   app.waitForLoad();
+   perspective.switchTo(switchPerspective.Developer);
+@@ -149,7 +149,7 @@ When('user selects {string} from Subscriber drop down', (subscriberName: string)
+ 
+ When('user clicks on Add button', () => {
+   cy.get(eventingPO.broker.confirm).click();
+-  cy.get('[class*="modal-dialog"]').should('not.exist');
++  cy.byLegacyTestID('modal-title').should('not.exist');
+ });
+ 
+ Then('user will see {string} created', (triggerName) => {
+diff --git a/frontend/packages/knative-plugin/integration-tests/support/step-definitions/eventing/eventing-channel.ts b/frontend/packages/knative-plugin/integration-tests/support/step-definitions/eventing/eventing-channel.ts
+index efa0816bec6..ab27c3e5327 100644
+--- a/frontend/packages/knative-plugin/integration-tests/support/step-definitions/eventing/eventing-channel.ts
++++ b/frontend/packages/knative-plugin/integration-tests/support/step-definitions/eventing/eventing-channel.ts
+@@ -161,7 +161,7 @@ When('user adds the label {string}', (label: string) => {
+ 
+ When('user clicks on the Save button on the modal to save labels and close the modal', () => {
+   cy.get(eventingPO.channel.save).click('center', { force: true });
+-  cy.get('[role="dialog"]').should('not.exist');
++  cy.byLegacyTestID('modal-title').should('not.exist');
+   navigateTo(devNavigationMenu.Add);
+ });
+ 
+diff --git a/frontend/packages/knative-plugin/src/components/pub-sub/PubSubController.tsx b/frontend/packages/knative-plugin/src/components/pub-sub/PubSubController.tsx
+index 4f3789881c6..eef44c90cdb 100644
+--- a/frontend/packages/knative-plugin/src/components/pub-sub/PubSubController.tsx
++++ b/frontend/packages/knative-plugin/src/components/pub-sub/PubSubController.tsx
+@@ -1,9 +1,9 @@
+ import type { FC } from 'react';
+ import { useCallback, useEffect } from 'react';
++import { Modal } from '@patternfly/react-core';
+ import type { OverlayComponent } from '@console/dynamic-plugin-sdk/src/app/modal-support/OverlayProvider';
+ import { useOverlay } from '@console/dynamic-plugin-sdk/src/app/modal-support/useOverlay';
+ import type { ModalComponentProps } from '@console/internal/components/factory/modal';
+-import { ModalWrapper } from '@console/internal/components/factory/modal';
+ import type { K8sResourceKind } from '@console/internal/module/k8s';
+ import PubSub from './PubSub';
+ import { setPubSubModalLauncher } from './PubSubModalLauncher';
+@@ -31,13 +31,14 @@ export const PubSubModalOverlay: OverlayComponent<Props> = (props) => {
+   }, [props]);
+ 
+   return (
+-    <ModalWrapper blocking onClose={handleOverlayDismiss}>
+-      <PubSubController
+-        cancel={props.cancel || props.closeOverlay}
+-        close={props.close || props.closeOverlay}
+-        {...props}
+-      />
+-    </ModalWrapper>
++    <Modal
++      isOpen
++      onClose={handleOverlayDismiss}
++      variant="small"
++      aria-labelledby="pub-sub-modal-title"
++    >
++      <PubSubController cancel={props.closeOverlay} close={props.closeOverlay} {...props} />
++    </Modal>
+   );
+ };
+ 
+diff --git a/frontend/packages/knative-plugin/src/components/pub-sub/PubSubModal.tsx b/frontend/packages/knative-plugin/src/components/pub-sub/PubSubModal.tsx
+index 05d9419ea77..8b11f015e84 100644
+--- a/frontend/packages/knative-plugin/src/components/pub-sub/PubSubModal.tsx
++++ b/frontend/packages/knative-plugin/src/components/pub-sub/PubSubModal.tsx
+@@ -1,15 +1,11 @@
+ import type { FC } from 'react';
+-import { TextInputTypes } from '@patternfly/react-core';
++import { Button, Form, ModalBody, ModalHeader, TextInputTypes } from '@patternfly/react-core';
+ import type { FormikProps, FormikValues } from 'formik';
+ import * as _ from 'lodash';
+ import { useTranslation } from 'react-i18next';
+ import FormSection from '@console/dev-console/src/components/import/section/FormSection';
+-import {
+-  ModalTitle,
+-  ModalBody,
+-  ModalSubmitFooter,
+-} from '@console/internal/components/factory/modal';
+ import InputField from '@console/shared/src/components/formik-fields/InputField';
++import { ModalFooterWithAlerts } from '@console/shared/src/components/modals/ModalFooterWithAlerts';
+ import PubSubFilter from './form-fields/PubSubFilter';
+ import PubSubSubscriber from './form-fields/PubSubSubscriber';
+ 
+@@ -34,29 +30,39 @@ const PubSubModal: FC<Props> = ({
+   const { t } = useTranslation();
+   const dirty = values?.formData?.metadata?.name && values?.formData?.spec?.subscriber?.ref?.name;
+   return (
+-    <form className="modal-content" onSubmit={handleSubmit}>
+-      <ModalTitle>{labelTitle}</ModalTitle>
++    <>
++      <ModalHeader title={labelTitle} labelId="pub-sub-modal-title" data-test-id="modal-title" />
+       <ModalBody>
+-        <FormSection fullWidth>
+-          <InputField
+-            type={TextInputTypes.text}
+-            name="formData.metadata.name"
+-            label={t('knative-plugin~Name')}
+-            required
+-          />
+-          <PubSubSubscriber cancel={cancel} />
+-          {filterEnabled && <PubSubFilter />}
+-        </FormSection>
++        <Form id="pub-sub-form" onSubmit={handleSubmit} className="pf-v6-u-mr-md">
++          <FormSection fullWidth>
++            <InputField
++              type={TextInputTypes.text}
++              name="formData.metadata.name"
++              label={t('knative-plugin~Name')}
++              required
++            />
++            <PubSubSubscriber cancel={cancel} />
++            {filterEnabled && <PubSubFilter />}
++          </FormSection>
++        </Form>
+       </ModalBody>
+-      <ModalSubmitFooter
+-        inProgress={isSubmitting}
+-        submitText={t('knative-plugin~Add')}
+-        cancelText={t('knative-plugin~Cancel')}
+-        submitDisabled={!dirty || !_.isEmpty(errors) || isSubmitting}
+-        cancel={cancel}
+-        errorMessage={status.error}
+-      />
+-    </form>
++      <ModalFooterWithAlerts errorMessage={status.error}>
++        <Button
++          type="submit"
++          variant="primary"
++          isLoading={isSubmitting}
++          isDisabled={!dirty || !_.isEmpty(errors) || isSubmitting}
++          form="pub-sub-form"
++          data-test="confirm-action"
++          id="confirm-action"
++        >
++          {t('knative-plugin~Add')}
++        </Button>
++        <Button variant="link" onClick={cancel} type="button" data-test-id="modal-cancel-action">
++          {t('knative-plugin~Cancel')}
++        </Button>
++      </ModalFooterWithAlerts>
++    </>
+   );
+ };
+ 
+diff --git a/frontend/packages/knative-plugin/src/components/revisions/DeleteRevisionModal.tsx b/frontend/packages/knative-plugin/src/components/revisions/DeleteRevisionModal.tsx
+index fec64373a2b..631b1c00cf7 100644
+--- a/frontend/packages/knative-plugin/src/components/revisions/DeleteRevisionModal.tsx
++++ b/frontend/packages/knative-plugin/src/components/revisions/DeleteRevisionModal.tsx
+@@ -1,14 +1,9 @@
+ import type { FC } from 'react';
+-import { Alert } from '@patternfly/react-core';
++import { Alert, Button, Form, ModalBody, ModalHeader } from '@patternfly/react-core';
+ import type { FormikProps, FormikValues } from 'formik';
+ import { useTranslation } from 'react-i18next';
+-import {
+-  ModalTitle,
+-  ModalBody,
+-  ModalSubmitFooter,
+-} from '@console/internal/components/factory/modal';
+ import type { K8sResourceKind } from '@console/internal/module/k8s';
+-import { YellowExclamationTriangleIcon } from '@console/shared';
++import { ModalFooterWithAlerts } from '@console/shared/src/components/modals/ModalFooterWithAlerts';
+ import { KNATIVE_SERVING_LABEL } from '../../const';
+ import { RevisionModel } from '../../models';
+ import type { RevisionItems } from '../../utils/traffic-splitting-utils';
+@@ -29,42 +24,52 @@ const DeleteRevisionModal: FC<Props> = (props) => {
+   const serviceName = deleteRevision.metadata.labels[KNATIVE_SERVING_LABEL];
+ 
+   return (
+-    <form className="modal-content" onSubmit={handleSubmit}>
+-      <ModalTitle>
+-        <YellowExclamationTriangleIcon className="co-icon-space-r" />{' '}
+-        {t('knative-plugin~Delete {{revlabel}}?', { revlabel: RevisionModel.label })}
+-      </ModalTitle>
++    <>
++      <ModalHeader
++        title={t('knative-plugin~Delete {{revlabel}}?', { revlabel: RevisionModel.label })}
++        titleIconVariant="warning"
++        labelId="delete-revision-modal-title"
++        data-test-id="modal-title"
++      />
+       <ModalBody>
+-        <p>
+-          {t('knative-plugin~Are you sure you want to delete ')}
+-          <strong className="co-break-word">{deleteRevision.metadata.name}</strong>{' '}
+-          {t('knative-plugin~from ')} <strong className="co-break-word">{serviceName}</strong>{' '}
+-          {t('knative-plugin~in namespace ')} <strong>{deleteRevision.metadata.namespace}</strong>?
+-        </p>
+-        {showTraffic && (
+-          <>
+-            <Alert
+-              isInline
+-              className="co-alert"
+-              variant="custom"
+-              title={t(
+-                'knative-plugin~Update the traffic distribution among the remaining Revisions',
+-              )}
+-            />
+-            <TrafficSplittingFields {...props} />
+-          </>
+-        )}
++        <Form id="delete-revision-form" onSubmit={handleSubmit} className="pf-v6-u-mr-md">
++          <p>
++            {t('knative-plugin~Are you sure you want to delete ')}
++            <strong className="co-break-word">{deleteRevision.metadata.name}</strong>{' '}
++            {t('knative-plugin~from ')} <strong className="co-break-word">{serviceName}</strong>{' '}
++            {t('knative-plugin~in namespace ')} <strong>{deleteRevision.metadata.namespace}</strong>
++            ?
++          </p>
++          {showTraffic && (
++            <>
++              <Alert
++                isInline
++                className="co-alert"
++                variant="custom"
++                title={t(
++                  'knative-plugin~Update the traffic distribution among the remaining Revisions',
++                )}
++              />
++              <TrafficSplittingFields {...props} />
++            </>
++          )}
++        </Form>
+       </ModalBody>
+-      <ModalSubmitFooter
+-        inProgress={isSubmitting}
+-        submitText={t('knative-plugin~Delete')}
+-        cancelText={t('knative-plugin~Cancel')}
+-        cancel={cancel}
+-        errorMessage={status.error}
+-        submitDisabled={isSubmitting}
+-        submitDanger
+-      />
+-    </form>
++      <ModalFooterWithAlerts errorMessage={status.error}>
++        <Button
++          type="submit"
++          variant="danger"
++          isLoading={isSubmitting}
++          isDisabled={isSubmitting}
++          form="delete-revision-form"
++        >
++          {t('knative-plugin~Delete')}
++        </Button>
++        <Button variant="link" onClick={cancel} type="button" data-test-id="modal-cancel-action">
++          {t('knative-plugin~Cancel')}
++        </Button>
++      </ModalFooterWithAlerts>
++    </>
+   );
+ };
+ 
+diff --git a/frontend/packages/knative-plugin/src/components/revisions/DeleteRevisionModalController.tsx b/frontend/packages/knative-plugin/src/components/revisions/DeleteRevisionModalController.tsx
+index 3bbadc1c15f..73c88d56491 100644
+--- a/frontend/packages/knative-plugin/src/components/revisions/DeleteRevisionModalController.tsx
++++ b/frontend/packages/knative-plugin/src/components/revisions/DeleteRevisionModalController.tsx
+@@ -1,6 +1,6 @@
+ import type { FC } from 'react';
+ import { useCallback, useMemo } from 'react';
+-import { ActionGroup, Button } from '@patternfly/react-core';
++import { Button, Modal, ModalBody, ModalFooter, ModalHeader } from '@patternfly/react-core';
+ import type { FormikHelpers, FormikValues } from 'formik';
+ import { Formik } from 'formik';
+ import { useTranslation } from 'react-i18next';
+@@ -8,17 +8,10 @@ import { useNavigate } from 'react-router-dom-v5-compat';
+ import type { OverlayComponent } from '@console/dynamic-plugin-sdk/src/app/modal-support/OverlayProvider';
+ import { useOverlay } from '@console/dynamic-plugin-sdk/src/app/modal-support/useOverlay';
+ import type { ModalComponentProps } from '@console/internal/components/factory';
+-import {
+-  ModalBody,
+-  ModalFooter,
+-  ModalTitle,
+-  ModalWrapper,
+-} from '@console/internal/components/factory';
+ import { resourceListPathFromModel } from '@console/internal/components/utils';
+ import { useK8sWatchResources } from '@console/internal/components/utils/k8s-watch-hook';
+ import type { K8sResourceKind } from '@console/internal/module/k8s';
+ import { k8sKill, k8sPatch, referenceForModel } from '@console/internal/module/k8s';
+-import { RedExclamationCircleIcon } from '@console/shared';
+ import { KNATIVE_SERVING_LABEL } from '../../const';
+ import { ConfigurationModel, RevisionModel, ServiceModel } from '../../models';
+ import { getKnativeRevisionsData } from '../../topology/knative-topology-utils';
+@@ -90,11 +83,15 @@ const DeleteRevisionModalController: FC<DeleteRevisionModalControllerProps> = ({
+ 
+   if (revisions.length === 0) {
+     return (
+-      <form className="modal-content" onSubmit={close}>
+-        <ModalTitle>
+-          <RedExclamationCircleIcon className="co-icon-space-r" />
+-          {t('knative-plugin~Unable to delete {{revlabel}}', { revlabel: RevisionModel.label })}
+-        </ModalTitle>
++      <>
++        <ModalHeader
++          title={t('knative-plugin~Unable to delete {{revlabel}}', {
++            revlabel: RevisionModel.label,
++          })}
++          titleIconVariant="danger"
++          labelId="delete-revision-modal-title"
++          data-test-id="modal-title"
++        />
+         <ModalBody>
+           <p>
+             {t('knative-plugin~You cannot delete the last {{revlabel}} for the {{serviceLabel}}.', {
+@@ -103,19 +100,17 @@ const DeleteRevisionModalController: FC<DeleteRevisionModalControllerProps> = ({
+             })}
+           </p>
+         </ModalBody>
+-        <ModalFooter inProgress={false}>
+-          <ActionGroup className="pf-v6-c-form pf-v6-c-form__actions--right pf-v6-c-form__group--no-top-margin">
+-            <Button
+-              type="button"
+-              variant="secondary"
+-              data-test-id="modal-cancel-action"
+-              onClick={close}
+-            >
+-              {t('knative-plugin~OK')}
+-            </Button>
+-          </ActionGroup>
++        <ModalFooter>
++          <Button
++            type="button"
++            variant="secondary"
++            data-test-id="modal-cancel-action"
++            onClick={close}
++          >
++            {t('knative-plugin~OK')}
++          </Button>
+         </ModalFooter>
+-      </form>
++      </>
+     );
+   }
+ 
+@@ -206,13 +201,18 @@ type Props = DeleteRevisionModalControllerProps & ModalComponentProps;
+ 
+ const DeleteRevisionModalProvider: OverlayComponent<Props> = (props) => {
+   return (
+-    <ModalWrapper blocking onClose={props.closeOverlay}>
++    <Modal
++      isOpen
++      onClose={props.closeOverlay}
++      variant="small"
++      aria-labelledby="delete-revision-modal-title"
++    >
+       <DeleteRevisionModalController
+         cancel={props.closeOverlay}
+         close={props.closeOverlay}
+         {...props}
+       />
+-    </ModalWrapper>
++    </Modal>
+   );
+ };
+ 
+diff --git a/frontend/packages/knative-plugin/src/components/sink-pubsub/SinkPubsubController.tsx b/frontend/packages/knative-plugin/src/components/sink-pubsub/SinkPubsubController.tsx
+index 1804bb0e9e2..19e88322f5a 100644
+--- a/frontend/packages/knative-plugin/src/components/sink-pubsub/SinkPubsubController.tsx
++++ b/frontend/packages/knative-plugin/src/components/sink-pubsub/SinkPubsubController.tsx
+@@ -1,9 +1,9 @@
+ import type { FC } from 'react';
+ import { useCallback } from 'react';
++import { Modal } from '@patternfly/react-core';
+ import type { OverlayComponent } from '@console/dynamic-plugin-sdk/src/app/modal-support/OverlayProvider';
+ import { useOverlay } from '@console/dynamic-plugin-sdk/src/app/modal-support/useOverlay';
+ import type { ModalComponentProps } from '@console/internal/components/factory';
+-import { ModalWrapper } from '@console/internal/components/factory';
+ import type { K8sResourceKind } from '@console/internal/module/k8s';
+ import SinkPubsub from './SinkPubsub';
+ 
+@@ -18,13 +18,16 @@ const SinkPubsubController: FC<SinkPubsubControllerProps> = ({ source, ...props
+ 
+ type Props = SinkPubsubControllerProps & ModalComponentProps;
+ 
+-const SinkPubsubModalProvider: OverlayComponent<Props> = (props) => {
+-  return (
+-    <ModalWrapper blocking onClose={props.closeOverlay}>
+-      <SinkPubsubController cancel={props.closeOverlay} close={props.closeOverlay} {...props} />
+-    </ModalWrapper>
+-  );
+-};
++const SinkPubsubModalProvider: OverlayComponent<Props> = (props) => (
++  <Modal
++    isOpen
++    onClose={props.closeOverlay}
++    variant="small"
++    aria-labelledby="sink-pubsub-modal-title"
++  >
++    <SinkPubsubController cancel={props.closeOverlay} close={props.closeOverlay} {...props} />
++  </Modal>
++);
+ 
+ export const useSinkPubsubModalLauncher = (props: Props) => {
+   const launcher = useOverlay();
+diff --git a/frontend/packages/knative-plugin/src/components/sink-pubsub/SinkPubsubModal.tsx b/frontend/packages/knative-plugin/src/components/sink-pubsub/SinkPubsubModal.tsx
+index c73e49ced82..7d535692529 100644
+--- a/frontend/packages/knative-plugin/src/components/sink-pubsub/SinkPubsubModal.tsx
++++ b/frontend/packages/knative-plugin/src/components/sink-pubsub/SinkPubsubModal.tsx
+@@ -1,16 +1,13 @@
+ import type { FC } from 'react';
+ import { useCallback } from 'react';
++import { Button, Form, ModalBody, ModalHeader } from '@patternfly/react-core';
+ import type { FormikProps, FormikValues } from 'formik';
+ import * as fuzzy from 'fuzzysearch';
+ import { Trans, useTranslation } from 'react-i18next';
+ import FormSection from '@console/dev-console/src/components/import/section/FormSection';
+-import {
+-  ModalTitle,
+-  ModalBody,
+-  ModalSubmitFooter,
+-} from '@console/internal/components/factory/modal';
+ import type { FirehoseResource } from '@console/internal/components/utils';
+ import { ResourceDropdownField } from '@console/shared';
++import { ModalFooterWithAlerts } from '@console/shared/src/components/modals/ModalFooterWithAlerts';
+ import { craftResourceKey } from '../pub-sub/pub-sub-utils';
+ 
+ export interface SinkPubsubModalProps {
+@@ -60,40 +57,56 @@ const SinkPubsubModal: FC<Props> = ({
+   const dirty = values?.ref?.name !== initialValues.ref.name;
+ 
+   return (
+-    <form className="modal-content" onSubmit={handleSubmit}>
+-      <ModalTitle>{labelTitle}</ModalTitle>
++    <>
++      <ModalHeader
++        title={labelTitle}
++        labelId="sink-pubsub-modal-title"
++        data-test-id="modal-title"
++      />
+       <ModalBody>
+-        <p>
+-          <Trans t={t} ns="knative-plugin" i18nKey="Connects <strong>{{resourceName}}</strong> to">
+-            Connects <strong>{{ resourceName }}</strong> to
+-          </Trans>
+-        </p>
+-        <FormSection fullWidth>
+-          <ResourceDropdownField
+-            name="ref.name"
+-            resources={resourceDropdown}
+-            dataSelector={['metadata', 'name']}
+-            fullWidth
+-            required
+-            placeholder={t('knative-plugin~Select a sink')}
+-            showBadge
+-            autocompleteFilter={autocompleteFilter}
+-            customResourceKey={craftResourceKey}
+-            onChange={onSinkChange}
+-            autoSelect
+-            selectedKey={values?.ref?.name}
+-          />
+-        </FormSection>
++        <Form id="sink-pubsub-form" onSubmit={handleSubmit} className="pf-v6-u-mr-md">
++          <p>
++            <Trans
++              t={t}
++              ns="knative-plugin"
++              i18nKey="Connects <strong>{{resourceName}}</strong> to"
++            >
++              Connects <strong>{{ resourceName }}</strong> to
++            </Trans>
++          </p>
++          <FormSection fullWidth>
++            <ResourceDropdownField
++              name="ref.name"
++              resources={resourceDropdown}
++              dataSelector={['metadata', 'name']}
++              fullWidth
++              required
++              placeholder={t('knative-plugin~Select a sink')}
++              showBadge
++              autocompleteFilter={autocompleteFilter}
++              customResourceKey={craftResourceKey}
++              onChange={onSinkChange}
++              autoSelect
++              selectedKey={values?.ref?.name}
++            />
++          </FormSection>
++        </Form>
+       </ModalBody>
+-      <ModalSubmitFooter
+-        inProgress={isSubmitting}
+-        submitText={t('knative-plugin~Save')}
+-        cancelText={t('knative-plugin~Cancel')}
+-        submitDisabled={!dirty}
+-        cancel={cancel}
+-        errorMessage={status.error}
+-      />
+-    </form>
++      <ModalFooterWithAlerts errorMessage={status.error}>
++        <Button
++          type="submit"
++          variant="primary"
++          isLoading={isSubmitting}
++          isDisabled={!dirty}
++          form="sink-pubsub-form"
++        >
++          {t('knative-plugin~Save')}
++        </Button>
++        <Button variant="link" onClick={cancel} type="button" data-test-id="modal-cancel-action">
++          {t('knative-plugin~Cancel')}
++        </Button>
++      </ModalFooterWithAlerts>
++    </>
+   );
+ };
+ 
+diff --git a/frontend/packages/knative-plugin/src/components/sink-pubsub/__tests__/SinkPubsubModal.spec.tsx b/frontend/packages/knative-plugin/src/components/sink-pubsub/__tests__/SinkPubsubModal.spec.tsx
+index 0606431ae8c..ecb21b34faa 100644
+--- a/frontend/packages/knative-plugin/src/components/sink-pubsub/__tests__/SinkPubsubModal.spec.tsx
++++ b/frontend/packages/knative-plugin/src/components/sink-pubsub/__tests__/SinkPubsubModal.spec.tsx
+@@ -1,10 +1,16 @@
+ import { render } from '@testing-library/react';
+ import SinkPubsubModal from '../SinkPubsubModal';
+ 
+-jest.mock('@console/internal/components/factory/modal', () => ({
+-  ModalTitle: jest.fn(() => null),
+-  ModalBody: jest.fn(() => null),
+-  ModalSubmitFooter: jest.fn(() => null),
++jest.mock('@patternfly/react-core', () => ({
++  ...jest.requireActual('@patternfly/react-core'),
++  ModalHeader: jest.fn(() => null),
++  ModalBody: jest.fn(({ children }) => <div>{children}</div>),
++  Button: jest.fn(() => null),
++  Form: jest.fn(({ children, ...props }) => <form {...props}>{children}</form>),
++}));
++
++jest.mock('@console/shared/src/components/modals/ModalFooterWithAlerts', () => ({
++  ModalFooterWithAlerts: jest.fn(({ children }) => <div>{children}</div>),
+ }));
+ 
+ jest.mock('@console/shared', () => ({
+diff --git a/frontend/packages/knative-plugin/src/components/sink-source/SinkSourceController.tsx b/frontend/packages/knative-plugin/src/components/sink-source/SinkSourceController.tsx
+index c8389234bf5..b3a00ea1e19 100644
+--- a/frontend/packages/knative-plugin/src/components/sink-source/SinkSourceController.tsx
++++ b/frontend/packages/knative-plugin/src/components/sink-source/SinkSourceController.tsx
+@@ -1,9 +1,9 @@
+ import type { FC } from 'react';
+ import { useCallback } from 'react';
++import { Modal } from '@patternfly/react-core';
+ import type { OverlayComponent } from '@console/dynamic-plugin-sdk/src/app/modal-support/OverlayProvider';
+ import { useOverlay } from '@console/dynamic-plugin-sdk/src/app/modal-support/useOverlay';
+ import type { ModalComponentProps } from '@console/internal/components/factory';
+-import { ModalWrapper } from '@console/internal/components/factory';
+ import type { K8sResourceKind } from '@console/internal/module/k8s';
+ import SinkSource from './SinkSource';
+ 
+@@ -17,13 +17,16 @@ const SinkSourceController: FC<SinkSourceControllerProps> = ({ source, ...props
+ 
+ type Props = SinkSourceControllerProps & ModalComponentProps;
+ 
+-const SinkSourceModalProvider: OverlayComponent<Props> = (props) => {
+-  return (
+-    <ModalWrapper blocking onClose={props.closeOverlay}>
+-      <SinkSourceController cancel={props.closeOverlay} close={props.closeOverlay} {...props} />
+-    </ModalWrapper>
+-  );
+-};
++const SinkSourceModalProvider: OverlayComponent<Props> = (props) => (
++  <Modal
++    isOpen
++    onClose={props.closeOverlay}
++    variant="small"
++    aria-labelledby="sink-source-modal-title"
++  >
++    <SinkSourceController cancel={props.closeOverlay} close={props.closeOverlay} {...props} />
++  </Modal>
++);
+ 
+ export const useSinkSourceModalLauncher = (props: Props) => {
+   const launcher = useOverlay();
+diff --git a/frontend/packages/knative-plugin/src/components/sink-source/SinkSourceModal.tsx b/frontend/packages/knative-plugin/src/components/sink-source/SinkSourceModal.tsx
+index fef4bdc3438..26a1bc90e49 100644
+--- a/frontend/packages/knative-plugin/src/components/sink-source/SinkSourceModal.tsx
++++ b/frontend/packages/knative-plugin/src/components/sink-source/SinkSourceModal.tsx
+@@ -1,13 +1,10 @@
+ import type { FC } from 'react';
++import { Button, Form, ModalBody, ModalHeader } from '@patternfly/react-core';
+ import type { FormikProps, FormikValues } from 'formik';
+ import * as _ from 'lodash';
+ import { Trans, useTranslation } from 'react-i18next';
+ import FormSection from '@console/dev-console/src/components/import/section/FormSection';
+-import {
+-  ModalTitle,
+-  ModalBody,
+-  ModalSubmitFooter,
+-} from '@console/internal/components/factory/modal';
++import { ModalFooterWithAlerts } from '@console/shared/src/components/modals/ModalFooterWithAlerts';
+ import SinkUriResourcesGroup from '../add/event-sources/form-fields/SinkUriResourcesGroup';
+ 
+ export interface SinkSourceModalProps {
+@@ -35,27 +32,43 @@ const SinkSourceModal: FC<Props> = ({
+     values?.formData?.sink?.uri !== initialValues.formData.sink.uri;
+ 
+   return (
+-    <form className="modal-content" onSubmit={handleSubmit}>
+-      <ModalTitle>{t('knative-plugin~Move sink')}</ModalTitle>
++    <>
++      <ModalHeader
++        title={t('knative-plugin~Move sink')}
++        labelId="sink-source-modal-title"
++        data-test-id="modal-title"
++      />
+       <ModalBody>
+-        <p>
+-          <Trans t={t} ns="knative-plugin" i18nKey="Connects <strong>{{resourceName}}</strong> to">
+-            Connects <strong>{{ resourceName }}</strong> to
+-          </Trans>
+-        </p>
+-        <FormSection fullWidth>
+-          <SinkUriResourcesGroup namespace={namespace} isMoveSink />
+-        </FormSection>
++        <Form id="sink-source-form" onSubmit={handleSubmit} className="pf-v6-u-mr-md">
++          <p>
++            <Trans
++              t={t}
++              ns="knative-plugin"
++              i18nKey="Connects <strong>{{resourceName}}</strong> to"
++            >
++              Connects <strong>{{ resourceName }}</strong> to
++            </Trans>
++          </p>
++          <FormSection fullWidth>
++            <SinkUriResourcesGroup namespace={namespace} isMoveSink />
++          </FormSection>
++        </Form>
+       </ModalBody>
+-      <ModalSubmitFooter
+-        inProgress={isSubmitting}
+-        submitText={t('knative-plugin~Save')}
+-        submitDisabled={!dirty || !_.isEmpty(errors)}
+-        cancelText={t('knative-plugin~Cancel')}
+-        cancel={cancel}
+-        errorMessage={status.error}
+-      />
+-    </form>
++      <ModalFooterWithAlerts errorMessage={status.error}>
++        <Button
++          type="submit"
++          variant="primary"
++          isLoading={isSubmitting}
++          isDisabled={!dirty || !_.isEmpty(errors)}
++          form="sink-source-form"
++        >
++          {t('knative-plugin~Save')}
++        </Button>
++        <Button variant="link" onClick={cancel} type="button" data-test-id="modal-cancel-action">
++          {t('knative-plugin~Cancel')}
++        </Button>
++      </ModalFooterWithAlerts>
++    </>
+   );
+ };
+ 
+diff --git a/frontend/packages/knative-plugin/src/components/sink-source/__tests__/SinkSourceModal.spec.tsx b/frontend/packages/knative-plugin/src/components/sink-source/__tests__/SinkSourceModal.spec.tsx
+index 0c75359b358..b055f64e6c6 100644
+--- a/frontend/packages/knative-plugin/src/components/sink-source/__tests__/SinkSourceModal.spec.tsx
++++ b/frontend/packages/knative-plugin/src/components/sink-source/__tests__/SinkSourceModal.spec.tsx
+@@ -4,10 +4,16 @@ import { formikFormProps } from '@console/shared/src/test-utils/formik-props-uti
+ import { ServiceModel } from '../../../models';
+ import SinkSourceModal from '../SinkSourceModal';
+ 
+-jest.mock('@console/internal/components/factory/modal', () => ({
+-  ModalTitle: jest.fn(() => null),
+-  ModalBody: jest.fn(() => null),
+-  ModalSubmitFooter: jest.fn(() => null),
++jest.mock('@patternfly/react-core', () => ({
++  ...jest.requireActual('@patternfly/react-core'),
++  ModalHeader: jest.fn(() => null),
++  ModalBody: jest.fn(({ children }) => <div>{children}</div>),
++  Button: jest.fn(() => null),
++  Form: jest.fn(({ children, ...props }) => <form {...props}>{children}</form>),
++}));
++
++jest.mock('@console/shared/src/components/modals/ModalFooterWithAlerts', () => ({
++  ModalFooterWithAlerts: jest.fn(({ children }) => <div>{children}</div>),
+ }));
+ 
+ jest.mock('../../add/event-sources/form-fields/SinkUriResourcesGroup', () => ({
+@@ -52,10 +58,11 @@ describe('SinkSourceModal Form', () => {
+     };
+   });
+ 
+-  it('should render form with modal structure', () => {
++  it('should render form with id', () => {
+     const { container } = render(<SinkSourceModal {...formProps} />);
+-    expect(container.querySelector('form')).toBeInTheDocument();
+-    expect(container.querySelector('form')).toHaveClass('modal-content');
++    const form = container.querySelector('form');
++    expect(form).toBeInTheDocument();
++    expect(form).toHaveAttribute('id', 'sink-source-form');
+   });
+ 
+   it('should call handleSubmit on form submit', () => {
+diff --git a/frontend/packages/knative-plugin/src/components/sink-uri/SinkUriController.tsx b/frontend/packages/knative-plugin/src/components/sink-uri/SinkUriController.tsx
+index e1cdb949d12..e3007020c1d 100644
+--- a/frontend/packages/knative-plugin/src/components/sink-uri/SinkUriController.tsx
++++ b/frontend/packages/knative-plugin/src/components/sink-uri/SinkUriController.tsx
+@@ -1,9 +1,9 @@
+ import type { FC } from 'react';
+ import { useCallback } from 'react';
++import { Modal } from '@patternfly/react-core';
+ import type { OverlayComponent } from '@console/dynamic-plugin-sdk/src/app/modal-support/OverlayProvider';
+ import { useOverlay } from '@console/dynamic-plugin-sdk/src/app/modal-support/useOverlay';
+ import type { ModalComponentProps } from '@console/internal/components/factory';
+-import { ModalWrapper } from '@console/internal/components/factory';
+ import type { K8sResourceKind } from '@console/internal/module/k8s';
+ import SinkUri from './SinkUri';
+ 
+@@ -20,9 +20,14 @@ type Props = SinkUriControllerProps & ModalComponentProps;
+ 
+ const SinkUriModalProvider: OverlayComponent<Props> = (props) => {
+   return (
+-    <ModalWrapper blocking onClose={props.closeOverlay}>
++    <Modal
++      isOpen
++      onClose={props.closeOverlay}
++      variant="small"
++      aria-labelledby="sink-uri-modal-title"
++    >
+       <SinkUriController cancel={props.closeOverlay} close={props.closeOverlay} {...props} />
+-    </ModalWrapper>
++    </Modal>
+   );
+ };
+ 
+diff --git a/frontend/packages/knative-plugin/src/components/sink-uri/SinkUriModal.tsx b/frontend/packages/knative-plugin/src/components/sink-uri/SinkUriModal.tsx
+index 7b860a0334b..67d83b8ed05 100644
+--- a/frontend/packages/knative-plugin/src/components/sink-uri/SinkUriModal.tsx
++++ b/frontend/packages/knative-plugin/src/components/sink-uri/SinkUriModal.tsx
+@@ -1,21 +1,20 @@
+ import type { FC } from 'react';
+ import {
++  Button,
+   Form,
+   FormGroup,
+   FormHelperText,
+   HelperText,
+   HelperTextItem,
++  ModalBody,
++  ModalHeader,
+   TextInputTypes,
+ } from '@patternfly/react-core';
+ import type { FormikProps, FormikValues } from 'formik';
+ import { useTranslation } from 'react-i18next';
+ import FormSection from '@console/dev-console/src/components/import/section/FormSection';
+-import {
+-  ModalTitle,
+-  ModalBody,
+-  ModalSubmitFooter,
+-} from '@console/internal/components/factory/modal';
+ import { InputField, getFieldId } from '@console/shared';
++import { ModalFooterWithAlerts } from '@console/shared/src/components/modals/ModalFooterWithAlerts';
+ 
+ export interface SinkUriModalProps {
+   cancel?: () => void;
+@@ -35,10 +34,14 @@ const SinkUriModal: FC<Props> = ({
+   const fieldId = getFieldId('sink-name', 'uri');
+   const dirty = values?.uri !== initialValues.uri;
+   return (
+-    <Form onSubmit={handleSubmit}>
+-      <div className="modal-content">
+-        <ModalTitle>{t('knative-plugin~Edit URI')}</ModalTitle>
+-        <ModalBody>
++    <>
++      <ModalHeader
++        title={t('knative-plugin~Edit URI')}
++        labelId="sink-uri-modal-title"
++        data-test-id="modal-title"
++      />
++      <ModalBody>
++        <Form id="sink-uri-form" onSubmit={handleSubmit} className="pf-v6-u-mr-md">
+           <FormSection fullWidth>
+             <FormGroup fieldId={fieldId} isRequired>
+               <InputField
+@@ -58,17 +61,23 @@ const SinkUriModal: FC<Props> = ({
+               </FormHelperText>
+             </FormGroup>
+           </FormSection>
+-        </ModalBody>
+-        <ModalSubmitFooter
+-          inProgress={isSubmitting}
+-          submitText={t('knative-plugin~Save')}
+-          submitDisabled={!dirty}
+-          cancelText={t('knative-plugin~Cancel')}
+-          cancel={cancel}
+-          errorMessage={status.error}
+-        />
+-      </div>
+-    </Form>
++        </Form>
++      </ModalBody>
++      <ModalFooterWithAlerts errorMessage={status.error}>
++        <Button
++          type="submit"
++          variant="primary"
++          isLoading={isSubmitting}
++          isDisabled={!dirty}
++          form="sink-uri-form"
++        >
++          {t('knative-plugin~Save')}
++        </Button>
++        <Button variant="link" onClick={cancel} type="button" data-test-id="modal-cancel-action">
++          {t('knative-plugin~Cancel')}
++        </Button>
++      </ModalFooterWithAlerts>
++    </>
+   );
+ };
+ 
+diff --git a/frontend/packages/knative-plugin/src/components/sink-uri/__tests__/SinkUriModal.spec.tsx b/frontend/packages/knative-plugin/src/components/sink-uri/__tests__/SinkUriModal.spec.tsx
+index 9019a17deec..dd7dc2051fc 100644
+--- a/frontend/packages/knative-plugin/src/components/sink-uri/__tests__/SinkUriModal.spec.tsx
++++ b/frontend/packages/knative-plugin/src/components/sink-uri/__tests__/SinkUriModal.spec.tsx
+@@ -3,10 +3,24 @@ import { render } from '@testing-library/react';
+ import { formikFormProps } from '@console/shared/src/test-utils/formik-props-utils';
+ import SinkUriModal from '../SinkUriModal';
+ 
+-jest.mock('@console/internal/components/factory/modal', () => ({
+-  ModalTitle: jest.fn(() => null),
+-  ModalBody: jest.fn(() => null),
+-  ModalSubmitFooter: jest.fn(() => null),
++jest.mock('@patternfly/react-core', () => ({
++  ...jest.requireActual('@patternfly/react-core'),
++  ModalHeader: jest.fn(() => null),
++  ModalBody: jest.fn(({ children }) => <div>{children}</div>),
++  Button: jest.fn(() => null),
++  Form: jest.fn(({ children, ...props }) => <form {...props}>{children}</form>),
++  FormGroup: jest.fn(({ children }) => <div>{children}</div>),
++  FormHelperText: jest.fn(() => null),
++  HelperText: jest.fn(() => null),
++  HelperTextItem: jest.fn(() => null),
++  TextInputTypes: {
++    text: 'text',
++    url: 'url',
++  },
++}));
++
++jest.mock('@console/shared/src/components/modals/ModalFooterWithAlerts', () => ({
++  ModalFooterWithAlerts: jest.fn(({ children }) => <div>{children}</div>),
+ }));
+ 
+ jest.mock('@console/shared', () => ({
+@@ -19,17 +33,6 @@ jest.mock('@console/dev-console/src/components/import/section/FormSection', () =
+   default: jest.fn(() => null),
+ }));
+ 
+-jest.mock('@patternfly/react-core', () => ({
+-  Form: jest.fn(() => null),
+-  FormGroup: jest.fn(() => null),
+-  FormHelperText: jest.fn(() => null),
+-  HelperText: jest.fn(() => null),
+-  HelperTextItem: jest.fn(() => null),
+-  TextInputTypes: {
+-    url: 'url',
+-  },
+-}));
+-
+ jest.mock('react-i18next', () => ({
+   useTranslation: () => ({
+     t: (key: string) => key,
+diff --git a/frontend/packages/knative-plugin/src/components/test-function/RequestPane.tsx b/frontend/packages/knative-plugin/src/components/test-function/RequestPane.tsx
+index aa330072299..e1693d558b2 100644
+--- a/frontend/packages/knative-plugin/src/components/test-function/RequestPane.tsx
++++ b/frontend/packages/knative-plugin/src/components/test-function/RequestPane.tsx
+@@ -87,58 +87,56 @@ const RequestPane: FC<FormikProps<FormikValues>> = ({ setFieldValue, values }) =
+           required
+         />
+       </FormLayout>
+-      <div className="kn-test-sf-modal-request__advanced-settings">
+-        <ExpandableSection
+-          toggleText={t('knative-plugin~Advanced Settings')}
+-          onToggle={onToggle}
+-          isExpanded={isExpanded}
+-          data-test="advanced-settings"
+-        >
+-          <FormLayout>
+-            <InputField
+-              type={TextInputTypes.text}
+-              name={`request.type`}
+-              label={t('knative-plugin~Type')}
+-              data-test="request-type"
+-              placeholder="boson.fn"
+-            />
+-            <InputField
+-              type={TextInputTypes.text}
+-              name={`request.source`}
+-              label={t('knative-plugin~Source')}
+-              data-test="request-source"
+-              placeholder="/boson/fn"
+-            />
+-          </FormLayout>
++      <ExpandableSection
++        toggleText={t('knative-plugin~Advanced Settings')}
++        onToggle={onToggle}
++        isExpanded={isExpanded}
++        data-test="advanced-settings"
++      >
++        <FormLayout>
++          <InputField
++            type={TextInputTypes.text}
++            name={`request.type`}
++            label={t('knative-plugin~Type')}
++            data-test="request-type"
++            placeholder="boson.fn"
++          />
++          <InputField
++            type={TextInputTypes.text}
++            name={`request.source`}
++            label={t('knative-plugin~Source')}
++            data-test="request-source"
++            placeholder="/boson/fn"
++          />
++        </FormLayout>
+ 
+-          <div className="kn-test-sf-modal-request__custom-headers">
+-            {showCustomHeaders || !checkCustomHeadersIsEmpty() ? (
+-              <NameValueEditorComponent
+-                nameValuePairs={customHeaders}
+-                nameString={t('knative-plugin~Name')}
+-                valueString={t('knative-plugin~Value')}
+-                addString={t('knative-plugin~Add headers')}
+-                readOnly={false}
+-                allowSorting={false}
+-                updateParentData={handleNameValuePairs}
+-              />
+-            ) : (
+-              <Button
+-                icon={
+-                  <PlusCircleIcon data-test-id="pairs-list__add-icon" className="co-icon-space-r" />
+-                }
+-                className="pf-m-link--align-left"
+-                data-test="add-optional-header"
+-                onClick={() => setShowCustomHeaders(true)}
+-                type="button"
+-                variant="link"
+-              >
+-                {t('knative-plugin~Add optional headers')}
+-              </Button>
+-            )}
+-          </div>
+-        </ExpandableSection>
+-      </div>
++        <div className="kn-test-sf-modal-request__custom-headers">
++          {showCustomHeaders || !checkCustomHeadersIsEmpty() ? (
++            <NameValueEditorComponent
++              nameValuePairs={customHeaders}
++              nameString={t('knative-plugin~Name')}
++              valueString={t('knative-plugin~Value')}
++              addString={t('knative-plugin~Add headers')}
++              readOnly={false}
++              allowSorting={false}
++              updateParentData={handleNameValuePairs}
++            />
++          ) : (
++            <Button
++              icon={
++                <PlusCircleIcon data-test-id="pairs-list__add-icon" className="co-icon-space-r" />
++              }
++              className="pf-m-link--align-left"
++              data-test="add-optional-header"
++              onClick={() => setShowCustomHeaders(true)}
++              type="button"
++              variant="link"
++            >
++              {t('knative-plugin~Add optional headers')}
++            </Button>
++          )}
++        </div>
++      </ExpandableSection>
+       <div className="kn-test-sf-modal__editor">
+         <CodeEditorField
+           name="request.body.data"
+diff --git a/frontend/packages/knative-plugin/src/components/test-function/TestFunction.tsx b/frontend/packages/knative-plugin/src/components/test-function/TestFunction.tsx
+index b2ac4c3e3db..b18639e6a0d 100644
+--- a/frontend/packages/knative-plugin/src/components/test-function/TestFunction.tsx
++++ b/frontend/packages/knative-plugin/src/components/test-function/TestFunction.tsx
+@@ -15,8 +15,8 @@ export interface TestFunctionProps {
+ }
+ 
+ const TestFunction: FC<TestFunctionProps> = ({ service, cancel, close }) => {
+-  const svcName = service.data.metadata.name;
+-  const svcNamespace = service.data.metadata.namespace;
++  const svcName = service.metadata.name;
++  const svcNamespace = service.metadata.namespace;
+   const initialValues: TestFunctionFormikValues = {
+     request: {
+       format: InvokeFormat.CloudEvent,
+diff --git a/frontend/packages/knative-plugin/src/components/test-function/TestFunctionController.tsx b/frontend/packages/knative-plugin/src/components/test-function/TestFunctionController.tsx
+index a7b57f331e0..1a5d4829be4 100644
+--- a/frontend/packages/knative-plugin/src/components/test-function/TestFunctionController.tsx
++++ b/frontend/packages/knative-plugin/src/components/test-function/TestFunctionController.tsx
+@@ -1,9 +1,9 @@
+ import type { FC } from 'react';
+ import { useCallback } from 'react';
++import { Modal } from '@patternfly/react-core';
+ import type { OverlayComponent } from '@console/dynamic-plugin-sdk/src/app/modal-support/OverlayProvider';
+ import { useOverlay } from '@console/dynamic-plugin-sdk/src/app/modal-support/useOverlay';
+ import type { ModalComponentProps } from '@console/internal/components/factory';
+-import { ModalWrapper } from '@console/internal/components/factory';
+ import { useK8sWatchResource } from '@console/internal/components/utils/k8s-watch-hook';
+ import { referenceForModel } from '@console/internal/module/k8s';
+ import { ServiceModel } from '../../models';
+@@ -39,9 +39,14 @@ type Props = TestFunctionControllerProps & ModalComponentProps;
+ 
+ const TestFunctionModalProvider: OverlayComponent<Props> = (props) => {
+   return (
+-    <ModalWrapper blocking onClose={props.closeOverlay}>
++    <Modal
++      isOpen
++      onClose={props.closeOverlay}
++      variant="small"
++      aria-labelledby="test-function-modal-title"
++    >
+       <TestFunctionController cancel={props.closeOverlay} close={props.closeOverlay} {...props} />
+-    </ModalWrapper>
++    </Modal>
+   );
+ };
+ 
+diff --git a/frontend/packages/knative-plugin/src/components/test-function/TestFunctionModal.scss b/frontend/packages/knative-plugin/src/components/test-function/TestFunctionModal.scss
+index 4581d3c734a..46423b057a8 100644
+--- a/frontend/packages/knative-plugin/src/components/test-function/TestFunctionModal.scss
++++ b/frontend/packages/knative-plugin/src/components/test-function/TestFunctionModal.scss
+@@ -13,12 +13,6 @@
+   padding-bottom: var(--pf-t--global--spacer--md);
+ }
+ 
+-.kn-test-sf-modal {
+-  &__body {
+-    padding-bottom: var(--pf-t--global--font--size--3xl);
+-  }
+-}
+-
+ .kn-test-sf-modal__editor {
+   @media screen and (max-width: 768px) {
+     margin-top: var(--pf-t--global--font--size--4xl);
+@@ -27,14 +21,8 @@
+   }
+ }
+ 
+-.kn-test-sf-modal-request {
+-  &__advanced-settings {
+-    margin-top: var(--pf-t--global--spacer--md);
+-    margin-bottom: var(--pf-t--global--spacer--md);
+-  }
+-  &__custom-headers {
+-    margin-top: var(--pf-t--global--spacer--xl);
+-  }
++.kn-test-sf-modal-request__custom-headers {
++  margin-top: var(--pf-t--global--spacer--xl);
+ }
+ 
+ .kn-test-sf-modal-response {
+@@ -53,7 +41,8 @@
+ 
+ .header-section {
+   color: var(--pf-t--global--text--color--regular);
+-  border: var(--pf-t--global--border--width--divider--default) solid var(--pf-t--global--border--color--default);
++  border: var(--pf-t--global--border--width--divider--default) solid
++    var(--pf-t--global--border--color--default);
+   padding: var(--pf-t--global--spacer--md);
+ }
+ 
+diff --git a/frontend/packages/knative-plugin/src/components/test-function/TestFunctionModal.tsx b/frontend/packages/knative-plugin/src/components/test-function/TestFunctionModal.tsx
+index 063d2552932..9579757d64f 100644
+--- a/frontend/packages/knative-plugin/src/components/test-function/TestFunctionModal.tsx
++++ b/frontend/packages/knative-plugin/src/components/test-function/TestFunctionModal.tsx
+@@ -1,7 +1,6 @@
+ import type { FC } from 'react';
+ import { useState } from 'react';
+-import { Button, Title, TitleSizes } from '@patternfly/react-core';
+-import { Modal, ModalVariant } from '@patternfly/react-core/deprecated';
++import { Button, Form, ModalHeader, ModalBody, ModalFooter } from '@patternfly/react-core';
+ import type { FormikProps, FormikValues } from 'formik';
+ import { useTranslation } from 'react-i18next';
+ import type { ModalComponentProps } from '@console/internal/components/factory/modal';
+@@ -23,79 +22,83 @@ const TestFunctionModal: FC<Props> = (props) => {
+   const { t } = useTranslation();
+   const { handleSubmit, cancel, close, isSubmitting } = props;
+   const [currentView, setCurrentView] = useState(ModalPanel.Request);
+-  const header = (
+-    <>
+-      <Title id="modal-custom-header-label" headingLevel="h1" size={TitleSizes['2xl']}>
+-        {t(`knative-plugin~Test Serverless Function`)}
+-      </Title>
+-    </>
+-  );
+ 
+-  const footer = (
++  return (
+     <>
+-      {currentView === ModalPanel.Request ? (
+-        <form
+-          onSubmit={() => {
+-            handleSubmit();
++      <ModalHeader
++        title={t('knative-plugin~Test Serverless Function')}
++        labelId="test-function-modal-title"
++        data-test-id="modal-title"
++      />
++      <ModalBody className="kn-test-sf-modal" data-test="test-serverless-function">
++        <Form
++          id="test-function-form"
++          onSubmit={(e) => {
++            e.preventDefault();
++            handleSubmit(e);
+             setCurrentView(ModalPanel.Response);
+           }}
++          className="pf-v6-u-mr-md"
+         >
+-          <Button type="submit" variant="primary" data-test="test-action" isDisabled={isSubmitting}>
+-            {t('knative-plugin~Test')}
+-          </Button>
+-          &nbsp; &nbsp;
+-          <Button type="button" variant="link" data-test="cancel-action" onClick={cancel}>
+-            {t('knative-plugin~Cancel')}
+-          </Button>
+-        </form>
+-      ) : (
+-        <>
+-          <Button
+-            type="button"
+-            variant="primary"
+-            data-test="back-action"
+-            onClick={() => {
+-              clearResponseValues(props);
+-              setCurrentView(ModalPanel.Request);
+-            }}
+-          >
+-            {t('knative-plugin~Back')}
+-          </Button>
+-          &nbsp;
+-          <Button
+-            type="button"
+-            variant="link"
+-            data-test="close-action"
+-            onClick={() => {
+-              clearResponseValues(props);
+-              close();
+-            }}
+-          >
+-            {t('knative-plugin~Close')}
+-          </Button>
+-        </>
+-      )}
+-    </>
+-  );
+-
+-  return (
+-    <Modal
+-      variant={ModalVariant.small}
+-      isOpen
+-      header={header}
+-      className="kn-test-sf-modal"
+-      onClose={close}
+-      footer={footer}
+-      data-test="test-serverless-function"
+-    >
+-      <div className="kn-test-sf-modal__body">
++          <>
++            {currentView === ModalPanel.Request ? (
++              <RequestPane {...props} />
++            ) : (
++              <ResponsePane {...props} />
++            )}
++          </>
++        </Form>
++      </ModalBody>
++      <ModalFooter>
+         {currentView === ModalPanel.Request ? (
+-          <RequestPane {...props} />
++          <>
++            <Button
++              type="submit"
++              variant="primary"
++              data-test="test-action"
++              isDisabled={isSubmitting}
++              form="test-function-form"
++            >
++              {t('knative-plugin~Test')}
++            </Button>
++            <Button
++              type="button"
++              variant="link"
++              data-test="cancel-action"
++              data-test-id="modal-cancel-action"
++              onClick={cancel}
++            >
++              {t('knative-plugin~Cancel')}
++            </Button>
++          </>
+         ) : (
+-          <ResponsePane {...props} />
++          <>
++            <Button
++              type="button"
++              variant="primary"
++              data-test="back-action"
++              onClick={() => {
++                clearResponseValues(props);
++                setCurrentView(ModalPanel.Request);
++              }}
++            >
++              {t('knative-plugin~Back')}
++            </Button>
++            <Button
++              type="button"
++              variant="link"
++              data-test="close-action"
++              onClick={() => {
++                clearResponseValues(props);
++                close();
++              }}
++            >
++              {t('knative-plugin~Close')}
++            </Button>
++          </>
+         )}
+-      </div>
+-    </Modal>
++      </ModalFooter>
++    </>
+   );
+ };
+ 
+diff --git a/frontend/packages/knative-plugin/src/components/traffic-splitting/TrafficSplittingController.tsx b/frontend/packages/knative-plugin/src/components/traffic-splitting/TrafficSplittingController.tsx
+index 7ebd1ab9a13..752026092b7 100644
+--- a/frontend/packages/knative-plugin/src/components/traffic-splitting/TrafficSplittingController.tsx
++++ b/frontend/packages/knative-plugin/src/components/traffic-splitting/TrafficSplittingController.tsx
+@@ -1,9 +1,9 @@
+ import type { FC } from 'react';
+ import { useCallback, useMemo } from 'react';
++import { Modal } from '@patternfly/react-core';
+ import type { OverlayComponent } from '@console/dynamic-plugin-sdk/src/app/modal-support/OverlayProvider';
+ import { useOverlay } from '@console/dynamic-plugin-sdk/src/app/modal-support/useOverlay';
+ import type { ModalComponentProps } from '@console/internal/components/factory';
+-import { ModalWrapper } from '@console/internal/components/factory';
+ import { useK8sWatchResources } from '@console/internal/components/utils/k8s-watch-hook';
+ import type { K8sResourceKind } from '@console/internal/module/k8s';
+ import { referenceForModel } from '@console/internal/module/k8s';
+@@ -56,13 +56,18 @@ type Props = TrafficSplittingControllerProps & ModalComponentProps;
+ 
+ const TrafficSplittingModalProvider: OverlayComponent<Props> = (props) => {
+   return (
+-    <ModalWrapper blocking onClose={props.closeOverlay}>
++    <Modal
++      isOpen
++      onClose={props.closeOverlay}
++      variant="small"
++      aria-labelledby="traffic-splitting-modal-title"
++    >
+       <TrafficSplittingController
+         cancel={props.closeOverlay}
+         close={props.closeOverlay}
+         {...props}
+       />
+-    </ModalWrapper>
++    </Modal>
+   );
+ };
+ 
+diff --git a/frontend/packages/knative-plugin/src/components/traffic-splitting/TrafficSplittingModal.tsx b/frontend/packages/knative-plugin/src/components/traffic-splitting/TrafficSplittingModal.tsx
+index 9a3b5d741d8..f55284dd3b7 100644
+--- a/frontend/packages/knative-plugin/src/components/traffic-splitting/TrafficSplittingModal.tsx
++++ b/frontend/packages/knative-plugin/src/components/traffic-splitting/TrafficSplittingModal.tsx
+@@ -1,12 +1,9 @@
+ import type { FC } from 'react';
++import { Button, Form, ModalBody, ModalHeader } from '@patternfly/react-core';
+ import type { FormikProps, FormikValues } from 'formik';
+ import { useTranslation } from 'react-i18next';
+ import type { ModalComponentProps } from '@console/internal/components/factory/modal';
+-import {
+-  ModalTitle,
+-  ModalBody,
+-  ModalSubmitFooter,
+-} from '@console/internal/components/factory/modal';
++import { ModalFooterWithAlerts } from '@console/shared/src/components/modals/ModalFooterWithAlerts';
+ import type { RevisionItems } from '../../utils/traffic-splitting-utils';
+ import TrafficSplittingFields from './TrafficSplittingFields';
+ 
+@@ -20,23 +17,35 @@ const TrafficSplittingModal: FC<Props> = (props) => {
+   const { t } = useTranslation();
+   const { handleSubmit, cancel, isSubmitting, status } = props;
+   return (
+-    <form className="modal-content" onSubmit={handleSubmit}>
+-      <ModalTitle>{t('knative-plugin~Set traffic distribution')}</ModalTitle>
++    <>
++      <ModalHeader
++        title={t('knative-plugin~Set traffic distribution')}
++        labelId="traffic-splitting-modal-title"
++        data-test-id="modal-title"
++      />
+       <ModalBody>
+-        <p>
+-          {t('knative-plugin~Set traffic distribution for the Revisions of the Knative Service')}
+-        </p>
+-        <TrafficSplittingFields {...props} />
++        <Form id="traffic-splitting-form" onSubmit={handleSubmit} className="pf-v6-u-mr-md">
++          <p>
++            {t('knative-plugin~Set traffic distribution for the Revisions of the Knative Service')}
++          </p>
++          <TrafficSplittingFields {...props} />
++        </Form>
+       </ModalBody>
+-      <ModalSubmitFooter
+-        inProgress={isSubmitting}
+-        submitDisabled={isSubmitting}
+-        submitText={t('knative-plugin~Save')}
+-        cancelText={t('knative-plugin~Cancel')}
+-        cancel={cancel}
+-        errorMessage={status.error}
+-      />
+-    </form>
++      <ModalFooterWithAlerts errorMessage={status.error}>
++        <Button
++          type="submit"
++          variant="primary"
++          isLoading={isSubmitting}
++          isDisabled={isSubmitting}
++          form="traffic-splitting-form"
++        >
++          {t('knative-plugin~Save')}
++        </Button>
++        <Button variant="link" onClick={cancel} type="button" data-test-id="modal-cancel-action">
++          {t('knative-plugin~Cancel')}
++        </Button>
++      </ModalFooterWithAlerts>
++    </>
+   );
+ };
+ 
+diff --git a/frontend/packages/knative-plugin/src/components/traffic-splitting/__tests__/TrafficSplittingModal.spec.tsx b/frontend/packages/knative-plugin/src/components/traffic-splitting/__tests__/TrafficSplittingModal.spec.tsx
+index 65433608d12..d2f8b55267e 100644
+--- a/frontend/packages/knative-plugin/src/components/traffic-splitting/__tests__/TrafficSplittingModal.spec.tsx
++++ b/frontend/packages/knative-plugin/src/components/traffic-splitting/__tests__/TrafficSplittingModal.spec.tsx
+@@ -7,10 +7,16 @@ import {
+ } from '../../../utils/__mocks__/traffic-splitting-utils-mock';
+ import TrafficSplittingModal from '../TrafficSplittingModal';
+ 
+-jest.mock('@console/internal/components/factory/modal', () => ({
+-  ModalTitle: jest.fn(() => null),
+-  ModalBody: jest.fn(() => null),
+-  ModalSubmitFooter: jest.fn(() => null),
++jest.mock('@patternfly/react-core', () => ({
++  ...jest.requireActual('@patternfly/react-core'),
++  ModalHeader: jest.fn(() => null),
++  ModalBody: jest.fn(({ children }) => <div>{children}</div>),
++  Button: jest.fn(() => null),
++  Form: jest.fn(({ children, ...props }) => <form {...props}>{children}</form>),
++}));
++
++jest.mock('@console/shared/src/components/modals/ModalFooterWithAlerts', () => ({
++  ModalFooterWithAlerts: jest.fn(({ children }) => <div>{children}</div>),
+ }));
+ 
+ jest.mock('../TrafficSplittingFields', () => ({
+@@ -42,7 +48,7 @@ describe('TrafficSplittingModal', () => {
+   it('should render form with modal structure', () => {
+     const { container } = render(<TrafficSplittingModal {...formProps} />);
+     expect(container.querySelector('form')).toBeInTheDocument();
+-    expect(container.querySelector('form')).toHaveClass('modal-content');
++    expect(container.querySelector('form')).toHaveAttribute('id', 'traffic-splitting-form');
+   });
+ 
+   it('should call handleSubmit on form submit', () => {

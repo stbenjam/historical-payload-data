@@ -1,0 +1,1814 @@
+diff --git a/frontend/packages/console-shared/src/components/formik-fields/ResourceDropdownField.tsx b/frontend/packages/console-shared/src/components/formik-fields/ResourceDropdownField.tsx
+index be3da3227be..d71d0c681f2 100644
+--- a/frontend/packages/console-shared/src/components/formik-fields/ResourceDropdownField.tsx
++++ b/frontend/packages/console-shared/src/components/formik-fields/ResourceDropdownField.tsx
+@@ -1,9 +1,9 @@
+ import type { FC } from 'react';
++import { useMemo } from 'react';
+ import { FormGroup, FormHelperText, HelperText, HelperTextItem } from '@patternfly/react-core';
+ import type { FormikValues } from 'formik';
+ import { useField, useFormikContext } from 'formik';
+-import { Firehose } from '@console/internal/components/utils/firehose';
+-import type { FirehoseResource } from '@console/internal/components/utils/types';
++import type { FirehoseResult } from '@console/internal/components/utils/types';
+ import type { K8sResourceKind } from '@console/internal/module/k8s';
+ import { useFormikValidationFix } from '../../hooks/useFormikValidationFix';
+ import type { ResourceDropdownItems } from '../dropdown/ResourceDropdown';
+@@ -13,7 +13,7 @@ import { getFieldId } from './field-utils';
+ 
+ export interface ResourceDropdownFieldProps extends DropdownFieldProps {
+   dataSelector: string[] | number[] | symbol[];
+-  resources: FirehoseResource[];
++  resources: FirehoseResult[];
+   showBadge?: boolean;
+   onLoad?: (items: ResourceDropdownItems) => void;
+   onChange?: (key: string, name?: string | object, resource?: K8sResourceKind) => void;
+@@ -50,24 +50,42 @@ const ResourceDropdownField: FC<ResourceDropdownFieldProps> = ({
+ 
+   useFormikValidationFix(field.value);
+ 
++  // Derive loaded and loadError from resources array for ResourceDropdown
++  // ResourceDropdown expects these as top-level props to manage loading state
++  const { loaded, loadError } = useMemo(() => {
++    if (!resources || resources.length === 0) {
++      return { loaded: true, loadError: undefined };
++    }
++    type ResourceWithOptional = { loaded: boolean; loadError?: unknown; optional?: boolean };
++    const requiredResources = (resources as ResourceWithOptional[]).filter((r) => !r.optional);
++    const target = requiredResources.length ? requiredResources : resources;
++    const allLoaded = target.every((r) => r.loaded);
++    const resourceWithLoadError = target.find((r) => r.loadError);
++    return {
++      loaded: allLoaded,
++      loadError: resourceWithLoadError?.loadError,
++    };
++  }, [resources]);
++
+   return (
+     <FormGroup fieldId={fieldId} label={label} isRequired={required} data-test={dataTest}>
+-      <Firehose resources={resources}>
+-        <ResourceDropdown
+-          {...props}
+-          id={fieldId}
+-          dataSelector={dataSelector}
+-          selectedKey={field.value}
+-          isFullWidth={fullWidth}
+-          onLoad={onLoad}
+-          resourceFilter={resourceFilter}
+-          onChange={(value: string, name: string | object, resource: K8sResourceKind) => {
+-            props.onChange && props.onChange(value, name, resource);
+-            setFieldValue(props.name, value);
+-            setFieldTouched(props.name, true);
+-          }}
+-        />
+-      </Firehose>
++      <ResourceDropdown
++        {...props}
++        id={fieldId}
++        dataSelector={dataSelector}
++        selectedKey={field.value}
++        isFullWidth={fullWidth}
++        onLoad={onLoad}
++        resourceFilter={resourceFilter}
++        resources={resources}
++        loaded={loaded}
++        loadError={loadError}
++        onChange={(value: string, name: string | object, resource: K8sResourceKind) => {
++          props.onChange && props.onChange(value, name, resource);
++          setFieldValue(props.name, value);
++          setFieldTouched(props.name, true);
++        }}
++      />
+ 
+       <FormHelperText>
+         <HelperText>
+diff --git a/frontend/packages/dev-console/src/components/buildconfig/sections/SecretsSection.tsx b/frontend/packages/dev-console/src/components/buildconfig/sections/SecretsSection.tsx
+index 71a6b12519a..04a7c8d2836 100644
+--- a/frontend/packages/dev-console/src/components/buildconfig/sections/SecretsSection.tsx
++++ b/frontend/packages/dev-console/src/components/buildconfig/sections/SecretsSection.tsx
+@@ -1,9 +1,12 @@
+ import type { FC } from 'react';
++import { useMemo } from 'react';
+ import { TextInputTypes } from '@patternfly/react-core';
+ import * as fuzzy from 'fuzzysearch';
+ import { useTranslation } from 'react-i18next';
+-import type { FirehoseResource } from '@console/internal/components/utils';
++import { useK8sWatchResources } from '@console/internal/components/utils/k8s-watch-hook';
+ import { SecretModel } from '@console/internal/models';
++import type { SecretKind } from '@console/internal/module/k8s';
++import { referenceForModel } from '@console/internal/module/k8s';
+ import { InputField, MultiColumnField, ResourceDropdownField } from '@console/shared';
+ import FormSection from '../../import/section/FormSection';
+ 
+@@ -20,14 +23,30 @@ const SecretsSection: FC<{ namespace: string }> = ({ namespace }) => {
+   const { t } = useTranslation();
+ 
+   const autocompleteFilter = (text: string, item: any): boolean => fuzzy(text, item?.props?.name);
+-  const resources: FirehoseResource[] = [
+-    {
++
++  const watchedResources = useK8sWatchResources<{ secrets: SecretKind[] }>({
++    secrets: {
+       isList: true,
+-      kind: SecretModel.kind,
+-      prop: SecretModel.id,
++      kind: referenceForModel(SecretModel),
+       namespace,
+     },
+-  ];
++  });
++
++  const resources = useMemo(
++    () => [
++      {
++        data: watchedResources.secrets.data,
++        loaded: watchedResources.secrets.loaded,
++        loadError: watchedResources.secrets.loadError,
++        kind: SecretModel.kind,
++      },
++    ],
++    [
++      watchedResources.secrets.data,
++      watchedResources.secrets.loaded,
++      watchedResources.secrets.loadError,
++    ],
++  );
+ 
+   const mountPointLabel = t('devconsole~Mount point');
+ 
+diff --git a/frontend/packages/dev-console/src/components/buildconfig/sections/TriggersSection.tsx b/frontend/packages/dev-console/src/components/buildconfig/sections/TriggersSection.tsx
+index 07abbad2158..5d5e0e2c62c 100644
+--- a/frontend/packages/dev-console/src/components/buildconfig/sections/TriggersSection.tsx
++++ b/frontend/packages/dev-console/src/components/buildconfig/sections/TriggersSection.tsx
+@@ -1,10 +1,13 @@
+ import type { FC } from 'react';
++import { useMemo } from 'react';
+ import { FormGroup } from '@patternfly/react-core';
+ import { useField } from 'formik';
+ import * as fuzzy from 'fuzzysearch';
+ import { useTranslation } from 'react-i18next';
+-import type { FirehoseResource } from '@console/internal/components/utils';
++import { useK8sWatchResources } from '@console/internal/components/utils/k8s-watch-hook';
+ import { SecretModel } from '@console/internal/models';
++import type { SecretKind } from '@console/internal/module/k8s';
++import { referenceForModel } from '@console/internal/module/k8s';
+ import {
+   DropdownField,
+   MultiColumnField,
+@@ -42,14 +45,30 @@ const TriggersSection: FC<{ namespace: string }> = ({ namespace }) => {
+   };
+ 
+   const autocompleteFilter = (text: string, item: any): boolean => fuzzy(text, item?.props?.name);
+-  const resources: FirehoseResource[] = [
+-    {
++
++  const watchedResources = useK8sWatchResources<{ secrets: SecretKind[] }>({
++    secrets: {
+       isList: true,
+-      kind: SecretModel.kind,
+-      prop: SecretModel.id,
++      kind: referenceForModel(SecretModel),
+       namespace,
+     },
+-  ];
++  });
++
++  const resources = useMemo(
++    () => [
++      {
++        data: watchedResources.secrets.data,
++        loaded: watchedResources.secrets.loaded,
++        loadError: watchedResources.secrets.loadError,
++        kind: SecretModel.kind,
++      },
++    ],
++    [
++      watchedResources.secrets.data,
++      watchedResources.secrets.loaded,
++      watchedResources.secrets.loadError,
++    ],
++  );
+ 
+   return (
+     <FormSection title={t('devconsole~Triggers')} dataTest="section triggers">
+diff --git a/frontend/packages/dev-console/src/components/buildconfig/sections/__tests__/TriggersSection.spec.tsx b/frontend/packages/dev-console/src/components/buildconfig/sections/__tests__/TriggersSection.spec.tsx
+index 57a45758989..c2ee48f4c37 100644
+--- a/frontend/packages/dev-console/src/components/buildconfig/sections/__tests__/TriggersSection.spec.tsx
++++ b/frontend/packages/dev-console/src/components/buildconfig/sections/__tests__/TriggersSection.spec.tsx
+@@ -1,17 +1,38 @@
+ import type { FC, ReactNode } from 'react';
+-import { render, waitFor } from '@testing-library/react';
++import { screen, waitFor } from '@testing-library/react';
+ import userEvent from '@testing-library/user-event';
+-import type { FormikConfig } from 'formik';
+ import { Formik } from 'formik';
++import { useK8sWatchResources } from '@console/internal/components/utils/k8s-watch-hook';
++import { renderWithProviders } from '@console/shared/src/test-utils/unit-test-utils';
+ import type { TriggersSectionFormData } from '../TriggersSection';
+ import TriggersSection from '../TriggersSection';
+ 
+-interface WrapperProps extends FormikConfig<TriggersSectionFormData> {
+-  children?: ReactNode;
++// Mock PatternFly topology to prevent console warnings during tests
++jest.mock('@patternfly/react-topology', () => ({}));
++
++jest.mock('@console/internal/components/utils/k8s-watch-hook', () => ({
++  useK8sWatchResources: jest.fn(),
++}));
++
++const mockUseK8sWatchResources = useK8sWatchResources as jest.Mock;
++
++const initialValues: TriggersSectionFormData = {
++  formData: {
++    triggers: {
++      configChange: false,
++      imageChange: false,
++      otherTriggers: [],
++    },
++  },
++};
++
++interface FormikWrapperProps {
++  children: ReactNode;
++  onSubmit: jest.Mock;
+ }
+ 
+-const Wrapper: FC<WrapperProps> = ({ children, ...formikConfig }) => (
+-  <Formik {...formikConfig}>
++const FormikWrapper: FC<FormikWrapperProps> = ({ children, onSubmit }) => (
++  <Formik initialValues={initialValues} onSubmit={onSubmit}>
+     {(formikProps) => (
+       <form onSubmit={formikProps.handleSubmit}>
+         {children}
+@@ -21,100 +42,93 @@ const Wrapper: FC<WrapperProps> = ({ children, ...formikConfig }) => (
+   </Formik>
+ );
+ 
+-const initialValues: TriggersSectionFormData = {
+-  formData: {
+-    triggers: {
+-      configChange: false,
+-      imageChange: false,
+-      otherTriggers: [],
+-    },
+-  },
++const renderTriggersSection = (onSubmit: jest.Mock) => {
++  renderWithProviders(
++    <FormikWrapper onSubmit={onSubmit}>
++      <TriggersSection namespace="a-namespace" />
++    </FormikWrapper>,
++  );
+ };
+ 
+ describe('TriggersSection', () => {
+-  it('should render empty form', () => {
++  beforeEach(() => {
++    mockUseK8sWatchResources.mockReturnValue({
++      secrets: { data: [], loaded: true, loadError: null },
++    });
++  });
++
++  afterEach(() => {
++    jest.restoreAllMocks();
++  });
++
++  it('should render all trigger configuration options', () => {
+     const onSubmit = jest.fn();
+ 
+-    const renderResult = render(
+-      <Wrapper initialValues={initialValues} onSubmit={onSubmit}>
+-        <TriggersSection namespace="a-namespace" />
+-      </Wrapper>,
+-    );
++    renderTriggersSection(onSubmit);
+ 
+-    renderResult.getByTestId('section triggers');
+-    renderResult.getByText('Triggers');
+-    renderResult.getByText('Automatically build a new image when config changes');
+-    renderResult.getByText('Automatically build a new image when image changes');
+-    renderResult.getByText('Add trigger');
++    expect(screen.getByTestId('section triggers')).toBeInTheDocument();
++    expect(screen.getByText('Triggers')).toBeVisible();
++    expect(
++      screen.getByText('Automatically build a new image when config changes'),
++    ).toBeInTheDocument();
++    expect(screen.getByText('Automatically build a new image when image changes')).toBeVisible();
++    expect(screen.getByRole('button', { name: 'Add trigger' })).toBeVisible();
+ 
+-    expect((renderResult.getByTestId('image-change checkbox') as HTMLInputElement).checked).toBe(
+-      false,
+-    );
++    const imageChangeCheckbox = screen.getByTestId('image-change checkbox') as HTMLInputElement;
++    expect(imageChangeCheckbox).not.toBeChecked();
+ 
+-    expect(onSubmit).toHaveBeenCalledTimes(0);
++    expect(onSubmit).not.toHaveBeenCalled();
+   });
+ 
+-  it('should allow user to change config change checkbox trigger and save this data', async () => {
++  it('should toggle config change checkbox and submit form with updated value', async () => {
+     const user = userEvent.setup();
+     const onSubmit = jest.fn();
++    renderTriggersSection(onSubmit);
+ 
+-    const renderResult = render(
+-      <Wrapper initialValues={initialValues} onSubmit={onSubmit}>
+-        <TriggersSection namespace="a-namespace" />
+-      </Wrapper>,
+-    );
+-
+-    // Change form
+-    await user.click(renderResult.getByTestId('config-change checkbox'));
++    const configChangeCheckbox = screen.getByTestId('config-change checkbox');
++    await user.click(configChangeCheckbox);
+ 
+-    // Submit
+-    const submitButton = renderResult.getByRole('button', { name: 'Submit' });
++    const submitButton = screen.getByRole('button', { name: 'Submit' });
+     await user.click(submitButton);
++
+     await waitFor(() => {
+       expect(onSubmit).toHaveBeenCalledTimes(1);
+     });
+ 
+-    const expectedFormData: TriggersSectionFormData = {
+-      formData: {
+-        triggers: {
+-          configChange: true,
+-          imageChange: false,
+-          otherTriggers: [],
+-        },
+-      },
+-    };
+-    expect(onSubmit).toHaveBeenLastCalledWith(expectedFormData, expect.anything());
++    expect(onSubmit.mock.calls[0][0]).toEqual(
++      expect.objectContaining({
++        formData: expect.objectContaining({
++          triggers: expect.objectContaining({
++            configChange: true,
++          }),
++        }),
++      }),
++    );
+   });
+ 
+-  it('should allow user to change image change checkbox trigger and save this data', async () => {
++  it('should toggle image change checkbox and submit form with updated value', async () => {
+     const user = userEvent.setup();
+     const onSubmit = jest.fn();
++    renderTriggersSection(onSubmit);
+ 
+-    const renderResult = render(
+-      <Wrapper initialValues={initialValues} onSubmit={onSubmit}>
+-        <TriggersSection namespace="a-namespace" />
+-      </Wrapper>,
+-    );
+-
+-    // Change form
+-    await user.click(renderResult.getByTestId('image-change checkbox'));
++    const imageChangeCheckbox = screen.getByTestId('image-change checkbox');
++    await user.click(imageChangeCheckbox);
+ 
+-    // Submit
+-    const submitButton = renderResult.getByRole('button', { name: 'Submit' });
++    const submitButton = screen.getByRole('button', { name: 'Submit' });
+     await user.click(submitButton);
++
+     await waitFor(() => {
+       expect(onSubmit).toHaveBeenCalledTimes(1);
+     });
+ 
+-    const expectedFormData: TriggersSectionFormData = {
+-      formData: {
+-        triggers: {
+-          configChange: false,
+-          imageChange: true,
+-          otherTriggers: [],
+-        },
+-      },
+-    };
+-    expect(onSubmit).toHaveBeenLastCalledWith(expectedFormData, expect.anything());
++    expect(onSubmit.mock.calls[0][0]).toEqual(
++      expect.objectContaining({
++        formData: expect.objectContaining({
++          triggers: expect.objectContaining({
++            imageChange: true,
++          }),
++        }),
++      }),
++    );
+   });
+ });
+diff --git a/frontend/packages/dev-console/src/components/deployments/images/AdvancedImageOptions.tsx b/frontend/packages/dev-console/src/components/deployments/images/AdvancedImageOptions.tsx
+index 6f87dbe5c91..0fba053a384 100644
+--- a/frontend/packages/dev-console/src/components/deployments/images/AdvancedImageOptions.tsx
++++ b/frontend/packages/dev-console/src/components/deployments/images/AdvancedImageOptions.tsx
+@@ -1,4 +1,5 @@
+ import type { FC } from 'react';
++import { useMemo } from 'react';
+ import { Button, ButtonVariant } from '@patternfly/react-core';
+ import type { FormikValues } from 'formik';
+ import { useFormikContext } from 'formik';
+@@ -6,7 +7,9 @@ import { useTranslation } from 'react-i18next';
+ import { useCreateSecretModal } from '@console/dev-console/src/components/import/CreateSecretModal';
+ import { SecretFormType } from '@console/internal/components/secrets/create-secret';
+ import { ExpandCollapse } from '@console/internal/components/utils';
++import { useK8sWatchResource } from '@console/internal/components/utils/k8s-watch-hook';
+ import { SecretModel } from '@console/internal/models';
++import type { K8sResourceKind } from '@console/internal/module/k8s';
+ import { ResourceDropdownField } from '@console/shared/src';
+ 
+ const AdvancedImageOptions: FC = () => {
+@@ -28,6 +31,25 @@ const AdvancedImageOptions: FC = () => {
+   const handleSave = (name: string) => {
+     setFieldValue('formData.imagePullSecret', name);
+   };
++
++  const [secretsData, secretsLoaded, secretsLoadError] = useK8sWatchResource<K8sResourceKind[]>({
++    isList: true,
++    namespace,
++    kind: SecretModel.kind,
++  });
++
++  const resources = useMemo(
++    () => [
++      {
++        data: secretsData,
++        loaded: secretsLoaded,
++        loadError: secretsLoadError,
++        kind: SecretModel.kind,
++      },
++    ],
++    [secretsData, secretsLoaded, secretsLoadError],
++  );
++
+   return (
+     <ExpandCollapse
+       textExpanded={t('devconsole~Hide advanced image options')}
+@@ -40,14 +62,7 @@ const AdvancedImageOptions: FC = () => {
+           'devconsole~Secret for authentication when pulling image from a secured registry.',
+         )}
+         placeholder={t('devconsole~Select Secret name')}
+-        resources={[
+-          {
+-            isList: true,
+-            namespace,
+-            kind: SecretModel.kind,
+-            prop: 'secrets',
+-          },
+-        ]}
++        resources={resources}
+         resourceFilter={filterData}
+         dataSelector={['metadata', 'name']}
+         dataTest="secrets-dropdown"
+diff --git a/frontend/packages/dev-console/src/components/import/image-search/ImageStreamDropdown.tsx b/frontend/packages/dev-console/src/components/import/image-search/ImageStreamDropdown.tsx
+index 4c376233226..29eb552f730 100644
+--- a/frontend/packages/dev-console/src/components/import/image-search/ImageStreamDropdown.tsx
++++ b/frontend/packages/dev-console/src/components/import/image-search/ImageStreamDropdown.tsx
+@@ -1,12 +1,14 @@
+ import type { FC } from 'react';
+-import { useContext, useCallback, useEffect } from 'react';
++import { useContext, useCallback, useEffect, useMemo, useRef } from 'react';
+ import type { FormikValues } from 'formik';
+ import { useFormikContext } from 'formik';
+ import * as _ from 'lodash';
+ import { useTranslation } from 'react-i18next';
++import { useK8sWatchResources } from '@console/internal/components/utils/k8s-watch-hook';
++import { ImageStreamModel } from '@console/internal/models';
+ import type { K8sResourceKind } from '@console/internal/module/k8s';
++import { referenceForModel } from '@console/internal/module/k8s';
+ import { ResourceDropdownField } from '@console/shared';
+-import { getImageStreamResource } from '../../../utils/imagestream-utils';
+ import { ImageStreamActions } from '../import-types';
+ import { ImageStreamContext } from './ImageStreamContext';
+ 
+@@ -17,8 +19,7 @@ const ImageStreamDropdown: FC<{
+   className?: string;
+ }> = ({ disabled = false, formContextField, reloadCount, className }) => {
+   const { t } = useTranslation();
+-  // eslint-disable-next-line react-hooks/exhaustive-deps
+-  const imgCollection = {};
++  const imgCollection = useRef<Record<string, Record<string, K8sResourceKind>>>({});
+ 
+   const { values, setFieldValue, initialValues } = useFormikContext<FormikValues>();
+   const { imageStream, formType } = _.get(values, formContextField) || values;
+@@ -29,10 +30,10 @@ const ImageStreamDropdown: FC<{
+   const isStreamsAvailable = isNamespaceSelected && hasImageStreams && !loading;
+   const fieldPrefix = formContextField ? `${formContextField}.` : '';
+   const collectImageStreams = (namespace: string, resource: K8sResourceKind): void => {
+-    if (!imgCollection[namespace]) {
+-      imgCollection[namespace] = {};
++    if (!imgCollection.current[namespace]) {
++      imgCollection.current[namespace] = {};
+     }
+-    imgCollection[namespace][resource.metadata.name] = resource;
++    imgCollection.current[namespace][resource.metadata.name] = resource;
+   };
+   const getTitle = () => {
+     return loading && !isStreamsAvailable
+@@ -49,7 +50,7 @@ const ImageStreamDropdown: FC<{
+         img === imageStream.image ? imageStream.tag : '',
+       );
+       formType !== 'edit' && setFieldValue(`${fieldPrefix}isi`, initialIsi);
+-      const image = _.get(imgCollection, [imageStream.namespace, img], {});
++      const image = _.get(imgCollection.current, [imageStream.namespace, img], {});
+       dispatch({ type: ImageStreamActions.setSelectedImageStream, value: image });
+     },
+     [
+@@ -60,7 +61,6 @@ const ImageStreamDropdown: FC<{
+       imageStream.namespace,
+       formType,
+       initialIsi,
+-      imgCollection,
+       dispatch,
+     ],
+   );
+@@ -84,6 +84,42 @@ const ImageStreamDropdown: FC<{
+     // eslint-disable-next-line react-hooks/exhaustive-deps
+   }, [imageStream.image, isStreamsAvailable]);
+ 
++  const watchSpec = useMemo(
++    () =>
++      imageStream.namespace
++        ? {
++            imagestreams: {
++              isList: true,
++              kind: referenceForModel(ImageStreamModel),
++              namespace: imageStream.namespace,
++            },
++          }
++        : {},
++    [imageStream.namespace],
++  );
++
++  const watchedResources = useK8sWatchResources<{ imagestreams?: K8sResourceKind[] }>(watchSpec);
++
++  const resources = useMemo(
++    () =>
++      imageStream.namespace
++        ? [
++            {
++              data: watchedResources.imagestreams?.data,
++              loaded: watchedResources.imagestreams?.loaded,
++              loadError: watchedResources.imagestreams?.loadError,
++              kind: ImageStreamModel.kind,
++            },
++          ]
++        : [],
++    [
++      imageStream.namespace,
++      watchedResources.imagestreams?.data,
++      watchedResources.imagestreams?.loaded,
++      watchedResources.imagestreams?.loadError,
++    ],
++  );
++
+   useEffect(() => {
+     reloadCount && imageStream.image && onDropdownChange(imageStream.image);
+     // eslint-disable-next-line react-hooks/exhaustive-deps
+@@ -93,7 +129,7 @@ const ImageStreamDropdown: FC<{
+     <ResourceDropdownField
+       name={`${fieldPrefix}imageStream.image`}
+       label={t('devconsole~Image Stream')}
+-      resources={getImageStreamResource(imageStream.namespace)}
++      resources={resources}
+       dataSelector={['metadata', 'name']}
+       key={imageStream.namespace}
+       fullWidth
+diff --git a/frontend/packages/dev-console/src/components/import/image-search/ImageStreamNsDropdown.tsx b/frontend/packages/dev-console/src/components/import/image-search/ImageStreamNsDropdown.tsx
+index 6c1120ccf9f..92d21fbeddf 100644
+--- a/frontend/packages/dev-console/src/components/import/image-search/ImageStreamNsDropdown.tsx
++++ b/frontend/packages/dev-console/src/components/import/image-search/ImageStreamNsDropdown.tsx
+@@ -1,11 +1,15 @@
+ import type { FC } from 'react';
+-import { useContext, useCallback, useEffect } from 'react';
++import { useContext, useCallback, useEffect, useMemo } from 'react';
+ import type { FormikValues } from 'formik';
+ import { useFormikContext } from 'formik';
+ import * as _ from 'lodash';
+ import { useTranslation } from 'react-i18next';
++import { useK8sWatchResources } from '@console/internal/components/utils/k8s-watch-hook';
++import { ProjectModel } from '@console/internal/models';
++import type { K8sResourceKind } from '@console/internal/module/k8s';
++import { referenceForModel } from '@console/internal/module/k8s';
+ import { ResourceDropdownField } from '@console/shared';
+-import { getProjectResource, BuilderImagesNamespace } from '../../../utils/imagestream-utils';
++import { BuilderImagesNamespace } from '../../../utils/imagestream-utils';
+ import { ImageStreamActions as Action } from '../import-types';
+ import { ImageStreamContext } from './ImageStreamContext';
+ 
+@@ -32,6 +36,29 @@ const ImageStreamNsDropdown: FC<{
+     [dispatch, fieldPrefix, initialIsi, setFieldValue],
+   );
+ 
++  const watchedResources = useK8sWatchResources<{ projects: K8sResourceKind[] }>({
++    projects: {
++      isList: true,
++      kind: referenceForModel(ProjectModel),
++    },
++  });
++
++  const resources = useMemo(
++    () => [
++      {
++        data: watchedResources.projects.data,
++        loaded: watchedResources.projects.loaded,
++        loadError: watchedResources.projects.loadError,
++        kind: ProjectModel.kind,
++      },
++    ],
++    [
++      watchedResources.projects.data,
++      watchedResources.projects.loaded,
++      watchedResources.projects.loadError,
++    ],
++  );
++
+   useEffect(() => {
+     imageStream.namespace && onDropdownChange();
+   }, [onDropdownChange, imageStream.namespace]);
+@@ -43,7 +70,7 @@ const ImageStreamNsDropdown: FC<{
+       title={imageStream.namespace || t('devconsole~Select Project')}
+       fullWidth
+       required
+-      resources={getProjectResource()}
++      resources={resources}
+       dataSelector={['metadata', 'name']}
+       onChange={onDropdownChange}
+       appendItems={{ openshift: BuilderImagesNamespace.Openshift }}
+diff --git a/frontend/packages/dev-console/src/components/pipeline-section/pipeline/WebhookSection.tsx b/frontend/packages/dev-console/src/components/pipeline-section/pipeline/WebhookSection.tsx
+index e61b27516e5..658a8dc054b 100644
+--- a/frontend/packages/dev-console/src/components/pipeline-section/pipeline/WebhookSection.tsx
++++ b/frontend/packages/dev-console/src/components/pipeline-section/pipeline/WebhookSection.tsx
+@@ -1,5 +1,5 @@
+ import type { FC, ReactNode, ReactElement } from 'react';
+-import { useState, useEffect } from 'react';
++import { useState, useEffect, useMemo } from 'react';
+ import {
+   Content,
+   TextInputTypes,
+@@ -25,9 +25,10 @@ import { Trans, useTranslation } from 'react-i18next';
+ import { generateSecret } from '@console/dev-console/src/components/import/import-submit-utils';
+ import FormSection from '@console/dev-console/src/components/import/section/FormSection';
+ import { GitProvider } from '@console/git-service/src';
+-import type { FirehoseResource } from '@console/internal/components/utils';
++import { useK8sWatchResources } from '@console/internal/components/utils/k8s-watch-hook';
+ import { SecretModel } from '@console/internal/models';
+-import type { ConfigMapKind } from '@console/internal/module/k8s/types';
++import type { ConfigMapKind, SecretKind } from '@console/internal/module/k8s';
++import { referenceForModel } from '@console/internal/module/k8s';
+ import { RadioGroupField, InputField, ResourceDropdownField } from '@console/shared/src';
+ import { ExternalLink } from '@console/shared/src/components/links/ExternalLink';
+ import { useActiveNamespace } from '@console/shared/src/hooks/useActiveNamespace';
+@@ -69,15 +70,32 @@ const WebhookSection: FC<WebhoookSectionProps> = ({ pac, formContextField }) =>
+       setFieldValue(`${fieldPrefix}webhook.url`, ctlUrl);
+     }
+   }, [fieldPrefix, pac, setFieldValue]);
++
+   const autocompleteFilter = (text: string, item: any): boolean => fuzzy(text, item?.props?.name);
+-  const resources: FirehoseResource[] = [
+-    {
++
++  const watchedResources = useK8sWatchResources<{ secrets: SecretKind[] }>({
++    secrets: {
+       isList: true,
+-      kind: SecretModel.kind,
+-      prop: SecretModel.id,
++      kind: referenceForModel(SecretModel),
+       namespace,
+     },
+-  ];
++  });
++
++  const resources = useMemo(
++    () => [
++      {
++        data: watchedResources.secrets.data,
++        loaded: watchedResources.secrets.loaded,
++        loadError: watchedResources.secrets.loadError,
++        kind: SecretModel.kind,
++      },
++    ],
++    [
++      watchedResources.secrets.data,
++      watchedResources.secrets.loaded,
++      watchedResources.secrets.loadError,
++    ],
++  );
+ 
+   const generateWebhookSecret = () => {
+     setWebhookSecret(generateSecret());
+diff --git a/frontend/packages/helm-plugin/src/components/forms/HelmChartRepository/CreateHelmChartRepositoryFormEditor.tsx b/frontend/packages/helm-plugin/src/components/forms/HelmChartRepository/CreateHelmChartRepositoryFormEditor.tsx
+index bdd36a74669..698d94e3a3f 100644
+--- a/frontend/packages/helm-plugin/src/components/forms/HelmChartRepository/CreateHelmChartRepositoryFormEditor.tsx
++++ b/frontend/packages/helm-plugin/src/components/forms/HelmChartRepository/CreateHelmChartRepositoryFormEditor.tsx
+@@ -1,4 +1,5 @@
+ import type { FC } from 'react';
++import { useMemo } from 'react';
+ import { TextInputTypes } from '@patternfly/react-core';
+ import type { FormikValues } from 'formik';
+ import { useFormikContext } from 'formik';
+@@ -7,7 +8,9 @@ import { useTranslation } from 'react-i18next';
+ import FormSection from '@console/dev-console/src/components/import/section/FormSection';
+ import type { HelmChartRepositoryType } from '@console/helm-plugin/src/types/helm-types';
+ import { ExpandCollapse } from '@console/internal/components/utils';
++import { useK8sWatchResources } from '@console/internal/components/utils/k8s-watch-hook';
+ import { ConfigMapModel, SecretModel } from '@console/internal/models';
++import type { K8sResourceKind } from '@console/internal/module/k8s';
+ import {
+   InputField,
+   ResourceDropdownField,
+@@ -40,6 +43,57 @@ const CreateHelmChartRepositoryFormEditor: FC<CreateHelmChartRepositoryFormEdito
+     values: { formData },
+   } = useFormikContext<FormikValues>();
+   const autocompleteFilter = (strText, item): boolean => fuzzy(strText, item?.props?.name);
++
++  const watchedResources = useK8sWatchResources<{
++    configMaps: K8sResourceKind[];
++    secrets: K8sResourceKind[];
++  }>({
++    configMaps: {
++      isList: true,
++      kind: ConfigMapModel.kind,
++      namespace: 'openshift-config',
++      optional: true,
++    },
++    secrets: {
++      isList: true,
++      kind: SecretModel.kind,
++      namespace: 'openshift-config',
++      optional: true,
++    },
++  });
++
++  const configMapResources = useMemo(
++    () => [
++      {
++        data: watchedResources.configMaps?.data,
++        loaded: watchedResources.configMaps?.loaded,
++        loadError: watchedResources.configMaps?.loadError,
++        kind: ConfigMapModel.kind,
++      },
++    ],
++    [
++      watchedResources.configMaps?.data,
++      watchedResources.configMaps?.loaded,
++      watchedResources.configMaps?.loadError,
++    ],
++  );
++
++  const secretResources = useMemo(
++    () => [
++      {
++        data: watchedResources.secrets?.data,
++        loaded: watchedResources.secrets?.loaded,
++        loadError: watchedResources.secrets?.loadError,
++        kind: SecretModel.kind,
++      },
++    ],
++    [
++      watchedResources.secrets?.data,
++      watchedResources.secrets?.loaded,
++      watchedResources.secrets?.loadError,
++    ],
++  );
++
+   return (
+     <FormSection>
+       {showScopeType && !existingRepo && (
+@@ -110,15 +164,7 @@ const CreateHelmChartRepositoryFormEditor: FC<CreateHelmChartRepositoryFormEdito
+           <ResourceDropdownField
+             name="formData.ca"
+             label={t('helm-plugin~CA certificate')}
+-            resources={[
+-              {
+-                isList: true,
+-                kind: ConfigMapModel.kind,
+-                namespace: 'openshift-config',
+-                optional: true,
+-                prop: ConfigMapModel.id,
+-              },
+-            ]}
++            resources={configMapResources}
+             dataSelector={['metadata', 'name']}
+             fullWidth
+             placeholder={t('helm-plugin~Select ConfigMap')}
+@@ -129,15 +175,7 @@ const CreateHelmChartRepositoryFormEditor: FC<CreateHelmChartRepositoryFormEdito
+           <ResourceDropdownField
+             name="formData.tlsClientConfig"
+             label={t('helm-plugin~TLS Client config')}
+-            resources={[
+-              {
+-                isList: true,
+-                kind: SecretModel.kind,
+-                namespace: 'openshift-config',
+-                optional: true,
+-                prop: SecretModel.id,
+-              },
+-            ]}
++            resources={secretResources}
+             dataSelector={['metadata', 'name']}
+             fullWidth
+             placeholder={t('helm-plugin~Select Secret')}
+diff --git a/frontend/packages/knative-plugin/src/components/add/event-sinks/KafkaSinkSection.tsx b/frontend/packages/knative-plugin/src/components/add/event-sinks/KafkaSinkSection.tsx
+index 155a27663fd..7e8919bc57b 100644
+--- a/frontend/packages/knative-plugin/src/components/add/event-sinks/KafkaSinkSection.tsx
++++ b/frontend/packages/knative-plugin/src/components/add/event-sinks/KafkaSinkSection.tsx
+@@ -1,10 +1,13 @@
+ import type { FC } from 'react';
++import { useMemo } from 'react';
+ import { TextInputTypes } from '@patternfly/react-core';
+ import * as fuzzy from 'fuzzysearch';
+ import { useTranslation } from 'react-i18next';
+ import FormSection from '@console/dev-console/src/components/import/section/FormSection';
+-import type { FirehoseResource } from '@console/internal/components/utils';
++import { useK8sWatchResources } from '@console/internal/components/utils/k8s-watch-hook';
+ import { SecretModel } from '@console/internal/models';
++import type { SecretKind } from '@console/internal/module/k8s';
++import { referenceForModel } from '@console/internal/module/k8s';
+ import { InputField, ResourceDropdownField, MultiTypeaheadField } from '@console/shared';
+ import { EVENT_SINK_KAFKA_KIND } from '../../../const';
+ import { useBootstrapServers } from '../../../hooks';
+@@ -21,14 +24,29 @@ const KafkaSinkSection: FC<KafkaSinkSectionProps> = ({ title, namespace, fullWid
+ 
+   const autocompleteFilter = (text: string, item: any): boolean => fuzzy(text, item?.props?.name);
+ 
+-  const resources: FirehoseResource[] = [
+-    {
++  const watchedResources = useK8sWatchResources<{ secrets: SecretKind[] }>({
++    secrets: {
+       isList: true,
+-      kind: SecretModel.kind,
+-      prop: SecretModel.id,
++      kind: referenceForModel(SecretModel),
+       namespace,
+     },
+-  ];
++  });
++
++  const resources = useMemo(
++    () => [
++      {
++        data: watchedResources.secrets.data,
++        loaded: watchedResources.secrets.loaded,
++        loadError: watchedResources.secrets.loadError,
++        kind: SecretModel.kind,
++      },
++    ],
++    [
++      watchedResources.secrets.data,
++      watchedResources.secrets.loaded,
++      watchedResources.secrets.loadError,
++    ],
++  );
+ 
+   return (
+     <FormSection title={title} extraMargin fullWidth={fullWidth}>
+diff --git a/frontend/packages/knative-plugin/src/components/add/event-sinks/__tests__/KafkaSinkSection.spec.tsx b/frontend/packages/knative-plugin/src/components/add/event-sinks/__tests__/KafkaSinkSection.spec.tsx
+index 60c4d6f209b..14ac9c37e59 100644
+--- a/frontend/packages/knative-plugin/src/components/add/event-sinks/__tests__/KafkaSinkSection.spec.tsx
++++ b/frontend/packages/knative-plugin/src/components/add/event-sinks/__tests__/KafkaSinkSection.spec.tsx
+@@ -8,7 +8,7 @@ jest.mock('@console/internal/components/utils/k8s-watch-hook', () => ({
+ 
+ jest.mock('@console/dev-console/src/components/import/section/FormSection', () => ({
+   __esModule: true,
+-  default: 'FormSection',
++  default: ({ children }) => children,
+ }));
+ 
+ jest.mock('@console/shared', () => ({
+@@ -30,20 +30,18 @@ jest.mock('../../../../hooks', () => ({
+ describe('KafkaSinkSection', () => {
+   const title = 'Kafka Sink';
+ 
+-  it('should render KafkaSink FormSection with proper title', () => {
++  beforeEach(() => {
+     (useK8sWatchResources as jest.Mock).mockReturnValue({
+-      kafkas: { data: [], loaded: true },
+-      kafkaconnections: { data: [], loaded: true },
++      secrets: { data: [], loaded: true, loadError: null },
+     });
++  });
++
++  it('should render KafkaSink FormSection', () => {
+     const { container } = render(<KafkaSinkSection title={title} namespace="my-app" />);
+-    expect(container.querySelector('FormSection')).toBeInTheDocument();
++    expect(container).toBeInTheDocument();
+   });
+ 
+   it('should render BootstrapServers and Topic fields with required and secret as not required', () => {
+-    (useK8sWatchResources as jest.Mock).mockReturnValue({
+-      kafkas: { data: [], loaded: true },
+-      kafkaconnections: { data: [], loaded: true },
+-    });
+     const { container } = render(<KafkaSinkSection title={title} namespace="my-app" />);
+     const bootstrapServersField = container.querySelector(
+       '[data-test="kafkasink-bootstrapservers-field"]',
+@@ -57,10 +55,9 @@ describe('KafkaSinkSection', () => {
+     expect(secretField).toBeInTheDocument();
+   });
+ 
+-  it('should render BootstrapServers and topic fields with even if kafkaconnections loaded failed', () => {
+-    (useK8sWatchResources as jest.Mock).mockReturnValue({
+-      kafkas: { data: [], loaded: true },
+-      kafkaconnections: { data: null, loaded: false, loadError: 'Error' },
++  it('should render BootstrapServers and topic fields even if secrets loaded failed', () => {
++    (useK8sWatchResources as jest.Mock).mockReturnValueOnce({
++      secrets: { data: [], loaded: false, loadError: 'Error' },
+     });
+     const { container } = render(<KafkaSinkSection title={title} namespace="my-app" />);
+     const bootstrapServersField = container.querySelector(
+diff --git a/frontend/packages/knative-plugin/src/components/add/event-sinks/form-fields/SourceResources.tsx b/frontend/packages/knative-plugin/src/components/add/event-sinks/form-fields/SourceResources.tsx
+index 235906dc357..67b7891e688 100644
+--- a/frontend/packages/knative-plugin/src/components/add/event-sinks/form-fields/SourceResources.tsx
++++ b/frontend/packages/knative-plugin/src/components/add/event-sinks/form-fields/SourceResources.tsx
+@@ -1,5 +1,5 @@
+ import type { FC, ReactElement } from 'react';
+-import { useState, useCallback } from 'react';
++import { useState, useCallback, useMemo } from 'react';
+ import {
+   FormGroup,
+   Alert,
+@@ -12,10 +12,13 @@ import { useFormikContext } from 'formik';
+ import * as fuzzy from 'fuzzysearch';
+ import { isEmpty } from 'lodash';
+ import { useTranslation } from 'react-i18next';
++import type { WatchK8sResource } from '@console/dynamic-plugin-sdk';
++import { useK8sWatchResources } from '@console/internal/components/utils/k8s-watch-hook';
+ import type { K8sResourceKind } from '@console/internal/module/k8s';
++import { referenceForModel } from '@console/internal/module/k8s';
+ import { getFieldId, ResourceDropdownField } from '@console/shared';
+-import { getDynamicChannelResourceList } from '../../../../utils/fetch-dynamic-eventsources-utils';
+-import { knativeEventingResourcesBroker } from '../../../../utils/get-knative-resources';
++import { EventingBrokerModel } from '../../../../models';
++import { useChannelModels } from '../../../../utils/fetch-dynamic-eventsources-utils';
+ import { craftResourceKey } from '../../../pub-sub/pub-sub-utils';
+ 
+ export interface SourceResourcesProps {
+@@ -30,16 +33,74 @@ const SourceResources: FC<SourceResourcesProps> = ({ namespace, isMoveSink }) =>
+     FormikValues
+   >();
+ 
+-  const resourcesData = [
+-    ...getDynamicChannelResourceList(namespace),
+-    ...knativeEventingResourcesBroker(namespace),
+-  ];
++  // Get dynamic channel models
++  const { loaded: channelsLoaded, eventSourceChannels: channels } = useChannelModels();
++
++  const watchSpec = useMemo(() => {
++    const spec: Record<string, WatchK8sResource> = {
++      brokers: {
++        isList: true,
++        kind: referenceForModel(EventingBrokerModel),
++        namespace,
++        optional: true,
++      },
++    };
++
++    // Add dynamic channels when loaded
++    if (channelsLoaded && channels.length > 0) {
++      channels.forEach((model) => {
++        const ref = referenceForModel(model);
++        spec[ref] = {
++          isList: true,
++          kind: ref,
++          namespace,
++          optional: true,
++        };
++      });
++    }
++
++    return spec;
++  }, [namespace, channelsLoaded, channels]);
++
++  const watchedResources = useK8sWatchResources<Record<string, K8sResourceKind[]>>(watchSpec);
++
++  // Transform watched resources to expected format
++  const resourcesData = useMemo(() => {
++    const result = [];
++
++    // Add broker resources
++    if (watchedResources.brokers) {
++      result.push({
++        data: watchedResources.brokers.data,
++        loaded: watchedResources.brokers.loaded,
++        loadError: watchedResources.brokers.loadError,
++        kind: EventingBrokerModel.kind,
++      });
++    }
++
++    // Add dynamic channel resources
++    if (channelsLoaded && channels.length > 0) {
++      channels.forEach((model) => {
++        const ref = referenceForModel(model);
++        if (watchedResources[ref]) {
++          result.push({
++            data: watchedResources[ref].data,
++            loaded: watchedResources[ref].loaded,
++            loadError: watchedResources[ref].loadError,
++            kind: model.kind,
++          });
++        }
++      });
++    }
++
++    return result;
++  }, [watchedResources, channelsLoaded, channels]);
+ 
+   const autocompleteFilter = (strText: string, item: ReactElement): boolean =>
+     fuzzy(strText, item?.props?.name);
+   const fieldId = getFieldId('source-name', 'dropdown');
+   const onChange = useCallback(
+-    (selectedValue, valueObj) => {
++    (_selectedValue, valueObj) => {
+       const modelData = valueObj?.props?.model;
+       const name = valueObj?.props?.name;
+       if (name && modelData) {
+diff --git a/frontend/packages/knative-plugin/src/components/add/event-sources/form-fields/SinkResources.tsx b/frontend/packages/knative-plugin/src/components/add/event-sources/form-fields/SinkResources.tsx
+index 29fda5d4552..4ef551cafcf 100644
+--- a/frontend/packages/knative-plugin/src/components/add/event-sources/form-fields/SinkResources.tsx
++++ b/frontend/packages/knative-plugin/src/components/add/event-sources/form-fields/SinkResources.tsx
+@@ -1,5 +1,5 @@
+ import type { FC, ReactElement } from 'react';
+-import { useState, useCallback } from 'react';
++import { useState, useCallback, useMemo } from 'react';
+ import {
+   FormGroup,
+   Alert,
+@@ -12,15 +12,18 @@ import { useFormikContext, useField } from 'formik';
+ import * as fuzzy from 'fuzzysearch';
+ import { isEmpty } from 'lodash';
+ import { useTranslation } from 'react-i18next';
++import type { WatchK8sResource } from '@console/dynamic-plugin-sdk';
++import { useK8sWatchResources } from '@console/internal/components/utils/k8s-watch-hook';
++import { ServiceModel } from '@console/internal/models';
+ import type { K8sResourceKind } from '@console/internal/module/k8s';
++import { referenceForModel } from '@console/internal/module/k8s';
+ import { getFieldId, ResourceDropdownField } from '@console/shared';
+-import { getDynamicChannelResourceList } from '../../../../utils/fetch-dynamic-eventsources-utils';
+ import {
+-  knativeServingResourcesServices,
+-  knativeEventingResourcesBroker,
+-  k8sServices,
+-  knativeKafkaSinks,
+-} from '../../../../utils/get-knative-resources';
++  ServiceModel as KnativeServiceModel,
++  EventingBrokerModel,
++  KafkaSinkModel,
++} from '../../../../models';
++import { useChannelModels } from '../../../../utils/fetch-dynamic-eventsources-utils';
+ import { craftResourceKey } from '../../../pub-sub/pub-sub-utils';
+ import { SinkType } from '../../import-types';
+ 
+@@ -62,13 +65,112 @@ const SinkResources: FC<SinkResourcesProps> = ({ namespace, isMoveSink }) => {
+     [setFieldValue, setFieldTouched, validateForm],
+   );
+   const contextAvailable = isMoveSink ? false : !!initialValues.formData.sink.name;
+-  const resourcesData = [
+-    ...k8sServices(namespace),
+-    ...knativeServingResourcesServices(namespace),
+-    ...getDynamicChannelResourceList(namespace),
+-    ...knativeEventingResourcesBroker(namespace),
+-    ...knativeKafkaSinks(namespace),
+-  ];
++
++  // Get dynamic channel models
++  const { loaded: channelsLoaded, eventSourceChannels: channels } = useChannelModels();
++
++  // Build watch spec for static resources
++  const watchSpec = useMemo(() => {
++    const spec: Record<string, WatchK8sResource> = {
++      services: {
++        isList: true,
++        kind: referenceForModel(ServiceModel),
++        namespace,
++        optional: true,
++      },
++      ksservices: {
++        isList: true,
++        kind: referenceForModel(KnativeServiceModel),
++        namespace,
++        optional: true,
++      },
++      brokers: {
++        isList: true,
++        kind: referenceForModel(EventingBrokerModel),
++        namespace,
++        optional: true,
++      },
++      kafkasinks: {
++        isList: true,
++        kind: referenceForModel(KafkaSinkModel),
++        namespace,
++        optional: true,
++      },
++    };
++
++    // Add dynamic channels when loaded
++    if (channelsLoaded && channels.length > 0) {
++      channels.forEach((model) => {
++        const ref = referenceForModel(model);
++        spec[ref] = {
++          isList: true,
++          kind: ref,
++          namespace,
++          optional: true,
++        };
++      });
++    }
++
++    return spec;
++  }, [namespace, channelsLoaded, channels]);
++
++  const watchedResources = useK8sWatchResources<Record<string, K8sResourceKind[]>>(watchSpec);
++
++  // Transform watched resources to expected format
++  const resourcesData = useMemo(() => {
++    const result = [];
++
++    // Add static resources
++    if (watchedResources.services) {
++      result.push({
++        data: watchedResources.services.data,
++        loaded: watchedResources.services.loaded,
++        loadError: watchedResources.services.loadError,
++        kind: referenceForModel(ServiceModel),
++      });
++    }
++    if (watchedResources.ksservices) {
++      result.push({
++        data: watchedResources.ksservices.data,
++        loaded: watchedResources.ksservices.loaded,
++        loadError: watchedResources.ksservices.loadError,
++        kind: referenceForModel(KnativeServiceModel),
++      });
++    }
++    if (watchedResources.brokers) {
++      result.push({
++        data: watchedResources.brokers.data,
++        loaded: watchedResources.brokers.loaded,
++        loadError: watchedResources.brokers.loadError,
++        kind: referenceForModel(EventingBrokerModel),
++      });
++    }
++    if (watchedResources.kafkasinks) {
++      result.push({
++        data: watchedResources.kafkasinks.data,
++        loaded: watchedResources.kafkasinks.loaded,
++        loadError: watchedResources.kafkasinks.loadError,
++        kind: referenceForModel(KafkaSinkModel),
++      });
++    }
++
++    // Add dynamic channel resources
++    if (channelsLoaded && channels.length > 0) {
++      channels.forEach((model) => {
++        const ref = referenceForModel(model);
++        if (watchedResources[ref]) {
++          result.push({
++            data: watchedResources[ref].data,
++            loaded: watchedResources[ref].loaded,
++            loadError: watchedResources[ref].loadError,
++            kind: ref,
++          });
++        }
++      });
++    }
++
++    return result;
++  }, [watchedResources, channelsLoaded, channels]);
+ 
+   const handleOnLoad = (resourceList: { [key: string]: string }) => {
+     if (isEmpty(resourceList)) {
+diff --git a/frontend/packages/knative-plugin/src/components/add/event-sources/form-fields/__tests__/SinkResources.spec.tsx b/frontend/packages/knative-plugin/src/components/add/event-sources/form-fields/__tests__/SinkResources.spec.tsx
+index e113ab60a72..43db5cb66ab 100644
+--- a/frontend/packages/knative-plugin/src/components/add/event-sources/form-fields/__tests__/SinkResources.spec.tsx
++++ b/frontend/packages/knative-plugin/src/components/add/event-sources/form-fields/__tests__/SinkResources.spec.tsx
+@@ -1,9 +1,18 @@
+-import { render } from '@testing-library/react';
+-import * as coFetchModule from '@console/dynamic-plugin-sdk/src/utils/fetch/console-fetch';
+-import { mockChannelCRDData } from '../../../../../utils/__mocks__/dynamic-channels-crd-mock';
+-import { fetchChannelsCrd } from '../../../../../utils/fetch-dynamic-eventsources-utils';
++import { useK8sWatchResources } from '@console/internal/components/utils/k8s-watch-hook';
++import { renderWithProviders } from '@console/shared/src/test-utils/unit-test-utils';
+ import SinkResources from '../SinkResources';
+ 
++// Mock PatternFly topology to prevent console warnings during tests
++jest.mock('@patternfly/react-topology', () => ({}));
++
++jest.mock('@console/internal/components/utils/k8s-watch-hook', () => ({
++  useK8sWatchResources: jest.fn(),
++}));
++
++jest.mock('../../../../../utils/fetch-dynamic-eventsources-utils', () => ({
++  useChannelModels: jest.fn(() => ({ loaded: true, eventSourceChannels: [] })),
++}));
++
+ jest.mock('@console/shared', () => ({
+   ResourceDropdownField: 'ResourceDropdownField',
+   getFieldId: jest.fn(() => 'mocked-field-id'),
+@@ -15,23 +24,20 @@ jest.mock('formik', () => ({
+     initialValues: {
+       formData: { sink: { name: 'test' } },
+     },
++    setFieldValue: jest.fn(),
++    setFieldTouched: jest.fn(),
++    validateForm: jest.fn(),
+   })),
+ }));
+ 
+-jest.mock('@console/dynamic-plugin-sdk/src/utils/fetch/console-fetch', () => ({
+-  ...jest.requireActual('@console/dynamic-plugin-sdk/src/utils/fetch/console-fetch'),
+-  consoleFetch: jest.fn(),
+-}));
+-
+-const consoleFetchMock = coFetchModule.consoleFetch as jest.Mock;
+-
+ describe('SinkResources', () => {
+   beforeEach(() => {
+-    consoleFetchMock.mockImplementation(() =>
+-      Promise.resolve({
+-        json: () => mockChannelCRDData,
+-      }),
+-    );
++    (useK8sWatchResources as jest.Mock).mockReturnValue({
++      services: { data: [], loaded: true, loadError: null },
++      ksservices: { data: [], loaded: true, loadError: null },
++      brokers: { data: [], loaded: true, loadError: null },
++      kafkasinks: { data: [], loaded: true, loadError: null },
++    });
+   });
+ 
+   afterEach(() => {
+@@ -39,14 +45,13 @@ describe('SinkResources', () => {
+   });
+ 
+   it('should be able to sink to k8s service', () => {
+-    const { container } = render(<SinkResources isMoveSink namespace="test" />);
++    const { container } = renderWithProviders(<SinkResources isMoveSink namespace="test" />);
+     const resourceDropdownField = container.querySelector('ResourceDropdownField');
+     expect(resourceDropdownField).toBeInTheDocument();
+   });
+ 
+   it('should be able to sink to knative service, broker, k8s service and channels', async () => {
+-    await fetchChannelsCrd();
+-    const { container } = render(<SinkResources isMoveSink namespace="test" />);
++    const { container } = renderWithProviders(<SinkResources isMoveSink namespace="test" />);
+     const resourceDropdownField = container.querySelector('ResourceDropdownField');
+     expect(resourceDropdownField).toBeInTheDocument();
+   });
+diff --git a/frontend/packages/knative-plugin/src/components/dropdowns/ServiceAccountDropdown.tsx b/frontend/packages/knative-plugin/src/components/dropdowns/ServiceAccountDropdown.tsx
+index 2acafbc33ce..c5be7a373df 100644
+--- a/frontend/packages/knative-plugin/src/components/dropdowns/ServiceAccountDropdown.tsx
++++ b/frontend/packages/knative-plugin/src/components/dropdowns/ServiceAccountDropdown.tsx
+@@ -1,8 +1,11 @@
+ import type { FC } from 'react';
++import { useMemo } from 'react';
+ import * as fuzzy from 'fuzzysearch';
+ import { useTranslation } from 'react-i18next';
+ import { connect } from 'react-redux';
++import { useK8sWatchResource } from '@console/internal/components/utils/k8s-watch-hook';
+ import { ServiceAccountModel } from '@console/internal/models';
++import type { K8sResourceKind } from '@console/internal/module/k8s';
+ import { getActiveNamespace } from '@console/internal/reducers/ui';
+ import type { RootState } from '@console/internal/redux';
+ import { ResourceDropdownField } from '@console/shared';
+@@ -24,15 +27,26 @@ const ServiceAccountDropdown: FC<ServiceAccountDropdownProps & StateProps> = ({
+ }) => {
+   const { t } = useTranslation();
+   const autocompleteFilter = (strText, item): boolean => fuzzy(strText, item?.props?.name);
+-  const resources = [
+-    {
+-      isList: true,
+-      kind: ServiceAccountModel.kind,
+-      namespace,
+-      prop: ServiceAccountModel.id,
+-      optional: true,
+-    },
+-  ];
++
++  const [saData, saLoaded, saLoadError] = useK8sWatchResource<K8sResourceKind[]>({
++    isList: true,
++    kind: ServiceAccountModel.kind,
++    namespace,
++    optional: true,
++  });
++
++  const resources = useMemo(
++    () => [
++      {
++        data: saData,
++        loaded: saLoaded,
++        loadError: saLoadError,
++        kind: ServiceAccountModel.kind,
++      },
++    ],
++    [saData, saLoaded, saLoadError],
++  );
++
+   return (
+     <ResourceDropdownField
+       name={name}
+diff --git a/frontend/packages/knative-plugin/src/components/pub-sub/form-fields/PubSubSubscriber.tsx b/frontend/packages/knative-plugin/src/components/pub-sub/form-fields/PubSubSubscriber.tsx
+index 0a02f6a7225..d926e701e80 100644
+--- a/frontend/packages/knative-plugin/src/components/pub-sub/form-fields/PubSubSubscriber.tsx
++++ b/frontend/packages/knative-plugin/src/components/pub-sub/form-fields/PubSubSubscriber.tsx
+@@ -1,5 +1,5 @@
+ import type { FC } from 'react';
+-import { useState, useCallback, useEffect } from 'react';
++import { useState, useCallback, useEffect, useMemo } from 'react';
+ import { FormGroup, Alert } from '@patternfly/react-core';
+ import type { FormikValues } from 'formik';
+ import { useFormikContext } from 'formik';
+@@ -7,10 +7,13 @@ import * as fuzzy from 'fuzzysearch';
+ import * as _ from 'lodash';
+ import { Trans, useTranslation } from 'react-i18next';
+ import { Link } from 'react-router';
++import { useK8sWatchResources } from '@console/internal/components/utils/k8s-watch-hook';
++import { ServiceModel } from '@console/internal/models';
+ import type { K8sResourceKind } from '@console/internal/module/k8s';
++import { referenceForModel } from '@console/internal/module/k8s';
+ import { getFieldId } from '@console/shared/src/components/formik-fields/field-utils';
+ import ResourceDropdownField from '@console/shared/src/components/formik-fields/ResourceDropdownField';
+-import { getSinkableResources } from '../../../utils/get-knative-resources';
++import { ServiceModel as KnativeServiceModel, KafkaSinkModel } from '../../../models';
+ import { craftResourceKey } from '../pub-sub-utils';
+ 
+ type PubSubSubscriberProps = {
+@@ -55,6 +58,77 @@ const PubSubSubscriber: FC<PubSubSubscriberProps> = ({ autoSelect = true, cancel
+     setResourceAlert(_.isEmpty(resourceList));
+   };
+ 
++  const watchSpec = useMemo(
++    () =>
++      namespace
++        ? {
++            services: {
++              isList: true,
++              kind: referenceForModel(ServiceModel),
++              namespace,
++              optional: true,
++            },
++            ksservices: {
++              isList: true,
++              kind: referenceForModel(KnativeServiceModel),
++              namespace,
++              optional: true,
++            },
++            kafkasinks: {
++              isList: true,
++              kind: referenceForModel(KafkaSinkModel),
++              namespace,
++              optional: true,
++            },
++          }
++        : {},
++    [namespace],
++  );
++
++  const watchedResources = useK8sWatchResources<{
++    services?: K8sResourceKind[];
++    ksservices?: K8sResourceKind[];
++    kafkasinks?: K8sResourceKind[];
++  }>(watchSpec);
++
++  const resources = useMemo(
++    () =>
++      namespace
++        ? [
++            {
++              data: watchedResources.services?.data,
++              loaded: watchedResources.services?.loaded,
++              loadError: watchedResources.services?.loadError,
++              kind: referenceForModel(ServiceModel),
++            },
++            {
++              data: watchedResources.ksservices?.data,
++              loaded: watchedResources.ksservices?.loaded,
++              loadError: watchedResources.ksservices?.loadError,
++              kind: referenceForModel(KnativeServiceModel),
++            },
++            {
++              data: watchedResources.kafkasinks?.data,
++              loaded: watchedResources.kafkasinks?.loaded,
++              loadError: watchedResources.kafkasinks?.loadError,
++              kind: referenceForModel(KafkaSinkModel),
++            },
++          ]
++        : [],
++    [
++      namespace,
++      watchedResources.services?.data,
++      watchedResources.services?.loaded,
++      watchedResources.services?.loadError,
++      watchedResources.ksservices?.data,
++      watchedResources.ksservices?.loaded,
++      watchedResources.ksservices?.loadError,
++      watchedResources.kafkasinks?.data,
++      watchedResources.kafkasinks?.loaded,
++      watchedResources.kafkasinks?.loadError,
++    ],
++  );
++
+   // filter out resource which are owned by other resource
+   const resourceFilter = ({ metadata }: K8sResourceKind) => !metadata?.ownerReferences?.length;
+ 
+@@ -85,7 +159,7 @@ const PubSubSubscriber: FC<PubSubSubscriberProps> = ({ autoSelect = true, cancel
+       )}
+       <ResourceDropdownField
+         name="formData.spec.subscriber.ref.name"
+-        resources={getSinkableResources(namespace)}
++        resources={resources}
+         dataSelector={['metadata', 'name']}
+         fullWidth
+         required
+diff --git a/frontend/packages/knative-plugin/src/components/sink-pubsub/SinkPubsub.tsx b/frontend/packages/knative-plugin/src/components/sink-pubsub/SinkPubsub.tsx
+index 1ac83fdfe2d..ff2c5d9b865 100644
+--- a/frontend/packages/knative-plugin/src/components/sink-pubsub/SinkPubsub.tsx
++++ b/frontend/packages/knative-plugin/src/components/sink-pubsub/SinkPubsub.tsx
+@@ -1,10 +1,13 @@
+ import type { FC } from 'react';
++import { useMemo } from 'react';
+ import type { FormikValues, FormikHelpers } from 'formik';
+ import { Formik } from 'formik';
+ import { useTranslation } from 'react-i18next';
++import { useK8sWatchResources } from '@console/internal/components/utils/k8s-watch-hook';
++import { ServiceModel } from '@console/internal/models';
+ import type { K8sResourceKind } from '@console/internal/module/k8s';
+-import { k8sUpdate, referenceFor, modelFor } from '@console/internal/module/k8s';
+-import { getSinkableResources } from '../../utils/get-knative-resources';
++import { k8sUpdate, referenceFor, modelFor, referenceForModel } from '@console/internal/module/k8s';
++import { ServiceModel as KsServiceModel, KafkaSinkModel } from '../../models';
+ import { craftResourceKey, sanitizeResourceName } from '../pub-sub/pub-sub-utils';
+ import SinkPubsubModal from './SinkPubsubModal';
+ 
+@@ -33,6 +36,77 @@ const SinkPubsub: FC<SinkPubsubProps> = ({ source, resourceType, cancel, close }
+     },
+   };
+ 
++  const watchSpec = useMemo(
++    () =>
++      namespace
++        ? {
++            services: {
++              isList: true,
++              kind: referenceForModel(ServiceModel),
++              namespace,
++              optional: true,
++            },
++            ksservices: {
++              isList: true,
++              kind: referenceForModel(KsServiceModel),
++              namespace,
++              optional: true,
++            },
++            kafkasinks: {
++              isList: true,
++              kind: referenceForModel(KafkaSinkModel),
++              namespace,
++              optional: true,
++            },
++          }
++        : {},
++    [namespace],
++  );
++
++  const watchedResources = useK8sWatchResources<{
++    services?: K8sResourceKind[];
++    ksservices?: K8sResourceKind[];
++    kafkasinks?: K8sResourceKind[];
++  }>(watchSpec);
++
++  const resourceDropdown = useMemo(
++    () =>
++      namespace
++        ? [
++            {
++              data: watchedResources.services?.data,
++              loaded: watchedResources.services?.loaded,
++              loadError: watchedResources.services?.loadError,
++              kind: referenceForModel(ServiceModel),
++            },
++            {
++              data: watchedResources.ksservices?.data,
++              loaded: watchedResources.ksservices?.loaded,
++              loadError: watchedResources.ksservices?.loadError,
++              kind: referenceForModel(KsServiceModel),
++            },
++            {
++              data: watchedResources.kafkasinks?.data,
++              loaded: watchedResources.kafkasinks?.loaded,
++              loadError: watchedResources.kafkasinks?.loadError,
++              kind: referenceForModel(KafkaSinkModel),
++            },
++          ]
++        : [],
++    [
++      namespace,
++      watchedResources.services?.data,
++      watchedResources.services?.loaded,
++      watchedResources.services?.loadError,
++      watchedResources.ksservices?.data,
++      watchedResources.ksservices?.loaded,
++      watchedResources.ksservices?.loadError,
++      watchedResources.kafkasinks?.data,
++      watchedResources.kafkasinks?.loaded,
++      watchedResources.kafkasinks?.loadError,
++    ],
++  );
++
+   const handleSubmit = (values: FormikValues, action: FormikHelpers<FormikValues>) => {
+     const updatePayload = sanitizeResourceName({
+       ...source,
+@@ -62,7 +136,7 @@ const SinkPubsub: FC<SinkPubsubProps> = ({ source, resourceType, cancel, close }
+         <SinkPubsubModal
+           {...formikProps}
+           resourceName={name}
+-          resourceDropdown={getSinkableResources(namespace)}
++          resourceDropdown={resourceDropdown}
+           labelTitle={t('knative-plugin~Move {{kind}}', { kind: resourceType })}
+           cancel={cancel}
+         />
+diff --git a/frontend/packages/knative-plugin/src/components/sink-pubsub/SinkPubsubModal.tsx b/frontend/packages/knative-plugin/src/components/sink-pubsub/SinkPubsubModal.tsx
+index 7d535692529..cbe20343bb5 100644
+--- a/frontend/packages/knative-plugin/src/components/sink-pubsub/SinkPubsubModal.tsx
++++ b/frontend/packages/knative-plugin/src/components/sink-pubsub/SinkPubsubModal.tsx
+@@ -5,14 +5,14 @@ import type { FormikProps, FormikValues } from 'formik';
+ import * as fuzzy from 'fuzzysearch';
+ import { Trans, useTranslation } from 'react-i18next';
+ import FormSection from '@console/dev-console/src/components/import/section/FormSection';
+-import type { FirehoseResource } from '@console/internal/components/utils';
++import type { FirehoseResult } from '@console/internal/components/utils/types';
+ import { ResourceDropdownField } from '@console/shared';
+ import { ModalFooterWithAlerts } from '@console/shared/src/components/modals/ModalFooterWithAlerts';
+ import { craftResourceKey } from '../pub-sub/pub-sub-utils';
+ 
+ export interface SinkPubsubModalProps {
+   resourceName: string;
+-  resourceDropdown: FirehoseResource[];
++  resourceDropdown: FirehoseResult[];
+   labelTitle: string;
+   cancel?: () => void;
+ }
+diff --git a/frontend/packages/knative-plugin/src/components/sink-pubsub/__tests__/SinkPubsub.spec.tsx b/frontend/packages/knative-plugin/src/components/sink-pubsub/__tests__/SinkPubsub.spec.tsx
+index 1e683ffdede..24b78f4fba7 100644
+--- a/frontend/packages/knative-plugin/src/components/sink-pubsub/__tests__/SinkPubsub.spec.tsx
++++ b/frontend/packages/knative-plugin/src/components/sink-pubsub/__tests__/SinkPubsub.spec.tsx
+@@ -28,8 +28,12 @@ jest.mock('@console/internal/module/k8s', () => ({
+   },
+ }));
+ 
+-jest.mock('../../../utils/get-knative-resources', () => ({
+-  getSinkableResources: jest.fn(),
++jest.mock('@console/internal/components/utils/k8s-watch-hook', () => ({
++  useK8sWatchResources: jest.fn(() => ({
++    services: { data: [], loaded: true, loadError: undefined },
++    ksservices: { data: [], loaded: true, loadError: undefined },
++    kafkasinks: { data: [], loaded: true, loadError: undefined },
++  })),
+ }));
+ 
+ jest.mock('../../pub-sub/pub-sub-utils', () => ({
+diff --git a/frontend/packages/shipwright-plugin/src/components/build-form/PVCDropdown.tsx b/frontend/packages/shipwright-plugin/src/components/build-form/PVCDropdown.tsx
+index 8cab5e40f6b..89c056a3fdf 100644
+--- a/frontend/packages/shipwright-plugin/src/components/build-form/PVCDropdown.tsx
++++ b/frontend/packages/shipwright-plugin/src/components/build-form/PVCDropdown.tsx
+@@ -1,7 +1,11 @@
+ import type { FC } from 'react';
++import { useMemo } from 'react';
+ import * as fuzzy from 'fuzzysearch';
+ import { useTranslation } from 'react-i18next';
++import { useK8sWatchResources } from '@console/internal/components/utils/k8s-watch-hook';
+ import { PersistentVolumeClaimModel } from '@console/internal/models';
++import type { PersistentVolumeClaimKind } from '@console/internal/module/k8s';
++import { referenceForModel } from '@console/internal/module/k8s';
+ import { ResourceDropdownField } from '@console/shared';
+ 
+ interface PVCDropdownProps {
+@@ -12,15 +16,28 @@ interface PVCDropdownProps {
+ const PVCDropdown: FC<PVCDropdownProps> = ({ name, namespace }) => {
+   const { t } = useTranslation();
+   const autocompleteFilter = (strText, item): boolean => fuzzy(strText, item?.props?.name);
+-  const resources = [
+-    {
++
++  const watchedResources = useK8sWatchResources<{ pvcs: PersistentVolumeClaimKind[] }>({
++    pvcs: {
+       isList: true,
+-      kind: PersistentVolumeClaimModel.kind,
++      kind: referenceForModel(PersistentVolumeClaimModel),
+       namespace,
+-      prop: PersistentVolumeClaimModel.id,
+       optional: true,
+     },
+-  ];
++  });
++
++  const resources = useMemo(
++    () => [
++      {
++        data: watchedResources.pvcs?.data,
++        loaded: watchedResources.pvcs?.loaded,
++        loadError: watchedResources.pvcs?.loadError,
++        kind: PersistentVolumeClaimModel.kind,
++      },
++    ],
++    [watchedResources.pvcs?.data, watchedResources.pvcs?.loaded, watchedResources.pvcs?.loadError],
++  );
++
+   return (
+     <ResourceDropdownField
+       name={name}
+diff --git a/frontend/packages/shipwright-plugin/src/components/build-form/SecretDropdown.tsx b/frontend/packages/shipwright-plugin/src/components/build-form/SecretDropdown.tsx
+index f9e65862416..aa51fcd475d 100644
+--- a/frontend/packages/shipwright-plugin/src/components/build-form/SecretDropdown.tsx
++++ b/frontend/packages/shipwright-plugin/src/components/build-form/SecretDropdown.tsx
+@@ -1,7 +1,11 @@
+ import type { FC } from 'react';
++import { useMemo } from 'react';
+ import * as fuzzy from 'fuzzysearch';
+ import { useTranslation } from 'react-i18next';
++import { useK8sWatchResources } from '@console/internal/components/utils/k8s-watch-hook';
+ import { SecretModel } from '@console/internal/models';
++import type { SecretKind } from '@console/internal/module/k8s';
++import { referenceForModel } from '@console/internal/module/k8s';
+ import { ResourceDropdownField } from '@console/shared';
+ 
+ interface SecretDropdownProps {
+@@ -12,15 +16,32 @@ interface SecretDropdownProps {
+ const SecretDropdown: FC<SecretDropdownProps> = ({ name, namespace }) => {
+   const { t } = useTranslation();
+   const autocompleteFilter = (strText, item): boolean => fuzzy(strText, item?.props?.name);
+-  const resources = [
+-    {
++
++  const watchedResources = useK8sWatchResources<{ secrets: SecretKind[] }>({
++    secrets: {
+       isList: true,
+-      kind: SecretModel.kind,
++      kind: referenceForModel(SecretModel),
+       namespace,
+-      prop: SecretModel.id,
+       optional: true,
+     },
+-  ];
++  });
++
++  const resources = useMemo(
++    () => [
++      {
++        data: watchedResources.secrets?.data,
++        loaded: watchedResources.secrets?.loaded,
++        loadError: watchedResources.secrets?.loadError,
++        kind: SecretModel.kind,
++      },
++    ],
++    [
++      watchedResources.secrets?.data,
++      watchedResources.secrets?.loaded,
++      watchedResources.secrets?.loadError,
++    ],
++  );
++
+   return (
+     <ResourceDropdownField
+       name={name}
+diff --git a/frontend/packages/webterminal-plugin/src/components/cloud-shell/setup/NamespaceSection.tsx b/frontend/packages/webterminal-plugin/src/components/cloud-shell/setup/NamespaceSection.tsx
+index 153b450b34e..8b1abb6e4ff 100644
+--- a/frontend/packages/webterminal-plugin/src/components/cloud-shell/setup/NamespaceSection.tsx
++++ b/frontend/packages/webterminal-plugin/src/components/cloud-shell/setup/NamespaceSection.tsx
+@@ -1,11 +1,14 @@
+ import type { FC } from 'react';
+-import { useCallback } from 'react';
++import { useCallback, useMemo } from 'react';
+ import { TextInputTypes } from '@patternfly/react-core';
+ import type { FormikValues } from 'formik';
+ import { useFormikContext, useField } from 'formik';
+ import * as _ from 'lodash';
+ import { useTranslation } from 'react-i18next';
++import { useK8sWatchResources } from '@console/internal/components/utils/k8s-watch-hook';
+ import { ProjectModel } from '@console/internal/models';
++import type { K8sResourceKind } from '@console/internal/module/k8s';
++import { referenceForModel } from '@console/internal/module/k8s';
+ import type { WithFlagsProps } from '@console/internal/reducers/connectToFlags';
+ import { connectToFlags } from '@console/internal/reducers/connectToFlags';
+ import { InputField, ResourceDropdownField, FLAGS } from '@console/shared';
+@@ -33,6 +36,29 @@ const NamespaceSection: FC<NamespaceSectionProps> = ({ flags }) => {
+     [setFieldValue, setFieldTouched],
+   );
+ 
++  const watchedResources = useK8sWatchResources<{ projects: K8sResourceKind[] }>({
++    projects: {
++      isList: true,
++      kind: referenceForModel(ProjectModel),
++    },
++  });
++
++  const resources = useMemo(
++    () => [
++      {
++        data: watchedResources.projects.data,
++        loaded: watchedResources.projects.loaded,
++        loadError: watchedResources.projects.loadError,
++        kind: ProjectModel.kind,
++      },
++    ],
++    [
++      watchedResources.projects.data,
++      watchedResources.projects.loaded,
++      watchedResources.projects.loadError,
++    ],
++  );
++
+   const handleOnLoad = (projectList: { [key: string]: string }) => {
+     const noProjects = _.isEmpty(projectList);
+     if (noProjects || !projectList[namespace.value]) {
+@@ -55,13 +81,7 @@ const NamespaceSection: FC<NamespaceSectionProps> = ({ flags }) => {
+         fullWidth
+         required
+         selectedKey={namespace.value}
+-        resources={[
+-          {
+-            isList: true,
+-            kind: ProjectModel.kind,
+-            prop: ProjectModel.id,
+-          },
+-        ]}
++        resources={resources}
+         dataSelector={['metadata', 'name']}
+         onChange={onDropdownChange}
+         actionItems={
+diff --git a/frontend/packages/webterminal-plugin/src/components/cloud-shell/setup/__tests__/NamespaceSection.spec.tsx b/frontend/packages/webterminal-plugin/src/components/cloud-shell/setup/__tests__/NamespaceSection.spec.tsx
+index 44d3b8466be..ab68d9c6e10 100644
+--- a/frontend/packages/webterminal-plugin/src/components/cloud-shell/setup/__tests__/NamespaceSection.spec.tsx
++++ b/frontend/packages/webterminal-plugin/src/components/cloud-shell/setup/__tests__/NamespaceSection.spec.tsx
+@@ -1,9 +1,16 @@
+-import { render, screen } from '@testing-library/react';
++import { screen } from '@testing-library/react';
+ import { useFormikContext, useField } from 'formik';
+ import { FLAGS } from '@console/shared';
++import { renderWithProviders } from '@console/shared/src/test-utils/unit-test-utils';
+ import { CREATE_NAMESPACE_KEY } from '../cloud-shell-setup-utils';
+ import { InternalNamespaceSection } from '../NamespaceSection';
+ 
++jest.mock('@console/internal/components/utils/k8s-watch-hook', () => ({
++  useK8sWatchResources: jest.fn(() => ({
++    projects: { data: [], loaded: true, loadError: null },
++  })),
++}));
++
+ jest.mock('formik', () => {
+   const context = {
+     setFieldValue: jest.fn(),
+@@ -58,13 +65,13 @@ describe('NamespaceSection', () => {
+ 
+   it('should display InputField when creating namespace', () => {
+     (useField as jest.Mock).mockImplementationOnce(() => [{ value: CREATE_NAMESPACE_KEY }, {}]);
+-    render(<InternalNamespaceSection flags={canCreateFlags} />);
++    renderWithProviders(<InternalNamespaceSection flags={canCreateFlags} />);
+ 
+     expect(screen.getByText('InputField newNamespace')).toBeVisible();
+   });
+ 
+   it('should switch to create namespace mode when there are no projects', () => {
+-    render(<InternalNamespaceSection flags={canCreateFlags} />);
++    renderWithProviders(<InternalNamespaceSection flags={canCreateFlags} />);
+ 
+     // Trigger onLoad with empty project list
+     mockCallbacks.onLoad?.({});
+@@ -78,7 +85,7 @@ describe('NamespaceSection', () => {
+   it('should switch from active namespace to no namespace when no projects and user cannot create a project', () => {
+     (useField as jest.Mock).mockReturnValueOnce([{ value: 'test-namespace' }, {}]);
+ 
+-    render(<InternalNamespaceSection flags={noFlags} />);
++    renderWithProviders(<InternalNamespaceSection flags={noFlags} />);
+ 
+     // Trigger onLoad with empty project list
+     mockCallbacks.onLoad?.({});
+@@ -87,7 +94,7 @@ describe('NamespaceSection', () => {
+   });
+ 
+   it('should update namespace value when dropdown changes', () => {
+-    render(<InternalNamespaceSection flags={canCreateFlags} />);
++    renderWithProviders(<InternalNamespaceSection flags={canCreateFlags} />);
+ 
+     // Trigger onChange
+     mockCallbacks.onChange?.('test');
+@@ -96,14 +103,14 @@ describe('NamespaceSection', () => {
+   });
+ 
+   it('should include create project action when user can create a project', () => {
+-    render(<InternalNamespaceSection flags={canCreateFlags} />);
++    renderWithProviders(<InternalNamespaceSection flags={canCreateFlags} />);
+ 
+     expect(mockCallbacks.actionItems).toBeDefined();
+     expect(mockCallbacks.actionItems?.[0]?.actionKey).toBe(CREATE_NAMESPACE_KEY);
+   });
+ 
+   it('should omit create project action when user cannot create a project', () => {
+-    render(<InternalNamespaceSection flags={noFlags} />);
++    renderWithProviders(<InternalNamespaceSection flags={noFlags} />);
+ 
+     expect(mockCallbacks.actionItems).toBeUndefined();
+   });

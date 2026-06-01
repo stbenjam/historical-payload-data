@@ -1,0 +1,1217 @@
+diff --git a/pkg/asset/installconfig/aws/route53.go b/pkg/asset/installconfig/aws/route53.go
+index d787fa742c7..1bb6cccd97c 100644
+--- a/pkg/asset/installconfig/aws/route53.go
++++ b/pkg/asset/installconfig/aws/route53.go
+@@ -191,39 +191,59 @@ type CreateRecordInput struct {
+ 	ZoneID string
+ 	// ID of the Hosted Zone for Alias record.
+ 	AliasZoneID string
++	// Whether to also include an AAAA record.
++	EnableAAAA bool
+ }
+ 
+ // CreateOrUpdateRecord Creates or Updates the Route53 Record for the cluster endpoint.
+ func (c *Route53Client) CreateOrUpdateRecord(ctx context.Context, in *CreateRecordInput) error {
+-	recordSet := &route53types.ResourceRecordSet{
+-		Name: aws.String(in.Name),
+-	}
++	recordSets := []*route53types.ResourceRecordSet{}
++
+ 	if cnameRegions.Has(in.Region) {
+-		recordSet.Type = route53types.RRTypeCname
+-		recordSet.TTL = aws.Int64(10)
+-		recordSet.ResourceRecords = []route53types.ResourceRecord{
+-			{Value: aws.String(in.DNSTarget)},
+-		}
++		recordSets = append(recordSets, &route53types.ResourceRecordSet{
++			Name: aws.String(in.Name),
++			Type: route53types.RRTypeCname,
++			TTL:  aws.Int64(10),
++			ResourceRecords: []route53types.ResourceRecord{
++				{Value: aws.String(in.DNSTarget)},
++			},
++		})
+ 	} else {
+-		recordSet.Type = route53types.RRTypeA
+-		recordSet.AliasTarget = &route53types.AliasTarget{
+-			DNSName:              aws.String(in.DNSTarget),
+-			HostedZoneId:         aws.String(in.AliasZoneID),
+-			EvaluateTargetHealth: false,
++		recordSets = append(recordSets, &route53types.ResourceRecordSet{
++			Name: aws.String(in.Name),
++			Type: route53types.RRTypeA,
++			AliasTarget: &route53types.AliasTarget{
++				DNSName:              aws.String(in.DNSTarget),
++				HostedZoneId:         aws.String(in.AliasZoneID),
++				EvaluateTargetHealth: false,
++			},
++		})
++
++		if in.EnableAAAA {
++			recordSets = append(recordSets, &route53types.ResourceRecordSet{
++				Name: aws.String(in.Name),
++				Type: route53types.RRTypeAaaa,
++				AliasTarget: &route53types.AliasTarget{
++					DNSName:              aws.String(in.DNSTarget),
++					HostedZoneId:         aws.String(in.AliasZoneID),
++					EvaluateTargetHealth: false,
++				},
++			})
+ 		}
+ 	}
++
+ 	input := &route53.ChangeResourceRecordSetsInput{
+ 		HostedZoneId: aws.String(in.ZoneID),
+ 		ChangeBatch: &route53types.ChangeBatch{
+ 			Comment: aws.String(fmt.Sprintf("Creating record %s", in.Name)),
+-			Changes: []route53types.Change{
+-				{
+-					Action:            route53types.ChangeActionUpsert,
+-					ResourceRecordSet: recordSet,
+-				},
+-			},
+ 		},
+ 	}
++	for _, recordSet := range recordSets {
++		input.ChangeBatch.Changes = append(input.ChangeBatch.Changes, route53types.Change{
++			Action:            route53types.ChangeActionUpsert,
++			ResourceRecordSet: recordSet,
++		})
++	}
+ 
+ 	_, err := c.client.ChangeResourceRecordSets(ctx, input)
+ 
+diff --git a/pkg/asset/machines/aws/awsmachines.go b/pkg/asset/machines/aws/awsmachines.go
+index b36e72c8d17..b77da8219d7 100644
+--- a/pkg/asset/machines/aws/awsmachines.go
++++ b/pkg/asset/machines/aws/awsmachines.go
+@@ -22,6 +22,7 @@ import (
+ 	"github.com/openshift/installer/pkg/asset/manifests/capiutils"
+ 	"github.com/openshift/installer/pkg/types"
+ 	awstypes "github.com/openshift/installer/pkg/types/aws"
++	"github.com/openshift/installer/pkg/types/network"
+ )
+ 
+ // MachineInput defines the inputs needed to generate a machine asset.
+@@ -32,6 +33,7 @@ type MachineInput struct {
+ 	Tags           capa.Tags
+ 	PublicIP       bool
+ 	PublicIpv4Pool string
++	IPFamily       network.IPFamily
+ 	Ignition       *capa.Ignition
+ }
+ 
+@@ -122,6 +124,25 @@ func GenerateMachines(clusterID string, in *MachineInput) ([]*asset.RuntimeFile,
+ 			awsMachine.Spec.RootVolume.Throughput = ptr.To(int64(*throughput))
+ 		}
+ 
++		if in.IPFamily.DualStackEnabled() {
++			awsMachine.Spec.PrivateDNSName = &capa.PrivateDNSName{
++				EnableResourceNameDNSAAAARecord: ptr.To(true),
++				EnableResourceNameDNSARecord:    ptr.To(true),
++				// Only resource-name supports A and AAAA records for private host names
++				// See: https://docs.aws.amazon.com/AWSEC2/latest/UserGuide/hostname-types.html#ec2-instance-private-hostnames
++				HostnameType: ptr.To("resource-name"),
++			}
++			awsMachine.Spec.InstanceMetadataOptions.HTTPProtocolIPv6 = capa.InstanceMetadataEndpointStateEnabled
++
++			// AssignPrimaryIPv6 is required for IPv6 primary to register instances to IPv6 target groups
++			switch in.IPFamily {
++			case network.DualStackIPv6Primary:
++				awsMachine.Spec.AssignPrimaryIPv6 = ptr.To(capa.PrimaryIPv6AssignmentStateEnabled)
++			case network.DualStackIPv4Primary:
++				awsMachine.Spec.AssignPrimaryIPv6 = ptr.To(capa.PrimaryIPv6AssignmentStateDisabled)
++			}
++		}
++
+ 		if in.Role == "bootstrap" {
+ 			awsMachine.Name = capiutils.GenerateBoostrapMachineName(clusterID)
+ 			awsMachine.Labels["install.openshift.io/bootstrap"] = ""
+diff --git a/pkg/asset/machines/clusterapi.go b/pkg/asset/machines/clusterapi.go
+index a82ec071e02..fe53170bdba 100644
+--- a/pkg/asset/machines/clusterapi.go
++++ b/pkg/asset/machines/clusterapi.go
+@@ -178,6 +178,7 @@ func (c *ClusterAPI) Generate(ctx context.Context, dependencies asset.Parents) e
+ 			Subnets:  subnets,
+ 			Tags:     tags,
+ 			PublicIP: publicOnlySubnets,
++			IPFamily: ic.AWS.IPFamily,
+ 			Ignition: &v1beta2.Ignition{
+ 				Version: "3.2",
+ 				// master machines should get ignition from the MCS on the bootstrap node
+@@ -212,6 +213,7 @@ func (c *ClusterAPI) Generate(ctx context.Context, dependencies asset.Parents) e
+ 			Subnets:        bootstrapSubnets,
+ 			Pool:           &pool,
+ 			Tags:           tags,
++			IPFamily:       ic.AWS.IPFamily,
+ 			PublicIP:       publicOnlySubnets || (installConfig.Config.Publish == types.ExternalPublishingStrategy),
+ 			PublicIpv4Pool: ic.Platform.AWS.PublicIpv4Pool,
+ 			Ignition:       ignition,
+diff --git a/pkg/asset/manifests/aws/cluster.go b/pkg/asset/manifests/aws/cluster.go
+index 6be52b16748..0baecbf6ce7 100644
+--- a/pkg/asset/manifests/aws/cluster.go
++++ b/pkg/asset/manifests/aws/cluster.go
+@@ -14,6 +14,8 @@ import (
+ 	"github.com/openshift/installer/pkg/asset/installconfig"
+ 	"github.com/openshift/installer/pkg/asset/machines/aws"
+ 	"github.com/openshift/installer/pkg/asset/manifests/capiutils"
++	"github.com/openshift/installer/pkg/ipnet"
++	"github.com/openshift/installer/pkg/types/network"
+ )
+ 
+ // BootstrapSSHDescription is the description for the
+@@ -24,24 +26,32 @@ const BootstrapSSHDescription = "Bootstrap SSH Access"
+ // GenerateClusterAssets generates the manifests for the cluster-api.
+ func GenerateClusterAssets(ic *installconfig.InstallConfig, clusterID *installconfig.ClusterID) (*capiutils.GenerateClusterAssetsOutput, error) {
+ 	manifests := []*asset.RuntimeFile{}
++	platformAWS := ic.Config.AWS
++	enableIPv6 := platformAWS.IPFamily.DualStackEnabled()
+ 
+-	tags, err := aws.CapaTagsFromUserTags(clusterID.InfraID, ic.Config.AWS.UserTags)
++	tags, err := aws.CapaTagsFromUserTags(clusterID.InfraID, platformAWS.UserTags)
+ 	if err != nil {
+ 		return nil, fmt.Errorf("failed to get user tags: %w", err)
+ 	}
+ 
+-	sshRuleCidr := []string{"0.0.0.0/0"}
++	var sshRuleCidrs []ipnet.IPNet
+ 	if !ic.Config.PublicAPI() {
+-		sshRuleCidr = []string{capiutils.CIDRFromInstallConfig(ic).String()}
++		sshRuleCidrs = capiutils.MachineCIDRsFromInstallConfig(ic)
++	} else {
++		sshRuleCidrs = []ipnet.IPNet{*capiutils.AnyIPv4CidrBlock}
++		if enableIPv6 {
++			sshRuleCidrs = append(sshRuleCidrs, *capiutils.AnyIPv6CidrBlock)
++		}
+ 	}
+ 
++	targetGroupIPType := GetTargetGroupIPType(platformAWS.IPFamily)
+ 	awsCluster := &capa.AWSCluster{
+ 		ObjectMeta: metav1.ObjectMeta{
+ 			Name:      clusterID.InfraID,
+ 			Namespace: capiutils.Namespace,
+ 		},
+ 		Spec: capa.AWSClusterSpec{
+-			Region: ic.Config.AWS.Region,
++			Region: platformAWS.Region,
+ 			NetworkSpec: capa.NetworkSpec{
+ 				CNI: &capa.CNISpec{
+ 					CNIIngressRules: capa.CNIIngressRules{
+@@ -142,14 +152,16 @@ func GenerateClusterAssets(ic *installconfig.InstallConfig, clusterID *installco
+ 						SourceSecurityGroupRoles: []capa.SecurityGroupRole{"controlplane", "node"},
+ 					},
+ 					{
+-						Description: BootstrapSSHDescription,
+-						Protocol:    capa.SecurityGroupProtocolTCP,
+-						FromPort:    22,
+-						ToPort:      22,
+-						CidrBlocks:  sshRuleCidr,
++						Description:    BootstrapSSHDescription,
++						Protocol:       capa.SecurityGroupProtocolTCP,
++						FromPort:       22,
++						ToPort:         22,
++						CidrBlocks:     capiutils.CIDRsToString(capiutils.GetIPv4CIDRs(sshRuleCidrs)),
++						IPv6CidrBlocks: capiutils.CIDRsToString(capiutils.GetIPv6CIDRs(sshRuleCidrs)),
+ 					},
+ 				},
+-				NodePortIngressRuleCidrBlocks: []string{capiutils.CIDRFromInstallConfig(ic).String()},
++				// If the installer provisions the VPC, VPC IPv6 CIDR is unknown at install time and added after infraReady
++				NodePortIngressRuleCidrBlocks: capiutils.CIDRsToString(capiutils.MachineCIDRsFromInstallConfig(ic)),
+ 			},
+ 			S3Bucket: &capa.S3Bucket{
+ 				Name:                    GetIgnitionBucketName(clusterID.InfraID),
+@@ -168,6 +180,7 @@ func GenerateClusterAssets(ic *installconfig.InstallConfig, clusterID *installco
+ 					ThresholdCount:          ptr.To[int64](2),
+ 					UnhealthyThresholdCount: ptr.To[int64](2),
+ 				},
++				TargetGroupIPType: targetGroupIPType,
+ 				AdditionalListeners: []capa.AdditionalListenerSpec{
+ 					{
+ 						Port:     22623,
+@@ -181,6 +194,7 @@ func GenerateClusterAssets(ic *installconfig.InstallConfig, clusterID *installco
+ 							ThresholdCount:          ptr.To[int64](2),
+ 							UnhealthyThresholdCount: ptr.To[int64](2),
+ 						},
++						TargetGroupIPType: targetGroupIPType,
+ 					},
+ 				},
+ 				IngressRules: []capa.IngressRule{
+@@ -198,7 +212,20 @@ func GenerateClusterAssets(ic *installconfig.InstallConfig, clusterID *installco
+ 	}
+ 	awsCluster.SetGroupVersionKind(capa.GroupVersion.WithKind("AWSCluster"))
+ 
++	// Create a ingress rule to allow acccess to the API LB.
++	apiLBIngressRule := capa.IngressRule{
++		Description: "Kubernetes API Server traffic",
++		Protocol:    capa.SecurityGroupProtocolTCP,
++		FromPort:    6443,
++		ToPort:      6443,
++		CidrBlocks:  []string{capiutils.AnyIPv4CidrBlock.String()},
++	}
++	if enableIPv6 {
++		apiLBIngressRule.IPv6CidrBlocks = []string{capiutils.AnyIPv6CidrBlock.String()}
++	}
++
+ 	if ic.Config.PublicAPI() {
++		apiLBIngressRule.Description = "Kubernetes API Server traffic for public access"
+ 		awsCluster.Spec.SecondaryControlPlaneLoadBalancer = &capa.AWSLoadBalancerSpec{
+ 			Name:                   ptr.To(clusterID.InfraID + "-ext"),
+ 			LoadBalancerType:       capa.LoadBalancerTypeNLB,
+@@ -211,26 +238,13 @@ func GenerateClusterAssets(ic *installconfig.InstallConfig, clusterID *installco
+ 				ThresholdCount:          ptr.To[int64](2),
+ 				UnhealthyThresholdCount: ptr.To[int64](2),
+ 			},
+-			IngressRules: []capa.IngressRule{
+-				{
+-					Description: "Kubernetes API Server traffic for public access",
+-					Protocol:    capa.SecurityGroupProtocolTCP,
+-					FromPort:    6443,
+-					ToPort:      6443,
+-					CidrBlocks:  []string{"0.0.0.0/0"},
+-				},
+-			},
++			TargetGroupIPType: targetGroupIPType,
++			IngressRules:      []capa.IngressRule{apiLBIngressRule},
+ 		}
+ 	} else {
+ 		awsCluster.Spec.ControlPlaneLoadBalancer.IngressRules = append(
+ 			awsCluster.Spec.ControlPlaneLoadBalancer.IngressRules,
+-			capa.IngressRule{
+-				Description: "Kubernetes API Server traffic",
+-				Protocol:    capa.SecurityGroupProtocolTCP,
+-				FromPort:    6443,
+-				ToPort:      6443,
+-				CidrBlocks:  []string{"0.0.0.0/0"},
+-			},
++			apiLBIngressRule,
+ 		)
+ 	}
+ 
+@@ -292,3 +306,19 @@ func GenerateClusterAssets(ic *installconfig.InstallConfig, clusterID *installco
+ func GetIgnitionBucketName(infraID string) string {
+ 	return fmt.Sprintf("openshift-bootstrap-data-%s", infraID)
+ }
++
++// GetTargetGroupIPType returns the ipType of the target group based on ipFamily.
++func GetTargetGroupIPType(ipFamily network.IPFamily) *capa.TargetGroupIPType {
++	var tgIPType capa.TargetGroupIPType
++	switch ipFamily {
++	case network.DualStackIPv6Primary:
++		tgIPType = capa.TargetGroupIPTypeIPv6
++	case network.DualStackIPv4Primary:
++		tgIPType = capa.TargetGroupIPTypeIPv4
++	default:
++		// Default to IPv4 if not specified or invalid
++		tgIPType = capa.TargetGroupIPTypeIPv4
++	}
++
++	return &tgIPType
++}
+diff --git a/pkg/asset/manifests/aws/zones.go b/pkg/asset/manifests/aws/zones.go
+index f1e5fbdbc81..4feb4b1a7ad 100644
+--- a/pkg/asset/manifests/aws/zones.go
++++ b/pkg/asset/manifests/aws/zones.go
+@@ -174,9 +174,16 @@ func setSubnets(ctx context.Context, in *networkInput) error {
+ // TODO: create support to mock AWS API calls in the unit tests, then the method
+ // GatherSubnetsFromMetadata() can be added in setSubnetsBYOVPC.
+ func setSubnetsBYOVPC(in *networkInput) error {
+-	in.Cluster.Spec.NetworkSpec.VPC = capa.VPCSpec{
++	enableIPv6 := in.InstallConfig.Config.AWS.IPFamily.DualStackEnabled()
++	// dualstack: we don't need to configure all IPv6 configurations, for example, VPC or subnet IPv6 CIDRs
++	// as CAPA will query AWS API to fill them in
++	vpcSpec := capa.VPCSpec{
+ 		ID: in.Subnets.vpc,
+ 	}
++	if enableIPv6 {
++		vpcSpec.IPv6 = &capa.IPv6{}
++	}
++	in.Cluster.Spec.NetworkSpec.VPC = vpcSpec
+ 
+ 	// Skip adding private subnets if this is a public-only subnets install.
+ 	// We need to skip because the Installer is tricked into thinking the public subnets are also private and we would
+@@ -239,14 +246,19 @@ func setSubnetsManagedVPC(in *networkInput) error {
+ 		return fmt.Errorf("failed to get availability zones: %w", err)
+ 	}
+ 
++	enableIPv6 := in.InstallConfig.Config.AWS.IPFamily.DualStackEnabled()
+ 	isPublishingExternal := in.InstallConfig.Config.Publish == types.ExternalPublishingStrategy
+ 	allAvailabilityZones := out.GetAvailabilityZones()
+ 	allEdgeZones := out.GetEdgeZones()
+ 
+ 	mainCIDR := capiutils.CIDRFromInstallConfig(in.InstallConfig)
+-	in.Cluster.Spec.NetworkSpec.VPC = capa.VPCSpec{
++	vpcSpec := capa.VPCSpec{
+ 		CidrBlock: mainCIDR.String(),
+ 	}
++	if enableIPv6 {
++		vpcSpec.IPv6 = &capa.IPv6{}
++	}
++	in.Cluster.Spec.NetworkSpec.VPC = vpcSpec
+ 
+ 	// Base subnets count considering only private zones, leaving one free block to allow
+ 	// future subnet expansions in Day-2.
+@@ -299,6 +311,7 @@ func setSubnetsManagedVPC(in *networkInput) error {
+ 				CidrBlock:        privateCIDRs[idxCIDR].String(),
+ 				ID:               fmt.Sprintf("%s-subnet-private-%s", in.ClusterID.InfraID, zone),
+ 				IsPublic:         false,
++				IsIPv6:           enableIPv6,
+ 			})
+ 		}
+ 		if isPublishingExternal {
+@@ -307,6 +320,7 @@ func setSubnetsManagedVPC(in *networkInput) error {
+ 				CidrBlock:        publicCIDRs[idxCIDR].String(),
+ 				ID:               fmt.Sprintf("%s-subnet-public-%s", in.ClusterID.InfraID, zone),
+ 				IsPublic:         true,
++				IsIPv6:           enableIPv6,
+ 			})
+ 		}
+ 	}
+@@ -341,6 +355,7 @@ func setSubnetsManagedVPC(in *networkInput) error {
+ 	}
+ 
+ 	// Create subnets from zone pool with type local-zone or wavelength-zone (edge zones)
++	// Important: We do not support IPv6 networking (i.e. dualstack) for edge zones
+ 	for idxCIDR, zone := range allEdgeZones {
+ 		in.Cluster.Spec.NetworkSpec.Subnets = append(in.Cluster.Spec.NetworkSpec.Subnets, capa.SubnetSpec{
+ 			AvailabilityZone: zone,
+diff --git a/pkg/asset/manifests/aws/zones_test.go b/pkg/asset/manifests/aws/zones_test.go
+index 52cc2409428..9a3231cd4b1 100644
+--- a/pkg/asset/manifests/aws/zones_test.go
++++ b/pkg/asset/manifests/aws/zones_test.go
+@@ -16,6 +16,7 @@ import (
+ 	"github.com/openshift/installer/pkg/ipnet"
+ 	"github.com/openshift/installer/pkg/types"
+ 	awstypes "github.com/openshift/installer/pkg/types/aws"
++	"github.com/openshift/installer/pkg/types/network"
+ )
+ 
+ var stubDefaultCIDR = "10.0.0.0/16"
+@@ -342,6 +343,9 @@ func Test_setSubnetsManagedVPC(t *testing.T) {
+ 									},
+ 								},
+ 							},
++							Platform: types.Platform{
++								AWS: &awstypes.Platform{},
++							},
+ 						}
+ 						return ic
+ 					}(),
+@@ -418,6 +422,9 @@ func Test_setSubnetsManagedVPC(t *testing.T) {
+ 									},
+ 								},
+ 							},
++							Platform: types.Platform{
++								AWS: &awstypes.Platform{},
++							},
+ 						}
+ 						return ic
+ 					}(),
+@@ -478,6 +485,77 @@ func Test_setSubnetsManagedVPC(t *testing.T) {
+ 				},
+ 			},
+ 		},
++		{
++			name: "dualstack enabled",
++			args: args{
++				in: &networkInput{
++					ClusterID: stubClusterID(),
++					InstallConfig: func() *installconfig.InstallConfig {
++						ic := stubInstallConfig()
++						ic.Config = &types.InstallConfig{
++							Publish: types.ExternalPublishingStrategy,
++							Networking: &types.Networking{
++								MachineNetwork: []types.MachineNetworkEntry{
++									{
++										CIDR: *ipnet.MustParseCIDR(stubDefaultCIDR),
++									},
++								},
++							},
++							Platform: types.Platform{
++								AWS: &awstypes.Platform{
++									IPFamily: "DualStackIPv4Primary",
++								},
++							},
++						}
++						return ic
++					}(),
++					Cluster: &capa.AWSCluster{
++						ObjectMeta: metav1.ObjectMeta{
++							Name:      "infraId",
++							Namespace: capiutils.Namespace,
++						},
++						Spec: capa.AWSClusterSpec{},
++					},
++					ZonesInRegion: []string{"a", "b"},
++				},
++			},
++			want: capa.NetworkSpec{
++				VPC: capa.VPCSpec{
++					CidrBlock: stubDefaultCIDR,
++					IPv6:      &capa.IPv6{},
++				},
++				Subnets: []capa.SubnetSpec{
++					{
++						ID:               "infra-id-subnet-private-a",
++						AvailabilityZone: "a",
++						IsPublic:         false,
++						CidrBlock:        "10.0.0.0/18",
++						IsIPv6:           true,
++					},
++					{
++						ID:               "infra-id-subnet-private-b",
++						AvailabilityZone: "b",
++						IsPublic:         false,
++						CidrBlock:        "10.0.64.0/18",
++						IsIPv6:           true,
++					},
++					{
++						ID:               "infra-id-subnet-public-a",
++						AvailabilityZone: "a",
++						IsPublic:         true,
++						CidrBlock:        "10.0.128.0/19",
++						IsIPv6:           true,
++					},
++					{
++						ID:               "infra-id-subnet-public-b",
++						AvailabilityZone: "b",
++						IsPublic:         true,
++						CidrBlock:        "10.0.160.0/19",
++						IsIPv6:           true,
++					},
++				},
++			},
++		},
+ 		// TODO: error scenarios to review the coverage
+ 		// {
+ 		// 	name: "err: failed to get availability zones: expect one or more zones in the edge compute pool",
+@@ -604,6 +682,12 @@ func Test_setSubnetsBYOVPC(t *testing.T) {
+ 							},
+ 						},
+ 					},
++					InstallConfig: func() *installconfig.InstallConfig {
++						ic := stubInstallConfig()
++						ic.Config = stubInstallConfigType()
++						ic.Config.AWS = &awstypes.Platform{}
++						return ic
++					}(),
+ 				},
+ 			},
+ 			want: capa.NetworkSpec{
+@@ -643,6 +727,113 @@ func Test_setSubnetsBYOVPC(t *testing.T) {
+ 				},
+ 			},
+ 		},
++		{
++			name: "default byo dualstack vpc",
++			args: args{
++				in: &networkInput{
++					Cluster: &capa.AWSCluster{},
++					Subnets: &subnetsInput{
++						vpc: "vpc-id",
++						privateSubnets: aws.Subnets{
++							"subnetId-a-private": aws.Subnet{
++								ID:   "subnetId-a-private",
++								CIDR: "10.0.1.0/24",
++								Zone: &aws.Zone{
++									Name: "a",
++								},
++								Public: false,
++							},
++							"subnetId-b-private": aws.Subnet{
++								ID:   "subnetId-b-private",
++								CIDR: "10.0.2.0/24",
++								Zone: &aws.Zone{
++									Name: "b",
++								},
++								Public: false,
++							},
++							"subnetId-c-private": aws.Subnet{
++								ID:   "subnetId-c-private",
++								CIDR: "10.0.3.0/24",
++								Zone: &aws.Zone{
++									Name: "c",
++								},
++								Public: false,
++							},
++						},
++						publicSubnets: aws.Subnets{
++							"subnetId-a-public": aws.Subnet{
++								ID:   "subnetId-a-public",
++								CIDR: "10.0.4.0/24",
++								Zone: &aws.Zone{
++									Name: "a",
++								},
++								Public: true,
++							},
++							"subnetId-b-public": aws.Subnet{
++								ID:   "subnetId-b-public",
++								CIDR: "10.0.5.0/24",
++								Zone: &aws.Zone{
++									Name: "b",
++								},
++								Public: true,
++							},
++							"subnetId-c-public": aws.Subnet{
++								ID:   "subnetId-c-public",
++								CIDR: "10.0.6.0/24",
++								Zone: &aws.Zone{
++									Name: "c",
++								},
++								Public: true,
++							},
++						},
++					},
++					InstallConfig: func() *installconfig.InstallConfig {
++						ic := stubInstallConfig()
++						ic.Config = stubInstallConfigType()
++						ic.Config.AWS = &awstypes.Platform{
++							IPFamily: network.DualStackIPv4Primary,
++						}
++						return ic
++					}(),
++				},
++			},
++			want: capa.NetworkSpec{
++				VPC: capa.VPCSpec{ID: "vpc-id", IPv6: &capa.IPv6{}},
++				Subnets: []capa.SubnetSpec{
++					{
++						ID:               "subnetId-a-private",
++						AvailabilityZone: "a",
++						IsPublic:         false,
++						CidrBlock:        "10.0.1.0/24",
++					}, {
++						ID:               "subnetId-a-public",
++						AvailabilityZone: "a",
++						IsPublic:         true,
++						CidrBlock:        "10.0.4.0/24",
++					}, {
++						ID:               "subnetId-b-private",
++						AvailabilityZone: "b",
++						IsPublic:         false,
++						CidrBlock:        "10.0.2.0/24",
++					}, {
++						ID:               "subnetId-b-public",
++						AvailabilityZone: "b",
++						IsPublic:         true,
++						CidrBlock:        "10.0.5.0/24",
++					}, {
++						ID:               "subnetId-c-private",
++						AvailabilityZone: "c",
++						IsPublic:         false,
++						CidrBlock:        "10.0.3.0/24",
++					}, {
++						ID:               "subnetId-c-public",
++						AvailabilityZone: "c",
++						IsPublic:         true,
++						CidrBlock:        "10.0.6.0/24",
++					},
++				},
++			},
++		},
+ 		{
+ 			name: "byo vpc only private subnets",
+ 			args: args{
+@@ -677,6 +868,12 @@ func Test_setSubnetsBYOVPC(t *testing.T) {
+ 							},
+ 						},
+ 					},
++					InstallConfig: func() *installconfig.InstallConfig {
++						ic := stubInstallConfig()
++						ic.Config = stubInstallConfigType()
++						ic.Config.AWS = &awstypes.Platform{}
++						return ic
++					}(),
+ 				},
+ 			},
+ 			want: capa.NetworkSpec{
+@@ -783,6 +980,12 @@ func Test_setSubnetsBYOVPC(t *testing.T) {
+ 							},
+ 						},
+ 					},
++					InstallConfig: func() *installconfig.InstallConfig {
++						ic := stubInstallConfig()
++						ic.Config = stubInstallConfigType()
++						ic.Config.AWS = &awstypes.Platform{}
++						return ic
++					}(),
+ 				},
+ 			},
+ 			want: capa.NetworkSpec{
+diff --git a/pkg/asset/manifests/capiutils/helpers.go b/pkg/asset/manifests/capiutils/helpers.go
+index f05875ec394..a2024f5a141 100644
+--- a/pkg/asset/manifests/capiutils/helpers.go
++++ b/pkg/asset/manifests/capiutils/helpers.go
+@@ -1,12 +1,18 @@
+ package capiutils
+ 
+ import (
++	netutils "k8s.io/utils/net"
++
+ 	"github.com/openshift/installer/pkg/asset/installconfig"
+ 	"github.com/openshift/installer/pkg/ipnet"
+ )
+ 
+ var (
+ 	defaultCIDR = ipnet.MustParseCIDR("10.0.0.0/16")
++	// AnyIPv4CidrBlock is the CIDR block to match all IPv4 addresses.
++	AnyIPv4CidrBlock = ipnet.MustParseCIDR("0.0.0.0/0")
++	// AnyIPv6CidrBlock is the CIDR block to match all IPv6 addresses.
++	AnyIPv6CidrBlock = ipnet.MustParseCIDR("::/0")
+ )
+ 
+ // CIDRFromInstallConfig generates the CIDR from the install config,
+@@ -29,3 +35,43 @@ func IsEnabled(installConfig *installconfig.InstallConfig) bool {
+ func GenerateBoostrapMachineName(infraID string) string {
+ 	return infraID + "-bootstrap"
+ }
++
++// MachineCIDRsFromInstallConfig returns the machine network CIDRs from the install config.
++func MachineCIDRsFromInstallConfig(ic *installconfig.InstallConfig) []ipnet.IPNet {
++	cidrs := make([]ipnet.IPNet, 0, len(ic.Config.MachineNetwork))
++	for _, cidr := range ic.Config.MachineNetwork {
++		cidrs = append(cidrs, cidr.CIDR)
++	}
++	return cidrs
++}
++
++// CIDRsToString returns the string representation of network CIDRs.
++func CIDRsToString(cidrs []ipnet.IPNet) []string {
++	cidrStrings := make([]string, 0, len(cidrs))
++	for _, cidr := range cidrs {
++		cidrStrings = append(cidrStrings, cidr.String())
++	}
++	return cidrStrings
++}
++
++// GetIPv4CIDRs returns only IPNets of IPv4 family.
++func GetIPv4CIDRs(cidrs []ipnet.IPNet) []ipnet.IPNet {
++	var ipv4Nets []ipnet.IPNet
++	for _, ipnet := range cidrs {
++		if netutils.IsIPv4CIDR(&ipnet.IPNet) {
++			ipv4Nets = append(ipv4Nets, ipnet)
++		}
++	}
++	return ipv4Nets
++}
++
++// GetIPv6CIDRs returns only IPNets of IPv6 family.
++func GetIPv6CIDRs(cidrs []ipnet.IPNet) []ipnet.IPNet {
++	var ipv6Nets []ipnet.IPNet
++	for _, ipnet := range cidrs {
++		if netutils.IsIPv6CIDR(&ipnet.IPNet) {
++			ipv6Nets = append(ipv6Nets, ipnet)
++		}
++	}
++	return ipv6Nets
++}
+diff --git a/pkg/infrastructure/aws/clusterapi/aws.go b/pkg/infrastructure/aws/clusterapi/aws.go
+index 11580003a3d..9be200ca39f 100644
+--- a/pkg/infrastructure/aws/clusterapi/aws.go
++++ b/pkg/infrastructure/aws/clusterapi/aws.go
+@@ -4,6 +4,7 @@ import (
+ 	"context"
+ 	"errors"
+ 	"fmt"
++	"slices"
+ 	"strings"
+ 	"time"
+ 
+@@ -91,7 +92,10 @@ func (*Provider) PreProvision(ctx context.Context, in clusterapi.PreProvisionInp
+ // infrastructure CR. The infrastructure CR is updated and added to the ignition files. CAPA creates a
+ // bucket for ignition, and this ignition data will be placed in the bucket.
+ func (p Provider) Ignition(ctx context.Context, in clusterapi.IgnitionInput) ([]*corev1.Secret, error) {
+-	ignOutput, err := editIgnition(ctx, in)
++	ignOutput, err := clusterapi.ApplyIgnitionEdits(ctx, in,
++		editIgnitionForCustomDNS,
++		editIgnitionForDualStack,
++	)
+ 	if err != nil {
+ 		return nil, fmt.Errorf("failed to edit bootstrap master or worker ignition: %w", err)
+ 	}
+@@ -130,10 +134,20 @@ func (*Provider) InfraReady(ctx context.Context, in clusterapi.InfraReadyInput)
+ 		vpcID = id
+ 	}
+ 
+-	clientset := awsconfig.NewRoute53Clientset(awsconfig.EndpointOptions{
+-		Region:    in.InstallConfig.AWS.Region,
+-		Endpoints: in.InstallConfig.AWS.Services,
+-	})
++	enableIPv6 := in.InstallConfig.Config.AWS.IPFamily.DualStackEnabled()
++
++	// dualstack: add VPC IPv6 CIDR to node port and SSH ingress rules when the installer provisions the VPC
++	// because the VPC IPv6 CIDR is not known at install time.
++	if enableIPv6 {
++		machineCIDRs := capiutils.MachineCIDRsFromInstallConfig(in.InstallConfig)
++		if len(capiutils.GetIPv6CIDRs(machineCIDRs)) == 0 {
++			if err := updateNodePortIngressRules(ctx, in.Client, in.InstallConfig, in.InfraID); err != nil {
++				return fmt.Errorf("failed to update node port ingress rules with VPC IPv6 CIDR: %w", err)
++			}
++		}
++		// If the machine network entries contain IPv6 CIDRs, the users must have added them manually for BYO subnets.
++		// In this case, those CIDRs are already passed to the security group rules.
++	}
+ 
+ 	// The user has selected to provision their own DNS solution. Skip the creation of the
+ 	// Hosted Zone(s) and the records for those zones.
+@@ -142,6 +156,11 @@ func (*Provider) InfraReady(ctx context.Context, in clusterapi.InfraReadyInput)
+ 		return nil
+ 	}
+ 
++	clientset := awsconfig.NewRoute53Clientset(awsconfig.EndpointOptions{
++		Region:    in.InstallConfig.AWS.Region,
++		Endpoints: in.InstallConfig.AWS.Services,
++	})
++
+ 	logrus.Infoln("Creating Route53 records for control plane load balancer")
+ 
+ 	publicHzClient, err := clientset.WithDefault(ctx)
+@@ -198,6 +217,7 @@ func (*Provider) InfraReady(ctx context.Context, in clusterapi.InfraReadyInput)
+ 			DNSTarget:   pubLB.DNSName,
+ 			ZoneID:      *zone.Id,
+ 			AliasZoneID: aliasZoneID,
++			EnableAAAA:  enableIPv6,
+ 		}); err != nil {
+ 			return fmt.Errorf("failed to create records for api in public zone: %w", err)
+ 		}
+@@ -216,6 +236,7 @@ func (*Provider) InfraReady(ctx context.Context, in clusterapi.InfraReadyInput)
+ 		DNSTarget:   awsCluster.Spec.ControlPlaneEndpoint.Host,
+ 		ZoneID:      phzID,
+ 		AliasZoneID: aliasZoneID,
++		EnableAAAA:  enableIPv6,
+ 	}); err != nil {
+ 		return fmt.Errorf("failed to create records for api in private zone: %w", err)
+ 	}
+@@ -228,6 +249,7 @@ func (*Provider) InfraReady(ctx context.Context, in clusterapi.InfraReadyInput)
+ 		DNSTarget:   awsCluster.Spec.ControlPlaneEndpoint.Host,
+ 		ZoneID:      phzID,
+ 		AliasZoneID: aliasZoneID,
++		EnableAAAA:  enableIPv6,
+ 	}); err != nil {
+ 		return fmt.Errorf("failed to create records for api-int in private zone: %w", err)
+ 	}
+@@ -310,6 +332,137 @@ func getHostedZoneIDForNLB(ctx context.Context, ic *installconfig.InstallConfig,
+ 	return "", errNotFound
+ }
+ 
++// securityGroupUpdateFunc updates the AWSCluster spec to add VPC IPv6 CIDR to a security group rule.
++// Returns true if an update was made.
++type securityGroupUpdateFunc func(*capa.AWSCluster, string) bool
++
++// securityGroupVerifyFunc verifies that a security group rule with IPv6 CIDR exists in AWS.
++type securityGroupVerifyFunc func(context.Context, *ec2.Client, string, string) (bool, error)
++
++// updateSecurityGroupWithVPCIPv6 is a generic function to update security group rules with VPC IPv6 CIDR.
++func updateSecurityGroupWithVPCIPv6(ctx context.Context, cl k8sClient.Client, ic *installconfig.InstallConfig, infraID string, sgRole capa.SecurityGroupRole, ruleName string, updateSpecFn securityGroupUpdateFunc, verifyAWSFn securityGroupVerifyFunc) error {
++	ec2Client, err := ic.AWS.EC2Client(ctx)
++	if err != nil {
++		return fmt.Errorf("failed to create ec2 client: %w", err)
++	}
++
++	timeout := 15 * time.Minute
++	startTime := time.Now()
++	untilTime := startTime.Add(timeout)
++	timezone, _ := untilTime.Zone()
++	logrus.Debugf("Waiting up to %v (until %v %s) for %s rule to be updated with VPC IPv6 CIDR...", timeout, untilTime.Format(time.Kitchen), timezone, ruleName)
++
++	if err := wait.PollUntilContextTimeout(ctx, 15*time.Second, timeout, true,
++		func(ctx context.Context) (bool, error) {
++			key := k8sClient.ObjectKey{
++				Name:      infraID,
++				Namespace: capiutils.Namespace,
++			}
++			awsCluster := &capa.AWSCluster{}
++			if err := cl.Get(ctx, key, awsCluster); err != nil {
++				return false, fmt.Errorf("failed to get AWSCluster: %w", err)
++			}
++
++			vpcSpec := awsCluster.Spec.NetworkSpec.VPC
++			if vpcSpec.IPv6 == nil || vpcSpec.IPv6.CidrBlock == "" {
++				return false, fmt.Errorf("VPC does not have an IPv6 CIDR to update %s rule", ruleName)
++			}
++
++			vpcIPv6CIDR := vpcSpec.IPv6.CidrBlock
++
++			// Get the security group ID
++			sg := awsCluster.Status.Network.SecurityGroups[sgRole]
++			if len(sg.ID) == 0 {
++				return false, fmt.Errorf("%s security group id is not populated in AWSCluster status", sgRole)
++			}
++
++			// Update the spec using the provided function
++			if updateSpecFn(awsCluster, vpcIPv6CIDR) {
++				// Update the AWSCluster resource
++				if err := cl.Update(ctx, awsCluster); err != nil {
++					// If the cluster object has been modified between Get and Update, k8s client will refuse to update it.
++					// In that case, we need to retry.
++					if k8serrors.IsConflict(err) {
++						logrus.Debugf("AWSCluster update conflict during %s rule update: %v", ruleName, err)
++						return false, nil
++					}
++					return false, fmt.Errorf("failed to update AWSCluster with VPC IPv6 CIDR: %w", err)
++				}
++				logrus.Infof("Updated AWSCluster %s rule with VPC IPv6 CIDR %s", ruleName, vpcIPv6CIDR)
++			}
++
++			// Verify the rule exists in AWS
++			return verifyAWSFn(ctx, ec2Client, sg.ID, vpcIPv6CIDR)
++		},
++	); err != nil {
++		if wait.Interrupted(err) {
++			return fmt.Errorf("%s rule was not updated within %v: %w", ruleName, timeout, err)
++		}
++		return fmt.Errorf("unable to update %s rule: %w", ruleName, err)
++	}
++
++	logrus.Debugf("Completed updating %s rule with VPC IPv6 CIDR after %v", ruleName, time.Since(startTime))
++	return nil
++}
++
++// updateNodePortIngressRules updates the NodePortIngressRuleCidrBlocks to include the VPC IPv6 CIDR if any.
++// This is necessary because the VPC IPv6 CIDR is not known at install time when the installer provisions the VPC.
++func updateNodePortIngressRules(ctx context.Context, cl k8sClient.Client, ic *installconfig.InstallConfig, infraID string) error {
++	return updateSecurityGroupWithVPCIPv6(
++		ctx, cl, ic, infraID,
++		capa.SecurityGroupNode,
++		"Node Port ingress",
++		func(awsCluster *capa.AWSCluster, vpcIPv6CIDR string) bool {
++			if slices.Contains(awsCluster.Spec.NetworkSpec.NodePortIngressRuleCidrBlocks, vpcIPv6CIDR) {
++				logrus.Debugf("VPC IPv6 CIDR %s already in node port ingress rules", vpcIPv6CIDR)
++				return false
++			}
++			awsCluster.Spec.NetworkSpec.NodePortIngressRuleCidrBlocks = append(
++				awsCluster.Spec.NetworkSpec.NodePortIngressRuleCidrBlocks,
++				vpcIPv6CIDR,
++			)
++			return true
++		},
++		isNodePortRulePresentWithIPv6CIDR,
++	)
++}
++
++// isNodePortRulePresentWithIPv6CIDR checks that the node port IPv6 ingress rule has been created in the security group.
++func isNodePortRulePresentWithIPv6CIDR(ctx context.Context, client *ec2.Client, sgID string, ipv6CIDR string) (bool, error) {
++	sgs, err := awsconfig.DescribeSecurityGroups(ctx, client, []string{sgID})
++	if err != nil {
++		return false, fmt.Errorf("failed to get security group: %w", err)
++	}
++
++	if len(sgs) != 1 {
++		ids := []string{}
++		for _, sg := range sgs {
++			ids = append(ids, *sg.GroupId)
++		}
++		return false, fmt.Errorf("expected exactly one security group with id %s, but got %v", sgID, ids)
++	}
++
++	sg := sgs[0]
++	for _, rule := range sg.IpPermissions {
++		fromPort := ptr.Deref(rule.FromPort, 0)
++		toPort := ptr.Deref(rule.ToPort, 0)
++
++		// Look for node port rules (30000-32767) with the provided IPv6 CIDR
++		// See: https://github.com/kubernetes-sigs/cluster-api-provider-aws/blob/a681199f101756fd608d7148aa504d1def016e21/pkg/cloud/services/securitygroup/securitygroups.go#L656-L677
++		if fromPort == 30000 && toPort == 32767 {
++			for _, ipv6Range := range rule.Ipv6Ranges {
++				if aws.ToString(ipv6Range.CidrIpv6) == ipv6CIDR {
++					logrus.Debugf("Found node port ingress rule with IPv6 CIDR %s", ipv6CIDR)
++					return true, nil
++				}
++			}
++		}
++	}
++
++	logrus.Debugf("Node port ingress rule with IPv6 CIDR %s not found yet. Still waiting for creation...", ipv6CIDR)
++	return false, nil
++}
++
+ // DestroyBootstrap removes aws bootstrap resources not handled
+ // by the deletion of the bootstrap machine by the capi controllers.
+ func (p *Provider) DestroyBootstrap(ctx context.Context, in clusterapi.BootstrapDestroyInput) error {
+@@ -428,6 +581,7 @@ func isSSHRuleGone(ctx context.Context, client *ec2.Client, sgID string) (bool,
+ 		if ptr.Deref(rule.ToPort, 0) != 22 {
+ 			continue
+ 		}
++		// Check IPv4 rules
+ 		for _, source := range rule.IpRanges {
+ 			if source.CidrIp != nil && *source.CidrIp == "0.0.0.0/0" {
+ 				ruleDesc := ptr.Deref(source.Description, "[no description]")
+@@ -435,6 +589,14 @@ func isSSHRuleGone(ctx context.Context, client *ec2.Client, sgID string) (bool,
+ 				return false, nil
+ 			}
+ 		}
++		// Check IPv6 rules
++		for _, source := range rule.Ipv6Ranges {
++			if source.CidrIpv6 != nil && *source.CidrIpv6 == "::/0" {
++				ruleDesc := ptr.Deref(source.Description, "[no description]")
++				logrus.Debugf("Found ingress rule %s with source cidr %s. Still waiting for deletion...", ruleDesc, *source.CidrIpv6)
++				return false, nil
++			}
++		}
+ 	}
+ 
+ 	return true, nil
+diff --git a/pkg/infrastructure/aws/clusterapi/ignition.go b/pkg/infrastructure/aws/clusterapi/ignition.go
+index dc9fd795715..5830f91df81 100644
+--- a/pkg/infrastructure/aws/clusterapi/ignition.go
++++ b/pkg/infrastructure/aws/clusterapi/ignition.go
+@@ -14,11 +14,14 @@ import (
+ 	awsconfig "github.com/openshift/installer/pkg/asset/installconfig/aws"
+ 	"github.com/openshift/installer/pkg/asset/manifests/capiutils"
+ 	"github.com/openshift/installer/pkg/infrastructure/clusterapi"
++	"github.com/openshift/installer/pkg/ipnet"
++	"github.com/openshift/installer/pkg/types"
+ 	awstypes "github.com/openshift/installer/pkg/types/aws"
+ 	"github.com/openshift/installer/pkg/types/dns"
++	"github.com/openshift/installer/pkg/types/network"
+ )
+ 
+-func editIgnition(ctx context.Context, in clusterapi.IgnitionInput) (*clusterapi.IgnitionOutput, error) {
++func editIgnitionForCustomDNS(ctx context.Context, in clusterapi.IgnitionInput) (*clusterapi.IgnitionOutput, error) {
+ 	if in.InstallConfig.Config.AWS.UserProvisionedDNS != dns.UserProvisionedDNSEnabled {
+ 		return &clusterapi.IgnitionOutput{
+ 			UpdatedBootstrapIgn: in.BootstrapIgnData,
+@@ -83,5 +86,52 @@ func editIgnition(ctx context.Context, in clusterapi.IgnitionInput) (*clusterapi
+ 		publicIPAddresses = privateIPAddresses
+ 	}
+ 	logrus.Debugf("AWS: Editing Ignition files to start in-cluster DNS when UserProvisionedDNS is enabled")
+-	return clusterapi.EditIgnition(in, awstypes.Name, publicIPAddresses, privateIPAddresses)
++	return clusterapi.EditIgnitionForCustomDNS(in, awstypes.Name, publicIPAddresses, privateIPAddresses)
++}
++
++func editIgnitionForDualStack(ctx context.Context, in clusterapi.IgnitionInput) (*clusterapi.IgnitionOutput, error) {
++	ic := in.InstallConfig.Config
++	machineCIDRs := capiutils.MachineCIDRsFromInstallConfig(in.InstallConfig)
++
++	// If the machine network entries contain IPv6 CIDRs, the users must have added in manually for BYO subnets.
++	// In this case, those CIDRs are already passed to the AWSCluster node port ingress rule spec
++	if !ic.AWS.IPFamily.DualStackEnabled() || len(capiutils.GetIPv6CIDRs(machineCIDRs)) > 0 {
++		return &clusterapi.IgnitionOutput{
++			UpdatedBootstrapIgn: in.BootstrapIgnData,
++			UpdatedMasterIgn:    in.MasterIgnData,
++			UpdatedWorkerIgn:    in.WorkerIgnData}, nil
++	}
++
++	awsCluster := &capa.AWSCluster{}
++	key := k8sClient.ObjectKey{
++		Name:      in.InfraID,
++		Namespace: capiutils.Namespace,
++	}
++	if err := in.Client.Get(ctx, key, awsCluster); err != nil {
++		return nil, fmt.Errorf("failed to get AWSCluster: %w", err)
++	}
++
++	vpcSpec := awsCluster.Spec.NetworkSpec.VPC
++	if vpcSpec.IPv6 == nil || vpcSpec.IPv6.CidrBlock == "" {
++		return nil, fmt.Errorf("dualstack networking is enabled, but VPC does not have IPV6 CIDR")
++	}
++
++	machineNetworks := ic.MachineNetwork
++	cidr, err := ipnet.ParseCIDR(vpcSpec.IPv6.CidrBlock)
++	if err != nil {
++		return nil, fmt.Errorf("failed to parse VPC IPv6 CIDR block %q: %w", vpcSpec.IPv6.CidrBlock, err)
++	}
++	ipv6Entry := []types.MachineNetworkEntry{
++		{
++			CIDR: *cidr,
++		},
++	}
++
++	if ic.AWS.IPFamily == network.DualStackIPv6Primary {
++		machineNetworks = append(ipv6Entry, machineNetworks...)
++	} else {
++		machineNetworks = append(machineNetworks, ipv6Entry...)
++	}
++
++	return clusterapi.EditIgnitionForDualStack(in, awstypes.Name, machineNetworks)
+ }
+diff --git a/pkg/infrastructure/azure/ignition.go b/pkg/infrastructure/azure/ignition.go
+index 0b5b6329806..cf02ce41cad 100644
+--- a/pkg/infrastructure/azure/ignition.go
++++ b/pkg/infrastructure/azure/ignition.go
+@@ -50,5 +50,5 @@ func editIgnition(ctx context.Context, in clusterapi.IgnitionInput, publicIP str
+ 		apiLBIP = publicIP
+ 	}
+ 	logrus.Debugf("Azure: Editing Ignition files with API LB IP: %s and API Int LB IP: %s", apiLBIP, apiIntLBIP)
+-	return clusterapi.EditIgnition(in, azure.Name, []string{apiLBIP}, []string{apiIntLBIP})
++	return clusterapi.EditIgnitionForCustomDNS(in, azure.Name, []string{apiLBIP}, []string{apiIntLBIP})
+ }
+diff --git a/pkg/infrastructure/clusterapi/ignition.go b/pkg/infrastructure/clusterapi/ignition.go
+index fbcc341fd72..299a68ee901 100644
+--- a/pkg/infrastructure/clusterapi/ignition.go
++++ b/pkg/infrastructure/clusterapi/ignition.go
+@@ -20,6 +20,7 @@ import (
+ 	"github.com/openshift/installer/pkg/asset/lbconfig"
+ 	"github.com/openshift/installer/pkg/asset/machines"
+ 	"github.com/openshift/installer/pkg/asset/tls"
++	"github.com/openshift/installer/pkg/types"
+ 	awstypes "github.com/openshift/installer/pkg/types/aws"
+ 	azuretypes "github.com/openshift/installer/pkg/types/azure"
+ 	gcptypes "github.com/openshift/installer/pkg/types/gcp"
+@@ -32,20 +33,24 @@ const (
+ 	mcsCertFile            = "/opt/openshift/tls/machine-config-server.crt"
+ 	masterUserDataFile     = "/opt/openshift/openshift/99_openshift-cluster-api_master-user-data-secret.yaml"
+ 	workerUserDataFile     = "/opt/openshift/openshift/99_openshift-cluster-api_worker-user-data-secret.yaml"
++	clusterConfigDataFile  = "/opt/openshift/manifests/cluster-config.yaml"
+ 
+ 	// header is the string that precedes the encoded data in the ignition data.
+ 	// The data must be replaced before decoding the string, and the string must be
+ 	// prepended to the encoded data.
+ 	header = "data:text/plain;charset=utf-8;base64,"
+ 
++	// The key in the cluster-config-v1 ConfigMap to extract the install-config.
++	clusterConfigCMKey = "install-config"
++
+ 	masterRole = "master"
+ 	workerRole = "worker"
+ )
+ 
+-// EditIgnition attempts to edit the contents of the bootstrap ignition when the user has selected
++// EditIgnitionForCustomDNS attempts to edit the contents of the bootstrap ignition when the user has selected
+ // a custom DNS configuration. Find the public and private load balancer addresses and fill in the
+ // infrastructure file within the ignition struct.
+-func EditIgnition(in IgnitionInput, platform string, publicIPAddresses, privateIPAddresses []string) (*IgnitionOutput, error) {
++func EditIgnitionForCustomDNS(in IgnitionInput, platform string, publicIPAddresses, privateIPAddresses []string) (*IgnitionOutput, error) {
+ 	ignData := &igntypes.Config{}
+ 	err := json.Unmarshal(in.BootstrapIgnData, ignData)
+ 	if err != nil {
+@@ -292,3 +297,82 @@ func updateUserDataSecret(in IgnitionInput, role string, config *igntypes.Config
+ 	}
+ 	return nil
+ }
++
++// EditIgnitionForDualStack attempts to edit the contents of the bootstrap ignition when the cluster is in dualstack.
++func EditIgnitionForDualStack(in IgnitionInput, platform string, machineNetworks []types.MachineNetworkEntry) (*IgnitionOutput, error) {
++	ignData := &igntypes.Config{}
++	err := json.Unmarshal(in.BootstrapIgnData, ignData)
++	if err != nil {
++		return nil, fmt.Errorf("failed to unmarshal bootstrap ignition: %w", err)
++	}
++
++	err = updateMachineNetworks(in, ignData, machineNetworks)
++	if err != nil {
++		return nil, fmt.Errorf("failed to update machine networks in ignition config: %w", err)
++	}
++	logrus.Debugf("Successfully updated the install-config machine networks")
++
++	editedIgnBytes, err := json.Marshal(ignData)
++	if err != nil {
++		return nil, fmt.Errorf("failed to convert ignition data to json: %w", err)
++	}
++	logrus.Debugf("Successfully updated bootstrap ignition with updated manifests for dualstack networking")
++
++	return &IgnitionOutput{
++		UpdatedBootstrapIgn: editedIgnBytes,
++		UpdatedMasterIgn:    in.MasterIgnData,
++		UpdatedWorkerIgn:    in.WorkerIgnData,
++	}, nil
++}
++
++func updateMachineNetworks(in IgnitionInput, config *igntypes.Config, machineNetworks []types.MachineNetworkEntry) error {
++	for i, fileData := range config.Storage.Files {
++		if fileData.Path != clusterConfigDataFile {
++			continue
++		}
++
++		contents := strings.Split(*config.Storage.Files[i].Contents.Source, ",")
++		rawDecodedText, err := base64.StdEncoding.DecodeString(contents[1])
++		if err != nil {
++			return fmt.Errorf("failed to decode contents of ignition file: %w", err)
++		}
++
++		configCM := &corev1.ConfigMap{}
++		if err := yaml.Unmarshal(rawDecodedText, configCM); err != nil {
++			return fmt.Errorf("failed to unmarshal cluster-config ConfigMap: %w", err)
++		}
++
++		installConfigData, ok := configCM.Data[clusterConfigCMKey]
++		if !ok || installConfigData == "" {
++			return fmt.Errorf("cluster-config ConfigMap missing %q data", clusterConfigCMKey)
++		}
++
++		installConfig := &types.InstallConfig{}
++		if err := yaml.Unmarshal([]byte(installConfigData), installConfig); err != nil {
++			return fmt.Errorf("failed to unmarshal install-config content: %w", err)
++		}
++
++		// Update the machine network field
++		installConfig.MachineNetwork = machineNetworks
++
++		// Convert the installconfig back to string and save it to the configmap
++		icContents, err := yaml.Marshal(installConfig)
++		if err != nil {
++			return fmt.Errorf("failed to marshal install-config: %w", err)
++		}
++		configCM.Data[clusterConfigCMKey] = string(icContents)
++
++		// convert the infrastructure back to an encoded string
++		configCMContents, err := yaml.Marshal(configCM)
++		if err != nil {
++			return fmt.Errorf("failed to marshal cluster-config ConfigMap: %w", err)
++		}
++
++		encoded := fmt.Sprintf("%s%s", header, base64.StdEncoding.EncodeToString(configCMContents))
++		// replace the contents with the edited information
++		config.Storage.Files[i].Contents.Source = &encoded
++
++		break
++	}
++	return nil
++}
+diff --git a/pkg/infrastructure/clusterapi/types.go b/pkg/infrastructure/clusterapi/types.go
+index 3e1549db65a..e3647eccb82 100644
+--- a/pkg/infrastructure/clusterapi/types.go
++++ b/pkg/infrastructure/clusterapi/types.go
+@@ -72,6 +72,42 @@ type IgnitionInput struct {
+ 	RootCA           *tls.RootCA
+ }
+ 
++// WithOutput returns a new IgnitionInput with ignition data from the output.
++// This allows chaining multiple ignition edits.
++func (in IgnitionInput) WithOutput(output *IgnitionOutput) IgnitionInput {
++	if output == nil {
++		return in
++	}
++	in.BootstrapIgnData = output.UpdatedBootstrapIgn
++	in.MasterIgnData = output.UpdatedMasterIgn
++	in.WorkerIgnData = output.UpdatedWorkerIgn
++	return in
++}
++
++// IgnitionEditFunc is a function that edits ignition data.
++type IgnitionEditFunc func(context.Context, IgnitionInput) (*IgnitionOutput, error)
++
++// ApplyIgnitionEdits applies multiple ignition edit functions in sequence, passing the ignition output
++// of each as input to the next. Returns the final output or the first error encountered.
++func ApplyIgnitionEdits(ctx context.Context, in IgnitionInput, edits ...IgnitionEditFunc) (*IgnitionOutput, error) {
++	output := &IgnitionOutput{
++		UpdatedBootstrapIgn: in.BootstrapIgnData,
++		UpdatedMasterIgn:    in.MasterIgnData,
++		UpdatedWorkerIgn:    in.WorkerIgnData,
++	}
++
++	for _, edit := range edits {
++		result, err := edit(ctx, in)
++		if err != nil {
++			return nil, err
++		}
++		output = result
++		in = in.WithOutput(result)
++	}
++
++	return output, nil
++}
++
+ // IgnitionOutput collects updated Ignition Data for Bootstrap, Master and Worker nodes.
+ type IgnitionOutput struct {
+ 	UpdatedBootstrapIgn []byte
+diff --git a/pkg/infrastructure/gcp/clusterapi/ignition.go b/pkg/infrastructure/gcp/clusterapi/ignition.go
+index d57b4d8e497..b8071a2afa2 100644
+--- a/pkg/infrastructure/gcp/clusterapi/ignition.go
++++ b/pkg/infrastructure/gcp/clusterapi/ignition.go
+@@ -76,5 +76,5 @@ func editIgnition(ctx context.Context, in clusterapi.IgnitionInput) (*clusterapi
+ 	}
+ 
+ 	logrus.Debugf("GCP: Editing Ignition files to start in-cluster DNS when UserProvisionedDNS is enabled")
+-	return clusterapi.EditIgnition(in, gcp.Name, []string{computeAddress}, []string{computeIntAddress})
++	return clusterapi.EditIgnitionForCustomDNS(in, gcp.Name, []string{computeAddress}, []string{computeIntAddress})
+ }

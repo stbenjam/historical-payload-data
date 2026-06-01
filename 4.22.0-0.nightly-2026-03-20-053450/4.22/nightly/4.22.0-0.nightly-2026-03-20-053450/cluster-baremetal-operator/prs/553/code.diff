@@ -1,0 +1,98 @@
+diff --git a/api/v1alpha1/provisioning_validation.go b/api/v1alpha1/provisioning_validation.go
+index be5446359..520157f3d 100644
+--- a/api/v1alpha1/provisioning_validation.go
++++ b/api/v1alpha1/provisioning_validation.go
+@@ -159,7 +159,7 @@ func validateProvisioningNetworkSettings(ip string, cidr string, dhcpRange strin
+ 		return errs
+ 	}
+ 
+-	if provisioningNetworkMode != ProvisioningNetworkManaged {
++	if provisioningNetworkMode == ProvisioningNetworkDisabled {
+ 		return errs
+ 	}
+ 	// Verify Network CIDR
+diff --git a/api/v1alpha1/provisioning_validation_test.go b/api/v1alpha1/provisioning_validation_test.go
+index e915b8a82..a012f1dbc 100644
+--- a/api/v1alpha1/provisioning_validation_test.go
++++ b/api/v1alpha1/provisioning_validation_test.go
+@@ -209,6 +209,14 @@ func TestValidateUnmanagedProvisioningConfig(t *testing.T) {
+ 			expectedMode:  ProvisioningNetworkUnmanaged,
+ 			expectedMsg:   "provisioningIP",
+ 		},
++		{
++			// ProvisioningIP is not in the NetworkCIDR
++			name:          "InvalidUnmanagedProvisioningIPCIDR",
++			spec:          unmanagedProvisioning().ProvisioningIP("172.30.30.3").build(),
++			expectedError: true,
++			expectedMode:  ProvisioningNetworkUnmanaged,
++			expectedMsg:   "is not in the range defined by the provisioningNetworkCIDR",
++		},
+ 		{
+ 			// Missing provisioning IP.
+ 			name:          "MissingProvisioningIP",
+diff --git a/provisioning/baremetal_config.go b/provisioning/baremetal_config.go
+index c07bd5470..c863b2f84 100644
+--- a/provisioning/baremetal_config.go
++++ b/provisioning/baremetal_config.go
+@@ -80,7 +80,9 @@ func getProvisioningIPWithPrefix(config *metal3iov1alpha1.ProvisioningSpec) *str
+ }
+ 
+ func getProvisioningIP(config *metal3iov1alpha1.ProvisioningSpec) *string {
+-	if config.ProvisioningNetwork == metal3iov1alpha1.ProvisioningNetworkManaged {
++	// Use provisioningCIDR for unmanaged provisioning network as well so that corresponding networking configuration
++	// happens at the time of deployment.
++	if config.ProvisioningNetwork != metal3iov1alpha1.ProvisioningNetworkDisabled {
+ 		return getProvisioningIPWithPrefix(config)
+ 	}
+ 
+diff --git a/provisioning/baremetal_config_test.go b/provisioning/baremetal_config_test.go
+index 5be149f6e..8cd915651 100644
+--- a/provisioning/baremetal_config_test.go
++++ b/provisioning/baremetal_config_test.go
+@@ -46,6 +46,12 @@ func TestGetMetal3DeploymentConfig(t *testing.T) {
+ 			spec:          managedProvisioning().build(),
+ 			expectedValue: ptr.To("eth0"),
+ 		},
++		{
++			name:          "Unmanaged ProvisioningIPCIDR",
++			configName:    provisioningIP,
++			spec:          unmanagedProvisioning().build(),
++			expectedValue: ptr.To("172.30.20.3/24"),
++		},
+ 		{
+ 			name:          "Unmanaged DeployKernelUrl",
+ 			configName:    deployKernelUrl,
+diff --git a/provisioning/baremetal_pod_test.go b/provisioning/baremetal_pod_test.go
+index 5543b6908..09a97645c 100644
+--- a/provisioning/baremetal_pod_test.go
++++ b/provisioning/baremetal_pod_test.go
+@@ -46,6 +46,15 @@ func TestBuildEnvVar(t *testing.T) {
+ 				Value: "172.30.20.3/24",
+ 			},
+ 		},
++		{
++			name:       "Unanaged ProvisioningIPCIDR",
++			configName: provisioningIP,
++			spec:       unmanagedProvisioning().build(),
++			expectedEnvVar: corev1.EnvVar{
++				Name:  provisioningIP,
++				Value: "172.30.20.3/24",
++			},
++		},
+ 		{
+ 			name:       "Unmanaged ProvisioningInterface",
+ 			configName: provisioningInterface,
+@@ -390,10 +399,10 @@ func TestNewMetal3Containers(t *testing.T) {
+ 			name:   "UnmanagedSpec",
+ 			config: unmanagedProvisioning().build(),
+ 			expectedContainers: []corev1.Container{
+-				withEnv(containers["metal3-httpd"], envWithValue("PROVISIONING_INTERFACE", "ensp0"), envWithValue("PROVISIONING_IP", "172.30.20.3")),
+-				withEnv(containers["metal3-ironic"], envWithValue("PROVISIONING_INTERFACE", "ensp0"), envWithValue("PROVISIONING_IP", "172.30.20.3")),
++				withEnv(containers["metal3-httpd"], envWithValue("PROVISIONING_INTERFACE", "ensp0"), envWithValue("PROVISIONING_IP", "172.30.20.3/24")),
++				withEnv(containers["metal3-ironic"], envWithValue("PROVISIONING_INTERFACE", "ensp0"), envWithValue("PROVISIONING_IP", "172.30.20.3/24")),
+ 				containers["metal3-ramdisk-logs"],
+-				withEnv(containers["metal3-static-ip-manager"], envWithValue("PROVISIONING_INTERFACE", "ensp0"), envWithValue("PROVISIONING_IP", "172.30.20.3")),
++				withEnv(containers["metal3-static-ip-manager"], envWithValue("PROVISIONING_INTERFACE", "ensp0"), envWithValue("PROVISIONING_IP", "172.30.20.3/24")),
+ 				withEnv(containers["metal3-dnsmasq"], envWithValue("PROVISIONING_INTERFACE", "ensp0"), envWithValue("DHCP_RANGE", "")),
+ 			},
+ 			sshkey: "",

@@ -1,0 +1,794 @@
+diff --git a/pkg/controller/common/dockerconfig_test.go b/pkg/controller/common/dockerconfig_test.go
+index aa0efc4869..3f7ac15015 100644
+--- a/pkg/controller/common/dockerconfig_test.go
++++ b/pkg/controller/common/dockerconfig_test.go
+@@ -170,3 +170,21 @@ func TestMergeDockerConfigstoJSONMap(t *testing.T) {
+ 		})
+ 	}
+ }
++
++// This test was heavily inspired by https://github.com/openshift/machine-config-operator/pull/5795
++func TestCredHelpers(t *testing.T) {
++	raw := `{"auths": {"foo": {"auth": "bar", "email": "baz"}}, "credHelpers": {}}`
++	outBytes, err := ConvertSecretTodockercfg([]byte(raw))
++	if err != nil {
++		t.Fatal(err)
++	}
++
++	assert.JSONEq(t, `{"foo": {"auth": "bar", "email": "baz"}}`, string(outBytes))
++
++	outBytes, _, err = ConvertSecretToDockerconfigJSON([]byte(raw))
++	if err != nil {
++		t.Fatal(err)
++	}
++
++	assert.JSONEq(t, `{"auths": {"foo": {"auth": "bar", "email": "baz"}}}`, string(outBytes))
++}
+diff --git a/pkg/secrets/helpers.go b/pkg/secrets/helpers.go
+index 7abe5d2f41..5a8085a632 100644
+--- a/pkg/secrets/helpers.go
++++ b/pkg/secrets/helpers.go
+@@ -1,9 +1,14 @@
+ package secrets
+ 
+ import (
++	"bytes"
++	"encoding/json"
++	"errors"
+ 	"fmt"
++	"strings"
+ 
+ 	corev1 "k8s.io/api/core/v1"
++	"k8s.io/klog/v2"
+ )
+ 
+ // NormalizeDockerConfigJSONSecret reads in a RegistrySecret and converts it
+@@ -79,3 +84,108 @@ func getSecretTypeMap() map[corev1.SecretType]string {
+ 		corev1.SecretTypeDockercfg:        corev1.DockerConfigKey,
+ 	}
+ }
++
++// Wraps imageRegistrySecretImpl and implements the Unmarshaller interface for
++// better control over unmarshalling.
++type dockerConfigJSONDecoder struct {
++	imageRegistrySecretImpl
++}
++
++// errNotDockerConfigJSON is returned when the input doesn't contain
++// DockerConfigJSON-specific keys, indicating a legacy DockerConfig format.
++var errNotDockerConfigJSON = errors.New("not DockerConfigJSON format")
++
++// Custom unmarshal method that supports both old-style and new-style
++// DockerConfig unmarshalling.
++func (d *dockerConfigJSONDecoder) UnmarshalJSON(in []byte) error {
++	// Check if we have a nil or zero-length payload.
++	if in == nil || len(in) == 0 {
++		return fmt.Errorf("empty dockerconfig bytes")
++	}
++
++	// Check if the input is just the JSON null literal
++	if bytes.TrimSpace(in) != nil && string(bytes.TrimSpace(in)) == "null" {
++		return fmt.Errorf("dockerconfig bytes contain JSON null")
++	}
++
++	if bytes.Equal(in, []byte(strings.TrimSpace(`{}`))) {
++		d.cfg = newDockerConfigJSON()
++		return nil
++	}
++
++	// Try to decode as DockerConfigJSON
++	err := d.decodeDockerConfigJSON(in)
++	if err == nil {
++		return nil
++	}
++
++	// If it's not DockerConfigJSON format, try legacy DockerConfig format
++	if errors.Is(err, errNotDockerConfigJSON) {
++		if err := d.decodeDockerConfig(in); err != nil {
++			return fmt.Errorf("decoding DockerConfig / DockerConfigJSON: %w", err)
++		}
++		return nil
++	}
++
++	// Error indicates malformed DockerConfigJSON, don't fall back
++	return err
++}
++
++// Strictly decodes bytes into a DockerConfig object.
++func (d *dockerConfigJSONDecoder) decodeDockerConfig(in []byte) error {
++	dc := DockerConfig{}
++	if err := strictJSONDecode(in, &dc); err != nil {
++		return fmt.Errorf("could not decode DockerConfig: %w", err)
++	}
++
++	d.cfg.Auths = dc
++	d.isLegacyStyle = true
++	return nil
++}
++
++// Strictly decodes JSON bytes into a DockerConfigJSON object.
++func (d *dockerConfigJSONDecoder) decodeDockerConfigJSON(in []byte) error {
++	// Private version of the DockerConfigJSON struct with CredHelpers and CredsStore fields.
++	// This prevents unknown field errors from occurring if these fields are present.
++	// However, these fields will be ignored. Strict decoding is necessary because we need
++	// to distinguish between the DockerConfigJSON and DockerConfig schemas.
++	type withCredHelpers struct {
++		DockerConfigJSON
++		CredHelpers json.RawMessage `json:"credHelpers"`
++		CredsStore  json.RawMessage `json:"credsStore"`
++	}
++
++	dcJSON := withCredHelpers{}
++	err := strictJSONDecode(in, &dcJSON)
++
++	// If strict decode succeeded, we have DockerConfigJSON format
++	if err == nil {
++		if len(dcJSON.CredHelpers) != 0 {
++			klog.Warning("Found credHelpers in DockerConfigJSON, ignoring")
++		}
++		if len(dcJSON.CredsStore) != 0 {
++			klog.Warning("Found credsStore in DockerConfigJSON, ignoring")
++		}
++		d.isLegacyStyle = false
++		d.cfg.Auths = dcJSON.Auths
++		return nil
++	}
++
++	// Strict decode as DockerConfigJSON failed. Check if input has DockerConfigJSON-specific
++	// keys - if so, the user intended DockerConfigJSON format but it's malformed,
++	// so we should NOT fall back to legacy format.
++	if len(dcJSON.Auths) > 0 || len(dcJSON.CredHelpers) > 0 || len(dcJSON.CredsStore) > 0 {
++		return fmt.Errorf("input has DockerConfigJSON-specific keys but failed to decode as DockerConfigJSON: %w", err)
++	}
++
++	// No DockerConfigJSON keys found, return sentinel to indicate legacy format should be tried
++	return errNotDockerConfigJSON
++}
++
++// Adds additional strictness to the unmarshalling process by disallowing
++// unknown fields.
++func strictJSONDecode(in []byte, target interface{}) error {
++	decoder := json.NewDecoder(bytes.NewReader(in))
++	decoder.DisallowUnknownFields()
++	return decoder.Decode(target)
++}
+diff --git a/pkg/secrets/helpers_test.go b/pkg/secrets/helpers_test.go
+index 1163d0eaa7..db89be7a97 100644
+--- a/pkg/secrets/helpers_test.go
++++ b/pkg/secrets/helpers_test.go
+@@ -160,3 +160,290 @@ func TestNormalizeFuncs(t *testing.T) {
+ 		})
+ 	}
+ }
++
++func TestDockerConfigJSONDecoder(t *testing.T) {
++	legacySecret := `{"registry.hostname.com":{"username":"user","password":"s3kr1t","auth":"s00pers3kr1t","email":"user@hostname.com"}}`
++	newSecret := `{"auths":` + legacySecret + `}`
++
++	testCases := []struct {
++		name        string
++		input       []byte
++		expected    *dockerConfigJSONDecoder
++		expectError bool
++	}{
++		// Nil and Empty Input
++		{
++			name:        "nil bytes",
++			input:       nil,
++			expectError: true,
++		},
++		{
++			name:        "zero-length byte slice",
++			input:       []byte{},
++			expectError: true,
++		},
++		{
++			name:        "JSON null literal",
++			input:       []byte("null"),
++			expectError: true,
++		},
++		{
++			name:        "JSON null with whitespace",
++			input:       []byte("  null  "),
++			expectError: true,
++		},
++		// Valid Empty Object
++		{
++			name:  "empty JSON object",
++			input: []byte("{}"),
++			expected: &dockerConfigJSONDecoder{
++				imageRegistrySecretImpl: imageRegistrySecretImpl{
++					cfg:           DockerConfigJSON{Auths: newDockerConfig()},
++					isLegacyStyle: false,
++				},
++			},
++		},
++		// Invalid JSON
++		{
++			name:        "malformed JSON - unclosed brace",
++			input:       []byte(`{"auths":`),
++			expectError: true,
++		},
++		{
++			name:        "malformed JSON - invalid syntax",
++			input:       []byte(`{"auths": invalid}`),
++			expectError: true,
++		},
++		{
++			name:        "invalid JSON - array instead of object",
++			input:       []byte(`["not", "an", "object"]`),
++			expectError: true,
++		},
++		// Unknown Fields
++		{
++			name:        "unknown field in DockerConfigJSON format",
++			input:       []byte(`{"auths":{},"unknownField":"value"}`),
++			expectError: true,
++		},
++		{
++			name:        "unknown field in DockerConfig format",
++			input:       []byte(`{"registry.hostname.com":{"username":"user","unknownField":"value"}}`),
++			expectError: true,
++		},
++		{
++			name:        "unknown field in DockerConfigEntry",
++			input:       []byte(`{"auths":{"registry.hostname.com":{"username":"user","unknownField":"value"}}}`),
++			expectError: true,
++		},
++		// Valid DockerConfigJSON Format
++		{
++			name:  "DockerConfigJSON with empty auths",
++			input: []byte(`{"auths":{}}`),
++			expected: &dockerConfigJSONDecoder{
++				imageRegistrySecretImpl: imageRegistrySecretImpl{
++					cfg: DockerConfigJSON{
++						Auths: DockerConfig{},
++					},
++					isLegacyStyle: false,
++				},
++			},
++		},
++		{
++			name:  "DockerConfigJSON with single registry",
++			input: []byte(newSecret),
++			expected: &dockerConfigJSONDecoder{
++				imageRegistrySecretImpl: imageRegistrySecretImpl{
++					cfg: DockerConfigJSON{
++						Auths: DockerConfig{
++							"registry.hostname.com": {
++								Username: "user",
++								Password: "s3kr1t",
++								Auth:     "s00pers3kr1t",
++								Email:    "user@hostname.com",
++							},
++						},
++					},
++					isLegacyStyle: false,
++				},
++			},
++		},
++		{
++			name: "DockerConfigJSON with multiple registries",
++			input: []byte(`{"auths":{
++				"registry1.com":{"username":"user1","password":"pass1","auth":"auth1","email":"user1@example.com"},
++				"registry2.com":{"username":"user2","password":"pass2","auth":"auth2","email":"user2@example.com"}
++			}}`),
++			expected: &dockerConfigJSONDecoder{
++				imageRegistrySecretImpl: imageRegistrySecretImpl{
++					cfg: DockerConfigJSON{
++						Auths: DockerConfig{
++							"registry1.com": {
++								Username: "user1",
++								Password: "pass1",
++								Auth:     "auth1",
++								Email:    "user1@example.com",
++							},
++							"registry2.com": {
++								Username: "user2",
++								Password: "pass2",
++								Auth:     "auth2",
++								Email:    "user2@example.com",
++							},
++						},
++					},
++					isLegacyStyle: false,
++				},
++			},
++		},
++		{
++			name:  "DockerConfigJSON with minimal fields",
++			input: []byte(`{"auths":{"registry.example.com":{"auth":"dXNlcjpwYXNz"}}}`),
++			expected: &dockerConfigJSONDecoder{
++				imageRegistrySecretImpl: imageRegistrySecretImpl{
++					cfg: DockerConfigJSON{
++						Auths: DockerConfig{
++							"registry.example.com": {
++								Auth: "dXNlcjpwYXNz",
++							},
++						},
++					},
++					isLegacyStyle: false,
++				},
++			},
++		},
++		{
++			name:  "DockerConfigJSON credHelpers are ignored",
++			input: []byte(`{"auths":{"registry.example.com":{"auth":"dXNlcjpwYXNz"}}, "credHelpers": {"cred-helper-1": "helper"}}`),
++			expected: &dockerConfigJSONDecoder{
++				imageRegistrySecretImpl: imageRegistrySecretImpl{
++					cfg: DockerConfigJSON{
++						Auths: DockerConfig{
++							"registry.example.com": {
++								Auth: "dXNlcjpwYXNz",
++							},
++						},
++					},
++					isLegacyStyle: false,
++				},
++			},
++		},
++		{
++			name:  "DockerConfigJSON credsStore are ignored",
++			input: []byte(`{"auths":{"registry.example.com":{"auth":"dXNlcjpwYXNz"}}, "credsStore": {"cred-store-1": "cred-store"}}`),
++			expected: &dockerConfigJSONDecoder{
++				imageRegistrySecretImpl: imageRegistrySecretImpl{
++					cfg: DockerConfigJSON{
++						Auths: DockerConfig{
++							"registry.example.com": {
++								Auth: "dXNlcjpwYXNz",
++							},
++						},
++					},
++					isLegacyStyle: false,
++				},
++			},
++		},
++		// Valid DockerConfig Format
++		{
++			name:  "DockerConfig with single registry",
++			input: []byte(legacySecret),
++			expected: &dockerConfigJSONDecoder{
++				imageRegistrySecretImpl: imageRegistrySecretImpl{
++					cfg: DockerConfigJSON{
++						Auths: DockerConfig{
++							"registry.hostname.com": {
++								Username: "user",
++								Password: "s3kr1t",
++								Auth:     "s00pers3kr1t",
++								Email:    "user@hostname.com",
++							},
++						},
++					},
++					isLegacyStyle: true,
++				},
++			},
++		},
++		{
++			name: "DockerConfig with multiple registries",
++			input: []byte(`{
++				"registry1.com":{"username":"user1","password":"pass1","auth":"auth1","email":"user1@example.com"},
++				"registry2.com":{"username":"user2","password":"pass2","auth":"auth2","email":"user2@example.com"}
++			}`),
++			expected: &dockerConfigJSONDecoder{
++				imageRegistrySecretImpl: imageRegistrySecretImpl{
++					cfg: DockerConfigJSON{
++						Auths: DockerConfig{
++							"registry1.com": {
++								Username: "user1",
++								Password: "pass1",
++								Auth:     "auth1",
++								Email:    "user1@example.com",
++							},
++							"registry2.com": {
++								Username: "user2",
++								Password: "pass2",
++								Auth:     "auth2",
++								Email:    "user2@example.com",
++							},
++						},
++					},
++					isLegacyStyle: true,
++				},
++			},
++		},
++		{
++			name:  "DockerConfig with minimal fields",
++			input: []byte(`{"registry.example.com":{"auth":"dXNlcjpwYXNz"}}`),
++			expected: &dockerConfigJSONDecoder{
++				imageRegistrySecretImpl: imageRegistrySecretImpl{
++					cfg: DockerConfigJSON{
++						Auths: DockerConfig{
++							"registry.example.com": {
++								Auth: "dXNlcjpwYXNz",
++							},
++						},
++					},
++					isLegacyStyle: true,
++				},
++			},
++		},
++		// Malformed Structure
++		{
++			name:        "invalid DockerConfigEntry structure (string instead of object)",
++			input:       []byte(`{"registry.hostname.com":"invalid-string-value"}`),
++			expectError: true,
++		},
++		{
++			name:        "invalid auth value type in legacy format",
++			input:       []byte(`{"registry.hostname.com":{"auth":123}}`),
++			expectError: true,
++		},
++		{
++			name:        "auths field with invalid value type",
++			input:       []byte(`{"auths":"invalid-string"}`),
++			expectError: true,
++		},
++		// Malformed DockerConfigJSON should not fall back to legacy DockerConfig
++		{
++			name:        "malformed DockerConfigJSON with auths key should not fall back to legacy",
++			input:       []byte(`{"auths":{"username":"user","password":"s3kr1t","auth":"s00pers3kr1t","email":"user@hostname.com"}}`),
++			expectError: true,
++		},
++	}
++
++	for _, tc := range testCases {
++		t.Run(tc.name, func(t *testing.T) {
++			d := &dockerConfigJSONDecoder{}
++			err := d.UnmarshalJSON(tc.input)
++
++			if tc.expectError {
++				assert.Error(t, err)
++				return
++			}
++
++			assert.NoError(t, err)
++			assert.Equal(t, tc.expected.isLegacyStyle, d.isLegacyStyle)
++			assert.Equal(t, tc.expected.cfg.Auths, d.cfg.Auths)
++		})
++	}
++}
+diff --git a/pkg/secrets/merger.go b/pkg/secrets/merger.go
+index 7448a0248b..14058ad568 100644
+--- a/pkg/secrets/merger.go
++++ b/pkg/secrets/merger.go
+@@ -20,7 +20,9 @@ func (s *SecretMerger) Insert(val any) error {
+ 		return err
+ 	}
+ 
+-	for key, val := range is.DockerConfigJSON().Auths {
++	dcj := is.DockerConfigJSON()
++
++	for key, val := range dcj.Auths {
+ 		s.cfg.Auths[key] = val
+ 	}
+ 
+diff --git a/pkg/secrets/secrets.go b/pkg/secrets/secrets.go
+index 1e56b8eda8..9d2954c26c 100644
+--- a/pkg/secrets/secrets.go
++++ b/pkg/secrets/secrets.go
+@@ -10,7 +10,6 @@
+ package secrets
+ 
+ import (
+-	"bytes"
+ 	"encoding/json"
+ 	"errors"
+ 	"fmt"
+@@ -71,7 +70,7 @@ func newDockerConfigJSON() DockerConfigJSON {
+ 
+ // newDockerConfig creates and returns a new, empty DockerConfig map.
+ func newDockerConfig() DockerConfig {
+-	return DockerConfig{}
++	return make(DockerConfig)
+ }
+ 
+ // DockerConfig represents the config file used by the docker CLI.
+@@ -182,68 +181,12 @@ func newImageRegistrySecretFromDockerConfig(dc DockerConfig) ImageRegistrySecret
+ // to decode a given byte slice into either a DockerConfigJSON or a DockerConfig
+ // structure, and then returns an ImageRegistrySecret. It prioritizes DockerConfigJSON.
+ func newImageRegistrySecretFromDockerConfigBytes(in []byte) (ImageRegistrySecret, error) {
+-	if in == nil || len(in) == 0 {
+-		return nil, fmt.Errorf("empty dockerconfig bytes")
+-	}
+-
+-	// Check if the input is just the JSON null literal
+-	if bytes.TrimSpace(in) != nil && string(bytes.TrimSpace(in)) == "null" {
+-		return nil, fmt.Errorf("dockerconfig bytes contain JSON null")
+-	}
+-
+-	errs := []error{}
+-
+-	cfg, err := decodeDockerConfigJSONBytes(in)
+-	if err == nil {
+-		if cfg == nil {
+-			return nil, fmt.Errorf("decoded DockerConfigJSONBytes is nil")
+-		}
+-		return &imageRegistrySecretImpl{cfg: *cfg, isLegacyStyle: false}, nil
+-	}
+-
+-	errs = append(errs, err)
+-
+-	auths, err := decodeDockercfgBytes(in)
+-	if err == nil {
+-		if auths == nil {
+-			return nil, fmt.Errorf("decoded DockercfgBytes is nil")
+-		}
+-		return &imageRegistrySecretImpl{cfg: DockerConfigJSON{Auths: *auths}, isLegacyStyle: true}, nil
+-	}
+-
+-	errs = append(errs, err)
+-
+-	return nil, fmt.Errorf("input bytes not dockerconfigjson or dockercfg secret(s): %w", errors.Join(errs...))
+-}
+-
+-// decodeDockerConfigJSONBytes decodes a byte slice into a DockerConfigJSON struct.
+-func decodeDockerConfigJSONBytes(in []byte) (*DockerConfigJSON, error) {
+-	cfg := &DockerConfigJSON{}
+-	err := decodeDockerConfigBytes(in, &cfg)
+-	if err != nil {
+-		return nil, fmt.Errorf("could not decode dockerconfigjson bytes: %w", err)
+-	}
+-
+-	return cfg, nil
+-}
+-
+-// decodeDockercfgBytes decodes a byte slice into a DockerConfig struct.
+-func decodeDockercfgBytes(in []byte) (*DockerConfig, error) {
+-	cfg := &DockerConfig{}
+-	err := decodeDockerConfigBytes(in, &cfg)
+-	if err != nil {
+-		return nil, fmt.Errorf("could not decode dockercfg bytes: %w", err)
++	d := &dockerConfigJSONDecoder{}
++	if err := json.Unmarshal(in, d); err != nil {
++		return nil, err
+ 	}
+ 
+-	return cfg, nil
+-}
+-
+-// decodeDockerConfigBytes creates a JSON decoder instance with strict settings
+-// and attempts to decode the input bytes into the provided target interface.
+-func decodeDockerConfigBytes(in []byte, target interface{}) error {
+-	decoder := json.NewDecoder(bytes.NewReader(in))
+-	decoder.DisallowUnknownFields()
+-	return decoder.Decode(target)
++	return &d.imageRegistrySecretImpl, nil
+ }
+ 
+ // K8sSecret converts the internal representation of the secret into a format
+diff --git a/pkg/secrets/secrets_test.go b/pkg/secrets/secrets_test.go
+index b830942207..6871e1d5cf 100644
+--- a/pkg/secrets/secrets_test.go
++++ b/pkg/secrets/secrets_test.go
+@@ -46,39 +46,47 @@ type: kubernetes.io/dockercfg`
+ 	k8sDockercfgJSONBytes, err := yaml.YAMLToJSON(k8sDockercfgYAMLBytes)
+ 	require.NoError(t, err)
+ 
+-	mismatchedK8sDockerConfigJSONSecret := `apiVersion: v1
++	k8sDockerConfigJsonSecretMissingKind := `apiVersion: v1
+ data:
+-  .dockerconfigjson: eyJyZWdpc3RyeS5ob3N0bmFtZS5jb20iOnsidXNlcm5hbWUiOiJ1c2VyIiwiZW1haWwiOiJ1c2VyQGhvc3RuYW1lLmNvbSIsImF1dGgiOiJzMDBwZXJzM2tyMXQifX0=
+-kind: Secret
++  .dockerconfigjson: eyJhdXRocyI6eyJyZWdpc3RyeS5ob3N0bmFtZS5jb20iOnsidXNlcm5hbWUiOiJ1c2VyIiwiZW1haWwiOiJ1c2VyQGhvc3RuYW1lLmNvbSIsImF1dGgiOiJzMDBwZXJzM2tyMXQifX19
+ metadata:
+   name: secret
+   # This is needed
+   creationTimestamp:
+ type: kubernetes.io/dockerconfigjson`
+ 
+-	mismatchedK8sDockercfgSecret := `apiVersion: v1
++	k8sDockerConfigYAMLBytesMissingKind := []byte(k8sDockerConfigJsonSecretMissingKind)
++
++	k8sDockerConfigJSONBytesMissingKind, err := yaml.YAMLToJSON(k8sDockerConfigYAMLBytesMissingKind)
++	require.NoError(t, err)
++
++	k8sDockercfgSecretMissingKind := `apiVersion: v1
+ data:
+-  .dockercfg: eyJhdXRocyI6eyJyZWdpc3RyeS5ob3N0bmFtZS5jb20iOnsidXNlcm5hbWUiOiJ1c2VyIiwiZW1haWwiOiJ1c2VyQGhvc3RuYW1lLmNvbSIsImF1dGgiOiJzMDBwZXJzM2tyMXQifX19
+-kind: Secret
++  .dockercfg: eyJyZWdpc3RyeS5ob3N0bmFtZS5jb20iOnsidXNlcm5hbWUiOiJ1c2VyIiwiZW1haWwiOiJ1c2VyQGhvc3RuYW1lLmNvbSIsImF1dGgiOiJzMDBwZXJzM2tyMXQifX0=
+ metadata:
+   name: secret
+   # This is needed
+   creationTimestamp:
+ type: kubernetes.io/dockercfg`
+ 
+-	emptyK8sDockerConfigJSON := `apiVersion: v1
++	k8sDockercfgYAMLBytesMissingKind := []byte(k8sDockercfgSecretMissingKind)
++
++	k8sDockercfgJSONBytesMissingKind, err := yaml.YAMLToJSON(k8sDockercfgYAMLBytesMissingKind)
++	require.NoError(t, err)
++
++	mismatchedK8sDockerConfigJSONSecret := `apiVersion: v1
+ data:
+-  .dockercfg:
++  .dockerconfigjson: eyJyZWdpc3RyeS5ob3N0bmFtZS5jb20iOnsidXNlcm5hbWUiOiJ1c2VyIiwiZW1haWwiOiJ1c2VyQGhvc3RuYW1lLmNvbSIsImF1dGgiOiJzMDBwZXJzM2tyMXQifX0=
+ kind: Secret
+ metadata:
+   name: secret
+   # This is needed
+   creationTimestamp:
+-type: kubernetes.io/dockercfg`
++type: kubernetes.io/dockerconfigjson`
+ 
+-	emptyBase64K8sDockerConfigJSON := `apiVersion: v1
++	mismatchedK8sDockercfgSecret := `apiVersion: v1
+ data:
+-  .dockercfg: Cg==
++  .dockercfg: eyJhdXRocyI6eyJyZWdpc3RyeS5ob3N0bmFtZS5jb20iOnsidXNlcm5hbWUiOiJ1c2VyIiwiZW1haWwiOiJ1c2VyQGhvc3RuYW1lLmNvbSIsImF1dGgiOiJzMDBwZXJzM2tyMXQifX19
+ kind: Secret
+ metadata:
+   name: secret
+@@ -86,34 +94,26 @@ metadata:
+   creationTimestamp:
+ type: kubernetes.io/dockercfg`
+ 
+-	k8sDockerConfigJsonSecretMissingKind := `apiVersion: v1
++	emptyK8sDockerConfigJSON := `apiVersion: v1
+ data:
+-  .dockerconfigjson: eyJhdXRocyI6eyJyZWdpc3RyeS5ob3N0bmFtZS5jb20iOnsidXNlcm5hbWUiOiJ1c2VyIiwiZW1haWwiOiJ1c2VyQGhvc3RuYW1lLmNvbSIsImF1dGgiOiJzMDBwZXJzM2tyMXQifX19
++  .dockercfg:
++kind: Secret
+ metadata:
+   name: secret
+   # This is needed
+   creationTimestamp:
+-type: kubernetes.io/dockerconfigjson`
+-
+-	k8sDockerConfigYAMLBytesMissingKind := []byte(k8sDockerConfigJsonSecretMissingKind)
+-
+-	k8sDockerConfigJSONBytesMissingKind, err := yaml.YAMLToJSON(k8sDockerConfigYAMLBytesMissingKind)
+-	require.NoError(t, err)
++type: kubernetes.io/dockercfg`
+ 
+-	k8sDockercfgSecretMissingKind := `apiVersion: v1
++	emptyBase64K8sDockerConfigJSON := `apiVersion: v1
+ data:
+-  .dockercfg: eyJyZWdpc3RyeS5ob3N0bmFtZS5jb20iOnsidXNlcm5hbWUiOiJ1c2VyIiwiZW1haWwiOiJ1c2VyQGhvc3RuYW1lLmNvbSIsImF1dGgiOiJzMDBwZXJzM2tyMXQifX0=
++  .dockercfg: Cg==
++kind: Secret
+ metadata:
+   name: secret
+   # This is needed
+   creationTimestamp:
+ type: kubernetes.io/dockercfg`
+ 
+-	k8sDockercfgYAMLBytesMissingKind := []byte(k8sDockercfgSecretMissingKind)
+-
+-	k8sDockercfgJSONBytesMissingKind, err := yaml.YAMLToJSON(k8sDockercfgYAMLBytesMissingKind)
+-	require.NoError(t, err)
+-
+ 	k8sDockerConfigJsonSecretMissingAPIVersion := `kind: Secret
+ data:
+   .dockerconfigjson: eyJhdXRocyI6eyJyZWdpc3RyeS5ob3N0bmFtZS5jb20iOnsidXNlcm5hbWUiOiJ1c2VyIiwiZW1haWwiOiJ1c2VyQGhvc3RuYW1lLmNvbSIsImF1dGgiOiJzMDBwZXJzM2tyMXQifX19
+@@ -238,7 +238,7 @@ type: kubernetes.io/dockercfg`
+ 		{
+ 			name:     "Empty JSON object without auths key",
+ 			bytes:    []byte(`{}`),
+-			expected: &DockerConfigJSON{Auths: nil},
++			expected: &DockerConfigJSON{Auths: newDockerConfig()},
+ 		},
+ 		{
+ 			name:        "JSON null literal",
+@@ -313,8 +313,8 @@ type: kubernetes.io/dockercfg`
+ }
+ 
+ func TestEquality(t *testing.T) {
+-	dockerconfigJSON := []byte(`{"auths":{"registry.hostname.com":{"username":"user","email":"user@hostname.com","auth":"s00pers3kr1t"}}}`)
+-	dockercfgJSON := []byte(`{"registry.hostname.com":{"username":"user","email":"user@hostname.com","auth":"s00pers3kr1t"}}`)
++	dockerconfigJSONbytes := []byte(`{"auths":{"registry.hostname.com":{"username":"user","email":"user@hostname.com","auth":"s00pers3kr1t"}}}`)
++	dockercfgJSONbytes := []byte(`{"registry.hostname.com":{"username":"user","email":"user@hostname.com","auth":"s00pers3kr1t"}}`)
+ 
+ 	k8sDockerConfigJsonSecret := `apiVersion: v1
+ data:
+@@ -340,27 +340,95 @@ type: kubernetes.io/dockercfg`
+ 
+ 	k8sDockercfgYAMLBytes := []byte(k8sDockercfgSecret)
+ 
+-	unequalDockerconfigJSON := []byte(`{"auths":{"other-registry.hostname.com":{"username":"user","email":"user@hostname.com","auth":"s00pers3kr1t"}}}`)
++	unequalDockerconfigJSONbytes := []byte(`{"auths":{"other-registry.hostname.com":{"username":"user","email":"user@hostname.com","auth":"s00pers3kr1t"}}}`)
+ 
+-	is1, err := NewImageRegistrySecret(dockerconfigJSON)
+-	assert.NoError(t, err)
++	dockerConfigJSON := DockerConfigJSON{
++		Auths: map[string]DockerConfigEntry{
++			"registry.hostname.com": DockerConfigEntry{
++				Username: "user",
++				Email:    "user@hostname.com",
++				Auth:     "s00pers3kr1t",
++			},
++		},
++	}
+ 
+-	is2, err := NewImageRegistrySecret(dockercfgJSON)
+-	assert.NoError(t, err)
++	dockerConfig := DockerConfig{
++		"registry.hostname.com": DockerConfigEntry{
++			Username: "user",
++			Email:    "user@hostname.com",
++			Auth:     "s00pers3kr1t",
++		},
++	}
+ 
+-	is3, err := NewImageRegistrySecret(k8sDockerConfigYAMLBytes)
+-	assert.NoError(t, err)
++	testCases := []struct {
++		name          string
++		input1        interface{}
++		input2        interface{}
++		expectedEqual bool
++	}{
++		{
++			name:          "DockerConfigJSON bytes and Dockercfg bytes",
++			input1:        dockerconfigJSONbytes,
++			input2:        dockercfgJSONbytes,
++			expectedEqual: true,
++		},
++		{
++			name:          "Dockercfg bytes and K8s DockerConfig YAML Bytes",
++			input1:        dockercfgJSONbytes,
++			input2:        k8sDockerConfigYAMLBytes,
++			expectedEqual: true,
++		},
++		{
++			name:          "K8s DockerConfig YAML Bytes and K8s DockerCfg YAML Bytes",
++			input1:        k8sDockerConfigYAMLBytes,
++			input2:        k8sDockercfgYAMLBytes,
++			expectedEqual: true,
++		},
++		{
++			name:          "K8s DockerCfg YAML Bytes and unequal DockerConfigJSON bytes",
++			input1:        k8sDockercfgYAMLBytes,
++			input2:        unequalDockerconfigJSONbytes,
++			expectedEqual: false,
++		},
++		{
++			name:          "DockerConfigJSON and DockerConfigJSON bytes",
++			input1:        dockerConfigJSON,
++			input2:        dockerconfigJSONbytes,
++			expectedEqual: true,
++		},
++		{
++			name:          "DockerConfigJSON and DockerConfig",
++			input1:        dockerConfigJSON,
++			input2:        dockerConfig,
++			expectedEqual: true,
++		},
++		{
++			name:          "DockerConfigJSON and DockerConfigJSON bytes with credHelpers ignored",
++			input1:        []byte(`{"auths":{"registry.hostname.com":{"username":"user","email":"user@hostname.com","auth":"s00pers3kr1t"}}, "credHelpers": {"helper-1": "helper"}}`),
++			input2:        dockerconfigJSONbytes,
++			expectedEqual: true,
++		},
++		{
++			name:          "DockerConfigJSON and DockerConfigJSON bytes with credHelpers ignored",
++			input1:        []byte(`{"auths":{"registry.hostname.com":{"username":"user","email":"user@hostname.com","auth":"s00pers3kr1t"}}, "credsStore": {"cred-store-1": "cred-store"}}`),
++			input2:        dockerconfigJSONbytes,
++			expectedEqual: true,
++		},
++	}
+ 
+-	is4, err := NewImageRegistrySecret(k8sDockercfgYAMLBytes)
+-	assert.NoError(t, err)
++	for _, testCase := range testCases {
++		t.Run(testCase.name, func(t *testing.T) {
++			// This test uses the private newImageRegistrySecretFromAny() constructor
++			// for easier instantiation with less TDD boilerplate.
++			is1, err := newImageRegistrySecretFromAny(testCase.input1)
++			assert.NoError(t, err)
+ 
+-	is5, err := NewImageRegistrySecret(unequalDockerconfigJSON)
+-	assert.NoError(t, err)
++			is2, err := newImageRegistrySecretFromAny(testCase.input2)
++			assert.NoError(t, err)
+ 
+-	assert.True(t, is1.Equal(is2))
+-	assert.True(t, is2.Equal(is3))
+-	assert.True(t, is3.Equal(is4))
+-	assert.False(t, is1.Equal(is5))
++			assert.Equal(t, testCase.expectedEqual, is1.Equal(is2))
++		})
++	}
+ }
+ 
+ func TestImageRegistrySecretFromK8s(t *testing.T) {

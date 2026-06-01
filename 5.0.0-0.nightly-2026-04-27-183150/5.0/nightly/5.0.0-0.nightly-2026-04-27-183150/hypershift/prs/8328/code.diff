@@ -1,0 +1,25 @@
+diff --git a/api/AGENTS.md b/api/AGENTS.md
+index c99f866bd6b..555e0cc08df 100644
+--- a/api/AGENTS.md
++++ b/api/AGENTS.md
+@@ -6,9 +6,7 @@ This module (`github.com/openshift/hypershift/api`) is consumed by external Go c
+ 
+ These are non-obvious behaviors of the Kubernetes API machinery that affect how CRD types in `api/` must be written. These are not style preferences or conventions — they are fundamental facts and reasoning about how the system works.
+ 
+-For conventions read [https://github.com/openshift/enhancements/blob/master/dev-guide/api-conventions.md](https://github.com/openshift/enhancements/blob/master/dev-guide/api-conventions.md)
+-
+-`make api-lint-fix` will enforce most conventions and best practices. **Do not suppress or work around its findings** — they exist because violations have caused production issues. If a finding seems wrong, understand why the rule exists before dismissing it.
++For conventions, always trust the kube-api-linter (`make api-lint-fix`). Do not question its findings and do not add exclusions unless explicitly told to by a human reviewer. The linter encodes the [OpenShift API conventions](https://github.com/openshift/enhancements/blob/master/dev-guide/api-conventions.md) (authoritative) and [upstream Kubernetes API conventions](https://github.com/kubernetes/community/blob/main/contributors/devel/sig-architecture/api-conventions.md) (informational, downstream wins on conflicts). Do not fetch or read those documents — the linter already enforces them, and the actionable rules are captured in this file.
+ 
+ ### API Versioning
+ 
+@@ -29,7 +27,8 @@ ENVTEST_OCP_K8S_VERSIONS=1.35.0 make test-envtest-ocp # Run envtest for CEL vali
+ 
+ ### Serialization
+ 
+-- `omitempty` **does nothing for non-pointer structs.** Only `omitzero` correctly omits a struct field when it equals its zero value. This is a Go encoding/json behavior, not a Kubernetes convention.
++- **Always set `omitempty` or `omitzero` on every field, regardless of whether it is `+required` or `+optional`.** `omitempty`/`omitzero` tags control serialization, not validation. `+required` is a schema constraint enforced at admission time; the serialization tag controls what goes on the wire. Without a tag, a zero-value field serializes as an explicit value (e.g., `"pullSecret": {"name": ""}`), which makes the API server unable to distinguish "not set" from "explicitly set to empty." This breaks defaulting, server-side apply field ownership, and strategic merge patch — all of which rely on field absence to mean "don't touch this." Additionally, without omission a structured client serializes the empty object, which passes the `+required` check (based on key presence) without validating the value — so a user can forget to set a required field, it passes admission, and the reader sees a required field with an unexpected empty value.
++- `omitempty` **does nothing for non-pointer structs.** Only `omitzero` correctly omits a struct field when it equals its zero value. This is a Go encoding/json behavior, not a Kubernetes convention. Use `omitempty` for scalar fields (string, int, bool) and slices/maps. Use `omitzero` for struct fields (available since Go 1.24; this repo requires Go 1.25+).
+ - **The only reason to use a pointer in a CRD is when the zero value is a valid, distinct user choice.** If the struct has a required field, `{}` can never be valid user input, so there is no ambiguity to resolve and no pointer is needed. `omitzero` on a non-pointer struct will correctly omit the key from serialized output. `MinProperties`/`MaxProperties` on the parent counts serialized keys — it has no concept of whether the Go field is a pointer.
+ - `// +default` **must be paired with** `// +optional` because the required check runs before defaulting. A required field with a default will be rejected before the default is ever applied.
+ 

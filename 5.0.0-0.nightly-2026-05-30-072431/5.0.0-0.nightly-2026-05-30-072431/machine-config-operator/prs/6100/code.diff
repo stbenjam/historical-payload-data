@@ -1,0 +1,86 @@
+diff --git a/pkg/controller/internalreleaseimage/aggregation.go b/pkg/controller/internalreleaseimage/aggregation.go
+index 51f50c5e8b..6e0e9de81c 100644
+--- a/pkg/controller/internalreleaseimage/aggregation.go
++++ b/pkg/controller/internalreleaseimage/aggregation.go
+@@ -283,9 +283,24 @@ func buildAPIIntUnavailableReleases(specReleases []mcfgv1alpha1.InternalReleaseI
+ 	return releases
+ }
+ 
+-// transformToAPIIntURL converts localhost:22625/path to api-int.<domain>:22625/path
++// transformToAPIIntURL converts a localhost URL (e.g. localhost:22625/path or
++// localhost.localdomain:22625/path) to api-int.<domain>:22625/path by replacing
++// the hostname before the port with the api-int hostname.
+ func transformToAPIIntURL(localhostURL, clusterDomain string) string {
+-	return strings.Replace(localhostURL, "localhost", "api-int."+clusterDomain, 1)
++	// Find the host:port boundary by looking for ":" before the first "/"
++	slashIdx := strings.Index(localhostURL, "/")
++	hostPort := localhostURL
++	if slashIdx >= 0 {
++		hostPort = localhostURL[:slashIdx]
++	}
++
++	colonIdx := strings.Index(hostPort, ":")
++	if colonIdx < 0 {
++		// No port found — return unchanged to avoid mangling the URL
++		return localhostURL
++	}
++
++	return "api-int." + clusterDomain + localhostURL[colonIdx:]
+ }
+ 
+ // pingRegistry checks if the registry at the given URL is reachable.
+diff --git a/pkg/controller/internalreleaseimage/internalreleaseimage_controller_test.go b/pkg/controller/internalreleaseimage/internalreleaseimage_controller_test.go
+index b330251f67..17ed443e84 100644
+--- a/pkg/controller/internalreleaseimage/internalreleaseimage_controller_test.go
++++ b/pkg/controller/internalreleaseimage/internalreleaseimage_controller_test.go
+@@ -461,3 +461,50 @@ func TestAggregateIRIStatus(t *testing.T) {
+ 		})
+ 	}
+ }
++
++func TestTransformToAPIIntURL(t *testing.T) {
++	cases := []struct {
++		name          string
++		localhostURL  string
++		clusterDomain string
++		expected      string
++	}{
++		{
++			name:          "localhost without localdomain",
++			localhostURL:  "localhost:22625/openshift/release-images@sha256:abc123",
++			clusterDomain: "ostest.test.metalkube.org",
++			expected:      "api-int.ostest.test.metalkube.org:22625/openshift/release-images@sha256:abc123",
++		},
++		{
++			name:          "localhost.localdomain",
++			localhostURL:  "localhost.localdomain:22625/openshift/release-images@sha256:abc123",
++			clusterDomain: "ostest.test.metalkube.org",
++			expected:      "api-int.ostest.test.metalkube.org:22625/openshift/release-images@sha256:abc123",
++		},
++		{
++			name:          "no port returns input unchanged",
++			localhostURL:  "localhost",
++			clusterDomain: "example.com",
++			expected:      "localhost",
++		},
++		{
++			name:          "no port with sha256 digest returns input unchanged",
++			localhostURL:  "localhost/openshift/release-images@sha256:abc123",
++			clusterDomain: "example.com",
++			expected:      "localhost/openshift/release-images@sha256:abc123",
++		},
++		{
++			name:          "non-localhost host with port",
++			localhostURL:  "virthost.example.com:5000/openshift/release-images@sha256:abc123",
++			clusterDomain: "ostest.test.metalkube.org",
++			expected:      "api-int.ostest.test.metalkube.org:5000/openshift/release-images@sha256:abc123",
++		},
++	}
++
++	for _, tc := range cases {
++		t.Run(tc.name, func(t *testing.T) {
++			result := transformToAPIIntURL(tc.localhostURL, tc.clusterDomain)
++			assert.Equal(t, tc.expected, result)
++		})
++	}
++}

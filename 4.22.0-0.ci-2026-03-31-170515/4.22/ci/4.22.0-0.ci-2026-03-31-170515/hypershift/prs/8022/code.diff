@@ -1,0 +1,1015 @@
+diff --git a/cmd/oadp/backup.go b/cmd/oadp/backup.go
+index d85d31e6b0b..27f90c66d78 100644
+--- a/cmd/oadp/backup.go
++++ b/cmd/oadp/backup.go
+@@ -10,10 +10,8 @@ import (
+ 	"github.com/openshift/hypershift/cmd/log"
+ 	"github.com/openshift/hypershift/cmd/util"
+ 	"github.com/openshift/hypershift/support/oadp"
+-	utilroute "github.com/openshift/hypershift/support/util"
+ 
+ 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
+-	utilrand "k8s.io/apimachinery/pkg/util/rand"
+ 	"k8s.io/apimachinery/pkg/util/validation"
+ 
+ 	"github.com/spf13/cobra"
+@@ -92,10 +90,15 @@ func (o *CreateOptions) RunBackup(ctx context.Context) error {
+ 				// In render mode, if we can't connect to cluster, we'll still render but skip validations
+ 				o.Log.Info("Warning: Cannot connect to cluster for validation, skipping all checks")
+ 				// Step: Generate backup object with default platform (AWS)
+-				backup, _, err := o.GenerateBackupObjectWithPlatform("AWS")
++				backup, resourcePolicyCM, err := o.GenerateBackupObject("AWS")
+ 				if err != nil {
+ 					return fmt.Errorf("backup generation failed: %w", err)
+ 				}
++				if resourcePolicyCM != nil {
++					if err := renderYAMLObject(resourcePolicyCM); err != nil {
++						return err
++					}
++				}
+ 				return renderYAMLObject(backup)
+ 			}
+ 			return fmt.Errorf("failed to create kubernetes client: %w", err)
+@@ -148,15 +151,19 @@ func (o *CreateOptions) RunBackup(ctx context.Context) error {
+ 	}
+ 
+ 	// Step 4: Generate backup object with detected platform
+-	backup, backupName, err := o.GenerateBackupObjectWithPlatform(platform)
++	backup, resourcePolicyCM, err := o.GenerateBackupObject(platform)
+ 	if err != nil {
+ 		return fmt.Errorf("backup generation failed: %w", err)
+ 	}
+ 
+ 	if o.Render {
+ 		// Render mode: output YAML to STDOUT
+-		err := renderYAMLObject(backup)
+-		if err != nil {
++		if resourcePolicyCM != nil {
++			if err := renderYAMLObject(resourcePolicyCM); err != nil {
++				return err
++			}
++		}
++		if err := renderYAMLObject(backup); err != nil {
+ 			return err
+ 		}
+ 		// Ensure proper newline after render for terminal prompt
+@@ -169,11 +176,16 @@ func (o *CreateOptions) RunBackup(ctx context.Context) error {
+ 			return fmt.Errorf("kubernetes client is required for resource creation (not in render mode)")
+ 		}
+ 
++		// Create resource policy ConfigMap if needed (KubeVirt platform)
++		if err := createResourcePolicyConfigMap(ctx, o.Client, resourcePolicyCM, o.OADPNamespace, o.Log); err != nil {
++			return err
++		}
++
+ 		o.Log.Info("Creating backup...")
+ 		if err := o.Client.Create(ctx, backup); err != nil {
+ 			return fmt.Errorf("failed to create backup resource: %w", err)
+ 		}
+-		o.Log.Info("Backup created successfully", "name", backupName, "namespace", o.OADPNamespace, "platform", platform)
++		o.Log.Info("Backup created successfully", "name", backup.GetName(), "namespace", o.OADPNamespace, "platform", platform)
+ 	}
+ 
+ 	return nil
+@@ -181,13 +193,10 @@ func (o *CreateOptions) RunBackup(ctx context.Context) error {
+ 
+ // Note: randomStringGenerator type is now in types.go
+ 
+-// GenerateBackupName creates a backup name using the format: {hcName}-{hcNamespace}-{randomSuffix}
+-// If the name is too long, it uses utils.ShortenName to ensure it doesn't exceed 63 characters
++// GenerateBackupName creates a backup name using the format: {hcName}-{hcNamespace}-{randomSuffix}.
++// If the name is too long, it uses utils.ShortenName to ensure it doesn't exceed 63 characters.
+ func GenerateBackupName(hcName, hcNamespace string) string {
+-	randomSuffix := utilrand.String(6)
+-	baseName := fmt.Sprintf("%s-%s", hcName, hcNamespace)
+-	// Use ShortenName to ensure it doesn't exceed DNS1123 subdomain max length (63 chars)
+-	return utilroute.ShortenName(baseName, randomSuffix, validation.DNS1123LabelMaxLength)
++	return generateName(hcName, hcNamespace)
+ }
+ 
+ // ValidateBackupName validates the custom backup name if provided
+@@ -205,7 +214,9 @@ func (o *CreateOptions) ValidateBackupName() error {
+ 	return nil
+ }
+ 
+-func (o *CreateOptions) GenerateBackupObjectWithPlatform(platform string) (*unstructured.Unstructured, string, error) {
++// GenerateBackupObject generates a backup object and, for KubeVirt platform,
++// also returns a resource policy ConfigMap that tells Velero to skip RHCOS boot image PVCs.
++func (o *CreateOptions) GenerateBackupObject(platform string) (*unstructured.Unstructured, *unstructured.Unstructured, error) {
+ 	// Apply default values if not set
+ 	if o.StorageLocation == "" {
+ 		o.StorageLocation = "default"
+@@ -231,6 +242,22 @@ func (o *CreateOptions) GenerateBackupObjectWithPlatform(platform string) (*unst
+ 		includedResources = getDefaultResourcesForPlatform(platform)
+ 	}
+ 
++	spec := map[string]interface{}{
++		"includedNamespaces":       buildIncludedNamespaces(o.HCNamespace, o.HCName, o.IncludeNamespaces),
++		"includedResources":        includedResources,
++		"storageLocation":          o.StorageLocation,
++		"ttl":                      o.TTL.String(),
++		"snapshotMoveData":         o.SnapshotMoveData,
++		"defaultVolumesToFsBackup": o.DefaultVolumesToFsBackup,
++		"dataMover":                "velero",
++		"snapshotVolumes":          true,
++	}
++
++	applyPlatformBackupSpec(spec, platform)
++
++	// For KubeVirt, generate a resource policy ConfigMap to skip RHCOS boot image PVCs
++	resourcePolicyConfigMap := maybeGenerateResourcePolicy(platform, o.HCName, o.HCNamespace, o.OADPNamespace, spec)
++
+ 	// Create backup object using unstructured to avoid Velero dependency
+ 	backup := &unstructured.Unstructured{
+ 		Object: map[string]interface{}{
+@@ -243,17 +270,8 @@ func (o *CreateOptions) GenerateBackupObjectWithPlatform(platform string) (*unst
+ 					"velero.io/storage-location": o.StorageLocation,
+ 				},
+ 			},
+-			"spec": map[string]interface{}{
+-				"includedNamespaces":       buildIncludedNamespaces(o.HCNamespace, o.HCName, o.IncludeNamespaces),
+-				"includedResources":        includedResources,
+-				"storageLocation":          o.StorageLocation,
+-				"ttl":                      o.TTL.String(),
+-				"snapshotMoveData":         o.SnapshotMoveData,
+-				"defaultVolumesToFsBackup": o.DefaultVolumesToFsBackup,
+-				"dataMover":                "velero",
+-				"snapshotVolumes":          true,
+-			},
++			"spec": spec,
+ 		},
+ 	}
+-	return backup, backupName, nil
++	return backup, resourcePolicyConfigMap, nil
+ }
+diff --git a/cmd/oadp/backup_test.go b/cmd/oadp/backup_test.go
+index ae5d0c0594b..99c5bfb9105 100644
+--- a/cmd/oadp/backup_test.go
++++ b/cmd/oadp/backup_test.go
+@@ -76,7 +76,7 @@ func TestGenerateBackupObject(t *testing.T) {
+ 		DefaultVolumesToFsBackup: false,
+ 	}
+ 
+-	backup, backupName, err := opts.GenerateBackupObjectWithPlatform("AWS")
++	backup, _, err := opts.GenerateBackupObject("AWS")
+ 	if err != nil {
+ 		t.Errorf("generateBackupObject() error = %v", err)
+ 		return
+@@ -84,6 +84,7 @@ func TestGenerateBackupObject(t *testing.T) {
+ 
+ 	// Check backup name is auto-generated since no custom name was provided
+ 	// Format should be: {hcName}-{hcNamespace}-{randomSuffix}
++	backupName := backup.GetName()
+ 	expectedPattern := "test-cluster-test-cluster-ns-"
+ 	if !strings.HasPrefix(backupName, expectedPattern) {
+ 		t.Errorf("Expected backup name to start with '%s', got '%s'", expectedPattern, backupName)
+@@ -251,14 +252,14 @@ func TestGenerateBackupObjectComprehensive(t *testing.T) {
+ 				IncludedResources:        tt.includedResources,
+ 			}
+ 
+-			backup, backupName, err := opts.GenerateBackupObjectWithPlatform(tt.platform)
++			backup, _, err := opts.GenerateBackupObject(tt.platform)
+ 			if err != nil {
+-				t.Errorf("GenerateBackupObjectWithPlatform() error = %v", err)
++				t.Errorf("GenerateBackupObject() error = %v", err)
+ 				return
+ 			}
+ 
+ 			// Basic validation
+-			if len(backupName) == 0 {
++			if len(backup.GetName()) == 0 {
+ 				t.Errorf("Expected backup name to be generated, got empty string")
+ 			}
+ 
+@@ -549,22 +550,17 @@ func TestGenerateBackupObjectWithCustomName(t *testing.T) {
+ 				TTL:              2 * time.Hour,
+ 			}
+ 
+-			backup, backupName, err := opts.GenerateBackupObjectWithPlatform("AWS")
++			backup, _, err := opts.GenerateBackupObject("AWS")
+ 			if err != nil {
+-				t.Fatalf("GenerateBackupObjectWithPlatform() failed: %v", err)
++				t.Fatalf("GenerateBackupObject() failed: %v", err)
+ 			}
+ 
+ 			// Verify the backup name matches expected pattern
++			backupName := backup.GetName()
+ 			if !tt.expectedNameCheck(backupName) {
+ 				t.Errorf("Backup name '%s' does not match expected pattern", backupName)
+ 			}
+ 
+-			// Verify the name is set correctly in the backup object
+-			actualName := backup.GetName()
+-			if actualName != backupName {
+-				t.Errorf("Expected backup object name '%s', got '%s'", backupName, actualName)
+-			}
+-
+ 			// Basic object validation
+ 			if backup.GetAPIVersion() != "velero.io/v1" {
+ 				t.Errorf("Expected APIVersion 'velero.io/v1', got '%s'", backup.GetAPIVersion())
+@@ -639,9 +635,9 @@ func TestGenerateBackupObjectWithIncludedNamespaces(t *testing.T) {
+ 				IncludeNamespaces: tt.includeNamespaces,
+ 			}
+ 
+-			backup, _, err := opts.GenerateBackupObjectWithPlatform("AWS")
++			backup, _, err := opts.GenerateBackupObject("AWS")
+ 			if err != nil {
+-				t.Fatalf("GenerateBackupObjectWithPlatform() failed: %v", err)
++				t.Fatalf("GenerateBackupObject() failed: %v", err)
+ 			}
+ 
+ 			// Extract included namespaces from the generated backup
+@@ -679,6 +675,106 @@ func TestGenerateBackupObjectWithIncludedNamespaces(t *testing.T) {
+ 	}
+ }
+ 
++// TestGenerateBackupObjectWithKubeVirtResourcePolicy verifies that for KubeVirt platform,
++// the backup spec contains a resourcePolicy referencing a ConfigMap, and a ConfigMap is returned.
++// For non-KubeVirt platforms, no resourcePolicy should be set and no ConfigMap should be returned.
++func TestGenerateBackupObjectWithKubeVirtResourcePolicy(t *testing.T) {
++	tests := []struct {
++		name                 string
++		platform             string
++		expectResourcePolicy bool
++	}{
++		{
++			name:                 "When platform is KubeVirt it should have resourcePolicy and ConfigMap",
++			platform:             "KUBEVIRT",
++			expectResourcePolicy: true,
++		},
++		{
++			name:                 "When platform is lowercase kubevirt it should have resourcePolicy and ConfigMap",
++			platform:             "kubevirt",
++			expectResourcePolicy: true,
++		},
++		{
++			name:                 "When platform is AWS it should not have resourcePolicy",
++			platform:             "AWS",
++			expectResourcePolicy: false,
++		},
++		{
++			name:                 "When platform is AGENT it should not have resourcePolicy",
++			platform:             "AGENT",
++			expectResourcePolicy: false,
++		},
++		{
++			name:                 "When platform is AZURE it should not have resourcePolicy",
++			platform:             "AZURE",
++			expectResourcePolicy: false,
++		},
++		{
++			name:                 "When platform is OPENSTACK it should not have resourcePolicy",
++			platform:             "OPENSTACK",
++			expectResourcePolicy: false,
++		},
++	}
++
++	for _, tt := range tests {
++		t.Run(tt.name, func(t *testing.T) {
++			opts := &CreateOptions{
++				HCName:          "test-cluster",
++				HCNamespace:     "test-ns",
++				OADPNamespace:   "openshift-adp",
++				StorageLocation: "default",
++				TTL:             2 * time.Hour,
++			}
++
++			backup, resourcePolicyCM, err := opts.GenerateBackupObject(tt.platform)
++			if err != nil {
++				t.Fatalf("GenerateBackupObject() failed: %v", err)
++			}
++
++			// Check resourcePolicy in backup spec
++			rpInterface, rpFound, _ := unstructured.NestedFieldNoCopy(backup.Object, "spec", "resourcePolicy")
++
++			if tt.expectResourcePolicy {
++				if !rpFound {
++					t.Fatal("Expected spec.resourcePolicy to be set for KubeVirt platform")
++				}
++				rpMap, ok := rpInterface.(map[string]interface{})
++				if !ok {
++					t.Fatalf("Expected resourcePolicy to be a map, got %T", rpInterface)
++				}
++				if rpMap["kind"] != "configmap" {
++					t.Errorf("Expected resourcePolicy.kind to be 'configmap', got %v", rpMap["kind"])
++				}
++				if rpMap["name"] == nil || rpMap["name"] == "" {
++					t.Error("Expected resourcePolicy.name to be set")
++				}
++
++				// Verify ConfigMap is returned
++				if resourcePolicyCM == nil {
++					t.Fatal("Expected resource policy ConfigMap to be returned for KubeVirt platform")
++				}
++				if resourcePolicyCM.GetKind() != "ConfigMap" {
++					t.Errorf("Expected ConfigMap kind, got %s", resourcePolicyCM.GetKind())
++				}
++				if resourcePolicyCM.GetNamespace() != "openshift-adp" {
++					t.Errorf("Expected ConfigMap namespace 'openshift-adp', got %s", resourcePolicyCM.GetNamespace())
++				}
++				// Verify the ConfigMap name matches the backup's resourcePolicy name
++				if rpMap["name"] != resourcePolicyCM.GetName() {
++					t.Errorf("Expected resourcePolicy.name '%v' to match ConfigMap name '%s'", rpMap["name"], resourcePolicyCM.GetName())
++				}
++			} else {
++				if rpFound {
++					t.Errorf("Expected no resourcePolicy for platform %s, but found %v", tt.platform, rpInterface)
++				}
++				if resourcePolicyCM != nil {
++					t.Errorf("Expected no ConfigMap for platform %s, but got one", tt.platform)
++				}
++			}
++		})
++	}
++}
++
+ // TestBackupCommandIncludedNamespacesFlag verifies that the --include-additional-namespaces flag
+ // is properly configured in the CLI command and accessible for testing.
+ func TestBackupCommandIncludedNamespacesFlag(t *testing.T) {
+diff --git a/cmd/oadp/common.go b/cmd/oadp/common.go
+index 19ab9522be7..8274d31727c 100644
+--- a/cmd/oadp/common.go
++++ b/cmd/oadp/common.go
+@@ -1,13 +1,25 @@
+ package oadp
+ 
+ import (
++	"context"
++	"crypto/sha256"
++	"encoding/hex"
+ 	"fmt"
+ 	"os"
+ 	"strings"
+ 
++	"github.com/openshift/hypershift/api/hypershift/v1beta1"
++	utilroute "github.com/openshift/hypershift/support/util"
++
++	apierrors "k8s.io/apimachinery/pkg/api/errors"
+ 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
++	utilrand "k8s.io/apimachinery/pkg/util/rand"
++	"k8s.io/apimachinery/pkg/util/validation"
+ 
++	"sigs.k8s.io/controller-runtime/pkg/client"
+ 	"sigs.k8s.io/yaml"
++
++	"github.com/go-logr/logr"
+ )
+ 
+ // renderYAMLObject renders an unstructured object as YAML to stdout with proper formatting
+@@ -30,6 +42,27 @@ func renderYAMLObject(obj *unstructured.Unstructured) error {
+ 	return nil
+ }
+ 
++// isKubeVirtPlatform checks if the given platform is KubeVirt (case-insensitive).
++func isKubeVirtPlatform(platform string) bool {
++	return strings.ToUpper(platform) == "KUBEVIRT"
++}
++
++// applyPlatformBackupSpec adds platform-specific fields to a backup spec map.
++// For KubeVirt, this adds a labelSelector to exclude RHCOS boot image PVCs
++// since they are recreated when new VMs are provisioned post-restore.
++func applyPlatformBackupSpec(spec map[string]interface{}, platform string) {
++	if isKubeVirtPlatform(platform) {
++		spec["labelSelector"] = map[string]interface{}{
++			"matchExpressions": []interface{}{
++				map[string]interface{}{
++					"key":      v1beta1.IsKubeVirtRHCOSVolumeLabelName,
++					"operator": "DoesNotExist",
++				},
++			},
++		}
++	}
++}
++
+ // getDefaultResourcesForPlatform returns the default resource list based on the platform
+ func getDefaultResourcesForPlatform(platform string) []string {
+ 	// Get platform-specific resources, default to AWS if platform is unknown
+@@ -46,6 +79,89 @@ func getDefaultResourcesForPlatform(platform string) []string {
+ 	return result
+ }
+ 
++// generateName creates a name using the format: {hcName}-{hcNamespace}-{randomSuffix}.
++// If the name is too long, it uses utils.ShortenName to ensure it doesn't exceed 63 characters.
++func generateName(hcName, hcNamespace string) string {
++	randomSuffix := utilrand.String(6)
++	baseName := fmt.Sprintf("%s-%s", hcName, hcNamespace)
++	return utilroute.ShortenName(baseName, randomSuffix, validation.DNS1123LabelMaxLength)
++}
++
++// GenerateResourcePolicyName creates a deterministic resource policy ConfigMap name
++// using the format: {hcName}-{hcNamespace}-{hashSuffix}.
++// The suffix is derived from a SHA-256 hash of the inputs so the same HC always
++// produces the same ConfigMap name, avoiding orphaned ConfigMaps on retries.
++func GenerateResourcePolicyName(hcName, hcNamespace string) string {
++	baseName := fmt.Sprintf("%s-%s", hcName, hcNamespace)
++	hash := sha256.Sum256([]byte(baseName))
++	hashSuffix := hex.EncodeToString(hash[:])[:6]
++	return utilroute.ShortenName(baseName, hashSuffix, validation.DNS1123LabelMaxLength)
++}
++
++// GenerateResourcePolicyConfigMap creates a ConfigMap with a Velero volume policy that skips
++// PVCs labeled with the KubeVirt RHCOS boot image label.
++func GenerateResourcePolicyConfigMap(name, namespace string) *unstructured.Unstructured {
++	policiesYAML := fmt.Sprintf(`version: v1
++volumePolicies:
++  - conditions:
++      pvcLabels:
++        %s: "true"
++    action:
++      type: skip
++`, v1beta1.IsKubeVirtRHCOSVolumeLabelName)
++
++	return &unstructured.Unstructured{
++		Object: map[string]interface{}{
++			"apiVersion": "v1",
++			"kind":       "ConfigMap",
++			"metadata": map[string]interface{}{
++				"name":      name,
++				"namespace": namespace,
++			},
++			"data": map[string]interface{}{
++				"policies.yaml": policiesYAML,
++			},
++		},
++	}
++}
++
++// applyResourcePolicy sets the resourcePolicy field in a backup spec to reference a ConfigMap by name.
++func applyResourcePolicy(spec map[string]interface{}, configMapName string) {
++	spec["resourcePolicy"] = map[string]interface{}{
++		"kind": "configmap",
++		"name": configMapName,
++	}
++}
++
++// maybeGenerateResourcePolicy generates a resource policy ConfigMap for KubeVirt platform
++// and applies the resourcePolicy reference to the given spec. Returns nil for non-KubeVirt platforms.
++func maybeGenerateResourcePolicy(platform, hcName, hcNamespace, oadpNamespace string, spec map[string]interface{}) *unstructured.Unstructured {
++	if !isKubeVirtPlatform(platform) {
++		return nil
++	}
++	configMapName := GenerateResourcePolicyName(hcName, hcNamespace)
++	applyResourcePolicy(spec, configMapName)
++	return GenerateResourcePolicyConfigMap(configMapName, oadpNamespace)
++}
++
++// createResourcePolicyConfigMap creates the resource policy ConfigMap in the cluster if it is non-nil.
++// If the ConfigMap already exists, it is treated as a no-op for idempotency.
++func createResourcePolicyConfigMap(ctx context.Context, c client.Client, resourcePolicyCM *unstructured.Unstructured, oadpNamespace string, log logr.Logger) error {
++	if resourcePolicyCM == nil {
++		return nil
++	}
++	log.Info("Creating resource policy ConfigMap...", "name", resourcePolicyCM.GetName())
++	if err := c.Create(ctx, resourcePolicyCM); err != nil {
++		if apierrors.IsAlreadyExists(err) {
++			log.Info("Resource policy ConfigMap already exists, skipping creation", "name", resourcePolicyCM.GetName(), "namespace", oadpNamespace)
++			return nil
++		}
++		return fmt.Errorf("failed to create resource policy ConfigMap: %w", err)
++	}
++	log.Info("Resource policy ConfigMap created successfully", "name", resourcePolicyCM.GetName(), "namespace", oadpNamespace)
++	return nil
++}
++
+ // buildIncludedNamespaces builds the list of namespaces to include in backup/schedule/restore operations
+ // Always includes HC-namespace and HCP-namespace, and then adds any additional namespaces specified
+ func buildIncludedNamespaces(hcNamespace, hcName string, additionalNamespaces []string) []string {
+diff --git a/cmd/oadp/common_test.go b/cmd/oadp/common_test.go
+new file mode 100644
+index 00000000000..920c26ab6ff
+--- /dev/null
++++ b/cmd/oadp/common_test.go
+@@ -0,0 +1,226 @@
++package oadp
++
++import (
++	"strings"
++	"testing"
++
++	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
++)
++
++func TestApplyPlatformBackupSpec(t *testing.T) {
++	tests := []struct {
++		name                string
++		platform            string
++		expectLabelSelector bool
++	}{
++		{
++			name:                "When platform is KUBEVIRT it should add labelSelector",
++			platform:            "KUBEVIRT",
++			expectLabelSelector: true,
++		},
++		{
++			name:                "When platform is lowercase kubevirt it should add labelSelector",
++			platform:            "kubevirt",
++			expectLabelSelector: true,
++		},
++		{
++			name:                "When platform is mixed case KubeVirt it should add labelSelector",
++			platform:            "KubeVirt",
++			expectLabelSelector: true,
++		},
++		{
++			name:                "When platform is AWS it should not add labelSelector",
++			platform:            "AWS",
++			expectLabelSelector: false,
++		},
++		{
++			name:                "When platform is AGENT it should not add labelSelector",
++			platform:            "AGENT",
++			expectLabelSelector: false,
++		},
++		{
++			name:                "When platform is empty it should not add labelSelector",
++			platform:            "",
++			expectLabelSelector: false,
++		},
++	}
++
++	for _, tt := range tests {
++		t.Run(tt.name, func(t *testing.T) {
++			spec := map[string]interface{}{}
++
++			applyPlatformBackupSpec(spec, tt.platform)
++
++			labelSelector, found := spec["labelSelector"]
++			if tt.expectLabelSelector {
++				if !found {
++					t.Fatal("Expected labelSelector to be set, but it was not")
++				}
++
++				selectorMap, ok := labelSelector.(map[string]interface{})
++				if !ok {
++					t.Fatalf("Expected labelSelector to be map[string]interface{}, got %T", labelSelector)
++				}
++
++				matchExpressions, ok := selectorMap["matchExpressions"].([]interface{})
++				if !ok || len(matchExpressions) != 1 {
++					t.Fatalf("Expected matchExpressions with 1 entry, got %v", selectorMap["matchExpressions"])
++				}
++
++				expr, ok := matchExpressions[0].(map[string]interface{})
++				if !ok {
++					t.Fatalf("Expected matchExpression to be map[string]interface{}, got %T", matchExpressions[0])
++				}
++
++				if expr["key"] != "hypershift.openshift.io/is-kubevirt-rhcos" {
++					t.Errorf("Expected key 'hypershift.openshift.io/is-kubevirt-rhcos', got %v", expr["key"])
++				}
++
++				if expr["operator"] != "DoesNotExist" {
++					t.Errorf("Expected operator 'DoesNotExist', got %v", expr["operator"])
++				}
++			} else {
++				if found {
++					t.Errorf("Expected no labelSelector for platform %q, but got %v", tt.platform, labelSelector)
++				}
++			}
++		})
++	}
++}
++
++func TestGenerateResourcePolicyConfigMap(t *testing.T) {
++	t.Run("When generating a resource policy ConfigMap it should have correct structure", func(t *testing.T) {
++		cm := GenerateResourcePolicyConfigMap("test-policy", "openshift-adp")
++
++		if cm.GetKind() != "ConfigMap" {
++			t.Errorf("Expected kind 'ConfigMap', got %s", cm.GetKind())
++		}
++		if cm.GetAPIVersion() != "v1" {
++			t.Errorf("Expected apiVersion 'v1', got %s", cm.GetAPIVersion())
++		}
++		if cm.GetName() != "test-policy" {
++			t.Errorf("Expected name 'test-policy', got %s", cm.GetName())
++		}
++		if cm.GetNamespace() != "openshift-adp" {
++			t.Errorf("Expected namespace 'openshift-adp', got %s", cm.GetNamespace())
++		}
++
++		data, found, err := unstructured.NestedString(cm.Object, "data", "policies.yaml")
++		if err != nil || !found {
++			t.Fatal("Expected data.policies.yaml to be set")
++		}
++		if !strings.Contains(data, "hypershift.openshift.io/is-kubevirt-rhcos") {
++			t.Error("Expected policies.yaml to contain the RHCOS label name")
++		}
++		if !strings.Contains(data, "type: skip") {
++			t.Error("Expected policies.yaml to contain skip action")
++		}
++		if !strings.Contains(data, "volumePolicies") {
++			t.Error("Expected policies.yaml to contain volumePolicies")
++		}
++	})
++}
++
++func TestGenerateResourcePolicyName(t *testing.T) {
++	t.Run("When generating a resource policy name it should follow the naming pattern", func(t *testing.T) {
++		name := GenerateResourcePolicyName("test-cluster", "test-ns")
++		expectedPrefix := "test-cluster-test-ns-"
++		if !strings.HasPrefix(name, expectedPrefix) {
++			t.Errorf("Expected name to start with '%s', got '%s'", expectedPrefix, name)
++		}
++		if len(name) != len(expectedPrefix)+6 {
++			t.Errorf("Expected name length %d, got %d", len(expectedPrefix)+6, len(name))
++		}
++	})
++
++	t.Run("When called with the same inputs it should return the same name", func(t *testing.T) {
++		name1 := GenerateResourcePolicyName("test-cluster", "test-ns")
++		name2 := GenerateResourcePolicyName("test-cluster", "test-ns")
++		if name1 != name2 {
++			t.Errorf("Expected deterministic name, got '%s' and '%s'", name1, name2)
++		}
++	})
++
++	t.Run("When called with different inputs it should return different names", func(t *testing.T) {
++		name1 := GenerateResourcePolicyName("cluster-a", "ns-a")
++		name2 := GenerateResourcePolicyName("cluster-b", "ns-b")
++		if name1 == name2 {
++			t.Errorf("Expected different names for different inputs, both got '%s'", name1)
++		}
++	})
++
++	t.Run("When HC name and namespace exceed 63 chars it should shorten properly", func(t *testing.T) {
++		name := GenerateResourcePolicyName("very-long-hostedcluster-name-12345", "very-long-namespace-name-12345")
++		if len(name) > 63 {
++			t.Errorf("Expected name <= 63 chars, got %d: %s", len(name), name)
++		}
++		if len(name) == 0 {
++			t.Error("Expected non-empty name")
++		}
++	})
++}
++
++func TestIsKubeVirtPlatform(t *testing.T) {
++	tests := []struct {
++		name     string
++		platform string
++		expected bool
++	}{
++		{"When platform is KUBEVIRT it should return true", "KUBEVIRT", true},
++		{"When platform is lowercase kubevirt it should return true", "kubevirt", true},
++		{"When platform is mixed case KubeVirt it should return true", "KubeVirt", true},
++		{"When platform is AWS it should return false", "AWS", false},
++		{"When platform is empty it should return false", "", false},
++	}
++
++	for _, tt := range tests {
++		t.Run(tt.name, func(t *testing.T) {
++			if got := isKubeVirtPlatform(tt.platform); got != tt.expected {
++				t.Errorf("isKubeVirtPlatform(%q) = %v, want %v", tt.platform, got, tt.expected)
++			}
++		})
++	}
++}
++
++func TestApplyResourcePolicy(t *testing.T) {
++	t.Run("When applying resource policy it should set configmap reference", func(t *testing.T) {
++		spec := map[string]interface{}{}
++		applyResourcePolicy(spec, "my-policy")
++
++		rp, found := spec["resourcePolicy"]
++		if !found {
++			t.Fatal("Expected resourcePolicy to be set")
++		}
++		rpMap, ok := rp.(map[string]interface{})
++		if !ok {
++			t.Fatalf("Expected resourcePolicy to be map, got %T", rp)
++		}
++		if rpMap["kind"] != "configmap" {
++			t.Errorf("Expected kind 'configmap', got %v", rpMap["kind"])
++		}
++		if rpMap["name"] != "my-policy" {
++			t.Errorf("Expected name 'my-policy', got %v", rpMap["name"])
++		}
++	})
++}
++
++func TestApplyPlatformBackupSpecPreservesExistingFields(t *testing.T) {
++	t.Run("When spec has existing fields it should preserve them", func(t *testing.T) {
++		spec := map[string]interface{}{
++			"storageLocation": "default",
++			"snapshotVolumes": true,
++		}
++
++		applyPlatformBackupSpec(spec, "KUBEVIRT")
++
++		if spec["storageLocation"] != "default" {
++			t.Errorf("Expected storageLocation to be preserved, got %v", spec["storageLocation"])
++		}
++		if spec["snapshotVolumes"] != true {
++			t.Errorf("Expected snapshotVolumes to be preserved, got %v", spec["snapshotVolumes"])
++		}
++		if _, found := spec["labelSelector"]; !found {
++			t.Error("Expected labelSelector to be added")
++		}
++	})
++}
+diff --git a/cmd/oadp/schedule.go b/cmd/oadp/schedule.go
+index de6940c5985..5284d8a7e5d 100644
+--- a/cmd/oadp/schedule.go
++++ b/cmd/oadp/schedule.go
+@@ -10,10 +10,8 @@ import (
+ 	"github.com/openshift/hypershift/cmd/log"
+ 	"github.com/openshift/hypershift/cmd/util"
+ 	"github.com/openshift/hypershift/support/oadp"
+-	utilroute "github.com/openshift/hypershift/support/util"
+ 
+ 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
+-	utilrand "k8s.io/apimachinery/pkg/util/rand"
+ 	"k8s.io/apimachinery/pkg/util/validation"
+ 
+ 	"github.com/spf13/cobra"
+@@ -97,13 +95,10 @@ https://hypershift.pages.dev/how-to/disaster-recovery/dr-cli/`,
+ 	return cmd
+ }
+ 
+-// GenerateScheduleName creates a schedule name using the format: {hcName}-{hcNamespace}-{randomSuffix}
+-// If the name is too long, it uses utils.ShortenName to ensure it doesn't exceed 63 characters
++// GenerateScheduleName creates a schedule name using the format: {hcName}-{hcNamespace}-{randomSuffix}.
++// If the name is too long, it uses utils.ShortenName to ensure it doesn't exceed 63 characters.
+ func GenerateScheduleName(hcName, hcNamespace string) string {
+-	randomSuffix := utilrand.String(6)
+-	baseName := fmt.Sprintf("%s-%s", hcName, hcNamespace)
+-	// Use ShortenName to ensure it doesn't exceed DNS1123 subdomain max length (63 chars)
+-	return utilroute.ShortenName(baseName, randomSuffix, validation.DNS1123LabelMaxLength)
++	return generateName(hcName, hcNamespace)
+ }
+ 
+ func (o *CreateOptions) RunSchedule(ctx context.Context) error {
+@@ -174,13 +169,18 @@ func (o *CreateOptions) RunSchedule(ctx context.Context) error {
+ 	}
+ 
+ 	// Step 6: Generate schedule object
+-	schedule, scheduleName, err := o.GenerateScheduleObject(platform)
++	schedule, resourcePolicyCM, err := o.GenerateScheduleObject(platform)
+ 	if err != nil {
+ 		return fmt.Errorf("failed to generate schedule object: %w", err)
+ 	}
+ 
+ 	// Step 7: Create or render the schedule
+ 	if o.Render {
++		if resourcePolicyCM != nil {
++			if err := renderYAMLObject(resourcePolicyCM); err != nil {
++				return err
++			}
++		}
+ 		return renderYAMLObject(schedule)
+ 	} else {
+ 		// Validate that client is available for creation
+@@ -188,17 +188,24 @@ func (o *CreateOptions) RunSchedule(ctx context.Context) error {
+ 			return fmt.Errorf("kubernetes client is required for resource creation (not in render mode)")
+ 		}
+ 
++		// Create resource policy ConfigMap if needed (KubeVirt platform)
++		if err := createResourcePolicyConfigMap(ctx, o.Client, resourcePolicyCM, o.OADPNamespace, o.Log); err != nil {
++			return err
++		}
++
+ 		o.Log.Info("Creating schedule...")
+ 		if err := o.Client.Create(ctx, schedule); err != nil {
+ 			return fmt.Errorf("failed to create schedule resource: %w", err)
+ 		}
+-		o.Log.Info("Schedule created successfully", "name", scheduleName, "namespace", o.OADPNamespace, "platform", platform, "schedule", o.Schedule)
++		o.Log.Info("Schedule created successfully", "name", schedule.GetName(), "namespace", o.OADPNamespace, "platform", platform, "schedule", o.Schedule)
+ 	}
+ 
+ 	return nil
+ }
+ 
+-func (o *CreateOptions) GenerateScheduleObject(platform string) (*unstructured.Unstructured, string, error) {
++// GenerateScheduleObject generates a schedule object and, for KubeVirt platform,
++// also returns a resource policy ConfigMap that tells Velero to skip RHCOS boot image PVCs.
++func (o *CreateOptions) GenerateScheduleObject(platform string) (*unstructured.Unstructured, *unstructured.Unstructured, error) {
+ 	// Use the name from flag, or generate if empty
+ 	scheduleName := o.ScheduleName
+ 	if scheduleName == "" {
+@@ -241,6 +248,11 @@ func (o *CreateOptions) GenerateScheduleObject(platform string) (*unstructured.U
+ 		"snapshotVolumes":          true,
+ 	}
+ 
++	applyPlatformBackupSpec(backupTemplate, platform)
++
++	// For KubeVirt, generate a resource policy ConfigMap to skip RHCOS boot image PVCs
++	resourcePolicyConfigMap := maybeGenerateResourcePolicy(platform, o.HCName, o.HCNamespace, o.OADPNamespace, backupTemplate)
++
+ 	// Create schedule spec
+ 	spec := map[string]interface{}{
+ 		"template":                   backupTemplate,
+@@ -268,7 +280,7 @@ func (o *CreateOptions) GenerateScheduleObject(platform string) (*unstructured.U
+ 		},
+ 	}
+ 
+-	return schedule, scheduleName, nil
++	return schedule, resourcePolicyConfigMap, nil
+ }
+ 
+ func (o *CreateOptions) ValidateSchedulePace() error {
+diff --git a/cmd/oadp/schedule_test.go b/cmd/oadp/schedule_test.go
+index 0c62eeb957c..5931d6c4a45 100644
+--- a/cmd/oadp/schedule_test.go
++++ b/cmd/oadp/schedule_test.go
+@@ -95,7 +95,7 @@ func TestGenerateScheduleObject(t *testing.T) {
+ 		SkipImmediately:          false,
+ 	}
+ 
+-	schedule, scheduleName, err := opts.GenerateScheduleObject("AWS")
++	schedule, _, err := opts.GenerateScheduleObject("AWS")
+ 	if err != nil {
+ 		t.Errorf("GenerateScheduleObject() error = %v", err)
+ 		return
+@@ -103,6 +103,7 @@ func TestGenerateScheduleObject(t *testing.T) {
+ 
+ 	// Check schedule name format - should be auto-generated since no custom name was provided
+ 	// Format should be: {hcName}-{hcNamespace}-{randomSuffix}
++	scheduleName := schedule.GetName()
+ 	expectedPattern := "test-cluster-test-cluster-ns-"
+ 	if !strings.HasPrefix(scheduleName, expectedPattern) {
+ 		t.Errorf("Expected schedule name to start with '%s', got '%s'", expectedPattern, scheduleName)
+@@ -121,10 +122,6 @@ func TestGenerateScheduleObject(t *testing.T) {
+ 		t.Errorf("Expected kind 'Schedule', got %s", schedule.GetKind())
+ 	}
+ 
+-	if schedule.GetName() != scheduleName {
+-		t.Errorf("Expected schedule name %s, got %s", scheduleName, schedule.GetName())
+-	}
+-
+ 	if schedule.GetNamespace() != opts.OADPNamespace {
+ 		t.Errorf("Expected schedule namespace %s, got %s", opts.OADPNamespace, schedule.GetNamespace())
+ 	}
+@@ -309,14 +306,14 @@ func TestGenerateScheduleObjectComprehensive(t *testing.T) {
+ 				SkipImmediately:          tt.skipImmediately,
+ 			}
+ 
+-			schedule, scheduleName, err := opts.GenerateScheduleObject(tt.platform)
++			schedule, _, err := opts.GenerateScheduleObject(tt.platform)
+ 			if err != nil {
+ 				t.Errorf("GenerateScheduleObject() error = %v", err)
+ 				return
+ 			}
+ 
+ 			// Basic validation
+-			if len(scheduleName) == 0 {
++			if len(schedule.GetName()) == 0 {
+ 				t.Errorf("Expected schedule name to be generated, got empty string")
+ 			}
+ 
+@@ -415,6 +412,94 @@ func TestGenerateScheduleObjectComprehensive(t *testing.T) {
+ 	}
+ }
+ 
++// TestGenerateScheduleObjectWithKubeVirtResourcePolicy verifies that for KubeVirt platform,
++// the schedule template contains a resourcePolicy referencing a ConfigMap, and a ConfigMap is returned.
++// For non-KubeVirt platforms, no resourcePolicy should be set and no ConfigMap should be returned.
++func TestGenerateScheduleObjectWithKubeVirtResourcePolicy(t *testing.T) {
++	tests := []struct {
++		name                 string
++		platform             string
++		expectResourcePolicy bool
++	}{
++		{
++			name:                 "When platform is KubeVirt it should have resourcePolicy in template",
++			platform:             "KUBEVIRT",
++			expectResourcePolicy: true,
++		},
++		{
++			name:                 "When platform is lowercase kubevirt it should have resourcePolicy in template",
++			platform:             "kubevirt",
++			expectResourcePolicy: true,
++		},
++		{
++			name:                 "When platform is AWS it should not have resourcePolicy in template",
++			platform:             "AWS",
++			expectResourcePolicy: false,
++		},
++		{
++			name:                 "When platform is AGENT it should not have resourcePolicy in template",
++			platform:             "AGENT",
++			expectResourcePolicy: false,
++		},
++	}
++
++	for _, tt := range tests {
++		t.Run(tt.name, func(t *testing.T) {
++			opts := &CreateOptions{
++				HCName:          "test-cluster",
++				HCNamespace:     "test-ns",
++				OADPNamespace:   "openshift-adp",
++				StorageLocation: "default",
++				TTL:             2 * time.Hour,
++				Schedule:        "0 2 * * *",
++			}
++
++			schedule, resourcePolicyCM, err := opts.GenerateScheduleObject(tt.platform)
++			if err != nil {
++				t.Fatalf("GenerateScheduleObject() failed: %v", err)
++			}
++
++			// Check resourcePolicy in schedule spec.template
++			rpInterface, rpFound, _ := unstructured.NestedFieldNoCopy(schedule.Object, "spec", "template", "resourcePolicy")
++
++			if tt.expectResourcePolicy {
++				if !rpFound {
++					t.Fatal("Expected spec.template.resourcePolicy to be set for KubeVirt platform")
++				}
++				rpMap, ok := rpInterface.(map[string]interface{})
++				if !ok {
++					t.Fatalf("Expected resourcePolicy to be a map, got %T", rpInterface)
++				}
++				if rpMap["kind"] != "configmap" {
++					t.Errorf("Expected resourcePolicy.kind to be 'configmap', got %v", rpMap["kind"])
++				}
++				if rpMap["name"] == nil || rpMap["name"] == "" {
++					t.Error("Expected resourcePolicy.name to be set")
++				}
++
++				// Verify ConfigMap is returned
++				if resourcePolicyCM == nil {
++					t.Fatal("Expected resource policy ConfigMap to be returned for KubeVirt platform")
++				}
++				if resourcePolicyCM.GetKind() != "ConfigMap" {
++					t.Errorf("Expected ConfigMap kind, got %s", resourcePolicyCM.GetKind())
++				}
++				// Verify the ConfigMap name matches the schedule template's resourcePolicy name
++				if rpMap["name"] != resourcePolicyCM.GetName() {
++					t.Errorf("Expected resourcePolicy.name '%v' to match ConfigMap name '%s'", rpMap["name"], resourcePolicyCM.GetName())
++				}
++			} else {
++				if rpFound {
++					t.Errorf("Expected no resourcePolicy for platform %s, but found %v", tt.platform, rpInterface)
++				}
++				if resourcePolicyCM != nil {
++					t.Errorf("Expected no ConfigMap for platform %s, but got one", tt.platform)
++				}
++			}
++		})
++	}
++}
++
+ // TestValidateSchedulePace verifies that the cron schedule validation works correctly.
+ // This test ensures that:
+ // - Valid cron expressions are accepted
+diff --git a/cmd/oadp/types.go b/cmd/oadp/types.go
+index cd9ba7ab847..8bdfdb90554 100644
+--- a/cmd/oadp/types.go
++++ b/cmd/oadp/types.go
+@@ -74,6 +74,7 @@ var (
+ 	}
+ 	kubevirtResources = []string{
+ 		"kubevirtclusters.infrastructure.cluster.x-k8s.io", "kubevirtmachinetemplates.infrastructure.cluster.x-k8s.io",
++		"datavolumes.cdi.kubevirt.io",
+ 	}
+ 	openstackResources = []string{
+ 		"openstackclusters.infrastructure.cluster.x-k8s.io", "openstackmachinetemplates.infrastructure.cluster.x-k8s.io", "openstackmachines.infrastructure.cluster.x-k8s.io",
+diff --git a/test/integration/oadp/cli/backup_cli_test.go b/test/integration/oadp/cli/backup_cli_test.go
+index 3c7f653ebe3..84754f85e53 100644
+--- a/test/integration/oadp/cli/backup_cli_test.go
++++ b/test/integration/oadp/cli/backup_cli_test.go
+@@ -49,7 +49,7 @@ func TestBackupManifestValidation(t *testing.T) {
+ 				TTL:             2 * time.Hour,
+ 			}
+ 
+-			backup, _, err := opts.GenerateBackupObjectWithPlatform(tt.platform)
++			backup, _, err := opts.GenerateBackupObject(tt.platform)
+ 			g.Expect(err).ToNot(HaveOccurred(), "Failed to generate backup object")
+ 
+ 			// Convert to YAML for validation
+@@ -121,7 +121,7 @@ func TestBackupCLIConfiguration(t *testing.T) {
+ 		t.Run(tt.name, func(t *testing.T) {
+ 			g := NewWithT(t)
+ 
+-			backup, _, err := tt.opts.GenerateBackupObjectWithPlatform("AWS")
++			backup, _, err := tt.opts.GenerateBackupObject("AWS")
+ 			if tt.wantErr {
+ 				g.Expect(err).To(HaveOccurred())
+ 				return
+@@ -326,17 +326,16 @@ func TestBackupCustomNameIntegration(t *testing.T) {
+ 
+ 			// Test backup generation
+ 			if tt.expectValidBackup {
+-				backup, backupName, err := opts.GenerateBackupObjectWithPlatform("AWS")
++				backup, _, err := opts.GenerateBackupObject("AWS")
+ 				g.Expect(err).ToNot(HaveOccurred(), "Failed to generate backup object")
+ 
++				backupName := backup.GetName()
+ 				if tt.customName != "" {
+ 					g.Expect(backupName).To(Equal(tt.customName), "Custom backup name should be used")
+-					g.Expect(backup.GetName()).To(Equal(tt.customName), "Backup object name should match custom name")
+ 				} else {
+ 					expectedPrefix := "test-cluster-test-cluster-ns-"
+ 					g.Expect(backupName).To(HavePrefix(expectedPrefix), "Should use auto-generated name pattern")
+ 					g.Expect(len(backupName)).To(Equal(len(expectedPrefix) + 6), "Auto-generated name should have 6-char random suffix")
+-					g.Expect(backup.GetName()).To(Equal(backupName), "Backup object name should match generated name")
+ 				}
+ 			}
+ 		})
+@@ -388,7 +387,7 @@ func TestBackupIncludedNamespacesIntegration(t *testing.T) {
+ 				TTL:               2 * time.Hour,
+ 			}
+ 
+-			backup, _, err := opts.GenerateBackupObjectWithPlatform("AWS")
++			backup, _, err := opts.GenerateBackupObject("AWS")
+ 			g.Expect(err).ToNot(HaveOccurred(), "Failed to generate backup object")
+ 
+ 			// Extract included namespaces from backup spec

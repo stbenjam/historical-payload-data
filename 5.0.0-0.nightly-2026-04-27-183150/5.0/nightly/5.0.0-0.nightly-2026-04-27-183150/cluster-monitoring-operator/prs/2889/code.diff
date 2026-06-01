@@ -1,0 +1,524 @@
+diff --git a/pkg/manifests/config_merge.go b/pkg/manifests/config_merge.go
+index 7b773b27cc..4f1069cb3f 100644
+--- a/pkg/manifests/config_merge.go
++++ b/pkg/manifests/config_merge.go
+@@ -16,7 +16,9 @@ package manifests
+ 
+ import (
+ 	configv1alpha1 "github.com/openshift/api/config/v1alpha1"
++	monv1 "github.com/prometheus-operator/prometheus-operator/pkg/apis/monitoring/v1"
+ 	v1 "k8s.io/api/core/v1"
++	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+ 	auditv1 "k8s.io/apiserver/pkg/apis/audit/v1"
+ 	"k8s.io/utils/ptr"
+ )
+@@ -35,6 +37,8 @@ func (c *Config) mergeClusterMonitoringCRD(clusterMonitoring *configv1alpha1.Clu
+ 	}
+ 
+ 	c.mergeMetricsServerConfiguration(clusterMonitoring.Spec.MetricsServerConfig)
++	c.mergePrometheusOperatorConfiguration(clusterMonitoring.Spec.PrometheusOperatorConfig)
++	c.mergeAlertmanagerConfiguration(clusterMonitoring.Spec.AlertmanagerConfig)
+ }
+ 
+ // clusterMonitoringMetricsServerSpecEmpty reports whether the CR's
+@@ -59,10 +63,36 @@ func clusterMonitoringMetricsServerSpecEmpty(msc configv1alpha1.MetricsServerCon
+ 	if len(msc.TopologySpreadConstraints) > 0 {
+ 		return false
+ 	}
++	return true
++}
+ 
++// clusterMonitoringPrometheusOperatorSpecEmpty reports whether the CR's
++// prometheusOperatorConfig stanza contains no user-set field.
++func clusterMonitoringPrometheusOperatorSpecEmpty(poc configv1alpha1.PrometheusOperatorConfig) bool {
++	if poc.LogLevel != "" {
++		return false
++	}
++	if len(poc.NodeSelector) > 0 {
++		return false
++	}
++	if len(poc.Tolerations) > 0 {
++		return false
++	}
++	if len(poc.Resources) > 0 {
++		return false
++	}
++	if len(poc.TopologySpreadConstraints) > 0 {
++		return false
++	}
+ 	return true
+ }
+ 
++// clusterMonitoringAlertmanagerSpecEmpty reports whether the CR's
++// alertmanagerConfig stanza contains no user intent.
++func clusterMonitoringAlertmanagerSpecEmpty(ac configv1alpha1.AlertmanagerConfig) bool {
++	return ac.DeploymentMode == ""
++}
++
+ func verbosityLevelToNumeric(level configv1alpha1.VerbosityLevel) uint8 {
+ 	switch level {
+ 	case configv1alpha1.VerbosityLevelErrors:
+@@ -78,6 +108,40 @@ func verbosityLevelToNumeric(level configv1alpha1.VerbosityLevel) uint8 {
+ 	}
+ }
+ 
++func logLevelCRDToManifest(ll configv1alpha1.LogLevel) string {
++	switch ll {
++	case configv1alpha1.LogLevelError:
++		return "error"
++	case configv1alpha1.LogLevelWarn:
++		return "warn"
++	case configv1alpha1.LogLevelInfo:
++		return "info"
++	case configv1alpha1.LogLevelDebug:
++		return "debug"
++	default:
++		return ""
++	}
++}
++
++func containerResourcesFromCRD(resources []configv1alpha1.ContainerResource) *v1.ResourceRequirements {
++	if len(resources) == 0 {
++		return nil
++	}
++	out := &v1.ResourceRequirements{
++		Requests: v1.ResourceList{},
++		Limits:   v1.ResourceList{},
++	}
++	for _, res := range resources {
++		if !res.Request.IsZero() {
++			out.Requests[v1.ResourceName(res.Name)] = res.Request
++		}
++		if !res.Limit.IsZero() {
++			out.Limits[v1.ResourceName(res.Name)] = res.Limit
++		}
++	}
++	return out
++}
++
+ func (c *Config) mergeMetricsServerConfiguration(msc configv1alpha1.MetricsServerConfig) {
+ 	// Metrics Server (Phase 1): if the ConfigMap already has metricsServer, mergeMetricsServerConfiguration
+ 	// is a no-op.
+@@ -97,33 +161,99 @@ func (c *Config) mergeMetricsServerConfiguration(msc configv1alpha1.MetricsServe
+ 	if msc.Verbosity != "" {
+ 		cfg.Verbosity = verbosityLevelToNumeric(msc.Verbosity)
+ 	}
+-
+ 	cfg.NodeSelector = msc.NodeSelector
+ 	cfg.Tolerations = msc.Tolerations
+-
+-	if len(msc.Resources) > 0 {
+-		resources := &v1.ResourceRequirements{
+-			Requests: v1.ResourceList{},
+-			Limits:   v1.ResourceList{},
+-		}
+-		for _, res := range msc.Resources {
+-			if !res.Request.IsZero() {
+-				resources.Requests[v1.ResourceName(res.Name)] = res.Request
+-			}
+-			if !res.Limit.IsZero() {
+-				resources.Limits[v1.ResourceName(res.Name)] = res.Limit
+-			}
+-		}
+-		cfg.Resources = resources
+-	}
+-
++	cfg.Resources = containerResourcesFromCRD(msc.Resources)
+ 	if msc.Audit.Profile != "" {
+ 		cfg.Audit = &Audit{
+ 			Profile: auditv1.Level(string(msc.Audit.Profile)),
+ 		}
+ 	}
+-
+ 	cfg.TopologySpreadConstraints = msc.TopologySpreadConstraints
+ 
+ 	c.ClusterMonitoringConfiguration.MetricsServerConfig = cfg
+ }
++
++func (c *Config) mergePrometheusOperatorConfiguration(poc configv1alpha1.PrometheusOperatorConfig) {
++	if c.ClusterMonitoringConfiguration.PrometheusOperatorConfig != nil {
++		return
++	}
++	if clusterMonitoringPrometheusOperatorSpecEmpty(poc) {
++		return
++	}
++
++	cfg := &PrometheusOperatorConfig{}
++
++	if poc.LogLevel != "" {
++		cfg.LogLevel = logLevelCRDToManifest(poc.LogLevel)
++	}
++	cfg.NodeSelector = poc.NodeSelector
++	cfg.Tolerations = poc.Tolerations
++	cfg.Resources = containerResourcesFromCRD(poc.Resources)
++	cfg.TopologySpreadConstraints = poc.TopologySpreadConstraints
++
++	c.ClusterMonitoringConfiguration.PrometheusOperatorConfig = cfg
++}
++
++func (c *Config) mergeAlertmanagerConfiguration(ac configv1alpha1.AlertmanagerConfig) {
++	if c.ClusterMonitoringConfiguration.AlertmanagerMainConfig != nil {
++		return
++	}
++	if clusterMonitoringAlertmanagerSpecEmpty(ac) {
++		return
++	}
++
++	cfg := &AlertmanagerMainConfig{}
++	switch ac.DeploymentMode {
++	case configv1alpha1.AlertManagerDeployModeDisabled:
++		cfg.Enabled = ptr.To(false)
++	case configv1alpha1.AlertManagerDeployModeDefaultConfig:
++		// Deploy with platform defaults (Enabled is nil → true via IsEnabled).
++	case configv1alpha1.AlertManagerDeployModeCustomConfig:
++		mergeAlertmanagerCustomConfigFromCRD(cfg, ac.CustomConfig)
++	default:
++		return
++	}
++	c.ClusterMonitoringConfiguration.AlertmanagerMainConfig = cfg
++}
++
++func mergeAlertmanagerCustomConfigFromCRD(dst *AlertmanagerMainConfig, cc configv1alpha1.AlertmanagerCustomConfig) {
++	if ll := logLevelCRDToManifest(cc.LogLevel); ll != "" {
++		dst.LogLevel = ll
++	}
++	if len(cc.NodeSelector) > 0 {
++		dst.NodeSelector = cc.NodeSelector
++	}
++	dst.Resources = containerResourcesFromCRD(cc.Resources)
++	if len(cc.Secrets) > 0 {
++		for _, s := range cc.Secrets {
++			dst.Secrets = append(dst.Secrets, string(s))
++		}
++	}
++	if len(cc.Tolerations) > 0 {
++		dst.Tolerations = cc.Tolerations
++	}
++	if len(cc.TopologySpreadConstraints) > 0 {
++		dst.TopologySpreadConstraints = cc.TopologySpreadConstraints
++	}
++	if cc.VolumeClaimTemplate != nil {
++		dst.VolumeClaimTemplate = persistentVolumeClaimToEmbedded(cc.VolumeClaimTemplate)
++	}
++}
++
++func persistentVolumeClaimToEmbedded(pvc *v1.PersistentVolumeClaim) *monv1.EmbeddedPersistentVolumeClaim {
++	if pvc == nil {
++		return nil
++	}
++	em := &monv1.EmbeddedPersistentVolumeClaim{
++		TypeMeta: metav1.TypeMeta{
++			APIVersion: v1.SchemeGroupVersion.String(),
++			Kind:       "PersistentVolumeClaim",
++		},
++	}
++	em.EmbeddedObjectMetadata.Name = pvc.Name
++	em.EmbeddedObjectMetadata.Labels = pvc.Labels
++	em.EmbeddedObjectMetadata.Annotations = pvc.Annotations
++	em.Spec = pvc.Spec
++	return em
++}
+diff --git a/pkg/manifests/config_merge_test.go b/pkg/manifests/config_merge_test.go
+index 1d69744cf5..725e9daac4 100644
+--- a/pkg/manifests/config_merge_test.go
++++ b/pkg/manifests/config_merge_test.go
+@@ -19,6 +19,8 @@ import (
+ 
+ 	configv1alpha1 "github.com/openshift/api/config/v1alpha1"
+ 	"github.com/stretchr/testify/require"
++	v1 "k8s.io/api/core/v1"
++	"k8s.io/apimachinery/pkg/api/resource"
+ )
+ 
+ func TestConfig_MergeClusterMonitoringCRD(t *testing.T) {
+@@ -89,6 +91,28 @@ func TestClusterMonitoringMetricsServerSpecEmpty(t *testing.T) {
+ 	}))
+ }
+ 
++func TestClusterMonitoringPrometheusOperatorSpecEmpty(t *testing.T) {
++	require.True(t, clusterMonitoringPrometheusOperatorSpecEmpty(configv1alpha1.PrometheusOperatorConfig{}))
++	require.False(t, clusterMonitoringPrometheusOperatorSpecEmpty(configv1alpha1.PrometheusOperatorConfig{
++		LogLevel: configv1alpha1.LogLevelInfo,
++	}))
++	require.False(t, clusterMonitoringPrometheusOperatorSpecEmpty(configv1alpha1.PrometheusOperatorConfig{
++		NodeSelector: map[string]string{"k": "v"},
++	}))
++}
++
++func TestClusterMonitoringAlertmanagerSpecEmpty(t *testing.T) {
++	require.True(t, clusterMonitoringAlertmanagerSpecEmpty(configv1alpha1.AlertmanagerConfig{}))
++	require.False(t, clusterMonitoringAlertmanagerSpecEmpty(configv1alpha1.AlertmanagerConfig{
++		DeploymentMode: configv1alpha1.AlertManagerDeployModeDefaultConfig,
++	}))
++}
++
++func TestLogLevelCRDToManifest(t *testing.T) {
++	require.Equal(t, "debug", logLevelCRDToManifest(configv1alpha1.LogLevelDebug))
++	require.Equal(t, "", logLevelCRDToManifest(configv1alpha1.LogLevel("Unknown")))
++}
++
+ func TestConfig_MergeClusterMonitoringCRD_MetricsServerConfigPhase1(t *testing.T) {
+ 	t.Run("CR applies when ConfigMap left MetricsServerConfig nil", func(t *testing.T) {
+ 		cm := &configv1alpha1.ClusterMonitoring{
+@@ -116,3 +140,98 @@ func TestConfig_MergeClusterMonitoringCRD_MetricsServerConfigPhase1(t *testing.T
+ 		require.Equal(t, uint8(1), c.ClusterMonitoringConfiguration.MetricsServerConfig.Verbosity)
+ 	})
+ }
++
++func TestConfig_MergeClusterMonitoringCRD_PrometheusOperatorConfigPhase1(t *testing.T) {
++	t.Run("CR applies when ConfigMap left PrometheusOperatorConfig nil", func(t *testing.T) {
++		cm := &configv1alpha1.ClusterMonitoring{
++			Spec: configv1alpha1.ClusterMonitoringSpec{
++				PrometheusOperatorConfig: configv1alpha1.PrometheusOperatorConfig{
++					LogLevel: configv1alpha1.LogLevelDebug,
++				},
++			},
++		}
++		c, err := NewConfigFromStringAndClusterMonitoringResource("{}", cm)
++		require.NoError(t, err)
++		require.NotNil(t, c.ClusterMonitoringConfiguration.PrometheusOperatorConfig)
++		require.Equal(t, "debug", c.ClusterMonitoringConfiguration.PrometheusOperatorConfig.LogLevel)
++	})
++	t.Run("CR ignored when ConfigMap already set PrometheusOperatorConfig", func(t *testing.T) {
++		cm := &configv1alpha1.ClusterMonitoring{
++			Spec: configv1alpha1.ClusterMonitoringSpec{
++				PrometheusOperatorConfig: configv1alpha1.PrometheusOperatorConfig{
++					LogLevel: configv1alpha1.LogLevelDebug,
++				},
++			},
++		}
++		c, err := NewConfigFromStringAndClusterMonitoringResource("{prometheusOperator: {logLevel: info}}", cm)
++		require.NoError(t, err)
++		require.Equal(t, "info", c.ClusterMonitoringConfiguration.PrometheusOperatorConfig.LogLevel)
++	})
++	t.Run("CR maps ContainerResource to Resources", func(t *testing.T) {
++		cm := &configv1alpha1.ClusterMonitoring{
++			Spec: configv1alpha1.ClusterMonitoringSpec{
++				PrometheusOperatorConfig: configv1alpha1.PrometheusOperatorConfig{
++					Resources: []configv1alpha1.ContainerResource{
++						{
++							Name:    "cpu",
++							Request: resource.MustParse("100m"),
++							Limit:   resource.MustParse("200m"),
++						},
++					},
++				},
++			},
++		}
++		c, err := NewConfigFromStringAndClusterMonitoringResource("{}", cm)
++		require.NoError(t, err)
++		require.NotNil(t, c.ClusterMonitoringConfiguration.PrometheusOperatorConfig.Resources)
++		require.Equal(t, resource.MustParse("100m"), c.ClusterMonitoringConfiguration.PrometheusOperatorConfig.Resources.Requests[v1.ResourceCPU])
++		require.Equal(t, resource.MustParse("200m"), c.ClusterMonitoringConfiguration.PrometheusOperatorConfig.Resources.Limits[v1.ResourceCPU])
++	})
++}
++
++func TestConfig_MergeClusterMonitoringCRD_AlertmanagerMainConfigPhase1(t *testing.T) {
++	t.Run("CR applies when ConfigMap left AlertmanagerMainConfig nil", func(t *testing.T) {
++		cm := &configv1alpha1.ClusterMonitoring{
++			Spec: configv1alpha1.ClusterMonitoringSpec{
++				AlertmanagerConfig: configv1alpha1.AlertmanagerConfig{
++					DeploymentMode: configv1alpha1.AlertManagerDeployModeCustomConfig,
++					CustomConfig: configv1alpha1.AlertmanagerCustomConfig{
++						LogLevel: configv1alpha1.LogLevelDebug,
++					},
++				},
++			},
++		}
++		c, err := NewConfigFromStringAndClusterMonitoringResource("{}", cm)
++		require.NoError(t, err)
++		require.NotNil(t, c.ClusterMonitoringConfiguration.AlertmanagerMainConfig)
++		require.Equal(t, "debug", c.ClusterMonitoringConfiguration.AlertmanagerMainConfig.LogLevel)
++	})
++	t.Run("CR ignored when ConfigMap already set AlertmanagerMainConfig", func(t *testing.T) {
++		cm := &configv1alpha1.ClusterMonitoring{
++			Spec: configv1alpha1.ClusterMonitoringSpec{
++				AlertmanagerConfig: configv1alpha1.AlertmanagerConfig{
++					DeploymentMode: configv1alpha1.AlertManagerDeployModeCustomConfig,
++					CustomConfig: configv1alpha1.AlertmanagerCustomConfig{
++						LogLevel: configv1alpha1.LogLevelDebug,
++					},
++				},
++			},
++		}
++		c, err := NewConfigFromStringAndClusterMonitoringResource("{alertmanagerMain: {logLevel: info}}", cm)
++		require.NoError(t, err)
++		require.Equal(t, "info", c.ClusterMonitoringConfiguration.AlertmanagerMainConfig.LogLevel)
++	})
++	t.Run("CR Disabled sets enabled false", func(t *testing.T) {
++		cm := &configv1alpha1.ClusterMonitoring{
++			Spec: configv1alpha1.ClusterMonitoringSpec{
++				AlertmanagerConfig: configv1alpha1.AlertmanagerConfig{
++					DeploymentMode: configv1alpha1.AlertManagerDeployModeDisabled,
++				},
++			},
++		}
++		c, err := NewConfigFromStringAndClusterMonitoringResource("{}", cm)
++		require.NoError(t, err)
++		require.NotNil(t, c.ClusterMonitoringConfiguration.AlertmanagerMainConfig.Enabled)
++		require.False(t, *c.ClusterMonitoringConfiguration.AlertmanagerMainConfig.Enabled)
++	})
++}
+diff --git a/test/e2e/cluster_monitoring_test.go b/test/e2e/cluster_monitoring_test.go
+index e0e60e9538..92d8b393fd 100644
+--- a/test/e2e/cluster_monitoring_test.go
++++ b/test/e2e/cluster_monitoring_test.go
+@@ -363,6 +363,158 @@ func TestClusterMonitorMetricsServerConfigMapAndCRD(t *testing.T) {
+ 	}
+ }
+ 
++// TestClusterMonitoringAlertmanager tests alertmanagerConfig via ClusterMonitoring CRD (CustomConfig).
++func TestClusterMonitoringAlertmanager(t *testing.T) {
++	if !clusterMonitoringCRDAvailable {
++		t.Skip("ClusterMonitoring CRD not available (TechPreview / ClusterMonitoringConfig feature gate may be disabled)")
++		return
++	}
++
++	t.Log("creating ClusterMonitoring resource with alertmanagerConfig CustomConfig")
++	cm := &configv1alpha1.ClusterMonitoring{
++		ObjectMeta: metav1.ObjectMeta{
++			Name: clusterMonitoringName,
++		},
++		Spec: configv1alpha1.ClusterMonitoringSpec{
++			AlertmanagerConfig: configv1alpha1.AlertmanagerConfig{
++				DeploymentMode: configv1alpha1.AlertManagerDeployModeCustomConfig,
++				CustomConfig: configv1alpha1.AlertmanagerCustomConfig{
++					LogLevel: configv1alpha1.LogLevelDebug,
++					Resources: []configv1alpha1.ContainerResource{
++						{
++							Name:    "cpu",
++							Request: resource.MustParse("10m"),
++							Limit:   resource.MustParse("100m"),
++						},
++						{
++							Name:    "memory",
++							Request: resource.MustParse("100Mi"),
++							Limit:   resource.MustParse("200Mi"),
++						},
++					},
++					NodeSelector: map[string]string{
++						"kubernetes.io/os": "linux",
++					},
++				},
++			},
++		},
++	}
++
++	f.MustCreateOrUpdateClusterMonitoring(t, cm)
++	t.Cleanup(func() {
++		cm.Spec.AlertmanagerConfig = configv1alpha1.AlertmanagerConfig{
++			DeploymentMode: configv1alpha1.AlertManagerDeployModeDefaultConfig,
++		}
++		f.MustCreateOrUpdateClusterMonitoring(t, cm)
++	})
++
++	t.Logf("configured ClusterMonitoring resource: %s", cm.Name)
++
++	for _, test := range []scenario{
++		{
++			name:      "assert alertmanager-main statefulset exists and rolled out",
++			assertion: f.AssertStatefulSetExistsAndRolloutFunc("alertmanager-main", f.Ns),
++		},
++		{
++			name: "assert pod configuration is as expected",
++			assertion: f.AssertPodConfigurationFunc(
++				f.Ns,
++				"app.kubernetes.io/name=alertmanager,app.kubernetes.io/instance=main",
++				[]framework.PodAssertion{
++					expectMatchingRequests("*", "alertmanager", "100Mi", "10m"),
++					expectMatchingLimits("*", "alertmanager", "200Mi", "100m"),
++					expectNodeSelector("kubernetes.io/os", "linux"),
++				},
++			),
++		},
++	} {
++		t.Run(test.name, test.assertion)
++	}
++}
++
++// TestClusterMonitorAlertmanagerConfigMapAndCRD verifies Phase 1 merge: when both ConfigMap and CR
++// specify alertmanagerMain / alertmanagerConfig, the ConfigMap wins at the top level and CR values are ignored.
++func TestClusterMonitorAlertmanagerConfigMapAndCRD(t *testing.T) {
++	if !clusterMonitoringCRDAvailable {
++		t.Skip("ClusterMonitoring CRD not available (TechPreview / ClusterMonitoringConfig feature gate may be disabled)")
++		return
++	}
++
++	t.Log("creating ConfigMap with baseline alertmanagerMain configuration")
++	configMapData := `alertmanagerMain:
++  nodeSelector:
++    test-precedence: "from-configmap"
++  resources:
++    requests:
++      cpu: "5m"
++      memory: "50Mi"
++`
++	cm := f.BuildCMOConfigMap(t, configMapData)
++	f.MustCreateOrUpdateConfigMap(t, cm)
++	t.Cleanup(func() {
++		f.MustDeleteConfigMap(t, cm)
++	})
++
++	t.Log("creating ClusterMonitoring CR with different alertmanager settings (must be ignored when ConfigMap defines alertmanagerMain)")
++	crd := &configv1alpha1.ClusterMonitoring{
++		ObjectMeta: metav1.ObjectMeta{
++			Name: clusterMonitoringName,
++		},
++		Spec: configv1alpha1.ClusterMonitoringSpec{
++			AlertmanagerConfig: configv1alpha1.AlertmanagerConfig{
++				DeploymentMode: configv1alpha1.AlertManagerDeployModeCustomConfig,
++				CustomConfig: configv1alpha1.AlertmanagerCustomConfig{
++					NodeSelector: map[string]string{
++						"test-precedence": "from-crd",
++					},
++					Resources: []configv1alpha1.ContainerResource{
++						{
++							Name:    "cpu",
++							Request: resource.MustParse("10m"),
++							Limit:   resource.MustParse("100m"),
++						},
++						{
++							Name:    "memory",
++							Request: resource.MustParse("100Mi"),
++							Limit:   resource.MustParse("200Mi"),
++						},
++					},
++				},
++			},
++		},
++	}
++
++	f.MustCreateOrUpdateClusterMonitoring(t, crd)
++	t.Cleanup(func() {
++		crd.Spec.AlertmanagerConfig = configv1alpha1.AlertmanagerConfig{
++			DeploymentMode: configv1alpha1.AlertManagerDeployModeDefaultConfig,
++		}
++		f.MustCreateOrUpdateClusterMonitoring(t, crd)
++	})
++
++	t.Logf("configured both ConfigMap and ClusterMonitoring CR for Phase 1 precedence (ConfigMap wins)")
++
++	for _, tc := range []scenario{
++		{
++			name:      "assert alertmanager-main statefulset exists and rolled out",
++			assertion: f.AssertStatefulSetExistsAndRolloutFunc("alertmanager-main", f.Ns),
++		},
++		{
++			name: "assert ConfigMap alertmanagerMain is used; CR alertmanagerConfig is ignored",
++			assertion: f.AssertPodConfigurationFunc(
++				f.Ns,
++				"app.kubernetes.io/name=alertmanager,app.kubernetes.io/instance=main",
++				[]framework.PodAssertion{
++					expectMatchingRequests("*", "alertmanager", "50Mi", "5m"),
++					expectNodeSelector("test-precedence", "from-configmap"),
++				},
++			),
++		},
++	} {
++		t.Run(tc.name, tc.assertion)
++	}
++}
++
+ func expectMatchingLimits(podName, containerName, expectMem, expectCPU string) framework.PodAssertion {
+ 	return func(pod v1.Pod) error {
+ 		if podName != "*" && pod.Name != podName {

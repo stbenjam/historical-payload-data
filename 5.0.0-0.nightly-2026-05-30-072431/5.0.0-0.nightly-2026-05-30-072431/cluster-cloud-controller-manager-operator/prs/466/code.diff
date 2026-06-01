@@ -1,0 +1,336 @@
+diff --git a/openshift-tests/ccm-aws-tests/e2e/aws/loadbalancer.go b/openshift-tests/ccm-aws-tests/e2e/aws/loadbalancer.go
+index 3ecb35cd6..796e2c3fc 100644
+--- a/openshift-tests/ccm-aws-tests/e2e/aws/loadbalancer.go
++++ b/openshift-tests/ccm-aws-tests/e2e/aws/loadbalancer.go
+@@ -9,6 +9,7 @@ import (
+ 	elbv2types "github.com/aws/aws-sdk-go-v2/service/elasticloadbalancingv2/types"
+ 	. "github.com/onsi/ginkgo/v2"
+ 	. "github.com/onsi/gomega"
++	"github.com/openshift/cluster-cloud-controller-manager-operator/openshift-tests/ccm-aws-tests/e2e/common"
+ 	v1 "k8s.io/api/core/v1"
+ 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+ 	"k8s.io/apimachinery/pkg/util/intstr"
+@@ -30,10 +31,6 @@ const (
+ 	featureGateAWSServiceLBNetworkSecurityGroup = "AWSServiceLBNetworkSecurityGroup"
+ 
+ 	annotationLBType = "service.beta.kubernetes.io/aws-load-balancer-type"
+-
+-	cloudConfigNamespace = "openshift-cloud-controller-manager"
+-	cloudConfigName      = "cloud-conf"
+-	cloudConfigKey       = "cloud.conf"
+ )
+ 
+ // TestAWSServiceLBNetworkSecurityGroup validates the AWSServiceLBNetworkSecurityGroup feature gate functionality.
+@@ -82,19 +79,13 @@ var _ = Describe(fmt.Sprintf("%s NLB [OCPFeatureGate:%s]", e2eTestPrefixLoadBala
+ 		isNLBFeatureEnabled(ctx)
+ 
+ 		By("getting cloud-config ConfigMap from openshift-cloud-controller-manager namespace")
+-		cm, err := cs.CoreV1().ConfigMaps(cloudConfigNamespace).Get(ctx, cloudConfigName, metav1.GetOptions{})
++		cm, err := common.GetCloudConfig(ctx, cs)
+ 		framework.ExpectNoError(err, "failed to get cloud-config ConfigMap")
+ 
+-		By("checking if cloud.conf key exists in ConfigMap")
+-		cloudConf, exists := cm.Data[cloudConfigKey]
+-		Expect(exists).To(BeTrue(), "cloud.conf key not found in ConfigMap")
+-
+-		By("verifying NLBSecurityGroupMode is present in cloud config")
+-		Expect(cloudConf).To(ContainSubstring("NLBSecurityGroupMode"),
+-			"NLBSecurityGroupMode must be present in cloud-config when feature gate is enabled")
+-
+ 		By("verifying NLBSecurityGroupMode is set to Managed")
+-		Expect(cloudConf).To(MatchRegexp(`NLBSecurityGroupMode\s*=\s*Managed`),
++		managed, err := common.IsNLBSecurityGroupModeManaged(cm)
++		framework.ExpectNoError(err, "failed to check NLBSecurityGroupMode in cloud-config")
++		Expect(managed).To(BeTrue(),
+ 			"NLBSecurityGroupMode must be set to 'Managed' in cloud-config when feature gate is enabled")
+ 
+ 		framework.Logf("Successfully validated cloud-config contains NLBSecurityGroupMode = Managed")
+@@ -531,7 +522,21 @@ func createServiceNLB(ctx context.Context, cs clientset.Interface, ns *v1.Namesp
+ 		},
+ 	}
+ 
+-	_, err := jig.Client.CoreV1().Services(jig.Namespace).Create(ctx, svc, metav1.CreateOptions{})
++	cloudCfg, err := common.GetCloudConfig(ctx, cs)
++	if err != nil {
++		return nil, nil, fmt.Errorf("failed to get cloud-config: %w", err)
++	}
++	isDualStack, _, err := common.IsDualStack(cloudCfg)
++	if err != nil {
++		return nil, nil, fmt.Errorf("failed to detect dual-stack from cloud-config: %w", err)
++	}
++	if isDualStack {
++		framework.Logf("Detected DualStack clusters, patching Service setting IPFamilyPolicy to %q", v1.IPFamilyPolicyRequireDualStack)
++		dualStack := v1.IPFamilyPolicyRequireDualStack
++		svc.Spec.IPFamilyPolicy = &dualStack
++	}
++
++	_, err = jig.Client.CoreV1().Services(jig.Namespace).Create(ctx, svc, metav1.CreateOptions{})
+ 	framework.ExpectNoError(err, "failed to create LoadBalancer Service")
+ 
+ 	By("waiting for AWS load balancer provisioning")
+diff --git a/openshift-tests/ccm-aws-tests/e2e/common/helper.go b/openshift-tests/ccm-aws-tests/e2e/common/helper.go
+index a359a1c58..2f285ab4c 100644
+--- a/openshift-tests/ccm-aws-tests/e2e/common/helper.go
++++ b/openshift-tests/ccm-aws-tests/e2e/common/helper.go
+@@ -3,12 +3,49 @@ package common
+ import (
+ 	"context"
+ 	"fmt"
++	"regexp"
++	"strings"
+ 
+ 	configv1client "github.com/openshift/client-go/config/clientset/versioned/typed/config/v1"
++	v1 "k8s.io/api/core/v1"
+ 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
++	clientset "k8s.io/client-go/kubernetes"
+ 	"k8s.io/kubernetes/test/e2e/framework"
+ )
+ 
++const (
++	cloudConfigNamespace = "openshift-cloud-controller-manager"
++	cloudConfigName      = "cloud-conf"
++)
++
++// GetOcClient returns an OpenShift config/v1 API client (FeatureGates, Infrastructures, etc.).
++func GetOcClient(ctx context.Context) (*configv1client.ConfigV1Client, error) {
++	restConfig, err := framework.LoadConfig()
++	if err != nil {
++		return nil, fmt.Errorf("failed to load kubeconfig: %w", err)
++	}
++	configClient, err := configv1client.NewForConfig(restConfig)
++	if err != nil {
++		return nil, fmt.Errorf("failed to openshift client: %w", err)
++	}
++
++	return configClient, nil
++}
++
++// GetKubeClient returns a core Kubernetes client (Pods, ConfigMaps, Services, etc.).
++func GetKubeClient(ctx context.Context) (clientset.Interface, error) {
++	restConfig, err := framework.LoadConfig()
++	if err != nil {
++		return nil, fmt.Errorf("failed to load kubeconfig: %w", err)
++	}
++	cs, err := clientset.NewForConfig(restConfig)
++	if err != nil {
++		return nil, fmt.Errorf("failed to kube clientset: %w", err)
++	}
++
++	return cs, nil
++}
++
+ // IsFeatureEnabled checks if an OpenShift feature gate is enabled by querying the
+ // FeatureGate resource named "cluster" using the typed OpenShift config API.
+ //
+@@ -27,22 +64,16 @@ import (
+ // Note: For HyperShift clusters, this checks the management cluster's feature gates.
+ // To check hosted cluster feature gates, use the hosted cluster's kubeconfig.
+ func IsFeatureEnabled(ctx context.Context, featureName string) (bool, error) {
+-	// Get the REST config
+-	restConfig, err := framework.LoadConfig()
+-	if err != nil {
+-		return false, fmt.Errorf("failed to load kubeconfig: %v", err)
+-	}
+-
+ 	// Create typed config client (more efficient than dynamic client)
+-	configClient, err := configv1client.NewForConfig(restConfig)
++	oclient, err := GetOcClient(ctx)
+ 	if err != nil {
+-		return false, fmt.Errorf("failed to create config client: %v", err)
++		return false, fmt.Errorf("failed to create config client: %w", err)
+ 	}
+ 
+ 	// Get the FeatureGate resource using typed API
+-	featureGate, err := configClient.FeatureGates().Get(ctx, "cluster", metav1.GetOptions{})
++	featureGate, err := oclient.FeatureGates().Get(ctx, "cluster", metav1.GetOptions{})
+ 	if err != nil {
+-		return false, fmt.Errorf("failed to get FeatureGate 'cluster': %v", err)
++		return false, fmt.Errorf("failed to get FeatureGate 'cluster': %w", err)
+ 	}
+ 
+ 	// Iterate through the feature gates status (typed structs)
+@@ -68,3 +99,106 @@ func IsFeatureEnabled(ctx context.Context, featureName string) (bool, error) {
+ 	framework.Logf("Feature %s not found in FeatureGate status", featureName)
+ 	return false, nil
+ }
++
++// GetCloudConfig retrieves the CCM cloud-config ConfigMap.
++// When cs is nil, a clientset is created from the current kubeconfig.
++// This function must not call Ginkgo control-flow helpers (Skip, Fail, etc.)
++// because it is also called from main.go outside a spec context.
++func GetCloudConfig(ctx context.Context, cs clientset.Interface) (*v1.ConfigMap, error) {
++	var err error
++	if cs == nil {
++		cs, err = GetKubeClient(ctx)
++		if err != nil {
++			return nil, fmt.Errorf("failed to get kubernetes client: %w", err)
++		}
++	}
++	cm, err := cs.CoreV1().ConfigMaps(cloudConfigNamespace).Get(ctx, cloudConfigName, metav1.GetOptions{})
++	if err != nil {
++		return nil, fmt.Errorf("failed to get cloud-config ConfigMap: %w", err)
++	}
++	return cm, nil
++}
++
++// IsConfigPresentCloudConfig checks if a specific configuration key is present in the
++// cloud-config data stored in the given ConfigMap. It searches all data entries for an
++// INI-style key=value match. Values are split by comma to support multi-value configs
++// e.g.: "ipFamilies = IPv4,IPv6" returns ["IPv4", "IPv6"], and
++// "NLBSecurityGroupMode" = "Managed" returns ["Managed"].
++func IsConfigPresentCloudConfig(cm *v1.ConfigMap, configKey string) (bool, []string, error) {
++	if cm == nil {
++		return false, nil, fmt.Errorf("ConfigMap is nil")
++	}
++	if configKey == "" {
++		return false, nil, fmt.Errorf("configKey is empty")
++	}
++
++	pattern, err := regexp.Compile(`(?m)^\s*` + regexp.QuoteMeta(configKey) + `\s*=\s*(.*)$`)
++	if err != nil {
++		return false, nil, fmt.Errorf("failed to compile regex for key %q: %w", configKey, err)
++	}
++
++	for dataKey, content := range cm.Data {
++		allMatches := pattern.FindAllStringSubmatch(content, -1)
++		if allMatches == nil {
++			continue
++		}
++
++		var values []string
++		for _, matches := range allMatches {
++			rawValue := strings.TrimSpace(matches[1])
++			if rawValue == "" {
++				continue
++			}
++			for _, p := range strings.Split(rawValue, ",") {
++				if v := strings.TrimSpace(p); v != "" {
++					values = append(values, v)
++				}
++			}
++		}
++
++		framework.Logf("Found key %q in ConfigMap data key %q with values: %v", configKey, dataKey, values)
++		return true, values, nil
++	}
++
++	framework.Logf("Key %q not found in ConfigMap %s/%s", configKey, cm.Namespace, cm.Name)
++	return false, nil, nil
++}
++
++// IsNLBSecurityGroupModeManaged returns true when the cloud-config has
++// NLBSecurityGroupMode set to "Managed".
++func IsNLBSecurityGroupModeManaged(cm *v1.ConfigMap) (bool, error) {
++	found, values, err := IsConfigPresentCloudConfig(cm, "NLBSecurityGroupMode")
++	if err != nil {
++		return false, err
++	}
++	if !found {
++		return false, nil
++	}
++	return len(values) == 1 && values[0] == "Managed", nil
++}
++
++// IsDualStack checks the NodeIPFamilies key in the cloud-config ConfigMap.
++// It returns (isDualStack, primaryIPv6, error) where isDualStack is true when
++// both IPv4 and IPv6 are present, and primaryIPv6 is true when the first
++// entry is IPv6 (e.g. NodeIPFamilies=ipv6 then NodeIPFamilies=ipv4).
++// When NodeIPFamilies is absent, both booleans are false with no error.
++func IsDualStack(cm *v1.ConfigMap) (bool, bool, error) {
++	found, values, err := IsConfigPresentCloudConfig(cm, "NodeIPFamilies")
++	if err != nil {
++		return false, false, fmt.Errorf("failed to lookup up configuration NodeIPFamilies in cloud-config: %w", err)
++	}
++	if !found {
++		return false, false, nil
++	}
++	var hasIPv4, hasIPv6 bool
++	for _, ipFamily := range values {
++		switch strings.ToLower(ipFamily) {
++		case "ipv6":
++			hasIPv6 = true
++		case "ipv4":
++			hasIPv4 = true
++		}
++	}
++	primaryIPv6 := len(values) > 0 && strings.ToLower(values[0]) == "ipv6"
++	return hasIPv4 && hasIPv6, primaryIPv6, nil
++}
+diff --git a/openshift-tests/ccm-aws-tests/main.go b/openshift-tests/ccm-aws-tests/main.go
+index eb9e37892..e817f17e8 100644
+--- a/openshift-tests/ccm-aws-tests/main.go
++++ b/openshift-tests/ccm-aws-tests/main.go
+@@ -21,13 +21,17 @@ import (
+ 
+ 	// Importing ginkgo tests from the CCM e2e packages
+ 	_ "github.com/openshift/cluster-cloud-controller-manager-operator/openshift-tests/ccm-aws-tests/e2e/aws"
+-	_ "github.com/openshift/cluster-cloud-controller-manager-operator/openshift-tests/ccm-aws-tests/e2e/common"
++	"github.com/openshift/cluster-cloud-controller-manager-operator/openshift-tests/ccm-aws-tests/e2e/common"
+ 	_ "k8s.io/cloud-provider-aws/tests/e2e"
+ )
+ 
+ var (
+ 	// testContext is the global test context that is used to store the test configuration.
+ 	testContext = &framework.TestContext
++
++	isDualStackCluster      bool
++	isDualStackPrimaryIpv6  bool
++	dualStackDetectionReady bool
+ )
+ 
+ func main() {
+@@ -44,6 +48,20 @@ func main() {
+ 		panic(fmt.Errorf("failed to initialize test framework: %w", err))
+ 	}
+ 
++	// Detect dual-stack from cloud-config before building specs.
++	// Upstream load balancer tests do not support dual-stack yet, so they
++	// must be excluded when the cluster is configured for dual-stack.
++	if cm, err := common.GetCloudConfig(context.TODO(), nil); err != nil {
++		log.Debugf("failed to get cloud-config for dual-stack detection: %v", err)
++	} else {
++		isDualStackCluster, isDualStackPrimaryIpv6, err = common.IsDualStack(cm)
++		if err != nil {
++			log.Debugf("failed to evaluate dual-stack configuration, leaving default Service config: %v", err)
++		}
++		dualStackDetectionReady = true
++		log.Debugf("Dual-stack cluster detected: %v", isDualStackCluster)
++	}
++
+ 	// Build the extension test specs
+ 	specs, err := g.BuildExtensionTestSpecsFromOpenShiftGinkgoSuite()
+ 	if err != nil {
+@@ -54,11 +72,22 @@ func main() {
+ 	// We need to filter to prevent adding ECR tests.
+ 	// All upstream tests must be runnable on OpenShift, if issues are found, let's try to
+ 	// fix in upstream to work well with OpenShift and cloud-provider-aws CI.
+-	specs, err = specs.MustSelectAny([]extensiontests.SelectFunction{
+-		extensiontests.NameContains("[cloud-provider-aws-e2e] loadbalancer"),
++	specSelectors := []extensiontests.SelectFunction{
+ 		extensiontests.NameContains("[cloud-provider-aws-e2e] nodes"),
+ 		extensiontests.NameContains("[cloud-provider-aws-e2e-openshift]"),
+-	})
++	}
++	// Exclude upstream load balancer tests on dual-stack clusters — upstream
++	// does not support dual-stack yet. When detection fails, the upstream LB
++	// tests are also excluded to avoid false positives.
++	// FIXME when upstream e2e supports Service Dual-stack scenarios:
++	// https://github.com/kubernetes/cloud-provider-aws/pull/1313
++	// https://github.com/kubernetes/cloud-provider-aws/pull/1356
++	if isDualStackCluster && isDualStackPrimaryIpv6 {
++		framework.Logf("Dual-stack cluster with Primary IPv6 detected, skipping test name that contains '[cloud-provider-aws-e2e] loadbalancer'")
++	} else {
++		specSelectors = append(specSelectors, extensiontests.NameContains("[cloud-provider-aws-e2e] loadbalancer"))
++	}
++	specs, err = specs.MustSelectAny(specSelectors)
+ 	if err != nil {
+ 		panic(fmt.Errorf("failed to select specs: %w", err))
+ 	}
+@@ -79,7 +108,6 @@ func main() {
+ 				spec.Exclude(extensiontests.TopologyEquals("SingleReplica"))
+ 			}
+ 		}
+-
+ 	}).Include(extensiontests.PlatformEquals("aws"))
+ 	specs.AddBeforeAll(func() {
+ 		if err := initFrameworkForTest(); err != nil {

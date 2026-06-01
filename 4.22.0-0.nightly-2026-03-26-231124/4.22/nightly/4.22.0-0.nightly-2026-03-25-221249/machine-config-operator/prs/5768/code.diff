@@ -1,0 +1,480 @@
+diff --git a/pkg/controller/node/node_controller.go b/pkg/controller/node/node_controller.go
+index 682543f96c..d8c5b65999 100644
+--- a/pkg/controller/node/node_controller.go
++++ b/pkg/controller/node/node_controller.go
+@@ -1983,6 +1983,12 @@ func (ctrl *Controller) syncBootImageSkewEnforcementMetric(obj any) {
+ 			ctrlcommon.MCCBootImageSkewEnforcementNone.Set(0)
+ 			return
+ 		}
++		// On BareMetal clusters using the machine-os-images provisioning path, boot images
++		// are automatically managed; None is expected; suppress the alert.
++		if infra.Status.PlatformStatus != nil && infra.Status.PlatformStatus.Type == configv1.BareMetalPlatformType {
++			ctrlcommon.MCCBootImageSkewEnforcementNone.Set(0)
++			return
++		}
+ 		ctrlcommon.MCCBootImageSkewEnforcementNone.Set(1)
+ 	} else {
+ 		ctrlcommon.MCCBootImageSkewEnforcementNone.Set(0)
+diff --git a/pkg/operator/operator.go b/pkg/operator/operator.go
+index f9888b77e3..7f45f36129 100644
+--- a/pkg/operator/operator.go
++++ b/pkg/operator/operator.go
+@@ -12,6 +12,7 @@ import (
+ 	"k8s.io/klog/v2"
+ 	"k8s.io/utils/clock"
+ 
++	configv1 "github.com/openshift/api/config/v1"
+ 	configclientset "github.com/openshift/client-go/config/clientset/versioned"
+ 	ctrlcommon "github.com/openshift/machine-config-operator/pkg/controller/common"
+ 	"github.com/openshift/machine-config-operator/pkg/version"
+@@ -31,6 +32,10 @@ import (
+ 	appslisterv1 "k8s.io/client-go/listers/apps/v1"
+ 	corelisterv1 "k8s.io/client-go/listers/core/v1"
+ 
++	"k8s.io/apimachinery/pkg/runtime/schema"
++	"k8s.io/client-go/dynamic"
++	"k8s.io/client-go/dynamic/dynamicinformer"
++	"k8s.io/client-go/dynamic/dynamiclister"
+ 	"k8s.io/client-go/tools/cache"
+ 	"k8s.io/client-go/tools/leaderelection/resourcelock"
+ 	"k8s.io/client-go/tools/record"
+@@ -89,40 +94,42 @@ type Operator struct {
+ 
+ 	syncHandler func(ic string) error
+ 
+-	imgLister             configlistersv1.ImageLister
+-	idmsLister            configlistersv1.ImageDigestMirrorSetLister
+-	itmsLister            configlistersv1.ImageTagMirrorSetLister
+-	icspLister            operatorlistersv1alpha1.ImageContentSourcePolicyLister
+-	crdLister             apiextlistersv1.CustomResourceDefinitionLister
+-	mcpLister             mcfglistersv1.MachineConfigPoolLister
+-	msLister              mcfglistersv1.MachineConfigNodeLister
+-	ccLister              mcfglistersv1.ControllerConfigLister
+-	mcLister              mcfglistersv1.MachineConfigLister
+-	deployLister          appslisterv1.DeploymentLister
+-	daemonsetLister       appslisterv1.DaemonSetLister
+-	infraLister           configlistersv1.InfrastructureLister
+-	networkLister         configlistersv1.NetworkLister
+-	mcoCmLister           corelisterv1.ConfigMapLister
+-	clusterCmLister       corelisterv1.ConfigMapLister
+-	proxyLister           configlistersv1.ProxyLister
+-	oseKubeAPILister      corelisterv1.ConfigMapLister
+-	nodeLister            corelisterv1.NodeLister
+-	dnsLister             configlistersv1.DNSLister
+-	mcoSALister           corelisterv1.ServiceAccountLister
+-	mcoSecretLister       corelisterv1.SecretLister
+-	ocCmLister            corelisterv1.ConfigMapLister
+-	ocSecretLister        corelisterv1.SecretLister
+-	ocManagedSecretLister corelisterv1.SecretLister
+-	clusterOperatorLister configlistersv1.ClusterOperatorLister
+-	mcopLister            mcoplistersv1.MachineConfigurationLister
+-	mckLister             mcfglistersv1.KubeletConfigLister
+-	crcLister             mcfglistersv1.ContainerRuntimeConfigLister
+-	nodeClusterLister     configlistersv1.NodeLister
+-	moscLister            mcfglistersv1.MachineOSConfigLister
+-	apiserverLister       configlistersv1.APIServerLister
+-	clusterVersionLister  configlistersv1.ClusterVersionLister
+-	osImageStreamLister   mcfglistersv1alpha1.OSImageStreamLister
+-	iriLister             mcfglistersv1alpha1.InternalReleaseImageLister
++	imgLister                configlistersv1.ImageLister
++	idmsLister               configlistersv1.ImageDigestMirrorSetLister
++	itmsLister               configlistersv1.ImageTagMirrorSetLister
++	icspLister               operatorlistersv1alpha1.ImageContentSourcePolicyLister
++	crdLister                apiextlistersv1.CustomResourceDefinitionLister
++	mcpLister                mcfglistersv1.MachineConfigPoolLister
++	msLister                 mcfglistersv1.MachineConfigNodeLister
++	ccLister                 mcfglistersv1.ControllerConfigLister
++	mcLister                 mcfglistersv1.MachineConfigLister
++	deployLister             appslisterv1.DeploymentLister
++	daemonsetLister          appslisterv1.DaemonSetLister
++	infraLister              configlistersv1.InfrastructureLister
++	networkLister            configlistersv1.NetworkLister
++	mcoCmLister              corelisterv1.ConfigMapLister
++	clusterCmLister          corelisterv1.ConfigMapLister
++	proxyLister              configlistersv1.ProxyLister
++	oseKubeAPILister         corelisterv1.ConfigMapLister
++	nodeLister               corelisterv1.NodeLister
++	dnsLister                configlistersv1.DNSLister
++	mcoSALister              corelisterv1.ServiceAccountLister
++	mcoSecretLister          corelisterv1.SecretLister
++	ocCmLister               corelisterv1.ConfigMapLister
++	ocSecretLister           corelisterv1.SecretLister
++	ocManagedSecretLister    corelisterv1.SecretLister
++	clusterOperatorLister    configlistersv1.ClusterOperatorLister
++	mcopLister               mcoplistersv1.MachineConfigurationLister
++	mckLister                mcfglistersv1.KubeletConfigLister
++	crcLister                mcfglistersv1.ContainerRuntimeConfigLister
++	nodeClusterLister        configlistersv1.NodeLister
++	moscLister               mcfglistersv1.MachineOSConfigLister
++	apiserverLister          configlistersv1.APIServerLister
++	clusterVersionLister     configlistersv1.ClusterVersionLister
++	osImageStreamLister      mcfglistersv1alpha1.OSImageStreamLister
++	iriLister                mcfglistersv1alpha1.InternalReleaseImageLister
++	provisioningLister       dynamiclister.Lister
++	provisioningListerSynced cache.InformerSynced
+ 
+ 	crdListerSynced                  cache.InformerSynced
+ 	deployListerSynced               cache.InformerSynced
+@@ -172,6 +179,8 @@ type Operator struct {
+ 	fgHandler ctrlcommon.FeatureGatesHandler
+ 
+ 	ctrlctx *ctrlcommon.ControllerContext
++
++	provisioningInformerFactory dynamicinformer.DynamicSharedInformerFactory
+ }
+ 
+ // New returns a new machine config operator.
+@@ -380,6 +389,25 @@ func New(
+ 		optr.iriListerSynced = iriInformer.Informer().HasSynced
+ 	}
+ 
++	// Set up a dynamic informer for the Provisioning CR (metal3.io/v1alpha1).
++	// The informer is only started in Run() when the cluster is on BareMetal to avoid
++	// unnecessary watch noise on other platforms where the CRD may not exist.
++	dynamicClient, err := dynamic.NewForConfig(ctrlctx.ClientBuilder.GetBuilderConfig())
++	if err != nil {
++		klog.Fatalf("error creating dynamic client for Provisioning informer: %v", err)
++	}
++	provisioningGVR := schema.GroupVersionResource{
++		Group:    "metal3.io",
++		Version:  "v1alpha1",
++		Resource: "provisionings",
++	}
++	provisioningFactory := dynamicinformer.NewDynamicSharedInformerFactory(dynamicClient, 0)
++	provisioningInformer := provisioningFactory.ForResource(provisioningGVR)
++	provisioningInformer.Informer().AddEventHandler(optr.eventHandler())
++	optr.provisioningLister = dynamiclister.New(provisioningInformer.Informer().GetIndexer(), provisioningGVR)
++	optr.provisioningListerSynced = provisioningInformer.Informer().HasSynced
++	optr.provisioningInformerFactory = provisioningFactory
++
+ 	optr.vStore.Set("operator", version.ReleaseVersion)
+ 	optr.vStore.Set("operator-image", version.OperatorImage)
+ 
+@@ -449,6 +477,21 @@ func (optr *Operator) Run(workers int, stopCh <-chan struct{}) {
+ 		return
+ 	}
+ 
++	// On BareMetal clusters, start the Provisioning informer so that
++	// syncBootImageSkewEnforcementStatus can check provisioningOSDownloadURL
++	// without making live API calls. The informer is not started on other platforms
++	// to avoid watch errors against a CRD that may not exist.
++	// We do not block on WaitForCacheSync here because the provisionings.metal3.io
++	// CRD is installed by CBO which may not be ready yet at operator startup.
++	// isBareMetalOnLegacyProvisioningPath handles lister errors conservatively
++	// until the cache is warm.
++	if infra, err := optr.infraLister.Get("cluster"); err == nil &&
++		infra.Status.PlatformStatus != nil &&
++		infra.Status.PlatformStatus.Type == configv1.BareMetalPlatformType &&
++		optr.provisioningInformerFactory != nil {
++		optr.provisioningInformerFactory.Start(stopCh)
++	}
++
+ 	// these can only be synced after CRDs are installed
+ 	if !optr.inClusterBringup {
+ 		if !cache.WaitForCacheSync(stopCh,
+diff --git a/pkg/operator/sync.go b/pkg/operator/sync.go
+index 12bd336a1f..f3d977a894 100644
+--- a/pkg/operator/sync.go
++++ b/pkg/operator/sync.go
+@@ -25,6 +25,7 @@ import (
+ 	corev1 "k8s.io/api/core/v1"
+ 	apierrors "k8s.io/apimachinery/pkg/api/errors"
+ 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
++	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
+ 	"k8s.io/apimachinery/pkg/labels"
+ 	"k8s.io/apimachinery/pkg/runtime"
+ 	"k8s.io/apimachinery/pkg/selection"
+@@ -2544,15 +2545,14 @@ func (optr *Operator) syncPreBuiltImageMachineConfigs() error {
+ // syncBootImageSkewEnforcementStatus determines the appropriate BootImageSkewEnforcementStatus based on
+ // the MachineConfiguration spec, platform defaults, and cluster version information.
+ func (optr *Operator) syncBootImageSkewEnforcementStatus(mcop *opv1.MachineConfiguration, newMachineConfigurationStatus *opv1.MachineConfigurationStatus, infra *configv1.Infrastructure, supportsBootImageUpdates bool) {
+-	// React to any changes in boot image skew enforcement configuration
+ 	if !optr.fgHandler.Enabled(features.FeatureGateBootImageSkewEnforcement) {
+ 		return
+ 	}
+ 
+-	// First, estimate an OCPVersion from ClusterVersion.
++	// Grab install time OCP version
+ 	ocpVersionAtInstall := optr.getOCPVersionFromClusterVersion()
+-	// If BootImageSkewEnforcement spec is defined, reflect that to status
+-	//nolint:gocritic
++
++	// Spec override takes priority over all platform defaults.
+ 	if mcop.Spec.BootImageSkewEnforcement != (opv1.BootImageSkewEnforcementConfig{}) {
+ 		if mcop.Spec.BootImageSkewEnforcement.Mode == opv1.BootImageSkewEnforcementConfigModeManual {
+ 			newMachineConfigurationStatus.BootImageSkewEnforcementStatus = opv1.BootImageSkewEnforcementStatus{
+@@ -2562,22 +2562,33 @@ func (optr *Operator) syncBootImageSkewEnforcementStatus(mcop *opv1.MachineConfi
+ 		} else { // only other possible opinion is "None"
+ 			newMachineConfigurationStatus.BootImageSkewEnforcementStatus = apihelpers.GetSkewEnforcementStatusNone()
+ 		}
+-	} else if infra.Status.ControlPlaneTopology == configv1.SingleReplicaTopologyMode {
+-		// On SNO clusters, default to None since there are no MachineSets to scale
++		return
++	}
++
++	// On BareMetal clusters using the machine-os-images provisioning path (provisioningOSDownloadURL
++	// is unset), boot images are managed by CVO and have no skew risk.
++	if infra.Status.PlatformStatus != nil && infra.Status.PlatformStatus.Type == configv1.BareMetalPlatformType && !optr.isBareMetalOnLegacyProvisioningPath() {
+ 		newMachineConfigurationStatus.BootImageSkewEnforcementStatus = apihelpers.GetSkewEnforcementStatusNone()
+-	} else if supportsBootImageUpdates {
+-		// If an "All" option is specified and BootImageSkewEnforcementStatus is empty or not set to Automatic => set Mode to Automatic.
+-		if apihelpers.HasMAPIMachineSetManagerWithMode(newMachineConfigurationStatus.ManagedBootImagesStatus.MachineManagers, opv1.MachineSets, opv1.All) {
+-			if (newMachineConfigurationStatus.BootImageSkewEnforcementStatus.Mode != opv1.BootImageSkewEnforcementModeStatusAutomatic ||
+-				mcop.Status.BootImageSkewEnforcementStatus == opv1.BootImageSkewEnforcementStatus{}) {
+-				newMachineConfigurationStatus.BootImageSkewEnforcementStatus = apihelpers.GetSkewEnforcementStatusAutomaticWithOCPVersion(ocpVersionAtInstall)
+-			}
+-		} else { // For any other opinion i.e. admin has overridden boot image opinion to Partial/None => set Mode to Manual.
+-			newMachineConfigurationStatus.BootImageSkewEnforcementStatus = apihelpers.GetSkewEnforcementStatusManualWithOCPVersion(ocpVersionAtInstall)
++		return
++	}
++
++	// SNO clusters do not scale; skew enforcement is not applicable.
++	if infra.Status.ControlPlaneTopology == configv1.SingleReplicaTopologyMode {
++		newMachineConfigurationStatus.BootImageSkewEnforcementStatus = apihelpers.GetSkewEnforcementStatusNone()
++		return
++	}
++
++	// Platforms with automated boot image updates: mode follows ManagedBootImages configuration.
++	if supportsBootImageUpdates && apihelpers.HasMAPIMachineSetManagerWithMode(newMachineConfigurationStatus.ManagedBootImagesStatus.MachineManagers, opv1.MachineSets, opv1.All) {
++		if (newMachineConfigurationStatus.BootImageSkewEnforcementStatus.Mode != opv1.BootImageSkewEnforcementModeStatusAutomatic ||
++			mcop.Status.BootImageSkewEnforcementStatus == opv1.BootImageSkewEnforcementStatus{}) {
++			newMachineConfigurationStatus.BootImageSkewEnforcementStatus = apihelpers.GetSkewEnforcementStatusAutomaticWithOCPVersion(ocpVersionAtInstall)
+ 		}
+-	} else { // For platforms that do not support automated boot image updates => set Mode to Manual.
+-		newMachineConfigurationStatus.BootImageSkewEnforcementStatus = apihelpers.GetSkewEnforcementStatusManualWithOCPVersion(ocpVersionAtInstall)
++		return
+ 	}
++
++	// All remaining cases require manual boot image tracking.
++	newMachineConfigurationStatus.BootImageSkewEnforcementStatus = apihelpers.GetSkewEnforcementStatusManualWithOCPVersion(ocpVersionAtInstall)
+ }
+ 
+ // getOCPVersionFromClusterVersion extracts the OCP version from ClusterVersion history.
+@@ -2615,3 +2626,38 @@ func (optr *Operator) getOCPVersionFromClusterVersion() string {
+ 	}
+ 	return fmt.Sprintf("%d.%d.%d", parsedVersion.Major(), parsedVersion.Minor(), parsedVersion.Patch())
+ }
++
++// isBareMetalOnLegacyProvisioningPath checks whether the BareMetal cluster is still using the
++// legacy qcow2-based provisioning path. It does so by inspecting the provisioningOSDownloadURL
++// field of the singleton Provisioning CR (metal3.io/v1alpha1).
++//
++// Returns true when the field is non-empty, meaning boot images are not managed via the machine-os-images
++// path and may be out of date (skew enforcement should be set to Manual mode). Also returns true when
++// when the field is not ready to be used yet, for safety.
++//
++// Returns false when:
++//   - The CR does not exist (cluster is using the machine-os-images path introduced in 4.10)
++//   - The field is empty (same as above)
++func (optr *Operator) isBareMetalOnLegacyProvisioningPath() bool {
++
++	if optr.provisioningListerSynced != nil && !optr.provisioningListerSynced() {
++		klog.V(2).Info("Provisioning informer not synced yet; assuming legacy provisioning path for safety")
++		return true
++	}
++	provisioning, err := optr.provisioningLister.Get("provisioning-configuration")
++	if err != nil {
++		if apierrors.IsNotFound(err) {
++			// CR not found, cluster is on machine-os-images path, no skew risk
++			return false
++		}
++		// Unexpected get error, assume legacy path for safety
++		klog.Warningf("Failed to get Provisioning CR: %v; assuming legacy provisioning path for BareMetal", err)
++		return true
++	}
++	url, _, err := unstructured.NestedString(provisioning.Object, "spec", "provisioningOSDownloadURL")
++	if err != nil {
++		klog.Warningf("Failed to parse provisioningOSDownloadURL: %v; assuming legacy provisioning path for BareMetal", err)
++		return true
++	}
++	return url != ""
++}
+diff --git a/pkg/operator/sync_test.go b/pkg/operator/sync_test.go
+index 4ad5527493..7c5ca80260 100644
+--- a/pkg/operator/sync_test.go
++++ b/pkg/operator/sync_test.go
+@@ -26,6 +26,9 @@ import (
+ 	mcfginformers "github.com/openshift/client-go/machineconfiguration/informers/externalversions"
+ 	fakemcopclientset "github.com/openshift/client-go/operator/clientset/versioned/fake"
+ 	mcoplistersv1 "github.com/openshift/client-go/operator/listers/operator/v1"
++	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
++	"k8s.io/apimachinery/pkg/runtime/schema"
++	"k8s.io/client-go/dynamic/dynamiclister"
+ )
+ 
+ func TestSyncCloudConfig(t *testing.T) {
+@@ -315,6 +318,8 @@ func TestSyncMachineConfiguration(t *testing.T) {
+ 		expectedSkewEnforcementStatus   opv1.BootImageSkewEnforcementStatus
+ 		annotationExpected              bool
+ 		enableCPMSFeatureGate           bool
++		provisioningCRPresent           bool
++		provisioningOSDownloadURL       string
+ 	}{
+ 		{
+ 			name:               "AWS platform, no existing config, opt-in expected",
+@@ -445,7 +450,7 @@ func TestSyncMachineConfiguration(t *testing.T) {
+ 			clusterVersion:                  buildClusterVersion("4.18.0"),
+ 			annotationExpected:              false,
+ 			expectedManagedBootImagesStatus: opv1.ManagedBootImages{},
+-			expectedSkewEnforcementStatus:   apihelpers.GetSkewEnforcementStatusManualWithOCPVersion("4.18.0"),
++			expectedSkewEnforcementStatus:   apihelpers.GetSkewEnforcementStatusNone(),
+ 		},
+ 		{
+ 			name:               "vsphere platform, empty list config, no opt-in expected",
+@@ -617,7 +622,7 @@ func TestSyncMachineConfiguration(t *testing.T) {
+ 			clusterVersion:                  buildClusterVersion("4.19.0"),
+ 			annotationExpected:              false,
+ 			expectedManagedBootImagesStatus: opv1.ManagedBootImages{},
+-			expectedSkewEnforcementStatus:   apihelpers.GetSkewEnforcementStatusManualWithOCPVersion("4.19.0"),
++			expectedSkewEnforcementStatus:   apihelpers.GetSkewEnforcementStatusNone(),
+ 		},
+ 		{
+ 			name:                  "vsphere platform, CPMS updates unsupported, MachineSet configuration expected, no CPMS configuration expected",
+@@ -700,13 +705,35 @@ func TestSyncMachineConfiguration(t *testing.T) {
+ 			expectedSkewEnforcementStatus: apihelpers.GetSkewEnforcementStatusAutomaticWithOCPVersion("4.19.1"),
+ 		},
+ 		{
+-			name:                            "BareMetal platform (unsupported), skew enforcement manual mode expected",
++			name:                            "BareMetal platform, Provisioning CR absent, skew enforcement None expected",
+ 			infra:                           buildInfra(withPlatformType(configv1.BareMetalPlatformType)),
+ 			mcop:                            buildMachineConfigurationWithNoBootImageConfiguration(),
+ 			clusterVersion:                  buildClusterVersion("4.18.0"),
+ 			annotationExpected:              false,
+ 			expectedManagedBootImagesStatus: opv1.ManagedBootImages{},
+-			expectedSkewEnforcementStatus:   apihelpers.GetSkewEnforcementStatusManualWithOCPVersion("4.18.0"),
++			expectedSkewEnforcementStatus:   apihelpers.GetSkewEnforcementStatusNone(),
++		},
++		{
++			name:                            "BareMetal platform, Provisioning CR present with empty URL, skew enforcement None expected",
++			infra:                           buildInfra(withPlatformType(configv1.BareMetalPlatformType)),
++			mcop:                            buildMachineConfigurationWithNoBootImageConfiguration(),
++			clusterVersion:                  buildClusterVersion("4.18.0"),
++			annotationExpected:              false,
++			provisioningCRPresent:           true,
++			provisioningOSDownloadURL:       "",
++			expectedManagedBootImagesStatus: opv1.ManagedBootImages{},
++			expectedSkewEnforcementStatus:   apihelpers.GetSkewEnforcementStatusNone(),
++		},
++		{
++			name:                            "BareMetal platform, legacy qcow2 path (provisioningOSDownloadURL set), skew enforcement Manual expected",
++			infra:                           buildInfra(withPlatformType(configv1.BareMetalPlatformType)),
++			mcop:                            buildMachineConfigurationWithNoBootImageConfiguration(),
++			clusterVersion:                  buildClusterVersion("4.9.0"),
++			annotationExpected:              false,
++			provisioningCRPresent:           true,
++			provisioningOSDownloadURL:       "https://example.com/rhcos.qcow2",
++			expectedManagedBootImagesStatus: opv1.ManagedBootImages{},
++			expectedSkewEnforcementStatus:   apihelpers.GetSkewEnforcementStatusManualWithOCPVersion("4.9.0"),
+ 		},
+ 		{
+ 			name:               "AWS platform, cluster version with multiple history entries",
+@@ -748,10 +775,10 @@ func TestSyncMachineConfiguration(t *testing.T) {
+ 			expectedSkewEnforcementStatus: apihelpers.GetSkewEnforcementStatusNone(),
+ 		},
+ 		{
+-			name:           "SNO cluster, spec defines manual mode, status should reflect spec",
+-			infra:          buildInfra(withPlatformType(configv1.AWSPlatformType), withControlPlaneTopology(configv1.SingleReplicaTopologyMode)),
+-			mcop:           buildMachineConfigurationWithSkewEnforcementManual("4.17.0"),
+-			clusterVersion: buildClusterVersion("4.18.0"),
++			name:               "SNO cluster, spec defines manual mode, status should reflect spec",
++			infra:              buildInfra(withPlatformType(configv1.AWSPlatformType), withControlPlaneTopology(configv1.SingleReplicaTopologyMode)),
++			mcop:               buildMachineConfigurationWithSkewEnforcementManual("4.17.0"),
++			clusterVersion:     buildClusterVersion("4.18.0"),
+ 			annotationExpected: true,
+ 			expectedManagedBootImagesStatus: opv1.ManagedBootImages{
+ 				MachineManagers: []opv1.MachineManager{
+@@ -778,6 +805,17 @@ func TestSyncMachineConfiguration(t *testing.T) {
+ 			if tc.enableCPMSFeatureGate {
+ 				enabledFeatureGates = append(enabledFeatureGates, features.FeatureGateManagedBootImagesCPMS)
+ 			}
++
++			provisioningGVR := schema.GroupVersionResource{Group: "metal3.io", Version: "v1alpha1", Resource: "provisionings"}
++			provisioningIndexer := cache.NewIndexer(cache.MetaNamespaceKeyFunc, cache.Indexers{})
++			if tc.provisioningCRPresent {
++				provisioningIndexer.Add(&unstructured.Unstructured{Object: map[string]interface{}{
++					"apiVersion": "metal3.io/v1alpha1",
++					"kind":       "Provisioning",
++					"metadata":   map[string]interface{}{"name": "provisioning-configuration"},
++					"spec":       map[string]interface{}{"provisioningOSDownloadURL": tc.provisioningOSDownloadURL},
++				}})
++			}
+ 			optr := &Operator{
+ 				eventRecorder: &record.FakeRecorder{},
+ 				fgHandler: ctrlcommon.NewFeatureGatesHardcodedHandler(
+@@ -788,6 +826,7 @@ func TestSyncMachineConfiguration(t *testing.T) {
+ 				mcopClient:           fakemcopclientset.NewSimpleClientset(tc.mcop),
+ 				mcpLister:            mcplister.NewMachineConfigPoolLister(mcpIndexer),
+ 				clusterVersionLister: configlistersv1.NewClusterVersionLister(clusterVersionIndexer),
++				provisioningLister:   dynamiclister.New(provisioningIndexer, provisioningGVR),
+ 			}
+ 			err := optr.syncMachineConfiguration(nil, nil)
+ 			assert.NoError(t, err)
+diff --git a/test/extended-priv/const.go b/test/extended-priv/const.go
+index 1d524f7805..ccdbfa868c 100644
+--- a/test/extended-priv/const.go
++++ b/test/extended-priv/const.go
+@@ -44,6 +44,8 @@ const (
+ 	AzurePlatform = "azure"
+ 	// VspherePlatform value used to identify Vsphere infrastructure
+ 	VspherePlatform = "vsphere"
++	// BaremetalPlatform value used to identify BareMetal infrastructure
++	BaremetalPlatform = "baremetal"
+ 
+ 	// ExpirationDockerfileLabel Expiration label in Dockerfile
+ 	ExpirationDockerfileLabel = `LABEL maintainer="mco-qe-team" quay.expires-after=24h`
+diff --git a/test/extended-priv/mco_bootimages_skew.go b/test/extended-priv/mco_bootimages_skew.go
+index 890539cfc6..82ca8d9725 100644
+--- a/test/extended-priv/mco_bootimages_skew.go
++++ b/test/extended-priv/mco_bootimages_skew.go
+@@ -237,6 +237,51 @@ var _ = g.Describe("[sig-mco][Suite:openshift/machine-config-operator/disruptive
+ 		}
+ 	})
+ 
++	g.It("Verify BareMetal defaults to None mode and flips to Manual on legacy provisioning path [apigroup:machineconfiguration.openshift.io]", func() {
++		// Only applicable on BareMetal clusters
++		skipTestIfSupportedPlatformNotMatched(oc, BaremetalPlatform)
++
++		provisioningCRName := "provisioning-configuration"
++
++		// machine-os-images path (default on 4.10+): provisioning URL should be empty
++		exutil.By("Verify provisioning CR URL is empty (machine-os-images path)")
++		originalURL, err := oc.AsAdmin().WithoutNamespace().Run("get").Args(
++			"provisioning", provisioningCRName,
++			"-o", "jsonpath={.spec.provisioningOSDownloadURL}",
++		).Output()
++		o.Expect(err).NotTo(o.HaveOccurred(), "Failed to get provisioning CR")
++		o.Expect(originalURL).To(o.BeEmpty(), "Expected provisioningOSDownloadURL to be empty on machine-os-images path")
++		logger.Infof("Provisioning URL is empty as expected")
++
++		exutil.By("Verify bootImageSkewEnforcementStatus.mode is None on BareMetal (machine-os-images path)")
++		machineConfiguration.WaitForBootImageSkewEnforcementStatusMode(SkewEnforcementNoneMode)
++		logger.Infof("bootImageSkewEnforcementStatus.mode is None as expected")
++
++		// Legacy qcow2 path (simulated): patch the provisioning CR with a URL to trigger Manual mode
++		exutil.By("Simulate legacy qcow2 path by patching provisioning CR with a URL")
++		defer func() {
++			exutil.By("Restoring provisioning CR: clearing provisioningOSDownloadURL")
++			patchErr := oc.AsAdmin().WithoutNamespace().Run("patch").Args(
++				"provisioning", provisioningCRName,
++				"--type=merge",
++				"-p", `{"spec":{"provisioningOSDownloadURL":""}}`,
++			).Execute()
++			o.Expect(patchErr).NotTo(o.HaveOccurred(), "Failed to restore provisioning CR")
++			machineConfiguration.WaitForBootImageSkewEnforcementStatusMode(SkewEnforcementNoneMode)
++		}()
++
++		err = oc.AsAdmin().WithoutNamespace().Run("patch").Args(
++			"provisioning", provisioningCRName,
++			"--type=merge",
++			"-p", `{"spec":{"provisioningOSDownloadURL":"https://example.com/rhcos.qcow2"}}`,
++		).Execute()
++		o.Expect(err).NotTo(o.HaveOccurred(), "Failed to patch provisioning CR with legacy URL")
++
++		exutil.By("Verify bootImageSkewEnforcementStatus.mode flips to Manual (legacy qcow2 path)")
++		machineConfiguration.WaitForBootImageSkewEnforcementStatusMode(SkewEnforcementManualMode)
++		logger.Infof("bootImageSkewEnforcementStatus.mode is Manual as expected")
++	})
++
+ 	g.It("Verify None mode [apigroup:machineconfiguration.openshift.io]", func() {
+ 		// Set None mode, effectively disabling skew enforcement
+ 		o.Expect(machineConfiguration.SetNoneSkew()).To(o.Succeed())

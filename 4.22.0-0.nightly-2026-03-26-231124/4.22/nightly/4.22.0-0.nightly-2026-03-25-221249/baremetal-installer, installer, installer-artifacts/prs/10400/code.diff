@@ -1,0 +1,75 @@
+diff --git a/pkg/infrastructure/baremetal/bootstrap.go b/pkg/infrastructure/baremetal/bootstrap.go
+index 2f4186b00a3..ec0f8f0766a 100644
+--- a/pkg/infrastructure/baremetal/bootstrap.go
++++ b/pkg/infrastructure/baremetal/bootstrap.go
+@@ -73,9 +73,17 @@ func newDomain(name string) libvirtxml.Domain {
+ 			Port: &targetPort,
+ 		},
+ 	}
+-
+ 	domainDef.Devices.Consoles = append(domainDef.Devices.Consoles, console)
+ 
++	serialLogPath := fmt.Sprintf("/var/log/libvirt/qemu/%s-serial0.log", name)
++	serial := libvirtxml.DomainSerial{
++		Log: &libvirtxml.DomainChardevLog{
++			File:   serialLogPath,
++			Append: "on",
++		},
++	}
++	domainDef.Devices.Serials = append(domainDef.Devices.Serials, serial)
++
+ 	domainDef.Devices.Graphics = []libvirtxml.DomainGraphic{
+ 		{
+ 			VNC: &libvirtxml.DomainGraphicVNC{
+@@ -233,7 +241,8 @@ func createLiveVolume(virConn *libvirt.Libvirt, config baremetalConfig, pool lib
+ 		return libvirt.StorageVol{}, fmt.Errorf("failed to get libvirt capabilities: %w", err)
+ 	}
+ 
+-	isoFile, err := getLiveISO(config, capabilities.Host.CPU.Arch)
++	arch := capabilities.Host.CPU.Arch
++	isoFile, err := getLiveISO(config, arch)
+ 	if err != nil {
+ 		return libvirt.StorageVol{}, err
+ 	}
+@@ -243,7 +252,16 @@ func createLiveVolume(virConn *libvirt.Libvirt, config baremetalConfig, pool lib
+ 	if err != nil {
+ 		return libvirt.StorageVol{}, err
+ 	}
++	consoleDevice := map[string]string{
++		"x86_64":  "ttyS0",
++		"aarch64": "ttyAMA0",
++		"s390x":   "ttysclp0",
++		"ppc64le": "hvc0",
++	}
+ 	var kargs string
++	if dev, ok := consoleDevice[arch]; ok {
++		kargs += " console=" + dev
++	}
+ 	if config.FIPS {
+ 		kargs += " fips=1"
+ 	}
+diff --git a/pkg/infrastructure/baremetal/bootstrap_test.go b/pkg/infrastructure/baremetal/bootstrap_test.go
+index 07d712b1fc3..8635d2f76c2 100644
+--- a/pkg/infrastructure/baremetal/bootstrap_test.go
++++ b/pkg/infrastructure/baremetal/bootstrap_test.go
+@@ -22,6 +22,11 @@ func TestNewDomain(t *testing.T) {
+ 	assert.NotEmpty(t, dom.Devices.RNGs, "RNG device should be configured")
+ 	assert.NotEmpty(t, dom.Devices.Graphics, "graphics should be configured")
+ 	assert.NotEmpty(t, dom.Devices.Consoles, "console should be configured")
++	assert.NotEmpty(t, dom.Devices.Serials, "serial device should be configured")
++	assert.NotNil(t, dom.Devices.Serials[0].Log, "serial device should have a log file configured")
++	assert.Equal(t, "/var/log/libvirt/qemu/test-bootstrap-serial0.log", dom.Devices.Serials[0].Log.File)
++	assert.Equal(t, "on", dom.Devices.Serials[0].Log.Append)
++	assert.Nil(t, dom.Devices.Serials[0].Target, "serial target should not be set by newDomain")
+ }
+ 
+ func TestConfigureDomainArch(t *testing.T) {
+@@ -76,6 +81,8 @@ func TestConfigureDomainArch(t *testing.T) {
+ 			} else {
+ 				assert.Nil(t, dom.Devices.Graphics, "graphics should be removed for %s", tc.arch)
+ 			}
++
++			assert.NotEmpty(t, dom.Devices.Serials, "serial device should be present for %s", tc.arch)
+ 		})
+ 	}
+ }

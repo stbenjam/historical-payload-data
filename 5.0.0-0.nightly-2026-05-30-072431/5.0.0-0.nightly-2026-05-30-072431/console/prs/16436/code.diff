@@ -1,0 +1,564 @@
+diff --git a/frontend/packages/console-shared/locales/en/console-shared.json b/frontend/packages/console-shared/locales/en/console-shared.json
+index afe0d28d13f..9e583810c75 100644
+--- a/frontend/packages/console-shared/locales/en/console-shared.json
++++ b/frontend/packages/console-shared/locales/en/console-shared.json
+@@ -232,6 +232,7 @@
+   "Namespace": "Namespace",
+   "Enable Autoscale": "Enable Autoscale",
+   "Increase the Pod count": "Increase the Pod count",
++  "This image is not intended to run with more than one replica. Scaling up may cause unexpected behavior.": "This image is not intended to run with more than one replica. Scaling up may cause unexpected behavior.",
+   "Decrease the Pod count": "Decrease the Pod count",
+   "No Pods found for this resource.": "No Pods found for this resource.",
+   "Hide waiting pods with errors": "Hide waiting pods with errors",
+diff --git a/frontend/packages/console-shared/src/components/pod/PodRing.tsx b/frontend/packages/console-shared/src/components/pod/PodRing.tsx
+index e7d6ef2544c..83988d72d27 100644
+--- a/frontend/packages/console-shared/src/components/pod/PodRing.tsx
++++ b/frontend/packages/console-shared/src/components/pod/PodRing.tsx
+@@ -1,12 +1,13 @@
+ import type { FC } from 'react';
+ import { useState, useEffect } from 'react';
+-import { Button, Split, SplitItem, Bullseye } from '@patternfly/react-core';
++import { Button, Split, SplitItem, Bullseye, Tooltip } from '@patternfly/react-core';
+ import { AngleDownIcon, AngleUpIcon, AutomationIcon } from '@patternfly/react-icons';
+ import * as _ from 'lodash';
+ import { useTranslation } from 'react-i18next';
+ import type { ImpersonateKind } from '@console/dynamic-plugin-sdk';
+ import type { K8sResourceKind, K8sKind } from '@console/internal/module/k8s';
+ import { k8sPatch } from '@console/internal/module/k8s';
++import { useNonScalableImageCheck } from '../../hooks/useNonScalableImageCheck';
+ import { useRelatedHPA } from '../../hooks/useRelatedHPA';
+ import type { ExtPodKind } from '../../types/pod';
+ import { usePodRingLabel, usePodScalingAccessStatus } from '../../utils/pod-ring-utils';
+@@ -82,6 +83,7 @@ export const PodRing: FC<PodRingProps> = ({
+   } = obj;
+   const [hpa] = useRelatedHPA(apiVersion, kind, name, namespace);
+   const hpaControlledScaling = !!hpa;
++  const { isNonScalable } = useNonScalableImageCheck(obj);
+ 
+   const isScalingAllowed = isAccessScalingAllowed && !hpaControlledScaling;
+ 
+@@ -126,15 +128,32 @@ export const PodRing: FC<PodRingProps> = ({
+         <SplitItem>
+           <Bullseye>
+             <div>
+-              <Button
+-                icon={<AngleUpIcon style={{ fontSize: '20' }} />}
+-                type="button"
+-                variant="plain"
+-                aria-label={t('console-shared~Increase the Pod count')}
+-                title={t('console-shared~Increase the Pod count')}
+-                onClick={() => handleClick(1)}
+-                isBlock
+-              />
++              {(() => {
++                const scaleUpButton = (
++                  <Button
++                    icon={<AngleUpIcon style={{ fontSize: '20' }} />}
++                    type="button"
++                    variant="plain"
++                    aria-label={t('console-shared~Increase the Pod count')}
++                    title={t('console-shared~Increase the Pod count')}
++                    onClick={() => handleClick(1)}
++                    isBlock
++                  />
++                );
++                // Show tooltip preemptively at >= 1 replica so users see
++                // the non-scalable warning before attempting to scale up
++                return isNonScalable && clickCount >= 1 ? (
++                  <Tooltip
++                    content={t(
++                      'console-shared~This image is not intended to run with more than one replica. Scaling up may cause unexpected behavior.',
++                    )}
++                  >
++                    {scaleUpButton}
++                  </Tooltip>
++                ) : (
++                  scaleUpButton
++                );
++              })()}
+               <Button
+                 icon={<AngleDownIcon style={{ fontSize: '20' }} />}
+                 type="button"
+diff --git a/frontend/packages/console-shared/src/hooks/__tests__/useNonScalableImageCheck.spec.ts b/frontend/packages/console-shared/src/hooks/__tests__/useNonScalableImageCheck.spec.ts
+new file mode 100644
+index 00000000000..0d1e6977f3a
+--- /dev/null
++++ b/frontend/packages/console-shared/src/hooks/__tests__/useNonScalableImageCheck.spec.ts
+@@ -0,0 +1,155 @@
++import { renderHook } from '@testing-library/react';
++import { useK8sWatchResource } from '@console/internal/components/utils/k8s-watch-hook';
++import { useNonScalableImageCheck } from '../useNonScalableImageCheck';
++
++jest.mock('@console/internal/components/utils/k8s-watch-hook', () => ({
++  useK8sWatchResource: jest.fn(),
++}));
++
++const mockUseK8sWatchResource = useK8sWatchResource as jest.Mock;
++
++const makeDeploymentConfig = (istName?: string, namespace = 'test-ns') => ({
++  kind: 'DeploymentConfig',
++  apiVersion: 'apps.openshift.io/v1',
++  metadata: { name: 'test-dc', namespace },
++  spec: {
++    replicas: 1,
++    triggers: istName
++      ? [
++          {
++            type: 'ImageChange',
++            imageChangeParams: {
++              from: { kind: 'ImageStreamTag', name: istName, namespace },
++            },
++          },
++        ]
++      : [],
++  },
++});
++
++const makeDeployment = (istName?: string, namespace = 'test-ns') => ({
++  kind: 'Deployment',
++  apiVersion: 'apps/v1',
++  metadata: {
++    name: 'test-deploy',
++    namespace,
++    annotations: istName
++      ? {
++          'image.openshift.io/triggers': JSON.stringify([
++            { from: { kind: 'ImageStreamTag', name: istName, namespace } },
++          ]),
++        }
++      : {},
++  },
++  spec: { replicas: 1 },
++});
++
++const makeIST = (nonScalable?: string) => ({
++  image: {
++    dockerImageMetadata: {
++      Config: {
++        Labels: nonScalable !== undefined ? { 'io.openshift.non-scalable': nonScalable } : {},
++      },
++    },
++  },
++});
++
++describe('useNonScalableImageCheck', () => {
++  beforeEach(() => {
++    jest.clearAllMocks();
++  });
++
++  it('should return isNonScalable=true when IST has io.openshift.non-scalable=true', () => {
++    mockUseK8sWatchResource.mockReturnValue([makeIST('true'), true, null]);
++    const resource = makeDeploymentConfig('myapp:latest');
++
++    const { result } = renderHook(() => useNonScalableImageCheck(resource));
++
++    expect(result.current.isNonScalable).toBe(true);
++    expect(result.current.loading).toBe(false);
++  });
++
++  it('should return isNonScalable=false when IST does not have the label', () => {
++    mockUseK8sWatchResource.mockReturnValue([makeIST(), true, null]);
++    const resource = makeDeploymentConfig('myapp:latest');
++
++    const { result } = renderHook(() => useNonScalableImageCheck(resource));
++
++    expect(result.current.isNonScalable).toBe(false);
++    expect(result.current.loading).toBe(false);
++  });
++
++  it('should pass null to useK8sWatchResource when there are no triggers', () => {
++    mockUseK8sWatchResource.mockReturnValue([null, true, null]);
++    const resource = makeDeploymentConfig();
++
++    const { result } = renderHook(() => useNonScalableImageCheck(resource));
++
++    expect(result.current.isNonScalable).toBe(false);
++    expect(mockUseK8sWatchResource).toHaveBeenCalledWith(null);
++  });
++
++  it('should handle Deployment with image.openshift.io/triggers annotation', () => {
++    mockUseK8sWatchResource.mockReturnValue([makeIST('true'), true, null]);
++    const resource = makeDeployment('myapp:latest');
++
++    const { result } = renderHook(() => useNonScalableImageCheck(resource));
++
++    expect(result.current.isNonScalable).toBe(true);
++    expect(mockUseK8sWatchResource).toHaveBeenCalledWith(
++      expect.objectContaining({
++        kind: 'ImageStreamTag',
++        name: 'myapp:latest',
++        namespace: 'test-ns',
++      }),
++    );
++  });
++
++  it('should return isNonScalable=false when useK8sWatchResource returns an error', () => {
++    mockUseK8sWatchResource.mockReturnValue([null, true, new Error('Forbidden')]);
++    const resource = makeDeploymentConfig('myapp:latest');
++
++    const { result } = renderHook(() => useNonScalableImageCheck(resource));
++
++    expect(result.current.isNonScalable).toBe(false);
++    expect(result.current.loading).toBe(false);
++  });
++
++  it('should pass null to useK8sWatchResource for Deployment without trigger annotation', () => {
++    mockUseK8sWatchResource.mockReturnValue([null, true, null]);
++    const resource = makeDeployment();
++
++    const { result } = renderHook(() => useNonScalableImageCheck(resource));
++
++    expect(result.current.isNonScalable).toBe(false);
++    expect(mockUseK8sWatchResource).toHaveBeenCalledWith(null);
++  });
++
++  it('should return loading=true while useK8sWatchResource has not loaded', () => {
++    mockUseK8sWatchResource.mockReturnValue([null, false, null]);
++    const resource = makeDeploymentConfig('myapp:latest');
++
++    const { result } = renderHook(() => useNonScalableImageCheck(resource));
++
++    expect(result.current.isNonScalable).toBe(false);
++    expect(result.current.loading).toBe(true);
++  });
++
++  it('should pass null to useK8sWatchResource when resource is null', () => {
++    mockUseK8sWatchResource.mockReturnValue([null, true, null]);
++
++    const { result } = renderHook(() => useNonScalableImageCheck(null));
++
++    expect(result.current.isNonScalable).toBe(false);
++    expect(mockUseK8sWatchResource).toHaveBeenCalledWith(null);
++  });
++
++  it('should return isNonScalable=false when label value is not "true"', () => {
++    mockUseK8sWatchResource.mockReturnValue([makeIST('false'), true, null]);
++    const resource = makeDeploymentConfig('myapp:latest');
++
++    const { result } = renderHook(() => useNonScalableImageCheck(resource));
++
++    expect(result.current.isNonScalable).toBe(false);
++  });
++});
+diff --git a/frontend/packages/console-shared/src/hooks/useNonScalableImageCheck.ts b/frontend/packages/console-shared/src/hooks/useNonScalableImageCheck.ts
+new file mode 100644
+index 00000000000..33971bc801d
+--- /dev/null
++++ b/frontend/packages/console-shared/src/hooks/useNonScalableImageCheck.ts
+@@ -0,0 +1,119 @@
++import { useMemo } from 'react';
++import { useK8sWatchResource } from '@console/internal/components/utils/k8s-watch-hook';
++import { ImageStreamTagModel } from '@console/internal/models';
++import type { K8sResourceKind } from '@console/internal/module/k8s';
++
++const NON_SCALABLE_LABEL = 'io.openshift.non-scalable';
++const IMAGE_TRIGGER_ANNOTATION = 'image.openshift.io/triggers';
++
++type ISTReference = {
++  name: string;
++  namespace: string;
++};
++
++type ImageStreamTagResource = K8sResourceKind & {
++  image?: {
++    dockerImageMetadata?: {
++      Config?: {
++        Labels?: Record<string, string>;
++      };
++    };
++  };
++};
++
++const getISTFromDeploymentConfig = (resource: K8sResourceKind): ISTReference | null => {
++  const triggers = resource?.spec?.triggers;
++  if (!Array.isArray(triggers)) {
++    return null;
++  }
++  const imageChangeTrigger = triggers.find(
++    (trigger) =>
++      trigger.type === 'ImageChange' &&
++      trigger?.imageChangeParams?.from?.kind === 'ImageStreamTag' &&
++      !!trigger?.imageChangeParams?.from?.name,
++  );
++  if (!imageChangeTrigger) {
++    return null;
++  }
++  const { name, namespace } = imageChangeTrigger.imageChangeParams.from;
++  return {
++    name,
++    namespace: namespace || resource.metadata?.namespace,
++  };
++};
++
++const getISTFromTriggerAnnotation = (resource: K8sResourceKind): ISTReference | null => {
++  const annotation = resource?.metadata?.annotations?.[IMAGE_TRIGGER_ANNOTATION];
++  if (!annotation) {
++    return null;
++  }
++  try {
++    const triggers = JSON.parse(annotation);
++    const trigger = Array.isArray(triggers)
++      ? triggers.find((t) => t?.from?.kind === 'ImageStreamTag' && !!t?.from?.name)
++      : null;
++    if (!trigger) {
++      return null;
++    }
++    return {
++      name: trigger.from.name,
++      namespace: trigger.from.namespace || resource.metadata?.namespace,
++    };
++  } catch {
++    return null;
++  }
++};
++
++const getISTReference = (resource: K8sResourceKind): ISTReference | null => {
++  if (resource?.kind === 'DeploymentConfig') {
++    return getISTFromDeploymentConfig(resource);
++  }
++  return getISTFromTriggerAnnotation(resource);
++};
++
++/**
++ * Checks if a workload's container image has the `io.openshift.non-scalable` label.
++ * Resolves the ImageStreamTag reference from the workload's triggers or annotations,
++ * watches the IST via `useK8sWatchResource`, and inspects
++ * `image.dockerImageMetadata.Config.Labels`.
++ *
++ * Pass `null` to skip the watch (e.g. for non-replica paths).
++ * Returns `{ isNonScalable: false }` silently on any error (missing IST, permissions, etc.).
++ */
++export const useNonScalableImageCheck = (
++  resource: K8sResourceKind | null,
++): { isNonScalable: boolean; loading: boolean } => {
++  const triggerAnnotation = resource?.metadata?.annotations?.[IMAGE_TRIGGER_ANNOTATION];
++  const resourceKind = resource?.kind;
++  const resourceNamespace = resource?.metadata?.namespace;
++  const dcISTName = resource?.spec?.triggers?.find(
++    (t) => t?.type === 'ImageChange' && t?.imageChangeParams?.from?.kind === 'ImageStreamTag',
++  )?.imageChangeParams?.from?.name;
++
++  const istRef = useMemo(
++    () => (resource ? getISTReference(resource) : null),
++    // eslint-disable-next-line react-hooks/exhaustive-deps
++    [resourceKind, resourceNamespace, triggerAnnotation, dcISTName],
++  );
++
++  const istName = istRef?.name;
++  const istNamespace = istRef?.namespace;
++
++  const [ist, loaded, error] = useK8sWatchResource<ImageStreamTagResource>(
++    istName && istNamespace
++      ? {
++          kind: ImageStreamTagModel.kind,
++          name: istName,
++          namespace: istNamespace,
++          isList: false,
++        }
++      : null,
++  );
++
++  const isNonScalable =
++    loaded && !error
++      ? ist?.image?.dockerImageMetadata?.Config?.Labels?.[NON_SCALABLE_LABEL] === 'true'
++      : false;
++
++  return { isNonScalable, loading: !loaded };
++};
+diff --git a/frontend/public/components/modals/__tests__/configure-count-modal.spec.tsx b/frontend/public/components/modals/__tests__/configure-count-modal.spec.tsx
+new file mode 100644
+index 00000000000..86197886c86
+--- /dev/null
++++ b/frontend/public/components/modals/__tests__/configure-count-modal.spec.tsx
+@@ -0,0 +1,121 @@
++import { screen, configure } from '@testing-library/react';
++import userEvent from '@testing-library/user-event';
++import '@testing-library/jest-dom';
++import { ConfigureCountModal } from '@console/internal/components/modals/configure-count-modal';
++import { DeploymentConfigModel } from '@console/internal/models';
++import { useNonScalableImageCheck } from '@console/shared/src/hooks/useNonScalableImageCheck';
++import { renderWithProviders } from '@console/shared/src/test-utils/unit-test-utils';
++
++jest.mock('@console/shared/src/hooks/useNonScalableImageCheck', () => ({
++  ...jest.requireActual('@console/shared/src/hooks/useNonScalableImageCheck'),
++  useNonScalableImageCheck: jest.fn(),
++}));
++
++jest.mock('@console/shared/src/hooks/usePromiseHandler', () => ({
++  usePromiseHandler: () => [jest.fn().mockResolvedValue(undefined), false, ''],
++}));
++
++const mockUseNonScalableImageCheck = useNonScalableImageCheck as jest.Mock;
++
++const baseProps = {
++  defaultValue: 1,
++  titleKey: 'public~Edit Pod count',
++  messageKey: 'public~{{resourceKinds}} maintain the desired number of healthy pods.',
++  messageVariables: { resourceKinds: 'Deployments' },
++  path: '/spec/replicas',
++  buttonTextKey: 'public~Save',
++  resource: {
++    kind: 'DeploymentConfig',
++    apiVersion: 'apps.openshift.io/v1',
++    metadata: { name: 'test-dc', namespace: 'test-ns' },
++    spec: {
++      replicas: 1,
++      triggers: [
++        {
++          type: 'ImageChange',
++          imageChangeParams: {
++            from: { kind: 'ImageStreamTag', name: 'myapp:latest', namespace: 'test-ns' },
++          },
++        },
++      ],
++    },
++  },
++  resourceKind: DeploymentConfigModel,
++  opts: { path: 'scale' },
++  closeOverlay: jest.fn(),
++};
++
++describe('ConfigureCountModal - Non-scalable image warning', () => {
++  beforeAll(() => {
++    configure({ testIdAttribute: 'data-test' });
++  });
++
++  beforeEach(() => {
++    jest.clearAllMocks();
++    mockUseNonScalableImageCheck.mockReturnValue({ isNonScalable: false, loading: false });
++  });
++
++  it('should show warning when image is non-scalable and value > 1', () => {
++    mockUseNonScalableImageCheck.mockReturnValue({ isNonScalable: true, loading: false });
++
++    const resource = {
++      ...baseProps.resource,
++      spec: { ...baseProps.resource.spec, replicas: 2 },
++    };
++    renderWithProviders(<ConfigureCountModal {...baseProps} resource={resource} />);
++
++    expect(screen.getByText('Non-scalable image')).toBeVisible();
++    expect(
++      screen.getByText(
++        'This image is not intended to run with more than one replica. Running multiple instances may cause unexpected behavior.',
++      ),
++    ).toBeVisible();
++  });
++
++  it('should not show warning when image is non-scalable but value is 1', () => {
++    mockUseNonScalableImageCheck.mockReturnValue({ isNonScalable: true, loading: false });
++
++    renderWithProviders(<ConfigureCountModal {...baseProps} />);
++
++    expect(screen.queryByText('Non-scalable image')).toBeNull();
++  });
++
++  it('should not show warning when image is scalable', () => {
++    mockUseNonScalableImageCheck.mockReturnValue({ isNonScalable: false, loading: false });
++
++    const resource = {
++      ...baseProps.resource,
++      spec: { ...baseProps.resource.spec, replicas: 3 },
++    };
++    renderWithProviders(<ConfigureCountModal {...baseProps} resource={resource} />);
++
++    expect(screen.queryByText('Non-scalable image')).toBeNull();
++  });
++
++  it('should not show warning for non-replica paths (e.g., parallelism)', () => {
++    mockUseNonScalableImageCheck.mockReturnValue({ isNonScalable: true, loading: false });
++
++    const resource = {
++      ...baseProps.resource,
++      spec: { ...baseProps.resource.spec, parallelism: 3 },
++    };
++    renderWithProviders(
++      <ConfigureCountModal {...baseProps} path="/spec/parallelism" resource={resource} />,
++    );
++
++    expect(screen.queryByText('Non-scalable image')).toBeNull();
++  });
++
++  it('should show warning when user increments from 1 to 2 for a non-scalable image', async () => {
++    mockUseNonScalableImageCheck.mockReturnValue({ isNonScalable: true, loading: false });
++
++    renderWithProviders(<ConfigureCountModal {...baseProps} />);
++    expect(screen.queryByText('Non-scalable image')).toBeNull();
++
++    const user = userEvent.setup();
++    const incrementButton = screen.getByRole('button', { name: 'Increment' });
++    await user.click(incrementButton);
++
++    expect(screen.getByText('Non-scalable image')).toBeVisible();
++  });
++});
+diff --git a/frontend/public/components/modals/configure-count-modal.tsx b/frontend/public/components/modals/configure-count-modal.tsx
+index 3653fc2f30c..29dc42782cc 100644
+--- a/frontend/public/components/modals/configure-count-modal.tsx
++++ b/frontend/public/components/modals/configure-count-modal.tsx
+@@ -1,7 +1,15 @@
+ import * as _ from 'lodash';
+ import { useTranslation } from 'react-i18next';
+ import { useState, useCallback } from 'react';
+-import { Modal, ModalHeader, ModalBody, Button, FormGroup, Form } from '@patternfly/react-core';
++import {
++  Alert,
++  Modal,
++  ModalHeader,
++  ModalBody,
++  Button,
++  FormGroup,
++  Form,
++} from '@patternfly/react-core';
+ import { useOverlay } from '@console/dynamic-plugin-sdk/src/app/modal-support/useOverlay';
+ import { useDeepCompareMemoize } from '@console/dynamic-plugin-sdk/src/utils/k8s/hooks/useDeepCompareMemoize';
+ import { OverlayComponent } from '@console/dynamic-plugin-sdk/src/app/modal-support/OverlayProvider';
+@@ -9,6 +17,7 @@ import { k8sPatchResource } from '@console/dynamic-plugin-sdk/src/utils/k8s';
+ import { K8sResourceKind, K8sModel } from '../../module/k8s';
+ import { NumberSpinner, NumberSpinnerProps } from '../utils/number-spinner';
+ import { usePromiseHandler } from '@console/shared/src/hooks/usePromiseHandler';
++import { useNonScalableImageCheck } from '@console/shared/src/hooks/useNonScalableImageCheck';
+ import { ModalFooterWithAlerts } from '@console/shared/src/components/modals/ModalFooterWithAlerts';
+ 
+ export const ConfigureCountModal: OverlayComponent<ConfigureCountModalProps> = (props) => {
+@@ -34,6 +43,8 @@ export const ConfigureCountModal: OverlayComponent<ConfigureCountModalProps> = (
+   const [value, setValue] = useState<number>(_.get(resource, getPath) ?? defaultValue);
+   const { t } = useTranslation();
+   const [handlePromise, inProgress, errorMessage] = usePromiseHandler();
++  const isReplicaPath = path === '/spec/replicas';
++  const { isNonScalable } = useNonScalableImageCheck(isReplicaPath ? resource : null);
+ 
+   const submit = useCallback(
+     (e) => {
+@@ -87,6 +98,18 @@ export const ConfigureCountModal: OverlayComponent<ConfigureCountModalProps> = (
+         description={messageKey ? t(messageKey, messageVariablesSafe) : message}
+       />
+       <ModalBody>
++        {isReplicaPath && isNonScalable && value > 1 && (
++          <Alert
++            variant="warning"
++            isInline
++            title={t('public~Non-scalable image')}
++            className="pf-v6-u-mb-md"
++          >
++            {t(
++              'public~This image is not intended to run with more than one replica. Running multiple instances may cause unexpected behavior.',
++            )}
++          </Alert>
++        )}
+         <Form id="configure-count-form">
+           <FormGroup>
+             <NumberSpinner
+diff --git a/frontend/public/locales/en/public.json b/frontend/public/locales/en/public.json
+index 8f88dcc2ff4..5d2b692b228 100644
+--- a/frontend/public/locales/en/public.json
++++ b/frontend/public/locales/en/public.json
+@@ -872,6 +872,8 @@
+   "Receive update information from Red Hat.": "Receive update information from Red Hat.",
+   "Custom update service": "Custom update service",
+   "Please enter a URL.": "Please enter a URL.",
++  "Non-scalable image": "Non-scalable image",
++  "This image is not intended to run with more than one replica. Running multiple instances may cause unexpected behavior.": "This image is not intended to run with more than one replica. Running multiple instances may cause unexpected behavior.",
+   "{{resourceKinds}} create one or more pods and ensure that a specified number of them successfully terminate. When the specified number of completions is successfully reached, the job is complete.": "{{resourceKinds}} create one or more pods and ensure that a specified number of them successfully terminate. When the specified number of completions is successfully reached, the job is complete.",
+   "Create MachineAutoscaler": "Create MachineAutoscaler",
+   "This will automatically scale machine set {{ name }}.": "This will automatically scale machine set {{ name }}.",

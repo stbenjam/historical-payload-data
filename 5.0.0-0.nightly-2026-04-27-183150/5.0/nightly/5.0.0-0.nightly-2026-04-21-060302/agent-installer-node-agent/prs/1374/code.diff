@@ -1,0 +1,1528 @@
+diff --git a/go.mod b/go.mod
+index 40f71838a..a873d304e 100644
+--- a/go.mod
++++ b/go.mod
+@@ -8,6 +8,7 @@ require (
+ 	github.com/PuerkitoBio/rehttp v1.4.0
+ 	github.com/alessio/shellescape v1.4.2
+ 	github.com/coreos/ignition/v2 v2.19.0
++	github.com/djherbis/times v1.6.0
+ 	github.com/go-openapi/runtime v0.28.0
+ 	github.com/go-openapi/strfmt v0.23.0
+ 	github.com/go-openapi/swag v0.23.0
+diff --git a/go.sum b/go.sum
+index 0cc09af04..3dcad91c6 100644
+--- a/go.sum
++++ b/go.sum
+@@ -132,6 +132,8 @@ github.com/davecgh/go-spew v1.1.2-0.20180830191138-d8f796af33cc/go.mod h1:J7Y8Yc
+ github.com/dgrijalva/jwt-go v0.0.0-20160705203006-01aeca54ebda/go.mod h1:E3ru+11k8xSBh+hMPgOLZmtrrCbhqsmaPHjLKYnJCaQ=
+ github.com/distribution/reference v0.6.0 h1:0IXCQ5g4/QMHHkarYzh5l+u8T3t73zM5QvfrDyIgxBk=
+ github.com/distribution/reference v0.6.0/go.mod h1:BbU0aIcezP1/5jX/8MP0YiH4SdvB5Y4f/wlDRiLyi3E=
++github.com/djherbis/times v1.6.0 h1:w2ctJ92J8fBvWPxugmXIv7Nz7Q3iDMKNx9v5ocVH20c=
++github.com/djherbis/times v1.6.0/go.mod h1:gOHeRAz2h+VJNZ5Gmc/o7iD9k4wW7NMVqieYCY99oc0=
+ github.com/docker/distribution v2.8.2-beta.1+incompatible h1:gILO60VLD2v28ozemv4aAwDb8ds5U2O/vD/sBXbd7Rw=
+ github.com/docker/distribution v2.8.2-beta.1+incompatible/go.mod h1:J2gT2udsDAN96Uj4KfcMRqY0/ypR+oyYUYmja8H+y+w=
+ github.com/docker/docker v25.0.6+incompatible h1:5cPwbwriIcsua2REJe8HqQV+6WlWc1byg2QSXzBxBGg=
+@@ -825,6 +827,7 @@ golang.org/x/sys v0.0.0-20210615035016-665e8c7367d1/go.mod h1:oPkhp1MJrh7nUepCBc
+ golang.org/x/sys v0.0.0-20210616094352-59db8d763f22/go.mod h1:oPkhp1MJrh7nUepCBck5+mAzfO9JrbApNNgaTdGDITg=
+ golang.org/x/sys v0.0.0-20210831042530-f4d43177bf5e/go.mod h1:oPkhp1MJrh7nUepCBck5+mAzfO9JrbApNNgaTdGDITg=
+ golang.org/x/sys v0.0.0-20220520151302-bc2c85ada10a/go.mod h1:oPkhp1MJrh7nUepCBck5+mAzfO9JrbApNNgaTdGDITg=
++golang.org/x/sys v0.0.0-20220615213510-4f61da869c0c/go.mod h1:oPkhp1MJrh7nUepCBck5+mAzfO9JrbApNNgaTdGDITg=
+ golang.org/x/sys v0.0.0-20220715151400-c0bba94af5f8/go.mod h1:oPkhp1MJrh7nUepCBck5+mAzfO9JrbApNNgaTdGDITg=
+ golang.org/x/sys v0.0.0-20220722155257-8c9f86f7a55f/go.mod h1:oPkhp1MJrh7nUepCBck5+mAzfO9JrbApNNgaTdGDITg=
+ golang.org/x/sys v0.5.0/go.mod h1:oPkhp1MJrh7nUepCBck5+mAzfO9JrbApNNgaTdGDITg=
+diff --git a/src/commands/actions/action.go b/src/commands/actions/action.go
+index f1578e0c9..7d5c53d0b 100644
+--- a/src/commands/actions/action.go
++++ b/src/commands/actions/action.go
+@@ -60,7 +60,7 @@ func New(agentConfig *config.AgentConfig, stepType models.StepType, args []strin
+ 		models.StepTypeContainerImageAvailability: {&imageAvailability{args: args, agentConfig: agentConfig}},
+ 		models.StepTypeStopInstallation:           {&stopInstallation{args: args}},
+ 		models.StepTypeLogsGather:                 {&logsGather{args: args, agentConfig: agentConfig}},
+-		models.StepTypeInstall:                    {&install{args: args, filesystem: afero.NewOsFs(), agentConfig: agentConfig}},
++		models.StepTypeInstall:                    {&install{args: args, filesystem: afero.NewOsFs(), agentConfig: agentConfig, birthTimeFn: defaultBirthTimeFn}},
+ 		models.StepTypeUpgradeAgent:               {&upgradeAgent{args: args}},
+ 		models.StepTypeDownloadBootArtifacts:      {&downloadBootArtifacts{args: args, agentConfig: agentConfig}},
+ 		models.StepTypeRebootForReclaim:           {&rebootForReclaim{args: args}},
+diff --git a/src/commands/actions/install_cmd.go b/src/commands/actions/install_cmd.go
+index 5fa186ddf..ab3563a60 100644
+--- a/src/commands/actions/install_cmd.go
++++ b/src/commands/actions/install_cmd.go
+@@ -4,11 +4,14 @@ import (
+ 	"encoding/json"
+ 	"fmt"
+ 	"os"
++	"path/filepath"
+ 	"regexp"
+ 	"strconv"
+ 	"strings"
++	"time"
+ 
+ 	"github.com/alessio/shellescape"
++	"github.com/djherbis/times"
+ 	"github.com/go-openapi/swag"
+ 	"github.com/hashicorp/go-version"
+ 	"github.com/openshift/assisted-installer-agent/src/config"
+@@ -28,6 +31,14 @@ const (
+ 	failedToPullImageExitCode = 2
+ 	defaultImagePullRetries   = 3
+ 	defaultImagePullTimeout   = 600
++	// nmConnectionsDir uses /proc/1/root to access the host's filesystem from
++	// within the next-step-runner container, which runs with --pid=host but does
++	// not mount /etc/NetworkManager/system-connections directly.
++	nmConnectionsDir = "/proc/1/root/etc/NetworkManager/system-connections"
++	// agentTUILogFile and agentTUILogDir are accessible at their normal paths
++	// because the next-step-runner container mounts /var/log from the host.
++	agentTUILogFile = "/var/log/agent/agent-tui.log"
++	agentTUILogDir  = "/var/log/agent"
+ )
+ 
+ var podmanBaseCmd = [...]string{
+@@ -46,6 +57,17 @@ type install struct {
+ 	installParams models.InstallCmdRequest
+ 	filesystem    afero.Fs
+ 	agentConfig   *config.AgentConfig
++	birthTimeFn   func(string) (time.Time, bool)
++}
++
++// defaultBirthTimeFn returns the birth time of the file at the given path using
++// the statx syscall (kernel >= 4.11). Returns false if birth time is unavailable.
++func defaultBirthTimeFn(path string) (time.Time, bool) {
++	ts, err := times.Stat(path)
++	if err != nil || !ts.HasBirthTime() {
++		return time.Time{}, false
++	}
++	return ts.BirthTime(), true
+ }
+ 
+ func (a *install) Validate() error {
+@@ -149,8 +171,13 @@ func (a *install) getFullInstallerCommand() string {
+ 		installerCmdArgs = append(installerCmdArgs, "--cacert", a.agentConfig.CACertificatePath)
+ 	}
+ 
+-	if a.installParams.InstallerArgs != "" {
+-		installerCmdArgs = append(installerCmdArgs, "--installer-args", a.installParams.InstallerArgs)
++	if installerArgs := a.buildInstallerArgs(); len(installerArgs) > 0 {
++		argsJSON, err := json.Marshal(installerArgs)
++		if err != nil {
++			log.WithError(err).Warn("Failed to marshal installer args, skipping")
++		} else {
++			installerCmdArgs = append(installerCmdArgs, "--installer-args", string(argsJSON))
++		}
+ 	}
+ 
+ 	if a.installParams.EnableSkipMcoReboot {
+@@ -272,6 +299,122 @@ func (a *install) validateDisks() error {
+ 	return nil
+ }
+ 
++// agentTUIStartTime returns the time the agent-tui started on this node.
++// It checks for the existence of the agent-tui log file to confirm the TUI
++// actually ran, then returns the birth time of the agent log directory.
++//
++// The log directory is created by agent-interactive-console.service's ExecStartPre
++// (mkdir -p /var/log/agent) just before the TUI launches. On an agent ISO boot the
++// directory does not exist beforehand, so its birth time is set exactly once at
++// service startup — making it a reliable proxy for TUI start time. Birth time is
++// used rather than mtime because mtime advances whenever a file is created inside
++// the directory (e.g. when agent-tui.log is created).
++//
++// Returns a zero time if the log file does not exist (not an ABI workflow or the
++// TUI did not produce output) or if birth time is unavailable on this system.
++func (a *install) agentTUIStartTime() time.Time {
++	if _, err := a.filesystem.Stat(agentTUILogFile); err != nil {
++		return time.Time{}
++	}
++	birthTimeFn := a.birthTimeFn
++	if birthTimeFn == nil {
++		birthTimeFn = defaultBirthTimeFn
++	}
++	btime, ok := birthTimeFn(agentTUILogDir)
++	if !ok {
++		return time.Time{}
++	}
++	return btime
++}
++
++// hasManualNetworkConfig returns true if NetworkManager keyfiles were created
++// during the agent-tui session on this node.
++//
++// The agent-tui gives users access to nmtui to configure networking. Any keyfile
++// the user creates via nmtui will appear in the NM connections directory AFTER the
++// agent-tui started. Auto-generated files (nm-initrd-generator, NMState configs via
++// pre-network-manager-config.sh) are created BEFORE the agent-tui starts, so they
++// are excluded by comparing their mtime to the TUI start time.
++//
++// If the agent-tui log file does not exist the TUI did not run on this node, so
++// we skip the check entirely. This limits the logic to ABI TUI scenarios and avoids
++// false positives in non-ABI workflows.
++//
++// Note: when NMState static configs are provided via agent-config.yaml, assisted-service
++// already adds --copy-network via StaticNetworkConfig, so those keyfiles do not need
++// to be detected here.
++func (a *install) hasManualNetworkConfig() bool {
++	tuiStart := a.agentTUIStartTime()
++	if tuiStart.IsZero() {
++		log.Info("Agent TUI log file not found, skipping manual network config detection")
++		return false
++	}
++
++	entries, err := afero.ReadDir(a.filesystem, nmConnectionsDir)
++	if err != nil {
++		if !os.IsNotExist(err) {
++			log.Warnf("Could not read %s: %v", nmConnectionsDir, err)
++		}
++		return false
++	}
++	log.Infof("Checking %s for manually-created keyfiles (agent-tui started at %v)", nmConnectionsDir, tuiStart)
++	found := false
++	for _, entry := range entries {
++		if entry.IsDir() {
++			continue
++		}
++		filePath := filepath.Join(nmConnectionsDir, entry.Name())
++
++		// Only consider files created at or after the agent-tui started. All auto-generated
++		// keyfiles (nm-initrd-generator, NMState via pre-network-manager-config.sh)
++		// are written before the TUI launches and will have an earlier mtime. We use
++		// >= rather than > to handle filesystems with second-level mtime precision
++		// where the user's keyfile and the TUI start may share the same timestamp.
++		info, err := a.filesystem.Stat(filePath)
++		if err != nil {
++			continue
++		}
++		log.Infof("Found NM keyfile: %s (mtime %v)", filePath, info.ModTime())
++		if info.ModTime().Before(tuiStart) {
++			log.Infof("Skipping NM keyfile created before agent-tui started (mtime %v < TUI start %v): %s",
++				info.ModTime(), tuiStart, filePath)
++			continue
++		}
++
++		content, err := afero.ReadFile(a.filesystem, filePath)
++		if err != nil {
++			continue
++		}
++		if strings.Contains(string(content), "[connection]") {
++			log.Infof("Found manually-created NetworkManager keyfile: %s (mtime %v)", filePath, info.ModTime())
++			found = true
++			break
++		}
++	}
++	if !found {
++		log.Infof("No manually-created NetworkManager keyfiles found in %s", nmConnectionsDir)
++	}
++	return found
++}
++
++// buildInstallerArgs returns the installer args to pass to coreos-installer,
++// combining any args already set via the assisted-service API with --copy-network
++// if manually-created NetworkManager keyfiles are detected on this host.
++func (a *install) buildInstallerArgs() []string {
++	var args []string
++	if a.installParams.InstallerArgs != "" {
++		if err := json.Unmarshal([]byte(a.installParams.InstallerArgs), &args); err != nil {
++			log.WithError(err).Warnf("Failed to unmarshal installer args: %s", a.installParams.InstallerArgs)
++		}
++	}
++	if a.hasManualNetworkConfig() && !funk.Contains(args, "--copy-network") {
++		log.Infof("Manually-created NetworkManager keyfiles detected in %s, adding --copy-network",
++			nmConnectionsDir)
++		args = append(args, "--copy-network")
++	}
++	return args
++}
++
+ func (a *install) pathExists(path string) bool {
+ 	if _, err := a.filesystem.Stat(path); os.IsNotExist(err) {
+ 		return false
+diff --git a/src/commands/actions/install_cmd_test.go b/src/commands/actions/install_cmd_test.go
+index 754176ad5..67e01bd1f 100644
+--- a/src/commands/actions/install_cmd_test.go
++++ b/src/commands/actions/install_cmd_test.go
+@@ -2,7 +2,9 @@ package actions
+ 
+ import (
+ 	"encoding/json"
++	"path/filepath"
+ 	"strings"
++	"time"
+ 
+ 	"github.com/spf13/afero"
+ 
+@@ -437,4 +439,110 @@ var _ = Describe("installer test", func() {
+ 		args := getInstall(installCommandRequest, filesystem, false).Args()
+ 		Expect(strings.Join(args, " ")).To(ContainSubstring("--coreos-image example.com/openshift/coreos:tag"))
+ 	})
++
++	Context("buildInstallerArgs", func() {
++		var tuiStart time.Time
++
++		setupAgentTUI := func() {
++			Expect(filesystem.MkdirAll(agentTUILogDir, 0755)).To(Succeed())
++			Expect(afero.WriteFile(filesystem, agentTUILogFile, []byte("agent-tui started\n"), 0644)).To(Succeed())
++		}
++
++		writeNMKeyfile := func(name, content string, mtime time.Time) {
++			Expect(filesystem.MkdirAll(nmConnectionsDir, 0755)).To(Succeed())
++			p := filepath.Join(nmConnectionsDir, name)
++			Expect(afero.WriteFile(filesystem, p, []byte(content), 0600)).To(Succeed())
++			Expect(filesystem.Chtimes(p, mtime, mtime)).To(Succeed())
++		}
++
++		// getInstallForTUI wraps getInstall and injects a birthTimeFn that returns
++		// tuiStart for agentTUILogDir, simulating djherbis/times on the real filesystem.
++		getInstallForTUI := func(request models.InstallCmdRequest) *install {
++			action := getInstall(request, filesystem, false)
++			action.birthTimeFn = func(string) (time.Time, bool) {
++				return tuiStart, true
++			}
++			return action
++		}
++
++		BeforeEach(func() {
++			tuiStart = time.Now()
++			setupAgentTUI()
++		})
++
++		It("does not add --copy-network when agent-tui log file is absent", func() {
++			// Without the agent-tui log file this is not an ABI workflow or the
++			// TUI did not produce output, so the check is skipped.
++			Expect(filesystem.Remove(agentTUILogFile)).To(Succeed())
++
++			writeNMKeyfile("static.nmconnection", `[connection]
++id=static
++type=ethernet
++`, time.Now())
++			args := getInstallForTUI(installCommandRequest).Args()
++			Expect(strings.Join(args, " ")).NotTo(ContainSubstring("--copy-network"))
++		})
++
++		It("does not add --copy-network when no keyfiles exist", func() {
++			installCommandRequest.InstallerArgs = "[\"--append-karg\",\"ip=ens3:dhcp\"]"
++			args := getInstallForTUI(installCommandRequest).Args()
++			Expect(strings.Join(args, " ")).To(ContainSubstring("--installer-args '[\"--append-karg\",\"ip=ens3:dhcp\"]'"))
++			Expect(strings.Join(args, " ")).NotTo(ContainSubstring("--copy-network"))
++		})
++
++		It("does not add --copy-network for keyfiles created before agent-tui started", func() {
++			// Files created before the agent-tui started are auto-generated
++			// (nm-initrd-generator, pre-network-manager-config.sh, etc.) and are
++			// filtered by comparing their mtime to the TUI start time.
++			writeNMKeyfile("ens3.nmconnection", `[connection]
++id=ens3
++type=ethernet
++interface-name=ens3
++
++[ipv4]
++method=auto
++`, tuiStart.Add(-3*time.Second))
++			args := getInstallForTUI(installCommandRequest).Args()
++			Expect(strings.Join(args, " ")).NotTo(ContainSubstring("--copy-network"))
++		})
++
++		It("adds --copy-network when a manually-created keyfile is created after agent-tui started", func() {
++			writeNMKeyfile("static.nmconnection", `[connection]
++id=static
++type=ethernet
++
++[ipv4]
++method=manual
++address1=192.168.111.20/24,192.168.111.1
++`, tuiStart.Add(3*time.Second))
++			args := getInstallForTUI(installCommandRequest).Args()
++			Expect(strings.Join(args, " ")).To(ContainSubstring("--copy-network"))
++		})
++
++		It("adds --copy-network when a manually-created keyfile has the same timestamp as TUI start", func() {
++			// Filesystems with second-level precision may give the keyfile the same
++			// timestamp as TUI start. We use >= so same-second files are included.
++			writeNMKeyfile("static.nmconnection", `[connection]
++id=static
++type=ethernet
++
++[ipv4]
++method=manual
++address1=192.168.111.20/24,192.168.111.1
++`, tuiStart)
++			args := getInstallForTUI(installCommandRequest).Args()
++			Expect(strings.Join(args, " ")).To(ContainSubstring("--copy-network"))
++		})
++
++		It("does not duplicate --copy-network if already set via the API", func() {
++			writeNMKeyfile("static.nmconnection", `[connection]
++id=static
++type=ethernet
++`, tuiStart.Add(2*time.Minute))
++			installCommandRequest.InstallerArgs = "[\"--copy-network\"]"
++			args := getInstallForTUI(installCommandRequest).Args()
++			argsStr := strings.Join(args, " ")
++			Expect(strings.Count(argsStr, "--copy-network")).To(Equal(1))
++		})
++	})
+ })
+diff --git a/vendor/github.com/djherbis/times/LICENSE b/vendor/github.com/djherbis/times/LICENSE
+new file mode 100644
+index 000000000..1e7b7cc09
+--- /dev/null
++++ b/vendor/github.com/djherbis/times/LICENSE
+@@ -0,0 +1,22 @@
++The MIT License (MIT)
++
++Copyright (c) 2015 Dustin H
++
++Permission is hereby granted, free of charge, to any person obtaining a copy
++of this software and associated documentation files (the "Software"), to deal
++in the Software without restriction, including without limitation the rights
++to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
++copies of the Software, and to permit persons to whom the Software is
++furnished to do so, subject to the following conditions:
++
++The above copyright notice and this permission notice shall be included in all
++copies or substantial portions of the Software.
++
++THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
++IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
++FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
++AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
++LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
++OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
++SOFTWARE.
++
+diff --git a/vendor/github.com/djherbis/times/README.md b/vendor/github.com/djherbis/times/README.md
+new file mode 100644
+index 000000000..7c8889048
+--- /dev/null
++++ b/vendor/github.com/djherbis/times/README.md
+@@ -0,0 +1,67 @@
++times 
++==========
++
++[![GoDoc](https://godoc.org/github.com/djherbis/times?status.svg)](https://godoc.org/github.com/djherbis/times)
++[![Release](https://img.shields.io/github/release/djherbis/times.svg)](https://github.com/djherbis/times/releases/latest)
++[![Software License](https://img.shields.io/badge/license-MIT-brightgreen.svg)](LICENSE.txt)
++[![go test](https://github.com/djherbis/times/actions/workflows/go-test.yml/badge.svg)](https://github.com/djherbis/times/actions/workflows/go-test.yml)
++[![Coverage Status](https://coveralls.io/repos/djherbis/times/badge.svg?branch=master)](https://coveralls.io/r/djherbis/times?branch=master)
++[![Go Report Card](https://goreportcard.com/badge/github.com/djherbis/times)](https://goreportcard.com/report/github.com/djherbis/times)
++[![Sourcegraph](https://sourcegraph.com/github.com/djherbis/times/-/badge.svg)](https://sourcegraph.com/github.com/djherbis/times?badge)
++
++Usage
++------------
++File Times for #golang
++
++Go has a hidden time functions for most platforms, this repo makes them accessible.
++
++```go
++package main
++
++import (
++  "log"
++
++  "github.com/djherbis/times"
++)
++
++func main() {
++  t, err := times.Stat("myfile")
++  if err != nil {
++    log.Fatal(err.Error())
++  }
++
++  log.Println(t.AccessTime())
++  log.Println(t.ModTime())
++
++  if t.HasChangeTime() {
++    log.Println(t.ChangeTime())
++  }
++
++  if t.HasBirthTime() {
++    log.Println(t.BirthTime())
++  }
++}
++```
++
++Supported Times
++------------
++|  | windows | linux | solaris | dragonfly | nacl | freebsd | darwin | netbsd | openbsd | plan9 | js | aix |
++|:-----:|:-------:|:-----:|:-------:|:---------:|:------:|:-------:|:----:|:------:|:-------:|:-----:|:-----:|:-----:|
++| atime | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ |
++| mtime | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ |
++| ctime | ✓* | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ |  | ✓ | ✓ |
++| btime | ✓ | ✓* |  |  |  | ✓ |  ✓| ✓ |  |  |
++
++* Linux btime requires kernel 4.11 and filesystem support, so HasBirthTime = false.
++Use Timespec.HasBirthTime() to check if file has birth time.
++Get(FileInfo) never returns btime.
++* Windows XP does not have ChangeTime so HasChangeTime = false, 
++however Vista onward does have ChangeTime so Timespec.HasChangeTime() will 
++only return false on those platforms when the syscall used to obtain them fails.
++* Also note, Get(FileInfo) will now only return values available in FileInfo.Sys(), this means Stat() is required to get ChangeTime on Windows
++
++Installation
++------------
++```sh
++go get -u github.com/djherbis/times
++```
+diff --git a/vendor/github.com/djherbis/times/ctime_windows.go b/vendor/github.com/djherbis/times/ctime_windows.go
+new file mode 100644
+index 000000000..f2a5c8b7b
+--- /dev/null
++++ b/vendor/github.com/djherbis/times/ctime_windows.go
+@@ -0,0 +1,149 @@
++package times
++
++import (
++	"os"
++	"syscall"
++	"time"
++	"unsafe"
++)
++
++// Stat returns the Timespec for the given filename.
++func Stat(name string) (Timespec, error) {
++	ts, err := platformSpecficStat(name)
++	if err == nil {
++		return ts, err
++	}
++
++	return stat(name, os.Stat)
++}
++
++// Lstat returns the Timespec for the given filename, and does not follow Symlinks.
++func Lstat(name string) (Timespec, error) {
++	ts, err := platformSpecficLstat(name)
++	if err == nil {
++		return ts, err
++	}
++
++	return stat(name, os.Lstat)
++}
++
++type timespecEx struct {
++	atime
++	mtime
++	ctime
++	btime
++}
++
++// StatFile finds a Windows Timespec with ChangeTime.
++func StatFile(file *os.File) (Timespec, error) {
++	return statFile(syscall.Handle(file.Fd()))
++}
++
++func statFile(h syscall.Handle) (Timespec, error) {
++	var fileInfo fileBasicInfo
++	if err := getFileInformationByHandleEx(h, &fileInfo); err != nil {
++		return nil, err
++	}
++
++	var t timespecEx
++	t.atime.v = time.Unix(0, fileInfo.LastAccessTime.Nanoseconds())
++	t.mtime.v = time.Unix(0, fileInfo.LastWriteTime.Nanoseconds())
++	t.ctime.v = time.Unix(0, fileInfo.ChangeTime.Nanoseconds())
++	t.btime.v = time.Unix(0, fileInfo.CreationTime.Nanoseconds())
++	return t, nil
++}
++
++func platformSpecficLstat(name string) (Timespec, error) {
++	if findProcErr != nil {
++		return nil, findProcErr
++	}
++
++	isSym, err := isSymlink(name)
++	if err != nil {
++		return nil, err
++	}
++
++	var attrs = uint32(syscall.FILE_FLAG_BACKUP_SEMANTICS)
++	if isSym {
++		attrs |= syscall.FILE_FLAG_OPEN_REPARSE_POINT
++	}
++
++	return openHandleAndStat(name, attrs)
++}
++
++func isSymlink(name string) (bool, error) {
++	fi, err := os.Lstat(name)
++	if err != nil {
++		return false, err
++	}
++	return fi.Mode()&os.ModeSymlink != 0, nil
++}
++
++func platformSpecficStat(name string) (Timespec, error) {
++	if findProcErr != nil {
++		return nil, findProcErr
++	}
++
++	return openHandleAndStat(name, syscall.FILE_FLAG_BACKUP_SEMANTICS)
++}
++
++func openHandleAndStat(name string, attrs uint32) (Timespec, error) {
++	pathp, e := syscall.UTF16PtrFromString(name)
++	if e != nil {
++		return nil, e
++	}
++	h, e := syscall.CreateFile(pathp,
++		syscall.FILE_WRITE_ATTRIBUTES, syscall.FILE_SHARE_WRITE, nil,
++		syscall.OPEN_EXISTING, attrs, 0)
++	if e != nil {
++		return nil, e
++	}
++	defer syscall.Close(h)
++
++	return statFile(h)
++}
++
++var (
++	findProcErr                      error
++	procGetFileInformationByHandleEx *syscall.Proc
++)
++
++func init() {
++	var modkernel32 *syscall.DLL
++	if modkernel32, findProcErr = syscall.LoadDLL("kernel32.dll"); findProcErr == nil {
++		procGetFileInformationByHandleEx, findProcErr = modkernel32.FindProc("GetFileInformationByHandleEx")
++	}
++}
++
++// fileBasicInfo holds the C++ data for FileTimes.
++//
++// https://msdn.microsoft.com/en-us/library/windows/desktop/aa364217(v=vs.85).aspx
++type fileBasicInfo struct {
++	CreationTime   syscall.Filetime
++	LastAccessTime syscall.Filetime
++	LastWriteTime  syscall.Filetime
++	ChangeTime     syscall.Filetime
++	FileAttributes uint32
++	_              uint32 // padding
++}
++
++type fileInformationClass int
++
++const (
++	fileBasicInfoClass fileInformationClass = iota
++)
++
++func getFileInformationByHandleEx(handle syscall.Handle, data *fileBasicInfo) (err error) {
++	if findProcErr != nil {
++		return findProcErr
++	}
++
++	r1, _, e1 := syscall.Syscall6(procGetFileInformationByHandleEx.Addr(), 4, uintptr(handle), uintptr(fileBasicInfoClass), uintptr(unsafe.Pointer(data)), unsafe.Sizeof(*data), 0, 0)
++	if r1 == 0 {
++		err = syscall.EINVAL
++		if e1 != 0 {
++			err = error(e1)
++		}
++	}
++	return
++}
+diff --git a/vendor/github.com/djherbis/times/js.cover.dockerfile b/vendor/github.com/djherbis/times/js.cover.dockerfile
+new file mode 100644
+index 000000000..f522a5e4f
+--- /dev/null
++++ b/vendor/github.com/djherbis/times/js.cover.dockerfile
+@@ -0,0 +1,9 @@
++FROM golang:1.17
++
++RUN curl -sL https://deb.nodesource.com/setup_17.x | bash
++RUN apt-get install --yes nodejs
++
++WORKDIR /go/src/github.com/djherbis/times
++COPY . .
++
++RUN GO111MODULE=auto GOOS=js GOARCH=wasm go test -covermode=count -coverprofile=profile.cov -exec="$(go env GOROOT)/misc/wasm/go_js_wasm_exec"
+diff --git a/vendor/github.com/djherbis/times/js.cover.sh b/vendor/github.com/djherbis/times/js.cover.sh
+new file mode 100644
+index 000000000..150610462
+--- /dev/null
++++ b/vendor/github.com/djherbis/times/js.cover.sh
+@@ -0,0 +1,7 @@
++#!/bin/bash
++set -e
++
++docker build -f js.cover.dockerfile -t js.cover.djherbis.times .
++docker create --name js.cover.djherbis.times js.cover.djherbis.times
++docker cp js.cover.djherbis.times:/go/src/github.com/djherbis/times/profile.cov .
++docker rm -v js.cover.djherbis.times
+\ No newline at end of file
+diff --git a/vendor/github.com/djherbis/times/linux.cover.dockerfile b/vendor/github.com/djherbis/times/linux.cover.dockerfile
+new file mode 100644
+index 000000000..e1a795927
+--- /dev/null
++++ b/vendor/github.com/djherbis/times/linux.cover.dockerfile
+@@ -0,0 +1,6 @@
++FROM golang:1.17
++
++WORKDIR /go/src/github.com/djherbis/times
++COPY . .
++
++RUN GO111MODULE=auto go test -covermode=count -coverprofile=profile.cov
+diff --git a/vendor/github.com/djherbis/times/linux.cover.sh b/vendor/github.com/djherbis/times/linux.cover.sh
+new file mode 100644
+index 000000000..83f97431b
+--- /dev/null
++++ b/vendor/github.com/djherbis/times/linux.cover.sh
+@@ -0,0 +1,7 @@
++#!/bin/bash
++set -e
++
++docker build -f linux.cover.dockerfile -t linux.cover.djherbis.times .
++docker create --name linux.cover.djherbis.times linux.cover.djherbis.times
++docker cp linux.cover.djherbis.times:/go/src/github.com/djherbis/times/profile.cov .
++docker rm -v linux.cover.djherbis.times
+\ No newline at end of file
+diff --git a/vendor/github.com/djherbis/times/times.go b/vendor/github.com/djherbis/times/times.go
+new file mode 100644
+index 000000000..190269850
+--- /dev/null
++++ b/vendor/github.com/djherbis/times/times.go
+@@ -0,0 +1,74 @@
++// Package times provides a platform-independent way to get atime, mtime, ctime and btime for files.
++package times
++
++import (
++	"os"
++	"time"
++)
++
++// Get returns the Timespec for the given FileInfo
++func Get(fi os.FileInfo) Timespec {
++	return getTimespec(fi)
++}
++
++type statFunc func(string) (os.FileInfo, error)
++
++func stat(name string, sf statFunc) (Timespec, error) {
++	fi, err := sf(name)
++	if err != nil {
++		return nil, err
++	}
++	return getTimespec(fi), nil
++}
++
++// Timespec provides access to file times.
++// ChangeTime() panics unless HasChangeTime() is true and
++// BirthTime() panics unless HasBirthTime() is true.
++type Timespec interface {
++	ModTime() time.Time
++	AccessTime() time.Time
++	ChangeTime() time.Time
++	BirthTime() time.Time
++	HasChangeTime() bool
++	HasBirthTime() bool
++}
++
++type atime struct {
++	v time.Time
++}
++
++func (a atime) AccessTime() time.Time { return a.v }
++
++type ctime struct {
++	v time.Time
++}
++
++func (ctime) HasChangeTime() bool { return true }
++
++func (c ctime) ChangeTime() time.Time { return c.v }
++
++type mtime struct {
++	v time.Time
++}
++
++func (m mtime) ModTime() time.Time { return m.v }
++
++type btime struct {
++	v time.Time
++}
++
++func (btime) HasBirthTime() bool { return true }
++
++func (b btime) BirthTime() time.Time { return b.v }
++
++type noctime struct{}
++
++func (noctime) HasChangeTime() bool { return false }
++
++func (noctime) ChangeTime() time.Time { panic("ctime not available") }
++
++type nobtime struct{}
++
++func (nobtime) HasBirthTime() bool { return false }
++
++func (nobtime) BirthTime() time.Time { panic("birthtime not available") }
+diff --git a/vendor/github.com/djherbis/times/times_aix.go b/vendor/github.com/djherbis/times/times_aix.go
+new file mode 100644
+index 000000000..5cbcbeca1
+--- /dev/null
++++ b/vendor/github.com/djherbis/times/times_aix.go
+@@ -0,0 +1,39 @@
++// Copyright 2009 The Go Authors. All rights reserved.
++// Use of this source code is governed by a BSD-style
++// license that can be found in the LICENSE file.
++
++// https://golang.org/src/os/stat_aix.go
++
++package times
++
++import (
++	"os"
++	"syscall"
++	"time"
++)
++
++// HasChangeTime and HasBirthTime are true if and only if
++// the target OS supports them.
++const (
++	HasChangeTime = true
++	HasBirthTime  = false
++)
++
++type timespec struct {
++	atime
++	mtime
++	ctime
++	nobtime
++}
++
++func timespecToTime(ts syscall.StTimespec_t) time.Time {
++	return time.Unix(int64(ts.Sec), int64(ts.Nsec))
++}
++
++func getTimespec(fi os.FileInfo) (t timespec) {
++	stat := fi.Sys().(*syscall.Stat_t)
++	t.atime.v = timespecToTime(stat.Atim)
++	t.mtime.v = timespecToTime(stat.Mtim)
++	t.ctime.v = timespecToTime(stat.Ctim)
++	return t
++}
+diff --git a/vendor/github.com/djherbis/times/times_darwin.go b/vendor/github.com/djherbis/times/times_darwin.go
+new file mode 100644
+index 000000000..94c5e4ca4
+--- /dev/null
++++ b/vendor/github.com/djherbis/times/times_darwin.go
+@@ -0,0 +1,40 @@
++// Copyright 2009 The Go Authors. All rights reserved.
++// Use of this source code is governed by a BSD-style
++// license that can be found in the LICENSE file.
++
++// http://golang.org/src/os/stat_darwin.go
++
++package times
++
++import (
++	"os"
++	"syscall"
++	"time"
++)
++
++// HasChangeTime and HasBirthTime are true if and only if
++// the target OS supports them.
++const (
++	HasChangeTime = true
++	HasBirthTime  = true
++)
++
++type timespec struct {
++	atime
++	mtime
++	ctime
++	btime
++}
++
++func timespecToTime(ts syscall.Timespec) time.Time {
++	return time.Unix(int64(ts.Sec), int64(ts.Nsec))
++}
++
++func getTimespec(fi os.FileInfo) (t timespec) {
++	stat := fi.Sys().(*syscall.Stat_t)
++	t.atime.v = timespecToTime(stat.Atimespec)
++	t.mtime.v = timespecToTime(stat.Mtimespec)
++	t.ctime.v = timespecToTime(stat.Ctimespec)
++	t.btime.v = timespecToTime(stat.Birthtimespec)
++	return t
++}
+diff --git a/vendor/github.com/djherbis/times/times_dragonfly.go b/vendor/github.com/djherbis/times/times_dragonfly.go
+new file mode 100644
+index 000000000..e11610c72
+--- /dev/null
++++ b/vendor/github.com/djherbis/times/times_dragonfly.go
+@@ -0,0 +1,39 @@
++// Copyright 2009 The Go Authors. All rights reserved.
++// Use of this source code is governed by a BSD-style
++// license that can be found in the LICENSE file.
++
++// http://golang.org/src/os/stat_dragonfly.go
++
++package times
++
++import (
++	"os"
++	"syscall"
++	"time"
++)
++
++// HasChangeTime and HasBirthTime are true if and only if
++// the target OS supports them.
++const (
++	HasChangeTime = true
++	HasBirthTime  = false
++)
++
++type timespec struct {
++	atime
++	mtime
++	ctime
++	nobtime
++}
++
++func timespecToTime(ts syscall.Timespec) time.Time {
++	return time.Unix(int64(ts.Sec), int64(ts.Nsec))
++}
++
++func getTimespec(fi os.FileInfo) (t timespec) {
++	stat := fi.Sys().(*syscall.Stat_t)
++	t.atime.v = timespecToTime(stat.Atim)
++	t.mtime.v = timespecToTime(stat.Mtim)
++	t.ctime.v = timespecToTime(stat.Ctim)
++	return t
++}
+diff --git a/vendor/github.com/djherbis/times/times_freebsd.go b/vendor/github.com/djherbis/times/times_freebsd.go
+new file mode 100644
+index 000000000..59d4335cc
+--- /dev/null
++++ b/vendor/github.com/djherbis/times/times_freebsd.go
+@@ -0,0 +1,40 @@
++// Copyright 2009 The Go Authors. All rights reserved.
++// Use of this source code is governed by a BSD-style
++// license that can be found in the LICENSE file.
++
++// http://golang.org/src/os/stat_freebsd.go
++
++package times
++
++import (
++	"os"
++	"syscall"
++	"time"
++)
++
++// HasChangeTime and HasBirthTime are true if and only if
++// the target OS supports them.
++const (
++	HasChangeTime = true
++	HasBirthTime  = true
++)
++
++type timespec struct {
++	atime
++	mtime
++	ctime
++	btime
++}
++
++func timespecToTime(ts syscall.Timespec) time.Time {
++	return time.Unix(int64(ts.Sec), int64(ts.Nsec))
++}
++
++func getTimespec(fi os.FileInfo) (t timespec) {
++	stat := fi.Sys().(*syscall.Stat_t)
++	t.atime.v = timespecToTime(stat.Atimespec)
++	t.mtime.v = timespecToTime(stat.Mtimespec)
++	t.ctime.v = timespecToTime(stat.Ctimespec)
++	t.btime.v = timespecToTime(stat.Birthtimespec)
++	return t
++}
+diff --git a/vendor/github.com/djherbis/times/times_js.go b/vendor/github.com/djherbis/times/times_js.go
+new file mode 100644
+index 000000000..40fbd6099
+--- /dev/null
++++ b/vendor/github.com/djherbis/times/times_js.go
+@@ -0,0 +1,41 @@
++// Copyright 2009 The Go Authors. All rights reserved.
++// Use of this source code is governed by a BSD-style
++// license that can be found in the LICENSE file.
++
++// https://golang.org/src/os/stat_nacljs.go
++
++// +build js,wasm
++
++package times
++
++import (
++	"os"
++	"syscall"
++	"time"
++)
++
++// HasChangeTime and HasBirthTime are true if and only if
++// the target OS supports them.
++const (
++	HasChangeTime = true
++	HasBirthTime  = false
++)
++
++type timespec struct {
++	atime
++	mtime
++	ctime
++	nobtime
++}
++
++func timespecToTime(sec, nsec int64) time.Time {
++	return time.Unix(sec, nsec)
++}
++
++func getTimespec(fi os.FileInfo) (t timespec) {
++	stat := fi.Sys().(*syscall.Stat_t)
++	t.atime.v = timespecToTime(stat.Atime, stat.AtimeNsec)
++	t.mtime.v = timespecToTime(stat.Mtime, stat.MtimeNsec)
++	t.ctime.v = timespecToTime(stat.Ctime, stat.CtimeNsec)
++	return t
++}
+diff --git a/vendor/github.com/djherbis/times/times_linux.go b/vendor/github.com/djherbis/times/times_linux.go
+new file mode 100644
+index 000000000..85f87dba3
+--- /dev/null
++++ b/vendor/github.com/djherbis/times/times_linux.go
+@@ -0,0 +1,185 @@
++// Copyright 2009 The Go Authors. All rights reserved.
++// Use of this source code is governed by a BSD-style
++// license that can be found in the LICENSE file.
++
++// http://golang.org/src/os/stat_linux.go
++
++package times
++
++import (
++	"errors"
++	"os"
++	"sync/atomic"
++	"syscall"
++	"time"
++
++	"golang.org/x/sys/unix"
++)
++
++// HasChangeTime and HasBirthTime are true if and only if
++// the target OS supports them.
++const (
++	HasChangeTime = true
++	HasBirthTime  = false
++)
++
++type timespec struct {
++	atime
++	mtime
++	ctime
++	nobtime
++}
++
++type timespecBtime struct {
++	atime
++	mtime
++	ctime
++	btime
++}
++
++var (
++	supportsStatx int32 = 1
++	statxFunc           = unix.Statx
++)
++
++func isStatXSupported() bool {
++	return atomic.LoadInt32(&supportsStatx) == 1
++}
++
++func isStatXUnsupported(err error) bool {
++	// linux 4.10 and earlier does not support Statx syscall
++	if err != nil && errors.Is(err, unix.ENOSYS) {
++		atomic.StoreInt32(&supportsStatx, 0)
++		return true
++	}
++	return false
++}
++
++// Stat returns the Timespec for the given filename.
++func Stat(name string) (Timespec, error) {
++	if isStatXSupported() {
++		ts, err := statX(name)
++		if err == nil {
++			return ts, nil
++		}
++		if !isStatXUnsupported(err) {
++			return nil, err
++		}
++		// Fallback.
++	}
++	return stat(name, os.Stat)
++}
++
++func statX(name string) (Timespec, error) {
++	// https://man7.org/linux/man-pages/man2/statx.2.html
++	var statx unix.Statx_t
++	err := statxFunc(unix.AT_FDCWD, name, unix.AT_STATX_SYNC_AS_STAT, unix.STATX_ATIME|unix.STATX_MTIME|unix.STATX_CTIME|unix.STATX_BTIME, &statx)
++	if err != nil {
++		return nil, err
++	}
++	return extractTimes(&statx), nil
++}
++
++// Lstat returns the Timespec for the given filename, and does not follow Symlinks.
++func Lstat(name string) (Timespec, error) {
++	if isStatXSupported() {
++		ts, err := lstatx(name)
++		if err == nil {
++			return ts, nil
++		}
++		if !isStatXUnsupported(err) {
++			return nil, err
++		}
++		// Fallback.
++	}
++	return stat(name, os.Lstat)
++}
++
++func lstatx(name string) (Timespec, error) {
++	// https://man7.org/linux/man-pages/man2/statx.2.html
++	var statX unix.Statx_t
++	err := statxFunc(unix.AT_FDCWD, name, unix.AT_STATX_SYNC_AS_STAT|unix.AT_SYMLINK_NOFOLLOW, unix.STATX_ATIME|unix.STATX_MTIME|unix.STATX_CTIME|unix.STATX_BTIME, &statX)
++	if err != nil {
++		return nil, err
++	}
++	return extractTimes(&statX), nil
++}
++
++func statXFile(file *os.File) (Timespec, error) {
++	sc, err := file.SyscallConn()
++	if err != nil {
++		return nil, err
++	}
++
++	var statx unix.Statx_t
++	var statxErr error
++	err = sc.Control(func(fd uintptr) {
++		// https://man7.org/linux/man-pages/man2/statx.2.html
++		statxErr = statxFunc(int(fd), "", unix.AT_EMPTY_PATH|unix.AT_STATX_SYNC_AS_STAT, unix.STATX_ATIME|unix.STATX_MTIME|unix.STATX_CTIME|unix.STATX_BTIME, &statx)
++	})
++	if err != nil {
++		return nil, err
++	}
++
++	if statxErr != nil {
++		return nil, statxErr
++	}
++
++	return extractTimes(&statx), nil
++}
++
++// StatFile returns the Timespec for the given *os.File.
++func StatFile(file *os.File) (Timespec, error) {
++	if isStatXSupported() {
++		ts, err := statXFile(file)
++		if err == nil {
++			return ts, nil
++		}
++		if !isStatXUnsupported(err) {
++			return nil, err
++		}
++		// Fallback.
++	}
++	return statFile(file)
++}
++
++func statFile(file *os.File) (Timespec, error) {
++	fi, err := file.Stat()
++	if err != nil {
++		return nil, err
++	}
++	return getTimespec(fi), nil
++}
++
++func statxTimestampToTime(ts unix.StatxTimestamp) time.Time {
++	return time.Unix(ts.Sec, int64(ts.Nsec))
++}
++
++func extractTimes(statx *unix.Statx_t) Timespec {
++	if statx.Mask&unix.STATX_BTIME == unix.STATX_BTIME {
++		var t timespecBtime
++		t.atime.v = statxTimestampToTime(statx.Atime)
++		t.mtime.v = statxTimestampToTime(statx.Mtime)
++		t.ctime.v = statxTimestampToTime(statx.Ctime)
++		t.btime.v = statxTimestampToTime(statx.Btime)
++		return t
++	}
++
++	var t timespec
++	t.atime.v = statxTimestampToTime(statx.Atime)
++	t.mtime.v = statxTimestampToTime(statx.Mtime)
++	t.ctime.v = statxTimestampToTime(statx.Ctime)
++	return t
++}
++
++func timespecToTime(ts syscall.Timespec) time.Time {
++	return time.Unix(int64(ts.Sec), int64(ts.Nsec))
++}
++
++func getTimespec(fi os.FileInfo) (t timespec) {
++	stat := fi.Sys().(*syscall.Stat_t)
++	t.atime.v = timespecToTime(stat.Atim)
++	t.mtime.v = timespecToTime(stat.Mtim)
++	t.ctime.v = timespecToTime(stat.Ctim)
++	return t
++}
+diff --git a/vendor/github.com/djherbis/times/times_nacl.go b/vendor/github.com/djherbis/times/times_nacl.go
+new file mode 100644
+index 000000000..7ef3ed50e
+--- /dev/null
++++ b/vendor/github.com/djherbis/times/times_nacl.go
+@@ -0,0 +1,39 @@
++// Copyright 2009 The Go Authors. All rights reserved.
++// Use of this source code is governed by a BSD-style
++// license that can be found in the LICENSE file.
++
++// https://golang.org/src/os/stat_nacljs.go
++
++package times
++
++import (
++	"os"
++	"syscall"
++	"time"
++)
++
++// HasChangeTime and HasBirthTime are true if and only if
++// the target OS supports them.
++const (
++	HasChangeTime = true
++	HasBirthTime  = false
++)
++
++type timespec struct {
++	atime
++	mtime
++	ctime
++	nobtime
++}
++
++func timespecToTime(sec, nsec int64) time.Time {
++	return time.Unix(sec, nsec)
++}
++
++func getTimespec(fi os.FileInfo) (t timespec) {
++	stat := fi.Sys().(*syscall.Stat_t)
++	t.atime.v = timespecToTime(stat.Atime, stat.AtimeNsec)
++	t.mtime.v = timespecToTime(stat.Mtime, stat.MtimeNsec)
++	t.ctime.v = timespecToTime(stat.Ctime, stat.CtimeNsec)
++	return t
++}
+diff --git a/vendor/github.com/djherbis/times/times_netbsd.go b/vendor/github.com/djherbis/times/times_netbsd.go
+new file mode 100644
+index 000000000..fa9149e1b
+--- /dev/null
++++ b/vendor/github.com/djherbis/times/times_netbsd.go
+@@ -0,0 +1,40 @@
++// Copyright 2009 The Go Authors. All rights reserved.
++// Use of this source code is governed by a BSD-style
++// license that can be found in the LICENSE file.
++
++// http://golang.org/src/os/stat_netbsd.go
++
++package times
++
++import (
++	"os"
++	"syscall"
++	"time"
++)
++
++// HasChangeTime and HasBirthTime are true if and only if
++// the target OS supports them.
++const (
++	HasChangeTime = true
++	HasBirthTime  = true
++)
++
++type timespec struct {
++	atime
++	mtime
++	ctime
++	btime
++}
++
++func timespecToTime(ts syscall.Timespec) time.Time {
++	return time.Unix(int64(ts.Sec), int64(ts.Nsec))
++}
++
++func getTimespec(fi os.FileInfo) (t timespec) {
++	stat := fi.Sys().(*syscall.Stat_t)
++	t.atime.v = timespecToTime(stat.Atimespec)
++	t.mtime.v = timespecToTime(stat.Mtimespec)
++	t.ctime.v = timespecToTime(stat.Ctimespec)
++	t.btime.v = timespecToTime(stat.Birthtimespec)
++	return t
++}
+diff --git a/vendor/github.com/djherbis/times/times_openbsd.go b/vendor/github.com/djherbis/times/times_openbsd.go
+new file mode 100644
+index 000000000..03c7a65a2
+--- /dev/null
++++ b/vendor/github.com/djherbis/times/times_openbsd.go
+@@ -0,0 +1,39 @@
++// Copyright 2009 The Go Authors. All rights reserved.
++// Use of this source code is governed by a BSD-style
++// license that can be found in the LICENSE file.
++
++// http://golang.org/src/os/stat_openbsd.go
++
++package times
++
++import (
++	"os"
++	"syscall"
++	"time"
++)
++
++// HasChangeTime and HasBirthTime are true if and only if
++// the target OS supports them.
++const (
++	HasChangeTime = true
++	HasBirthTime  = false
++)
++
++type timespec struct {
++	atime
++	mtime
++	ctime
++	nobtime
++}
++
++func timespecToTime(ts syscall.Timespec) time.Time {
++	return time.Unix(int64(ts.Sec), int64(ts.Nsec))
++}
++
++func getTimespec(fi os.FileInfo) (t timespec) {
++	stat := fi.Sys().(*syscall.Stat_t)
++	t.atime.v = timespecToTime(stat.Atim)
++	t.mtime.v = timespecToTime(stat.Mtim)
++	t.ctime.v = timespecToTime(stat.Ctim)
++	return t
++}
+diff --git a/vendor/github.com/djherbis/times/times_plan9.go b/vendor/github.com/djherbis/times/times_plan9.go
+new file mode 100644
+index 000000000..0b1beebf3
+--- /dev/null
++++ b/vendor/github.com/djherbis/times/times_plan9.go
+@@ -0,0 +1,34 @@
++// Copyright 2009 The Go Authors. All rights reserved.
++// Use of this source code is governed by a BSD-style
++// license that can be found in the LICENSE file.
++
++// http://golang.org/src/os/stat_plan9.go
++
++package times
++
++import (
++	"os"
++	"syscall"
++	"time"
++)
++
++// HasChangeTime and HasBirthTime are true if and only if
++// the target OS supports them.
++const (
++	HasChangeTime = false
++	HasBirthTime  = false
++)
++
++type timespec struct {
++	atime
++	mtime
++	noctime
++	nobtime
++}
++
++func getTimespec(fi os.FileInfo) (t timespec) {
++	stat := fi.Sys().(*syscall.Dir)
++	t.atime.v = time.Unix(int64(stat.Atime), 0)
++	t.mtime.v = time.Unix(int64(stat.Mtime), 0)
++	return t
++}
+diff --git a/vendor/github.com/djherbis/times/times_solaris.go b/vendor/github.com/djherbis/times/times_solaris.go
+new file mode 100644
+index 000000000..b1b15bf9f
+--- /dev/null
++++ b/vendor/github.com/djherbis/times/times_solaris.go
+@@ -0,0 +1,39 @@
++// Copyright 2009 The Go Authors. All rights reserved.
++// Use of this source code is governed by a BSD-style
++// license that can be found in the LICENSE file.
++
++// http://golang.org/src/os/stat_solaris.go
++
++package times
++
++import (
++	"os"
++	"syscall"
++	"time"
++)
++
++// HasChangeTime and HasBirthTime are true if and only if
++// the target OS supports them.
++const (
++	HasChangeTime = true
++	HasBirthTime  = false
++)
++
++type timespec struct {
++	atime
++	mtime
++	ctime
++	nobtime
++}
++
++func timespecToTime(ts syscall.Timespec) time.Time {
++	return time.Unix(int64(ts.Sec), int64(ts.Nsec))
++}
++
++func getTimespec(fi os.FileInfo) (t timespec) {
++	stat := fi.Sys().(*syscall.Stat_t)
++	t.atime.v = timespecToTime(stat.Atim)
++	t.mtime.v = timespecToTime(stat.Mtim)
++	t.ctime.v = timespecToTime(stat.Ctim)
++	return t
++}
+diff --git a/vendor/github.com/djherbis/times/times_wasip1.go b/vendor/github.com/djherbis/times/times_wasip1.go
+new file mode 100644
+index 000000000..5463a8f3c
+--- /dev/null
++++ b/vendor/github.com/djherbis/times/times_wasip1.go
+@@ -0,0 +1,42 @@
++// Copyright 2009 The Go Authors. All rights reserved.
++// Use of this source code is governed by a BSD-style
++// license that can be found in the LICENSE file.
++
++// https://github.com/golang/go/blob/master/src/os/stat_wasip1.go
++
++//go:build wasip1
++// +build wasip1
++
++package times
++
++import (
++	"os"
++	"syscall"
++	"time"
++)
++
++// HasChangeTime and HasBirthTime are true if and only if
++// the target OS supports them.
++const (
++	HasChangeTime = true
++	HasBirthTime  = false
++)
++
++type timespec struct {
++	atime
++	mtime
++	ctime
++	nobtime
++}
++
++func timespecToTime(sec, nsec int64) time.Time {
++	return time.Unix(sec, nsec)
++}
++
++func getTimespec(fi os.FileInfo) (t timespec) {
++	stat := fi.Sys().(*syscall.Stat_t)
++	t.atime.v = timespecToTime(int64(stat.Atime), 0)
++	t.mtime.v = timespecToTime(int64(stat.Mtime), 0)
++	t.ctime.v = timespecToTime(int64(stat.Ctime), 0)
++	return t
++}
+diff --git a/vendor/github.com/djherbis/times/times_windows.go b/vendor/github.com/djherbis/times/times_windows.go
+new file mode 100644
+index 000000000..36828f286
+--- /dev/null
++++ b/vendor/github.com/djherbis/times/times_windows.go
+@@ -0,0 +1,36 @@
++// Copyright 2009 The Go Authors. All rights reserved.
++// Use of this source code is governed by a BSD-style
++// license that can be found in the LICENSE file.
++
++// http://golang.org/src/os/stat_windows.go
++
++package times
++
++import (
++	"os"
++	"syscall"
++	"time"
++)
++
++// HasChangeTime and HasBirthTime are true if and only if
++// the target OS supports them.
++const (
++	HasChangeTime = false
++	HasBirthTime  = true
++)
++
++type timespec struct {
++	atime
++	mtime
++	noctime
++	btime
++}
++
++func getTimespec(fi os.FileInfo) Timespec {
++	var t timespec
++	stat := fi.Sys().(*syscall.Win32FileAttributeData)
++	t.atime.v = time.Unix(0, stat.LastAccessTime.Nanoseconds())
++	t.mtime.v = time.Unix(0, stat.LastWriteTime.Nanoseconds())
++	t.btime.v = time.Unix(0, stat.CreationTime.Nanoseconds())
++	return t
++}
+diff --git a/vendor/github.com/djherbis/times/use_generic_stat.go b/vendor/github.com/djherbis/times/use_generic_stat.go
+new file mode 100644
+index 000000000..0040aa9dc
+--- /dev/null
++++ b/vendor/github.com/djherbis/times/use_generic_stat.go
+@@ -0,0 +1,24 @@
++// +build !windows,!linux
++
++package times
++
++import "os"
++
++// Stat returns the Timespec for the given filename.
++func Stat(name string) (Timespec, error) {
++	return stat(name, os.Stat)
++}
++
++// Lstat returns the Timespec for the given filename, and does not follow Symlinks.
++func Lstat(name string) (Timespec, error) {
++	return stat(name, os.Lstat)
++}
++
++// StatFile returns the Timespec for the given *os.File.
++func StatFile(file *os.File) (Timespec, error) {
++	fi, err := file.Stat()
++	if err != nil {
++		return nil, err
++	}
++	return getTimespec(fi), nil
++}
+diff --git a/vendor/modules.txt b/vendor/modules.txt
+index 2fce4f5c2..a190d9ed4 100644
+--- a/vendor/modules.txt
++++ b/vendor/modules.txt
+@@ -98,6 +98,9 @@ github.com/davecgh/go-spew/spew
+ # github.com/distribution/reference v0.6.0
+ ## explicit; go 1.20
+ github.com/distribution/reference
++# github.com/djherbis/times v1.6.0
++## explicit; go 1.16
++github.com/djherbis/times
+ # github.com/docker/distribution v2.8.2-beta.1+incompatible
+ ## explicit
+ github.com/docker/distribution/digestset

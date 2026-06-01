@@ -1,0 +1,464 @@
+diff --git a/data/data/install.openshift.io_installconfigs.yaml b/data/data/install.openshift.io_installconfigs.yaml
+index b287fd6f861..dfc7b3bd424 100644
+--- a/data/data/install.openshift.io_installconfigs.yaml
++++ b/data/data/install.openshift.io_installconfigs.yaml
+@@ -478,11 +478,11 @@ spec:
+                                 description: |-
+                                   SubscriptionID defines the Azure subscription the disk encryption
+                                   set is in.
++                                  Must be the same subscription ID as the resource group of the installer.
+                                 type: string
+                             required:
+                             - name
+                             - resourceGroup
+-                            - subscriptionId
+                             type: object
+                           diskSizeGB:
+                             description: DiskSizeGB defines the size of disk in GB.
+@@ -522,11 +522,11 @@ spec:
+                                     description: |-
+                                       SubscriptionID defines the Azure subscription the disk encryption
+                                       set is in.
++                                      Must be the same subscription ID as the resource group of the installer.
+                                     type: string
+                                 required:
+                                 - name
+                                 - resourceGroup
+-                                - subscriptionId
+                                 type: object
+                               securityEncryptionType:
+                                 description: |-
+@@ -2039,11 +2039,11 @@ spec:
+                                   description: |-
+                                     SubscriptionID defines the Azure subscription the disk encryption
+                                     set is in.
++                                    Must be the same subscription ID as the resource group of the installer.
+                                   type: string
+                               required:
+                               - name
+                               - resourceGroup
+-                              - subscriptionId
+                               type: object
+                             diskSizeGB:
+                               description: DiskSizeGB defines the size of disk in
+@@ -2084,11 +2084,11 @@ spec:
+                                       description: |-
+                                         SubscriptionID defines the Azure subscription the disk encryption
+                                         set is in.
++                                        Must be the same subscription ID as the resource group of the installer.
+                                       type: string
+                                   required:
+                                   - name
+                                   - resourceGroup
+-                                  - subscriptionId
+                                   type: object
+                                 securityEncryptionType:
+                                   description: |-
+@@ -3538,11 +3538,11 @@ spec:
+                                 description: |-
+                                   SubscriptionID defines the Azure subscription the disk encryption
+                                   set is in.
++                                  Must be the same subscription ID as the resource group of the installer.
+                                 type: string
+                             required:
+                             - name
+                             - resourceGroup
+-                            - subscriptionId
+                             type: object
+                           diskSizeGB:
+                             description: DiskSizeGB defines the size of disk in GB.
+@@ -3582,11 +3582,11 @@ spec:
+                                     description: |-
+                                       SubscriptionID defines the Azure subscription the disk encryption
+                                       set is in.
++                                      Must be the same subscription ID as the resource group of the installer.
+                                     type: string
+                                 required:
+                                 - name
+                                 - resourceGroup
+-                                - subscriptionId
+                                 type: object
+                               securityEncryptionType:
+                                 description: |-
+@@ -5505,11 +5505,11 @@ spec:
+                                 description: |-
+                                   SubscriptionID defines the Azure subscription the disk encryption
+                                   set is in.
++                                  Must be the same subscription ID as the resource group of the installer.
+                                 type: string
+                             required:
+                             - name
+                             - resourceGroup
+-                            - subscriptionId
+                             type: object
+                           diskSizeGB:
+                             description: DiskSizeGB defines the size of disk in GB.
+@@ -5549,11 +5549,11 @@ spec:
+                                     description: |-
+                                       SubscriptionID defines the Azure subscription the disk encryption
+                                       set is in.
++                                      Must be the same subscription ID as the resource group of the installer.
+                                     type: string
+                                 required:
+                                 - name
+                                 - resourceGroup
+-                                - subscriptionId
+                                 type: object
+                               securityEncryptionType:
+                                 description: |-
+diff --git a/pkg/asset/installconfig/azure/client.go b/pkg/asset/installconfig/azure/client.go
+index a8c2d2b0904..152bc9555bd 100644
+--- a/pkg/asset/installconfig/azure/client.go
++++ b/pkg/asset/installconfig/azure/client.go
+@@ -318,6 +318,9 @@ func (c *Client) GetVirtualMachineSku(ctx context.Context, name, region string)
+ 
+ // GetDiskEncryptionSet retrieves the specified disk encryption set.
+ func (c *Client) GetDiskEncryptionSet(ctx context.Context, subscriptionID, groupName, diskEncryptionSetName string) (*azenc.DiskEncryptionSet, error) {
++	if !strings.EqualFold(c.ssn.Credentials.SubscriptionID, subscriptionID) {
++		return nil, fmt.Errorf("different subscription from resource group subscription. Azure does not support cross subscription encryption sets")
++	}
+ 	client := azenc.NewDiskEncryptionSetsClientWithBaseURI(c.ssn.Environment.ResourceManagerEndpoint, subscriptionID)
+ 	client.Authorizer = c.ssn.Authorizer
+ 	ctx, cancel := context.WithTimeout(ctx, 30*time.Second)
+@@ -327,7 +330,6 @@ func (c *Client) GetDiskEncryptionSet(ctx context.Context, subscriptionID, group
+ 	if err != nil {
+ 		return nil, fmt.Errorf("failed to get disk encryption set: %w", err)
+ 	}
+-
+ 	return &diskEncryptionSet, nil
+ }
+ 
+diff --git a/pkg/asset/installconfig/azure/validation.go b/pkg/asset/installconfig/azure/validation.go
+index a07ae672ff5..32403971ff1 100644
+--- a/pkg/asset/installconfig/azure/validation.go
++++ b/pkg/asset/installconfig/azure/validation.go
+@@ -79,19 +79,27 @@ func Validate(client API, meta *Metadata, ic *types.InstallConfig) error {
+ func ValidateDiskEncryptionSet(client API, ic *types.InstallConfig) field.ErrorList {
+ 	allErrs := field.ErrorList{}
+ 
++	clusterRegion := ic.Platform.Azure.Region
++
+ 	if ic.Platform.Azure.DefaultMachinePlatform != nil && ic.Platform.Azure.DefaultMachinePlatform.OSDisk.DiskEncryptionSet != nil {
+ 		diskEncryptionSet := ic.Platform.Azure.DefaultMachinePlatform.OSDisk.DiskEncryptionSet
+-		_, err := client.GetDiskEncryptionSet(context.TODO(), diskEncryptionSet.SubscriptionID, diskEncryptionSet.ResourceGroup, diskEncryptionSet.Name)
++		desFieldPath := field.NewPath("platform").Child("azure", "defaultMachinePlatform", "osDisk", "diskEncryptionSet")
++		des, err := client.GetDiskEncryptionSet(context.TODO(), diskEncryptionSet.SubscriptionID, diskEncryptionSet.ResourceGroup, diskEncryptionSet.Name)
+ 		if err != nil {
+-			allErrs = append(allErrs, field.Invalid(field.NewPath("platform").Child("azure", "defaultMachinePlatform", "osDisk", "diskEncryptionSet"), diskEncryptionSet, err.Error()))
++			allErrs = append(allErrs, field.Invalid(desFieldPath, diskEncryptionSet, err.Error()))
++		} else if des != nil && des.Location != nil && !strings.EqualFold(*des.Location, clusterRegion) {
++			allErrs = append(allErrs, field.Invalid(desFieldPath, diskEncryptionSet, fmt.Sprintf("disk encryption set is in %s, but the cluster region is %s", *des.Location, clusterRegion)))
+ 		}
+ 	}
+ 
+ 	if ic.ControlPlane != nil && ic.ControlPlane.Platform.Azure != nil && ic.ControlPlane.Platform.Azure.OSDisk.DiskEncryptionSet != nil {
+ 		diskEncryptionSet := ic.ControlPlane.Platform.Azure.OSDisk.DiskEncryptionSet
+-		_, err := client.GetDiskEncryptionSet(context.TODO(), diskEncryptionSet.SubscriptionID, diskEncryptionSet.ResourceGroup, diskEncryptionSet.Name)
++		desFieldPath := field.NewPath("platform").Child("azure", "osDisk", "diskEncryptionSet")
++		des, err := client.GetDiskEncryptionSet(context.TODO(), diskEncryptionSet.SubscriptionID, diskEncryptionSet.ResourceGroup, diskEncryptionSet.Name)
+ 		if err != nil {
+-			allErrs = append(allErrs, field.Invalid(field.NewPath("platform").Child("azure", "osDisk", "diskEncryptionSet"), diskEncryptionSet, err.Error()))
++			allErrs = append(allErrs, field.Invalid(desFieldPath, diskEncryptionSet, err.Error()))
++		} else if des != nil && des.Location != nil && !strings.EqualFold(*des.Location, clusterRegion) {
++			allErrs = append(allErrs, field.Invalid(desFieldPath, diskEncryptionSet, fmt.Sprintf("disk encryption set is in %s, but the cluster region is %s", *des.Location, clusterRegion)))
+ 		}
+ 	}
+ 
+@@ -99,9 +107,12 @@ func ValidateDiskEncryptionSet(client API, ic *types.InstallConfig) field.ErrorL
+ 		fieldPath := field.NewPath("compute").Index(idx)
+ 		if compute.Platform.Azure != nil && compute.Platform.Azure.OSDisk.DiskEncryptionSet != nil {
+ 			diskEncryptionSet := compute.Platform.Azure.OSDisk.DiskEncryptionSet
+-			_, err := client.GetDiskEncryptionSet(context.TODO(), diskEncryptionSet.SubscriptionID, diskEncryptionSet.ResourceGroup, diskEncryptionSet.Name)
++			desFieldPath := fieldPath.Child("platform", "azure", "osDisk", "diskEncryptionSet")
++			des, err := client.GetDiskEncryptionSet(context.TODO(), diskEncryptionSet.SubscriptionID, diskEncryptionSet.ResourceGroup, diskEncryptionSet.Name)
+ 			if err != nil {
+-				allErrs = append(allErrs, field.Invalid(fieldPath.Child("platform", "azure", "osDisk", "diskEncryptionSet"), diskEncryptionSet, err.Error()))
++				allErrs = append(allErrs, field.Invalid(desFieldPath, diskEncryptionSet, err.Error()))
++			} else if des != nil && des.Location != nil && !strings.EqualFold(*des.Location, clusterRegion) {
++				allErrs = append(allErrs, field.Invalid(desFieldPath, diskEncryptionSet, fmt.Sprintf("disk encryption set is in %s, but the cluster region is %s", *des.Location, clusterRegion)))
+ 			}
+ 		}
+ 	}
+@@ -109,26 +120,30 @@ func ValidateDiskEncryptionSet(client API, ic *types.InstallConfig) field.ErrorL
+ 	return allErrs
+ }
+ 
+-func validateConfidentialDiskEncryptionSet(client API, diskEncryptionSet *aztypes.DiskEncryptionSet, desFieldPath *field.Path) error {
++func validateConfidentialDiskEncryptionSet(client API, diskEncryptionSet *aztypes.DiskEncryptionSet, desFieldPath *field.Path, clusterRegion string) error {
+ 	resp, requestErr := client.GetDiskEncryptionSet(context.TODO(), diskEncryptionSet.SubscriptionID, diskEncryptionSet.ResourceGroup, diskEncryptionSet.Name)
+ 	if requestErr != nil {
+ 		return requestErr
+ 	} else if resp == nil || resp.EncryptionSetProperties == nil || resp.EncryptionSetProperties.EncryptionType != azenc.ConfidentialVMEncryptedWithCustomerKey {
+ 		return fmt.Errorf("the disk encryption set should be created with type %s", azenc.ConfidentialVMEncryptedWithCustomerKey)
+ 	}
++	if resp.Location != nil && !strings.EqualFold(*resp.Location, clusterRegion) {
++		return fmt.Errorf("disk encryption set is in %s, but the cluster region is %s", *resp.Location, clusterRegion)
++	}
+ 	return nil
+ }
+ 
+ // ValidateSecurityProfileDiskEncryptionSet ensures the security profile disk encryption set exists and is valid.
+ func ValidateSecurityProfileDiskEncryptionSet(client API, ic *types.InstallConfig) field.ErrorList {
+ 	allErrs := field.ErrorList{}
++	clusterRegion := ic.Platform.Azure.Region
+ 
+ 	if ic.Platform.Azure.DefaultMachinePlatform != nil &&
+ 		ic.Platform.Azure.DefaultMachinePlatform.OSDisk.SecurityProfile != nil &&
+ 		ic.Platform.Azure.DefaultMachinePlatform.OSDisk.SecurityProfile.DiskEncryptionSet != nil {
+ 		desFieldPath := field.NewPath("platform").Child("azure", "defaultMachinePlatform", "osDisk", "securityProfile", "diskEncryptionSet")
+ 		diskEncryptionSet := ic.Platform.Azure.DefaultMachinePlatform.OSDisk.SecurityProfile.DiskEncryptionSet
+-		err := validateConfidentialDiskEncryptionSet(client, diskEncryptionSet, desFieldPath)
++		err := validateConfidentialDiskEncryptionSet(client, diskEncryptionSet, desFieldPath, clusterRegion)
+ 		if err != nil {
+ 			allErrs = append(allErrs, field.Invalid(desFieldPath, diskEncryptionSet, err.Error()))
+ 		}
+@@ -140,7 +155,7 @@ func ValidateSecurityProfileDiskEncryptionSet(client API, ic *types.InstallConfi
+ 		ic.ControlPlane.Platform.Azure.OSDisk.SecurityProfile.DiskEncryptionSet != nil {
+ 		desFieldPath := field.NewPath("platform").Child("azure", "osDisk", "securityProfile", "diskEncryptionSet")
+ 		diskEncryptionSet := ic.ControlPlane.Platform.Azure.OSDisk.SecurityProfile.DiskEncryptionSet
+-		err := validateConfidentialDiskEncryptionSet(client, diskEncryptionSet, desFieldPath)
++		err := validateConfidentialDiskEncryptionSet(client, diskEncryptionSet, desFieldPath, clusterRegion)
+ 		if err != nil {
+ 			allErrs = append(allErrs, field.Invalid(desFieldPath, diskEncryptionSet, err.Error()))
+ 		}
+@@ -153,7 +168,7 @@ func ValidateSecurityProfileDiskEncryptionSet(client API, ic *types.InstallConfi
+ 			compute.Platform.Azure.OSDisk.SecurityProfile.DiskEncryptionSet != nil {
+ 			desFieldPath := fieldPath.Child("platform", "azure", "osDisk", "securityProfile", "diskEncryptionSet")
+ 			diskEncryptionSet := compute.Platform.Azure.OSDisk.SecurityProfile.DiskEncryptionSet
+-			err := validateConfidentialDiskEncryptionSet(client, diskEncryptionSet, desFieldPath)
++			err := validateConfidentialDiskEncryptionSet(client, diskEncryptionSet, desFieldPath, clusterRegion)
+ 			if err != nil {
+ 				allErrs = append(allErrs, field.Invalid(desFieldPath, diskEncryptionSet, err.Error()))
+ 			}
+diff --git a/pkg/asset/installconfig/azure/validation_test.go b/pkg/asset/installconfig/azure/validation_test.go
+index 7f32a207235..a85bf895e63 100644
+--- a/pkg/asset/installconfig/azure/validation_test.go
++++ b/pkg/asset/installconfig/azure/validation_test.go
+@@ -262,13 +262,20 @@ var (
+ 	diskEncryptionSetID          = "test-encryption-set-id"
+ 	diskEncryptionSetName        = "test-encryption-set-name"
+ 	diskEncryptionSetType        = "test-encryption-set-type"
+-	diskEncryptionSetLocation    = "disk-encryption-set-location"
++	diskEncryptionSetLocation    = validRegion
++	wrongDiskEncryptionSetRegion = "westus"
+ 	validDiskEncryptionSetResult = &azenc.DiskEncryptionSet{
+ 		ID:       to.StringPtr(diskEncryptionSetID),
+ 		Name:     to.StringPtr(diskEncryptionSetName),
+ 		Type:     to.StringPtr(diskEncryptionSetType),
+ 		Location: to.StringPtr(diskEncryptionSetLocation),
+ 	}
++	wrongRegionDiskEncryptionSetResult = &azenc.DiskEncryptionSet{
++		ID:       to.StringPtr(diskEncryptionSetID),
++		Name:     to.StringPtr(diskEncryptionSetName),
++		Type:     to.StringPtr(diskEncryptionSetType),
++		Location: to.StringPtr(wrongDiskEncryptionSetRegion),
++	}
+ 	validConfidentialVMDiskEncryptionSetResult = &azenc.DiskEncryptionSet{
+ 		ID:                      to.StringPtr(diskEncryptionSetID),
+ 		Name:                    to.StringPtr(diskEncryptionSetName),
+@@ -276,6 +283,13 @@ var (
+ 		Location:                to.StringPtr(diskEncryptionSetLocation),
+ 		EncryptionSetProperties: &azenc.EncryptionSetProperties{EncryptionType: azenc.ConfidentialVMEncryptedWithCustomerKey},
+ 	}
++	wrongRegionConfidentialVMDiskEncryptionSetResult = &azenc.DiskEncryptionSet{
++		ID:                      to.StringPtr(diskEncryptionSetID),
++		Name:                    to.StringPtr(diskEncryptionSetName),
++		Type:                    to.StringPtr(diskEncryptionSetType),
++		Location:                to.StringPtr(wrongDiskEncryptionSetRegion),
++		EncryptionSetProperties: &azenc.EncryptionSetProperties{EncryptionType: azenc.ConfidentialVMEncryptedWithCustomerKey},
++	}
+ 
+ 	validDiskEncryptionSetSubscriptionID = "test-encryption-set-subscription-id"
+ 	validDiskEncryptionSetResourceGroup  = "test-encryption-set-resource-group"
+@@ -303,6 +317,22 @@ var (
+ 			Name:           invalidDiskEncryptionSetName,
+ 		}
+ 	}
++	wrongRegionDiskEncryptionSetName   = "test-encryption-set-wrong-region"
++	wrongRegionDiskEncryptionSetConfig = func() *azure.DiskEncryptionSet {
++		return &azure.DiskEncryptionSet{
++			SubscriptionID: validDiskEncryptionSetSubscriptionID,
++			ResourceGroup:  validDiskEncryptionSetResourceGroup,
++			Name:           wrongRegionDiskEncryptionSetName,
++		}
++	}
++	wrongRegionConfidentialVMDiskEncryptionSetName   = "test-confidential-vm-encryption-set-wrong-region"
++	wrongRegionConfidentialVMDiskEncryptionSetConfig = func() *azure.DiskEncryptionSet {
++		return &azure.DiskEncryptionSet{
++			SubscriptionID: validDiskEncryptionSetSubscriptionID,
++			ResourceGroup:  validDiskEncryptionSetResourceGroup,
++			Name:           wrongRegionConfidentialVMDiskEncryptionSetName,
++		}
++	}
+ 
+ 	validOSImagePublisher            = "test-publisher"
+ 	validOSImageOffer                = "test-offer"
+@@ -338,6 +368,15 @@ var (
+ 	invalidDiskEncryptionSetCompute = func(ic *types.InstallConfig) {
+ 		ic.Compute[0].Platform.Azure.OSDisk.DiskEncryptionSet = invalidDiskEncryptionSetConfig()
+ 	}
++	wrongRegionDiskEncryptionSetDefaultMachinePlatform = func(ic *types.InstallConfig) {
++		ic.Azure.DefaultMachinePlatform.OSDisk.DiskEncryptionSet = wrongRegionDiskEncryptionSetConfig()
++	}
++	wrongRegionDiskEncryptionSetControlPlane = func(ic *types.InstallConfig) {
++		ic.ControlPlane.Platform.Azure.OSDisk.DiskEncryptionSet = wrongRegionDiskEncryptionSetConfig()
++	}
++	wrongRegionDiskEncryptionSetCompute = func(ic *types.InstallConfig) {
++		ic.Compute[0].Platform.Azure.OSDisk.DiskEncryptionSet = wrongRegionDiskEncryptionSetConfig()
++	}
+ 
+ 	validConfidentialVMDiskEncryptionSetDefaultMachinePlatform = func(ic *types.InstallConfig) {
+ 		ic.Azure.DefaultMachinePlatform.OSDisk.SecurityProfile = &azure.VMDiskSecurityProfile{DiskEncryptionSet: validConfidentialVMDiskEncryptionSetConfig()}
+@@ -366,6 +405,15 @@ var (
+ 	invalidTypeConfidentialVMDiskEncryptionSetCompute = func(ic *types.InstallConfig) {
+ 		ic.Compute[0].Platform.Azure.OSDisk.SecurityProfile = &azure.VMDiskSecurityProfile{DiskEncryptionSet: validDiskEncryptionSetConfig()}
+ 	}
++	wrongRegionConfidentialVMDiskEncryptionSetDefaultMachinePlatform = func(ic *types.InstallConfig) {
++		ic.Azure.DefaultMachinePlatform.OSDisk.SecurityProfile = &azure.VMDiskSecurityProfile{DiskEncryptionSet: wrongRegionConfidentialVMDiskEncryptionSetConfig()}
++	}
++	wrongRegionConfidentialVMDiskEncryptionSetControlPlane = func(ic *types.InstallConfig) {
++		ic.ControlPlane.Platform.Azure.OSDisk.SecurityProfile = &azure.VMDiskSecurityProfile{DiskEncryptionSet: wrongRegionConfidentialVMDiskEncryptionSetConfig()}
++	}
++	wrongRegionConfidentialVMDiskEncryptionSetCompute = func(ic *types.InstallConfig) {
++		ic.Compute[0].Platform.Azure.OSDisk.SecurityProfile = &azure.VMDiskSecurityProfile{DiskEncryptionSet: wrongRegionConfidentialVMDiskEncryptionSetConfig()}
++	}
+ 
+ 	validUserAssignedIdentityName          = "valid-identity"
+ 	validUserAssignedIdentityResourceGroup = "valid-identity-rg"
+@@ -909,6 +957,21 @@ func TestAzureDiskEncryptionSet(t *testing.T) {
+ 			edits:    editFunctions{invalidDiskEncryptionSetCompute},
+ 			errorMsg: fmt.Sprintf(`^compute\[0\].platform.azure.osDisk.diskEncryptionSet: Invalid value: {"subscriptionId":"%s","resourceGroup":"%s","name":"%s"}: failed to get disk encryption set$`, validDiskEncryptionSetSubscriptionID, validDiskEncryptionSetResourceGroup, invalidDiskEncryptionSetName),
+ 		},
++		{
++			name:     "Wrong region disk encryption set for default pool",
++			edits:    editFunctions{wrongRegionDiskEncryptionSetDefaultMachinePlatform},
++			errorMsg: fmt.Sprintf(`^platform.azure.defaultMachinePlatform.osDisk.diskEncryptionSet: Invalid value: {"subscriptionId":"%s","resourceGroup":"%s","name":"%s"}: disk encryption set is in %s, but the cluster region is %s$`, validDiskEncryptionSetSubscriptionID, validDiskEncryptionSetResourceGroup, wrongRegionDiskEncryptionSetName, wrongDiskEncryptionSetRegion, validRegion),
++		},
++		{
++			name:     "Wrong region disk encryption set for control-plane",
++			edits:    editFunctions{wrongRegionDiskEncryptionSetControlPlane},
++			errorMsg: fmt.Sprintf(`^platform.azure.osDisk.diskEncryptionSet: Invalid value: {"subscriptionId":"%s","resourceGroup":"%s","name":"%s"}: disk encryption set is in %s, but the cluster region is %s$`, validDiskEncryptionSetSubscriptionID, validDiskEncryptionSetResourceGroup, wrongRegionDiskEncryptionSetName, wrongDiskEncryptionSetRegion, validRegion),
++		},
++		{
++			name:     "Wrong region disk encryption set for compute",
++			edits:    editFunctions{wrongRegionDiskEncryptionSetCompute},
++			errorMsg: fmt.Sprintf(`^compute\[0\].platform.azure.osDisk.diskEncryptionSet: Invalid value: {"subscriptionId":"%s","resourceGroup":"%s","name":"%s"}: disk encryption set is in %s, but the cluster region is %s$`, validDiskEncryptionSetSubscriptionID, validDiskEncryptionSetResourceGroup, wrongRegionDiskEncryptionSetName, wrongDiskEncryptionSetRegion, validRegion),
++		},
+ 	}
+ 
+ 	mockCtrl := gomock.NewController(t)
+@@ -919,6 +982,7 @@ func TestAzureDiskEncryptionSet(t *testing.T) {
+ 	// DiskEncryptionSet
+ 	azureClient.EXPECT().GetDiskEncryptionSet(gomock.Any(), validDiskEncryptionSetSubscriptionID, validDiskEncryptionSetResourceGroup, validDiskEncryptionSetName).Return(validDiskEncryptionSetResult, nil).AnyTimes()
+ 	azureClient.EXPECT().GetDiskEncryptionSet(gomock.Any(), validDiskEncryptionSetSubscriptionID, validDiskEncryptionSetResourceGroup, invalidDiskEncryptionSetName).Return(nil, fmt.Errorf("failed to get disk encryption set")).AnyTimes()
++	azureClient.EXPECT().GetDiskEncryptionSet(gomock.Any(), validDiskEncryptionSetSubscriptionID, validDiskEncryptionSetResourceGroup, wrongRegionDiskEncryptionSetName).Return(wrongRegionDiskEncryptionSetResult, nil).AnyTimes()
+ 
+ 	for _, tc := range cases {
+ 		t.Run(tc.name, func(t *testing.T) {
+@@ -989,6 +1053,21 @@ func TestAzureSecurityProfileDiskEncryptionSet(t *testing.T) {
+ 			edits:    editFunctions{invalidTypeConfidentialVMDiskEncryptionSetCompute},
+ 			errorMsg: fmt.Sprintf(`^compute\[0\].platform.azure.osDisk.securityProfile.diskEncryptionSet: Invalid value: {"subscriptionId":"%s","resourceGroup":"%s","name":"%s"}: the disk encryption set should be created with type %s$`, validDiskEncryptionSetSubscriptionID, validDiskEncryptionSetResourceGroup, validDiskEncryptionSetName, azenc.ConfidentialVMEncryptedWithCustomerKey),
+ 		},
++		{
++			name:     "Wrong region security profile disk encryption set for default pool",
++			edits:    editFunctions{wrongRegionConfidentialVMDiskEncryptionSetDefaultMachinePlatform},
++			errorMsg: fmt.Sprintf(`^platform.azure.defaultMachinePlatform.osDisk.securityProfile.diskEncryptionSet: Invalid value: {"subscriptionId":"%s","resourceGroup":"%s","name":"%s"}: disk encryption set is in %s, but the cluster region is %s$`, validDiskEncryptionSetSubscriptionID, validDiskEncryptionSetResourceGroup, wrongRegionConfidentialVMDiskEncryptionSetName, wrongDiskEncryptionSetRegion, validRegion),
++		},
++		{
++			name:     "Wrong region security profile disk encryption set for control-plane",
++			edits:    editFunctions{wrongRegionConfidentialVMDiskEncryptionSetControlPlane},
++			errorMsg: fmt.Sprintf(`^platform.azure.osDisk.securityProfile.diskEncryptionSet: Invalid value: {"subscriptionId":"%s","resourceGroup":"%s","name":"%s"}: disk encryption set is in %s, but the cluster region is %s$`, validDiskEncryptionSetSubscriptionID, validDiskEncryptionSetResourceGroup, wrongRegionConfidentialVMDiskEncryptionSetName, wrongDiskEncryptionSetRegion, validRegion),
++		},
++		{
++			name:     "Wrong region security profile disk encryption set for compute",
++			edits:    editFunctions{wrongRegionConfidentialVMDiskEncryptionSetCompute},
++			errorMsg: fmt.Sprintf(`^compute\[0\].platform.azure.osDisk.securityProfile.diskEncryptionSet: Invalid value: {"subscriptionId":"%s","resourceGroup":"%s","name":"%s"}: disk encryption set is in %s, but the cluster region is %s$`, validDiskEncryptionSetSubscriptionID, validDiskEncryptionSetResourceGroup, wrongRegionConfidentialVMDiskEncryptionSetName, wrongDiskEncryptionSetRegion, validRegion),
++		},
+ 	}
+ 
+ 	mockCtrl := gomock.NewController(t)
+@@ -999,6 +1078,7 @@ func TestAzureSecurityProfileDiskEncryptionSet(t *testing.T) {
+ 	azureClient.EXPECT().GetDiskEncryptionSet(gomock.Any(), validDiskEncryptionSetSubscriptionID, validDiskEncryptionSetResourceGroup, validConfidentialVMDiskEncryptionSetName).Return(validConfidentialVMDiskEncryptionSetResult, nil).AnyTimes()
+ 	azureClient.EXPECT().GetDiskEncryptionSet(gomock.Any(), validDiskEncryptionSetSubscriptionID, validDiskEncryptionSetResourceGroup, validDiskEncryptionSetName).Return(validDiskEncryptionSetResult, nil).AnyTimes()
+ 	azureClient.EXPECT().GetDiskEncryptionSet(gomock.Any(), validDiskEncryptionSetSubscriptionID, validDiskEncryptionSetResourceGroup, invalidDiskEncryptionSetName).Return(nil, fmt.Errorf("failed to get disk encryption set")).AnyTimes()
++	azureClient.EXPECT().GetDiskEncryptionSet(gomock.Any(), validDiskEncryptionSetSubscriptionID, validDiskEncryptionSetResourceGroup, wrongRegionConfidentialVMDiskEncryptionSetName).Return(wrongRegionConfidentialVMDiskEncryptionSetResult, nil).AnyTimes()
+ 
+ 	for _, tc := range cases {
+ 		t.Run(tc.name, func(t *testing.T) {
+diff --git a/pkg/asset/installconfig/installconfig.go b/pkg/asset/installconfig/installconfig.go
+index 00fd2ce00c4..4adc60179b1 100644
+--- a/pkg/asset/installconfig/installconfig.go
++++ b/pkg/asset/installconfig/installconfig.go
+@@ -165,6 +165,34 @@ func (a *InstallConfig) finishGCP() error {
+ 	return nil
+ }
+ 
++// finishAzure set defaults for Azure platform.
++func (a *InstallConfig) finishAzure() error {
++	defaultConfig := a.Config.Azure.DefaultMachinePlatform
++	session, err := a.Azure.Session()
++	if err != nil {
++		return err
++	}
++	if defaultConfig != nil && defaultConfig.OSDisk.DiskEncryptionSet != nil &&
++		defaultConfig.OSDisk.DiskEncryptionSet.SubscriptionID == "" {
++		a.Config.Azure.DefaultMachinePlatform.OSDisk.DiskEncryptionSet.SubscriptionID = session.Credentials.SubscriptionID
++	}
++
++	if a.Config.ControlPlane != nil && a.Config.ControlPlane.Platform.Azure != nil &&
++		a.Config.ControlPlane.Platform.Azure.OSDisk.DiskEncryptionSet != nil {
++		if a.Config.ControlPlane.Platform.Azure.OSDisk.DiskEncryptionSet.SubscriptionID == "" {
++			a.Config.ControlPlane.Platform.Azure.OSDisk.DiskEncryptionSet.SubscriptionID = session.Credentials.SubscriptionID
++		}
++	}
++
++	for _, compute := range a.Config.Compute {
++		if compute.Platform.Azure != nil && compute.Platform.Azure.OSDisk.DiskEncryptionSet != nil &&
++			compute.Platform.Azure.OSDisk.DiskEncryptionSet.SubscriptionID == "" {
++			compute.Platform.Azure.OSDisk.DiskEncryptionSet.SubscriptionID = session.Credentials.SubscriptionID
++		}
++	}
++	return nil
++}
++
+ // finishAWS set defaults for AWS Platform before the config validation.
+ func (a *InstallConfig) finishAWS() error {
+ 	// Set the Default Edge Compute pool when the subnets in AWS Local Zones are defined,
+@@ -194,6 +222,9 @@ func (a *InstallConfig) finish(ctx context.Context, filename string) error {
+ 	}
+ 	if a.Config.Azure != nil {
+ 		a.Azure = icazure.NewMetadata(a.Config.Azure, a.Config.ControlPlane, &a.Config.Compute[0])
++		if err := a.finishAzure(); err != nil {
++			return err
++		}
+ 	}
+ 	if a.Config.GCP != nil {
+ 		if err := a.finishGCP(); err != nil {
+diff --git a/pkg/types/azure/disk.go b/pkg/types/azure/disk.go
+index 0dcb87bdaa9..5b07ea8ecc3 100644
+--- a/pkg/types/azure/disk.go
++++ b/pkg/types/azure/disk.go
+@@ -50,6 +50,9 @@ type OSDisk struct {
+ type DiskEncryptionSet struct {
+ 	// SubscriptionID defines the Azure subscription the disk encryption
+ 	// set is in.
++	// Must be the same subscription ID as the resource group of the installer.
++	//
++	// +optional
+ 	SubscriptionID string `json:"subscriptionId"`
+ 	// ResourceGroup defines the Azure resource group used by the disk
+ 	// encryption set.
+diff --git a/pkg/types/azure/validation/disk.go b/pkg/types/azure/validation/disk.go
+index 179e4f9ee91..56a89542aee 100644
+--- a/pkg/types/azure/validation/disk.go
++++ b/pkg/types/azure/validation/disk.go
+@@ -31,9 +31,6 @@ func ValidateDiskEncryption(p *azure.MachinePool, cloudName azure.CloudEnvironme
+ 	if diskEncryptionSet != nil && cloudName == azure.StackCloud {
+ 		return append(allErrs, field.Invalid(childFldPath.Child("diskEncryptionSet"), diskEncryptionSet, "disk encryption sets are not supported on this platform"))
+ 	}
+-	if diskEncryptionSet.SubscriptionID == "" {
+-		return append(allErrs, field.Required(childFldPath.Child("subscriptionID"), "subscription ID is required"))
+-	}
+ 	if !RxSubscriptionID.MatchString(diskEncryptionSet.SubscriptionID) {
+ 		return append(allErrs, field.Invalid(childFldPath.Child("subscriptionID"), diskEncryptionSet.SubscriptionID, "invalid subscription ID format"))
+ 	}

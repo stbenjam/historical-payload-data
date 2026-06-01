@@ -1,0 +1,149 @@
+diff --git a/control-plane-operator/controllers/hostedcontrolplane/infra/infra_test.go b/control-plane-operator/controllers/hostedcontrolplane/infra/infra_test.go
+index f344b921cc4..1636e722d9b 100644
+--- a/control-plane-operator/controllers/hostedcontrolplane/infra/infra_test.go
++++ b/control-plane-operator/controllers/hostedcontrolplane/infra/infra_test.go
+@@ -1475,7 +1475,8 @@ func TestReconcileHCPRouterServices(t *testing.T) {
+ 				Name:      "router",
+ 				Namespace: namespace,
+ 				Annotations: map[string]string{
+-					"service.beta.kubernetes.io/aws-load-balancer-type": "nlb",
++					"service.beta.kubernetes.io/aws-load-balancer-type":   "nlb",
++					"service.beta.kubernetes.io/aws-load-balancer-scheme": "internet-facing",
+ 				},
+ 				Labels: map[string]string{"app": "private-router"},
+ 			},
+@@ -1497,6 +1498,7 @@ func TestReconcileHCPRouterServices(t *testing.T) {
+ 		return publicService(append(m, func(s *corev1.Service) {
+ 			s.Name = "private-router"
+ 			s.Annotations["service.beta.kubernetes.io/aws-load-balancer-internal"] = "true"
++			delete(s.Annotations, "service.beta.kubernetes.io/aws-load-balancer-scheme")
+ 		})...)
+ 	}
+ 	withCrossZoneAnnotation := func(svc *corev1.Service) {
+diff --git a/control-plane-operator/controllers/hostedcontrolplane/infra/testdata/zz_fixture_TestReconcileInfrastructure_AWS_PublicAndPrivate_Route.yaml b/control-plane-operator/controllers/hostedcontrolplane/infra/testdata/zz_fixture_TestReconcileInfrastructure_AWS_PublicAndPrivate_Route.yaml
+index 452e8b2d7e1..a530d255d63 100644
+--- a/control-plane-operator/controllers/hostedcontrolplane/infra/testdata/zz_fixture_TestReconcileInfrastructure_AWS_PublicAndPrivate_Route.yaml
++++ b/control-plane-operator/controllers/hostedcontrolplane/infra/testdata/zz_fixture_TestReconcileInfrastructure_AWS_PublicAndPrivate_Route.yaml
+@@ -286,6 +286,7 @@ services:
+       annotations:
+         service.beta.kubernetes.io/aws-load-balancer-attributes: load_balancing.cross_zone.enabled=true
+         service.beta.kubernetes.io/aws-load-balancer-cross-zone-load-balancing-enabled: "true"
++        service.beta.kubernetes.io/aws-load-balancer-scheme: internet-facing
+         service.beta.kubernetes.io/aws-load-balancer-type: nlb
+       labels:
+         app: private-router
+diff --git a/control-plane-operator/controllers/hostedcontrolplane/infra/testdata/zz_fixture_TestReconcileInfrastructure_AWS_Public_Route.yaml b/control-plane-operator/controllers/hostedcontrolplane/infra/testdata/zz_fixture_TestReconcileInfrastructure_AWS_Public_Route.yaml
+index 0b603a11a1b..b0eedd091b3 100644
+--- a/control-plane-operator/controllers/hostedcontrolplane/infra/testdata/zz_fixture_TestReconcileInfrastructure_AWS_Public_Route.yaml
++++ b/control-plane-operator/controllers/hostedcontrolplane/infra/testdata/zz_fixture_TestReconcileInfrastructure_AWS_Public_Route.yaml
+@@ -239,6 +239,7 @@ services:
+       loadBalancer: {}
+   - metadata:
+       annotations:
++        service.beta.kubernetes.io/aws-load-balancer-scheme: internet-facing
+         service.beta.kubernetes.io/aws-load-balancer-type: nlb
+       labels:
+         app: private-router
+diff --git a/control-plane-operator/controllers/hostedcontrolplane/ingress/router.go b/control-plane-operator/controllers/hostedcontrolplane/ingress/router.go
+index cc0e845217e..8421a068550 100644
+--- a/control-plane-operator/controllers/hostedcontrolplane/ingress/router.go
++++ b/control-plane-operator/controllers/hostedcontrolplane/ingress/router.go
+@@ -29,6 +29,15 @@ func ReconcileRouterService(svc *corev1.Service, internal, crossZoneLoadBalancin
+ 		svc.Annotations["service.beta.kubernetes.io/aws-load-balancer-type"] = "nlb"
+ 		if internal {
+ 			svc.Annotations["service.beta.kubernetes.io/aws-load-balancer-internal"] = "true"
++			delete(svc.Annotations, "service.beta.kubernetes.io/aws-load-balancer-scheme")
++		} else {
++			delete(svc.Annotations, "service.beta.kubernetes.io/aws-load-balancer-internal")
++			// The AWS Load Balancer Controller (used on EKS) defaults to scheme=internal:
++			//   https://kubernetes-sigs.github.io/aws-load-balancer-controller/v2.4/guide/service/annotations/
++			// The in-tree AWS cloud provider (used on OpenShift) defaults to internet-facing:
++			//   https://cloud-provider-aws.sigs.k8s.io/service_controller/
++			// Set the annotation explicitly so the public router works on both.
++			svc.Annotations["service.beta.kubernetes.io/aws-load-balancer-scheme"] = "internet-facing"
+ 		}
+ 		if crossZoneLoadBalancingEnabled {
+ 			// In-tree AWS cloud provider annotation for cross-zone load balancing (OpenShift management clusters).
+diff --git a/control-plane-operator/controllers/hostedcontrolplane/ingress/router_test.go b/control-plane-operator/controllers/hostedcontrolplane/ingress/router_test.go
+index 81dfec25637..f2df7f8de0d 100644
+--- a/control-plane-operator/controllers/hostedcontrolplane/ingress/router_test.go
++++ b/control-plane-operator/controllers/hostedcontrolplane/ingress/router_test.go
+@@ -3,6 +3,8 @@ package ingress
+ import (
+ 	"testing"
+ 
++	. "github.com/onsi/gomega"
++
+ 	hyperv1 "github.com/openshift/hypershift/api/hypershift/v1beta1"
+ 	"github.com/openshift/hypershift/support/netutil"
+ 
+@@ -56,6 +58,69 @@ func TestReconcileRouterServiceAnnotations(t *testing.T) {
+ 	}
+ }
+ 
++// When reconciling an external (non-internal) AWS router service
++// it should set aws-load-balancer-scheme to internet-facing.
++func TestReconcileRouterService_WhenExternalAWS_ItShouldSetInternetFacingScheme(t *testing.T) {
++	g := NewGomegaWithT(t)
++
++	hcp := &hyperv1.HostedControlPlane{}
++	hcp.Spec.Platform.Type = hyperv1.AWSPlatform
++
++	svc := &corev1.Service{}
++
++	err := ReconcileRouterService(svc, false /* internal */, true /* cross-zone */, hcp)
++	g.Expect(err).ToNot(HaveOccurred())
++
++	g.Expect(svc.Annotations).To(HaveKeyWithValue(
++		"service.beta.kubernetes.io/aws-load-balancer-scheme", "internet-facing"))
++	g.Expect(svc.Annotations).ToNot(HaveKey(
++		"service.beta.kubernetes.io/aws-load-balancer-internal"))
++}
++
++func TestReconcileRouterService_WhenSwitchingMode_ItShouldRemoveConflictingAnnotation(t *testing.T) {
++	tests := []struct {
++		name         string
++		internal     bool
++		preExisting  map[string]string
++		expectKey    string
++		expectValue  string
++		expectAbsent string
++	}{
++		{
++			name:         "When switching from internal to external it should remove the internal annotation",
++			internal:     false,
++			preExisting:  map[string]string{"service.beta.kubernetes.io/aws-load-balancer-internal": "true"},
++			expectKey:    "service.beta.kubernetes.io/aws-load-balancer-scheme",
++			expectValue:  "internet-facing",
++			expectAbsent: "service.beta.kubernetes.io/aws-load-balancer-internal",
++		},
++		{
++			name:         "When switching from external to internal it should remove the scheme annotation",
++			internal:     true,
++			preExisting:  map[string]string{"service.beta.kubernetes.io/aws-load-balancer-scheme": "internet-facing"},
++			expectKey:    "service.beta.kubernetes.io/aws-load-balancer-internal",
++			expectValue:  "true",
++			expectAbsent: "service.beta.kubernetes.io/aws-load-balancer-scheme",
++		},
++	}
++	for _, tt := range tests {
++		t.Run(tt.name, func(t *testing.T) {
++			g := NewGomegaWithT(t)
++
++			hcp := &hyperv1.HostedControlPlane{}
++			hcp.Spec.Platform.Type = hyperv1.AWSPlatform
++
++			svc := &corev1.Service{}
++			svc.Annotations = tt.preExisting
++
++			err := ReconcileRouterService(svc, tt.internal, true /* cross-zone */, hcp)
++			g.Expect(err).ToNot(HaveOccurred())
++			g.Expect(svc.Annotations).To(HaveKeyWithValue(tt.expectKey, tt.expectValue))
++			g.Expect(svc.Annotations).ToNot(HaveKey(tt.expectAbsent))
++		})
++	}
++}
++
+ // Test that LoadBalancerSourceRanges is applied for external router services with allowedCIDRBlocks
+ func TestReconcileRouterService_AppliesLoadBalancerSourceRanges(t *testing.T) {
+ 	// Test case 1: External router service should have LoadBalancerSourceRanges set

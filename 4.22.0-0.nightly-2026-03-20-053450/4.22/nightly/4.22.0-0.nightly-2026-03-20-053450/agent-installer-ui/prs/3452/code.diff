@@ -1,0 +1,1187 @@
+diff --git a/libs/locales/lib/en/translation.json b/libs/locales/lib/en/translation.json
+index ecc2fa5cd9..c3fb159d84 100644
+--- a/libs/locales/lib/en/translation.json
++++ b/libs/locales/lib/en/translation.json
+@@ -49,6 +49,7 @@
+   "ai:A cluster with OVN networking type cannot use 'allocate IPs via DHCP server'": "A cluster with OVN networking type cannot use 'allocate IPs via DHCP server'",
+   "ai:A comma separated list of IP or domain names of the NTP pools or servers.": "A comma-separated list of IP addresses or the domain names of the NTP pools or servers.",
+   "ai:A comma separated list of IP or domain names of the NTP pools or servers. Additional NTP sources are added to all hosts to ensure all hosts clocks are synchronized with a valid NTP server. It may take a few minutes for the new NTP sources to sync.": "A comma-separated list of IP addresses or domain names of the NTP pools or servers. Additional NTP sources are added to all hosts to ensure that all clocks of the hosts are synchronized with a valid NTP server. It might take a few minutes for the new NTP sources to synchronize.",
++  "ai:A pull secret has already been set for this cluster. You can continue to the next step.": "A pull secret has already been set for this cluster. You can continue to the next step.",
+   "ai:A Red Hat account's pull secret can be found in ": "A Red Hat account pull secret can be found in ",
+   "ai:A role will be chosen automatically based on detected hardware and network latency.": "A role will be chosen automatically based on detected hardware and network latency.",
+   "ai:Actions": "Actions",
+@@ -363,7 +364,6 @@
+   "ai:Failed to add hosts to the cluster": "Failed to add hosts to the cluster",
+   "ai:Failed to configure provisioning to enable registering hosts via BMC.": "Failed to configure provisioning to enable registering hosts via BMC.",
+   "ai:Failed to create AgentServiceConfig": "Failed to create AgentServiceConfig",
+-  "ai:Failed to create infrastructure environment": "Failed to create infrastructure environment",
+   "ai:Failed to create IngressController": "Failed to create IngressController",
+   "ai:Failed to delete host": "Failed to delete host",
+   "ai:Failed to download the discovery Image": "Failed to download the discovery Image",
+@@ -485,6 +485,7 @@
+   "ai:Infrastructure availability policy": "Infrastructure availability policy",
+   "ai:Infrastructure env": "Infrastructure env",
+   "ai:Infrastructure environment details": "Infrastructure environment details",
++  "ai:Infrastructure environment must be created in the Basic step first": "Infrastructure environment must be created in the Basic step first",
+   "ai:Infrastructure environments are used by clusters. Create an infrastructure environment to add resources to your cluster.": "Infrastructure environments are used by clusters. Create an infrastructure environment to add resources to your cluster.",
+   "ai:Ingress IP": "Ingress IP",
+   "ai:Ingress IP (Primary)": "Ingress IP (Primary)",
+@@ -600,6 +601,7 @@
+   "ai:Minimum memory for selected role": "Minimum memory for selected role",
+   "ai:Minimum number of hosts": "Minimum number of hosts",
+   "ai:Missing cluster": "Missing cluster",
++  "ai:Missing infrastructure environment": "Missing infrastructure environment",
+   "ai:Model": "Model",
+   "ai:Modify your platform configuration to access your platform's features directly in OpenShift.": "Modify your platform configuration to access your platform's features directly in OpenShift.",
+   "ai:More info for configure storage sizes": "More information for configure storage sizes",
+@@ -757,6 +759,7 @@
+   "ai:Provisioning": "Provisioning",
+   "ai:Proxy settings": "Proxy settings",
+   "ai:Pull secret": "Pull secret",
++  "ai:Pull secret configured": "Pull secret configured",
+   "ai:Pull secret is a required field.": "Pull secret is a required field.",
+   "ai:Pull secrets are used to download OpenShift Container Platform components and connect clusters to a Red Hat account. ": "Pull secrets are used to download OpenShift Container Platform components and connect clusters to a Red Hat account. ",
+   "ai:Pull secrets can be found in": "Pull secrets can be found in",
+diff --git a/libs/types/assisted-installer-service.d.ts b/libs/types/assisted-installer-service.d.ts
+index e13a478270..61b707108a 100644
+--- a/libs/types/assisted-installer-service.d.ts
++++ b/libs/types/assisted-installer-service.d.ts
+@@ -1959,7 +1959,7 @@ export interface InfraEnvCreateParams {
+   /**
+    * The CPU architecture of the image (x86_64/arm64/etc).
+    */
+-  cpuArchitecture?: 'x86_64' | 'aarch64' | 'arm64' | 'ppc64le' | 's390x';
++  cpuArchitecture?: 'x86_64' | 'aarch64' | 'arm64' | 'ppc64le' | 's390x' | 'multi';
+   kernelArguments?: KernelArguments;
+   /**
+    * PEM-encoded X.509 certificate bundle. Hosts discovered by this
+diff --git a/libs/ui-lib-tests/cypress/integration/static-ip/1-configure-static-ip-network-wide.cy.ts b/libs/ui-lib-tests/cypress/integration/static-ip/1-configure-static-ip-network-wide.cy.ts
+index 1a471b1ff1..e2e44ad11c 100644
+--- a/libs/ui-lib-tests/cypress/integration/static-ip/1-configure-static-ip-network-wide.cy.ts
++++ b/libs/ui-lib-tests/cypress/integration/static-ip/1-configure-static-ip-network-wide.cy.ts
+@@ -75,9 +75,9 @@ describe(`Assisted Installer Static IP Network wide Configuration`, () => {
+       fillStaticIpForm('ipv4', ipv4Fields);
+ 
+       commonActions.getDangerAlert().should('not.exist');
+-      commonActions.verifyNextIsDisabled(); // auto-save is triggered
+ 
+-      cy.wait('@update-infra-env').then(({ request }) => {
++      cy.get('@update-infra-env').then((interception) => {
++        const { request } = interception as unknown as { request: { body: unknown } };
+         validateStaticIpRequest(request.body, 'ipv4');
+         commonActions.verifyNextIsEnabled();
+       });
+@@ -92,7 +92,6 @@ describe(`Assisted Installer Static IP Network wide Configuration`, () => {
+       fillStaticIpForm('dual-stack', ipv6Fields);
+ 
+       commonActions.getDangerAlert().should('not.exist');
+-      commonActions.verifyNextIsDisabled(); // auto-save is triggered
+ 
+       cy.wait('@update-infra-env').then(({ request }) => {
+         validateStaticIpRequest(request.body, 'dual-stack');
+diff --git a/libs/ui-lib/lib/common/validationSchemas/pullSecretValidation.tsx b/libs/ui-lib/lib/common/validationSchemas/pullSecretValidation.tsx
+index 1ff883eab9..9abbfbac86 100644
+--- a/libs/ui-lib/lib/common/validationSchemas/pullSecretValidation.tsx
++++ b/libs/ui-lib/lib/common/validationSchemas/pullSecretValidation.tsx
+@@ -6,19 +6,18 @@ export const pullSecretValidationSchema = (t: TFunction) =>
+     'is-well-formed-json',
+     t("ai:Invalid pull secret format. You must use your Red Hat account's pull secret."),
+     (value?: string) => {
+-      const isValid = true;
+-      if (!value) return isValid;
++      if (!value || !value.trim()) return true;
+       try {
+-        const pullSecret = JSON.parse(value) as {
+-          auths: string;
+-        };
++        const pullSecret = JSON.parse(value) as unknown;
+         return (
+-          pullSecret.constructor.name === 'Object' &&
+-          !!pullSecret?.auths &&
+-          pullSecret.auths.constructor.name === 'Object'
++          typeof pullSecret === 'object' &&
++          pullSecret !== null &&
++          'auths' in pullSecret &&
++          typeof (pullSecret as { auths: unknown }).auths === 'object' &&
++          (pullSecret as { auths: unknown }).auths !== null
+         );
+       } catch {
+-        return !isValid;
++        return false;
+       }
+     },
+   );
+diff --git a/libs/ui-lib/lib/ocm/components/clusterConfiguration/staticIp/components/StaticIpForm.tsx b/libs/ui-lib/lib/ocm/components/clusterConfiguration/staticIp/components/StaticIpForm.tsx
+index 4851b26712..e5386af121 100644
+--- a/libs/ui-lib/lib/ocm/components/clusterConfiguration/staticIp/components/StaticIpForm.tsx
++++ b/libs/ui-lib/lib/ocm/components/clusterConfiguration/staticIp/components/StaticIpForm.tsx
+@@ -1,7 +1,7 @@
+ import React, { PropsWithChildren } from 'react';
+ import { useSelector } from 'react-redux';
+ import { Form } from '@patternfly/react-core';
+-import { Formik, FormikConfig, useFormikContext, yupToFormErrors } from 'formik';
++import { Formik, useFormikContext, yupToFormErrors } from 'formik';
+ import isEqual from 'lodash-es/isEqual.js';
+ import { useAlerts, useFormikAutoSave } from '../../../../../common';
+ import { useErrorMonitor } from '../../../../../common/components/ErrorHandling/ErrorMonitorContext';
+@@ -9,6 +9,7 @@ import { getApiErrorMessage } from '../../../../../common/api';
+ import { StaticIpFormProps } from './propTypes';
+ import { selectCurrentClusterPermissionsState } from '../../../../store/slices/current-cluster/selectors';
+ 
++/** Reports form state and triggers save on every value change (useFormikAutoSave) */
+ const AutosaveWithParentUpdate = <StaticIpFormValues extends object>({
+   onFormStateChange,
+   getEmptyValues,
+@@ -16,28 +17,41 @@ const AutosaveWithParentUpdate = <StaticIpFormValues extends object>({
+   onFormStateChange: StaticIpFormProps<StaticIpFormValues>['onFormStateChange'];
+   getEmptyValues: StaticIpFormProps<StaticIpFormValues>['getEmptyValues'];
+ }) => {
+-  // eslint-disable-next-line react-hooks/exhaustive-deps
+-  const emptyValues = React.useMemo(() => getEmptyValues(), []);
++  const emptyValues = React.useMemo(() => getEmptyValues(), [getEmptyValues]);
+   const { isSubmitting, isValid, touched, errors, values, initialValues, submitForm } =
+     useFormikContext<StaticIpFormValues>();
+ 
+-  const isEmpty = React.useMemo<boolean>(() => {
+-    return isEqual(values, emptyValues);
+-  }, [values, emptyValues]);
+-
+-  const isAutoSaveRunning = useFormikAutoSave();
++  const isEmpty = React.useMemo(() => isEqual(values, emptyValues), [values, emptyValues]);
++  const isAutoSaveRunning = useFormikAutoSave(0);
+ 
++  // Submit once on mount when form was opened with existing data (so it gets persisted).
+   React.useEffect(() => {
+     if (!isEqual(emptyValues, initialValues)) {
+       void submitForm();
+     }
+-    // eslint-disable-next-line react-hooks/exhaustive-deps
++    // eslint-disable-next-line react-hooks/exhaustive-deps -- intentional: run only on mount.
+   }, []);
+ 
+   React.useEffect(() => {
+-    onFormStateChange({ isSubmitting, isAutoSaveRunning, isValid, touched, errors, isEmpty });
+-    // eslint-disable-next-line react-hooks/exhaustive-deps
+-  }, [isSubmitting, isValid, isAutoSaveRunning, touched, errors]);
++    onFormStateChange({
++      isSubmitting,
++      isAutoSaveRunning,
++      isValid,
++      touched,
++      errors,
++      isEmpty,
++      values: values as Record<string, unknown>,
++    });
++  }, [
++    isSubmitting,
++    isValid,
++    isAutoSaveRunning,
++    touched,
++    errors,
++    values,
++    isEmpty,
++    onFormStateChange,
++  ]);
+   return null;
+ };
+ 
+@@ -55,27 +69,13 @@ export const StaticIpForm = <StaticIpFormValues extends object>({
+   const { clearAlerts, addAlert } = useAlerts();
+   const { captureException } = useErrorMonitor();
+   const { isViewerMode } = useSelector(selectCurrentClusterPermissionsState);
+-  const [initialValues, setInitialValues] = React.useState<StaticIpFormValues | undefined>();
+-  React.useEffect(() => {
+-    if (showEmptyValues) {
+-      //after view changed the formik should be rendered with empty values
+-      setInitialValues(getEmptyValues());
+-    } else {
+-      setInitialValues(getInitialValues(infraEnv));
+-    }
+-    // eslint-disable-next-line react-hooks/exhaustive-deps
+-  }, []);
+-
+-  if (!initialValues) {
+-    return null;
+-  }
++  const initialValues = showEmptyValues ? getEmptyValues() : getInitialValues(infraEnv);
+ 
+-  const handleSubmit: FormikConfig<StaticIpFormValues>['onSubmit'] = async (values) => {
++  const handleSubmit = async (values: StaticIpFormValues) => {
+     clearAlerts();
+     try {
+-      const staticNetworkConfig = getUpdateParams(infraEnv, values);
+       await updateInfraEnv({
+-        staticNetworkConfig: staticNetworkConfig,
++        staticNetworkConfig: getUpdateParams(infraEnv, values),
+       });
+     } catch (error) {
+       captureException(error);
+@@ -98,6 +98,10 @@ export const StaticIpForm = <StaticIpFormValues extends object>({
+     }
+   };
+ 
++  if (!initialValues) {
++    return null;
++  }
++
+   const onSubmit = isViewerMode ? () => Promise.resolve() : handleSubmit;
+   return (
+     <Formik initialValues={initialValues} onSubmit={onSubmit} validate={validate} validateOnMount>
+diff --git a/libs/ui-lib/lib/ocm/components/clusterConfiguration/staticIp/components/StaticIpPage.tsx b/libs/ui-lib/lib/ocm/components/clusterConfiguration/staticIp/components/StaticIpPage.tsx
+index 7afc8000d2..ce69f9720c 100644
+--- a/libs/ui-lib/lib/ocm/components/clusterConfiguration/staticIp/components/StaticIpPage.tsx
++++ b/libs/ui-lib/lib/ocm/components/clusterConfiguration/staticIp/components/StaticIpPage.tsx
+@@ -49,15 +49,17 @@ export const StaticIpPage: React.FC<StaticIpPageProps> = ({
+     return getStaticIpInfo(infraEnv);
+     // eslint-disable-next-line react-hooks/exhaustive-deps
+   }, []);
+-  if (!initialStaticIpInfo) {
+-    return null;
+-  }
+-  const onFormStateChange = (formState: StaticIpFormState) => {
+-    const hasFilledData =
+-      clusterWizardContext.currentStepId === 'static-ip-host-configurations' || !formState.isEmpty;
+-    setConfirmOnChangeView(hasFilledData);
+-    onFormStateChangeParent(formState);
+-  };
++
++  const onFormStateChange = React.useCallback(
++    (formState: StaticIpFormState) => {
++      const hasFilledData =
++        clusterWizardContext.currentStepId === 'static-ip-host-configurations' ||
++        !formState.isEmpty;
++      setConfirmOnChangeView(hasFilledData);
++      onFormStateChangeParent(formState);
++    },
++    [clusterWizardContext.currentStepId, onFormStateChangeParent],
++  );
+ 
+   const viewProps: StaticIpViewProps = {
+     onFormStateChange,
+@@ -66,7 +68,7 @@ export const StaticIpPage: React.FC<StaticIpPageProps> = ({
+     showEmptyValues: viewChanged,
+   };
+ 
+-  const getContent = () => {
++  const content = (() => {
+     switch (clusterWizardContext.currentStepId) {
+       case 'static-ip-yaml-view':
+         return <YamlView {...viewProps} />;
+@@ -75,14 +77,16 @@ export const StaticIpPage: React.FC<StaticIpPageProps> = ({
+       case 'static-ip-host-configurations':
+         return <FormViewHosts {...viewProps} />;
+       default:
+-        throw `Unexpected wizard step id ${clusterWizardContext.currentStepId} when entering static ip page`;
++        throw new Error(
++          `Unexpected wizard step id ${clusterWizardContext.currentStepId} when entering static ip page`,
++        );
+     }
+-  };
++  })();
+ 
+-  const content = getContent();
+-  if (!content) {
++  if (!initialStaticIpInfo) {
+     return null;
+   }
++
+   return (
+     <Grid hasGutter>
+       <GridItem>
+diff --git a/libs/ui-lib/lib/ocm/components/clusterConfiguration/staticIp/components/propTypes.ts b/libs/ui-lib/lib/ocm/components/clusterConfiguration/staticIp/components/propTypes.ts
+index b6df03654e..215c5e2bee 100644
+--- a/libs/ui-lib/lib/ocm/components/clusterConfiguration/staticIp/components/propTypes.ts
++++ b/libs/ui-lib/lib/ocm/components/clusterConfiguration/staticIp/components/propTypes.ts
+@@ -13,6 +13,7 @@ export type StaticIpFormState = {
+   touched: FormikTouched<object>;
+   errors: FormikErrors<object>;
+   isEmpty: boolean;
++  values?: Record<string, unknown>;
+ };
+ 
+ export type StaticIpProps = {
+@@ -29,7 +30,6 @@ export type StaticIpViewProps = StaticIpPageProps & {
+ };
+ 
+ export type StaticIpFormProps<StaticIpViewValues extends object> = StaticIpViewProps & {
+-  showEmptyValues: boolean;
+   getInitialValues(infraEnv: InfraEnv): StaticIpViewValues;
+   getUpdateParams(currentInfraEnv: InfraEnv, values: StaticIpViewValues): HostStaticNetworkConfig[];
+   validationSchema: Yup.ObjectSchema<Yup.AnyObject> | Yup.Lazy<Yup.AnyObject>;
+diff --git a/libs/ui-lib/lib/ocm/components/clusterWizard/ClusterWizardContext.tsx b/libs/ui-lib/lib/ocm/components/clusterWizard/ClusterWizardContext.tsx
+index b196aca486..9af15adf00 100644
+--- a/libs/ui-lib/lib/ocm/components/clusterWizard/ClusterWizardContext.tsx
++++ b/libs/ui-lib/lib/ocm/components/clusterWizard/ClusterWizardContext.tsx
+@@ -21,6 +21,9 @@ export type ClusterWizardContextType = {
+   setInstallDisconnected: (enabled: boolean) => void;
+   disconnectedInfraEnv?: InfraEnv;
+   setDisconnectedInfraEnv: (infraEnv: InfraEnv | undefined) => void;
++  /** UI-only: network config type for disconnected flow (not on API infraEnv). */
++  disconnectedHostsNetworkConfigurationType?: 'dhcp' | 'static';
++  setDisconnectedHostsNetworkConfigurationType: (value: 'dhcp' | 'static') => void;
+ };
+ 
+ export const ClusterWizardContext = React.createContext<ClusterWizardContextType | null>(null);
+diff --git a/libs/ui-lib/lib/ocm/components/clusterWizard/ClusterWizardContextProvider.tsx b/libs/ui-lib/lib/ocm/components/clusterWizard/ClusterWizardContextProvider.tsx
+index c9b6c70959..0a8cf76220 100644
+--- a/libs/ui-lib/lib/ocm/components/clusterWizard/ClusterWizardContextProvider.tsx
++++ b/libs/ui-lib/lib/ocm/components/clusterWizard/ClusterWizardContextProvider.tsx
+@@ -116,9 +116,18 @@ const ClusterWizardContextProvider = ({
+     React.useState<ClusterWizardStepsType[]>(disconnectedSteps);
+   const [wizardPerPage, setWizardPerPage] = React.useState(10);
+   const [installDisconnected, setInstallDisconnected] = React.useState(false);
+-  const [disconnectedInfraEnv, setDisconnectedInfraEnv] = React.useState<InfraEnv | undefined>(
++  const [disconnectedInfraEnv, setDisconnectedInfraEnvState] = React.useState<InfraEnv | undefined>(
+     infraEnv,
+   );
++  const [disconnectedHostsNetworkConfigurationType, setDisconnectedHostsNetworkConfigurationType] =
++    React.useState<'dhcp' | 'static'>('dhcp');
++
++  const setDisconnectedInfraEnv = React.useCallback((infraEnv: InfraEnv | undefined) => {
++    setDisconnectedInfraEnvState(infraEnv);
++    if (infraEnv === undefined) {
++      setDisconnectedHostsNetworkConfigurationType('dhcp');
++    }
++  }, []);
+   const location = useLocation();
+   const locationState = location.state as ClusterWizardFlowStateType | undefined;
+   const {
+@@ -301,6 +310,8 @@ const ClusterWizardContextProvider = ({
+       },
+       disconnectedInfraEnv,
+       setDisconnectedInfraEnv,
++      disconnectedHostsNetworkConfigurationType,
++      setDisconnectedHostsNetworkConfigurationType,
+     };
+   }, [
+     wizardStepIds,
+@@ -315,6 +326,8 @@ const ClusterWizardContextProvider = ({
+     connectedWizardStepIds,
+     disconnectedWizardStepIds,
+     disconnectedInfraEnv,
++    disconnectedHostsNetworkConfigurationType,
++    setDisconnectedInfraEnv,
+   ]);
+ 
+   if (!contextValue) {
+diff --git a/libs/ui-lib/lib/ocm/components/clusterWizard/disconnected/BasicStep.tsx b/libs/ui-lib/lib/ocm/components/clusterWizard/disconnected/BasicStep.tsx
+index 7ac86f3cad..f29e9d59f1 100644
+--- a/libs/ui-lib/lib/ocm/components/clusterWizard/disconnected/BasicStep.tsx
++++ b/libs/ui-lib/lib/ocm/components/clusterWizard/disconnected/BasicStep.tsx
+@@ -1,4 +1,5 @@
+ import * as React from 'react';
++import * as Yup from 'yup';
+ import {
+   ClusterWizardStep,
+   TechnologyPreview,
+@@ -6,8 +7,10 @@ import {
+   OCP_RELEASES_PAGE,
+   StaticTextField,
+   useTranslation,
++  PullSecret,
++  pullSecretValidationSchema,
+ } from '../../../../common';
+-import { Flex, Grid, GridItem, Form, Content, Spinner } from '@patternfly/react-core';
++import { Flex, Grid, GridItem, Form, Content, Spinner, Alert } from '@patternfly/react-core';
+ import OcmOpenShiftVersion from '../../clusterConfiguration/OcmOpenShiftVersion';
+ import { useClusterWizardContext } from '../ClusterWizardContext';
+ import ClusterWizardFooter from '../ClusterWizardFooter';
+@@ -16,6 +19,7 @@ import { WithErrorBoundary } from '../../../../common/components/ErrorHandling/W
+ import InstallDisconnectedSwitch from './InstallDisconnectedSwitch';
+ import { Formik, useFormikContext } from 'formik';
+ import ClustersService from '../../../services/ClustersService';
++import InfraEnvsService from '../../../services/InfraEnvsService';
+ import { handleApiError, getApiErrorMessage } from '../../../../common/api';
+ import { useAlerts } from '../../../../common/components/AlertsContextProvider';
+ import { AlertVariant } from '@patternfly/react-core';
+@@ -24,10 +28,15 @@ import { useLocation, useNavigate, useParams } from 'react-router-dom-v5-compat'
+ import { AxiosResponse } from 'axios';
+ import { Cluster } from '@openshift-assisted/types/assisted-installer-service';
+ import OcmOpenShiftVersionSelect from '../../clusterConfiguration/OcmOpenShiftVersionSelect';
++import usePullSecret from '../../../hooks/usePullSecret';
++import { isInOcm } from '../../../../common/api';
++
++const DISCONNECTED_IMAGE_TYPE = 'disconnected-iso';
+ 
+ type BasicStepFormikValues = {
+   openshiftVersion: string;
+   customOpenshiftSelect: string | null;
++  pullSecret?: string;
+ };
+ 
+ const BasicStepForm = () => {
+@@ -35,10 +44,11 @@ const BasicStepForm = () => {
+   const [isLoading, setIsLoading] = React.useState(true);
+   const [cluster, setCluster] = React.useState<Cluster>();
+ 
+-  const { values } = useFormikContext<BasicStepFormikValues>();
++  const { values, isValid, setFieldValue } = useFormikContext<BasicStepFormikValues>();
+   const { t } = useTranslation();
+-  const { moveNext } = useClusterWizardContext();
++  const { moveNext, setDisconnectedInfraEnv, disconnectedInfraEnv } = useClusterWizardContext();
+   const { addAlert } = useAlerts();
++  const defaultPullSecret = usePullSecret();
+   const [isSubmitting, setIsSubmitting] = React.useState(false);
+   const navigate = useNavigate();
+   const location = useLocation();
+@@ -67,10 +77,17 @@ const BasicStepForm = () => {
+     }
+   }, [clusterId, addAlert]);
+ 
+-  const createCluster = async () => {
++  // When returning to Basic with existing cluster, sync openshiftVersion so validation passes
++  // and Next can be enabled once pull secret is filled
++  React.useEffect(() => {
++    if (cluster?.openshiftVersion && values.openshiftVersion !== cluster.openshiftVersion) {
++      setFieldValue('openshiftVersion', cluster.openshiftVersion);
++    }
++  }, [cluster?.openshiftVersion, values.openshiftVersion, setFieldValue]);
++
++  const createClusterAndInfraEnv = async () => {
+     try {
+       setIsSubmitting(true);
+-      // Create cluster only - infraEnv will be created in OptionalConfigurationsStep
+       // eslint-disable-next-line @typescript-eslint/no-unsafe-assignment
+       const { data: disconnectedCluster }: AxiosResponse<Cluster> =
+         // eslint-disable-next-line @typescript-eslint/no-unsafe-call
+@@ -78,6 +95,22 @@ const BasicStepForm = () => {
+           name: 'disconnected-cluster',
+           openshiftVersion: values.openshiftVersion,
+         });
++      const pullSecretToUse = (isInOcm ? defaultPullSecret : values.pullSecret) ?? '';
++      const createdInfraEnv = await InfraEnvsService.create({
++        name: InfraEnvsService.makeInfraEnvName(
++          disconnectedCluster.cpuArchitecture as string,
++          disconnectedCluster.name,
++        ),
++        clusterId: disconnectedCluster.id,
++        openshiftVersion: disconnectedCluster.openshiftVersion,
++        cpuArchitecture: disconnectedCluster.cpuArchitecture,
++        imageType: DISCONNECTED_IMAGE_TYPE,
++        pullSecret: pullSecretToUse,
++      });
++      setDisconnectedInfraEnv({
++        ...createdInfraEnv,
++        openshiftVersion: disconnectedCluster.openshiftVersion,
++      });
+       navigate(`${currentPath}/${disconnectedCluster.id}`, {
+         state: ClusterWizardFlowStateNew,
+       });
+@@ -101,10 +134,14 @@ const BasicStepForm = () => {
+       footer={
+         <ClusterWizardFooter
+           onNext={() => {
+-            clusterId ? moveNext() : void createCluster();
++            clusterId ? moveNext() : void createClusterAndInfraEnv();
+           }}
+           isSubmitting={isSubmitting}
+-          isNextDisabled={isLoading || (cluster ? false : !values.openshiftVersion)}
++          isNextDisabled={
++            isLoading ||
++            (cluster ? false : !values.openshiftVersion) ||
++            (!isInOcm && !isValid && !disconnectedInfraEnv?.pullSecretSet)
++          }
+           disconnectedClusterId={clusterId}
+         />
+       }
+@@ -143,6 +180,20 @@ const BasicStepForm = () => {
+               <StaticTextField name="cpuArchitecture" label="CPU architecture" isRequired>
+                 x86_64
+               </StaticTextField>
++              {/* Always show pull secret when !isInOcm so it can be re-entered after going back */}
++              {!isInOcm && !disconnectedInfraEnv?.pullSecretSet ? (
++                <PullSecret defaultPullSecret={defaultPullSecret} isOcm={false} />
++              ) : (
++                <Alert
++                  variant={AlertVariant.success}
++                  isInline
++                  title={t('ai:Pull secret configured')}
++                >
++                  {t(
++                    'ai:A pull secret has already been set for this cluster. You can continue to the next step.',
++                  )}
++                </Alert>
++              )}
+             </Form>
+           </GridItem>
+         </Grid>
+@@ -151,15 +202,32 @@ const BasicStepForm = () => {
+   );
+ };
+ 
++const BASIC_STEP_DEFAULT_VALUES: BasicStepFormikValues = {
++  openshiftVersion: '',
++  customOpenshiftSelect: null,
++  pullSecret: '',
++};
++
++const getBasicStepValidationSchema = (t: ReturnType<typeof useTranslation>['t']) =>
++  Yup.object().shape({
++    openshiftVersion: Yup.string().required(),
++    customOpenshiftSelect: Yup.string().nullable(),
++    ...(!isInOcm && {
++      pullSecret: pullSecretValidationSchema(t).required(t('ai:Required field')),
++    }),
++  });
++
+ const BasicStep = () => {
++  const { t } = useTranslation();
+   return (
+     <Formik<BasicStepFormikValues>
+-      initialValues={{
+-        openshiftVersion: '',
+-        customOpenshiftSelect: null,
+-      }}
++      initialValues={BASIC_STEP_DEFAULT_VALUES}
++      validationSchema={getBasicStepValidationSchema(t)}
++      validateOnMount
++      validateOnChange
++      validateOnBlur
+       onSubmit={() => {
+-        // nothing to do
++        // No persistence until Next (create cluster + infraEnv)
+       }}
+     >
+       <BasicStepForm />
+diff --git a/libs/ui-lib/lib/ocm/components/clusterWizard/disconnected/DisconnectedStaticIp.tsx b/libs/ui-lib/lib/ocm/components/clusterWizard/disconnected/DisconnectedStaticIp.tsx
+index 86e4e1068b..796a98e483 100644
+--- a/libs/ui-lib/lib/ocm/components/clusterWizard/disconnected/DisconnectedStaticIp.tsx
++++ b/libs/ui-lib/lib/ocm/components/clusterWizard/disconnected/DisconnectedStaticIp.tsx
+@@ -28,21 +28,19 @@ const DisconnectedStaticIp: React.FC = () => {
+     getInitialFormStateProps(),
+   );
+ 
+-  const onFormStateChange = (formState: StaticIpFormState) => {
+-    setFormStateProps(formState);
+-  };
+-
+-  const updateInfraEnv = async (params: InfraEnvUpdateParams) => {
+-    if (!disconnectedInfraEnv?.id) {
+-      throw new Error('No disconnected infraEnv available');
+-    }
+-    const { data: updatedInfraEnv } = await InfraEnvsAPI.update(disconnectedInfraEnv.id, params);
+-    setDisconnectedInfraEnv(updatedInfraEnv);
+-    return updatedInfraEnv;
+-  };
++  const updateInfraEnv = React.useCallback(
++    async (params: InfraEnvUpdateParams) => {
++      if (!disconnectedInfraEnv?.id) {
++        throw new Error('No disconnected infraEnv available');
++      }
++      const { data: updatedInfraEnv } = await InfraEnvsAPI.update(disconnectedInfraEnv.id, params);
++      setDisconnectedInfraEnv(updatedInfraEnv);
++      return updatedInfraEnv;
++    },
++    [disconnectedInfraEnv, setDisconnectedInfraEnv],
++  );
+ 
+-  const isNextDisabled =
+-    formState.isAutoSaveRunning || !formState.isValid || !!alerts.length || formState.isSubmitting;
++  const isNextDisabled = !formState.isValid || !!alerts.length || formState.isSubmitting;
+   const errorFields = getFormikErrorFields<object>(formState.errors, formState.touched);
+ 
+   const footer = (
+@@ -51,10 +49,10 @@ const DisconnectedStaticIp: React.FC = () => {
+       alertContent={null}
+       errorFields={errorFields}
+       isSubmitting={formState.isSubmitting}
+-      onNext={() => moveNext()}
+-      onBack={() => moveBack()}
++      onNext={moveNext}
++      onBack={moveBack}
+       isNextDisabled={isNextDisabled}
+-      isBackDisabled={formState.isSubmitting || formState.isAutoSaveRunning}
++      isBackDisabled={formState.isSubmitting}
+     />
+   );
+ 
+@@ -68,7 +66,7 @@ const DisconnectedStaticIp: React.FC = () => {
+         <StaticIpPage
+           infraEnv={disconnectedInfraEnv}
+           updateInfraEnv={updateInfraEnv}
+-          onFormStateChange={onFormStateChange}
++          onFormStateChange={setFormStateProps}
+         />
+       </WithErrorBoundary>
+     </ClusterWizardStep>
+diff --git a/libs/ui-lib/lib/ocm/components/clusterWizard/disconnected/OptionalConfigurationsStep.tsx b/libs/ui-lib/lib/ocm/components/clusterWizard/disconnected/OptionalConfigurationsStep.tsx
+index e044b89d44..da8d70c950 100644
+--- a/libs/ui-lib/lib/ocm/components/clusterWizard/disconnected/OptionalConfigurationsStep.tsx
++++ b/libs/ui-lib/lib/ocm/components/clusterWizard/disconnected/OptionalConfigurationsStep.tsx
+@@ -1,10 +1,11 @@
+ import * as React from 'react';
+-import { Formik } from 'formik';
++import { Formik, useFormikContext } from 'formik';
+ import { TFunction } from 'i18next';
+ import * as Yup from 'yup';
+ import {
+   ClusterWizardStep,
+   TechnologyPreview,
++  FormikAutoSave,
+   sshPublicKeyValidationSchema,
+   getFormikErrorFields,
+   httpProxyValidationSchema,
+@@ -14,8 +15,6 @@ import {
+   CheckboxField,
+   AdditionalNTPSourcesField,
+   ProxyFieldsType,
+-  PullSecret,
+-  pullSecretValidationSchema,
+ } from '../../../../common';
+ import { Split, SplitItem, Grid, GridItem, Form, Content } from '@patternfly/react-core';
+ import { useClusterWizardContext } from '../ClusterWizardContext';
+@@ -27,25 +26,23 @@ import { ProxyInputFields } from '../../../../common/components/clusterConfigura
+ import { handleApiError, getApiErrorMessage } from '../../../../common/api';
+ import { useAlerts } from '../../../../common/components/AlertsContextProvider';
+ import { AlertVariant } from '@patternfly/react-core';
+-import InfraEnvsService from '../../../services/InfraEnvsService';
+ import { InfraEnvsAPI } from '../../../services/apis';
+-import usePullSecret from '../../../hooks/usePullSecret';
+ import { useParams } from 'react-router-dom-v5-compat';
+ import ClustersService from '../../../services/ClustersService';
+ import {
+   Cluster,
+   InfraEnv,
+-  InfraEnvCreateParams,
+   InfraEnvUpdateParams,
+ } from '@openshift-assisted/types/assisted-installer-service';
+ import { HostsNetworkConfigurationControlGroup } from '../../clusterConfiguration/HostsNetworkConfigurationControlGroup';
++import {
++  getDummyInfraEnvField,
++  isDummyYaml,
++} from '../../clusterConfiguration/staticIp/data/dummyData';
+ import { HostsNetworkConfigurationType } from '../../../services/types';
+ import { useTranslation } from '../../../../common/hooks/use-translation-wrapper';
+-import { getDummyInfraEnvField } from '../../clusterConfiguration/staticIp/data/dummyData';
+ import { ntpSourceValidationSchema } from '../../../../common/validationSchemas/ntpValidation';
+-import { isInOcm } from '../../../../common/api';
+ 
+-const DEFAULT_CPU_ARCHITECTURE = 'x86_64' as const;
+ const DISCONNECTED_IMAGE_TYPE = 'disconnected-iso' as const;
+ 
+ type OptionalConfigurationsFormValues = ProxyFieldsType & {
+@@ -54,7 +51,6 @@ type OptionalConfigurationsFormValues = ProxyFieldsType & {
+   additionalNtpSources?: string;
+   hostsNetworkConfigurationType: HostsNetworkConfigurationType;
+   rendezvousIp?: string;
+-  pullSecret?: string;
+ };
+ 
+ const DEFAULT_INITIAL_VALUES: OptionalConfigurationsFormValues = {
+@@ -67,56 +63,87 @@ const DEFAULT_INITIAL_VALUES: OptionalConfigurationsFormValues = {
+   additionalNtpSources: '',
+   hostsNetworkConfigurationType: HostsNetworkConfigurationType.DHCP,
+   rendezvousIp: '',
+-  pullSecret: '',
+ };
+ 
+ /**
+  * Rehydrate form values from infraEnv when navigating back to this step.
++ * hostsNetworkConfigurationType comes from context (UI-only); when not set, derive from infraEnv.staticNetworkConfig.
+  */
+-const infraEnvToFormValues = (infraEnv: InfraEnv): OptionalConfigurationsFormValues => ({
+-  ...DEFAULT_INITIAL_VALUES,
+-  sshPublicKey: infraEnv.sshAuthorizedKey ?? '',
+-  enableProxy: !!(infraEnv.proxy?.httpProxy || infraEnv.proxy?.httpsProxy),
+-  httpProxy: infraEnv.proxy?.httpProxy ?? '',
+-  httpsProxy: infraEnv.proxy?.httpsProxy ?? '',
+-  noProxy: infraEnv.proxy?.noProxy ?? '',
+-  enableNtpSources: !!infraEnv.additionalNtpSources,
+-  additionalNtpSources: infraEnv.additionalNtpSources ?? '',
+-  hostsNetworkConfigurationType:
+-    (infraEnv.staticNetworkConfig?.length ?? 0) > 0
+-      ? HostsNetworkConfigurationType.STATIC
+-      : HostsNetworkConfigurationType.DHCP,
+-  rendezvousIp: infraEnv.rendezvousIp ?? '',
+-});
++const infraEnvToFormValues = (
++  infraEnv: InfraEnv,
++  hostsNetworkConfigurationType?: 'dhcp' | 'static',
++): OptionalConfigurationsFormValues => {
++  const networkType =
++    hostsNetworkConfigurationType ?? (infraEnv.staticNetworkConfig ? 'static' : 'dhcp');
++  return {
++    ...DEFAULT_INITIAL_VALUES,
++    sshPublicKey: infraEnv.sshAuthorizedKey ?? '',
++    enableProxy: !!(infraEnv.proxy?.httpProxy || infraEnv.proxy?.httpsProxy),
++    httpProxy: infraEnv.proxy?.httpProxy ?? '',
++    httpsProxy: infraEnv.proxy?.httpsProxy ?? '',
++    noProxy: infraEnv.proxy?.noProxy ?? '',
++    enableNtpSources: !!infraEnv.additionalNtpSources,
++    additionalNtpSources: infraEnv.additionalNtpSources ?? '',
++    hostsNetworkConfigurationType:
++      networkType === 'static'
++        ? HostsNetworkConfigurationType.STATIC
++        : HostsNetworkConfigurationType.DHCP,
++    rendezvousIp: infraEnv.rendezvousIp ?? '',
++  };
++};
+ 
+-/**
+- * Builds common infrastructure environment params from form values
+- */
+-const buildInfraEnvParams = (values: OptionalConfigurationsFormValues) => {
+-  // Build proxy object - only include fields that have values
++/** Only send dummy static config when Static is selected and no real config exists yet (avoid overwriting after Static IP step). */
++const shouldSendDummyStaticConfig = (
++  values: OptionalConfigurationsFormValues,
++  infraEnv: InfraEnv | null,
++): boolean =>
++  values.hostsNetworkConfigurationType === HostsNetworkConfigurationType.STATIC &&
++  (!infraEnv?.staticNetworkConfig ||
++    (typeof infraEnv.staticNetworkConfig === 'string' &&
++      isDummyYaml(infraEnv.staticNetworkConfig)));
++
++const buildInfraEnvParams = (
++  values: OptionalConfigurationsFormValues,
++  disconnectedInfraEnv: InfraEnv | null,
++): InfraEnvUpdateParams => {
+   const proxy = {
+     ...(values.httpProxy && { httpProxy: values.httpProxy }),
+     ...(values.httpsProxy && { httpsProxy: values.httpsProxy }),
+     ...(values.noProxy && { noProxy: values.noProxy }),
+   };
+-  const hasProxy = Object.keys(proxy).length > 0;
+-
+   return {
+     ...(values.sshPublicKey && { sshAuthorizedKey: values.sshPublicKey }),
+-    ...(hasProxy && { proxy }),
+-    ...(values.additionalNtpSources && {
+-      additionalNtpSources: values.additionalNtpSources,
+-    }),
++    ...(Object.keys(proxy).length > 0 && { proxy }),
++    ...(values.additionalNtpSources && { additionalNtpSources: values.additionalNtpSources }),
+     ...(values.rendezvousIp && { rendezvousIp: values.rendezvousIp }),
+-    // Initialize with dummy static network config when static IP is selected
+-    // This is required for the StaticIpPage to render properly
+-    ...(values.hostsNetworkConfigurationType === HostsNetworkConfigurationType.STATIC && {
++    ...(shouldSendDummyStaticConfig(values, disconnectedInfraEnv) && {
+       staticNetworkConfig: getDummyInfraEnvField(),
+     }),
+   };
+ };
+ 
+-const getValidationSchema = (t: TFunction, requirePullSecret: boolean) =>
++/** Merge saved form values into API response so they persist in context when navigating (API may omit some fields). */
++const mergeFormValuesIntoInfraEnv = (
++  updatedInfraEnv: InfraEnv,
++  values: OptionalConfigurationsFormValues,
++  openshiftVersion: string | undefined,
++): InfraEnv => ({
++  ...updatedInfraEnv,
++  openshiftVersion,
++  sshAuthorizedKey: values.sshPublicKey || undefined,
++  proxy:
++    values.enableProxy && (values.httpProxy || values.httpsProxy)
++      ? {
++          httpProxy: values.httpProxy || undefined,
++          httpsProxy: values.httpsProxy || undefined,
++          noProxy: values.noProxy || undefined,
++        }
++      : undefined,
++  additionalNtpSources: values.additionalNtpSources || undefined,
++  rendezvousIp: values.rendezvousIp || undefined,
++});
++
++const getValidationSchema = (t: TFunction) =>
+   Yup.lazy((values: OptionalConfigurationsFormValues) =>
+     Yup.object().shape({
+       sshPublicKey: sshPublicKeyValidationSchema(t),
+@@ -146,20 +173,129 @@ const getValidationSchema = (t: TFunction, requirePullSecret: boolean) =>
+           'Not a valid IP address',
+           (value) => !value || ipValidationSchema(t).isValidSync(value),
+         ),
+-      ...(requirePullSecret && {
+-        pullSecret: pullSecretValidationSchema(t).required(t('ai:Required field')),
+-      }),
+     }),
+   );
+ 
++type OptionalConfigurationsStepFormProps = {
++  clusterId: string | undefined;
++  cluster: Cluster | null;
++};
++
++const OptionalConfigurationsStepForm = ({
++  clusterId,
++  cluster,
++}: OptionalConfigurationsStepFormProps) => {
++  const { t } = useTranslation();
++  const { moveNext, moveBack, disconnectedInfraEnv } = useClusterWizardContext();
++  const { isValid, errors, touched, isSubmitting, values } =
++    useFormikContext<OptionalConfigurationsFormValues>();
++
++  const errorFields = getFormikErrorFields(errors, touched);
++
++  return (
++    <>
++      {cluster && disconnectedInfraEnv && <FormikAutoSave debounce={0} />}
++      <ClusterWizardStep
++        navigation={<ClusterWizardNavigation />}
++        footer={
++          <ClusterWizardFooter
++            disconnectedClusterId={clusterId}
++            onNext={moveNext}
++            onBack={moveBack}
++            isBackDisabled={isSubmitting}
++            isNextDisabled={!isValid || !cluster}
++            errorFields={errorFields}
++            isSubmitting={isSubmitting}
++          />
++        }
++      >
++        <WithErrorBoundary title="Failed to load Optional Configurations step">
++          <Grid hasGutter>
++            <GridItem>
++              <Split>
++                <SplitItem>
++                  <Content component="h2">{t('ai:Optional configurations')}</Content>
++                </SplitItem>
++                <SplitItem>
++                  <TechnologyPreview />
++                </SplitItem>
++              </Split>
++            </GridItem>
++            <GridItem>
++              <Form id="wizard-cluster-optional-configurations__form">
++                {/* Rendezvous IP */}
++                <InputField
++                  label={t('ai:Rendezvous IP')}
++                  name="rendezvousIp"
++                  helperText={t(
++                    'ai:The IP address that hosts will use to communicate with the bootstrap node during installation.',
++                  )}
++                  placeholder="e.g., 192.168.1.10"
++                  maxLength={45}
++                />
++
++                <UploadSSH />
++
++                {/* Proxy Settings */}
++                <CheckboxField
++                  label={t('ai:Configure proxy settings')}
++                  name="enableProxy"
++                  helperText={
++                    <p>
++                      {t(
++                        'ai:If hosts are behind a firewall that requires the use of a proxy, provide additional information about the proxy.',
++                      )}
++                    </p>
++                  }
++                  body={values.enableProxy && <ProxyInputFields />}
++                />
++
++                {/* NTP Configuration */}
++                <CheckboxField
++                  label={t('ai:Add your own NTP (Network Time Protocol) sources')}
++                  name="enableNtpSources"
++                  helperText={
++                    <p>
++                      {t(
++                        'ai:Configure your own NTP sources to synchronize the time between the hosts that will be added to this infrastructure environment.',
++                      )}
++                    </p>
++                  }
++                  body={
++                    values.enableNtpSources && (
++                      <Grid hasGutter>
++                        <AdditionalNTPSourcesField
++                          name="additionalNtpSources"
++                          helperText={t(
++                            'ai:A comma separated list of IP or domain names of the NTP pools or servers.',
++                          )}
++                        />
++                      </Grid>
++                    )
++                  }
++                />
++
++                {/* Network Configuration */}
++                <HostsNetworkConfigurationControlGroup clusterExists={false} isDisabled={false} />
++              </Form>
++            </GridItem>
++          </Grid>
++        </WithErrorBoundary>
++      </ClusterWizardStep>
++    </>
++  );
++};
++
+ const OptionalConfigurationsStep = () => {
+   const { clusterId } = useParams<{ clusterId: string }>();
+   const [cluster, setCluster] = React.useState<Cluster | null>(null);
+   const { t } = useTranslation();
+-  const defaultPullSecret = usePullSecret();
+-
+-  const { moveNext, moveBack, setDisconnectedInfraEnv, disconnectedInfraEnv } =
+-    useClusterWizardContext();
++  const {
++    setDisconnectedInfraEnv,
++    disconnectedInfraEnv,
++    disconnectedHostsNetworkConfigurationType,
++    setDisconnectedHostsNetworkConfigurationType,
++  } = useClusterWizardContext();
+   const { addAlert, clearAlerts } = useAlerts();
+ 
+   React.useEffect(() => {
+@@ -183,180 +319,79 @@ const OptionalConfigurationsStep = () => {
+     void fetchCluster();
+   }, [clusterId, addAlert, t]);
+ 
+-  const initialValues: OptionalConfigurationsFormValues = disconnectedInfraEnv
+-    ? infraEnvToFormValues(disconnectedInfraEnv)
+-    : DEFAULT_INITIAL_VALUES;
++  const initialValues = React.useMemo<OptionalConfigurationsFormValues>(
++    () =>
++      disconnectedInfraEnv
++        ? infraEnvToFormValues(disconnectedInfraEnv, disconnectedHostsNetworkConfigurationType)
++        : DEFAULT_INITIAL_VALUES,
++    [disconnectedInfraEnv, disconnectedHostsNetworkConfigurationType],
++  );
+ 
+-  return (
+-    <Formik
+-      initialValues={initialValues}
+-      validateOnMount
+-      validationSchema={getValidationSchema(t, !isInOcm)}
+-      onSubmit={async (values) => {
+-        clearAlerts();
+-        if (!cluster?.id) {
++  const validationSchema = React.useMemo(() => getValidationSchema(t), [t]);
++
++  const onSubmit = React.useCallback(
++    async (values: OptionalConfigurationsFormValues) => {
++      clearAlerts();
++      if (!cluster?.id) {
++        addAlert({
++          title: t('ai:Missing cluster'),
++          message: t('ai:Cluster must be created before configuring infrastructure environment'),
++          variant: AlertVariant.danger,
++        });
++        return;
++      }
++      if (!disconnectedInfraEnv?.id) {
++        addAlert({
++          title: t('ai:Missing infrastructure environment'),
++          message: t('ai:Infrastructure environment must be created in the Basic step first'),
++          variant: AlertVariant.danger,
++        });
++        return;
++      }
++      const updateParams: InfraEnvUpdateParams = {
++        ...buildInfraEnvParams(values, disconnectedInfraEnv),
++        imageType: DISCONNECTED_IMAGE_TYPE,
++      };
++      try {
++        const { data: updatedInfraEnv } = await InfraEnvsAPI.update(
++          disconnectedInfraEnv.id,
++          updateParams,
++        );
++        setDisconnectedInfraEnv(
++          mergeFormValuesIntoInfraEnv(updatedInfraEnv, values, cluster.openshiftVersion),
++        );
++        setDisconnectedHostsNetworkConfigurationType(
++          values.hostsNetworkConfigurationType as 'dhcp' | 'static',
++        );
++      } catch (error) {
++        handleApiError(error, () => {
+           addAlert({
+-            title: t('ai:Missing cluster'),
+-            message: t('ai:Cluster must be created before configuring infrastructure environment'),
++            title: t('ai:Failed to update infrastructure environment'),
++            message: getApiErrorMessage(error),
+             variant: AlertVariant.danger,
+           });
+-          return;
+-        }
+-
+-        const commonParams = buildInfraEnvParams(values);
+-        // Default pull secret only exists in OCM; when !isInOcm the user must provide it via the field
+-        const pullSecretToUse = isInOcm ? defaultPullSecret : values.pullSecret;
++        });
++      }
++    },
++    [
++      clearAlerts,
++      addAlert,
++      t,
++      cluster,
++      disconnectedInfraEnv,
++      setDisconnectedInfraEnv,
++      setDisconnectedHostsNetworkConfigurationType,
++    ],
++  );
+ 
+-        try {
+-          if (disconnectedInfraEnv?.id) {
+-            // Update existing infraEnv
+-            const updateParams: InfraEnvUpdateParams = {
+-              ...commonParams,
+-              imageType: DISCONNECTED_IMAGE_TYPE,
+-              pullSecret: pullSecretToUse,
+-            };
+-            const { data: updatedInfraEnv } = await InfraEnvsAPI.update(
+-              disconnectedInfraEnv.id,
+-              updateParams,
+-            );
+-            setDisconnectedInfraEnv({
+-              ...updatedInfraEnv,
+-              // infraEnv does not return the whole OCP version
+-              openshiftVersion: cluster.openshiftVersion,
+-            });
+-          } else {
+-            // Create new infraEnv
+-            const createParams: InfraEnvCreateParams = {
+-              name: InfraEnvsService.makeInfraEnvName(DEFAULT_CPU_ARCHITECTURE, cluster.name),
+-              clusterId: cluster.id,
+-              openshiftVersion: cluster.openshiftVersion,
+-              cpuArchitecture: DEFAULT_CPU_ARCHITECTURE,
+-              imageType: DISCONNECTED_IMAGE_TYPE,
+-              pullSecret: pullSecretToUse ?? '',
+-              ...commonParams,
+-            };
+-            const createdInfraEnv = await InfraEnvsService.create(createParams);
+-            setDisconnectedInfraEnv({
+-              ...createdInfraEnv,
+-              // infraEnv does not return the whole OCP version
+-              openshiftVersion: cluster.openshiftVersion,
+-            });
+-          }
+-          moveNext();
+-        } catch (error) {
+-          handleApiError(error, () => {
+-            addAlert({
+-              title: disconnectedInfraEnv?.id
+-                ? t('ai:Failed to update infrastructure environment')
+-                : t('ai:Failed to create infrastructure environment'),
+-              message: getApiErrorMessage(error),
+-              variant: AlertVariant.danger,
+-            });
+-          });
+-        }
+-      }}
++  return (
++    <Formik
++      initialValues={initialValues}
++      validateOnMount
++      validationSchema={validationSchema}
++      onSubmit={onSubmit}
+     >
+-      {({ submitForm, isValid, errors, touched, isSubmitting, values }) => {
+-        const errorFields = getFormikErrorFields(errors, touched);
+-        const handleNext = () => {
+-          void submitForm(); // This will trigger onSubmit
+-        };
+-
+-        return (
+-          <ClusterWizardStep
+-            navigation={<ClusterWizardNavigation />}
+-            footer={
+-              <ClusterWizardFooter
+-                disconnectedClusterId={clusterId}
+-                onNext={handleNext} // Changed from moveNext
+-                onBack={moveBack}
+-                isNextDisabled={!isValid || !cluster}
+-                errorFields={errorFields}
+-                isSubmitting={isSubmitting}
+-              />
+-            }
+-          >
+-            <WithErrorBoundary title="Failed to load Optional Configurations step">
+-              <Grid hasGutter>
+-                <GridItem>
+-                  <Split>
+-                    <SplitItem>
+-                      <Content component="h2">{t('ai:Optional configurations')}</Content>
+-                    </SplitItem>
+-                    <SplitItem>
+-                      <TechnologyPreview />
+-                    </SplitItem>
+-                  </Split>
+-                </GridItem>
+-                <GridItem>
+-                  <Form id="wizard-cluster-optional-configurations__form">
+-                    {/* Pull secret (!OCM only) */}
+-                    {!isInOcm && <PullSecret defaultPullSecret={defaultPullSecret} isOcm={false} />}
+-
+-                    {/* Rendezvous IP */}
+-                    <InputField
+-                      label={t('ai:Rendezvous IP')}
+-                      name="rendezvousIp"
+-                      helperText={t(
+-                        'ai:The IP address that hosts will use to communicate with the bootstrap node during installation.',
+-                      )}
+-                      placeholder="e.g., 192.168.1.10"
+-                      maxLength={45}
+-                    />
+-
+-                    <UploadSSH />
+-
+-                    {/* Proxy Settings */}
+-                    <CheckboxField
+-                      label={t('ai:Configure proxy settings')}
+-                      name="enableProxy"
+-                      helperText={
+-                        <p>
+-                          {t(
+-                            'ai:If hosts are behind a firewall that requires the use of a proxy, provide additional information about the proxy.',
+-                          )}
+-                        </p>
+-                      }
+-                      body={values.enableProxy && <ProxyInputFields />}
+-                    />
+-
+-                    {/* NTP Configuration */}
+-                    <CheckboxField
+-                      label={t('ai:Add your own NTP (Network Time Protocol) sources')}
+-                      name="enableNtpSources"
+-                      helperText={
+-                        <p>
+-                          {t(
+-                            'ai:Configure your own NTP sources to synchronize the time between the hosts that will be added to this infrastructure environment.',
+-                          )}
+-                        </p>
+-                      }
+-                      body={
+-                        values.enableNtpSources && (
+-                          <Grid hasGutter>
+-                            <AdditionalNTPSourcesField
+-                              name="additionalNtpSources"
+-                              helperText={t(
+-                                'ai:A comma separated list of IP or domain names of the NTP pools or servers.',
+-                              )}
+-                            />
+-                          </Grid>
+-                        )
+-                      }
+-                    />
+-
+-                    {/* Network Configuration */}
+-                    <HostsNetworkConfigurationControlGroup
+-                      clusterExists={false}
+-                      isDisabled={false}
+-                    />
+-                  </Form>
+-                </GridItem>
+-              </Grid>
+-            </WithErrorBoundary>
+-          </ClusterWizardStep>
+-        );
+-      }}
++      <OptionalConfigurationsStepForm clusterId={clusterId} cluster={cluster} />
+     </Formik>
+   );
+ };
+diff --git a/libs/ui-lib/lib/ocm/services/ClustersService.ts b/libs/ui-lib/lib/ocm/services/ClustersService.ts
+index b3467041cc..420467b9d1 100644
+--- a/libs/ui-lib/lib/ocm/services/ClustersService.ts
++++ b/libs/ui-lib/lib/ocm/services/ClustersService.ts
+@@ -40,7 +40,7 @@ const ClustersService = {
+       pullSecret: params.pullSecret,
+       clusterId: cluster.id,
+       openshiftVersion: params.openshiftVersion,
+-      cpuArchitecture: params.cpuArchitecture as InfraEnvCreateParams['cpuArchitecture'],
++      cpuArchitecture: params.cpuArchitecture,
+       staticNetworkConfig: params.staticNetworkConfig,
+     };
+ 

@@ -1,0 +1,202 @@
+diff --git a/data/data/install.openshift.io_installconfigs.yaml b/data/data/install.openshift.io_installconfigs.yaml
+index 38f422476d1..3accf6516ab 100644
+--- a/data/data/install.openshift.io_installconfigs.yaml
++++ b/data/data/install.openshift.io_installconfigs.yaml
+@@ -143,6 +143,18 @@ spec:
+                 - Enabled
+                 - Disabled
+                 type: string
++              management:
++                default: ClusterAPI
++                description: |-
++                  Management is the API that will be used for machine management in the cluster.
++                  Using this field for control plane machines requires the ClusterAPIControlPlaneInstall feature gate.
++                  Using this field for compute machines requires the ClusterAPIComputeInstall feature gate.
++                  Supported platforms: aws
++                  Default is ClusterAPI.
++                enum:
++                - ClusterAPI
++                - MachineAPI
++                type: string
+               name:
+                 description: |-
+                   Name is the name of the machine pool.
+@@ -1703,6 +1715,18 @@ spec:
+                   - Enabled
+                   - Disabled
+                   type: string
++                management:
++                  default: ClusterAPI
++                  description: |-
++                    Management is the API that will be used for machine management in the cluster.
++                    Using this field for control plane machines requires the ClusterAPIControlPlaneInstall feature gate.
++                    Using this field for compute machines requires the ClusterAPIComputeInstall feature gate.
++                    Supported platforms: aws
++                    Default is ClusterAPI.
++                  enum:
++                  - ClusterAPI
++                  - MachineAPI
++                  type: string
+                 name:
+                   description: |-
+                     Name is the name of the machine pool.
+@@ -3203,6 +3227,18 @@ spec:
+                 - Enabled
+                 - Disabled
+                 type: string
++              management:
++                default: ClusterAPI
++                description: |-
++                  Management is the API that will be used for machine management in the cluster.
++                  Using this field for control plane machines requires the ClusterAPIControlPlaneInstall feature gate.
++                  Using this field for compute machines requires the ClusterAPIComputeInstall feature gate.
++                  Supported platforms: aws
++                  Default is ClusterAPI.
++                enum:
++                - ClusterAPI
++                - MachineAPI
++                type: string
+               name:
+                 description: |-
+                   Name is the name of the machine pool.
+diff --git a/pkg/types/machinepools.go b/pkg/types/machinepools.go
+index 799698a7bf3..4e046db814e 100644
+--- a/pkg/types/machinepools.go
++++ b/pkg/types/machinepools.go
+@@ -128,6 +128,17 @@ type MachinePool struct {
+ 	// The available types are etcd, swap and user-defined.
+ 	// +optional
+ 	DiskSetup []Disk `json:"diskSetup,omitempty"`
++
++	// Management is the API that will be used for machine management in the cluster.
++	// Using this field for control plane machines requires the ClusterAPIControlPlaneInstall feature gate.
++	// Using this field for compute machines requires the ClusterAPIComputeInstall feature gate.
++	// Supported platforms: aws
++	// Default is ClusterAPI.
++	//
++	// +kubebuilder:default=ClusterAPI
++	// +kubebuilder:validation:Enum=ClusterAPI;MachineAPI
++	// +optional
++	Management MachineManagementAPI `json:"management,omitempty"`
+ }
+ 
+ // MachinePoolPlatform is the platform-specific configuration for a machine
+@@ -229,3 +240,13 @@ type Credential struct {
+ 	// +optional
+ 	CertificateVerification CertificateVerificationPolicy `json:"certificateVerification,omitempty" yaml:"certificateVerification,omitempty"`
+ }
++
++// MachineManagementAPI is the API used for machine management in the cluster.
++type MachineManagementAPI string
++
++const (
++	// ClusterAPI indicates that the machine management API is ClusterAPI.
++	ClusterAPI MachineManagementAPI = "ClusterAPI"
++	// MachineAPI indicates that the machine management API is MachineAPI.
++	MachineAPI MachineManagementAPI = "MachineAPI"
++)
+diff --git a/pkg/types/validation/featuregate_test.go b/pkg/types/validation/featuregate_test.go
+index 6ecc4496739..7d3ce61bf39 100644
+--- a/pkg/types/validation/featuregate_test.go
++++ b/pkg/types/validation/featuregate_test.go
+@@ -211,6 +211,42 @@ func TestFeatureGates(t *testing.T) {
+ 				return ""
+ 			}(),
+ 		},
++		{
++			name: "Control Plane CAPI machine management is allowed with DevPreviewNoUpgrade Feature Set",
++			installConfig: func() *types.InstallConfig {
++				c := validInstallConfig()
++				c.FeatureSet = v1.DevPreviewNoUpgrade
++				c.ControlPlane.Management = types.ClusterAPI
++				return c
++			}(),
++		},
++		{
++			name: "Compute CAPI machine management is allowed with DevPreviewNoUpgrade Feature Set",
++			installConfig: func() *types.InstallConfig {
++				c := validInstallConfig()
++				c.FeatureSet = v1.DevPreviewNoUpgrade
++				c.Compute[0].Management = types.ClusterAPI
++				return c
++			}(),
++		},
++		{
++			name: "Control Plane CAPI machine management is not allowed with Default Feature Set",
++			installConfig: func() *types.InstallConfig {
++				c := validInstallConfig()
++				c.ControlPlane.Management = types.ClusterAPI
++				return c
++			}(),
++			expected: `^controlPlane.management: Forbidden: this field is protected by the ClusterAPIControlPlaneInstall feature gate which must be enabled through either the TechPreviewNoUpgrade or CustomNoUpgrade feature set$`,
++		},
++		{
++			name: "Compute CAPI machine management is not allowed with the Default Feature Set",
++			installConfig: func() *types.InstallConfig {
++				c := validInstallConfig()
++				c.Compute[0].Management = types.ClusterAPI
++				return c
++			}(),
++			expected: `^compute.management: Forbidden: this field is protected by the ClusterAPIComputeInstall feature gate which must be enabled through either the TechPreviewNoUpgrade or CustomNoUpgrade feature set$`,
++		},
+ 	}
+ 
+ 	for _, tc := range cases {
+diff --git a/pkg/types/defaults/validation/featuregates.go b/pkg/types/validation/featuregates.go
+similarity index 65%
+rename from pkg/types/defaults/validation/featuregates.go
+rename to pkg/types/validation/featuregates.go
+index 3fbb15dd30a..a3504450844 100644
+--- a/pkg/types/defaults/validation/featuregates.go
++++ b/pkg/types/validation/featuregates.go
+@@ -8,9 +8,9 @@ import (
+ 	"github.com/openshift/installer/pkg/types/featuregates"
+ )
+ 
+-// GatedFeatures determines all of the install config fields that should
++// validateMachinePoolFeatureGates determines all of the install config fields that should
+ // be validated to ensure that the proper featuregate is enabled when the field is used.
+-func GatedFeatures(c *types.InstallConfig) []featuregates.GatedInstallConfigFeature {
++func validateMachinePoolFeatureGates(c *types.InstallConfig) []featuregates.GatedInstallConfigFeature {
+ 	return []featuregates.GatedInstallConfigFeature{
+ 		{
+ 			FeatureGateName: features.FeatureGateDualReplica,
+@@ -40,5 +40,15 @@ func GatedFeatures(c *types.InstallConfig) []featuregates.GatedInstallConfigFeat
+ 			Condition:       len(c.OSImageStream) != 0,
+ 			Field:           field.NewPath("osImageStream"),
+ 		},
++		{
++			FeatureGateName: features.FeatureGateClusterAPIControlPlaneInstall,
++			Condition:       c.ControlPlane != nil && c.ControlPlane.Management == types.ClusterAPI,
++			Field:           field.NewPath("controlPlane", "management"),
++		},
++		{
++			FeatureGateName: features.FeatureGateClusterAPIComputeInstall,
++			Condition:       len(c.Compute) > 0 && c.Compute[0].Management == types.ClusterAPI,
++			Field:           field.NewPath("compute", "management"),
++		},
+ 	}
+ }
+diff --git a/pkg/types/validation/installconfig.go b/pkg/types/validation/installconfig.go
+index ea947434ee3..04ad977ff11 100644
+--- a/pkg/types/validation/installconfig.go
++++ b/pkg/types/validation/installconfig.go
+@@ -34,7 +34,6 @@ import (
+ 	"github.com/openshift/installer/pkg/types/baremetal"
+ 	baremetalvalidation "github.com/openshift/installer/pkg/types/baremetal/validation"
+ 	"github.com/openshift/installer/pkg/types/common"
+-	defaultsvalidation "github.com/openshift/installer/pkg/types/defaults/validation"
+ 	"github.com/openshift/installer/pkg/types/external"
+ 	"github.com/openshift/installer/pkg/types/featuregates"
+ 	"github.com/openshift/installer/pkg/types/gcp"
+@@ -1652,9 +1651,7 @@ func validateGatedFeatures(c *types.InstallConfig) field.ErrorList {
+ 		gatedFeatures = append(gatedFeatures, openstackvalidation.GatedFeatures(c)...)
+ 	}
+ 
+-	if c.ControlPlane != nil {
+-		gatedFeatures = append(gatedFeatures, defaultsvalidation.GatedFeatures(c)...)
+-	}
++	gatedFeatures = append(gatedFeatures, validateMachinePoolFeatureGates(c)...)
+ 
+ 	fg := c.EnabledFeatureGates()
+ 	errMsgTemplate := "this field is protected by the %s feature gate which must be enabled through either the TechPreviewNoUpgrade or CustomNoUpgrade feature set"

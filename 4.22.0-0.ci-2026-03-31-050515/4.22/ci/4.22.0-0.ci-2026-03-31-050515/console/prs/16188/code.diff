@@ -1,0 +1,125 @@
+diff --git a/analyze.sh b/analyze.sh
+index 3537bdf56bc..771206f81d2 100755
+--- a/analyze.sh
++++ b/analyze.sh
+@@ -8,20 +8,13 @@ ARTIFACT_DIR=${ARTIFACT_DIR:=/tmp/artifacts}
+ 
+ cd frontend
+ echo "Analyzing Webpack bundles..."
+-yarn run analyze
++ANALYZE_RC=0
++yarn run analyze || ANALYZE_RC=$?
+ if [ -d "$ARTIFACT_DIR" ]; then
+   echo "Copying the Webpack Bundle Analyzer report to $ARTIFACT_DIR..."
+   cp public/dist/report.html "${ARTIFACT_DIR}"
+ fi
+-
+-MAX_BYTES=3879731 # ~3.7 MiB
+-VENDORS_MAIN_BYTES=$(du -b `find public/dist -type f -name 'vendors~main-chunk*js'` | cut -f1)
+-DISPLAY_VALUE=$(awk "BEGIN {printf \"%.2f\n\", $VENDORS_MAIN_BYTES/1024/1024}")
+-MAX_DISPLAY_VALUE=$(awk "BEGIN {printf \"%.2f\n\", $MAX_BYTES/1024/1024}")
+-
+-echo "Main vendor bundle size: $DISPLAY_VALUE MiB"
+-if (( VENDORS_MAIN_BYTES > MAX_BYTES )); then
+-  echo "FAILURE: Main vendor bundle is larger than the $MAX_DISPLAY_VALUE MiB limit."
++if [ $ANALYZE_RC -ne 0 ]; then
+   echo "If you haven't added a new dependency, an import might have accidentally pulled an existing dependency into the main vendor bundle."
+   echo "If adding a large dependency, consider lazy loading the component with AsyncComponent."
+   exit 1
+diff --git a/frontend/packages/eslint-plugin-console/lib/config/rules/typescript.js b/frontend/packages/eslint-plugin-console/lib/config/rules/typescript.js
+index a73eedd7ff1..ce89ad96b83 100644
+--- a/frontend/packages/eslint-plugin-console/lib/config/rules/typescript.js
++++ b/frontend/packages/eslint-plugin-console/lib/config/rules/typescript.js
+@@ -289,18 +289,41 @@ module.exports = {
+   'prefer-rest-params': 'error',
+   'prefer-spread': 'error',
+ 
+-  // Prevent imports from @patternfly/react-icons CJS distribution
++  // Prevent imports from @patternfly CJS distributions (dist/js or dist/cjs).
++  // The import/no-restricted-paths rule does not support globs, so each package
++  // with a CJS distribution must be listed individually.
++  // TODO: change this to a glob when our eslint is no longer ancient
+   'import/no-restricted-paths': [
+     'error',
+     {
+       zones: [
+-        {
++        'react-core',
++        'react-icons',
++        'react-table',
++        'react-charts',
++        'react-code-editor',
++        'react-data-view',
++        'react-drag-drop',
++        'react-log-viewer',
++        'react-styles',
++        'react-templates',
++        'react-tokens',
++        'react-topology',
++        'react-virtualized-extension',
++        'react-catalog-view-extension',
++      ]
++        .map((pkg) => ({
+           target: './',
+-          from: 'node_modules/@patternfly/react-icons/dist/js',
+-          except: ['./index.js'],
+-          message: 'Import from the ESM entry point instead: @patternfly/react-icons',
+-        },
+-      ],
++          from: `node_modules/@patternfly/${pkg}/dist/js`,
++          message: 'Import from the package index instead of the CJS dist/js path.',
++        }))
++        .concat(
++          ['react-component-groups', 'react-data-view', 'react-user-feedback'].map((pkg) => ({
++            target: './',
++            from: `node_modules/@patternfly/${pkg}/dist/cjs`,
++            message: 'Import from the package index instead of the CJS dist/cjs path.',
++          })),
++        ),
+     },
+   ],
+ };
+diff --git a/frontend/webpack.config.ts b/frontend/webpack.config.ts
+index dbf428af08b..af5cceccd6c 100644
+--- a/frontend/webpack.config.ts
++++ b/frontend/webpack.config.ts
+@@ -92,6 +92,11 @@ const config: Configuration = {
+     filename: '[name]-bundle.js',
+     chunkFilename: '[name]-[chunkhash].js',
+   },
++  performance: {
++    // The maximum size of the entry point and generated files permitted by analyze.sh
++    maxEntrypointSize: 11207475, // ~10.69 MiB
++    maxAssetSize: 5945425, // ~5.67 MiB
++  },
+   devServer: {
+     hot: HOT_RELOAD !== 'false',
+     webSocketServer: 'sockjs',
+@@ -222,13 +227,7 @@ const config: Configuration = {
+           test: /\/node_modules\//,
+           priority: -10,
+           enforce: true,
+-          filename: (pathData) => {
+-            // give a special name to initial chunk for analyze.sh
+-            if ((pathData?.chunk as webpack.Chunk)?.isOnlyInitial()) {
+-              return `vendors~main-chunk-[name]-[contenthash].min.js`;
+-            }
+-            return 'vendors~[name]-chunk-[contenthash].min.js';
+-          },
++          filename: 'vendors~[name]-chunk-[contenthash].min.js',
+         },
+         'vendor-plugins-shared': {
+           test(module: webpack.NormalModule) {
+@@ -339,6 +338,12 @@ if (ANALYZE_BUNDLE === 'true') {
+       openAnalyzer: false,
+     }),
+   );
++
++  // Only fail the build due to excess bundle size if running analyze.sh
++  // This way, the other tests (frontend, e2e) can still provide feedback in CI
++  if (config.performance) {
++    config.performance.hints = 'error';
++  }
+ }
+ 
+ /* Production settings */

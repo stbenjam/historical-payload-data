@@ -1,0 +1,2136 @@
+diff --git a/go.mod b/go.mod
+index 1c4f616f84..c49a1e9395 100644
+--- a/go.mod
++++ b/go.mod
+@@ -27,6 +27,7 @@ require (
+ 	github.com/prometheus/client_golang v1.23.2
+ 	github.com/spf13/cobra v1.10.2
+ 	github.com/spf13/pflag v1.0.10
++	golang.org/x/sync v0.19.0
+ 	gopkg.in/fsnotify.v1 v1.4.7
+ 	gopkg.in/ini.v1 v1.67.1
+ 	gopkg.in/yaml.v2 v2.4.0
+@@ -123,7 +124,6 @@ require (
+ 	golang.org/x/mod v0.32.0 // indirect
+ 	golang.org/x/net v0.49.0 // indirect
+ 	golang.org/x/oauth2 v0.34.0 // indirect
+-	golang.org/x/sync v0.19.0 // indirect
+ 	golang.org/x/sys v0.40.0 // indirect
+ 	golang.org/x/term v0.39.0 // indirect
+ 	golang.org/x/text v0.33.0 // indirect
+diff --git a/test/e2e/performanceprofile/functests/11_mixedcpus/mixedcpus.go b/test/e2e/performanceprofile/functests/11_mixedcpus/mixedcpus.go
+index 944b9f0701..3957884285 100644
+--- a/test/e2e/performanceprofile/functests/11_mixedcpus/mixedcpus.go
++++ b/test/e2e/performanceprofile/functests/11_mixedcpus/mixedcpus.go
+@@ -4,10 +4,13 @@ import (
+ 	"context"
+ 	"encoding/json"
+ 	"fmt"
++	"math"
+ 	"strconv"
+ 	"strings"
+ 	"time"
+ 
++	"golang.org/x/sync/errgroup"
++
+ 	. "github.com/onsi/ginkgo/v2"
+ 	. "github.com/onsi/gomega"
+ 
+@@ -41,6 +44,7 @@ import (
+ 	"github.com/openshift/cluster-node-tuning-operator/test/e2e/performanceprofile/functests/utils/poolname"
+ 	"github.com/openshift/cluster-node-tuning-operator/test/e2e/performanceprofile/functests/utils/profiles"
+ 	"github.com/openshift/cluster-node-tuning-operator/test/e2e/performanceprofile/functests/utils/profilesupdate"
++	"github.com/openshift/cluster-node-tuning-operator/test/e2e/performanceprofile/functests/utils/resources"
+ )
+ 
+ const (
+@@ -510,6 +514,311 @@ var _ = Describe("Mixedcpus", Ordered, Label(string(label.MixedCPUs)), func() {
+ 			})
+ 		})
+ 	})
++
++	Context("Check exec-cpu-affinity feature", func() {
++		BeforeEach(func() {
++			ns := getTestingNamespace()
++			Expect(testclient.DataPlaneClient.Create(ctx, &ns)).ToNot(HaveOccurred())
++			DeferCleanup(func() {
++				Expect(testclient.DataPlaneClient.Delete(ctx, &ns)).ToNot(HaveOccurred())
++				Expect(namespaces.WaitForDeletion(testutils.NamespaceTesting, 5*time.Minute)).ToNot(HaveOccurred())
++			})
++		})
++
++		When("exec-cpu-affinity is enabled (default in PP)", func() {
++			var workerRTNode *corev1.Node
++			var profile, initialProfile *performancev2.PerformanceProfile
++			var getter cgroup.ControllersGetter
++			var updatedShared, updatedIsolated cpuset.CPUSet
++			var needsUpdate bool
++
++			BeforeEach(func() {
++				needsUpdate = false
++
++				By("Checking if exec-cpu-affinity is enabled by default in the profile")
++				var err error
++				profile, err = profiles.GetByNodeLabels(testutils.NodeSelectorLabels)
++				Expect(err).ToNot(HaveOccurred())
++				Expect(profile).ToNot(BeNil(), "Failed to get performance profile")
++				initialProfile = profile.DeepCopy()
++				val, ok := profile.Annotations[performancev2.PerformanceProfileExecCPUAffinityAnnotation]
++				if ok {
++					Expect(val).NotTo(Equal(performancev2.PerformanceProfileExecCPUAffinityDisable), "exec-cpu-affinity is disabled in the profile")
++				}
++
++				workerRTNodes, err := nodes.GetByLabels(testutils.NodeSelectorLabels)
++				Expect(err).ToNot(HaveOccurred())
++				workerRTNodes, err = nodes.MatchingOptionalSelector(workerRTNodes)
++				Expect(err).ToNot(HaveOccurred(), fmt.Sprintf("error looking for the optional selector: %v", err))
++				Expect(workerRTNodes).ToNot(BeEmpty())
++				workerRTNode = &workerRTNodes[0]
++
++				getter, err = cgroup.BuildGetter(ctx, testclient.DataPlaneClient, testclient.K8sClient)
++				Expect(err).ToNot(HaveOccurred())
++
++				By("Updating performance profile to have enough shared cpus if needed")
++				updatedIsolated = *mustParse(string(*profile.Spec.CPU.Isolated))
++				updatedShared = *mustParse(string(*profile.Spec.CPU.Shared))
++
++				if updatedShared.Size() < 2 {
++					testlog.Info("shared cpuset has less than 2 cpus; this test requires at least 2 shared cpus; update the profile")
++
++					// we need at least 4 total isolated and shared CPUs:
++					// 1 as a buffer for node's base load
++					// 1 as the test gu pod requests
++					// 2 as shared cpus
++					minIsolatedCpus := 3
++					if updatedShared.Size() == 0 {
++						minIsolatedCpus = 4
++					}
++					if updatedIsolated.Size() < minIsolatedCpus {
++						Skip(fmt.Sprintf("isolated cpuset has less than %d cpus; this test requires at least another %d isolated cpus", minIsolatedCpus, minIsolatedCpus))
++					}
++
++					coreSiblings, err := nodes.GetCoreSiblings(ctx, workerRTNode)
++					Expect(err).ToNot(HaveOccurred())
++					updatedShared, err = nodes.GetTwoSiblingsFromCPUSet(coreSiblings, updatedIsolated)
++					if err != nil {
++						testlog.Info("no two siblings found in the given CPU set, looks like the initial profile does not respect hyperthreading; proceed then with this state and pick first two isolated CPUs as the shared CPUs")
++						updatedShared = cpuset.New(updatedIsolated.List()[0], updatedIsolated.List()[1])
++					}
++
++					updatedIsolated = updatedIsolated.Difference(updatedShared)
++
++					testlog.Infof("CPU update:shared cpu %q isolated cpus %q", updatedShared.String(), updatedIsolated.String())
++					profile.Spec.CPU.Isolated = cpuSetToPerformanceCPUSet(&updatedIsolated)
++					profile.Spec.CPU.Shared = cpuSetToPerformanceCPUSet(&updatedShared)
++					profile.Spec.WorkloadHints.MixedCpus = ptr.To(true) // if not already
++
++					profiles.UpdateWithRetry(profile)
++
++					poolName := poolname.GetByProfile(context.TODO(), profile)
++					By(fmt.Sprintf("Applying changes in performance profile and waiting until %s will start updating", poolName))
++					profilesupdate.WaitForTuningUpdating(context.TODO(), profile)
++					By(fmt.Sprintf("Waiting when %s finishes updates", poolName))
++					profilesupdate.WaitForTuningUpdated(context.TODO(), profile)
++					needsUpdate = true
++				}
++			})
++
++			AfterEach(func() {
++				if !needsUpdate {
++					By("no need for a revert")
++					return
++				}
++
++				By("Reverting the cluster to previous state")
++				profiles.UpdateWithRetry(initialProfile)
++				poolName := poolname.GetByProfile(context.TODO(), initialProfile)
++				By(fmt.Sprintf("Applying changes in performance profile and waiting until %s will start updating", poolName))
++				profilesupdate.WaitForTuningUpdating(context.TODO(), initialProfile)
++				By(fmt.Sprintf("Waiting when %s finishes updates", poolName))
++				profilesupdate.WaitForTuningUpdated(context.TODO(), initialProfile)
++			})
++
++			DescribeTable("should pin exec process to the first CPU that belongs to the right CPU set in the container, that is expected to take charge of exec process (isolated or shared)", func(qos corev1.PodQOSClass, containersResources []corev1.ResourceList) {
++				By("Creating the test pod")
++				isolatedCpus, err := cpuset.Parse(string(*profile.Spec.CPU.Isolated))
++				Expect(err).ToNot(HaveOccurred(), "Failed to parse isolated CPUs")
++				switch qos {
++				case corev1.PodQOSGuaranteed:
++					totalPodCpus := resources.TotalCPUsRoundedUp(containersResources)
++					if isolatedCpus.Size() < totalPodCpus {
++						Skip("Skipping test: Insufficient isolated CPUs")
++					}
++				case corev1.PodQOSBurstable:
++					maxPodCpus := resources.MaxCPURequestsRoundedUp(containersResources)
++					if isolatedCpus.Size() < maxPodCpus {
++						Skip("Skipping test: Insufficient isolated CPUs")
++					}
++				case corev1.PodQOSBestEffort:
++					testlog.Info("test best-effort pod")
++				default:
++					Fail("Invalid QoS class")
++				}
++
++				testPod, err := pods.MakePodWithResources(workerRTNode.Name, qos, containersResources)
++				Expect(err).ToNot(HaveOccurred(), "Failed to make test pod")
++				Expect(testclient.DataPlaneClient.Create(ctx, testPod)).To(Succeed(), "Failed to create test pod")
++				DeferCleanup(func() {
++					Expect(pods.DeleteAndSync(ctx, testclient.DataPlaneClient, testPod)).To(Succeed())
++				})
++				testPod, err = pods.WaitForCondition(ctx, client.ObjectKeyFromObject(testPod), corev1.PodReady, corev1.ConditionTrue, 5*time.Minute)
++				Expect(err).ToNot(HaveOccurred())
++
++				cpusetCfg := &controller.CpuSet{}
++				for _, container := range testPod.Spec.Containers {
++					/* we need to verify the below scenarios:
++					 1. non gu pod -> exec process will be pinned to any CPU
++					 2. gu pods:
++					    2.1 containers requesting whole CPUs:
++							a. with Shared CPU -> exec process is pinned to the FIRST SHARED CPU
++							b. without Shared CPU -> exec process is pinned to the FIRST ISOLATED CPU of the container
++						2.2 containers requesting fractional CPUs -> exec process is pinned to ANY CPU
++					*/
++
++					isExclusiveCPURequest := false
++					retries := 1
++
++					if qos == corev1.PodQOSGuaranteed {
++						milliCPU := container.Resources.Requests.Cpu().MilliValue()
++						isExclusiveCPURequest = (milliCPU % 1000) == 0
++					}
++
++					if !isExclusiveCPURequest {
++						testlog.Infof("exec process should be pinned to any CPU of the isolated set")
++					}
++
++					By(fmt.Sprintf("Prepare comparable data for container %s, resource list: %v", container.Name, container.Resources.String()))
++					Expect(getter.Container(ctx, testPod, container.Name, cpusetCfg)).To(Succeed(), "Failed to get cpuset config for the container")
++
++					cpusIncludingShared, err := cpuset.Parse(cpusetCfg.Cpus)
++					Expect(err).ToNot(HaveOccurred(), "Failed to parse cpuset config for test pod cpus=%q", cpusetCfg.Cpus)
++					Expect(cpusIncludingShared.Size()).ToNot(BeZero(), "Failed to get cpuset config for test pod cpus=%q", cpusetCfg.Cpus)
++					testlog.Infof("all CPUs dedicated for the container (including shared if requested): %s", cpusIncludingShared.String())
++					firstCPU := cpusIncludingShared.List()[0]
++
++					isSharedCPUsRequested := container.Resources.Limits.Name(sharedCpusResource, resource.DecimalSI).Value() > 0
++					if isSharedCPUsRequested {
++						cntShared := cpusIncludingShared.Difference(updatedIsolated)
++						reserved := mustParse(string(*profile.Spec.CPU.Reserved))
++						cntShared = cntShared.Difference(*reserved)
++						Expect(cntShared.Size()).ToNot(BeZero(), "no shared CPUs found for container %s", container.Name)
++						Expect(cntShared.Equals(updatedShared)).To(BeTrue(), "shared CPUs are not as configured in the profile; found=%s, expected=%s", cntShared.String(), updatedShared.String())
++						firstCPU = cntShared.List()[0]
++						testlog.Infof("container %s: first shared CPU: %d; all shared CPUs: %s", container.Name, firstCPU, cntShared.String())
++					}
++
++					// try high enough times to ensure that even with low cpus count, the functionality is preserved
++					if isExclusiveCPURequest {
++						cpuRequest := container.Resources.Requests.Name(corev1.ResourceCPU, resource.DecimalSI).Value()
++						if isSharedCPUsRequested {
++							cpuRequest = int64(updatedShared.Size())
++						}
++
++						// The concept of retries is to avoid false positives on first check.
++						// especially when the number of allowed cpus is low, the possibility to
++						// choose the correct (first) CPU is anyway high; with retries we ensure
++						// that even with this high possibility, retrying many times still gives
++						// us the correct result.
++						// the formula is to start with 5 retries (`oc exec` entries to the container)
++						// for CPUset of size 2, and reduce that when the number is higher, down
++						// to 1 retry minimum.
++						retries = int(math.Ceil(float64(10) / float64(cpuRequest)))
++					}
++
++					testlog.Infof("expected CPU affinity: pinToFirstCPU: %t, retries: %d", isExclusiveCPURequest, retries)
++					if isExclusiveCPURequest {
++						testlog.Infof("expected CPU affinity: affinityToShared: %t, affinityToIsolated: %t", isSharedCPUsRequested, !isSharedCPUsRequested)
++					} else {
++						testlog.Infof("expected CPU affinity: Any CPU from the allowed list")
++					}
++
++					// Sample the pinned CPU multiple times per run to ensure the process stays pinned (not a single racy snapshot).
++					// Field 39 in /proc/<pid>/stat is the processor number.
++					// See proc_pid_stat(5): https://man7.org/linux/man-pages/man5/proc_pid_stat.5.html
++					By(fmt.Sprintf("Run exec commands on the pod in parallel and verify the process is pinned to the right CPU for container %s", container.Name))
++					const samplesPerRun = 5
++					const sampleIntervalSec = 1
++					cmd := []string{"/bin/bash", "-c", fmt.Sprintf(
++						"sleep 10 & SLPID=$!; sleep 0.5; for ((i=1;i<=%d;i++)); do awk '{print $39}' /proc/$SLPID/stat; sleep %d; done",
++						samplesPerRun, sampleIntervalSec)}
++					execProcessCPUSamples := make([][]int, retries)
++					g, _ := errgroup.WithContext(ctx)
++					for i := 0; i < retries; i++ {
++						idx := i
++						g.Go(func() error {
++							output, err := pods.ExecCommandOnPod(testclient.K8sClient, testPod, container.Name, cmd)
++							if err != nil {
++								return fmt.Errorf("exec command failed for run %d: %w", idx, err)
++							}
++							strout := strings.TrimSpace(string(output))
++							testlog.Infof("entry %d: exec command output (samples): \n%s", idx, strout)
++							var samples []int
++							for _, line := range strings.Split(strout, "\n") {
++								line = strings.TrimSpace(line)
++								if line == "" {
++									continue
++								}
++								cpu, err := strconv.Atoi(line)
++								if err != nil {
++									return fmt.Errorf("entry %d: failed to parse processor number from %q: %w", idx, line, err)
++								}
++								samples = append(samples, cpu)
++							}
++							if len(samples) == 0 {
++								return fmt.Errorf("entry %d: no valid samples", idx)
++							}
++							if len(samples) < samplesPerRun {
++								testlog.Warningf("entry %d: got %d/%d samples (process may have exited early)", idx, len(samples), samplesPerRun)
++							}
++							execProcessCPUSamples[idx] = samples
++							return nil
++						})
++					}
++					Expect(g.Wait()).ToNot(HaveOccurred(), "One or more exec commands failed")
++					for i := 0; i < retries; i++ {
++						testlog.Infof("process samples of entry %d: %v", i, execProcessCPUSamples[i])
++						for _, cpu := range execProcessCPUSamples[i] {
++							if isExclusiveCPURequest {
++								Expect(cpu).To(Equal(firstCPU), "Exec process CPU is not the correct first CPU")
++							} else {
++								Expect(cpusIncludingShared.Contains(cpu)).To(BeTrue(), "Exec process CPU %d is not part of the cpuset: %s", cpu, cpusIncludingShared.String())
++							}
++						}
++					}
++				}
++			},
++				Entry("guaranteed pod with mixed containers: exec process on container with whole CPUs should be pinned to the first shared CPU; and on container with fractional CPUs should be pinned to any CPU even if shared is specified",
++					corev1.PodQOSGuaranteed,
++					[]corev1.ResourceList{
++						{ // cnt1 resources
++							corev1.ResourceCPU:    resource.MustParse("2"),
++							corev1.ResourceMemory: resource.MustParse("100Mi"),
++							sharedCpusResource:    resource.MustParse("1"),
++						},
++						{ // cnt2 resources
++							corev1.ResourceCPU:    resource.MustParse("2300m"),
++							corev1.ResourceMemory: resource.MustParse("100Mi"),
++							sharedCpusResource:    resource.MustParse("1"),
++						},
++					}),
++				Entry("guaranteed pod with mixed containers: with shared CPU and without shared CPU",
++					corev1.PodQOSGuaranteed,
++					[]corev1.ResourceList{
++						{ // cnt1 resources
++							corev1.ResourceCPU:    resource.MustParse("2"),
++							corev1.ResourceMemory: resource.MustParse("100Mi"),
++							sharedCpusResource:    resource.MustParse("1"),
++						},
++						{ // cnt2 resources
++							corev1.ResourceCPU:    resource.MustParse("2"),
++							corev1.ResourceMemory: resource.MustParse("100Mi"),
++						},
++						{ // cnt3 resources
++							corev1.ResourceCPU:    resource.MustParse("2300m"),
++							corev1.ResourceMemory: resource.MustParse("100Mi"),
++						},
++					}),
++				Entry("best-effort pod with shared CPU request",
++					corev1.PodQOSBestEffort,
++					// shared CPUs are only allowed for guaranteed pods
++					[]corev1.ResourceList{
++						//cnt1 resources
++						{},
++					}),
++				Entry("burstable pod with shared CPU request",
++					corev1.PodQOSBurstable,
++					// shared CPUs are only allowed for guaranteed pods
++					[]corev1.ResourceList{
++						{ // cnt1 resources
++							corev1.ResourceCPU:    resource.MustParse("2"),
++							corev1.ResourceMemory: resource.MustParse("100Mi"),
++						},
++					}),
++			)
++		})
++	})
+ })
+ 
+ func setup(ctx context.Context) func(ctx2 context.Context) {
+diff --git a/test/e2e/performanceprofile/functests/13_llc/llc.go b/test/e2e/performanceprofile/functests/13_llc/llc.go
+index 421dd1afd3..35f50f3aac 100644
+--- a/test/e2e/performanceprofile/functests/13_llc/llc.go
++++ b/test/e2e/performanceprofile/functests/13_llc/llc.go
+@@ -14,7 +14,6 @@ import (
+ 	. "github.com/onsi/gomega"
+ 	appsv1 "k8s.io/api/apps/v1"
+ 	corev1 "k8s.io/api/core/v1"
+-	apierrors "k8s.io/apimachinery/pkg/api/errors"
+ 	"k8s.io/apimachinery/pkg/api/resource"
+ 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+ 	"k8s.io/apimachinery/pkg/fields"
+@@ -1278,7 +1277,7 @@ var _ = Describe("[rfe_id:77446] LLC-aware cpu pinning", Label(string(label.Open
+ 			}
+ 			ctx := context.Background()
+ 			testlog.Infof("deleting pod %q", testPod.Name)
+-			deleteTestPod(ctx, testPod)
++			Expect(pods.DeleteAndSync(ctx, testclient.DataPlaneClient, testPod)).To(Succeed())
+ 		})
+ 
+ 		It("[test_id:77727] should align containers which request less than a L3 group size exclusive CPUs", func(ctx context.Context) {
+@@ -1429,7 +1428,7 @@ func waitForDeploymentPodsDeletion(ctx context.Context, targetNode *corev1.Node,
+ 	}).WithTimeout(time.Minute * 5).WithPolling(time.Second * 30).Should(BeTrue())
+ 	for _, pod := range podList.Items {
+ 		testlog.TaggedInfof("cleanup", "Deleting pod %s", pod.Name)
+-		err := pods.WaitForDeletion(ctx, &pod, pods.DefaultDeletionTimeout*time.Second)
++		err := pods.WaitForDeletion(ctx, testclient.DataPlaneClient, &pod, pods.DefaultDeletionTimeout*time.Second)
+ 		Expect(err).ToNot(HaveOccurred())
+ 	}
+ }
+@@ -1582,21 +1581,3 @@ func makeLLCPod(nodeName string, guaranteedCPUs int) *corev1.Pod {
+ 	testPod.Spec.RuntimeClassName = &runtimeClass
+ 	return testPod
+ }
+-
+-func deleteTestPod(ctx context.Context, testpod *corev1.Pod) bool {
+-	GinkgoHelper()
+-
+-	// it possible that the pod already was deleted as part of the test, in this case we want to skip teardown
+-	err := testclient.DataPlaneClient.Get(ctx, client.ObjectKeyFromObject(testpod), testpod)
+-	if apierrors.IsNotFound(err) {
+-		return false
+-	}
+-
+-	err = testclient.DataPlaneClient.Delete(ctx, testpod)
+-	Expect(err).ToNot(HaveOccurred())
+-
+-	err = pods.WaitForDeletion(ctx, testpod, pods.DefaultDeletionTimeout*time.Second)
+-	Expect(err).ToNot(HaveOccurred())
+-
+-	return true
+-}
+diff --git a/test/e2e/performanceprofile/functests/1_performance/cpu_management.go b/test/e2e/performanceprofile/functests/1_performance/cpu_management.go
+index 7dcc572aac..3cbd8cc8b2 100644
+--- a/test/e2e/performanceprofile/functests/1_performance/cpu_management.go
++++ b/test/e2e/performanceprofile/functests/1_performance/cpu_management.go
+@@ -4,15 +4,17 @@ import (
+ 	"context"
+ 	"encoding/json"
+ 	"fmt"
++	"math"
+ 	"os"
+ 	"regexp"
+ 	"strconv"
+ 	"strings"
+ 	"time"
+ 
++	"golang.org/x/sync/errgroup"
++
+ 	appsv1 "k8s.io/api/apps/v1"
+ 	corev1 "k8s.io/api/core/v1"
+-	"k8s.io/apimachinery/pkg/api/errors"
+ 	"k8s.io/apimachinery/pkg/api/resource"
+ 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+ 	"k8s.io/apimachinery/pkg/labels"
+@@ -44,6 +46,7 @@ import (
+ 	"github.com/openshift/cluster-node-tuning-operator/test/e2e/performanceprofile/functests/utils/nodes"
+ 	"github.com/openshift/cluster-node-tuning-operator/test/e2e/performanceprofile/functests/utils/pods"
+ 	"github.com/openshift/cluster-node-tuning-operator/test/e2e/performanceprofile/functests/utils/profiles"
++	"github.com/openshift/cluster-node-tuning-operator/test/e2e/performanceprofile/functests/utils/resources"
+ )
+ 
+ var workerRTNode *corev1.Node
+@@ -156,6 +159,7 @@ var _ = Describe("[rfe_id:27363][performance] CPU Management", Ordered, func() {
+ 			allocatableCPU, _ := workerRTNode.Status.Allocatable.Cpu().AsInt64()
+ 			differenceCPUGot := capacityCPU - allocatableCPU
+ 			differenceCPUExpected := int64(len(listReservedCPU))
++			// TODO: adjust the test to consider having shared CPUs
+ 			Expect(differenceCPUGot).To(Equal(differenceCPUExpected), "Allocatable CPU %d should be less than capacity %d by %d; got %d instead", allocatableCPU, capacityCPU, differenceCPUExpected, differenceCPUGot)
+ 		})
+ 
+@@ -275,7 +279,7 @@ var _ = Describe("[rfe_id:27363][performance] CPU Management", Ordered, func() {
+ 		})
+ 
+ 		AfterEach(func() {
+-			deleteTestPod(context.TODO(), testpod)
++			Expect(pods.DeleteAndSync(context.TODO(), testclient.DataPlaneClient, testpod)).To(Succeed())
+ 		})
+ 
+ 		DescribeTable("Verify CPU usage by stress PODs", func(ctx context.Context, guaranteed bool) {
+@@ -366,7 +370,7 @@ var _ = Describe("[rfe_id:27363][performance] CPU Management", Ordered, func() {
+ 			Expect(err).ToNot(HaveOccurred())
+ 		})
+ 		AfterEach(func() {
+-			deleteTestPod(context.TODO(), testpod)
++			Expect(pods.DeleteAndSync(context.TODO(), testclient.DataPlaneClient, testpod)).To(Succeed())
+ 		})
+ 		When("kubelet is restart", func() {
+ 			It("[test_id: 73501] defaultCpuset should not change", func() {
+@@ -449,7 +453,7 @@ var _ = Describe("[rfe_id:27363][performance] CPU Management", Ordered, func() {
+ 
+ 		AfterEach(func() {
+ 			if testpod != nil {
+-				deleteTestPod(context.TODO(), testpod)
++				Expect(pods.DeleteAndSync(context.TODO(), testclient.DataPlaneClient, testpod)).To(Succeed())
+ 			}
+ 		})
+ 
+@@ -508,7 +512,7 @@ var _ = Describe("[rfe_id:27363][performance] CPU Management", Ordered, func() {
+ 				fmt.Sprintf("IRQ still active on CPU%s", psr))
+ 
+ 			By("Checking that after removing POD default smp affinity is returned back to all active CPUs")
+-			deleteTestPod(context.TODO(), testpod)
++			Expect(pods.DeleteAndSync(context.TODO(), testclient.DataPlaneClient, testpod)).To(Succeed())
+ 			defaultSmpAffinitySet, err = nodes.GetDefaultSmpAffinitySet(context.TODO(), workerRTNode)
+ 			Expect(err).ToNot(HaveOccurred())
+ 
+@@ -607,7 +611,7 @@ var _ = Describe("[rfe_id:27363][performance] CPU Management", Ordered, func() {
+ 			if testpod == nil {
+ 				return
+ 			}
+-			deleteTestPod(context.TODO(), testpod)
++			Expect(pods.DeleteAndSync(context.TODO(), testclient.DataPlaneClient, testpod)).To(Succeed())
+ 		})
+ 
+ 		It("[test_id:49149] should reject pods which request integral CPUs not aligned with machine SMT level", func() {
+@@ -660,7 +664,7 @@ var _ = Describe("[rfe_id:27363][performance] CPU Management", Ordered, func() {
+ 			if testpod == nil {
+ 				return
+ 			}
+-			deleteTestPod(context.TODO(), testpod)
++			Expect(pods.DeleteAndSync(context.TODO(), testclient.DataPlaneClient, testpod)).To(Succeed())
+ 		})
+ 
+ 		DescribeTable("Verify Hyper-Thread aware scheduling for guaranteed pods",
+@@ -707,7 +711,7 @@ var _ = Describe("[rfe_id:27363][performance] CPU Management", Ordered, func() {
+ 					testpod = startHTtestPod(ctx, cpuCount)
+ 					Expect(checkPodHTSiblings(ctx, testpod)).To(BeTrue(), "Pod cpu set does not map to host cpu sibling pairs")
+ 					By("Deleting test pod...")
+-					deleteTestPod(ctx, testpod)
++					Expect(pods.DeleteAndSync(ctx, testclient.DataPlaneClient, testpod)).To(Succeed())
+ 				}
+ 			},
+ 
+@@ -900,13 +904,7 @@ var _ = Describe("[rfe_id:27363][performance] CPU Management", Ordered, func() {
+ 		AfterAll(func() {
+ 			for podUID, testpod := range allTestpods {
+ 				testlog.Infof("deleting test pod %s/%s UID=%q", testpod.Namespace, testpod.Name, podUID)
+-				err := testclient.DataPlaneClient.Get(ctx, client.ObjectKeyFromObject(testpod), testpod)
+-				Expect(err).ToNot(HaveOccurred())
+-				err = testclient.DataPlaneClient.Delete(ctx, testpod)
+-				Expect(err).ToNot(HaveOccurred())
+-
+-				err = pods.WaitForDeletion(ctx, testpod, pods.DefaultDeletionTimeout*time.Second)
+-				Expect(err).ToNot(HaveOccurred())
++				Expect(pods.DeleteAndSync(ctx, testclient.DataPlaneClient, testpod)).To(Succeed())
+ 			}
+ 		})
+ 
+@@ -1016,7 +1014,7 @@ var _ = Describe("[rfe_id:27363][performance] CPU Management", Ordered, func() {
+ 			defer func() {
+ 				if guaranteedPod != nil {
+ 					testlog.Infof("deleting pod %q", guaranteedPod.Name)
+-					deleteTestPod(ctx, guaranteedPod)
++					Expect(pods.DeleteAndSync(ctx, testclient.DataPlaneClient, guaranteedPod)).To(Succeed())
+ 				}
+ 			}()
+ 
+@@ -1047,7 +1045,7 @@ var _ = Describe("[rfe_id:27363][performance] CPU Management", Ordered, func() {
+ 			defer func() {
+ 				if bestEffortPod != nil {
+ 					testlog.Infof("deleting pod %q", bestEffortPod.Name)
+-					deleteTestPod(ctx, bestEffortPod)
++					Expect(pods.DeleteAndSync(ctx, testclient.DataPlaneClient, bestEffortPod)).To(Succeed())
+ 				}
+ 			}()
+ 
+@@ -1175,15 +1173,192 @@ var _ = Describe("[rfe_id:27363][performance] CPU Management", Ordered, func() {
+ 			defer func() {
+ 				if guPod != nil {
+ 					testlog.Infof("deleting pod %q", guPod.Name)
+-					deleteTestPod(ctx, guPod)
++					Expect(pods.DeleteAndSync(ctx, testclient.DataPlaneClient, guPod)).To(Succeed())
+ 				}
+ 				if buPod != nil {
+ 					testlog.Infof("deleting pod %q", buPod.Name)
+-					deleteTestPod(ctx, buPod)
++					Expect(pods.DeleteAndSync(ctx, testclient.DataPlaneClient, buPod)).To(Succeed())
+ 				}
+ 			}()
+ 		})
+ 	})
++
++	Context("Check exec-cpu-affinity feature", func() {
++		When("exec-cpu-affinity is enabled (default in PP)", func() {
++			BeforeEach(func() {
++				By("Checking if exec-cpu-affinity is enabled by default in the profile")
++				profile, err := profiles.GetByNodeLabels(testutils.NodeSelectorLabels)
++				Expect(err).ToNot(HaveOccurred(), "Failed to get performance profile")
++				Expect(profile).ToNot(BeNil(), "Failed to get performance profile")
++				val, ok := profile.Annotations[performancev2.PerformanceProfileExecCPUAffinityAnnotation]
++				if ok {
++					Expect(val).NotTo(Equal(performancev2.PerformanceProfileExecCPUAffinityDisable), "exec-cpu-affinity is disabled in the profile")
++				}
++			})
++
++			DescribeTable(
++				"should pin exec process to specific CPU dedicated to the container", func(qos corev1.PodQOSClass, containersResources []corev1.ResourceList) {
++					By("Creating the test pod")
++					isolatedCpus, err := cpuset.Parse(string(*profile.Spec.CPU.Isolated))
++					Expect(err).ToNot(HaveOccurred(), "Failed to parse isolated CPUs")
++					switch qos {
++					case corev1.PodQOSGuaranteed:
++						totalPodCpus := resources.TotalCPUsRoundedUp(containersResources)
++						if isolatedCpus.Size() < totalPodCpus {
++							Skip("Skipping test: Insufficient isolated CPUs")
++						}
++					case corev1.PodQOSBurstable:
++						maxPodCpus := resources.MaxCPURequestsRoundedUp(containersResources)
++						if isolatedCpus.Size() < maxPodCpus {
++							Skip("Skipping test: Insufficient isolated CPUs")
++						}
++					case corev1.PodQOSBestEffort:
++						testlog.Info("test best-effort pod")
++					default:
++						Fail("Invalid QoS class")
++					}
++
++					testPod, err := pods.MakePodWithResources(workerRTNode.Name, qos, containersResources)
++					Expect(err).ToNot(HaveOccurred(), "Failed to make test pod")
++					Expect(testclient.DataPlaneClient.Create(ctx, testPod)).To(Succeed(), "Failed to create test pod")
++					DeferCleanup(func() {
++						Expect(pods.DeleteAndSync(ctx, testclient.DataPlaneClient, testPod)).To(Succeed())
++					})
++
++					testPod, err = pods.WaitForCondition(ctx, client.ObjectKeyFromObject(testPod), corev1.PodReady, corev1.ConditionTrue, 5*time.Minute)
++					Expect(err).ToNot(HaveOccurred())
++
++					cpusetCfg := &controller.CpuSet{}
++					for _, container := range testPod.Spec.Containers {
++						/*
++							we need to verify the below scenarios:
++							1. non gu pod -> exec process will be pinned to any CPU
++							2. gu pods:
++								2.1 containers requesting whole CPUs -> exec process is pinned to the FIRST ISOLATED CPU
++								2.2 containers requesting fractional CPUs -> exec process is pinned to ANY CPU
++						*/
++
++						isExclusiveCPURequest := false
++						retries := 1
++
++						if qos == corev1.PodQOSGuaranteed {
++							milliCPU := container.Resources.Requests.Cpu().MilliValue()
++							isExclusiveCPURequest = (milliCPU % 1000) == 0
++						}
++
++						if !isExclusiveCPURequest {
++							testlog.Infof("exec process should be pinned to any CPU of the isolated set")
++						}
++
++						By(fmt.Sprintf("Collect comparable data for container %s", container.Name))
++						Expect(getter.Container(ctx, testPod, container.Name, cpusetCfg)).To(Succeed(), "Failed to get cpuset config for test pod container %s", container.Name)
++
++						cpusList, err := cpuset.Parse(cpusetCfg.Cpus)
++						Expect(err).ToNot(HaveOccurred(), "Failed to parse cpuset config for test pod container %s", container.Name)
++						Expect(cpusList.Size()).ToNot(BeZero())
++						// assumes no shared configured in this suite
++						firstExclusiveCPU := cpusList.List()[0]
++						testlog.Infof("first exclusive CPU: %d, all exclusive CPUs: %s", firstExclusiveCPU, cpusList.String())
++
++						// try high enough times to ensure that even with low cpus count, the functionality is preserved
++						if isExclusiveCPURequest {
++							cpuRequest := container.Resources.Requests.Name(corev1.ResourceCPU, resource.DecimalSI).Value()
++							// The concept of retries is to avoid false positives on first check.
++							// especially when the number of allowed cpus is low, the possibility to
++							// choose the correct (first) CPU is anyway high; with retries we ensure
++							// that even with this high possibility, retrying many times still gives
++							// us the correct result.
++							// the formula is to start with 5 retries (`oc exec` entries to the container)
++							// for CPUset of size 2, and reduce that when the number is higher, down
++							// to 1 retry minimum.
++							retries = int(math.Ceil(float64(10) / float64(cpuRequest)))
++						}
++
++						testlog.Infof("expected CPU affinity: pinToFirstCPU: %t, retries: %d", isExclusiveCPURequest, retries)
++
++						// Sample the pinned CPU multiple times per run to ensure the process stays pinned (not a single racy snapshot).
++						// Field 39 in /proc/<pid>/stat is the processor number.
++						// See proc_pid_stat(5): https://man7.org/linux/man-pages/man5/proc_pid_stat.5.html
++						const samplesPerRun = 5
++						const sampleIntervalSec = 1
++						cmd := []string{"/bin/bash", "-c", fmt.Sprintf(
++							"sleep 15 & SLPID=$!; sleep 0.5; for ((i=1;i<=%d;i++)); do awk '{print $39}' /proc/$SLPID/stat; sleep %d; done",
++							samplesPerRun, sampleIntervalSec)}
++						execProcessCPUSamples := make([][]int, retries)
++						g, _ := errgroup.WithContext(ctx)
++						for i := 0; i < retries; i++ {
++							idx := i
++							g.Go(func() error {
++								output, err := pods.ExecCommandOnPod(testclient.K8sClient, testPod, container.Name, cmd)
++								if err != nil {
++									return fmt.Errorf("exec command failed for run %d: %w", idx, err)
++								}
++								strout := strings.TrimSpace(string(output))
++								testlog.Infof("entry %d: exec command output (samples): \n%s", idx, strout)
++								var samples []int
++								for _, line := range strings.Split(strout, "\n") {
++									line = strings.TrimSpace(line)
++									if line == "" {
++										continue
++									}
++									cpu, err := strconv.Atoi(line)
++									if err != nil {
++										return fmt.Errorf("entry %d: failed to parse processor number from %q: %w", idx, line, err)
++									}
++									samples = append(samples, cpu)
++								}
++								if len(samples) == 0 {
++									return fmt.Errorf("entry %d: no valid samples", idx)
++								}
++								if len(samples) < samplesPerRun {
++									testlog.Warningf("entry %d: got %d/%d samples (process may have exited early)", idx, len(samples), samplesPerRun)
++								}
++								execProcessCPUSamples[idx] = samples
++								return nil
++							})
++						}
++						Expect(g.Wait()).ToNot(HaveOccurred(), "One or more exec commands failed")
++						for i := 0; i < retries; i++ {
++							testlog.Infof("process samples of entry %d: %v", i, execProcessCPUSamples[i])
++							for _, cpu := range execProcessCPUSamples[i] {
++								if isExclusiveCPURequest {
++									Expect(cpu).To(Equal(firstExclusiveCPU), "Exec process CPU is not the first exclusive CPU")
++								} else {
++									Expect(cpusList.Contains(cpu)).To(BeTrue(), "Exec process CPU %d is not part of the cpuset: %s", cpu, cpusList.String())
++								}
++							}
++						}
++					}
++				},
++				Entry("guaranteed pod with mixed containers, exec process can be pinned to any CPU for container requesting fractional CPUs, and to the first CPU for container requesting exclusive CPUs",
++					corev1.PodQOSGuaranteed,
++					[]corev1.ResourceList{
++						{ // cnt1 resources
++							corev1.ResourceCPU:    resource.MustParse("2"),
++							corev1.ResourceMemory: resource.MustParse("200Mi"),
++						},
++						{ // cnt2 resources
++							corev1.ResourceCPU:    resource.MustParse("1300m"),
++							corev1.ResourceMemory: resource.MustParse("200Mi"),
++						},
++					}),
++				Entry("best-effort pod with shared CPU request, exec process can be pinned to any CPU ",
++					corev1.PodQOSBestEffort,
++					[]corev1.ResourceList{
++						//cnt1 resources
++						{},
++					}),
++				Entry("burstable pod with shared CPU request, exec process can be pinned to any CPU ",
++					corev1.PodQOSBurstable,
++					[]corev1.ResourceList{
++						{
++							corev1.ResourceCPU:    resource.MustParse("2"),
++							corev1.ResourceMemory: resource.MustParse("100Mi"),
++						},
++					}),
++			)
++		})
++	})
+ })
+ 
+ func extractConfigInfo(output string) (*ContainerConfig, error) {
+@@ -1435,24 +1610,6 @@ func getTestPodWithAnnotations(annotations map[string]string, cpus int) *corev1.
+ 	return testpod
+ }
+ 
+-func deleteTestPod(ctx context.Context, testpod *corev1.Pod) (types.UID, bool) {
+-	// it possible that the pod already was deleted as part of the test, in this case we want to skip teardown
+-	err := testclient.DataPlaneClient.Get(ctx, client.ObjectKeyFromObject(testpod), testpod)
+-	if errors.IsNotFound(err) {
+-		return "", false
+-	}
+-
+-	testpodUID := testpod.UID
+-
+-	err = testclient.DataPlaneClient.Delete(ctx, testpod)
+-	Expect(err).ToNot(HaveOccurred())
+-
+-	err = pods.WaitForDeletion(ctx, testpod, pods.DefaultDeletionTimeout*time.Second)
+-	Expect(err).ToNot(HaveOccurred())
+-
+-	return testpodUID, true
+-}
+-
+ func cpuSpecToString(cpus *performancev2.CPU) (string, error) {
+ 	if cpus == nil {
+ 		return "", fmt.Errorf("performance CPU field is nil")
+diff --git a/test/e2e/performanceprofile/functests/1_performance/hugepages.go b/test/e2e/performanceprofile/functests/1_performance/hugepages.go
+index a831bfd90c..b1e5658404 100644
+--- a/test/e2e/performanceprofile/functests/1_performance/hugepages.go
++++ b/test/e2e/performanceprofile/functests/1_performance/hugepages.go
+@@ -128,11 +128,7 @@ var _ = Describe("[performance]Hugepages", Ordered, func() {
+ 		var testpod *corev1.Pod
+ 
+ 		AfterEach(func() {
+-			err := testclient.DataPlaneClient.Delete(context.TODO(), testpod)
+-			Expect(err).ToNot(HaveOccurred())
+-
+-			err = pods.WaitForDeletion(context.TODO(), testpod, pods.DefaultDeletionTimeout*time.Second)
+-			Expect(err).ToNot(HaveOccurred())
++			Expect(pods.DeleteAndSync(context.TODO(), testclient.DataPlaneClient, testpod)).To(Succeed())
+ 		})
+ 
+ 		It("[test_id:27477][crit:high][vendor:cnf-qe@redhat.com][level:acceptance] Huge pages support for container workloads", func() {
+diff --git a/test/e2e/performanceprofile/functests/1_performance/irqbalance.go b/test/e2e/performanceprofile/functests/1_performance/irqbalance.go
+index 5abf701a44..744159c160 100644
+--- a/test/e2e/performanceprofile/functests/1_performance/irqbalance.go
++++ b/test/e2e/performanceprofile/functests/1_performance/irqbalance.go
+@@ -223,7 +223,7 @@ var _ = Describe("[performance] Checking IRQBalance settings", Ordered, func() {
+ 			defer func() {
+ 				if testpod != nil {
+ 					testlog.Infof("deleting pod %q", testpod.Name)
+-					deleteTestPod(context.TODO(), testpod)
++					Expect(pods.DeleteAndSync(context.TODO(), testclient.DataPlaneClient, testpod)).To(Succeed())
+ 				}
+ 				bannedCPUs, err := getIrqBalanceBannedCPUs(context.TODO(), targetNode)
+ 				Expect(err).ToNot(HaveOccurred(), "failed to extract the banned CPUs from node %q", targetNode.Name)
+@@ -338,10 +338,11 @@ var _ = Describe("[performance] Checking IRQBalance settings", Ordered, func() {
+ 				Skip(fmt.Sprintf("cpus request %d is greater than the available on the node as the isolated cpus are %d", cpuRequest, isolatedCPUSet.Size()))
+ 			}
+ 			testpod, err := createPodWithHouskeeping(numOfContainersInPod, cpusPerContainer, profile, context.TODO(), targetNode)
++			defer func() {
++				Expect(pods.DeleteAndSync(context.TODO(), testclient.DataPlaneClient, testpod)).To(Succeed())
++			}()
+ 			Expect(err).ToNot(HaveOccurred(), "Failed to create pod with housekeeping annotation")
+ 
+-			defer deleteTestPod(context.TODO(), testpod)
+-
+ 			for i := 0; i < numOfContainersInPod; i++ {
+ 				containerName := testpod.Spec.Containers[i].Name
+ 				// Get housekeeping CPUs for this container and convert to cpuset
+diff --git a/test/e2e/performanceprofile/functests/2_performance_update/memorymanager.go b/test/e2e/performanceprofile/functests/2_performance_update/memorymanager.go
+index 3c9c0f1282..b19f06e31a 100644
+--- a/test/e2e/performanceprofile/functests/2_performance_update/memorymanager.go
++++ b/test/e2e/performanceprofile/functests/2_performance_update/memorymanager.go
+@@ -25,7 +25,6 @@ import (
+ 	"github.com/openshift/cluster-node-tuning-operator/test/e2e/performanceprofile/functests/utils/profilesupdate"
+ 	corev1 "k8s.io/api/core/v1"
+ 	"k8s.io/apimachinery/pkg/api/equality"
+-	"k8s.io/apimachinery/pkg/api/errors"
+ 	"k8s.io/apimachinery/pkg/api/resource"
+ 	"k8s.io/utils/cpuset"
+ 	"k8s.io/utils/ptr"
+@@ -727,16 +726,7 @@ func (mm MMPod) createPodTemplate(profile *performancev2.PerformanceProfile, gu
+ 
+ // removePod Delete test pod
+ func (mm MMPod) removePod(ctx context.Context, testPod *corev1.Pod) error {
+-	err := testclient.DataPlaneClient.Get(ctx, client.ObjectKeyFromObject(testPod), testPod)
+-	if errors.IsNotFound(err) {
+-		return err
+-	}
+-	err = testclient.DataPlaneClient.Delete(ctx, testPod)
+-	if err != nil {
+-		return err
+-	}
+-
+-	return pods.WaitForDeletion(ctx, testPod, pods.DefaultDeletionTimeout*time.Second)
++	return pods.DeleteAndSync(ctx, testclient.DataPlaneClient, testPod)
+ }
+ 
+ // InitializePod initialize pods which we want to be in running state
+diff --git a/test/e2e/performanceprofile/functests/2_performance_update/updating_profile.go b/test/e2e/performanceprofile/functests/2_performance_update/updating_profile.go
+index d710f8ccd0..c1f17e90fd 100644
+--- a/test/e2e/performanceprofile/functests/2_performance_update/updating_profile.go
++++ b/test/e2e/performanceprofile/functests/2_performance_update/updating_profile.go
+@@ -11,6 +11,8 @@ import (
+ 	"strings"
+ 	"time"
+ 
++	"golang.org/x/sync/errgroup"
++
+ 	. "github.com/onsi/ginkgo/v2"
+ 	. "github.com/onsi/gomega"
+ 	corev1 "k8s.io/api/core/v1"
+@@ -1269,9 +1271,8 @@ var _ = Describe("[rfe_id:28761][performance] Updating parameters in performance
+ 					By(fmt.Sprintf("creating a test pod using high-performance runtime class on node %s", workerRTNodes[i].Name))
+ 					Expect(testclient.DataPlaneClient.Create(context.TODO(), testpod)).ToNot(HaveOccurred())
+ 					DeferCleanup(func() {
+-						By(fmt.Sprintf("deleting the test pod from node %s", workerRTNodes[i].Name))
+-						Expect(testclient.DataPlaneClient.Delete(context.TODO(), testpod)).ToNot(HaveOccurred())
+-						Expect(pods.WaitForDeletion(context.TODO(), testpod, pods.DefaultDeletionTimeout*time.Second)).ToNot(HaveOccurred())
++						By(fmt.Sprintf("deleting the test pod from node %s", testpod.Spec.NodeName))
++						Expect(pods.DeleteAndSync(context.TODO(), testclient.DataPlaneClient, testpod)).To(Succeed())
+ 					})
+ 					testpod, err = pods.WaitForCondition(context.TODO(), client.ObjectKeyFromObject(testpod), corev1.PodReady, corev1.ConditionTrue, 10*time.Minute)
+ 					Expect(err).ToNot(HaveOccurred())
+@@ -1284,6 +1285,154 @@ var _ = Describe("[rfe_id:28761][performance] Updating parameters in performance
+ 			Entry("test without ContainerRuntimeConfig", false),
+ 			Entry("create and test with ContainerRuntimeConfig", true),
+ 		)
++
++		When("exec-cpu-affinity is disabled", func() {
++			// by default the exec-cpu-affinity is enabled, thus this requires an update to the profile
++			var getter cgroup.ControllersGetter
++			var initialProfile, profile *performancev2.PerformanceProfile
++			var needsUpdate bool
++
++			BeforeEach(func() {
++				needsUpdate = false
++
++				var err error
++				getter, err = cgroup.BuildGetter(context.TODO(), testclient.DataPlaneClient, testclient.K8sClient)
++				Expect(err).ToNot(HaveOccurred())
++				Expect(getter).ToNot(BeNil())
++
++				By("Checking if exec-cpu-affinity is disabled, if not disable it")
++				initialProfile, err = profiles.GetByNodeLabels(testutils.NodeSelectorLabels)
++				Expect(err).ToNot(HaveOccurred(), "Failed to get performance profile")
++				Expect(initialProfile).ToNot(BeNil(), "Failed to get performance profile")
++				profile = initialProfile.DeepCopy()
++				needsUpdate = false
++				if initialProfile.Annotations == nil {
++					profile.Annotations = make(map[string]string)
++				}
++
++				val, ok := profile.Annotations[performancev2.PerformanceProfileExecCPUAffinityAnnotation]
++				if !ok || val != performancev2.PerformanceProfileExecCPUAffinityDisable {
++					profile.Annotations[performancev2.PerformanceProfileExecCPUAffinityAnnotation] = performancev2.PerformanceProfileExecCPUAffinityDisable
++					needsUpdate = true
++				}
++
++				if !needsUpdate {
++					testlog.Infof("profile already has disabled execCPUAffinity: %+v", initialProfile.Annotations)
++					return
++				}
++
++				By("Updating the profile")
++				profiles.UpdateWithRetry(profile)
++				poolName := poolname.GetByProfile(context.TODO(), profile)
++				By(fmt.Sprintf("Applying changes in performance profile and waiting until %s will start updating", poolName))
++				profilesupdate.WaitForTuningUpdating(context.TODO(), profile)
++				By(fmt.Sprintf("Waiting when %s finishes updates", poolName))
++				profilesupdate.WaitForTuningUpdated(context.TODO(), profile)
++
++			})
++
++			AfterEach(func() {
++				if !needsUpdate {
++					By("no need for a revert")
++					return
++				}
++				By("Restoring the profile")
++				profiles.UpdateWithRetry(initialProfile)
++				poolName := poolname.GetByProfile(context.TODO(), initialProfile)
++				By(fmt.Sprintf("Applying changes in performance profile and waiting until %s will start updating", poolName))
++				profilesupdate.WaitForTuningUpdating(context.TODO(), initialProfile)
++				By(fmt.Sprintf("Waiting when %s finishes updates", poolName))
++				profilesupdate.WaitForTuningUpdated(context.TODO(), initialProfile)
++			})
++
++			It("should pin exec process to any exclusive CPU - guaranteed pod single container", func() {
++				By("Creating a guaranteed test pod")
++				ctx := context.TODO()
++				testPod := testpodTemplate.DeepCopy()
++				testPod.Spec.NodeName = workerRTNodes[0].Name
++				testPod.Spec.NodeSelector = map[string]string{testutils.LabelHostname: workerRTNodes[0].Name}
++				testPod.Spec.Containers[0].Resources.Limits = corev1.ResourceList{
++					corev1.ResourceCPU:    resource.MustParse("2"),
++					corev1.ResourceMemory: resource.MustParse("100Mi"),
++				}
++				Expect(testclient.DataPlaneClient.Create(ctx, testPod)).To(Succeed(), "Failed to create test pod: %+v", testPod)
++				DeferCleanup(func() {
++					if testPod == nil {
++						By("test pod was not created, skipping")
++						return
++					}
++					testlog.Infof("deleting pod %q", testPod.Name)
++					Expect(pods.DeleteAndSync(ctx, testclient.DataPlaneClient, testPod)).To(Succeed())
++				})
++
++				testPod, err = pods.WaitForCondition(ctx, client.ObjectKeyFromObject(testPod), corev1.PodReady, corev1.ConditionTrue, 5*time.Minute)
++				Expect(err).ToNot(HaveOccurred())
++
++				cpusetCfg := &controller.CpuSet{}
++				Expect(getter.Container(ctx, testPod, testPod.Spec.Containers[0].Name, cpusetCfg)).To(Succeed(), "Failed to get cpuset config for test pod")
++				cpusList, err := cpuset.Parse(cpusetCfg.Cpus)
++				Expect(err).ToNot(HaveOccurred())
++				Expect(cpusList.Size()).ToNot(BeZero())
++				testlog.Infof("allowed CPUs: %s; now exclude reserved and shared CPUs", cpusList.String())
++
++				reservedCPUs, err := cpuset.Parse(string(*profile.Spec.CPU.Reserved))
++				Expect(err).ToNot(HaveOccurred())
++				Expect(reservedCPUs.Size()).ToNot(BeZero())
++				testlog.Infof("reserved CPUs: %s", reservedCPUs.String())
++				sharedCPUs := cpuset.CPUSet{}
++				if profile.Spec.CPU.Shared != nil {
++					sharedCPUs, err = cpuset.Parse(string(*profile.Spec.CPU.Shared))
++					Expect(err).ToNot(HaveOccurred())
++					Expect(sharedCPUs.Size()).ToNot(BeZero())
++					testlog.Infof("shared CPUs: %s", sharedCPUs.String())
++				}
++				testlog.Infof("reserved CPUs: %s", reservedCPUs.String())
++				testlog.Infof("shared CPUs: %s", sharedCPUs.String())
++				exclusiveCPUs := cpusList.Difference(reservedCPUs).Difference(sharedCPUs)
++				Expect(exclusiveCPUs.Size()).ToNot(BeZero())
++				firstExclusiveCPU := exclusiveCPUs.List()[0]
++				testlog.Infof("first exclusive CPU: %d, all exclusive CPUs: %s", firstExclusiveCPU, exclusiveCPUs.String())
++
++				// The concept of retries is to avoid false positives on first check. We set a
++				// high enough number of retries to ensure that the exec process is not pinned
++				// to the first exclusive CPU always.
++				// The test finishes successfully. If, with all retries, the exec process is pinned to the first exclusive CPU,
++				// then something is likely wrong in the flow and must be investigated, hence the test fails.
++				retries := 10
++				By("Run exec commands on the pod in parallel and verify the process is pinned not only to the first exclusive CPU")
++				// Field 39 in /proc/<pid>/stat is the processor number
++				// See proc_pid_stat(5): https://man7.org/linux/man-pages/man5/proc_pid_stat.5.html
++				cmd := []string{"/bin/bash", "-c", "sleep 10 & SLPID=$!; sleep 0.5; awk '{print $39}' /proc/$SLPID/stat"}
++				execProcessCPUs := make([]int, retries)
++				g, _ := errgroup.WithContext(ctx)
++				for i := 0; i < retries; i++ {
++					idx := i
++					g.Go(func() error {
++						output, err := pods.ExecCommandOnPod(testclient.K8sClient, testPod, testPod.Spec.Containers[0].Name, cmd)
++						if err != nil {
++							return fmt.Errorf("exec command failed for run %d: %w", idx, err)
++						}
++						strout := strings.TrimSpace(string(output))
++						testlog.Infof("entry %d: exec command output: %s", idx, strout)
++						cpu, err := strconv.Atoi(strout)
++						if err != nil {
++							return fmt.Errorf("entry %d: failed to parse processor number from %q: %w", idx, strout, err)
++						}
++
++						if !exclusiveCPUs.Contains(cpu) {
++							return fmt.Errorf("entry %d: exec process was pinned to a reserved or shared CPU %d", idx, cpu)
++						}
++
++						execProcessCPUs[idx] = cpu
++						return nil
++					})
++				}
++				Expect(g.Wait()).ToNot(HaveOccurred(), "One or more exec commands failed")
++
++				Expect(execProcessCPUs).ToNot(HaveEach(firstExclusiveCPU),
++					"exec process was always pinned to the first exclusive CPU %d across all %d retries", firstExclusiveCPU, retries)
++			})
++		})
+ 	})
+ 
+ 	Context("Verify single hyperthread allocation", Label(string(label.Tier2)), func() {
+@@ -1356,7 +1505,7 @@ var _ = Describe("[rfe_id:28761][performance] Updating parameters in performance
+ 
+ 			err = testclient.DataPlaneClient.Create(ctx, testpod)
+ 			Expect(err).ToNot(HaveOccurred())
+-			defer deleteTestPod(ctx, testpod)
++			defer func() { Expect(pods.DeleteAndSync(ctx, testclient.DataPlaneClient, testpod)).To(Succeed()) }()
+ 
+ 			testpod, err = pods.WaitForCondition(ctx, client.ObjectKeyFromObject(testpod), corev1.PodReady, corev1.ConditionTrue, 10*time.Minute)
+ 			Expect(err).ToNot(HaveOccurred())
+@@ -1558,7 +1707,7 @@ var _ = Describe("[rfe_id:28761][performance] Updating parameters in performance
+ 
+ 			err = testclient.DataPlaneClient.Create(ctx, testpod)
+ 			Expect(err).ToNot(HaveOccurred())
+-			defer deleteTestPod(ctx, testpod)
++			defer func() { Expect(pods.DeleteAndSync(ctx, testclient.DataPlaneClient, testpod)).To(Succeed()) }()
+ 
+ 			testpod, err = pods.WaitForCondition(ctx, client.ObjectKeyFromObject(testpod), corev1.PodReady, corev1.ConditionTrue, 10*time.Minute)
+ 			Expect(err).ToNot(HaveOccurred())
+@@ -1648,24 +1797,6 @@ func getTestPodWithProfileAndAnnotations(perfProf *performancev2.PerformanceProf
+ 	return testpod
+ }
+ 
+-func deleteTestPod(ctx context.Context, testpod *corev1.Pod) (types.UID, bool) {
+-	// it possible that the pod already was deleted as part of the test, in this case we want to skip teardown
+-	err := testclient.DataPlaneClient.Get(ctx, client.ObjectKeyFromObject(testpod), testpod)
+-	if errors.IsNotFound(err) {
+-		return "", false
+-	}
+-
+-	testpodUID := testpod.UID
+-
+-	err = testclient.DataPlaneClient.Delete(ctx, testpod)
+-	Expect(err).ToNot(HaveOccurred())
+-
+-	err = pods.WaitForDeletion(ctx, testpod, pods.DefaultDeletionTimeout*time.Second)
+-	Expect(err).ToNot(HaveOccurred())
+-
+-	return testpodUID, true
+-}
+-
+ func getContainerHouskeepCpuSet(testpod *corev1.Pod, containerName string) (cpuset.CPUSet, error) {
+ 	getHousekeepCpusCmd := []string{"printenv", "OPENSHIFT_HOUSEKEEPING_CPUS"}
+ 	testpodHousekeepCpusByte, err := pods.ExecCommandOnPod(testclient.K8sClient, testpod, containerName, getHousekeepCpusCmd)
+diff --git a/test/e2e/performanceprofile/functests/4_latency/latency.go b/test/e2e/performanceprofile/functests/4_latency/latency.go
+index 0e86950d52..49f4514f28 100644
+--- a/test/e2e/performanceprofile/functests/4_latency/latency.go
++++ b/test/e2e/performanceprofile/functests/4_latency/latency.go
+@@ -105,15 +105,7 @@ var _ = Describe("[performance] Latency Test", Ordered, func() {
+ 
+ 	AfterEach(func() {
+ 		if latencyTestPod != nil {
+-			err = testclient.Client.Delete(context.TODO(), latencyTestPod)
+-			if err != nil {
+-				testlog.Error(err)
+-			}
+-
+-			err = pods.WaitForDeletion(context.TODO(), latencyTestPod, pods.DefaultDeletionTimeout*time.Second)
+-			if err != nil {
+-				testlog.Error(err)
+-			}
++			Expect(pods.DeleteAndSync(context.TODO(), testclient.DataPlaneClient, latencyTestPod)).To(Succeed())
+ 		}
+ 
+ 		maximumLatency = -1
+diff --git a/test/e2e/performanceprofile/functests/7_performance_kubelet_node/cgroups.go b/test/e2e/performanceprofile/functests/7_performance_kubelet_node/cgroups.go
+index db56d19d31..fe32b53621 100644
+--- a/test/e2e/performanceprofile/functests/7_performance_kubelet_node/cgroups.go
++++ b/test/e2e/performanceprofile/functests/7_performance_kubelet_node/cgroups.go
+@@ -14,7 +14,6 @@ import (
+ 	. "github.com/onsi/gomega"
+ 	appsv1 "k8s.io/api/apps/v1"
+ 	corev1 "k8s.io/api/core/v1"
+-	"k8s.io/apimachinery/pkg/api/errors"
+ 	"k8s.io/apimachinery/pkg/api/resource"
+ 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+ 	"k8s.io/apimachinery/pkg/fields"
+@@ -339,7 +338,7 @@ var _ = Describe("[performance] Cgroups and affinity", Ordered, Label(string(lab
+ 					testlog.Infof("OVS service pid %s is using cpus %s", pid, cpumask)
+ 					Expect(ctnCpuset.Equals(cpumask)).To(BeTrue(), "affinity of ovn kube node pods(%s) do not match with ovservices pid %s (%s)", ctnCpuset, pid, cpumask)
+ 				}
+-				deleteTestPod(ctx, testpod)
++				Expect(pods.DeleteAndSync(ctx, testclient.DataPlaneClient, testpod)).To(Succeed())
+ 
+ 			})
+ 
+@@ -416,7 +415,7 @@ var _ = Describe("[performance] Cgroups and affinity", Ordered, Label(string(lab
+ 				}
+ 				// Delete testpod1
+ 				testlog.Infof("Deleting pod %v", testpod1.Name)
+-				deleteTestPod(context.TODO(), testpod1)
++				Expect(pods.DeleteAndSync(context.TODO(), testclient.DataPlaneClient, testpod1)).To(Succeed())
+ 
+ 				time.Sleep(30 * time.Second)
+ 				// Check the cpus of ovnkubenode pods
+@@ -433,7 +432,7 @@ var _ = Describe("[performance] Cgroups and affinity", Ordered, Label(string(lab
+ 					Expect(ovnContainerCpuset2.Equals(cpumask)).To(BeTrue(), "affinity of ovn kube node pods(%s) do not match with ovservices pid %s (%s)", ovnContainerCpuset2, pid, cpumask)
+ 				}
+ 				// Delete testpod2
+-				deleteTestPod(context.TODO(), testpod2)
++				Expect(pods.DeleteAndSync(context.TODO(), testclient.DataPlaneClient, testpod2)).To(Succeed())
+ 			})
+ 
+ 			It("[test_id:64103] ovs process affinity still excludes guaranteed pods after reboot", func() {
+@@ -654,12 +653,7 @@ var _ = Describe("[performance] Cgroups and affinity", Ordered, Label(string(lab
+ 				}
+ 				testlog.Infof("Deleting one of the pods of the deployment %q", dpObj.String())
+ 				podToDelete := podList.Items[0]
+-				err = testclient.DataPlaneClient.Get(ctx, client.ObjectKeyFromObject(&podToDelete), &podToDelete)
+-				Expect(err).ToNot(HaveOccurred())
+-				err = testclient.DataPlaneClient.Delete(ctx, &podToDelete)
+-				Expect(err).ToNot(HaveOccurred())
+-				err = pods.WaitForDeletion(ctx, &podToDelete, pods.DefaultDeletionTimeout*time.Second)
+-				Expect(err).ToNot(HaveOccurred())
++				Expect(pods.DeleteAndSync(ctx, testclient.DataPlaneClient, &podToDelete)).To(Succeed())
+ 
+ 				Eventually(func() bool {
+ 					err = testclient.DataPlaneClient.Get(context.TODO(), dpObj, dp)
+@@ -752,21 +746,6 @@ func checkCpuCount(ctx context.Context, workerNode *corev1.Node) {
+ 	}
+ }
+ 
+-// deleteTestPod removes guaranteed pod
+-func deleteTestPod(ctx context.Context, testpod *corev1.Pod) {
+-	// it possible that the pod already was deleted as part of the test, in this case we want to skip teardown
+-	err := testclient.DataPlaneClient.Get(ctx, client.ObjectKeyFromObject(testpod), testpod)
+-	if errors.IsNotFound(err) {
+-		return
+-	}
+-
+-	err = testclient.DataPlaneClient.Delete(ctx, testpod)
+-	Expect(err).ToNot(HaveOccurred())
+-
+-	err = pods.WaitForDeletion(ctx, testpod, pods.DefaultDeletionTimeout*time.Second)
+-	Expect(err).ToNot(HaveOccurred())
+-}
+-
+ // ovnCnfNodePod returns OVN Kubenode pods running on the worker cnf node
+ func ovnCnfNodePod(ctx context.Context, workerNode *corev1.Node) (corev1.Pod, error) {
+ 	var ovnKubeNodePod corev1.Pod
+diff --git a/test/e2e/performanceprofile/functests/8_performance_workloadhints/workloadhints.go b/test/e2e/performanceprofile/functests/8_performance_workloadhints/workloadhints.go
+index 7849fa3ecf..b992d2c757 100644
+--- a/test/e2e/performanceprofile/functests/8_performance_workloadhints/workloadhints.go
++++ b/test/e2e/performanceprofile/functests/8_performance_workloadhints/workloadhints.go
+@@ -758,8 +758,10 @@ var _ = Describe("[rfe_id:49062][workloadHints] Telco friendly workload specific
+ 
+ 				By("creating test pod")
+ 				err = testclient.DataPlaneClient.Create(context.TODO(), testpod)
++				DeferCleanup(func() {
++					Expect(pods.DeleteAndSync(context.TODO(), testclient.DataPlaneClient, testpod)).To(Succeed())
++				})
+ 				Expect(err).ToNot(HaveOccurred())
+-				defer deleteTestPod(context.TODO(), testpod)
+ 				testpod, err = pods.WaitForCondition(context.TODO(), client.ObjectKeyFromObject(testpod), corev1.PodReady, corev1.ConditionTrue, 10*time.Minute)
+ 				Expect(err).ToNot(HaveOccurred())
+ 				Expect(testpod.Status.QOSClass).To(Equal(corev1.PodQOSGuaranteed), "Test pod does not have QoS class of Guaranteed")
+@@ -809,7 +811,7 @@ var _ = Describe("[rfe_id:49062][workloadHints] Telco friendly workload specific
+ 				}
+ 				err = checkCpuGovernorsAndResumeLatency(context.TODO(), otherCpus, &workerRTNodes[0], "0", "performance")
+ 				Expect(err).ToNot(HaveOccurred())
+-				deleteTestPod(context.TODO(), testpod)
++				Expect(pods.DeleteAndSync(context.TODO(), testclient.DataPlaneClient, testpod)).To(Succeed())
+ 				//Verify after the pod is deleted the cpus assigned to container have default powersave settings
+ 				By("Verify after pod is delete cpus assigned to container have default powersave settings")
+ 				err = checkCpuGovernorsAndResumeLatency(context.TODO(), targetCpus, &workerRTNodes[0], "0", "performance")
+@@ -869,8 +871,10 @@ var _ = Describe("[rfe_id:49062][workloadHints] Telco friendly workload specific
+ 
+ 				By("creating test pod")
+ 				err = testclient.DataPlaneClient.Create(context.TODO(), testpod)
++				DeferCleanup(func() {
++					Expect(pods.DeleteAndSync(context.TODO(), testclient.DataPlaneClient, testpod)).To(Succeed())
++				})
+ 				Expect(err).ToNot(HaveOccurred())
+-				defer deleteTestPod(context.TODO(), testpod)
+ 				testpod, err = pods.WaitForCondition(context.TODO(), client.ObjectKeyFromObject(testpod), corev1.PodReady, corev1.ConditionTrue, 10*time.Minute)
+ 				Expect(err).ToNot(HaveOccurred())
+ 				Expect(testpod.Status.QOSClass).To(Equal(corev1.PodQOSGuaranteed), "Test pod does not have QoS class of Guaranteed")
+@@ -920,7 +924,7 @@ var _ = Describe("[rfe_id:49062][workloadHints] Telco friendly workload specific
+ 				//Verify cpus not assigned to the pod have default power settings
+ 				err = checkCpuGovernorsAndResumeLatency(context.TODO(), otherCpus, &workerRTNodes[0], "0", "performance")
+ 				Expect(err).ToNot(HaveOccurred())
+-				deleteTestPod(context.TODO(), testpod)
++				Expect(pods.DeleteAndSync(context.TODO(), testclient.DataPlaneClient, testpod)).To(Succeed())
+ 				//Test after pod is deleted the governors are set back to default for the cpus that were alloted to containers.
+ 				By("Verify after pod is delete cpus assigned to container have default powersave settings")
+ 				err = checkCpuGovernorsAndResumeLatency(context.TODO(), targetCpus, &workerRTNodes[0], "0", "performance")
+@@ -958,21 +962,6 @@ func getTunedStructuredData(profile *performancev2.PerformanceProfile) *ini.File
+ 	return cfg
+ }
+ 
+-// deleteTestPod removes guaranteed pod
+-func deleteTestPod(ctx context.Context, testpod *corev1.Pod) {
+-	// it possible that the pod already was deleted as part of the test, in this case we want to skip teardown
+-	err := testclient.DataPlaneClient.Get(ctx, client.ObjectKeyFromObject(testpod), testpod)
+-	if errors.IsNotFound(err) {
+-		return
+-	}
+-
+-	err = testclient.DataPlaneClient.Delete(ctx, testpod)
+-	Expect(err).ToNot(HaveOccurred())
+-
+-	err = pods.WaitForDeletion(ctx, testpod, pods.DefaultDeletionTimeout*time.Second)
+-	Expect(err).ToNot(HaveOccurred())
+-}
+-
+ // checkCpuGovernorsAndResumeLatency  Checks power and latency settings of the cpus
+ func checkCpuGovernorsAndResumeLatency(ctx context.Context, cpus []int, targetNode *corev1.Node, pm_qos string, governor string) error {
+ 	for _, cpu := range cpus {
+diff --git a/test/e2e/performanceprofile/functests/utils/nodes/nodes.go b/test/e2e/performanceprofile/functests/utils/nodes/nodes.go
+index d79d5af417..366849a3b8 100644
+--- a/test/e2e/performanceprofile/functests/utils/nodes/nodes.go
++++ b/test/e2e/performanceprofile/functests/utils/nodes/nodes.go
+@@ -359,6 +359,22 @@ func GetCoreSiblings(ctx context.Context, node *corev1.Node) (map[int]map[int][]
+ 	return coreSiblings, err
+ }
+ 
++// GetTwoSiblingsFromCPUSet returns two siblings that are both found in the cpuSet
++func GetTwoSiblingsFromCPUSet(siblings map[int]map[int][]int, cpuSet cpuset.CPUSet) (cpuset.CPUSet, error) {
++	for _, node := range siblings {
++		for _, core := range node {
++			if len(core) != 2 {
++				return cpuset.New(), fmt.Errorf("core %d has %d siblings, wanted 2", core, len(core))
++			}
++			siblingCPUSet := cpuset.New(core...)
++			if siblingCPUSet.IsSubsetOf(cpuSet) {
++				return siblingCPUSet, nil
++			}
++		}
++	}
++	return cpuset.New(), fmt.Errorf("no two siblings found in the given CPU set")
++}
++
+ // TunedForNode find tuned pod for appropriate node
+ func TunedForNode(node *corev1.Node, sno bool) *corev1.Pod {
+ 	listOptions := &client.ListOptions{
+diff --git a/test/e2e/performanceprofile/functests/utils/nodes/nodes_test.go b/test/e2e/performanceprofile/functests/utils/nodes/nodes_test.go
+new file mode 100644
+index 0000000000..0a11f5f8e4
+--- /dev/null
++++ b/test/e2e/performanceprofile/functests/utils/nodes/nodes_test.go
+@@ -0,0 +1,111 @@
++package nodes
++
++import (
++	"testing"
++
++	"k8s.io/utils/cpuset"
++)
++
++func TestGetTwoSiblingsFromCPUSet(t *testing.T) {
++	tests := []struct {
++		name        string
++		siblings    map[int]map[int][]int
++		cpuSet      cpuset.CPUSet
++		wantCPUSet  cpuset.CPUSet
++		expectError bool
++	}{
++		{
++			name:        "empty siblings map returns error",
++			siblings:    map[int]map[int][]int{},
++			cpuSet:      cpuset.New(0, 1, 2, 3),
++			wantCPUSet:  cpuset.New(),
++			expectError: true,
++		},
++		{
++			name:        "nil siblings map returns error",
++			siblings:    nil,
++			cpuSet:      cpuset.New(0, 1),
++			wantCPUSet:  cpuset.New(),
++			expectError: true,
++		},
++		{
++			name: "two siblings both in cpuSet returns that sibling set",
++			siblings: map[int]map[int][]int{
++				0: {0: {0, 16}}, // NUMA 0, core 0: CPUs 0 and 16 (HT pair)
++			},
++			cpuSet:      cpuset.New(0, 1, 2, 16),
++			wantCPUSet:  cpuset.New(0, 16),
++			expectError: false,
++		},
++		{
++			name: "two siblings only one in cpuSet returns error",
++			siblings: map[int]map[int][]int{
++				0: {0: {0, 16}},
++			},
++			cpuSet:      cpuset.New(0, 1, 2), // 16 not in set
++			wantCPUSet:  cpuset.New(),
++			expectError: true,
++		},
++		{
++			name: "first core not subset second core is subset returns second",
++			siblings: map[int]map[int][]int{
++				0: {
++					0: {0, 16}, // not in cpuSet
++					1: {2, 18}, // both in cpuSet
++				},
++			},
++			cpuSet:      cpuset.New(2, 18, 4, 5),
++			wantCPUSet:  cpuset.New(2, 18),
++			expectError: false,
++		},
++		{
++			name: "single CPU sibling returns error (wanted 2)",
++			siblings: map[int]map[int][]int{
++				0: {0: {5}}, // single CPU - core must have exactly 2 siblings
++			},
++			cpuSet:      cpuset.New(1, 2, 5, 6),
++			wantCPUSet:  cpuset.New(),
++			expectError: true,
++		},
++		{
++			name: "multiple NUMA nodes first matching core returned",
++			siblings: map[int]map[int][]int{
++				0: {0: {0, 16}}, // not in cpuSet (no 16)
++				1: {0: {1, 17}}, // both in cpuSet
++			},
++			cpuSet:      cpuset.New(1, 17, 2, 18),
++			wantCPUSet:  cpuset.New(1, 17),
++			expectError: false,
++		},
++		{
++			name: "no core's siblings are subset of cpuSet returns error",
++			siblings: map[int]map[int][]int{
++				0: {0: {0, 16}, 1: {2, 18}},
++			},
++			cpuSet:      cpuset.New(10, 11, 12),
++			wantCPUSet:  cpuset.New(),
++			expectError: true,
++		},
++		{
++			name: "empty cpuSet returns error",
++			siblings: map[int]map[int][]int{
++				0: {0: {0, 16}},
++			},
++			cpuSet:      cpuset.New(),
++			wantCPUSet:  cpuset.New(),
++			expectError: true,
++		},
++	}
++	for _, tt := range tests {
++		t.Run(tt.name, func(t *testing.T) {
++			got, err := GetTwoSiblingsFromCPUSet(tt.siblings, tt.cpuSet)
++			if (err != nil) != tt.expectError {
++				t.Errorf("GetTwoSiblingsFromCPUSet() error = %v, expectError %v", err, tt.expectError)
++				return
++			}
++			if !got.Equals(tt.wantCPUSet) {
++				t.Errorf("GetTwoSiblingsFromCPUSet() got = %v, want %v", got.String(), tt.wantCPUSet.String())
++			}
++		})
++	}
++}
+diff --git a/test/e2e/performanceprofile/functests/utils/pods/pods.go b/test/e2e/performanceprofile/functests/utils/pods/pods.go
+index 8e3f93d200..2763fb2b62 100644
+--- a/test/e2e/performanceprofile/functests/utils/pods/pods.go
++++ b/test/e2e/performanceprofile/functests/utils/pods/pods.go
+@@ -20,11 +20,15 @@ import (
+ 	"k8s.io/client-go/kubernetes"
+ 	"k8s.io/client-go/kubernetes/scheme"
+ 	"k8s.io/client-go/tools/remotecommand"
++	"k8s.io/klog/v2"
+ 	"sigs.k8s.io/controller-runtime/pkg/client"
+ 
++	"github.com/openshift/cluster-node-tuning-operator/pkg/performanceprofile/controller/performanceprofile/components"
++	testutils "github.com/openshift/cluster-node-tuning-operator/test/e2e/performanceprofile/functests/utils"
+ 	testclient "github.com/openshift/cluster-node-tuning-operator/test/e2e/performanceprofile/functests/utils/client"
+ 	"github.com/openshift/cluster-node-tuning-operator/test/e2e/performanceprofile/functests/utils/events"
+ 	"github.com/openshift/cluster-node-tuning-operator/test/e2e/performanceprofile/functests/utils/images"
++	"github.com/openshift/cluster-node-tuning-operator/test/e2e/performanceprofile/functests/utils/profiles"
+ )
+ 
+ // DefaultDeletionTimeout contains the default pod deletion timeout in seconds
+@@ -51,10 +55,74 @@ func GetTestPod() *corev1.Pod {
+ 	}
+ }
+ 
++func MakePodWithResources(nodeName string, qos corev1.PodQOSClass, containersResources []corev1.ResourceList) (*corev1.Pod, error) {
++	if len(containersResources) == 0 {
++		return nil, fmt.Errorf("no containers resources provided")
++	}
++
++	podContainers := []corev1.Container{}
++	for i, containerResources := range containersResources {
++		cnt := corev1.Container{
++			Name:    fmt.Sprintf("test%d", i+1),
++			Image:   images.Test(),
++			Command: []string{"sleep", "10h"},
++		}
++		cnt.Resources.Requests = containerResources
++
++		if qos == corev1.PodQOSGuaranteed {
++			cnt.Resources.Limits = containerResources
++		}
++
++		podContainers = append(podContainers, cnt)
++	}
++
++	testPod := &corev1.Pod{
++		ObjectMeta: metav1.ObjectMeta{
++			GenerateName: "test-",
++			Namespace:    testutils.NamespaceTesting,
++		},
++		Spec: corev1.PodSpec{
++			Containers:   podContainers,
++			NodeSelector: map[string]string{testutils.LabelHostname: nodeName},
++		},
++	}
++
++	profile, err := profiles.GetByNodeLabels(testutils.NodeSelectorLabels)
++	if err != nil {
++		return nil, err
++	}
++	runtimeClass := components.GetComponentName(profile.Name, components.ComponentNamePrefix)
++	testPod.Spec.RuntimeClassName = &runtimeClass
++	return testPod, nil
++}
++
++func DeleteAndSync(ctx context.Context, cli client.Client, pod *corev1.Pod) error {
++	if pod == nil {
++		klog.InfoS("pod is nil, skipping deletion")
++		return nil
++	}
++
++	if cli == nil {
++		return fmt.Errorf("client is nil")
++	}
++	klog.InfoS("delete pod and waiting for deletion", "namespace", pod.Namespace, "name", pod.Name)
++
++	err := cli.Delete(ctx, pod)
++	if err != nil {
++		if errors.IsNotFound(err) {
++			klog.InfoS("pod already deleted")
++			return nil
++		}
++		return err
++	}
++
++	return WaitForDeletion(ctx, cli, pod, DefaultDeletionTimeout*time.Second)
++}
++
+ // WaitForDeletion waits until the pod will be removed from the cluster
+-func WaitForDeletion(ctx context.Context, pod *corev1.Pod, timeout time.Duration) error {
++func WaitForDeletion(ctx context.Context, cli client.Client, pod *corev1.Pod, timeout time.Duration) error {
+ 	return wait.PollUntilContextTimeout(ctx, time.Second, timeout, true, func(ctx context.Context) (bool, error) {
+-		if err := testclient.DataPlaneClient.Get(ctx, client.ObjectKeyFromObject(pod), pod); errors.IsNotFound(err) {
++		if err := cli.Get(ctx, client.ObjectKeyFromObject(pod), pod); errors.IsNotFound(err) {
+ 			return true, nil
+ 		}
+ 		return false, nil
+diff --git a/test/e2e/performanceprofile/functests/utils/resources/resources.go b/test/e2e/performanceprofile/functests/utils/resources/resources.go
+new file mode 100644
+index 0000000000..10e9cffc81
+--- /dev/null
++++ b/test/e2e/performanceprofile/functests/utils/resources/resources.go
+@@ -0,0 +1,27 @@
++package resources
++
++import (
++	corev1 "k8s.io/api/core/v1"
++	"k8s.io/apimachinery/pkg/api/resource"
++)
++
++// TODO: handle init containers vs application containers
++
++func TotalCPUsRoundedUp(containersResources []corev1.ResourceList) int {
++	totalCPUs := *resource.NewQuantity(0, resource.DecimalSI)
++	for _, containerResources := range containersResources {
++		totalCPUs.Add(*containerResources.Cpu())
++	}
++	return int(totalCPUs.Value())
++}
++
++func MaxCPURequestsRoundedUp(containersResources []corev1.ResourceList) int {
++	maxPodCpus := 0
++	for _, containerResources := range containersResources {
++		current := int(containerResources.Cpu().Value())
++		if current > maxPodCpus {
++			maxPodCpus = current
++		}
++	}
++	return maxPodCpus
++}
+diff --git a/test/e2e/performanceprofile/functests/utils/resources/resources_test.go b/test/e2e/performanceprofile/functests/utils/resources/resources_test.go
+new file mode 100644
+index 0000000000..4865da0e05
+--- /dev/null
++++ b/test/e2e/performanceprofile/functests/utils/resources/resources_test.go
+@@ -0,0 +1,630 @@
++package resources
++
++import (
++	"testing"
++
++	corev1 "k8s.io/api/core/v1"
++	"k8s.io/apimachinery/pkg/api/resource"
++)
++
++func TestTotalCPUsRounded(t *testing.T) {
++	tests := []struct {
++		name                string
++		containersResources []corev1.ResourceList
++		expectedTotalCPUs   int
++	}{
++		{
++			name:                "zero containers - empty slice",
++			containersResources: []corev1.ResourceList{},
++			expectedTotalCPUs:   0,
++		},
++		{
++			name: "single container - no CPU resource",
++			containersResources: []corev1.ResourceList{
++				{
++					corev1.ResourceMemory: resource.MustParse("100Mi"),
++				},
++			},
++			expectedTotalCPUs: 0,
++		},
++		{
++			name: "single container - empty ResourceList",
++			containersResources: []corev1.ResourceList{
++				{},
++			},
++			expectedTotalCPUs: 0,
++		},
++		{
++			name: "single container - 1 CPU",
++			containersResources: []corev1.ResourceList{
++				{
++					corev1.ResourceCPU:    resource.MustParse("1"),
++					corev1.ResourceMemory: resource.MustParse("100Mi"),
++				},
++			},
++			expectedTotalCPUs: 1,
++		},
++		{
++			name: "single container - 2 CPUs",
++			containersResources: []corev1.ResourceList{
++				{
++					corev1.ResourceCPU:    resource.MustParse("2"),
++					corev1.ResourceMemory: resource.MustParse("200Mi"),
++				},
++			},
++			expectedTotalCPUs: 2,
++		},
++		{
++			name: "single container - fractional CPU (500m)",
++			containersResources: []corev1.ResourceList{
++				{
++					corev1.ResourceCPU:    resource.MustParse("500m"),
++					corev1.ResourceMemory: resource.MustParse("100Mi"),
++				},
++			},
++			expectedTotalCPUs: 1, // 500m (0.5 CPU) rounded up to 1
++		},
++		{
++			name: "single container - fractional CPU (1500m)",
++			containersResources: []corev1.ResourceList{
++				{
++					corev1.ResourceCPU:    resource.MustParse("1500m"),
++					corev1.ResourceMemory: resource.MustParse("100Mi"),
++				},
++			},
++			expectedTotalCPUs: 2, // 1500m (1.5 CPU) rounded up to 2
++		},
++		{
++			name: "two containers - same CPU value",
++			containersResources: []corev1.ResourceList{
++				{
++					corev1.ResourceCPU:    resource.MustParse("2"),
++					corev1.ResourceMemory: resource.MustParse("200Mi"),
++				},
++				{
++					corev1.ResourceCPU:    resource.MustParse("2"),
++					corev1.ResourceMemory: resource.MustParse("200Mi"),
++				},
++			},
++			expectedTotalCPUs: 4,
++		},
++		{
++			name: "two containers - different CPU values",
++			containersResources: []corev1.ResourceList{
++				{
++					corev1.ResourceCPU:    resource.MustParse("1"),
++					corev1.ResourceMemory: resource.MustParse("100Mi"),
++				},
++				{
++					corev1.ResourceCPU:    resource.MustParse("3"),
++					corev1.ResourceMemory: resource.MustParse("300Mi"),
++				},
++			},
++			expectedTotalCPUs: 4,
++		},
++		{
++			name: "two containers - one with no CPU",
++			containersResources: []corev1.ResourceList{
++				{
++					corev1.ResourceCPU:    resource.MustParse("2"),
++					corev1.ResourceMemory: resource.MustParse("200Mi"),
++				},
++				{
++					corev1.ResourceMemory: resource.MustParse("100Mi"),
++				},
++			},
++			expectedTotalCPUs: 2,
++		},
++		{
++			name: "two containers - both with no CPU",
++			containersResources: []corev1.ResourceList{
++				{
++					corev1.ResourceMemory: resource.MustParse("100Mi"),
++				},
++				{
++					corev1.ResourceMemory: resource.MustParse("200Mi"),
++				},
++			},
++			expectedTotalCPUs: 0,
++		},
++		{
++			name: "three containers - mixed CPU values",
++			containersResources: []corev1.ResourceList{
++				{
++					corev1.ResourceCPU:    resource.MustParse("1"),
++					corev1.ResourceMemory: resource.MustParse("100Mi"),
++				},
++				{
++					corev1.ResourceCPU:    resource.MustParse("2"),
++					corev1.ResourceMemory: resource.MustParse("200Mi"),
++				},
++				{
++					corev1.ResourceCPU:    resource.MustParse("4"),
++					corev1.ResourceMemory: resource.MustParse("400Mi"),
++				},
++			},
++			expectedTotalCPUs: 7,
++		},
++		{
++			name: "three containers - with fractional CPUs that sum exactly",
++			containersResources: []corev1.ResourceList{
++				{
++					corev1.ResourceCPU:    resource.MustParse("500m"),
++					corev1.ResourceMemory: resource.MustParse("50Mi"),
++				},
++				{
++					corev1.ResourceCPU:    resource.MustParse("500m"),
++					corev1.ResourceMemory: resource.MustParse("50Mi"),
++				},
++			},
++			expectedTotalCPUs: 1, // 500m + 500m = 1000m = 1 CPU
++		},
++		{
++			name: "multiple containers - with fractional CPUs",
++			containersResources: []corev1.ResourceList{
++				{
++					corev1.ResourceCPU:    resource.MustParse("1"),
++					corev1.ResourceMemory: resource.MustParse("100Mi"),
++				},
++				{
++					corev1.ResourceCPU:    resource.MustParse("2300m"), // 2.3 CPUs
++					corev1.ResourceMemory: resource.MustParse("200Mi"),
++				},
++				{
++					corev1.ResourceCPU:    resource.MustParse("500m"), // 0.5 CPUs
++					corev1.ResourceMemory: resource.MustParse("50Mi"),
++				},
++			},
++			expectedTotalCPUs: 4, // 1 + 2.3 + 0.5 = 3.8, rounded up to 4
++		},
++		{
++			name: "four containers - large CPU values",
++			containersResources: []corev1.ResourceList{
++				{
++					corev1.ResourceCPU:    resource.MustParse("8"),
++					corev1.ResourceMemory: resource.MustParse("1Gi"),
++				},
++				{
++					corev1.ResourceCPU:    resource.MustParse("16"),
++					corev1.ResourceMemory: resource.MustParse("2Gi"),
++				},
++				{
++					corev1.ResourceCPU:    resource.MustParse("4"),
++					corev1.ResourceMemory: resource.MustParse("500Mi"),
++				},
++				{
++					corev1.ResourceCPU:    resource.MustParse("32"),
++					corev1.ResourceMemory: resource.MustParse("4Gi"),
++				},
++			},
++			expectedTotalCPUs: 60,
++		},
++		{
++			name: "multiple containers - all empty ResourceLists",
++			containersResources: []corev1.ResourceList{
++				{},
++				{},
++				{},
++			},
++			expectedTotalCPUs: 0,
++		},
++		{
++			name: "multiple containers - mix of empty and non-empty",
++			containersResources: []corev1.ResourceList{
++				{},
++				{
++					corev1.ResourceCPU:    resource.MustParse("2"),
++					corev1.ResourceMemory: resource.MustParse("200Mi"),
++				},
++				{},
++				{
++					corev1.ResourceCPU:    resource.MustParse("1"),
++					corev1.ResourceMemory: resource.MustParse("100Mi"),
++				},
++			},
++			expectedTotalCPUs: 3,
++		},
++		{
++			name: "five containers - sequential CPU values",
++			containersResources: []corev1.ResourceList{
++				{
++					corev1.ResourceCPU:    resource.MustParse("1"),
++					corev1.ResourceMemory: resource.MustParse("100Mi"),
++				},
++				{
++					corev1.ResourceCPU:    resource.MustParse("2"),
++					corev1.ResourceMemory: resource.MustParse("200Mi"),
++				},
++				{
++					corev1.ResourceCPU:    resource.MustParse("3"),
++					corev1.ResourceMemory: resource.MustParse("300Mi"),
++				},
++				{
++					corev1.ResourceCPU:    resource.MustParse("4"),
++					corev1.ResourceMemory: resource.MustParse("400Mi"),
++				},
++				{
++					corev1.ResourceCPU:    resource.MustParse("5"),
++					corev1.ResourceMemory: resource.MustParse("500Mi"),
++				},
++			},
++			expectedTotalCPUs: 15,
++		},
++		{
++			name: "multiple containers - fractional CPUs that sum to whole number",
++			containersResources: []corev1.ResourceList{
++				{
++					corev1.ResourceCPU:    resource.MustParse("250m"),
++					corev1.ResourceMemory: resource.MustParse("25Mi"),
++				},
++				{
++					corev1.ResourceCPU:    resource.MustParse("250m"),
++					corev1.ResourceMemory: resource.MustParse("25Mi"),
++				},
++				{
++					corev1.ResourceCPU:    resource.MustParse("250m"),
++					corev1.ResourceMemory: resource.MustParse("25Mi"),
++				},
++				{
++					corev1.ResourceCPU:    resource.MustParse("250m"),
++					corev1.ResourceMemory: resource.MustParse("25Mi"),
++				},
++			},
++			expectedTotalCPUs: 1, // 250m * 4 = 1000m = 1 CPU exactly
++		},
++		{
++			name: "multiple containers - mix of whole and fractional CPUs",
++			containersResources: []corev1.ResourceList{
++				{
++					corev1.ResourceCPU:    resource.MustParse("1"),
++					corev1.ResourceMemory: resource.MustParse("100Mi"),
++				},
++				{
++					corev1.ResourceCPU:    resource.MustParse("750m"),
++					corev1.ResourceMemory: resource.MustParse("75Mi"),
++				},
++				{
++					corev1.ResourceCPU:    resource.MustParse("2"),
++					corev1.ResourceMemory: resource.MustParse("200Mi"),
++				},
++				{
++					corev1.ResourceCPU:    resource.MustParse("250m"),
++					corev1.ResourceMemory: resource.MustParse("25Mi"),
++				},
++			},
++			expectedTotalCPUs: 4, // 1 + 0.75 + 2 + 0.25 = 4.0 exactly
++		},
++		{
++			name: "multiple containers - some with CPU, some without",
++			containersResources: []corev1.ResourceList{
++				{
++					corev1.ResourceCPU:    resource.MustParse("2"),
++					corev1.ResourceMemory: resource.MustParse("200Mi"),
++				},
++				{
++					corev1.ResourceMemory: resource.MustParse("100Mi"),
++				},
++				{
++					corev1.ResourceCPU:    resource.MustParse("3"),
++					corev1.ResourceMemory: resource.MustParse("300Mi"),
++				},
++				{
++					corev1.ResourceMemory: resource.MustParse("150Mi"),
++				},
++				{
++					corev1.ResourceCPU:    resource.MustParse("1"),
++					corev1.ResourceMemory: resource.MustParse("100Mi"),
++				},
++			},
++			expectedTotalCPUs: 6,
++		},
++	}
++
++	for _, tt := range tests {
++		t.Run(tt.name, func(t *testing.T) {
++			result := TotalCPUsRoundedUp(tt.containersResources)
++			if result != tt.expectedTotalCPUs {
++				t.Errorf("TotalCPUsRounded() = %d, want %d", result, tt.expectedTotalCPUs)
++			}
++		})
++	}
++}
++
++func TestMaxCPURequestsRounded(t *testing.T) {
++	tests := []struct {
++		name                string
++		containersResources []corev1.ResourceList
++		expectedMaxCPUs     int
++	}{
++		{
++			name:                "zero containers - empty slice",
++			containersResources: []corev1.ResourceList{},
++			expectedMaxCPUs:     0,
++		},
++		{
++			name: "single container - no CPU resource",
++			containersResources: []corev1.ResourceList{
++				{
++					corev1.ResourceMemory: resource.MustParse("100Mi"),
++				},
++			},
++			expectedMaxCPUs: 0,
++		},
++		{
++			name: "single container - empty ResourceList",
++			containersResources: []corev1.ResourceList{
++				{},
++			},
++			expectedMaxCPUs: 0,
++		},
++		{
++			name: "single container - 1 CPU",
++			containersResources: []corev1.ResourceList{
++				{
++					corev1.ResourceCPU:    resource.MustParse("1"),
++					corev1.ResourceMemory: resource.MustParse("100Mi"),
++				},
++			},
++			expectedMaxCPUs: 1,
++		},
++		{
++			name: "single container - 5 CPUs",
++			containersResources: []corev1.ResourceList{
++				{
++					corev1.ResourceCPU:    resource.MustParse("5"),
++					corev1.ResourceMemory: resource.MustParse("500Mi"),
++				},
++			},
++			expectedMaxCPUs: 5,
++		},
++		{
++			name: "single container - fractional CPU (500m rounded up to 1)",
++			containersResources: []corev1.ResourceList{
++				{
++					corev1.ResourceCPU:    resource.MustParse("500m"),
++					corev1.ResourceMemory: resource.MustParse("100Mi"),
++				},
++			},
++			expectedMaxCPUs: 1, // 500m (0.5 CPU) rounded up to 1
++		},
++		{
++			name: "single container - fractional CPU (2300m rounded up to 3)",
++			containersResources: []corev1.ResourceList{
++				{
++					corev1.ResourceCPU:    resource.MustParse("2300m"),
++					corev1.ResourceMemory: resource.MustParse("200Mi"),
++				},
++			},
++			expectedMaxCPUs: 3, // 2300m (2.3 CPU) rounded up to 3
++		},
++		{
++			name: "two containers - same CPU value",
++			containersResources: []corev1.ResourceList{
++				{
++					corev1.ResourceCPU:    resource.MustParse("2"),
++					corev1.ResourceMemory: resource.MustParse("200Mi"),
++				},
++				{
++					corev1.ResourceCPU:    resource.MustParse("2"),
++					corev1.ResourceMemory: resource.MustParse("200Mi"),
++				},
++			},
++			expectedMaxCPUs: 2,
++		},
++		{
++			name: "two containers - first is max",
++			containersResources: []corev1.ResourceList{
++				{
++					corev1.ResourceCPU:    resource.MustParse("5"),
++					corev1.ResourceMemory: resource.MustParse("500Mi"),
++				},
++				{
++					corev1.ResourceCPU:    resource.MustParse("2"),
++					corev1.ResourceMemory: resource.MustParse("200Mi"),
++				},
++			},
++			expectedMaxCPUs: 5,
++		},
++		{
++			name: "two containers - second is max",
++			containersResources: []corev1.ResourceList{
++				{
++					corev1.ResourceCPU:    resource.MustParse("1"),
++					corev1.ResourceMemory: resource.MustParse("100Mi"),
++				},
++				{
++					corev1.ResourceCPU:    resource.MustParse("8"),
++					corev1.ResourceMemory: resource.MustParse("800Mi"),
++				},
++			},
++			expectedMaxCPUs: 8,
++		},
++		{
++			name: "two containers - one with no CPU",
++			containersResources: []corev1.ResourceList{
++				{
++					corev1.ResourceCPU:    resource.MustParse("3"),
++					corev1.ResourceMemory: resource.MustParse("300Mi"),
++				},
++				{
++					corev1.ResourceMemory: resource.MustParse("100Mi"),
++				},
++			},
++			expectedMaxCPUs: 3,
++		},
++		{
++			name: "two containers - both with no CPU",
++			containersResources: []corev1.ResourceList{
++				{
++					corev1.ResourceMemory: resource.MustParse("100Mi"),
++				},
++				{
++					corev1.ResourceMemory: resource.MustParse("200Mi"),
++				},
++			},
++			expectedMaxCPUs: 0,
++		},
++		{
++			name: "three containers - middle is max",
++			containersResources: []corev1.ResourceList{
++				{
++					corev1.ResourceCPU:    resource.MustParse("2"),
++					corev1.ResourceMemory: resource.MustParse("200Mi"),
++				},
++				{
++					corev1.ResourceCPU:    resource.MustParse("10"),
++					corev1.ResourceMemory: resource.MustParse("1Gi"),
++				},
++				{
++					corev1.ResourceCPU:    resource.MustParse("4"),
++					corev1.ResourceMemory: resource.MustParse("400Mi"),
++				},
++			},
++			expectedMaxCPUs: 10,
++		},
++		{
++			name: "three containers - last is max",
++			containersResources: []corev1.ResourceList{
++				{
++					corev1.ResourceCPU:    resource.MustParse("1"),
++					corev1.ResourceMemory: resource.MustParse("100Mi"),
++				},
++				{
++					corev1.ResourceCPU:    resource.MustParse("2"),
++					corev1.ResourceMemory: resource.MustParse("200Mi"),
++				},
++				{
++					corev1.ResourceCPU:    resource.MustParse("16"),
++					corev1.ResourceMemory: resource.MustParse("2Gi"),
++				},
++			},
++			expectedMaxCPUs: 16,
++		},
++		{
++			name: "multiple containers - with fractional CPUs",
++			containersResources: []corev1.ResourceList{
++				{
++					corev1.ResourceCPU:    resource.MustParse("1"),
++					corev1.ResourceMemory: resource.MustParse("100Mi"),
++				},
++				{
++					corev1.ResourceCPU:    resource.MustParse("2300m"), // 2.3 CPUs, rounded up to 3
++					corev1.ResourceMemory: resource.MustParse("200Mi"),
++				},
++				{
++					corev1.ResourceCPU:    resource.MustParse("500m"), // 0.5 CPUs, rounded up to 1
++					corev1.ResourceMemory: resource.MustParse("50Mi"),
++				},
++			},
++			expectedMaxCPUs: 3, // max of 1, 3, 1
++		},
++		{
++			name: "multiple containers - large CPU values",
++			containersResources: []corev1.ResourceList{
++				{
++					corev1.ResourceCPU:    resource.MustParse("8"),
++					corev1.ResourceMemory: resource.MustParse("1Gi"),
++				},
++				{
++					corev1.ResourceCPU:    resource.MustParse("64"),
++					corev1.ResourceMemory: resource.MustParse("8Gi"),
++				},
++				{
++					corev1.ResourceCPU:    resource.MustParse("32"),
++					corev1.ResourceMemory: resource.MustParse("4Gi"),
++				},
++				{
++					corev1.ResourceCPU:    resource.MustParse("16"),
++					corev1.ResourceMemory: resource.MustParse("2Gi"),
++				},
++			},
++			expectedMaxCPUs: 64,
++		},
++		{
++			name: "multiple containers - all empty ResourceLists",
++			containersResources: []corev1.ResourceList{
++				{},
++				{},
++				{},
++			},
++			expectedMaxCPUs: 0,
++		},
++		{
++			name: "multiple containers - mix of empty and non-empty",
++			containersResources: []corev1.ResourceList{
++				{},
++				{
++					corev1.ResourceCPU:    resource.MustParse("2"),
++					corev1.ResourceMemory: resource.MustParse("200Mi"),
++				},
++				{},
++				{
++					corev1.ResourceCPU:    resource.MustParse("5"),
++					corev1.ResourceMemory: resource.MustParse("500Mi"),
++				},
++			},
++			expectedMaxCPUs: 5,
++		},
++		{
++			name: "five containers - ascending order",
++			containersResources: []corev1.ResourceList{
++				{
++					corev1.ResourceCPU:    resource.MustParse("1"),
++					corev1.ResourceMemory: resource.MustParse("100Mi"),
++				},
++				{
++					corev1.ResourceCPU:    resource.MustParse("2"),
++					corev1.ResourceMemory: resource.MustParse("200Mi"),
++				},
++				{
++					corev1.ResourceCPU:    resource.MustParse("3"),
++					corev1.ResourceMemory: resource.MustParse("300Mi"),
++				},
++				{
++					corev1.ResourceCPU:    resource.MustParse("4"),
++					corev1.ResourceMemory: resource.MustParse("400Mi"),
++				},
++				{
++					corev1.ResourceCPU:    resource.MustParse("5"),
++					corev1.ResourceMemory: resource.MustParse("500Mi"),
++				},
++			},
++			expectedMaxCPUs: 5,
++		},
++		{
++			name: "five containers - descending order",
++			containersResources: []corev1.ResourceList{
++				{
++					corev1.ResourceCPU:    resource.MustParse("10"),
++					corev1.ResourceMemory: resource.MustParse("1Gi"),
++				},
++				{
++					corev1.ResourceCPU:    resource.MustParse("8"),
++					corev1.ResourceMemory: resource.MustParse("800Mi"),
++				},
++				{
++					corev1.ResourceCPU:    resource.MustParse("6"),
++					corev1.ResourceMemory: resource.MustParse("600Mi"),
++				},
++				{
++					corev1.ResourceCPU:    resource.MustParse("4"),
++					corev1.ResourceMemory: resource.MustParse("400Mi"),
++				},
++				{
++					corev1.ResourceCPU:    resource.MustParse("2"),
++					corev1.ResourceMemory: resource.MustParse("200Mi"),
++				},
++			},
++			expectedMaxCPUs: 10,
++		},
++	}
++
++	for _, tt := range tests {
++		t.Run(tt.name, func(t *testing.T) {
++			result := MaxCPURequestsRoundedUp(tt.containersResources)
++			if result != tt.expectedMaxCPUs {
++				t.Errorf("MaxCPURequestsRounded() = %d, want %d", result, tt.expectedMaxCPUs)
++			}
++		})
++	}
++}

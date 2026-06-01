@@ -1,0 +1,231 @@
+diff --git a/pkg/tuned/tuned_parser.go b/pkg/tuned/tuned_parser.go
+index 9a358954ad..5b75e78b0c 100644
+--- a/pkg/tuned/tuned_parser.go
++++ b/pkg/tuned/tuned_parser.go
+@@ -6,6 +6,7 @@ import (
+ 	"io"      // io.EOF
+ 	"os"      // os.Stat()
+ 	"os/exec" // os.Exec()
++	"regexp"  // regexp.Compile()
+ 	"strings" // strings.Split()
+ 	"syscall" // syscall.SIGHUP, ...
+ 	"time"    // time.Second, ...
+@@ -309,6 +310,49 @@ func execCmd(command []string) (string, error) {
+ 	return out, nil
+ }
+ 
++// lscpu_check checks `lscpuStr` (lscpu output) against regular expressions.
++// Accepts args in the form: REGEX1, STR1, REGEX2, STR2, ...[, STR_FALLBACK]
++// If REGEX1 matches something in the output it returns STR1,
++// if REGEX2 matches it returns STR2, etc.
++// It stops on the first match. If no regex matches, it returns STR_FALLBACK
++// (or empty string if no fallback is provided).
++func lscpu_check(lscpuStr string, args []string) (string, error) {
++	var fallback string
++
++	if len(args) < 2 {
++		return "", fmt.Errorf("lscpu_check requires at least 2 arguments, got %d", len(args))
++	}
++
++	// See if we have a fallback (odd number of args).
++	if len(args)%2 == 1 {
++		fallback = args[len(args)-1]
++		args = args[:len(args)-1]
++	}
++
++	for i := 0; i < len(args); i += 2 {
++		regexStr := args[i]
++		resultStr := args[i+1]
++
++		// Enable multi-line matching: (?m) makes ^ and $ match line boundaries.
++		// Only add (?m) if not already present.
++		if len(regexStr) < 4 || regexStr[:4] != "(?m)" {
++			regexStr = "(?m)" + regexStr
++		}
++
++		re, err := regexp.Compile(regexStr)
++		if err != nil {
++			return "", fmt.Errorf("invalid regex '%s': %w", regexStr, err)
++		}
++
++		if re.MatchString(lscpuStr) {
++			return resultStr, nil
++		}
++	}
++
++	// No match found, return fallback.
++	return fallback, nil
++}
++
+ // execTuneDBuiltin executes TuneD built-in function 'function' with
+ // arguments 'args'.  Returns the result/expansion of running the built-in.
+ // If the execution of the built-in fails, returns the string 'onFail'.
+@@ -317,7 +361,7 @@ func execTuneDBuiltin(function string, args []string, onFail string) string {
+ 	case "exec":
+ 		out, err := execCmd(args)
+ 		if err != nil {
+-			klog.Errorf("error calling built-in exec: %v", err)
++			klog.Warningf("failure calling built-in exec: %v", err)
+ 			return onFail
+ 		}
+ 		return out
+@@ -330,7 +374,7 @@ func execTuneDBuiltin(function string, args []string, onFail string) string {
+ 		// argument 2.  Note the expansion to argument 2 is done also on error
+ 		// to match the semantics of the TuneD "virt_check".
+ 		if len(args) != 2 {
+-			klog.Errorf("built-in \"virt_check\" requires 2 arguments")
++			klog.Warningf("built-in \"virt_check\" requires 2 arguments")
+ 			return onFail
+ 		}
+ 		out, err := execCmd([]string{"virt-what"})
+@@ -338,13 +382,27 @@ func execTuneDBuiltin(function string, args []string, onFail string) string {
+ 			return args[0]
+ 		}
+ 		if err != nil {
+-			klog.Errorf("failure calling built-in exec: %v", err)
++			klog.Warningf("failure calling built-in exec: %v", err)
+ 		}
+ 
+ 		return args[1]
+ 
++	case "lscpu_check":
++		lscpuOut, err := execCmd([]string{"lscpu"})
++		if err != nil {
++			klog.Warningf("failure calling built-in lscpu_check: %v", err)
++			return onFail
++		}
++		out, err := lscpu_check(lscpuOut, args)
++		if err != nil {
++			klog.Warningf("failure calling built-in lscpu_check: %v", err)
++			return onFail
++		}
++
++		return out
++
+ 	default:
+-		klog.Errorf("calling unsupported built-in: %v", function)
++		klog.Warningf("calling unsupported built-in: %q, TuneD reloads on config changes may not work properly", function)
+ 		// unsupported built-in
+ 	}
+ 
+diff --git a/pkg/tuned/tuned_parser_test.go b/pkg/tuned/tuned_parser_test.go
+index 7b7fbe1127..ebbcd85606 100644
+--- a/pkg/tuned/tuned_parser_test.go
++++ b/pkg/tuned/tuned_parser_test.go
+@@ -67,3 +67,116 @@ func TestBuiltinExpansion(t *testing.T) {
+ 		}
+ 	}
+ }
++
++func TestLscpuCheckARM(t *testing.T) {
++	lscpuARM := `Architecture:                         aarch64
++CPU op-mode(s):                       32-bit, 64-bit
++Byte Order:                           Little Endian
++CPU(s):                               80
++On-line CPU(s) list:                  0-79
++Vendor ID:                            ARM
++BIOS Vendor ID:                       Ampere(R)
++Model name:                           Neoverse-N1
++BIOS Model name:                      Ampere(R) Altra(R) Processor Q80-30 CPU @ 3.0GHz
++BIOS CPU family:                      257
++Model:                                1
++Thread(s) per core:                   1
++Core(s) per socket:                   80
++Socket(s):                            1
++Stepping:                             r3p1
++Frequency boost:                      disabled
++CPU(s) scaling MHz:                   100%
++CPU max MHz:                          3000.0000
++CPU min MHz:                          1000.0000
++BogoMIPS:                             50.00
++Flags:                                fp asimd evtstrm aes pmull sha1 sha2 crc32 atomics fphp asimdhp cpuid asimdrdm lrcpc dcpop asimddp
++L1d cache:                            5 MiB (80 instances)
++L1i cache:                            5 MiB (80 instances)
++L2 cache:                             80 MiB (80 instances)
++NUMA node(s):                         1
++NUMA node0 CPU(s):                    0-79
++Vulnerability Gather data sampling:   Not affected
++Vulnerability Itlb multihit:          Not affected
++Vulnerability L1tf:                   Not affected
++Vulnerability Mds:                    Not affected
++Vulnerability Meltdown:               Not affected
++Vulnerability Mmio stale data:        Not affected
++Vulnerability Reg file data sampling: Not affected
++Vulnerability Retbleed:               Not affected
++Vulnerability Spec rstack overflow:   Not affected
++Vulnerability Spec store bypass:      Mitigation; Speculative Store Bypass disabled via prctl
++Vulnerability Spectre v1:             Mitigation; __user pointer sanitization
++Vulnerability Spectre v2:             Mitigation; CSV2, BHB
++Vulnerability Srbds:                  Not affected
++Vulnerability Tsx async abort:        Not affected
++`
++
++	tests := []struct {
++		name    string
++		args    []string
++		want    string
++		wantErr bool
++	}{
++		{
++			name:    "Match ARM Vendor ID",
++			args:    []string{"Vendor ID\\:\\s*GenuineIntel", "intel", "Vendor ID\\:\\s*AuthenticAMD", "amd", "Architecture\\:\\s*aarch64", "arm", "unknown"},
++			want:    "arm",
++			wantErr: false,
++		},
++		{
++			name:    "Match aarch64 architecture",
++			args:    []string{"Architecture\\:\\s*x86_64", "x86", "Architecture\\:\\s*aarch64", "aarch64"},
++			want:    "aarch64",
++			wantErr: false,
++		},
++		{
++			name:    "No match returns fallback",
++			args:    []string{"NonExistentPattern", "result", "fallback"},
++			want:    "fallback",
++			wantErr: false,
++		},
++		{
++			name:    "No match no fallback returns empty string",
++			args:    []string{"AuthenticAMD", "amd"},
++			want:    "",
++			wantErr: false,
++		},
++		{
++			name:    "First match wins",
++			args:    []string{"^Architecture", "aarch64", "ARM", "arm", "unknown"},
++			want:    "aarch64",
++			wantErr: false,
++		},
++		{
++			name:    "One argument returns error",
++			args:    []string{"fallback"},
++			want:    "",
++			wantErr: true,
++		},
++		{
++			name:    "Zero arguments returns error",
++			args:    []string{},
++			want:    "",
++			wantErr: true,
++		},
++		{
++			name:    "Invalid regex returns error",
++			args:    []string{"[invalid(regex", "result"},
++			want:    "",
++			wantErr: true,
++		},
++	}
++
++	for _, tc := range tests {
++		t.Run(tc.name, func(t *testing.T) {
++			got, err := lscpu_check(lscpuARM, tc.args)
++			if (err != nil) != tc.wantErr {
++				t.Errorf("lscpu_check() error = %v, wantErr %v", err, tc.wantErr)
++				return
++			}
++			if got != tc.want {
++				t.Errorf("lscpu_check() = %v, want %v", got, tc.want)
++			}
++		})
++	}
++}

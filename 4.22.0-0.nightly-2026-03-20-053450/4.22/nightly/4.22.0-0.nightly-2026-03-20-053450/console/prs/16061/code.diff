@@ -1,0 +1,924 @@
+diff --git a/frontend/packages/console-app/src/actions/hooks/useCommonActions.ts b/frontend/packages/console-app/src/actions/hooks/useCommonActions.ts
+index 51e1414d964..eb5a509bc0f 100644
+--- a/frontend/packages/console-app/src/actions/hooks/useCommonActions.ts
++++ b/frontend/packages/console-app/src/actions/hooks/useCommonActions.ts
+@@ -161,11 +161,7 @@ export const useCommonActions = <T extends readonly CommonActionCreator[]>(
+         accessReview: asAccessReview(kind as K8sModel, resource as K8sResourceKind, 'patch'),
+       }),
+     }),
+-    // Excluding stable modal launcher functions (launchCountModal)
+-    // to prevent unnecessary re-renders
+-    // TODO: remove once all Modals have been updated to useOverlay
+-    // eslint-disable-next-line react-hooks/exhaustive-deps
+-    [kind, resource, t, message, actualEditPath, launchModal],
++    [kind, resource, t, message, actualEditPath, launchModal, launchCountModal],
+   );
+ 
+   const result = useMemo((): [ActionObject<T>, boolean] => {
+diff --git a/frontend/packages/console-app/src/components/oauth-config/IdentityProviders.tsx b/frontend/packages/console-app/src/components/oauth-config/IdentityProviders.tsx
+index bd385836176..9ae86232d2e 100644
+--- a/frontend/packages/console-app/src/components/oauth-config/IdentityProviders.tsx
++++ b/frontend/packages/console-app/src/components/oauth-config/IdentityProviders.tsx
+@@ -2,7 +2,7 @@ import type { FC } from 'react';
+ import { useCallback } from 'react';
+ import * as _ from 'lodash';
+ import { useTranslation } from 'react-i18next';
+-import { useModal } from '@console/dynamic-plugin-sdk/src/app/modal-support/useModal';
++import { useOverlay } from '@console/dynamic-plugin-sdk/src/app/modal-support/useOverlay';
+ import { useK8sModel } from '@console/dynamic-plugin-sdk/src/utils/k8s/hooks/useK8sModel';
+ import { getGroupVersionKindForResource } from '@console/dynamic-plugin-sdk/src/utils/k8s/k8s-ref';
+ import type { RemoveIdentityProvider } from '@console/internal/components/modals/remove-idp-modal';
+@@ -13,13 +13,13 @@ import type { IdentityProvider, OAuthKind } from '@console/internal/module/k8s';
+ 
+ export const IdentityProviders: FC<IdentityProvidersProps> = ({ identityProviders, obj }) => {
+   const { t } = useTranslation();
+-  const launcher = useModal();
++  const launchModal = useOverlay();
+   const groupVersionKind = getGroupVersionKindForResource(obj);
+   const [model] = useK8sModel(groupVersionKind);
+-  const launchModal = useCallback(
++  const openRemoveModal = useCallback(
+     (index, name, type) => {
+       if (obj && model) {
+-        launcher<RemoveIdentityProvider>(RemoveIdentityProviderModal, {
++        launchModal<RemoveIdentityProvider>(RemoveIdentityProviderModal, {
+           obj,
+           model,
+           index,
+@@ -28,7 +28,7 @@ export const IdentityProviders: FC<IdentityProvidersProps> = ({ identityProvider
+         });
+       }
+     },
+-    [launcher, model, obj],
++    [launchModal, model, obj],
+   );
+ 
+   return _.isEmpty(identityProviders) ? (
+@@ -60,7 +60,7 @@ export const IdentityProviders: FC<IdentityProvidersProps> = ({ identityProvider
+                   options={[
+                     {
+                       label: t('console-app~Remove identity provider'),
+-                      callback: () => launchModal(index, idp.name, idp.type),
++                      callback: () => openRemoveModal(index, idp.name, idp.type),
+                     },
+                   ]}
+                 />
+diff --git a/frontend/packages/console-dynamic-plugin-sdk/CHANGELOG-core.md b/frontend/packages/console-dynamic-plugin-sdk/CHANGELOG-core.md
+index 0cb388c87c4..5b35eaa0d3d 100644
+--- a/frontend/packages/console-dynamic-plugin-sdk/CHANGELOG-core.md
++++ b/frontend/packages/console-dynamic-plugin-sdk/CHANGELOG-core.md
+@@ -12,6 +12,7 @@ table in [Console dynamic plugins README](./README.md).
+ 
+ ## 4.22.0-prerelease.2 - TBD
+ 
++- **Breaking**: Changed `AlertAction` extension to use `LaunchOverlay` instead of `LaunchModal`. The `action` callback parameter is now typed as `LaunchOverlay`, which does not support the optional `id` parameter that `LaunchModal` had. Plugins implementing `console.alert-action` extensions must update their action callbacks accordingly. ([CONSOLE-4447])
+ - **Breaking**: Removed `pluginID` from the result in `useResolvedExtensions` hook ([CONSOLE-3769], [#15904])
+ - **Breaking**: Removed `AppInitSDK` and `useReduxStore` in `app` directory ([CONSOLE-5063], [#16019])
+ - **Deprecated**: `useUserSettings` hook has been renamed to `useUserPreference` for consistency ([OCPBUGS-44612], [#16057])
+diff --git a/frontend/packages/console-dynamic-plugin-sdk/docs/console-extensions.md b/frontend/packages/console-dynamic-plugin-sdk/docs/console-extensions.md
+index 3da7234cf47..93c0fde8c01 100644
+--- a/frontend/packages/console-dynamic-plugin-sdk/docs/console-extensions.md
++++ b/frontend/packages/console-dynamic-plugin-sdk/docs/console-extensions.md
+@@ -158,7 +158,7 @@ This extension can be used to trigger a specific action when a specific Promethe
+ | ---- | ---------- | -------- | ----------- |
+ | `alert` | `string` | no | Alert name as defined by `alert.rule.name` property |
+ | `text` | `string` | no | Action text |
+-| `action` | `CodeRef<(alert: Alert, launchModal: LaunchModal) => void>` | no | Function to perform side effect |
++| `action` | `CodeRef<(alert: Alert, launchModal: LaunchOverlay) => void>` | no | Function to perform side effect |
+ 
+ ---
+ 
+diff --git a/frontend/packages/console-dynamic-plugin-sdk/src/extensions/notification-alert.ts b/frontend/packages/console-dynamic-plugin-sdk/src/extensions/notification-alert.ts
+index 028a65f891d..bee94266791 100644
+--- a/frontend/packages/console-dynamic-plugin-sdk/src/extensions/notification-alert.ts
++++ b/frontend/packages/console-dynamic-plugin-sdk/src/extensions/notification-alert.ts
+@@ -1,5 +1,5 @@
+ import type { Alert } from '../api/common-types';
+-import type { LaunchModal } from '../app/modal-support/ModalProvider';
++import type { LaunchOverlay } from '../app/modal-support/OverlayProvider';
+ import type { Extension, CodeRef } from '../types';
+ 
+ /** This extension can be used to trigger a specific action when a specific Prometheus alert is observed by the Console based on its `rule.name` value. */
+@@ -11,7 +11,7 @@ export type AlertAction = Extension<
+     /** Action text */
+     text: string;
+     /** Function to perform side effect */
+-    action: CodeRef<(alert: Alert, launchModal: LaunchModal) => void>;
++    action: CodeRef<(alert: Alert, launchModal: LaunchOverlay) => void>;
+   }
+ >;
+ 
+diff --git a/frontend/packages/console-shared/src/components/dashboard/status-card/AlertItem.tsx b/frontend/packages/console-shared/src/components/dashboard/status-card/AlertItem.tsx
+index e0409a04b5c..e4b7e8cdef2 100644
+--- a/frontend/packages/console-shared/src/components/dashboard/status-card/AlertItem.tsx
++++ b/frontend/packages/console-shared/src/components/dashboard/status-card/AlertItem.tsx
+@@ -6,7 +6,7 @@ import { Link, useNavigate } from 'react-router';
+ import type { AlertAction } from '@console/dynamic-plugin-sdk';
+ import { isAlertAction, useResolvedExtensions } from '@console/dynamic-plugin-sdk';
+ import type { AlertItemProps } from '@console/dynamic-plugin-sdk/src/api/internal-types';
+-import { useModal } from '@console/dynamic-plugin-sdk/src/lib-core';
++import { useOverlay } from '@console/dynamic-plugin-sdk/src/app/modal-support/useOverlay';
+ import { alertURL } from '@console/internal/components/monitoring/utils';
+ import { getAlertActions } from '@console/internal/components/notification-drawer';
+ import { LinkifyExternal } from '@console/internal/components/utils/link';
+@@ -92,7 +92,7 @@ export const StatusItem: FC<StatusItemProps> = ({
+ 
+ const AlertItem: FC<AlertItemProps> = ({ alert, documentationLink }) => {
+   const { t } = useTranslation();
+-  const launchModal = useModal();
++  const launchModal = useOverlay();
+   const [actionExtensions] = useResolvedExtensions<AlertAction>(
+     useCallback(
+       (e): e is AlertAction => isAlertAction(e) && e.properties.alert === alert.rule.name,
+diff --git a/frontend/packages/console-shared/src/components/modals/CreateNamespaceModal.tsx b/frontend/packages/console-shared/src/components/modals/CreateNamespaceModal.tsx
+index 10cd280e6d4..c31cb4d5b9b 100644
+--- a/frontend/packages/console-shared/src/components/modals/CreateNamespaceModal.tsx
++++ b/frontend/packages/console-shared/src/components/modals/CreateNamespaceModal.tsx
+@@ -20,7 +20,7 @@ import {
+ import { useTranslation } from 'react-i18next';
+ import { useNavigate } from 'react-router';
+ import type { CreateProjectModalProps } from '@console/dynamic-plugin-sdk/src';
+-import type { ModalComponent } from '@console/dynamic-plugin-sdk/src/app/modal-support/ModalProvider';
++import type { OverlayComponent } from '@console/dynamic-plugin-sdk/src/app/modal-support/OverlayProvider';
+ import { FieldLevelHelp } from '@console/internal/components/utils/field-level-help';
+ import { resourceObjPath } from '@console/internal/components/utils/resource-link';
+ import { SelectorInput } from '@console/internal/components/utils/selector-input';
+@@ -39,8 +39,8 @@ const defaultDeny = {
+   },
+ };
+ 
+-export const CreateNamespaceModal: ModalComponent<CreateProjectModalProps> = ({
+-  closeModal,
++export const CreateNamespaceModal: OverlayComponent<CreateProjectModalProps> = ({
++  closeOverlay,
+   onSubmit,
+ }) => {
+   const { t } = useTranslation();
+@@ -99,7 +99,7 @@ export const CreateNamespaceModal: ModalComponent<CreateProjectModalProps> = ({
+     event.preventDefault();
+     handlePromise(create())
+       .then((obj) => {
+-        closeModal();
++        closeOverlay();
+         if (onSubmit) {
+           onSubmit(obj);
+         } else {
+@@ -157,7 +157,7 @@ export const CreateNamespaceModal: ModalComponent<CreateProjectModalProps> = ({
+     <Modal
+       variant={ModalVariant.small}
+       isOpen
+-      onClose={closeModal}
++      onClose={closeOverlay}
+       aria-labelledby="create-namespace-modal-title"
+     >
+       <ModalHeader
+@@ -236,7 +236,7 @@ export const CreateNamespaceModal: ModalComponent<CreateProjectModalProps> = ({
+           type="button"
+           variant="link"
+           isDisabled={inProgress}
+-          onClick={closeModal}
++          onClick={closeOverlay}
+           data-test-id="modal-cancel-action"
+         >
+           {t('console-shared~Cancel')}
+diff --git a/frontend/packages/console-shared/src/components/modals/CreateProjectModal.tsx b/frontend/packages/console-shared/src/components/modals/CreateProjectModal.tsx
+index cb458327e16..f64420833f1 100644
+--- a/frontend/packages/console-shared/src/components/modals/CreateProjectModal.tsx
++++ b/frontend/packages/console-shared/src/components/modals/CreateProjectModal.tsx
+@@ -19,6 +19,7 @@ import type {
+   CreateProjectModalProps,
+ } from '@console/dynamic-plugin-sdk/src';
+ import { isCreateProjectModal, useResolvedExtensions } from '@console/dynamic-plugin-sdk/src';
++import type { OverlayComponent } from '@console/dynamic-plugin-sdk/src/app/modal-support/OverlayProvider';
+ import { setFlag } from '@console/internal/actions/flags';
+ import {
+   documentationURLs,
+@@ -33,10 +34,9 @@ import { ExternalLink } from '@console/shared/src/components/links/ExternalLink'
+ import { ModalFooterWithAlerts } from '@console/shared/src/components/modals/ModalFooterWithAlerts';
+ import { FLAGS } from '@console/shared/src/constants/common';
+ import { useConsoleDispatch } from '@console/shared/src/hooks/useConsoleDispatch';
+-import type { ModalComponent } from 'packages/console-dynamic-plugin-sdk/src/app/modal-support/ModalProvider';
+ 
+-const DefaultCreateProjectModal: ModalComponent<CreateProjectModalProps> = ({
+-  closeModal,
++const DefaultCreateProjectModal: OverlayComponent<CreateProjectModalProps> = ({
++  closeOverlay,
+   onSubmit,
+ }) => {
+   const navigate = useNavigate();
+@@ -95,7 +95,7 @@ const DefaultCreateProjectModal: ModalComponent<CreateProjectModalProps> = ({
+     event.preventDefault();
+     handlePromise(createProject())
+       .then((obj) => {
+-        closeModal();
++        closeOverlay();
+         if (onSubmit) {
+           onSubmit(obj);
+         } else {
+@@ -114,7 +114,7 @@ const DefaultCreateProjectModal: ModalComponent<CreateProjectModalProps> = ({
+     <Modal
+       variant={ModalVariant.small}
+       isOpen
+-      onClose={closeModal}
++      onClose={closeOverlay}
+       aria-labelledby="create-project-modal-title"
+     >
+       <ModalHeader
+@@ -200,7 +200,7 @@ const DefaultCreateProjectModal: ModalComponent<CreateProjectModalProps> = ({
+           type="button"
+           variant="link"
+           isDisabled={inProgress}
+-          onClick={closeModal}
++          onClick={closeOverlay}
+           data-test-id="modal-cancel-action"
+         >
+           {t('console-shared~Cancel')}
+@@ -210,7 +210,7 @@ const DefaultCreateProjectModal: ModalComponent<CreateProjectModalProps> = ({
+   );
+ };
+ 
+-export const CreateProjectModal: ModalComponent<CreateProjectModalProps> = (props) => {
++export const CreateProjectModal: OverlayComponent<CreateProjectModalProps> = (props) => {
+   // Get create project modal extensions
+   const [createProjectModalExtensions, resolved] = useResolvedExtensions<
+     CreateProjectModalExtension
+@@ -225,5 +225,10 @@ export const CreateProjectModal: ModalComponent<CreateProjectModalProps> = (prop
+   }
+ 
+   // If extension modal component exists, render it, else render default
+-  return Component ? <Component {...props} /> : <DefaultCreateProjectModal {...props} />;
++  // Pass closeModal as an alias for closeOverlay for backward compatibility with extensions
++  return Component ? (
++    <Component {...props} closeModal={props.closeOverlay} />
++  ) : (
++    <DefaultCreateProjectModal {...props} />
++  );
+ };
+diff --git a/frontend/packages/console-shared/src/hooks/useAnnotationsModal.tsx b/frontend/packages/console-shared/src/hooks/useAnnotationsModal.tsx
+index 6e4275d5193..350326dd469 100644
+--- a/frontend/packages/console-shared/src/hooks/useAnnotationsModal.tsx
++++ b/frontend/packages/console-shared/src/hooks/useAnnotationsModal.tsx
+@@ -1,34 +1,20 @@
+ import { useCallback } from 'react';
+-import type { ModalComponent } from '@console/dynamic-plugin-sdk/src/app/modal-support/ModalProvider';
+-import { useModal } from '@console/dynamic-plugin-sdk/src/app/modal-support/useModal';
++import { useOverlay } from '@console/dynamic-plugin-sdk/src/app/modal-support/useOverlay';
+ import type { UseAnnotationsModal } from '@console/dynamic-plugin-sdk/src/extensions/console-types';
+ import { useK8sModel } from '@console/dynamic-plugin-sdk/src/utils/k8s/hooks/useK8sModel';
+ import { getGroupVersionKindForResource } from '@console/dynamic-plugin-sdk/src/utils/k8s/k8s-ref';
+-import { ModalWrapper } from '@console/internal/components/factory/modal';
++import { LazyAnnotationsModalOverlay } from '@console/internal/components/modals';
+ import type { AnnotationsModalProps } from '@console/internal/components/modals/tags';
+-import { AnnotationsModal } from '@console/internal/components/modals/tags';
+-
+-const AnnotationsModalComponent: ModalComponent<AnnotationsModalProps> = ({
+-  closeModal,
+-  kind,
+-  resource,
+-}) => {
+-  return (
+-    <ModalWrapper blocking onClose={closeModal}>
+-      <AnnotationsModal cancel={closeModal} close={closeModal} kind={kind} resource={resource} />
+-    </ModalWrapper>
+-  );
+-};
+ 
+ export const useAnnotationsModal: UseAnnotationsModal = (resource) => {
+-  const launcher = useModal();
++  const launchModal = useOverlay();
+   const groupVersionKind = getGroupVersionKindForResource(resource);
+   const [kind] = useK8sModel(groupVersionKind);
+   return useCallback(
+     () =>
+       resource &&
+       kind &&
+-      launcher<AnnotationsModalProps>(AnnotationsModalComponent, { kind, resource }),
+-    [launcher, kind, resource],
++      launchModal<AnnotationsModalProps>(LazyAnnotationsModalOverlay, { kind, resource }),
++    [launchModal, kind, resource],
+   );
+ };
+diff --git a/frontend/packages/console-shared/src/hooks/useCopyCodeModal.tsx b/frontend/packages/console-shared/src/hooks/useCopyCodeModal.tsx
+index e1dd798afa1..0b5d6b39c73 100644
+--- a/frontend/packages/console-shared/src/hooks/useCopyCodeModal.tsx
++++ b/frontend/packages/console-shared/src/hooks/useCopyCodeModal.tsx
+@@ -1,12 +1,17 @@
+ import { useCallback } from 'react';
+ import { Modal, ModalHeader, ModalBody, ModalVariant } from '@patternfly/react-core';
+-import { useModal } from '@console/dynamic-plugin-sdk/src/lib-core';
++import type { OverlayComponent } from '@console/dynamic-plugin-sdk/src/app/modal-support/OverlayProvider';
++import { useOverlay } from '@console/dynamic-plugin-sdk/src/app/modal-support/useOverlay';
+ import { CopyToClipboard } from '@console/internal/components/utils/copy-to-clipboard';
+-import type { ModalComponent } from 'packages/console-dynamic-plugin-sdk/src/app/modal-support/ModalProvider';
+ 
+-const CopyCodeModal: CopyCodeModalComponent = ({ title, snippet, closeModal }) => (
+-  <Modal isOpen onClose={closeModal} variant={ModalVariant.medium}>
+-    <ModalHeader title={title} />
++const CopyCodeModal: CopyCodeModalComponent = ({ title, snippet, closeOverlay }) => (
++  <Modal
++    isOpen
++    onClose={closeOverlay}
++    variant={ModalVariant.medium}
++    aria-labelledby="copy-code-modal-title"
++  >
++    <ModalHeader title={title} labelId="copy-code-modal-title" />
+     <ModalBody>
+       <CopyToClipboard key={snippet} value={snippet} />
+     </ModalBody>
+@@ -14,14 +19,14 @@ const CopyCodeModal: CopyCodeModalComponent = ({ title, snippet, closeModal }) =
+ );
+ 
+ export const useCopyCodeModal: UseCopyCodeModal = (title, snippet) => {
+-  const launcher = useModal();
+-  return useCallback(() => (snippet ? launcher(CopyCodeModal, { title, snippet }) : null), [
+-    launcher,
++  const launchModal = useOverlay();
++  return useCallback(() => (snippet ? launchModal(CopyCodeModal, { title, snippet }) : null), [
++    launchModal,
+     snippet,
+     title,
+   ]);
+ };
+ 
+ type CopyCodeModalProps = { title: string; snippet: string };
+-type CopyCodeModalComponent = ModalComponent<CopyCodeModalProps>;
++type CopyCodeModalComponent = OverlayComponent<CopyCodeModalProps>;
+ type UseCopyCodeModal = (title: string, snippet: string) => () => void;
+diff --git a/frontend/packages/console-shared/src/hooks/useCreateNamespaceModal.ts b/frontend/packages/console-shared/src/hooks/useCreateNamespaceModal.ts
+index 503bf97a7b2..32b69372986 100644
+--- a/frontend/packages/console-shared/src/hooks/useCreateNamespaceModal.ts
++++ b/frontend/packages/console-shared/src/hooks/useCreateNamespaceModal.ts
+@@ -1,11 +1,11 @@
+ import { useCallback } from 'react';
+ import type { CreateProjectModalProps } from '@console/dynamic-plugin-sdk/src';
+-import { useModal } from '@console/dynamic-plugin-sdk/src/app/modal-support/useModal';
++import { useOverlay } from '@console/dynamic-plugin-sdk/src/app/modal-support/useOverlay';
+ import { CreateNamespaceModal } from '../components/modals/CreateNamespaceModal';
+ 
+ export const useCreateNamespaceModal: UseCreateNamespaceModal = () => {
+-  const launcher = useModal();
+-  return useCallback((props) => launcher(CreateNamespaceModal, props), [launcher]);
++  const launchModal = useOverlay();
++  return useCallback((props) => launchModal(CreateNamespaceModal, props), [launchModal]);
+ };
+ 
+ type UseCreateNamespaceModal = () => (props: CreateProjectModalProps) => void;
+diff --git a/frontend/packages/console-shared/src/hooks/useCreateNamespaceOrProjectModal.ts b/frontend/packages/console-shared/src/hooks/useCreateNamespaceOrProjectModal.ts
+index 2f9884bb2b4..83b2f8802c9 100644
+--- a/frontend/packages/console-shared/src/hooks/useCreateNamespaceOrProjectModal.ts
++++ b/frontend/packages/console-shared/src/hooks/useCreateNamespaceOrProjectModal.ts
+@@ -1,16 +1,16 @@
+ import { useCallback } from 'react';
+ import type { CreateProjectModalProps } from '@console/dynamic-plugin-sdk/src';
+-import { useModal } from '@console/dynamic-plugin-sdk/src/app/modal-support/useModal';
++import { useOverlay } from '@console/dynamic-plugin-sdk/src/app/modal-support/useOverlay';
+ import { FLAGS } from '@console/shared/src/constants/common';
+ import { useFlag } from '@console/shared/src/hooks/useFlag';
+ import { CreateNamespaceModal } from '../components/modals/CreateNamespaceModal';
+ import { CreateProjectModal } from '../components/modals/CreateProjectModal';
+ 
+ export const useCreateNamespaceOrProjectModal: UseCreateProjectModal = () => {
+-  const launcher = useModal();
++  const launchModal = useOverlay();
+   const isOpenShift = useFlag(FLAGS.OPENSHIFT);
+   const ModalComponent = isOpenShift ? CreateProjectModal : CreateNamespaceModal;
+-  return useCallback((props) => launcher(ModalComponent, props), [launcher, ModalComponent]);
++  return useCallback((props) => launchModal(ModalComponent, props), [launchModal, ModalComponent]);
+ };
+ 
+ type UseCreateProjectModal = () => (props: CreateProjectModalProps) => void;
+diff --git a/frontend/packages/console-shared/src/hooks/useCreateProjectModal.ts b/frontend/packages/console-shared/src/hooks/useCreateProjectModal.ts
+index 33fe3a9b4e7..7ece3b0f295 100644
+--- a/frontend/packages/console-shared/src/hooks/useCreateProjectModal.ts
++++ b/frontend/packages/console-shared/src/hooks/useCreateProjectModal.ts
+@@ -1,11 +1,11 @@
+ import { useCallback } from 'react';
+ import type { CreateProjectModalProps } from '@console/dynamic-plugin-sdk/src';
+-import { useModal } from '@console/dynamic-plugin-sdk/src/app/modal-support/useModal';
++import { useOverlay } from '@console/dynamic-plugin-sdk/src/app/modal-support/useOverlay';
+ import { CreateProjectModal } from '../components/modals/CreateProjectModal';
+ 
+ export const useCreateProjectModal: UseCreateProjectModal = () => {
+-  const launcher = useModal();
+-  return useCallback((props) => launcher(CreateProjectModal, props), [launcher]);
++  const launchModal = useOverlay();
++  return useCallback((props) => launchModal(CreateProjectModal, props), [launchModal]);
+ };
+ 
+ type UseCreateProjectModal = () => (props: CreateProjectModalProps) => void;
+diff --git a/frontend/packages/console-shared/src/hooks/useDeleteModal.tsx b/frontend/packages/console-shared/src/hooks/useDeleteModal.tsx
+index 7400ea8d603..3b27fcfbfe6 100644
+--- a/frontend/packages/console-shared/src/hooks/useDeleteModal.tsx
++++ b/frontend/packages/console-shared/src/hooks/useDeleteModal.tsx
+@@ -1,37 +1,10 @@
+ import { useCallback } from 'react';
+ import type { UseDeleteModal } from '@console/dynamic-plugin-sdk/src';
+-import type { ModalComponent } from '@console/dynamic-plugin-sdk/src/app/modal-support/ModalProvider';
+-import { useModal } from '@console/dynamic-plugin-sdk/src/app/modal-support/useModal';
++import { useOverlay } from '@console/dynamic-plugin-sdk/src/app/modal-support/useOverlay';
+ import { useK8sModel } from '@console/dynamic-plugin-sdk/src/utils/k8s/hooks/useK8sModel';
+ import { getGroupVersionKindForResource } from '@console/dynamic-plugin-sdk/src/utils/k8s/k8s-ref';
+-import { ModalWrapper } from '@console/internal/components/factory/modal';
++import { LazyDeleteModalOverlay } from '@console/internal/components/modals';
+ import type { DeleteModalProps } from '@console/internal/components/modals/delete-modal';
+-import { DeleteModal } from '@console/internal/components/modals/delete-modal';
+-
+-const DeleteModalComponent: ModalComponent<DeleteModalProps> = ({
+-  btnText,
+-  closeModal,
+-  deleteAllResources,
+-  kind,
+-  message,
+-  redirectTo,
+-  resource,
+-}) => {
+-  return (
+-    <ModalWrapper blocking onClose={closeModal}>
+-      <DeleteModal
+-        kind={kind}
+-        resource={resource}
+-        btnText={btnText}
+-        cancel={closeModal}
+-        close={closeModal}
+-        deleteAllResources={deleteAllResources}
+-        message={message}
+-        redirectTo={redirectTo}
+-      />
+-    </ModalWrapper>
+-  );
+-};
+ 
+ export const useDeleteModal: UseDeleteModal = (
+   resource,
+@@ -40,14 +13,14 @@ export const useDeleteModal: UseDeleteModal = (
+   btnText,
+   deleteAllResources,
+ ) => {
+-  const launcher = useModal();
++  const launchModal = useOverlay();
+   const groupVersionKind = getGroupVersionKindForResource(resource);
+   const [kind] = useK8sModel(groupVersionKind);
+   return useCallback(
+     () =>
+       resource &&
+       kind &&
+-      launcher<DeleteModalProps>(DeleteModalComponent, {
++      launchModal<DeleteModalProps>(LazyDeleteModalOverlay, {
+         kind,
+         resource,
+         redirectTo,
+@@ -55,6 +28,6 @@ export const useDeleteModal: UseDeleteModal = (
+         btnText,
+         deleteAllResources,
+       }),
+-    [resource, kind, launcher, btnText, deleteAllResources, message, redirectTo],
++    [resource, kind, launchModal, btnText, deleteAllResources, message, redirectTo],
+   );
+ };
+diff --git a/frontend/packages/console-shared/src/hooks/useLabelsModal.tsx b/frontend/packages/console-shared/src/hooks/useLabelsModal.tsx
+index 3916bc3e649..8ee9c27fa27 100644
+--- a/frontend/packages/console-shared/src/hooks/useLabelsModal.tsx
++++ b/frontend/packages/console-shared/src/hooks/useLabelsModal.tsx
+@@ -3,15 +3,16 @@ import { useOverlay } from '@console/dynamic-plugin-sdk/src/app/modal-support/us
+ import type { UseLabelsModal } from '@console/dynamic-plugin-sdk/src/extensions/console-types';
+ import { useK8sModel } from '@console/dynamic-plugin-sdk/src/utils/k8s/hooks/useK8sModel';
+ import { getGroupVersionKindForResource } from '@console/dynamic-plugin-sdk/src/utils/k8s/k8s-ref';
++import { LazyLabelsModalOverlay } from '@console/internal/components/modals';
+ import type { LabelsModalProps } from '@console/internal/components/modals/labels-modal';
+-import { LabelsModalOverlay } from '@console/internal/components/modals/labels-modal';
+ 
+ export const useLabelsModal: UseLabelsModal = (resource) => {
+   const launchModal = useOverlay();
+   const groupVersionKind = getGroupVersionKindForResource(resource);
+   const [kind] = useK8sModel(groupVersionKind);
+   return useCallback(
+-    () => resource && kind && launchModal<LabelsModalProps>(LabelsModalOverlay, { kind, resource }),
++    () =>
++      resource && kind && launchModal<LabelsModalProps>(LazyLabelsModalOverlay, { kind, resource }),
+     [launchModal, kind, resource],
+   );
+ };
+diff --git a/frontend/public/components/modals/configure-count-modal.tsx b/frontend/public/components/modals/configure-count-modal.tsx
+index 17382758a40..3653fc2f30c 100644
+--- a/frontend/public/components/modals/configure-count-modal.tsx
++++ b/frontend/public/components/modals/configure-count-modal.tsx
+@@ -3,6 +3,7 @@ import { useTranslation } from 'react-i18next';
+ import { useState, useCallback } from 'react';
+ import { Modal, ModalHeader, ModalBody, Button, FormGroup, Form } from '@patternfly/react-core';
+ import { useOverlay } from '@console/dynamic-plugin-sdk/src/app/modal-support/useOverlay';
++import { useDeepCompareMemoize } from '@console/dynamic-plugin-sdk/src/utils/k8s/hooks/useDeepCompareMemoize';
+ import { OverlayComponent } from '@console/dynamic-plugin-sdk/src/app/modal-support/OverlayProvider';
+ import { k8sPatchResource } from '@console/dynamic-plugin-sdk/src/utils/k8s';
+ import { K8sResourceKind, K8sModel } from '../../module/k8s';
+@@ -122,15 +123,16 @@ export const ConfigureCountModal: OverlayComponent<ConfigureCountModalProps> = (
+  */
+ export const useConfigureCountModal = (baseProps?: Partial<ConfigureCountModalProps>) => {
+   const launcher = useOverlay();
++  const memoizedBaseProps = useDeepCompareMemoize(baseProps);
+   return useCallback(
+     (overrideProps?: Partial<ConfigureCountModalProps>) => {
+       const mergedProps = {
+-        ...baseProps,
++        ...memoizedBaseProps,
+         ...overrideProps,
+       };
+       launcher<ConfigureCountModalProps>(ConfigureCountModal, mergedProps);
+     },
+-    [launcher, baseProps],
++    [launcher, memoizedBaseProps],
+   );
+ };
+ 
+diff --git a/frontend/public/components/modals/remove-idp-modal.tsx b/frontend/public/components/modals/remove-idp-modal.tsx
+index 309e8d7662f..5772dcdb0b7 100644
+--- a/frontend/public/components/modals/remove-idp-modal.tsx
++++ b/frontend/public/components/modals/remove-idp-modal.tsx
+@@ -1,32 +1,23 @@
+-import type { FC, FormEvent } from 'react';
+ import { useTranslation, Trans } from 'react-i18next';
++import { Button, Modal, ModalBody, ModalHeader, ModalVariant } from '@patternfly/react-core';
+ import { k8sPatchResource } from '@console/dynamic-plugin-sdk/src/utils/k8s';
+-import {
+-  ModalBody,
+-  ModalComponentProps,
+-  ModalSubmitFooter,
+-  ModalTitle,
+-  ModalWrapper,
+-} from '@console/internal/components/factory/modal';
+-import { ModalComponent } from '@console/dynamic-plugin-sdk/src/app/modal-support/ModalProvider';
++import type { OverlayComponent } from '@console/dynamic-plugin-sdk/src/app/modal-support/OverlayProvider';
+ import { K8sModel, OAuthKind } from '@console/internal/module/k8s';
+-import { YellowExclamationTriangleIcon } from '@console/shared/src/components/status/icons';
++import { ModalFooterWithAlerts } from '@console/shared/src/components/modals/ModalFooterWithAlerts';
+ import { usePromiseHandler } from '@console/shared/src/hooks/usePromiseHandler';
+ 
+-const RemoveIdentityProviderModalComponent: FC<RemoveIdentityProviderModalProps> = ({
++const RemoveIdentityProviderModalContent: OverlayComponent<RemoveIdentityProvider> = ({
+   obj,
+   model,
+   index,
+   name,
+   type,
+-  cancel,
+-  close,
++  closeOverlay,
+ }) => {
+   const { t } = useTranslation();
+   const [handlePromise, inProgress, errorMessage] = usePromiseHandler();
+ 
+-  const handleSubmit = (event: FormEvent<HTMLFormElement>): void => {
+-    event.preventDefault();
++  const handleSubmit = (): void => {
+     handlePromise(
+       k8sPatchResource({
+         model,
+@@ -38,55 +29,58 @@ const RemoveIdentityProviderModalComponent: FC<RemoveIdentityProviderModalProps>
+           },
+         ],
+       }),
+-    ).then(() => close());
++    ).then(() => closeOverlay());
+   };
+ 
+   return (
+-    <form onSubmit={handleSubmit} name="form" className="modal-content ">
+-      <ModalTitle>
+-        <YellowExclamationTriangleIcon className="co-icon-space-r" />
+-        {t('public~Remove identity provider from OAuth?')}
+-      </ModalTitle>
++    <>
++      <ModalHeader
++        titleIconVariant="warning"
++        title={t('public~Remove identity provider from OAuth?')}
++        labelId="remove-idp-modal-title"
++        data-test-id="modal-title"
++      />
+       <ModalBody>
+-        <ModalBody>
+-          <Trans ns="public">
+-            Are you sure you want to remove <strong> {{ name }}</strong> identity provider from
+-            OAuth
+-            <strong> {{ type }}</strong>?
+-          </Trans>
+-        </ModalBody>
++        <Trans ns="public">
++          Are you sure you want to remove <strong> {{ name }}</strong> identity provider from OAuth
++          <strong> {{ type }}</strong>?
++        </Trans>
+       </ModalBody>
+-      <ModalSubmitFooter
+-        errorMessage={errorMessage}
+-        inProgress={inProgress}
+-        submitText={t('public~Remove')}
+-        cancel={cancel}
+-        submitDanger
+-      />
+-    </form>
++      <ModalFooterWithAlerts errorMessage={errorMessage}>
++        <Button
++          variant="danger"
++          isDisabled={inProgress}
++          isLoading={inProgress}
++          onClick={handleSubmit}
++          data-test="confirm-action"
++          id="confirm-action"
++        >
++          {t('public~Remove')}
++        </Button>
++        <Button
++          type="button"
++          variant="link"
++          isDisabled={inProgress}
++          onClick={closeOverlay}
++          data-test-id="modal-cancel-action"
++        >
++          {t('public~Cancel')}
++        </Button>
++      </ModalFooterWithAlerts>
++    </>
+   );
+ };
+ 
+-export const RemoveIdentityProviderModal: ModalComponent<RemoveIdentityProviderModalProps> = ({
+-  closeModal,
+-  obj,
+-  model,
+-  index,
+-  name,
+-  type,
+-}) => {
++export const RemoveIdentityProviderModal: OverlayComponent<RemoveIdentityProvider> = (props) => {
+   return (
+-    <ModalWrapper blocking onClose={closeModal}>
+-      <RemoveIdentityProviderModalComponent
+-        close={closeModal}
+-        cancel={closeModal}
+-        obj={obj}
+-        model={model}
+-        index={index}
+-        name={name}
+-        type={type}
+-      />
+-    </ModalWrapper>
++    <Modal
++      variant={ModalVariant.small}
++      isOpen
++      onClose={props.closeOverlay}
++      aria-labelledby="remove-idp-modal-title"
++    >
++      <RemoveIdentityProviderModalContent {...props} />
++    </Modal>
+   );
+ };
+ 
+@@ -97,5 +91,3 @@ export type RemoveIdentityProvider = {
+   name: string;
+   type: string;
+ };
+-
+-type RemoveIdentityProviderModalProps = RemoveIdentityProvider & ModalComponentProps;
+diff --git a/frontend/public/components/modals/tags.tsx b/frontend/public/components/modals/tags.tsx
+index 5cfc127f2c0..5365657d302 100644
+--- a/frontend/public/components/modals/tags.tsx
++++ b/frontend/public/components/modals/tags.tsx
+@@ -2,22 +2,18 @@ import * as _ from 'lodash';
+ import type { FC } from 'react';
+ import { useState, useEffect } from 'react';
+ import { useTranslation } from 'react-i18next';
++import { Button, Form, Modal, ModalBody, ModalHeader } from '@patternfly/react-core';
+ 
+ import { k8sPatch } from '@console/dynamic-plugin-sdk/src/utils/k8s/k8s-resource';
+ import { K8sModel } from '@console/dynamic-plugin-sdk/src/api/common-types';
+ import { K8sResourceCommon } from '@console/dynamic-plugin-sdk/src/extensions/console-types';
+ import { OverlayComponent } from '@console/dynamic-plugin-sdk/src/app/modal-support/OverlayProvider';
+-import {
+-  ModalTitle,
+-  ModalBody,
+-  ModalSubmitFooter,
+-  ModalComponentProps,
+-  ModalWrapper,
+-} from '../factory/modal';
++import { ModalComponentProps } from '../factory/modal';
+ import { NameValueEditorPair } from '../utils/types';
+ import { AsyncComponent } from '../utils/async';
+ import { useK8sWatchResource } from '../utils/k8s-watch-hook';
+ import { usePromiseHandler } from '@console/shared/src/hooks/usePromiseHandler';
++import { ModalFooterWithAlerts } from '@console/shared/src/components/modals/ModalFooterWithAlerts';
+ 
+ /**
+  * Set up an AsyncComponent to wrap the name-value-editor to allow on demand loading to reduce the
+@@ -30,7 +26,7 @@ const NameValueEditorComponent = (props) => (
+   />
+ );
+ 
+-export const TagsModal = (props: TagsModalProps) => {
++const TagsModal = (props: TagsModalProps) => {
+   // Track tags as an array instead of an object / Map so we can preserve the order during editing and so we can have
+   // duplicate keys during editing. However, the ordering and any duplicate keys are lost when the form is submitted.
+   const [tags, setTags] = useState(_.isEmpty(props.tags) ? [['', '']] : _.toPairs(props.tags));
+@@ -72,46 +68,70 @@ export const TagsModal = (props: TagsModalProps) => {
+   };
+ 
+   return (
+-    <form onSubmit={submit} className="modal-content">
+-      <ModalTitle>{t(props.titleKey)}</ModalTitle>
++    <>
++      <ModalHeader
++        title={t('public~Edit annotations')}
++        labelId="annotations-modal-title"
++        data-test-id="modal-title"
++      />
+       <ModalBody>
+-        <NameValueEditorComponent
+-          nameValuePairs={tags}
+-          submit={submit}
+-          updateParentData={({ nameValuePairs }) => setTags(nameValuePairs)}
+-        />
++        <Form onSubmit={submit} id="tags-modal-form">
++          <NameValueEditorComponent
++            nameValuePairs={tags}
++            submit={submit}
++            updateParentData={({ nameValuePairs }) => setTags(nameValuePairs)}
++          />
++        </Form>
+       </ModalBody>
+-      <ModalSubmitFooter
+-        submitText={t('public~Save')}
+-        submitDisabled={stale}
+-        cancel={props.cancel}
++      <ModalFooterWithAlerts
+         errorMessage={errorMessage || localErrorMessage}
+         message={
+           stale
+             ? t('public~Annotations have been updated. Click Cancel and reapply your changes.')
+             : undefined
+         }
+-        inProgress={inProgress}
+-      />
+-    </form>
++      >
++        <Button
++          type="submit"
++          variant="primary"
++          isDisabled={stale || inProgress}
++          isLoading={inProgress}
++          form="tags-modal-form"
++          data-test="confirm-action"
++          id="confirm-action"
++        >
++          {t('public~Save')}
++        </Button>
++        <Button
++          type="button"
++          variant="link"
++          isDisabled={inProgress}
++          onClick={props.cancel}
++          data-test-id="modal-cancel-action"
++        >
++          {t('public~Cancel')}
++        </Button>
++      </ModalFooterWithAlerts>
++    </>
+   );
+ };
+ 
+-export const AnnotationsModal: FC<AnnotationsModalProps> = (props) => (
+-  <TagsModal
+-    path="/metadata/annotations"
+-    tags={props.resource?.metadata?.annotations}
+-    // t('public~Edit annotations')
+-    titleKey="public~Edit annotations"
+-    {...props}
+-  />
++const AnnotationsModal: FC<AnnotationsModalProps> = (props) => (
++  <TagsModal path="/metadata/annotations" tags={props.resource?.metadata?.annotations} {...props} />
+ );
+ 
+-export const AnnotationsModalOverlay: OverlayComponent<AnnotationsModalProps> = (props) => (
+-  <ModalWrapper blocking onClose={props.closeOverlay}>
+-    <AnnotationsModal {...props} cancel={props.closeOverlay} close={props.closeOverlay} />
+-  </ModalWrapper>
+-);
++export const AnnotationsModalOverlay: OverlayComponent<AnnotationsModalProps> = (props) => {
++  return (
++    <Modal
++      variant="small"
++      isOpen
++      onClose={props.closeOverlay}
++      aria-labelledby="annotations-modal-title"
++    >
++      <AnnotationsModal {...props} cancel={props.closeOverlay} close={props.closeOverlay} />
++    </Modal>
++  );
++};
+ 
+ TagsModal.displayName = 'TagsModal';
+ 
+@@ -120,7 +140,6 @@ export type TagsModalProps = {
+   path: string;
+   resource: K8sResourceCommon;
+   tags?: { [key: string]: string };
+-  titleKey: string;
+ } & ModalComponentProps;
+ 
+ export type AnnotationsModalProps = Omit<TagsModalProps, 'path' | 'tags' | 'titleKey'>;
+diff --git a/frontend/public/components/notification-drawer.tsx b/frontend/public/components/notification-drawer.tsx
+index 321d97eb539..9b681bb65a5 100644
+--- a/frontend/public/components/notification-drawer.tsx
++++ b/frontend/public/components/notification-drawer.tsx
+@@ -78,7 +78,7 @@ import {
+ import { LinkifyExternal } from './utils/link';
+ import { LabelSelector } from '@console/internal/module/k8s/label-selector';
+ import { useNotificationAlerts } from '@console/shared/src/hooks/useNotificationAlerts';
+-import { useModal } from '@console/dynamic-plugin-sdk/src/lib-core';
++import { useOverlay } from '@console/dynamic-plugin-sdk/src/app/modal-support/useOverlay';
+ import { NotificationTypes } from './utils/types';
+ 
+ const AlertErrorState: FC<AlertErrorProps> = ({ errorText }) => {
+@@ -247,7 +247,7 @@ export const NotificationDrawer: FC<NotificationDrawerProps> = ({
+   const dispatch = useConsoleDispatch();
+   const clusterVersion: ClusterVersionKind = useClusterVersion();
+   const [alerts, , loadError] = useNotificationAlerts();
+-  const launchModal = useModal();
++  const launchModal = useOverlay();
+   const alertIds = useMemo(() => alerts?.map((alert) => alert.rule.name) || [], [alerts]);
+   const [alertActionExtensions] = useResolvedExtensions<AlertAction>(
+     useCallback(
+diff --git a/frontend/public/components/utils/name-value-editor.jsx b/frontend/public/components/utils/name-value-editor.jsx
+index bc7775936e4..8a99708d6aa 100644
+--- a/frontend/public/components/utils/name-value-editor.jsx
++++ b/frontend/public/components/utils/name-value-editor.jsx
+@@ -97,12 +97,12 @@ const NameValueEditor_ = withDragDropContext(
+       const {
+         addString,
+         nameValuePairs,
+-        allowSorting,
+-        readOnly,
+-        nameValueId,
++        allowSorting = false,
++        readOnly = false,
++        nameValueId = 0,
+         configMaps,
+         secrets,
+-        addConfigMapSecret,
++        addConfigMapSecret = false,
+         toolTip,
+         t,
+         onLastItemRemoved,
+@@ -217,12 +217,6 @@ NameValueEditor.propTypes = {
+   toolTip: PropTypes.string,
+   onLastItemRemoved: PropTypes.func,
+ };
+-NameValueEditor.defaultProps = {
+-  allowSorting: false,
+-  readOnly: false,
+-  nameValueId: 0,
+-  addConfigMapSecret: false,
+-};
+ 
+ NameValueEditor.displayName = 'Name Value Editor';
+ 
+@@ -284,14 +278,14 @@ const EnvFromEditor_ = withDragDropContext(
+     render() {
+       const {
+         nameValuePairs,
+-        readOnly,
+-        nameValueId,
++        readOnly = false,
++        nameValueId = 0,
+         configMaps,
+         secrets,
+         serviceAccounts,
+         firstTitle,
+         secondTitle,
+-        addButtonDisabled,
++        addButtonDisabled = false,
+         addButtonLabel,
+         t,
+       } = this.props;
+@@ -374,11 +368,6 @@ EnvFromEditor.propTypes = {
+   secondTitle: PropTypes.string,
+   addButtonDisabled: PropTypes.bool,
+ };
+-EnvFromEditor.defaultProps = {
+-  readOnly: false,
+-  nameValueId: 0,
+-  addButtonDisabled: false,
+-};
+ const pairSource = {
+   beginDrag(props) {
+     return {
+diff --git a/frontend/public/locales/en/public.json b/frontend/public/locales/en/public.json
+index bd5c000c758..9eb230cc488 100644
+--- a/frontend/public/locales/en/public.json
++++ b/frontend/public/locales/en/public.json
+@@ -984,8 +984,8 @@
+   "Rollback": "Rollback",
+   "Unable to Rollback": "Unable to Rollback",
+   "Duplicate keys found.": "Duplicate keys found.",
+-  "Annotations have been updated. Click Cancel and reapply your changes.": "Annotations have been updated. Click Cancel and reapply your changes.",
+   "Edit annotations": "Edit annotations",
++  "Annotations have been updated. Click Cancel and reapply your changes.": "Annotations have been updated. Click Cancel and reapply your changes.",
+   "Edit taints": "Edit taints",
+   "Taints": "Taints",
+   "Effect": "Effect",

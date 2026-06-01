@@ -1,0 +1,2212 @@
+diff --git a/api/karpenter/v1beta1/karpenter_types.go b/api/karpenter/v1beta1/karpenter_types.go
+index cfc52ce0aec..a3b7da6244b 100644
+--- a/api/karpenter/v1beta1/karpenter_types.go
++++ b/api/karpenter/v1beta1/karpenter_types.go
+@@ -1,7 +1,6 @@
+ package v1beta1
+ 
+ import (
+-	"k8s.io/apimachinery/pkg/api/resource"
+ 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+ )
+ 
+@@ -56,26 +55,114 @@ const (
+ 	ConditionReasonAsExpected = "AsExpected"
+ )
+ 
++// IPAddressAssociation controls IP address assignment for instances.
++// +kubebuilder:validation:Enum=Public;SubnetDefault
++type IPAddressAssociation string
++
++const (
++	// IPAddressAssociationPublic assigns public IP addresses to instances, allowing direct internet access.
++	IPAddressAssociationPublic IPAddressAssociation = "Public"
++	// IPAddressAssociationSubnetDefault defers IP address assignment to the subnet configuration.
++	IPAddressAssociationSubnetDefault IPAddressAssociation = "SubnetDefault"
++)
++
++// MonitoringState controls the monitoring level for instances.
++// For more information, see Basic monitoring and detailed monitoring (https://docs.aws.amazon.com/AmazonCloudWatch/latest/monitoring/cloudwatch-metrics-basic-detailed.html).
++// +kubebuilder:validation:Enum=Detailed;Basic
++type MonitoringState string
++
++const (
++	// MonitoringStateDetailed enables detailed monitoring for instances.
++	MonitoringStateDetailed MonitoringState = "Detailed"
++	// MonitoringStateBasic enables basic monitoring for instances.
++	MonitoringStateBasic MonitoringState = "Basic"
++)
++
++// RootVolumeDesignation indicates whether a device is mounted as the kubelet root directory.
++// +kubebuilder:validation:Enum=RootVolume;NotRootVolume
++type RootVolumeDesignation string
++
++const (
++	// RootVolumeDesignationRootVolume indicates the device is mounted as kubelet root dir.
++	RootVolumeDesignationRootVolume RootVolumeDesignation = "RootVolume"
++	// RootVolumeDesignationNotRootVolume indicates the device is not the kubelet root dir.
++	RootVolumeDesignationNotRootVolume RootVolumeDesignation = "NotRootVolume"
++)
++
++// DeleteOnTerminationPolicy controls whether an EBS volume is deleted on instance termination.
++// +kubebuilder:validation:Enum=Delete;Retain
++type DeleteOnTerminationPolicy string
++
++const (
++	// DeleteOnTerminationPolicyDelete deletes the EBS volume when the instance terminates.
++	DeleteOnTerminationPolicyDelete DeleteOnTerminationPolicy = "Delete"
++	// DeleteOnTerminationPolicyRetain retains the EBS volume when the instance terminates.
++	DeleteOnTerminationPolicyRetain DeleteOnTerminationPolicy = "Retain"
++)
++
++// EncryptionState controls whether an EBS volume is encrypted.
++// +kubebuilder:validation:Enum=Encrypted;Unencrypted
++type EncryptionState string
++
++const (
++	// EncryptionStateEncrypted indicates the EBS volume is encrypted.
++	EncryptionStateEncrypted EncryptionState = "Encrypted"
++	// EncryptionStateUnencrypted indicates the EBS volume is not encrypted.
++	EncryptionStateUnencrypted EncryptionState = "Unencrypted"
++)
++
++// VolumeType is the type of an EBS block device.
++// For more information, see Amazon EBS volume types (https://docs.aws.amazon.com/AWSEC2/latest/UserGuide/EBSVolumeTypes.html).
++// +kubebuilder:validation:Enum=Standard;IO1;IO2;GP2;SC1;ST1;GP3
++type VolumeType string
++
++const (
++	// VolumeTypeStandard is a previous generation magnetic volume.
++	VolumeTypeStandard VolumeType = "Standard"
++	// VolumeTypeIO1 is a provisioned IOPS SSD volume.
++	VolumeTypeIO1 VolumeType = "IO1"
++	// VolumeTypeIO2 is a provisioned IOPS SSD volume (latest generation).
++	VolumeTypeIO2 VolumeType = "IO2"
++	// VolumeTypeGP2 is a general purpose SSD volume.
++	VolumeTypeGP2 VolumeType = "GP2"
++	// VolumeTypeSC1 is a cold HDD volume.
++	VolumeTypeSC1 VolumeType = "SC1"
++	// VolumeTypeST1 is a throughput optimized HDD volume.
++	VolumeTypeST1 VolumeType = "ST1"
++	// VolumeTypeGP3 is a general purpose SSD volume (latest generation).
++	VolumeTypeGP3 VolumeType = "GP3"
++)
++
+ // Subnet contains resolved Subnet selector values utilized for node launch
+ type Subnet struct {
+-	// ID of the subnet
++	// id is the ID of the subnet.
+ 	// +required
+-	ID string `json:"id"`
+-	// The associated availability zone
++	// +kubebuilder:validation:MinLength=1
++	// +kubebuilder:validation:MaxLength=256
++	ID string `json:"id,omitempty"`
++	// zone is the associated availability zone.
+ 	// +required
+-	Zone string `json:"zone"`
+-	// The associated availability zone ID
++	// +kubebuilder:validation:MinLength=1
++	// +kubebuilder:validation:MaxLength=256
++	Zone string `json:"zone,omitempty"`
++	// zoneID is the associated availability zone ID.
+ 	// +optional
++	// +kubebuilder:validation:MinLength=1
++	// +kubebuilder:validation:MaxLength=256
+ 	ZoneID string `json:"zoneID,omitempty"`
+ }
+ 
+ // SecurityGroup contains resolved SecurityGroup selector values utilized for node launch
+ type SecurityGroup struct {
+-	// ID of the security group
++	// id is the ID of the security group.
+ 	// +required
+-	ID string `json:"id"`
+-	// Name of the security group
++	// +kubebuilder:validation:MinLength=1
++	// +kubebuilder:validation:MaxLength=256
++	ID string `json:"id,omitempty"`
++	// name is the name of the security group.
+ 	// +optional
++	// +kubebuilder:validation:MinLength=1
++	// +kubebuilder:validation:MaxLength=256
+ 	Name string `json:"name,omitempty"`
+ }
+ 
+@@ -93,125 +180,166 @@ const (
+ 
+ // OpenshiftEC2NodeClassSpec defines the desired state of ClusterSizingConfiguration
+ // This will contain configuration necessary to launch instances in AWS.
++// +kubebuilder:validation:MinProperties=1
+ type OpenshiftEC2NodeClassSpec struct {
+-	// SubnetSelectorTerms is a list of or subnet selector terms. The terms are ORed.
++	// subnetSelectorTerms is a list of or subnet selector terms. The terms are ORed.
+ 	// +kubebuilder:validation:XValidation:message="subnetSelectorTerms cannot be empty",rule="self.size() != 0"
+ 	// +kubebuilder:validation:XValidation:message="expected at least one, got none, ['tags', 'id']",rule="self.all(x, has(x.tags) || has(x.id))"
+ 	// +kubebuilder:validation:XValidation:message="'id' is mutually exclusive, cannot be set with a combination of other fields in subnetSelectorTerms",rule="!self.all(x, has(x.id) && has(x.tags))"
++	// +kubebuilder:validation:MinItems=1
+ 	// +kubebuilder:validation:MaxItems:=30
++	// +listType=atomic
+ 	// +optional
+ 	SubnetSelectorTerms []SubnetSelectorTerm `json:"subnetSelectorTerms,omitempty"`
+ 
+-	// SecurityGroupSelectorTerms is a list of or security group selector terms. The terms are ORed.
++	// securityGroupSelectorTerms is a list of or security group selector terms. The terms are ORed.
+ 	// +kubebuilder:validation:XValidation:message="securityGroupSelectorTerms cannot be empty",rule="self.size() != 0"
+ 	// +kubebuilder:validation:XValidation:message="expected at least one, got none, ['tags', 'id', 'name']",rule="self.all(x, has(x.tags) || has(x.id) || has(x.name))"
+ 	// +kubebuilder:validation:XValidation:message="'id' is mutually exclusive, cannot be set with a combination of other fields in securityGroupSelectorTerms",rule="!self.all(x, has(x.id) && (has(x.tags) || has(x.name)))"
+ 	// +kubebuilder:validation:XValidation:message="'name' is mutually exclusive, cannot be set with a combination of other fields in securityGroupSelectorTerms",rule="!self.all(x, has(x.name) && (has(x.tags) || has(x.id)))"
++	// +kubebuilder:validation:MinItems=1
+ 	// +kubebuilder:validation:MaxItems:=30
++	// +listType=atomic
+ 	// +optional
+ 	SecurityGroupSelectorTerms []SecurityGroupSelectorTerm `json:"securityGroupSelectorTerms,omitempty"`
+ 
+-	// AssociatePublicIPAddress controls if public IP addresses are assigned to instances that are launched with the nodeclass.
++	// ipAddressAssociation controls the IP address assignment for instances launched with the nodeclass.
++	// Valid values are:
++	// - "Public": assigns public IP addresses to instances, allowing direct internet access.
++	// - "SubnetDefault": defers IP address assignment to the subnet configuration.
++	// When unset, the cloud provider's subnet default behavior is used.
+ 	// +optional
+-	AssociatePublicIPAddress *bool `json:"associatePublicIPAddress,omitempty"`
++	IPAddressAssociation IPAddressAssociation `json:"ipAddressAssociation,omitempty"`
+ 
+-	// Tags to be applied on ec2 resources like instances and launch templates.
++	// tags to be applied on ec2 resources like instances and launch templates.
+ 	// +kubebuilder:validation:XValidation:message="empty tag keys aren't supported",rule="self.all(k, k != '')"
+ 	// +kubebuilder:validation:XValidation:message="tag contains a restricted tag matching eks:eks-cluster-name",rule="self.all(k, k !='eks:eks-cluster-name')"
+ 	// +kubebuilder:validation:XValidation:message="tag contains a restricted tag matching kubernetes.io/cluster/",rule="self.all(k, !k.startsWith('kubernetes.io/cluster') )"
+ 	// +kubebuilder:validation:XValidation:message="tag contains a restricted tag matching karpenter.sh/nodepool",rule="self.all(k, k != 'karpenter.sh/nodepool')"
+ 	// +kubebuilder:validation:XValidation:message="tag contains a restricted tag matching karpenter.sh/nodeclaim",rule="self.all(k, k !='karpenter.sh/nodeclaim')"
+ 	// +kubebuilder:validation:XValidation:message="tag contains a restricted tag matching karpenter.k8s.aws/ec2nodeclass",rule="self.all(k, k !='karpenter.k8s.aws/ec2nodeclass')"
++	// +kubebuilder:validation:MinProperties=1
+ 	// +optional
+ 	Tags map[string]string `json:"tags,omitempty"`
+ 
+-	// BlockDeviceMappings to be applied to provisioned nodes.
++	// blockDeviceMappings to be applied to provisioned nodes.
+ 	// For OpenShift nodes, a default root volume size of 120Gi and type gp3 is set if no blockDeviceMapping overrides are specified.
+-	// +kubebuilder:validation:XValidation:message="must have only one blockDeviceMappings with rootVolume",rule="self.filter(x, has(x.rootVolume)?x.rootVolume==true:false).size() <= 1"
++	// +kubebuilder:validation:XValidation:message="must have only one blockDeviceMappings with rootVolume",rule="self.filter(x, has(x.rootVolume)?x.rootVolume=='RootVolume':false).size() <= 1"
++	// +kubebuilder:validation:MinItems=1
+ 	// +kubebuilder:validation:MaxItems:=50
++	// +listType=atomic
+ 	// +optional
+-	BlockDeviceMappings []*BlockDeviceMapping `json:"blockDeviceMappings,omitempty"`
++	BlockDeviceMappings []BlockDeviceMapping `json:"blockDeviceMappings,omitempty"`
+ 
+-	// InstanceStorePolicy specifies how to handle instance-store disks.
++	// instanceStorePolicy specifies how to handle instance-store disks.
+ 	// +optional
+-	InstanceStorePolicy *InstanceStorePolicy `json:"instanceStorePolicy,omitempty"`
+-
+-	// DetailedMonitoring controls if detailed monitoring is enabled for instances that are launched
++	InstanceStorePolicy InstanceStorePolicy `json:"instanceStorePolicy,omitempty"`
++
++	// monitoring controls the monitoring level for instances that are launched.
++	// For more information, see Basic monitoring and detailed monitoring
++	// (https://docs.aws.amazon.com/AmazonCloudWatch/latest/monitoring/cloudwatch-metrics-basic-detailed.html).
++	// Valid values are:
++	// - "Detailed": enables detailed monitoring.
++	// - "Basic": enables basic monitoring.
++	// When unset, the cloud provider's default basic monitoring behavior is used.
+ 	// +optional
+-	DetailedMonitoring *bool `json:"detailedMonitoring,omitempty"`
++	Monitoring MonitoringState `json:"monitoring,omitempty"`
+ 
+-	// Version is an OpenShift version (e.g., "4.20.1") specifying the release version
++	// version is an OpenShift version (e.g., "4.20.1") specifying the release version
+ 	// for nodes managed by this NodeClass. When set, the controller resolves this to a
+ 	// release image via the Cincinnati graph API. When not set, nodes use the control plane's
+ 	// release image.
+-	// +kubebuilder:validation:Pattern=`^(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)$`
++	// +kubebuilder:validation:XValidation:rule="self.matches('^(0|[1-9]\\\\d*)\\\\.(0|[1-9]\\\\d*)\\\\.(0|[1-9]\\\\d*)$')",message="version must be a valid semantic version (e.g., 4.20.1)"
++	// +kubebuilder:validation:MinLength=5
++	// +kubebuilder:validation:MaxLength=64
+ 	// +optional
+ 	Version string `json:"version,omitempty"`
+ }
+ 
+ // SubnetSelectorTerm defines selection logic for a subnet used by Karpenter to launch nodes.
+ // If multiple fields are used for selection, the requirements are ANDed.
++// +kubebuilder:validation:MinProperties=1
+ type SubnetSelectorTerm struct {
+-	// Tags is a map of key/value tags used to select subnets
++	// tags is a map of key/value tags used to select subnets.
+ 	// Specifying '*' for a value selects all values for a given tag key.
++	// The expected format is {"key1": "value1", "key2": "*"}.
+ 	// +kubebuilder:validation:XValidation:message="empty tag keys or values aren't supported",rule="self.all(k, k != '' && self[k] != '')"
+ 	// +kubebuilder:validation:MaxProperties:=20
++	// +kubebuilder:validation:MinProperties=1
+ 	// +optional
+ 	Tags map[string]string `json:"tags,omitempty"`
+ 
+-	// ID is the subnet id in EC2
+-	// +kubebuilder:validation:Pattern="subnet-[0-9a-z]+"
++	// id is the subnet id in EC2.
++	// The expected format is "subnet-" followed by alphanumeric characters, e.g. "subnet-0a1b2c3d4e5f".
++	// +kubebuilder:validation:XValidation:rule="self.matches('^subnet-[0-9a-z]+$')",message="id must match the pattern subnet-[0-9a-z]+"
++	// +kubebuilder:validation:MinLength=1
++	// +kubebuilder:validation:MaxLength=256
+ 	// +optional
+ 	ID string `json:"id,omitempty"`
+ }
+ 
+ // SecurityGroupSelectorTerm defines selection logic for a security group used by Karpenter to launch nodes.
+ // If multiple fields are used for selection, the requirements are ANDed.
++// +kubebuilder:validation:MinProperties=1
+ type SecurityGroupSelectorTerm struct {
+-	// Tags is a map of key/value tags used to select subnets
++	// tags is a map of key/value tags used to select security groups.
+ 	// Specifying '*' for a value selects all values for a given tag key.
++	// The expected format is {"key1": "value1", "key2": "*"}.
+ 	// +kubebuilder:validation:XValidation:message="empty tag keys or values aren't supported",rule="self.all(k, k != '' && self[k] != '')"
+ 	// +kubebuilder:validation:MaxProperties:=20
++	// +kubebuilder:validation:MinProperties=1
+ 	// +optional
+ 	Tags map[string]string `json:"tags,omitempty"`
+ 
+-	// ID is the security group id in EC2
+-	// +kubebuilder:validation:Pattern:="sg-[0-9a-z]+"
++	// id is the security group id in EC2.
++	// The expected format is "sg-" followed by alphanumeric characters, e.g. "sg-0a1b2c3d4e5f".
++	// +kubebuilder:validation:XValidation:rule="self.matches('^sg-[0-9a-z]+$')",message="id must match the pattern sg-[0-9a-z]+"
++	// +kubebuilder:validation:MinLength=1
++	// +kubebuilder:validation:MaxLength=256
+ 	// +optional
+ 	ID string `json:"id,omitempty"`
+ 
+-	// Name is the security group name in EC2.
++	// name is the security group name in EC2.
+ 	// This value is the name field, which is different from the name tag.
++	// +kubebuilder:validation:MinLength=1
++	// +kubebuilder:validation:MaxLength=256
++	// +optional
+ 	Name string `json:"name,omitempty"`
+ }
+ 
++// BlockDeviceMapping defines a block device mapping for a node.
++// +kubebuilder:validation:MinProperties=1
+ type BlockDeviceMapping struct {
+-	// The device name (for example, /dev/sdh or xvdh).
++	// deviceName is the device name (for example, /dev/sdh or xvdh).
+ 	// +optional
+-	DeviceName *string `json:"deviceName,omitempty"`
++	// +kubebuilder:validation:MinLength=1
++	// +kubebuilder:validation:MaxLength=256
++	DeviceName string `json:"deviceName,omitempty"`
+ 
+-	// EBS contains parameters used to automatically set up EBS volumes when an instance is launched.
+-	// +kubebuilder:validation:XValidation:message="snapshotID or volumeSize must be defined",rule="has(self.snapshotID) || has(self.volumeSize)"
++	// ebs contains parameters used to automatically set up EBS volumes when an instance is launched.
++	// +kubebuilder:validation:XValidation:message="snapshotID or volumeSizeGiB must be defined",rule="has(self.snapshotID) || has(self.volumeSizeGiB)"
+ 	// +optional
+-	EBS *BlockDevice `json:"ebs,omitempty"`
++	EBS BlockDevice `json:"ebs,omitempty,omitzero"`
+ 
+-	// RootVolume is a flag indicating if this device is mounted as kubelet root dir. You can
++	// rootVolume indicates whether this device is mounted as kubelet root dir. You can
+ 	// configure at most one root volume in BlockDeviceMappings.
+-	RootVolume bool `json:"rootVolume,omitempty"`
++	// +optional
++	RootVolume RootVolumeDesignation `json:"rootVolume,omitempty"`
+ }
+ 
++// +kubebuilder:validation:MinProperties=1
+ type BlockDevice struct {
+-	// DeleteOnTermination indicates whether the EBS volume is deleted on instance termination.
++	// deleteOnTermination indicates whether the EBS volume is deleted on instance termination.
+ 	// +optional
+-	DeleteOnTermination *bool `json:"deleteOnTermination,omitempty"`
++	DeleteOnTermination DeleteOnTerminationPolicy `json:"deleteOnTermination,omitempty"`
+ 
+-	// Encrypted indicates whether the EBS volume is encrypted. Encrypted volumes can only
++	// encrypted indicates whether the EBS volume is encrypted. Encrypted volumes can only
+ 	// be attached to instances that support Amazon EBS encryption. If you are creating
+ 	// a volume from a snapshot, you can't specify an encryption value.
+ 	// +optional
+-	Encrypted *bool `json:"encrypted,omitempty"`
++	Encrypted EncryptionState `json:"encrypted,omitempty"`
+ 
+-	// IOPS is the number of I/O operations per second (IOPS). For gp3, io1, and io2 volumes,
++	// iops is the number of I/O operations per second (IOPS). For gp3, io1, and io2 volumes,
+ 	// this represents the number of IOPS that are provisioned for the volume. For
+ 	// gp2 volumes, this represents the baseline performance of the volume and the
+ 	// rate at which the volume accumulates I/O credits for bursting.
+@@ -233,22 +361,25 @@ type BlockDevice struct {
+ 	// +optional
+ 	IOPS *int64 `json:"iops,omitempty"`
+ 
+-	// KMSKeyID (ARN) of the symmetric Key Management Service (KMS) CMK used for encryption.
++	// kmsKeyID is the ARN of the symmetric Key Management Service (KMS) CMK used for encryption.
+ 	// +optional
+-	KMSKeyID *string `json:"kmsKeyID,omitempty"`
++	// +kubebuilder:validation:MinLength=1
++	// +kubebuilder:validation:MaxLength=2048
++	KMSKeyID string `json:"kmsKeyID,omitempty"`
+ 
+-	// SnapshotID is the ID of an EBS snapshot
++	// snapshotID is the ID of an EBS snapshot.
+ 	// +optional
+-	SnapshotID *string `json:"snapshotID,omitempty"`
++	// +kubebuilder:validation:MinLength=1
++	// +kubebuilder:validation:MaxLength=256
++	SnapshotID string `json:"snapshotID,omitempty"`
+ 
+-	// Throughput to provision for a gp3 volume, with a maximum of 1,000 MiB/s.
++	// throughput to provision for a gp3 volume, with a maximum of 1,000 MiB/s.
+ 	// Valid Range: Minimum value of 125. Maximum value of 1000.
+ 	// +optional
+ 	Throughput *int64 `json:"throughput,omitempty"`
+ 
+-	// VolumeSize in `Gi`, `G`, `Ti`, or `T`. You must specify either a snapshot ID or
+-	// a volume size. The following are the supported volumes sizes for each volume
+-	// type:
++	// volumeSizeGiB is the size of the volume in GiB. You must specify either a snapshot ID or
++	// a volume size. The following are the supported volume sizes for each volume type:
+ 	//
+ 	//    * gp2 and gp3: 1-16,384
+ 	//
+@@ -257,51 +388,58 @@ type BlockDevice struct {
+ 	//    * st1 and sc1: 125-16,384
+ 	//
+ 	//    * standard: 1-1,024
+-	// + TODO: Add the CEL resources.quantity type after k8s 1.29
+-	// + https://github.com/kubernetes/apiserver/commit/b137c256373aec1c5d5810afbabb8932a19ecd2a#diff-838176caa5882465c9d6061febd456397a3e2b40fb423ed36f0cabb1847ecb4dR190
+-	// +kubebuilder:validation:Pattern:="^((?:[1-9][0-9]{0,3}|[1-4][0-9]{4}|[5][0-8][0-9]{3}|59000)Gi|(?:[1-9][0-9]{0,3}|[1-5][0-9]{4}|[6][0-3][0-9]{3}|64000)G|([1-9]||[1-5][0-7]|58)Ti|([1-9]||[1-5][0-9]|6[0-3]|64)T)$"
+-	// +kubebuilder:validation:Schemaless
+-	// +kubebuilder:validation:Type:=string
++	// +kubebuilder:validation:Minimum=1
++	// +kubebuilder:validation:Maximum=65536
+ 	// +optional
+-	VolumeSize *resource.Quantity `json:"volumeSize,omitempty" hash:"string"`
++	VolumeSizeGiB int64 `json:"volumeSizeGiB,omitempty"`
+ 
+-	// VolumeType of the block device.
++	// volumeType is the type of the block device.
+ 	// For more information, see Amazon EBS volume types (https://docs.aws.amazon.com/AWSEC2/latest/UserGuide/EBSVolumeTypes.html)
+ 	// in the Amazon Elastic Compute Cloud User Guide.
+-	// +kubebuilder:validation:Enum:={standard,io1,io2,gp2,sc1,st1,gp3}
+ 	// +optional
+-	VolumeType *string `json:"volumeType,omitempty"`
++	VolumeType VolumeType `json:"volumeType,omitempty"`
+ }
+ 
+ // OpenshiftEC2NodeClassStatus defines the observed state of OpenshiftEC2NodeClass.
++// +kubebuilder:validation:MinProperties=1
+ type OpenshiftEC2NodeClassStatus struct {
+-	// Subnets contains the current Subnet values that are available to the
++	// conditions contain signals for health and readiness.
++	// +optional
++	// +listType=map
++	// +listMapKey=type
++	// +kubebuilder:validation:MinItems=1
++	// +kubebuilder:validation:MaxItems=100
++	Conditions []metav1.Condition `json:"conditions,omitempty"`
++
++	// subnets contains the current Subnet values that are available to the
+ 	// cluster under the subnet selectors.
+ 	// +optional
++	// +listType=atomic
++	// +kubebuilder:validation:MinItems=1
++	// +kubebuilder:validation:MaxItems=100
+ 	Subnets []Subnet `json:"subnets,omitempty"`
+ 
+-	// SecurityGroups contains the current Security Groups values that are available to the
++	// securityGroups contains the current Security Groups values that are available to the
+ 	// cluster under the SecurityGroups selectors.
+ 	// +optional
++	// +listType=atomic
++	// +kubebuilder:validation:MinItems=1
++	// +kubebuilder:validation:MaxItems=100
+ 	SecurityGroups []SecurityGroup `json:"securityGroups,omitempty"`
+ 
+-	// ReleaseImage is the fully qualified release image resolved either from spec.version, or inherited from
++	// releaseImage is the fully qualified release image resolved either from spec.version, or inherited from
+ 	// the HostedControlPlane's spec.ReleaseImage.
+ 	// Of the format "quay.io/openshift-release-dev/ocp-release@sha256:<digest>".
+ 	// +optional
++	// +kubebuilder:validation:MinLength=1
++	// +kubebuilder:validation:MaxLength=512
+ 	ReleaseImage string `json:"releaseImage,omitempty"`
+ 
+-	// Version is the resolved OpenShift version corresponding to the status.releaseImage.
++	// version is the resolved OpenShift version corresponding to the status.releaseImage.
+ 	// +optional
++	// +kubebuilder:validation:MinLength=1
++	// +kubebuilder:validation:MaxLength=64
+ 	Version string `json:"version,omitempty"`
+-
+-	// +optional
+-	// +listType=map
+-	// +listMapKey=type
+-	// +patchMergeKey=type
+-	// +patchStrategy=merge
+-	// Conditions contain signals for health and readiness.
+-	Conditions []metav1.Condition `json:"conditions,omitempty" patchStrategy:"merge" patchMergeKey:"type"`
+ }
+ 
+ // +genclient
+@@ -312,11 +450,19 @@ type OpenshiftEC2NodeClassStatus struct {
+ // +kubebuilder:storageversion
+ // OpenshiftEC2NodeClass defines the desired state of OpenshiftEC2NodeClass.
+ type OpenshiftEC2NodeClass struct {
+-	metav1.TypeMeta   `json:",inline"`
++	metav1.TypeMeta `json:",inline"`
++
++	// metadata is the standard object metadata.
++	// +optional
+ 	metav1.ObjectMeta `json:"metadata,omitempty"`
+ 
+-	Spec   OpenshiftEC2NodeClassSpec   `json:"spec,omitempty"`
+-	Status OpenshiftEC2NodeClassStatus `json:"status,omitempty"`
++	// spec defines the desired state of the OpenshiftEC2NodeClass.
++	// +required
++	Spec OpenshiftEC2NodeClassSpec `json:"spec,omitzero"`
++
++	// status defines the observed state of the OpenshiftEC2NodeClass.
++	// +optional
++	Status OpenshiftEC2NodeClassStatus `json:"status,omitempty,omitzero"`
+ }
+ 
+ // +kubebuilder:object:root=true
+diff --git a/api/karpenter/v1beta1/util.go b/api/karpenter/v1beta1/util.go
+index 63560976ca1..772fbd37ce6 100644
+--- a/api/karpenter/v1beta1/util.go
++++ b/api/karpenter/v1beta1/util.go
+@@ -1,7 +1,13 @@
+ package v1beta1
+ 
+ import (
++	"fmt"
++	"strings"
++
+ 	awskarpenterv1 "github.com/aws/karpenter-provider-aws/pkg/apis/v1"
++
++	"k8s.io/apimachinery/pkg/api/resource"
++	"k8s.io/utils/ptr"
+ )
+ 
+ func (spec OpenshiftEC2NodeClassSpec) KarpenterBlockDeviceMapping() []*awskarpenterv1.BlockDeviceMapping {
+@@ -10,13 +16,9 @@ func (spec OpenshiftEC2NodeClassSpec) KarpenterBlockDeviceMapping() []*awskarpen
+ 	}
+ 	var blockDeviceMapping []*awskarpenterv1.BlockDeviceMapping
+ 	for _, mapping := range spec.BlockDeviceMappings {
+-		if mapping == nil {
+-			continue
+-		}
+-
+ 		blockDeviceMapping = append(blockDeviceMapping, &awskarpenterv1.BlockDeviceMapping{
+-			DeviceName: mapping.DeviceName,
+-			RootVolume: mapping.RootVolume,
++			DeviceName: ptrIfNonEmpty(mapping.DeviceName),
++			RootVolume: mapping.RootVolume == RootVolumeDesignationRootVolume,
+ 			EBS:        mapping.EBS.ToKarpenterTypes(),
+ 		})
+ 	}
+@@ -25,25 +27,89 @@ func (spec OpenshiftEC2NodeClassSpec) KarpenterBlockDeviceMapping() []*awskarpen
+ }
+ 
+ func (spec OpenshiftEC2NodeClassSpec) KarpenterInstanceStorePolicy() *awskarpenterv1.InstanceStorePolicy {
+-	if spec.InstanceStorePolicy == nil {
++	if spec.InstanceStorePolicy == "" {
++		return nil
++	}
++	return (*awskarpenterv1.InstanceStorePolicy)(&spec.InstanceStorePolicy)
++}
++
++func (spec OpenshiftEC2NodeClassSpec) KarpenterAssociatePublicIPAddress() *bool {
++	switch spec.IPAddressAssociation {
++	case IPAddressAssociationPublic:
++		return ptr.To(true)
++	case IPAddressAssociationSubnetDefault:
++		return ptr.To(false)
++	default:
+ 		return nil
+ 	}
+-	return (*awskarpenterv1.InstanceStorePolicy)(spec.InstanceStorePolicy)
+ }
+ 
+-func (bd *BlockDevice) ToKarpenterTypes() *awskarpenterv1.BlockDevice {
+-	if bd == nil {
++func (spec OpenshiftEC2NodeClassSpec) KarpenterDetailedMonitoring() *bool {
++	switch spec.Monitoring {
++	case MonitoringStateDetailed:
++		return ptr.To(true)
++	case MonitoringStateBasic:
++		return ptr.To(false)
++	default:
+ 		return nil
+ 	}
++}
+ 
++func (bd BlockDevice) ToKarpenterTypes() *awskarpenterv1.BlockDevice {
+ 	return &awskarpenterv1.BlockDevice{
+-		DeleteOnTermination: bd.DeleteOnTermination,
+-		Encrypted:           bd.Encrypted,
++		DeleteOnTermination: deleteOnTerminationToBool(bd.DeleteOnTermination),
++		Encrypted:           encryptionStateToBool(bd.Encrypted),
+ 		IOPS:                bd.IOPS,
+-		KMSKeyID:            bd.KMSKeyID,
+-		SnapshotID:          bd.SnapshotID,
++		KMSKeyID:            ptrIfNonEmpty(bd.KMSKeyID),
++		SnapshotID:          ptrIfNonEmpty(bd.SnapshotID),
+ 		Throughput:          bd.Throughput,
+-		VolumeSize:          bd.VolumeSize,
+-		VolumeType:          bd.VolumeType,
++		VolumeSize:          volumeSizeGiBToQuantity(bd.VolumeSizeGiB),
++		VolumeType:          volumeTypeToKarpenter(bd.VolumeType),
++	}
++}
++
++func deleteOnTerminationToBool(policy DeleteOnTerminationPolicy) *bool {
++	switch policy {
++	case DeleteOnTerminationPolicyDelete:
++		return ptr.To(true)
++	case DeleteOnTerminationPolicyRetain:
++		return ptr.To(false)
++	default:
++		return nil
++	}
++}
++
++func encryptionStateToBool(state EncryptionState) *bool {
++	switch state {
++	case EncryptionStateEncrypted:
++		return ptr.To(true)
++	case EncryptionStateUnencrypted:
++		return ptr.To(false)
++	default:
++		return nil
++	}
++}
++
++func volumeSizeGiBToQuantity(sizeGiB int64) *resource.Quantity {
++	if sizeGiB == 0 {
++		return nil
++	}
++	q := resource.MustParse(fmt.Sprintf("%dGi", sizeGiB))
++	return &q
++}
++
++func volumeTypeToKarpenter(vt VolumeType) *string {
++	if vt == "" {
++		return nil
++	}
++	// Upstream Karpenter uses lowercase volume type values.
++	v := strings.ToLower(string(vt))
++	return &v
++}
++
++func ptrIfNonEmpty(s string) *string {
++	if s == "" {
++		return nil
+ 	}
++	return &s
+ }
+diff --git a/api/karpenter/v1beta1/zz_generated.deepcopy.go b/api/karpenter/v1beta1/zz_generated.deepcopy.go
+index 4f0648135a6..c1684322f85 100644
+--- a/api/karpenter/v1beta1/zz_generated.deepcopy.go
++++ b/api/karpenter/v1beta1/zz_generated.deepcopy.go
+@@ -28,46 +28,16 @@ import (
+ // DeepCopyInto is an autogenerated deepcopy function, copying the receiver, writing into out. in must be non-nil.
+ func (in *BlockDevice) DeepCopyInto(out *BlockDevice) {
+ 	*out = *in
+-	if in.DeleteOnTermination != nil {
+-		in, out := &in.DeleteOnTermination, &out.DeleteOnTermination
+-		*out = new(bool)
+-		**out = **in
+-	}
+-	if in.Encrypted != nil {
+-		in, out := &in.Encrypted, &out.Encrypted
+-		*out = new(bool)
+-		**out = **in
+-	}
+ 	if in.IOPS != nil {
+ 		in, out := &in.IOPS, &out.IOPS
+ 		*out = new(int64)
+ 		**out = **in
+ 	}
+-	if in.KMSKeyID != nil {
+-		in, out := &in.KMSKeyID, &out.KMSKeyID
+-		*out = new(string)
+-		**out = **in
+-	}
+-	if in.SnapshotID != nil {
+-		in, out := &in.SnapshotID, &out.SnapshotID
+-		*out = new(string)
+-		**out = **in
+-	}
+ 	if in.Throughput != nil {
+ 		in, out := &in.Throughput, &out.Throughput
+ 		*out = new(int64)
+ 		**out = **in
+ 	}
+-	if in.VolumeSize != nil {
+-		in, out := &in.VolumeSize, &out.VolumeSize
+-		x := (*in).DeepCopy()
+-		*out = &x
+-	}
+-	if in.VolumeType != nil {
+-		in, out := &in.VolumeType, &out.VolumeType
+-		*out = new(string)
+-		**out = **in
+-	}
+ }
+ 
+ // DeepCopy is an autogenerated deepcopy function, copying the receiver, creating a new BlockDevice.
+@@ -83,16 +53,7 @@ func (in *BlockDevice) DeepCopy() *BlockDevice {
+ // DeepCopyInto is an autogenerated deepcopy function, copying the receiver, writing into out. in must be non-nil.
+ func (in *BlockDeviceMapping) DeepCopyInto(out *BlockDeviceMapping) {
+ 	*out = *in
+-	if in.DeviceName != nil {
+-		in, out := &in.DeviceName, &out.DeviceName
+-		*out = new(string)
+-		**out = **in
+-	}
+-	if in.EBS != nil {
+-		in, out := &in.EBS, &out.EBS
+-		*out = new(BlockDevice)
+-		(*in).DeepCopyInto(*out)
+-	}
++	in.EBS.DeepCopyInto(&out.EBS)
+ }
+ 
+ // DeepCopy is an autogenerated deepcopy function, copying the receiver, creating a new BlockDeviceMapping.
+@@ -181,11 +142,6 @@ func (in *OpenshiftEC2NodeClassSpec) DeepCopyInto(out *OpenshiftEC2NodeClassSpec
+ 			(*in)[i].DeepCopyInto(&(*out)[i])
+ 		}
+ 	}
+-	if in.AssociatePublicIPAddress != nil {
+-		in, out := &in.AssociatePublicIPAddress, &out.AssociatePublicIPAddress
+-		*out = new(bool)
+-		**out = **in
+-	}
+ 	if in.Tags != nil {
+ 		in, out := &in.Tags, &out.Tags
+ 		*out = make(map[string]string, len(*in))
+@@ -195,25 +151,11 @@ func (in *OpenshiftEC2NodeClassSpec) DeepCopyInto(out *OpenshiftEC2NodeClassSpec
+ 	}
+ 	if in.BlockDeviceMappings != nil {
+ 		in, out := &in.BlockDeviceMappings, &out.BlockDeviceMappings
+-		*out = make([]*BlockDeviceMapping, len(*in))
++		*out = make([]BlockDeviceMapping, len(*in))
+ 		for i := range *in {
+-			if (*in)[i] != nil {
+-				in, out := &(*in)[i], &(*out)[i]
+-				*out = new(BlockDeviceMapping)
+-				(*in).DeepCopyInto(*out)
+-			}
++			(*in)[i].DeepCopyInto(&(*out)[i])
+ 		}
+ 	}
+-	if in.InstanceStorePolicy != nil {
+-		in, out := &in.InstanceStorePolicy, &out.InstanceStorePolicy
+-		*out = new(InstanceStorePolicy)
+-		**out = **in
+-	}
+-	if in.DetailedMonitoring != nil {
+-		in, out := &in.DetailedMonitoring, &out.DetailedMonitoring
+-		*out = new(bool)
+-		**out = **in
+-	}
+ }
+ 
+ // DeepCopy is an autogenerated deepcopy function, copying the receiver, creating a new OpenshiftEC2NodeClassSpec.
+@@ -229,6 +171,13 @@ func (in *OpenshiftEC2NodeClassSpec) DeepCopy() *OpenshiftEC2NodeClassSpec {
+ // DeepCopyInto is an autogenerated deepcopy function, copying the receiver, writing into out. in must be non-nil.
+ func (in *OpenshiftEC2NodeClassStatus) DeepCopyInto(out *OpenshiftEC2NodeClassStatus) {
+ 	*out = *in
++	if in.Conditions != nil {
++		in, out := &in.Conditions, &out.Conditions
++		*out = make([]v1.Condition, len(*in))
++		for i := range *in {
++			(*in)[i].DeepCopyInto(&(*out)[i])
++		}
++	}
+ 	if in.Subnets != nil {
+ 		in, out := &in.Subnets, &out.Subnets
+ 		*out = make([]Subnet, len(*in))
+@@ -239,13 +188,6 @@ func (in *OpenshiftEC2NodeClassStatus) DeepCopyInto(out *OpenshiftEC2NodeClassSt
+ 		*out = make([]SecurityGroup, len(*in))
+ 		copy(*out, *in)
+ 	}
+-	if in.Conditions != nil {
+-		in, out := &in.Conditions, &out.Conditions
+-		*out = make([]v1.Condition, len(*in))
+-		for i := range *in {
+-			(*in)[i].DeepCopyInto(&(*out)[i])
+-		}
+-	}
+ }
+ 
+ // DeepCopy is an autogenerated deepcopy function, copying the receiver, creating a new OpenshiftEC2NodeClassStatus.
+diff --git a/client/applyconfiguration/karpenter/v1beta1/blockdevice.go b/client/applyconfiguration/karpenter/v1beta1/blockdevice.go
+index 3f740fef00c..5c33ad22b8f 100644
+--- a/client/applyconfiguration/karpenter/v1beta1/blockdevice.go
++++ b/client/applyconfiguration/karpenter/v1beta1/blockdevice.go
+@@ -18,20 +18,20 @@ limitations under the License.
+ package v1beta1
+ 
+ import (
+-	resource "k8s.io/apimachinery/pkg/api/resource"
++	karpenterv1beta1 "github.com/openshift/hypershift/api/karpenter/v1beta1"
+ )
+ 
+ // BlockDeviceApplyConfiguration represents a declarative configuration of the BlockDevice type for use
+ // with apply.
+ type BlockDeviceApplyConfiguration struct {
+-	DeleteOnTermination *bool              `json:"deleteOnTermination,omitempty"`
+-	Encrypted           *bool              `json:"encrypted,omitempty"`
+-	IOPS                *int64             `json:"iops,omitempty"`
+-	KMSKeyID            *string            `json:"kmsKeyID,omitempty"`
+-	SnapshotID          *string            `json:"snapshotID,omitempty"`
+-	Throughput          *int64             `json:"throughput,omitempty"`
+-	VolumeSize          *resource.Quantity `json:"volumeSize,omitempty"`
+-	VolumeType          *string            `json:"volumeType,omitempty"`
++	DeleteOnTermination *karpenterv1beta1.DeleteOnTerminationPolicy `json:"deleteOnTermination,omitempty"`
++	Encrypted           *karpenterv1beta1.EncryptionState           `json:"encrypted,omitempty"`
++	IOPS                *int64                                      `json:"iops,omitempty"`
++	KMSKeyID            *string                                     `json:"kmsKeyID,omitempty"`
++	SnapshotID          *string                                     `json:"snapshotID,omitempty"`
++	Throughput          *int64                                      `json:"throughput,omitempty"`
++	VolumeSizeGiB       *int64                                      `json:"volumeSizeGiB,omitempty"`
++	VolumeType          *karpenterv1beta1.VolumeType                `json:"volumeType,omitempty"`
+ }
+ 
+ // BlockDeviceApplyConfiguration constructs a declarative configuration of the BlockDevice type for use with
+@@ -43,7 +43,7 @@ func BlockDevice() *BlockDeviceApplyConfiguration {
+ // WithDeleteOnTermination sets the DeleteOnTermination field in the declarative configuration to the given value
+ // and returns the receiver, so that objects can be built by chaining "With" function invocations.
+ // If called multiple times, the DeleteOnTermination field is set to the value of the last call.
+-func (b *BlockDeviceApplyConfiguration) WithDeleteOnTermination(value bool) *BlockDeviceApplyConfiguration {
++func (b *BlockDeviceApplyConfiguration) WithDeleteOnTermination(value karpenterv1beta1.DeleteOnTerminationPolicy) *BlockDeviceApplyConfiguration {
+ 	b.DeleteOnTermination = &value
+ 	return b
+ }
+@@ -51,7 +51,7 @@ func (b *BlockDeviceApplyConfiguration) WithDeleteOnTermination(value bool) *Blo
+ // WithEncrypted sets the Encrypted field in the declarative configuration to the given value
+ // and returns the receiver, so that objects can be built by chaining "With" function invocations.
+ // If called multiple times, the Encrypted field is set to the value of the last call.
+-func (b *BlockDeviceApplyConfiguration) WithEncrypted(value bool) *BlockDeviceApplyConfiguration {
++func (b *BlockDeviceApplyConfiguration) WithEncrypted(value karpenterv1beta1.EncryptionState) *BlockDeviceApplyConfiguration {
+ 	b.Encrypted = &value
+ 	return b
+ }
+@@ -88,18 +88,18 @@ func (b *BlockDeviceApplyConfiguration) WithThroughput(value int64) *BlockDevice
+ 	return b
+ }
+ 
+-// WithVolumeSize sets the VolumeSize field in the declarative configuration to the given value
++// WithVolumeSizeGiB sets the VolumeSizeGiB field in the declarative configuration to the given value
+ // and returns the receiver, so that objects can be built by chaining "With" function invocations.
+-// If called multiple times, the VolumeSize field is set to the value of the last call.
+-func (b *BlockDeviceApplyConfiguration) WithVolumeSize(value resource.Quantity) *BlockDeviceApplyConfiguration {
+-	b.VolumeSize = &value
++// If called multiple times, the VolumeSizeGiB field is set to the value of the last call.
++func (b *BlockDeviceApplyConfiguration) WithVolumeSizeGiB(value int64) *BlockDeviceApplyConfiguration {
++	b.VolumeSizeGiB = &value
+ 	return b
+ }
+ 
+ // WithVolumeType sets the VolumeType field in the declarative configuration to the given value
+ // and returns the receiver, so that objects can be built by chaining "With" function invocations.
+ // If called multiple times, the VolumeType field is set to the value of the last call.
+-func (b *BlockDeviceApplyConfiguration) WithVolumeType(value string) *BlockDeviceApplyConfiguration {
++func (b *BlockDeviceApplyConfiguration) WithVolumeType(value karpenterv1beta1.VolumeType) *BlockDeviceApplyConfiguration {
+ 	b.VolumeType = &value
+ 	return b
+ }
+diff --git a/client/applyconfiguration/karpenter/v1beta1/blockdevicemapping.go b/client/applyconfiguration/karpenter/v1beta1/blockdevicemapping.go
+index 86b094e650d..9336003d8e4 100644
+--- a/client/applyconfiguration/karpenter/v1beta1/blockdevicemapping.go
++++ b/client/applyconfiguration/karpenter/v1beta1/blockdevicemapping.go
+@@ -17,12 +17,16 @@ limitations under the License.
+ 
+ package v1beta1
+ 
++import (
++	karpenterv1beta1 "github.com/openshift/hypershift/api/karpenter/v1beta1"
++)
++
+ // BlockDeviceMappingApplyConfiguration represents a declarative configuration of the BlockDeviceMapping type for use
+ // with apply.
+ type BlockDeviceMappingApplyConfiguration struct {
+-	DeviceName *string                        `json:"deviceName,omitempty"`
+-	EBS        *BlockDeviceApplyConfiguration `json:"ebs,omitempty"`
+-	RootVolume *bool                          `json:"rootVolume,omitempty"`
++	DeviceName *string                                 `json:"deviceName,omitempty"`
++	EBS        *BlockDeviceApplyConfiguration          `json:"ebs,omitempty"`
++	RootVolume *karpenterv1beta1.RootVolumeDesignation `json:"rootVolume,omitempty"`
+ }
+ 
+ // BlockDeviceMappingApplyConfiguration constructs a declarative configuration of the BlockDeviceMapping type for use with
+@@ -50,7 +54,7 @@ func (b *BlockDeviceMappingApplyConfiguration) WithEBS(value *BlockDeviceApplyCo
+ // WithRootVolume sets the RootVolume field in the declarative configuration to the given value
+ // and returns the receiver, so that objects can be built by chaining "With" function invocations.
+ // If called multiple times, the RootVolume field is set to the value of the last call.
+-func (b *BlockDeviceMappingApplyConfiguration) WithRootVolume(value bool) *BlockDeviceMappingApplyConfiguration {
++func (b *BlockDeviceMappingApplyConfiguration) WithRootVolume(value karpenterv1beta1.RootVolumeDesignation) *BlockDeviceMappingApplyConfiguration {
+ 	b.RootVolume = &value
+ 	return b
+ }
+diff --git a/client/applyconfiguration/karpenter/v1beta1/openshiftec2nodeclassspec.go b/client/applyconfiguration/karpenter/v1beta1/openshiftec2nodeclassspec.go
+index 549e541ce8d..88038625afa 100644
+--- a/client/applyconfiguration/karpenter/v1beta1/openshiftec2nodeclassspec.go
++++ b/client/applyconfiguration/karpenter/v1beta1/openshiftec2nodeclassspec.go
+@@ -26,11 +26,11 @@ import (
+ type OpenshiftEC2NodeClassSpecApplyConfiguration struct {
+ 	SubnetSelectorTerms        []SubnetSelectorTermApplyConfiguration        `json:"subnetSelectorTerms,omitempty"`
+ 	SecurityGroupSelectorTerms []SecurityGroupSelectorTermApplyConfiguration `json:"securityGroupSelectorTerms,omitempty"`
+-	AssociatePublicIPAddress   *bool                                         `json:"associatePublicIPAddress,omitempty"`
++	IPAddressAssociation       *karpenterv1beta1.IPAddressAssociation        `json:"ipAddressAssociation,omitempty"`
+ 	Tags                       map[string]string                             `json:"tags,omitempty"`
+-	BlockDeviceMappings        []*karpenterv1beta1.BlockDeviceMapping        `json:"blockDeviceMappings,omitempty"`
++	BlockDeviceMappings        []BlockDeviceMappingApplyConfiguration        `json:"blockDeviceMappings,omitempty"`
+ 	InstanceStorePolicy        *karpenterv1beta1.InstanceStorePolicy         `json:"instanceStorePolicy,omitempty"`
+-	DetailedMonitoring         *bool                                         `json:"detailedMonitoring,omitempty"`
++	Monitoring                 *karpenterv1beta1.MonitoringState             `json:"monitoring,omitempty"`
+ 	Version                    *string                                       `json:"version,omitempty"`
+ }
+ 
+@@ -66,11 +66,11 @@ func (b *OpenshiftEC2NodeClassSpecApplyConfiguration) WithSecurityGroupSelectorT
+ 	return b
+ }
+ 
+-// WithAssociatePublicIPAddress sets the AssociatePublicIPAddress field in the declarative configuration to the given value
++// WithIPAddressAssociation sets the IPAddressAssociation field in the declarative configuration to the given value
+ // and returns the receiver, so that objects can be built by chaining "With" function invocations.
+-// If called multiple times, the AssociatePublicIPAddress field is set to the value of the last call.
+-func (b *OpenshiftEC2NodeClassSpecApplyConfiguration) WithAssociatePublicIPAddress(value bool) *OpenshiftEC2NodeClassSpecApplyConfiguration {
+-	b.AssociatePublicIPAddress = &value
++// If called multiple times, the IPAddressAssociation field is set to the value of the last call.
++func (b *OpenshiftEC2NodeClassSpecApplyConfiguration) WithIPAddressAssociation(value karpenterv1beta1.IPAddressAssociation) *OpenshiftEC2NodeClassSpecApplyConfiguration {
++	b.IPAddressAssociation = &value
+ 	return b
+ }
+ 
+@@ -91,7 +91,7 @@ func (b *OpenshiftEC2NodeClassSpecApplyConfiguration) WithTags(entries map[strin
+ // WithBlockDeviceMappings adds the given value to the BlockDeviceMappings field in the declarative configuration
+ // and returns the receiver, so that objects can be build by chaining "With" function invocations.
+ // If called multiple times, values provided by each call will be appended to the BlockDeviceMappings field.
+-func (b *OpenshiftEC2NodeClassSpecApplyConfiguration) WithBlockDeviceMappings(values ...**karpenterv1beta1.BlockDeviceMapping) *OpenshiftEC2NodeClassSpecApplyConfiguration {
++func (b *OpenshiftEC2NodeClassSpecApplyConfiguration) WithBlockDeviceMappings(values ...*BlockDeviceMappingApplyConfiguration) *OpenshiftEC2NodeClassSpecApplyConfiguration {
+ 	for i := range values {
+ 		if values[i] == nil {
+ 			panic("nil value passed to WithBlockDeviceMappings")
+@@ -109,11 +109,11 @@ func (b *OpenshiftEC2NodeClassSpecApplyConfiguration) WithInstanceStorePolicy(va
+ 	return b
+ }
+ 
+-// WithDetailedMonitoring sets the DetailedMonitoring field in the declarative configuration to the given value
++// WithMonitoring sets the Monitoring field in the declarative configuration to the given value
+ // and returns the receiver, so that objects can be built by chaining "With" function invocations.
+-// If called multiple times, the DetailedMonitoring field is set to the value of the last call.
+-func (b *OpenshiftEC2NodeClassSpecApplyConfiguration) WithDetailedMonitoring(value bool) *OpenshiftEC2NodeClassSpecApplyConfiguration {
+-	b.DetailedMonitoring = &value
++// If called multiple times, the Monitoring field is set to the value of the last call.
++func (b *OpenshiftEC2NodeClassSpecApplyConfiguration) WithMonitoring(value karpenterv1beta1.MonitoringState) *OpenshiftEC2NodeClassSpecApplyConfiguration {
++	b.Monitoring = &value
+ 	return b
+ }
+ 
+diff --git a/client/applyconfiguration/karpenter/v1beta1/openshiftec2nodeclassstatus.go b/client/applyconfiguration/karpenter/v1beta1/openshiftec2nodeclassstatus.go
+index 3f9128fda0c..fabb7ee9fac 100644
+--- a/client/applyconfiguration/karpenter/v1beta1/openshiftec2nodeclassstatus.go
++++ b/client/applyconfiguration/karpenter/v1beta1/openshiftec2nodeclassstatus.go
+@@ -24,11 +24,11 @@ import (
+ // OpenshiftEC2NodeClassStatusApplyConfiguration represents a declarative configuration of the OpenshiftEC2NodeClassStatus type for use
+ // with apply.
+ type OpenshiftEC2NodeClassStatusApplyConfiguration struct {
++	Conditions     []v1.ConditionApplyConfiguration  `json:"conditions,omitempty"`
+ 	Subnets        []SubnetApplyConfiguration        `json:"subnets,omitempty"`
+ 	SecurityGroups []SecurityGroupApplyConfiguration `json:"securityGroups,omitempty"`
+ 	ReleaseImage   *string                           `json:"releaseImage,omitempty"`
+ 	Version        *string                           `json:"version,omitempty"`
+-	Conditions     []v1.ConditionApplyConfiguration  `json:"conditions,omitempty"`
+ }
+ 
+ // OpenshiftEC2NodeClassStatusApplyConfiguration constructs a declarative configuration of the OpenshiftEC2NodeClassStatus type for use with
+@@ -37,6 +37,19 @@ func OpenshiftEC2NodeClassStatus() *OpenshiftEC2NodeClassStatusApplyConfiguratio
+ 	return &OpenshiftEC2NodeClassStatusApplyConfiguration{}
+ }
+ 
++// WithConditions adds the given value to the Conditions field in the declarative configuration
++// and returns the receiver, so that objects can be build by chaining "With" function invocations.
++// If called multiple times, values provided by each call will be appended to the Conditions field.
++func (b *OpenshiftEC2NodeClassStatusApplyConfiguration) WithConditions(values ...*v1.ConditionApplyConfiguration) *OpenshiftEC2NodeClassStatusApplyConfiguration {
++	for i := range values {
++		if values[i] == nil {
++			panic("nil value passed to WithConditions")
++		}
++		b.Conditions = append(b.Conditions, *values[i])
++	}
++	return b
++}
++
+ // WithSubnets adds the given value to the Subnets field in the declarative configuration
+ // and returns the receiver, so that objects can be build by chaining "With" function invocations.
+ // If called multiple times, values provided by each call will be appended to the Subnets field.
+@@ -78,16 +91,3 @@ func (b *OpenshiftEC2NodeClassStatusApplyConfiguration) WithVersion(value string
+ 	b.Version = &value
+ 	return b
+ }
+-
+-// WithConditions adds the given value to the Conditions field in the declarative configuration
+-// and returns the receiver, so that objects can be build by chaining "With" function invocations.
+-// If called multiple times, values provided by each call will be appended to the Conditions field.
+-func (b *OpenshiftEC2NodeClassStatusApplyConfiguration) WithConditions(values ...*v1.ConditionApplyConfiguration) *OpenshiftEC2NodeClassStatusApplyConfiguration {
+-	for i := range values {
+-		if values[i] == nil {
+-			panic("nil value passed to WithConditions")
+-		}
+-		b.Conditions = append(b.Conditions, *values[i])
+-	}
+-	return b
+-}
+diff --git a/karpenter-operator/controllers/karpenter/assets/karpenter.hypershift.openshift.io_openshiftec2nodeclasses.yaml b/karpenter-operator/controllers/karpenter/assets/karpenter.hypershift.openshift.io_openshiftec2nodeclasses.yaml
+index 5b433a4464a..a768b20c163 100644
+--- a/karpenter-operator/controllers/karpenter/assets/karpenter.hypershift.openshift.io_openshiftec2nodeclasses.yaml
++++ b/karpenter-operator/controllers/karpenter/assets/karpenter.hypershift.openshift.io_openshiftec2nodeclasses.yaml
+@@ -44,40 +44,48 @@ spec:
+           metadata:
+             type: object
+           spec:
+-            description: |-
+-              OpenshiftEC2NodeClassSpec defines the desired state of ClusterSizingConfiguration
+-              This will contain configuration necessary to launch instances in AWS.
++            description: spec defines the desired state of the OpenshiftEC2NodeClass.
++            minProperties: 1
+             properties:
+-              associatePublicIPAddress:
+-                description: AssociatePublicIPAddress controls if public IP addresses
+-                  are assigned to instances that are launched with the nodeclass.
+-                type: boolean
+               blockDeviceMappings:
+                 description: |-
+-                  BlockDeviceMappings to be applied to provisioned nodes.
++                  blockDeviceMappings to be applied to provisioned nodes.
+                   For OpenShift nodes, a default root volume size of 120Gi and type gp3 is set if no blockDeviceMapping overrides are specified.
+                 items:
++                  description: BlockDeviceMapping defines a block device mapping for
++                    a node.
++                  minProperties: 1
+                   properties:
+                     deviceName:
+-                      description: The device name (for example, /dev/sdh or xvdh).
++                      description: deviceName is the device name (for example, /dev/sdh
++                        or xvdh).
++                      maxLength: 256
++                      minLength: 1
+                       type: string
+                     ebs:
+-                      description: EBS contains parameters used to automatically set
++                      description: ebs contains parameters used to automatically set
+                         up EBS volumes when an instance is launched.
++                      minProperties: 1
+                       properties:
+                         deleteOnTermination:
+-                          description: DeleteOnTermination indicates whether the EBS
++                          description: deleteOnTermination indicates whether the EBS
+                             volume is deleted on instance termination.
+-                          type: boolean
++                          enum:
++                          - Delete
++                          - Retain
++                          type: string
+                         encrypted:
+                           description: |-
+-                            Encrypted indicates whether the EBS volume is encrypted. Encrypted volumes can only
++                            encrypted indicates whether the EBS volume is encrypted. Encrypted volumes can only
+                             be attached to instances that support Amazon EBS encryption. If you are creating
+                             a volume from a snapshot, you can't specify an encryption value.
+-                          type: boolean
++                          enum:
++                          - Encrypted
++                          - Unencrypted
++                          type: string
+                         iops:
+                           description: |-
+-                            IOPS is the number of I/O operations per second (IOPS). For gp3, io1, and io2 volumes,
++                            iops is the number of I/O operations per second (IOPS). For gp3, io1, and io2 volumes,
+                             this represents the number of IOPS that are provisioned for the volume. For
+                             gp2 volumes, this represents the baseline performance of the volume and the
+                             rate at which the volume accumulates I/O credits for bursting.
+@@ -99,23 +107,26 @@ spec:
+                           format: int64
+                           type: integer
+                         kmsKeyID:
+-                          description: KMSKeyID (ARN) of the symmetric Key Management
++                          description: kmsKeyID is the ARN of the symmetric Key Management
+                             Service (KMS) CMK used for encryption.
++                          maxLength: 2048
++                          minLength: 1
+                           type: string
+                         snapshotID:
+-                          description: SnapshotID is the ID of an EBS snapshot
++                          description: snapshotID is the ID of an EBS snapshot.
++                          maxLength: 256
++                          minLength: 1
+                           type: string
+                         throughput:
+                           description: |-
+-                            Throughput to provision for a gp3 volume, with a maximum of 1,000 MiB/s.
++                            throughput to provision for a gp3 volume, with a maximum of 1,000 MiB/s.
+                             Valid Range: Minimum value of 125. Maximum value of 1000.
+                           format: int64
+                           type: integer
+-                        volumeSize:
++                        volumeSizeGiB:
+                           description: |-
+-                            VolumeSize in `Gi`, `G`, `Ti`, or `T`. You must specify either a snapshot ID or
+-                            a volume size. The following are the supported volumes sizes for each volume
+-                            type:
++                            volumeSizeGiB is the size of the volume in GiB. You must specify either a snapshot ID or
++                            a volume size. The following are the supported volume sizes for each volume type:
+ 
+                                * gp2 and gp3: 1-16,384
+ 
+@@ -124,79 +135,119 @@ spec:
+                                * st1 and sc1: 125-16,384
+ 
+                                * standard: 1-1,024
+-                          pattern: ^((?:[1-9][0-9]{0,3}|[1-4][0-9]{4}|[5][0-8][0-9]{3}|59000)Gi|(?:[1-9][0-9]{0,3}|[1-5][0-9]{4}|[6][0-3][0-9]{3}|64000)G|([1-9]||[1-5][0-7]|58)Ti|([1-9]||[1-5][0-9]|6[0-3]|64)T)$
+-                          type: string
++                          format: int64
++                          maximum: 65536
++                          minimum: 1
++                          type: integer
+                         volumeType:
+                           description: |-
+-                            VolumeType of the block device.
++                            volumeType is the type of the block device.
+                             For more information, see Amazon EBS volume types (https://docs.aws.amazon.com/AWSEC2/latest/UserGuide/EBSVolumeTypes.html)
+                             in the Amazon Elastic Compute Cloud User Guide.
+                           enum:
+-                          - standard
+-                          - io1
+-                          - io2
+-                          - gp2
+-                          - sc1
+-                          - st1
+-                          - gp3
++                          - Standard
++                          - IO1
++                          - IO2
++                          - GP2
++                          - SC1
++                          - ST1
++                          - GP3
+                           type: string
+                       type: object
+                       x-kubernetes-validations:
+-                      - message: snapshotID or volumeSize must be defined
+-                        rule: has(self.snapshotID) || has(self.volumeSize)
++                      - message: snapshotID or volumeSizeGiB must be defined
++                        rule: has(self.snapshotID) || has(self.volumeSizeGiB)
+                     rootVolume:
+                       description: |-
+-                        RootVolume is a flag indicating if this device is mounted as kubelet root dir. You can
++                        rootVolume indicates whether this device is mounted as kubelet root dir. You can
+                         configure at most one root volume in BlockDeviceMappings.
+-                      type: boolean
++                      enum:
++                      - RootVolume
++                      - NotRootVolume
++                      type: string
+                   type: object
+                 maxItems: 50
++                minItems: 1
+                 type: array
++                x-kubernetes-list-type: atomic
+                 x-kubernetes-validations:
+                 - message: must have only one blockDeviceMappings with rootVolume
+-                  rule: self.filter(x, has(x.rootVolume)?x.rootVolume==true:false).size()
++                  rule: self.filter(x, has(x.rootVolume)?x.rootVolume=='RootVolume':false).size()
+                     <= 1
+-              detailedMonitoring:
+-                description: DetailedMonitoring controls if detailed monitoring is
+-                  enabled for instances that are launched
+-                type: boolean
+               instanceStorePolicy:
+-                description: InstanceStorePolicy specifies how to handle instance-store
++                description: instanceStorePolicy specifies how to handle instance-store
+                   disks.
+                 enum:
+                 - RAID0
+                 type: string
++              ipAddressAssociation:
++                description: |-
++                  ipAddressAssociation controls the IP address assignment for instances launched with the nodeclass.
++                  Valid values are:
++                  - "Public": assigns public IP addresses to instances, allowing direct internet access.
++                  - "SubnetDefault": defers IP address assignment to the subnet configuration.
++                  When unset, the cloud provider's subnet default behavior is used.
++                enum:
++                - Public
++                - SubnetDefault
++                type: string
++              monitoring:
++                description: |-
++                  monitoring controls the monitoring level for instances that are launched.
++                  For more information, see Basic monitoring and detailed monitoring
++                  (https://docs.aws.amazon.com/AmazonCloudWatch/latest/monitoring/cloudwatch-metrics-basic-detailed.html).
++                  Valid values are:
++                  - "Detailed": enables detailed monitoring.
++                  - "Basic": enables basic monitoring.
++                  When unset, the cloud provider's default basic monitoring behavior is used.
++                enum:
++                - Detailed
++                - Basic
++                type: string
+               securityGroupSelectorTerms:
+-                description: SecurityGroupSelectorTerms is a list of or security group
++                description: securityGroupSelectorTerms is a list of or security group
+                   selector terms. The terms are ORed.
+                 items:
+                   description: |-
+                     SecurityGroupSelectorTerm defines selection logic for a security group used by Karpenter to launch nodes.
+                     If multiple fields are used for selection, the requirements are ANDed.
++                  minProperties: 1
+                   properties:
+                     id:
+-                      description: ID is the security group id in EC2
+-                      pattern: sg-[0-9a-z]+
++                      description: |-
++                        id is the security group id in EC2.
++                        The expected format is "sg-" followed by alphanumeric characters, e.g. "sg-0a1b2c3d4e5f".
++                      maxLength: 256
++                      minLength: 1
+                       type: string
++                      x-kubernetes-validations:
++                      - message: id must match the pattern sg-[0-9a-z]+
++                        rule: self.matches('^sg-[0-9a-z]+$')
+                     name:
+                       description: |-
+-                        Name is the security group name in EC2.
++                        name is the security group name in EC2.
+                         This value is the name field, which is different from the name tag.
++                      maxLength: 256
++                      minLength: 1
+                       type: string
+                     tags:
+                       additionalProperties:
+                         type: string
+                       description: |-
+-                        Tags is a map of key/value tags used to select subnets
++                        tags is a map of key/value tags used to select security groups.
+                         Specifying '*' for a value selects all values for a given tag key.
++                        The expected format is {"key1": "value1", "key2": "*"}.
+                       maxProperties: 20
++                      minProperties: 1
+                       type: object
+                       x-kubernetes-validations:
+                       - message: empty tag keys or values aren't supported
+                         rule: self.all(k, k != '' && self[k] != '')
+                   type: object
+                 maxItems: 30
++                minItems: 1
+                 type: array
++                x-kubernetes-list-type: atomic
+                 x-kubernetes-validations:
+                 - message: securityGroupSelectorTerms cannot be empty
+                   rule: self.size() != 0
+@@ -209,31 +260,42 @@ spec:
+                     of other fields in securityGroupSelectorTerms'
+                   rule: '!self.all(x, has(x.name) && (has(x.tags) || has(x.id)))'
+               subnetSelectorTerms:
+-                description: SubnetSelectorTerms is a list of or subnet selector terms.
++                description: subnetSelectorTerms is a list of or subnet selector terms.
+                   The terms are ORed.
+                 items:
+                   description: |-
+                     SubnetSelectorTerm defines selection logic for a subnet used by Karpenter to launch nodes.
+                     If multiple fields are used for selection, the requirements are ANDed.
++                  minProperties: 1
+                   properties:
+                     id:
+-                      description: ID is the subnet id in EC2
+-                      pattern: subnet-[0-9a-z]+
++                      description: |-
++                        id is the subnet id in EC2.
++                        The expected format is "subnet-" followed by alphanumeric characters, e.g. "subnet-0a1b2c3d4e5f".
++                      maxLength: 256
++                      minLength: 1
+                       type: string
++                      x-kubernetes-validations:
++                      - message: id must match the pattern subnet-[0-9a-z]+
++                        rule: self.matches('^subnet-[0-9a-z]+$')
+                     tags:
+                       additionalProperties:
+                         type: string
+                       description: |-
+-                        Tags is a map of key/value tags used to select subnets
++                        tags is a map of key/value tags used to select subnets.
+                         Specifying '*' for a value selects all values for a given tag key.
++                        The expected format is {"key1": "value1", "key2": "*"}.
+                       maxProperties: 20
++                      minProperties: 1
+                       type: object
+                       x-kubernetes-validations:
+                       - message: empty tag keys or values aren't supported
+                         rule: self.all(k, k != '' && self[k] != '')
+                   type: object
+                 maxItems: 30
++                minItems: 1
+                 type: array
++                x-kubernetes-list-type: atomic
+                 x-kubernetes-validations:
+                 - message: subnetSelectorTerms cannot be empty
+                   rule: self.size() != 0
+@@ -245,8 +307,9 @@ spec:
+               tags:
+                 additionalProperties:
+                   type: string
+-                description: Tags to be applied on ec2 resources like instances and
++                description: tags to be applied on ec2 resources like instances and
+                   launch templates.
++                minProperties: 1
+                 type: object
+                 x-kubernetes-validations:
+                 - message: empty tag keys aren't supported
+@@ -263,19 +326,23 @@ spec:
+                   rule: self.all(k, k !='karpenter.k8s.aws/ec2nodeclass')
+               version:
+                 description: |-
+-                  Version is an OpenShift version (e.g., "4.20.1") specifying the release version
++                  version is an OpenShift version (e.g., "4.20.1") specifying the release version
+                   for nodes managed by this NodeClass. When set, the controller resolves this to a
+                   release image via the Cincinnati graph API. When not set, nodes use the control plane's
+                   release image.
+-                pattern: ^(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)$
++                maxLength: 64
++                minLength: 5
+                 type: string
++                x-kubernetes-validations:
++                - message: version must be a valid semantic version (e.g., 4.20.1)
++                  rule: self.matches('^(0|[1-9]\\d*)\\.(0|[1-9]\\d*)\\.(0|[1-9]\\d*)$')
+             type: object
+           status:
+-            description: OpenshiftEC2NodeClassStatus defines the observed state of
+-              OpenshiftEC2NodeClass.
++            description: status defines the observed state of the OpenshiftEC2NodeClass.
++            minProperties: 1
+             properties:
+               conditions:
+-                description: Conditions contain signals for health and readiness.
++                description: conditions contain signals for health and readiness.
+                 items:
+                   description: Condition contains details for one aspect of the current
+                     state of this API Resource.
+@@ -330,61 +397,85 @@ spec:
+                   - status
+                   - type
+                   type: object
++                maxItems: 100
++                minItems: 1
+                 type: array
+                 x-kubernetes-list-map-keys:
+                 - type
+                 x-kubernetes-list-type: map
+               releaseImage:
+                 description: |-
+-                  ReleaseImage is the fully qualified release image resolved either from spec.version, or inherited from
++                  releaseImage is the fully qualified release image resolved either from spec.version, or inherited from
+                   the HostedControlPlane's spec.ReleaseImage.
+                   Of the format "quay.io/openshift-release-dev/ocp-release@sha256:<digest>".
++                maxLength: 512
++                minLength: 1
+                 type: string
+               securityGroups:
+                 description: |-
+-                  SecurityGroups contains the current Security Groups values that are available to the
++                  securityGroups contains the current Security Groups values that are available to the
+                   cluster under the SecurityGroups selectors.
+                 items:
+                   description: SecurityGroup contains resolved SecurityGroup selector
+                     values utilized for node launch
+                   properties:
+                     id:
+-                      description: ID of the security group
++                      description: id is the ID of the security group.
++                      maxLength: 256
++                      minLength: 1
+                       type: string
+                     name:
+-                      description: Name of the security group
++                      description: name is the name of the security group.
++                      maxLength: 256
++                      minLength: 1
+                       type: string
+                   required:
+                   - id
+                   type: object
++                maxItems: 100
++                minItems: 1
+                 type: array
++                x-kubernetes-list-type: atomic
+               subnets:
+                 description: |-
+-                  Subnets contains the current Subnet values that are available to the
++                  subnets contains the current Subnet values that are available to the
+                   cluster under the subnet selectors.
+                 items:
+                   description: Subnet contains resolved Subnet selector values utilized
+                     for node launch
+                   properties:
+                     id:
+-                      description: ID of the subnet
++                      description: id is the ID of the subnet.
++                      maxLength: 256
++                      minLength: 1
+                       type: string
+                     zone:
+-                      description: The associated availability zone
++                      description: zone is the associated availability zone.
++                      maxLength: 256
++                      minLength: 1
+                       type: string
+                     zoneID:
+-                      description: The associated availability zone ID
++                      description: zoneID is the associated availability zone ID.
++                      maxLength: 256
++                      minLength: 1
+                       type: string
+                   required:
+                   - id
+                   - zone
+                   type: object
++                maxItems: 100
++                minItems: 1
+                 type: array
++                x-kubernetes-list-type: atomic
+               version:
+-                description: Version is the resolved OpenShift version corresponding
++                description: version is the resolved OpenShift version corresponding
+                   to the status.releaseImage.
++                maxLength: 64
++                minLength: 1
+                 type: string
+             type: object
++        required:
++        - spec
+         type: object
+     served: true
+     storage: true
+diff --git a/karpenter-operator/controllers/karpenter/karpenter_controller.go b/karpenter-operator/controllers/karpenter/karpenter_controller.go
+index b462945e969..806cd930615 100644
+--- a/karpenter-operator/controllers/karpenter/karpenter_controller.go
++++ b/karpenter-operator/controllers/karpenter/karpenter_controller.go
+@@ -344,7 +344,7 @@ func (r *Reconciler) reconcileOpenshiftEC2NodeClassDefault(ctx context.Context,
+ 		}
+ 
+ 		if hcp.Annotations[hyperv1.AWSMachinePublicIPs] == "true" {
+-			ec2NodeClass.Spec.AssociatePublicIPAddress = ptr.To(true)
++			ec2NodeClass.Spec.IPAddressAssociation = hyperkarpenterv1.IPAddressAssociationPublic
+ 		}
+ 		return nil
+ 	})
+diff --git a/karpenter-operator/controllers/nodeclass/ec2_nodeclass_controller.go b/karpenter-operator/controllers/nodeclass/ec2_nodeclass_controller.go
+index 6b15132c018..438cdd7b823 100644
+--- a/karpenter-operator/controllers/nodeclass/ec2_nodeclass_controller.go
++++ b/karpenter-operator/controllers/nodeclass/ec2_nodeclass_controller.go
+@@ -269,9 +269,9 @@ func reconcileEC2NodeClass(ctx context.Context, ec2NodeClass *awskarpenterv1.EC2
+ 		UserData:                 ptr.To(string(userDataSecret.Data["value"])),
+ 		AMIFamily:                ptr.To("Custom"),
+ 		AMISelectorTerms:         amiSelectorTerms,
+-		AssociatePublicIPAddress: openshiftEC2NodeClass.Spec.AssociatePublicIPAddress,
++		AssociatePublicIPAddress: openshiftEC2NodeClass.Spec.KarpenterAssociatePublicIPAddress(),
+ 		Tags:                     mergeEC2NodeClassTags(ctx, openshiftEC2NodeClass, hcp),
+-		DetailedMonitoring:       openshiftEC2NodeClass.Spec.DetailedMonitoring,
++		DetailedMonitoring:       openshiftEC2NodeClass.Spec.KarpenterDetailedMonitoring(),
+ 		BlockDeviceMappings:      openshiftEC2NodeClass.Spec.KarpenterBlockDeviceMapping(),
+ 		InstanceStorePolicy:      openshiftEC2NodeClass.Spec.KarpenterInstanceStorePolicy(),
+ 	}
+diff --git a/karpenter-operator/controllers/nodeclass/ec2_nodeclass_controller_test.go b/karpenter-operator/controllers/nodeclass/ec2_nodeclass_controller_test.go
+index 476131fdca4..c68f4e9aa7e 100644
+--- a/karpenter-operator/controllers/nodeclass/ec2_nodeclass_controller_test.go
++++ b/karpenter-operator/controllers/nodeclass/ec2_nodeclass_controller_test.go
+@@ -105,21 +105,21 @@ func TestReconcileEC2NodeClass(t *testing.T) {
+ 						Name: "testName",
+ 					},
+ 				},
+-				AssociatePublicIPAddress: ptr.To(true),
++				IPAddressAssociation: hyperkarpenterv1.IPAddressAssociationPublic,
+ 				Tags: map[string]string{
+ 					"tag1": "value1",
+ 				},
+-				BlockDeviceMappings: []*hyperkarpenterv1.BlockDeviceMapping{
++				BlockDeviceMappings: []hyperkarpenterv1.BlockDeviceMapping{
+ 					{
+-						DeviceName: ptr.To("xvdh"),
+-						EBS: &hyperkarpenterv1.BlockDevice{
+-							Encrypted:  ptr.To(true),
+-							VolumeSize: resource.NewQuantity(20, resource.DecimalSI),
++						DeviceName: "xvdh",
++						EBS: hyperkarpenterv1.BlockDevice{
++							Encrypted:     hyperkarpenterv1.EncryptionStateEncrypted,
++							VolumeSizeGiB: 20,
+ 						},
+ 					},
+ 				},
+-				InstanceStorePolicy: ptr.To(hyperkarpenterv1.InstanceStorePolicyRAID0),
+-				DetailedMonitoring:  ptr.To(true),
++				InstanceStorePolicy: hyperkarpenterv1.InstanceStorePolicyRAID0,
++				Monitoring:          hyperkarpenterv1.MonitoringStateDetailed,
+ 			},
+ 			expectedSpec: awskarpenterv1.EC2NodeClassSpec{
+ 				SubnetSelectorTerms: []awskarpenterv1.SubnetSelectorTerm{
+@@ -147,7 +147,7 @@ func TestReconcileEC2NodeClass(t *testing.T) {
+ 						DeviceName: ptr.To("xvdh"),
+ 						EBS: &awskarpenterv1.BlockDevice{
+ 							Encrypted:  ptr.To(true),
+-							VolumeSize: resource.NewQuantity(20, resource.DecimalSI),
++							VolumeSize: ptr.To(resource.MustParse("20Gi")),
+ 						},
+ 					},
+ 				},
+diff --git a/vendor/github.com/openshift/hypershift/api/karpenter/v1beta1/karpenter_types.go b/vendor/github.com/openshift/hypershift/api/karpenter/v1beta1/karpenter_types.go
+index cfc52ce0aec..a3b7da6244b 100644
+--- a/vendor/github.com/openshift/hypershift/api/karpenter/v1beta1/karpenter_types.go
++++ b/vendor/github.com/openshift/hypershift/api/karpenter/v1beta1/karpenter_types.go
+@@ -1,7 +1,6 @@
+ package v1beta1
+ 
+ import (
+-	"k8s.io/apimachinery/pkg/api/resource"
+ 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+ )
+ 
+@@ -56,26 +55,114 @@ const (
+ 	ConditionReasonAsExpected = "AsExpected"
+ )
+ 
++// IPAddressAssociation controls IP address assignment for instances.
++// +kubebuilder:validation:Enum=Public;SubnetDefault
++type IPAddressAssociation string
++
++const (
++	// IPAddressAssociationPublic assigns public IP addresses to instances, allowing direct internet access.
++	IPAddressAssociationPublic IPAddressAssociation = "Public"
++	// IPAddressAssociationSubnetDefault defers IP address assignment to the subnet configuration.
++	IPAddressAssociationSubnetDefault IPAddressAssociation = "SubnetDefault"
++)
++
++// MonitoringState controls the monitoring level for instances.
++// For more information, see Basic monitoring and detailed monitoring (https://docs.aws.amazon.com/AmazonCloudWatch/latest/monitoring/cloudwatch-metrics-basic-detailed.html).
++// +kubebuilder:validation:Enum=Detailed;Basic
++type MonitoringState string
++
++const (
++	// MonitoringStateDetailed enables detailed monitoring for instances.
++	MonitoringStateDetailed MonitoringState = "Detailed"
++	// MonitoringStateBasic enables basic monitoring for instances.
++	MonitoringStateBasic MonitoringState = "Basic"
++)
++
++// RootVolumeDesignation indicates whether a device is mounted as the kubelet root directory.
++// +kubebuilder:validation:Enum=RootVolume;NotRootVolume
++type RootVolumeDesignation string
++
++const (
++	// RootVolumeDesignationRootVolume indicates the device is mounted as kubelet root dir.
++	RootVolumeDesignationRootVolume RootVolumeDesignation = "RootVolume"
++	// RootVolumeDesignationNotRootVolume indicates the device is not the kubelet root dir.
++	RootVolumeDesignationNotRootVolume RootVolumeDesignation = "NotRootVolume"
++)
++
++// DeleteOnTerminationPolicy controls whether an EBS volume is deleted on instance termination.
++// +kubebuilder:validation:Enum=Delete;Retain
++type DeleteOnTerminationPolicy string
++
++const (
++	// DeleteOnTerminationPolicyDelete deletes the EBS volume when the instance terminates.
++	DeleteOnTerminationPolicyDelete DeleteOnTerminationPolicy = "Delete"
++	// DeleteOnTerminationPolicyRetain retains the EBS volume when the instance terminates.
++	DeleteOnTerminationPolicyRetain DeleteOnTerminationPolicy = "Retain"
++)
++
++// EncryptionState controls whether an EBS volume is encrypted.
++// +kubebuilder:validation:Enum=Encrypted;Unencrypted
++type EncryptionState string
++
++const (
++	// EncryptionStateEncrypted indicates the EBS volume is encrypted.
++	EncryptionStateEncrypted EncryptionState = "Encrypted"
++	// EncryptionStateUnencrypted indicates the EBS volume is not encrypted.
++	EncryptionStateUnencrypted EncryptionState = "Unencrypted"
++)
++
++// VolumeType is the type of an EBS block device.
++// For more information, see Amazon EBS volume types (https://docs.aws.amazon.com/AWSEC2/latest/UserGuide/EBSVolumeTypes.html).
++// +kubebuilder:validation:Enum=Standard;IO1;IO2;GP2;SC1;ST1;GP3
++type VolumeType string
++
++const (
++	// VolumeTypeStandard is a previous generation magnetic volume.
++	VolumeTypeStandard VolumeType = "Standard"
++	// VolumeTypeIO1 is a provisioned IOPS SSD volume.
++	VolumeTypeIO1 VolumeType = "IO1"
++	// VolumeTypeIO2 is a provisioned IOPS SSD volume (latest generation).
++	VolumeTypeIO2 VolumeType = "IO2"
++	// VolumeTypeGP2 is a general purpose SSD volume.
++	VolumeTypeGP2 VolumeType = "GP2"
++	// VolumeTypeSC1 is a cold HDD volume.
++	VolumeTypeSC1 VolumeType = "SC1"
++	// VolumeTypeST1 is a throughput optimized HDD volume.
++	VolumeTypeST1 VolumeType = "ST1"
++	// VolumeTypeGP3 is a general purpose SSD volume (latest generation).
++	VolumeTypeGP3 VolumeType = "GP3"
++)
++
+ // Subnet contains resolved Subnet selector values utilized for node launch
+ type Subnet struct {
+-	// ID of the subnet
++	// id is the ID of the subnet.
+ 	// +required
+-	ID string `json:"id"`
+-	// The associated availability zone
++	// +kubebuilder:validation:MinLength=1
++	// +kubebuilder:validation:MaxLength=256
++	ID string `json:"id,omitempty"`
++	// zone is the associated availability zone.
+ 	// +required
+-	Zone string `json:"zone"`
+-	// The associated availability zone ID
++	// +kubebuilder:validation:MinLength=1
++	// +kubebuilder:validation:MaxLength=256
++	Zone string `json:"zone,omitempty"`
++	// zoneID is the associated availability zone ID.
+ 	// +optional
++	// +kubebuilder:validation:MinLength=1
++	// +kubebuilder:validation:MaxLength=256
+ 	ZoneID string `json:"zoneID,omitempty"`
+ }
+ 
+ // SecurityGroup contains resolved SecurityGroup selector values utilized for node launch
+ type SecurityGroup struct {
+-	// ID of the security group
++	// id is the ID of the security group.
+ 	// +required
+-	ID string `json:"id"`
+-	// Name of the security group
++	// +kubebuilder:validation:MinLength=1
++	// +kubebuilder:validation:MaxLength=256
++	ID string `json:"id,omitempty"`
++	// name is the name of the security group.
+ 	// +optional
++	// +kubebuilder:validation:MinLength=1
++	// +kubebuilder:validation:MaxLength=256
+ 	Name string `json:"name,omitempty"`
+ }
+ 
+@@ -93,125 +180,166 @@ const (
+ 
+ // OpenshiftEC2NodeClassSpec defines the desired state of ClusterSizingConfiguration
+ // This will contain configuration necessary to launch instances in AWS.
++// +kubebuilder:validation:MinProperties=1
+ type OpenshiftEC2NodeClassSpec struct {
+-	// SubnetSelectorTerms is a list of or subnet selector terms. The terms are ORed.
++	// subnetSelectorTerms is a list of or subnet selector terms. The terms are ORed.
+ 	// +kubebuilder:validation:XValidation:message="subnetSelectorTerms cannot be empty",rule="self.size() != 0"
+ 	// +kubebuilder:validation:XValidation:message="expected at least one, got none, ['tags', 'id']",rule="self.all(x, has(x.tags) || has(x.id))"
+ 	// +kubebuilder:validation:XValidation:message="'id' is mutually exclusive, cannot be set with a combination of other fields in subnetSelectorTerms",rule="!self.all(x, has(x.id) && has(x.tags))"
++	// +kubebuilder:validation:MinItems=1
+ 	// +kubebuilder:validation:MaxItems:=30
++	// +listType=atomic
+ 	// +optional
+ 	SubnetSelectorTerms []SubnetSelectorTerm `json:"subnetSelectorTerms,omitempty"`
+ 
+-	// SecurityGroupSelectorTerms is a list of or security group selector terms. The terms are ORed.
++	// securityGroupSelectorTerms is a list of or security group selector terms. The terms are ORed.
+ 	// +kubebuilder:validation:XValidation:message="securityGroupSelectorTerms cannot be empty",rule="self.size() != 0"
+ 	// +kubebuilder:validation:XValidation:message="expected at least one, got none, ['tags', 'id', 'name']",rule="self.all(x, has(x.tags) || has(x.id) || has(x.name))"
+ 	// +kubebuilder:validation:XValidation:message="'id' is mutually exclusive, cannot be set with a combination of other fields in securityGroupSelectorTerms",rule="!self.all(x, has(x.id) && (has(x.tags) || has(x.name)))"
+ 	// +kubebuilder:validation:XValidation:message="'name' is mutually exclusive, cannot be set with a combination of other fields in securityGroupSelectorTerms",rule="!self.all(x, has(x.name) && (has(x.tags) || has(x.id)))"
++	// +kubebuilder:validation:MinItems=1
+ 	// +kubebuilder:validation:MaxItems:=30
++	// +listType=atomic
+ 	// +optional
+ 	SecurityGroupSelectorTerms []SecurityGroupSelectorTerm `json:"securityGroupSelectorTerms,omitempty"`
+ 
+-	// AssociatePublicIPAddress controls if public IP addresses are assigned to instances that are launched with the nodeclass.
++	// ipAddressAssociation controls the IP address assignment for instances launched with the nodeclass.
++	// Valid values are:
++	// - "Public": assigns public IP addresses to instances, allowing direct internet access.
++	// - "SubnetDefault": defers IP address assignment to the subnet configuration.
++	// When unset, the cloud provider's subnet default behavior is used.
+ 	// +optional
+-	AssociatePublicIPAddress *bool `json:"associatePublicIPAddress,omitempty"`
++	IPAddressAssociation IPAddressAssociation `json:"ipAddressAssociation,omitempty"`
+ 
+-	// Tags to be applied on ec2 resources like instances and launch templates.
++	// tags to be applied on ec2 resources like instances and launch templates.
+ 	// +kubebuilder:validation:XValidation:message="empty tag keys aren't supported",rule="self.all(k, k != '')"
+ 	// +kubebuilder:validation:XValidation:message="tag contains a restricted tag matching eks:eks-cluster-name",rule="self.all(k, k !='eks:eks-cluster-name')"
+ 	// +kubebuilder:validation:XValidation:message="tag contains a restricted tag matching kubernetes.io/cluster/",rule="self.all(k, !k.startsWith('kubernetes.io/cluster') )"
+ 	// +kubebuilder:validation:XValidation:message="tag contains a restricted tag matching karpenter.sh/nodepool",rule="self.all(k, k != 'karpenter.sh/nodepool')"
+ 	// +kubebuilder:validation:XValidation:message="tag contains a restricted tag matching karpenter.sh/nodeclaim",rule="self.all(k, k !='karpenter.sh/nodeclaim')"
+ 	// +kubebuilder:validation:XValidation:message="tag contains a restricted tag matching karpenter.k8s.aws/ec2nodeclass",rule="self.all(k, k !='karpenter.k8s.aws/ec2nodeclass')"
++	// +kubebuilder:validation:MinProperties=1
+ 	// +optional
+ 	Tags map[string]string `json:"tags,omitempty"`
+ 
+-	// BlockDeviceMappings to be applied to provisioned nodes.
++	// blockDeviceMappings to be applied to provisioned nodes.
+ 	// For OpenShift nodes, a default root volume size of 120Gi and type gp3 is set if no blockDeviceMapping overrides are specified.
+-	// +kubebuilder:validation:XValidation:message="must have only one blockDeviceMappings with rootVolume",rule="self.filter(x, has(x.rootVolume)?x.rootVolume==true:false).size() <= 1"
++	// +kubebuilder:validation:XValidation:message="must have only one blockDeviceMappings with rootVolume",rule="self.filter(x, has(x.rootVolume)?x.rootVolume=='RootVolume':false).size() <= 1"
++	// +kubebuilder:validation:MinItems=1
+ 	// +kubebuilder:validation:MaxItems:=50
++	// +listType=atomic
+ 	// +optional
+-	BlockDeviceMappings []*BlockDeviceMapping `json:"blockDeviceMappings,omitempty"`
++	BlockDeviceMappings []BlockDeviceMapping `json:"blockDeviceMappings,omitempty"`
+ 
+-	// InstanceStorePolicy specifies how to handle instance-store disks.
++	// instanceStorePolicy specifies how to handle instance-store disks.
+ 	// +optional
+-	InstanceStorePolicy *InstanceStorePolicy `json:"instanceStorePolicy,omitempty"`
+-
+-	// DetailedMonitoring controls if detailed monitoring is enabled for instances that are launched
++	InstanceStorePolicy InstanceStorePolicy `json:"instanceStorePolicy,omitempty"`
++
++	// monitoring controls the monitoring level for instances that are launched.
++	// For more information, see Basic monitoring and detailed monitoring
++	// (https://docs.aws.amazon.com/AmazonCloudWatch/latest/monitoring/cloudwatch-metrics-basic-detailed.html).
++	// Valid values are:
++	// - "Detailed": enables detailed monitoring.
++	// - "Basic": enables basic monitoring.
++	// When unset, the cloud provider's default basic monitoring behavior is used.
+ 	// +optional
+-	DetailedMonitoring *bool `json:"detailedMonitoring,omitempty"`
++	Monitoring MonitoringState `json:"monitoring,omitempty"`
+ 
+-	// Version is an OpenShift version (e.g., "4.20.1") specifying the release version
++	// version is an OpenShift version (e.g., "4.20.1") specifying the release version
+ 	// for nodes managed by this NodeClass. When set, the controller resolves this to a
+ 	// release image via the Cincinnati graph API. When not set, nodes use the control plane's
+ 	// release image.
+-	// +kubebuilder:validation:Pattern=`^(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)$`
++	// +kubebuilder:validation:XValidation:rule="self.matches('^(0|[1-9]\\\\d*)\\\\.(0|[1-9]\\\\d*)\\\\.(0|[1-9]\\\\d*)$')",message="version must be a valid semantic version (e.g., 4.20.1)"
++	// +kubebuilder:validation:MinLength=5
++	// +kubebuilder:validation:MaxLength=64
+ 	// +optional
+ 	Version string `json:"version,omitempty"`
+ }
+ 
+ // SubnetSelectorTerm defines selection logic for a subnet used by Karpenter to launch nodes.
+ // If multiple fields are used for selection, the requirements are ANDed.
++// +kubebuilder:validation:MinProperties=1
+ type SubnetSelectorTerm struct {
+-	// Tags is a map of key/value tags used to select subnets
++	// tags is a map of key/value tags used to select subnets.
+ 	// Specifying '*' for a value selects all values for a given tag key.
++	// The expected format is {"key1": "value1", "key2": "*"}.
+ 	// +kubebuilder:validation:XValidation:message="empty tag keys or values aren't supported",rule="self.all(k, k != '' && self[k] != '')"
+ 	// +kubebuilder:validation:MaxProperties:=20
++	// +kubebuilder:validation:MinProperties=1
+ 	// +optional
+ 	Tags map[string]string `json:"tags,omitempty"`
+ 
+-	// ID is the subnet id in EC2
+-	// +kubebuilder:validation:Pattern="subnet-[0-9a-z]+"
++	// id is the subnet id in EC2.
++	// The expected format is "subnet-" followed by alphanumeric characters, e.g. "subnet-0a1b2c3d4e5f".
++	// +kubebuilder:validation:XValidation:rule="self.matches('^subnet-[0-9a-z]+$')",message="id must match the pattern subnet-[0-9a-z]+"
++	// +kubebuilder:validation:MinLength=1
++	// +kubebuilder:validation:MaxLength=256
+ 	// +optional
+ 	ID string `json:"id,omitempty"`
+ }
+ 
+ // SecurityGroupSelectorTerm defines selection logic for a security group used by Karpenter to launch nodes.
+ // If multiple fields are used for selection, the requirements are ANDed.
++// +kubebuilder:validation:MinProperties=1
+ type SecurityGroupSelectorTerm struct {
+-	// Tags is a map of key/value tags used to select subnets
++	// tags is a map of key/value tags used to select security groups.
+ 	// Specifying '*' for a value selects all values for a given tag key.
++	// The expected format is {"key1": "value1", "key2": "*"}.
+ 	// +kubebuilder:validation:XValidation:message="empty tag keys or values aren't supported",rule="self.all(k, k != '' && self[k] != '')"
+ 	// +kubebuilder:validation:MaxProperties:=20
++	// +kubebuilder:validation:MinProperties=1
+ 	// +optional
+ 	Tags map[string]string `json:"tags,omitempty"`
+ 
+-	// ID is the security group id in EC2
+-	// +kubebuilder:validation:Pattern:="sg-[0-9a-z]+"
++	// id is the security group id in EC2.
++	// The expected format is "sg-" followed by alphanumeric characters, e.g. "sg-0a1b2c3d4e5f".
++	// +kubebuilder:validation:XValidation:rule="self.matches('^sg-[0-9a-z]+$')",message="id must match the pattern sg-[0-9a-z]+"
++	// +kubebuilder:validation:MinLength=1
++	// +kubebuilder:validation:MaxLength=256
+ 	// +optional
+ 	ID string `json:"id,omitempty"`
+ 
+-	// Name is the security group name in EC2.
++	// name is the security group name in EC2.
+ 	// This value is the name field, which is different from the name tag.
++	// +kubebuilder:validation:MinLength=1
++	// +kubebuilder:validation:MaxLength=256
++	// +optional
+ 	Name string `json:"name,omitempty"`
+ }
+ 
++// BlockDeviceMapping defines a block device mapping for a node.
++// +kubebuilder:validation:MinProperties=1
+ type BlockDeviceMapping struct {
+-	// The device name (for example, /dev/sdh or xvdh).
++	// deviceName is the device name (for example, /dev/sdh or xvdh).
+ 	// +optional
+-	DeviceName *string `json:"deviceName,omitempty"`
++	// +kubebuilder:validation:MinLength=1
++	// +kubebuilder:validation:MaxLength=256
++	DeviceName string `json:"deviceName,omitempty"`
+ 
+-	// EBS contains parameters used to automatically set up EBS volumes when an instance is launched.
+-	// +kubebuilder:validation:XValidation:message="snapshotID or volumeSize must be defined",rule="has(self.snapshotID) || has(self.volumeSize)"
++	// ebs contains parameters used to automatically set up EBS volumes when an instance is launched.
++	// +kubebuilder:validation:XValidation:message="snapshotID or volumeSizeGiB must be defined",rule="has(self.snapshotID) || has(self.volumeSizeGiB)"
+ 	// +optional
+-	EBS *BlockDevice `json:"ebs,omitempty"`
++	EBS BlockDevice `json:"ebs,omitempty,omitzero"`
+ 
+-	// RootVolume is a flag indicating if this device is mounted as kubelet root dir. You can
++	// rootVolume indicates whether this device is mounted as kubelet root dir. You can
+ 	// configure at most one root volume in BlockDeviceMappings.
+-	RootVolume bool `json:"rootVolume,omitempty"`
++	// +optional
++	RootVolume RootVolumeDesignation `json:"rootVolume,omitempty"`
+ }
+ 
++// +kubebuilder:validation:MinProperties=1
+ type BlockDevice struct {
+-	// DeleteOnTermination indicates whether the EBS volume is deleted on instance termination.
++	// deleteOnTermination indicates whether the EBS volume is deleted on instance termination.
+ 	// +optional
+-	DeleteOnTermination *bool `json:"deleteOnTermination,omitempty"`
++	DeleteOnTermination DeleteOnTerminationPolicy `json:"deleteOnTermination,omitempty"`
+ 
+-	// Encrypted indicates whether the EBS volume is encrypted. Encrypted volumes can only
++	// encrypted indicates whether the EBS volume is encrypted. Encrypted volumes can only
+ 	// be attached to instances that support Amazon EBS encryption. If you are creating
+ 	// a volume from a snapshot, you can't specify an encryption value.
+ 	// +optional
+-	Encrypted *bool `json:"encrypted,omitempty"`
++	Encrypted EncryptionState `json:"encrypted,omitempty"`
+ 
+-	// IOPS is the number of I/O operations per second (IOPS). For gp3, io1, and io2 volumes,
++	// iops is the number of I/O operations per second (IOPS). For gp3, io1, and io2 volumes,
+ 	// this represents the number of IOPS that are provisioned for the volume. For
+ 	// gp2 volumes, this represents the baseline performance of the volume and the
+ 	// rate at which the volume accumulates I/O credits for bursting.
+@@ -233,22 +361,25 @@ type BlockDevice struct {
+ 	// +optional
+ 	IOPS *int64 `json:"iops,omitempty"`
+ 
+-	// KMSKeyID (ARN) of the symmetric Key Management Service (KMS) CMK used for encryption.
++	// kmsKeyID is the ARN of the symmetric Key Management Service (KMS) CMK used for encryption.
+ 	// +optional
+-	KMSKeyID *string `json:"kmsKeyID,omitempty"`
++	// +kubebuilder:validation:MinLength=1
++	// +kubebuilder:validation:MaxLength=2048
++	KMSKeyID string `json:"kmsKeyID,omitempty"`
+ 
+-	// SnapshotID is the ID of an EBS snapshot
++	// snapshotID is the ID of an EBS snapshot.
+ 	// +optional
+-	SnapshotID *string `json:"snapshotID,omitempty"`
++	// +kubebuilder:validation:MinLength=1
++	// +kubebuilder:validation:MaxLength=256
++	SnapshotID string `json:"snapshotID,omitempty"`
+ 
+-	// Throughput to provision for a gp3 volume, with a maximum of 1,000 MiB/s.
++	// throughput to provision for a gp3 volume, with a maximum of 1,000 MiB/s.
+ 	// Valid Range: Minimum value of 125. Maximum value of 1000.
+ 	// +optional
+ 	Throughput *int64 `json:"throughput,omitempty"`
+ 
+-	// VolumeSize in `Gi`, `G`, `Ti`, or `T`. You must specify either a snapshot ID or
+-	// a volume size. The following are the supported volumes sizes for each volume
+-	// type:
++	// volumeSizeGiB is the size of the volume in GiB. You must specify either a snapshot ID or
++	// a volume size. The following are the supported volume sizes for each volume type:
+ 	//
+ 	//    * gp2 and gp3: 1-16,384
+ 	//
+@@ -257,51 +388,58 @@ type BlockDevice struct {
+ 	//    * st1 and sc1: 125-16,384
+ 	//
+ 	//    * standard: 1-1,024
+-	// + TODO: Add the CEL resources.quantity type after k8s 1.29
+-	// + https://github.com/kubernetes/apiserver/commit/b137c256373aec1c5d5810afbabb8932a19ecd2a#diff-838176caa5882465c9d6061febd456397a3e2b40fb423ed36f0cabb1847ecb4dR190
+-	// +kubebuilder:validation:Pattern:="^((?:[1-9][0-9]{0,3}|[1-4][0-9]{4}|[5][0-8][0-9]{3}|59000)Gi|(?:[1-9][0-9]{0,3}|[1-5][0-9]{4}|[6][0-3][0-9]{3}|64000)G|([1-9]||[1-5][0-7]|58)Ti|([1-9]||[1-5][0-9]|6[0-3]|64)T)$"
+-	// +kubebuilder:validation:Schemaless
+-	// +kubebuilder:validation:Type:=string
++	// +kubebuilder:validation:Minimum=1
++	// +kubebuilder:validation:Maximum=65536
+ 	// +optional
+-	VolumeSize *resource.Quantity `json:"volumeSize,omitempty" hash:"string"`
++	VolumeSizeGiB int64 `json:"volumeSizeGiB,omitempty"`
+ 
+-	// VolumeType of the block device.
++	// volumeType is the type of the block device.
+ 	// For more information, see Amazon EBS volume types (https://docs.aws.amazon.com/AWSEC2/latest/UserGuide/EBSVolumeTypes.html)
+ 	// in the Amazon Elastic Compute Cloud User Guide.
+-	// +kubebuilder:validation:Enum:={standard,io1,io2,gp2,sc1,st1,gp3}
+ 	// +optional
+-	VolumeType *string `json:"volumeType,omitempty"`
++	VolumeType VolumeType `json:"volumeType,omitempty"`
+ }
+ 
+ // OpenshiftEC2NodeClassStatus defines the observed state of OpenshiftEC2NodeClass.
++// +kubebuilder:validation:MinProperties=1
+ type OpenshiftEC2NodeClassStatus struct {
+-	// Subnets contains the current Subnet values that are available to the
++	// conditions contain signals for health and readiness.
++	// +optional
++	// +listType=map
++	// +listMapKey=type
++	// +kubebuilder:validation:MinItems=1
++	// +kubebuilder:validation:MaxItems=100
++	Conditions []metav1.Condition `json:"conditions,omitempty"`
++
++	// subnets contains the current Subnet values that are available to the
+ 	// cluster under the subnet selectors.
+ 	// +optional
++	// +listType=atomic
++	// +kubebuilder:validation:MinItems=1
++	// +kubebuilder:validation:MaxItems=100
+ 	Subnets []Subnet `json:"subnets,omitempty"`
+ 
+-	// SecurityGroups contains the current Security Groups values that are available to the
++	// securityGroups contains the current Security Groups values that are available to the
+ 	// cluster under the SecurityGroups selectors.
+ 	// +optional
++	// +listType=atomic
++	// +kubebuilder:validation:MinItems=1
++	// +kubebuilder:validation:MaxItems=100
+ 	SecurityGroups []SecurityGroup `json:"securityGroups,omitempty"`
+ 
+-	// ReleaseImage is the fully qualified release image resolved either from spec.version, or inherited from
++	// releaseImage is the fully qualified release image resolved either from spec.version, or inherited from
+ 	// the HostedControlPlane's spec.ReleaseImage.
+ 	// Of the format "quay.io/openshift-release-dev/ocp-release@sha256:<digest>".
+ 	// +optional
++	// +kubebuilder:validation:MinLength=1
++	// +kubebuilder:validation:MaxLength=512
+ 	ReleaseImage string `json:"releaseImage,omitempty"`
+ 
+-	// Version is the resolved OpenShift version corresponding to the status.releaseImage.
++	// version is the resolved OpenShift version corresponding to the status.releaseImage.
+ 	// +optional
++	// +kubebuilder:validation:MinLength=1
++	// +kubebuilder:validation:MaxLength=64
+ 	Version string `json:"version,omitempty"`
+-
+-	// +optional
+-	// +listType=map
+-	// +listMapKey=type
+-	// +patchMergeKey=type
+-	// +patchStrategy=merge
+-	// Conditions contain signals for health and readiness.
+-	Conditions []metav1.Condition `json:"conditions,omitempty" patchStrategy:"merge" patchMergeKey:"type"`
+ }
+ 
+ // +genclient
+@@ -312,11 +450,19 @@ type OpenshiftEC2NodeClassStatus struct {
+ // +kubebuilder:storageversion
+ // OpenshiftEC2NodeClass defines the desired state of OpenshiftEC2NodeClass.
+ type OpenshiftEC2NodeClass struct {
+-	metav1.TypeMeta   `json:",inline"`
++	metav1.TypeMeta `json:",inline"`
++
++	// metadata is the standard object metadata.
++	// +optional
+ 	metav1.ObjectMeta `json:"metadata,omitempty"`
+ 
+-	Spec   OpenshiftEC2NodeClassSpec   `json:"spec,omitempty"`
+-	Status OpenshiftEC2NodeClassStatus `json:"status,omitempty"`
++	// spec defines the desired state of the OpenshiftEC2NodeClass.
++	// +required
++	Spec OpenshiftEC2NodeClassSpec `json:"spec,omitzero"`
++
++	// status defines the observed state of the OpenshiftEC2NodeClass.
++	// +optional
++	Status OpenshiftEC2NodeClassStatus `json:"status,omitempty,omitzero"`
+ }
+ 
+ // +kubebuilder:object:root=true
+diff --git a/vendor/github.com/openshift/hypershift/api/karpenter/v1beta1/util.go b/vendor/github.com/openshift/hypershift/api/karpenter/v1beta1/util.go
+index 63560976ca1..772fbd37ce6 100644
+--- a/vendor/github.com/openshift/hypershift/api/karpenter/v1beta1/util.go
++++ b/vendor/github.com/openshift/hypershift/api/karpenter/v1beta1/util.go
+@@ -1,7 +1,13 @@
+ package v1beta1
+ 
+ import (
++	"fmt"
++	"strings"
++
+ 	awskarpenterv1 "github.com/aws/karpenter-provider-aws/pkg/apis/v1"
++
++	"k8s.io/apimachinery/pkg/api/resource"
++	"k8s.io/utils/ptr"
+ )
+ 
+ func (spec OpenshiftEC2NodeClassSpec) KarpenterBlockDeviceMapping() []*awskarpenterv1.BlockDeviceMapping {
+@@ -10,13 +16,9 @@ func (spec OpenshiftEC2NodeClassSpec) KarpenterBlockDeviceMapping() []*awskarpen
+ 	}
+ 	var blockDeviceMapping []*awskarpenterv1.BlockDeviceMapping
+ 	for _, mapping := range spec.BlockDeviceMappings {
+-		if mapping == nil {
+-			continue
+-		}
+-
+ 		blockDeviceMapping = append(blockDeviceMapping, &awskarpenterv1.BlockDeviceMapping{
+-			DeviceName: mapping.DeviceName,
+-			RootVolume: mapping.RootVolume,
++			DeviceName: ptrIfNonEmpty(mapping.DeviceName),
++			RootVolume: mapping.RootVolume == RootVolumeDesignationRootVolume,
+ 			EBS:        mapping.EBS.ToKarpenterTypes(),
+ 		})
+ 	}
+@@ -25,25 +27,89 @@ func (spec OpenshiftEC2NodeClassSpec) KarpenterBlockDeviceMapping() []*awskarpen
+ }
+ 
+ func (spec OpenshiftEC2NodeClassSpec) KarpenterInstanceStorePolicy() *awskarpenterv1.InstanceStorePolicy {
+-	if spec.InstanceStorePolicy == nil {
++	if spec.InstanceStorePolicy == "" {
++		return nil
++	}
++	return (*awskarpenterv1.InstanceStorePolicy)(&spec.InstanceStorePolicy)
++}
++
++func (spec OpenshiftEC2NodeClassSpec) KarpenterAssociatePublicIPAddress() *bool {
++	switch spec.IPAddressAssociation {
++	case IPAddressAssociationPublic:
++		return ptr.To(true)
++	case IPAddressAssociationSubnetDefault:
++		return ptr.To(false)
++	default:
+ 		return nil
+ 	}
+-	return (*awskarpenterv1.InstanceStorePolicy)(spec.InstanceStorePolicy)
+ }
+ 
+-func (bd *BlockDevice) ToKarpenterTypes() *awskarpenterv1.BlockDevice {
+-	if bd == nil {
++func (spec OpenshiftEC2NodeClassSpec) KarpenterDetailedMonitoring() *bool {
++	switch spec.Monitoring {
++	case MonitoringStateDetailed:
++		return ptr.To(true)
++	case MonitoringStateBasic:
++		return ptr.To(false)
++	default:
+ 		return nil
+ 	}
++}
+ 
++func (bd BlockDevice) ToKarpenterTypes() *awskarpenterv1.BlockDevice {
+ 	return &awskarpenterv1.BlockDevice{
+-		DeleteOnTermination: bd.DeleteOnTermination,
+-		Encrypted:           bd.Encrypted,
++		DeleteOnTermination: deleteOnTerminationToBool(bd.DeleteOnTermination),
++		Encrypted:           encryptionStateToBool(bd.Encrypted),
+ 		IOPS:                bd.IOPS,
+-		KMSKeyID:            bd.KMSKeyID,
+-		SnapshotID:          bd.SnapshotID,
++		KMSKeyID:            ptrIfNonEmpty(bd.KMSKeyID),
++		SnapshotID:          ptrIfNonEmpty(bd.SnapshotID),
+ 		Throughput:          bd.Throughput,
+-		VolumeSize:          bd.VolumeSize,
+-		VolumeType:          bd.VolumeType,
++		VolumeSize:          volumeSizeGiBToQuantity(bd.VolumeSizeGiB),
++		VolumeType:          volumeTypeToKarpenter(bd.VolumeType),
++	}
++}
++
++func deleteOnTerminationToBool(policy DeleteOnTerminationPolicy) *bool {
++	switch policy {
++	case DeleteOnTerminationPolicyDelete:
++		return ptr.To(true)
++	case DeleteOnTerminationPolicyRetain:
++		return ptr.To(false)
++	default:
++		return nil
++	}
++}
++
++func encryptionStateToBool(state EncryptionState) *bool {
++	switch state {
++	case EncryptionStateEncrypted:
++		return ptr.To(true)
++	case EncryptionStateUnencrypted:
++		return ptr.To(false)
++	default:
++		return nil
++	}
++}
++
++func volumeSizeGiBToQuantity(sizeGiB int64) *resource.Quantity {
++	if sizeGiB == 0 {
++		return nil
++	}
++	q := resource.MustParse(fmt.Sprintf("%dGi", sizeGiB))
++	return &q
++}
++
++func volumeTypeToKarpenter(vt VolumeType) *string {
++	if vt == "" {
++		return nil
++	}
++	// Upstream Karpenter uses lowercase volume type values.
++	v := strings.ToLower(string(vt))
++	return &v
++}
++
++func ptrIfNonEmpty(s string) *string {
++	if s == "" {
++		return nil
+ 	}
++	return &s
+ }
+diff --git a/vendor/github.com/openshift/hypershift/api/karpenter/v1beta1/zz_generated.deepcopy.go b/vendor/github.com/openshift/hypershift/api/karpenter/v1beta1/zz_generated.deepcopy.go
+index 4f0648135a6..c1684322f85 100644
+--- a/vendor/github.com/openshift/hypershift/api/karpenter/v1beta1/zz_generated.deepcopy.go
++++ b/vendor/github.com/openshift/hypershift/api/karpenter/v1beta1/zz_generated.deepcopy.go
+@@ -28,46 +28,16 @@ import (
+ // DeepCopyInto is an autogenerated deepcopy function, copying the receiver, writing into out. in must be non-nil.
+ func (in *BlockDevice) DeepCopyInto(out *BlockDevice) {
+ 	*out = *in
+-	if in.DeleteOnTermination != nil {
+-		in, out := &in.DeleteOnTermination, &out.DeleteOnTermination
+-		*out = new(bool)
+-		**out = **in
+-	}
+-	if in.Encrypted != nil {
+-		in, out := &in.Encrypted, &out.Encrypted
+-		*out = new(bool)
+-		**out = **in
+-	}
+ 	if in.IOPS != nil {
+ 		in, out := &in.IOPS, &out.IOPS
+ 		*out = new(int64)
+ 		**out = **in
+ 	}
+-	if in.KMSKeyID != nil {
+-		in, out := &in.KMSKeyID, &out.KMSKeyID
+-		*out = new(string)
+-		**out = **in
+-	}
+-	if in.SnapshotID != nil {
+-		in, out := &in.SnapshotID, &out.SnapshotID
+-		*out = new(string)
+-		**out = **in
+-	}
+ 	if in.Throughput != nil {
+ 		in, out := &in.Throughput, &out.Throughput
+ 		*out = new(int64)
+ 		**out = **in
+ 	}
+-	if in.VolumeSize != nil {
+-		in, out := &in.VolumeSize, &out.VolumeSize
+-		x := (*in).DeepCopy()
+-		*out = &x
+-	}
+-	if in.VolumeType != nil {
+-		in, out := &in.VolumeType, &out.VolumeType
+-		*out = new(string)
+-		**out = **in
+-	}
+ }
+ 
+ // DeepCopy is an autogenerated deepcopy function, copying the receiver, creating a new BlockDevice.
+@@ -83,16 +53,7 @@ func (in *BlockDevice) DeepCopy() *BlockDevice {
+ // DeepCopyInto is an autogenerated deepcopy function, copying the receiver, writing into out. in must be non-nil.
+ func (in *BlockDeviceMapping) DeepCopyInto(out *BlockDeviceMapping) {
+ 	*out = *in
+-	if in.DeviceName != nil {
+-		in, out := &in.DeviceName, &out.DeviceName
+-		*out = new(string)
+-		**out = **in
+-	}
+-	if in.EBS != nil {
+-		in, out := &in.EBS, &out.EBS
+-		*out = new(BlockDevice)
+-		(*in).DeepCopyInto(*out)
+-	}
++	in.EBS.DeepCopyInto(&out.EBS)
+ }
+ 
+ // DeepCopy is an autogenerated deepcopy function, copying the receiver, creating a new BlockDeviceMapping.
+@@ -181,11 +142,6 @@ func (in *OpenshiftEC2NodeClassSpec) DeepCopyInto(out *OpenshiftEC2NodeClassSpec
+ 			(*in)[i].DeepCopyInto(&(*out)[i])
+ 		}
+ 	}
+-	if in.AssociatePublicIPAddress != nil {
+-		in, out := &in.AssociatePublicIPAddress, &out.AssociatePublicIPAddress
+-		*out = new(bool)
+-		**out = **in
+-	}
+ 	if in.Tags != nil {
+ 		in, out := &in.Tags, &out.Tags
+ 		*out = make(map[string]string, len(*in))
+@@ -195,25 +151,11 @@ func (in *OpenshiftEC2NodeClassSpec) DeepCopyInto(out *OpenshiftEC2NodeClassSpec
+ 	}
+ 	if in.BlockDeviceMappings != nil {
+ 		in, out := &in.BlockDeviceMappings, &out.BlockDeviceMappings
+-		*out = make([]*BlockDeviceMapping, len(*in))
++		*out = make([]BlockDeviceMapping, len(*in))
+ 		for i := range *in {
+-			if (*in)[i] != nil {
+-				in, out := &(*in)[i], &(*out)[i]
+-				*out = new(BlockDeviceMapping)
+-				(*in).DeepCopyInto(*out)
+-			}
++			(*in)[i].DeepCopyInto(&(*out)[i])
+ 		}
+ 	}
+-	if in.InstanceStorePolicy != nil {
+-		in, out := &in.InstanceStorePolicy, &out.InstanceStorePolicy
+-		*out = new(InstanceStorePolicy)
+-		**out = **in
+-	}
+-	if in.DetailedMonitoring != nil {
+-		in, out := &in.DetailedMonitoring, &out.DetailedMonitoring
+-		*out = new(bool)
+-		**out = **in
+-	}
+ }
+ 
+ // DeepCopy is an autogenerated deepcopy function, copying the receiver, creating a new OpenshiftEC2NodeClassSpec.
+@@ -229,6 +171,13 @@ func (in *OpenshiftEC2NodeClassSpec) DeepCopy() *OpenshiftEC2NodeClassSpec {
+ // DeepCopyInto is an autogenerated deepcopy function, copying the receiver, writing into out. in must be non-nil.
+ func (in *OpenshiftEC2NodeClassStatus) DeepCopyInto(out *OpenshiftEC2NodeClassStatus) {
+ 	*out = *in
++	if in.Conditions != nil {
++		in, out := &in.Conditions, &out.Conditions
++		*out = make([]v1.Condition, len(*in))
++		for i := range *in {
++			(*in)[i].DeepCopyInto(&(*out)[i])
++		}
++	}
+ 	if in.Subnets != nil {
+ 		in, out := &in.Subnets, &out.Subnets
+ 		*out = make([]Subnet, len(*in))
+@@ -239,13 +188,6 @@ func (in *OpenshiftEC2NodeClassStatus) DeepCopyInto(out *OpenshiftEC2NodeClassSt
+ 		*out = make([]SecurityGroup, len(*in))
+ 		copy(*out, *in)
+ 	}
+-	if in.Conditions != nil {
+-		in, out := &in.Conditions, &out.Conditions
+-		*out = make([]v1.Condition, len(*in))
+-		for i := range *in {
+-			(*in)[i].DeepCopyInto(&(*out)[i])
+-		}
+-	}
+ }
+ 
+ // DeepCopy is an autogenerated deepcopy function, copying the receiver, creating a new OpenshiftEC2NodeClassStatus.

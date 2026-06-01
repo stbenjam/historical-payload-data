@@ -1,0 +1,520 @@
+diff --git a/frontend/packages/console-shared/locales/en/console-shared.json b/frontend/packages/console-shared/locales/en/console-shared.json
+index 98dda309822..d7e135f9488 100644
+--- a/frontend/packages/console-shared/locales/en/console-shared.json
++++ b/frontend/packages/console-shared/locales/en/console-shared.json
+@@ -174,7 +174,6 @@
+   "Container {{containersName}} does not have health checks to ensure your Application is running correctly.": "Container {{containersName}} does not have health checks to ensure your Application is running correctly.",
+   "Health checks": "Health checks",
+   "Add health checks": "Add health checks",
+-  "Unknown error removing {{hpaLabel}} {{hpaName}}.": "Unknown error removing {{hpaLabel}} {{hpaName}}.",
+   "Remove {{label}}?": "Remove {{label}}?",
+   "Are you sure you want to remove the {{hpaLabel}}": "Are you sure you want to remove the {{hpaLabel}}",
+   "from": "from",
+@@ -205,7 +204,7 @@
+   "Description": "Description",
+   "Delete": "Delete",
+   "This action cannot be undone. All associated Deployments, Routes, Builds, Pipelines, Storage/PVCs, Secrets, and ConfigMaps will be deleted.": "This action cannot be undone. All associated Deployments, Routes, Builds, Pipelines, Storage/PVCs, Secrets, and ConfigMaps will be deleted.",
+-  "Confirm deletion by typing <1>{{resourceName}}</1> below:": "Confirm deletion by typing <1>{{resourceName}}</1> below:",
++  "Confirm deletion by typing <2>{{resourceName}}</2> below:": "Confirm deletion by typing <2>{{resourceName}}</2> below:",
+   "Description:": "Description:",
+   "Component trace:": "Component trace:",
+   "Stack trace:": "Stack trace:",
+diff --git a/frontend/packages/console-shared/src/components/hpa/DeleteHPAModal.tsx b/frontend/packages/console-shared/src/components/hpa/DeleteHPAModal.tsx
+index 8f26b444eee..57768ab8c5b 100644
+--- a/frontend/packages/console-shared/src/components/hpa/DeleteHPAModal.tsx
++++ b/frontend/packages/console-shared/src/components/hpa/DeleteHPAModal.tsx
+@@ -1,55 +1,39 @@
+-import type { FC } from 'react';
+ import { useState } from 'react';
+-import { Form } from '@patternfly/react-core';
+-import { ExclamationTriangleIcon } from '@patternfly/react-icons/dist/esm/icons/exclamation-triangle-icon';
+-import { t_global_icon_color_status_warning_default as warningColor } from '@patternfly/react-tokens';
++import type { FC } from 'react';
++import { Button, Form, Modal, ModalBody, ModalHeader, ModalVariant } from '@patternfly/react-core';
+ import { useTranslation } from 'react-i18next';
+ import type { OverlayComponent } from '@console/dynamic-plugin-sdk/src/app/modal-support/OverlayProvider';
+ import type { ModalComponentProps } from '@console/internal/components/factory/modal';
+-import {
+-  ModalBody,
+-  ModalSubmitFooter,
+-  ModalTitle,
+-  ModalWrapper,
+-} from '@console/internal/components/factory/modal';
+ import { LoadingInline } from '@console/internal/components/utils/status-box';
+ import { HorizontalPodAutoscalerModel } from '@console/internal/models';
+ import type { HorizontalPodAutoscalerKind, K8sResourceCommon } from '@console/internal/module/k8s';
+ import { k8sKill } from '@console/internal/module/k8s';
++import { usePromiseHandler } from '@console/shared/src/hooks/usePromiseHandler';
++import { ModalFooterWithAlerts } from '../modals/ModalFooterWithAlerts';
+ 
+ const DeleteHPAModal: FC<DeleteHPAModalProps> = ({ close, cancel, hpa, workload }) => {
+-  const [submitError, setSubmitError] = useState<string>(null);
+-  const [isSubmitting, setIsSubmitting] = useState<boolean>(false);
++  const [handlePromise, inProgress, errorMessage] = usePromiseHandler();
+   const { t } = useTranslation();
+   const hpaName = hpa.metadata.name;
+   const workloadName = workload.metadata.name;
+ 
+   const handleSubmit = (e) => {
+     e.preventDefault();
+-    setIsSubmitting(true);
+-    k8sKill(HorizontalPodAutoscalerModel, hpa)
+-      .then(() => {
+-        close();
+-      })
+-      .catch((error) => {
+-        setSubmitError(
+-          error?.message ||
+-            t('console-shared~Unknown error removing {{hpaLabel}} {{hpaName}}.', {
+-              hpaLabel: HorizontalPodAutoscalerModel.label,
+-              hpaName,
+-            }),
+-        );
+-      });
++    return handlePromise(k8sKill(HorizontalPodAutoscalerModel, hpa)).then(() => {
++      close();
++    });
+   };
+ 
+   return (
+-    <Form onSubmit={handleSubmit}>
+-      <div className="modal-content">
+-        <ModalTitle>
+-          <ExclamationTriangleIcon color={warningColor.value} />{' '}
+-          {t('console-shared~Remove {{label}}?', { label: HorizontalPodAutoscalerModel.label })}
+-        </ModalTitle>
+-        <ModalBody>
++    <>
++      <ModalHeader
++        title={t('console-shared~Remove {{label}}?', { label: HorizontalPodAutoscalerModel.label })}
++        titleIconVariant="warning"
++        labelId="delete-hpa-modal-title"
++        data-test-id="modal-title"
++      />
++      <ModalBody>
++        <Form id="delete-hpa-modal-form">
+           {hpaName ? (
+             <>
+               <p>
+@@ -66,33 +50,57 @@ const DeleteHPAModal: FC<DeleteHPAModalProps> = ({ close, cancel, hpa, workload
+               </p>
+             </>
+           ) : (
+-            !submitError && <LoadingInline />
++            !errorMessage && <LoadingInline />
+           )}
+-        </ModalBody>
+-        <ModalSubmitFooter
+-          errorMessage={submitError}
+-          inProgress={isSubmitting}
+-          submitText={t('console-shared~Remove')}
+-          submitDanger
+-          submitDisabled={!!submitError}
+-          cancel={cancel}
+-        />
+-      </div>
+-    </Form>
++        </Form>
++      </ModalBody>
++      <ModalFooterWithAlerts errorMessage={errorMessage}>
++        <Button
++          type="submit"
++          variant="danger"
++          onClick={handleSubmit}
++          form="delete-hpa-modal-form"
++          isLoading={inProgress}
++          isDisabled={inProgress || !!errorMessage}
++          data-test="confirm-action"
++        >
++          {t('console-shared~Remove')}
++        </Button>
++        <Button variant="link" onClick={cancel}>
++          {t('console-shared~Cancel')}
++        </Button>
++      </ModalFooterWithAlerts>
++    </>
+   );
+ };
+ 
+-export const DeleteHPAModalOverlay: OverlayComponent<DeleteHPAModalProps> = (props) => {
+-  return (
+-    <ModalWrapper blocking onClose={props.closeOverlay}>
++export const DeleteHPAModalOverlay: OverlayComponent<DeleteHPAModalOverlayProps> = (props) => {
++  const [isOpen, setIsOpen] = useState(true);
++  const handleClose = () => {
++    setIsOpen(false);
++    props.closeOverlay();
++  };
++
++  return isOpen ? (
++    <Modal
++      variant={ModalVariant.small}
++      isOpen
++      onClose={handleClose}
++      aria-labelledby="delete-hpa-modal-title"
++    >
+       <DeleteHPAModal
+-        close={props.closeOverlay}
+-        cancel={props.closeOverlay}
++        close={handleClose}
++        cancel={handleClose}
+         hpa={props.hpa}
+         workload={props.workload}
+       />
+-    </ModalWrapper>
+-  );
++    </Modal>
++  ) : null;
++};
++
++type DeleteHPAModalOverlayProps = {
++  hpa: HorizontalPodAutoscalerKind;
++  workload: K8sResourceCommon;
+ };
+ 
+ type DeleteHPAModalProps = ModalComponentProps & {
+diff --git a/frontend/packages/console-shared/src/components/modals/ConsolePluginModal.tsx b/frontend/packages/console-shared/src/components/modals/ConsolePluginModal.tsx
+index 29350e4911d..65ea9baedc1 100644
+--- a/frontend/packages/console-shared/src/components/modals/ConsolePluginModal.tsx
++++ b/frontend/packages/console-shared/src/components/modals/ConsolePluginModal.tsx
+@@ -1,13 +1,17 @@
+ import { useState } from 'react';
++import {
++  Button,
++  Content,
++  ContentVariants,
++  Form,
++  Modal,
++  ModalBody,
++  ModalHeader,
++  ModalVariant,
++} from '@patternfly/react-core';
+ import { useTranslation } from 'react-i18next';
+ import type { OverlayComponent } from '@console/dynamic-plugin-sdk/src/app/modal-support/OverlayProvider';
+ import type { ModalComponentProps } from '@console/internal/components/factory/modal';
+-import {
+-  ModalTitle,
+-  ModalBody,
+-  ModalSubmitFooter,
+-  ModalWrapper,
+-} from '@console/internal/components/factory/modal';
+ import { ConsoleOperatorConfigModel } from '@console/internal/models';
+ import type { K8sResourceKind } from '@console/internal/module/k8s';
+ import { k8sPatch } from '@console/internal/module/k8s';
+@@ -17,6 +21,7 @@ import {
+ } from '@console/shared/src/components/utils';
+ import { usePromiseHandler } from '@console/shared/src/hooks/usePromiseHandler';
+ import { getPluginPatch, isPluginEnabled } from '@console/shared/src/utils';
++import { ModalFooterWithAlerts } from './ModalFooterWithAlerts';
+ 
+ export const ConsolePluginModal = (props: ConsolePluginModalProps) => {
+   const { cancel, close, consoleOperatorConfig, csvPluginsCount, pluginName, trusted } = props;
+@@ -34,14 +39,18 @@ export const ConsolePluginModal = (props: ConsolePluginModalProps) => {
+   };
+ 
+   return (
+-    <form onSubmit={submit} name="form" className="modal-content">
+-      <ModalTitle>
+-        {csvPluginsCount > 1
+-          ? t('console-shared~Console plugin enablement - {{plugin}}', { plugin: pluginName })
+-          : t('console-shared~Console plugin enablement')}
+-      </ModalTitle>
++    <>
++      <ModalHeader
++        title={
++          csvPluginsCount > 1
++            ? t('console-shared~Console plugin enablement - {{plugin}}', { plugin: pluginName })
++            : t('console-shared~Console plugin enablement')
++        }
++        labelId="console-plugin-modal-title"
++        data-test-id="modal-title"
++      />
+       <ModalBody>
+-        <p>
++        <Content component={ContentVariants.p}>
+           {csvPluginsCount
+             ? t(
+                 'console-shared~This operator includes a console plugin which provides a custom interface that can be included in the console. Updating the enablement of this console plugin will prompt for the console to be refreshed once it has been updated. Make sure you trust this console plugin before enabling.',
+@@ -49,43 +58,76 @@ export const ConsolePluginModal = (props: ConsolePluginModalProps) => {
+             : t(
+                 'console-shared~This console plugin provides a custom interface that can be included in the console. Updating the enablement of this console plugin will prompt for the console to be refreshed once it has been updated. Make sure you trust this console plugin before enabling.',
+               )}
+-        </p>
+-        <ConsolePluginRadioInputs
+-          autofocus
+-          name={pluginName}
+-          enabled={enabled}
+-          onChange={setEnabled}
+-        />
+-        <ConsolePluginWarning
+-          previouslyEnabled={previouslyEnabled}
+-          enabled={enabled}
+-          trusted={trusted}
+-        />
++        </Content>
++        <Form id="console-plugin-modal-form">
++          <ConsolePluginRadioInputs
++            autofocus
++            name={pluginName}
++            enabled={enabled}
++            onChange={setEnabled}
++          />
++          <ConsolePluginWarning
++            previouslyEnabled={previouslyEnabled}
++            enabled={enabled}
++            trusted={trusted}
++          />
++        </Form>
+       </ModalBody>
+-      <ModalSubmitFooter
+-        errorMessage={errorMessage}
+-        inProgress={inProgress}
+-        submitText={t('public~Save')}
+-        cancel={cancel}
+-        submitDisabled={(previouslyEnabled && enabled) || (!previouslyEnabled && !enabled)}
+-      />
+-    </form>
++      <ModalFooterWithAlerts errorMessage={errorMessage}>
++        <Button
++          type="submit"
++          variant="primary"
++          onClick={submit}
++          form="console-plugin-modal-form"
++          isLoading={inProgress}
++          isDisabled={
++            inProgress || (previouslyEnabled && enabled) || (!previouslyEnabled && !enabled)
++          }
++          data-test="confirm-action"
++        >
++          {t('public~Save')}
++        </Button>
++        <Button variant="link" onClick={cancel} data-test-id="modal-cancel-action">
++          {t('public~Cancel')}
++        </Button>
++      </ModalFooterWithAlerts>
++    </>
+   );
+ };
+ 
+-export const ConsolePluginModalOverlay: OverlayComponent<ConsolePluginModalProps> = (props) => {
+-  return (
+-    <ModalWrapper blocking onClose={props.closeOverlay}>
++export const ConsolePluginModalOverlay: OverlayComponent<ConsolePluginModalProviderProps> = (
++  props,
++) => {
++  const [isOpen, setIsOpen] = useState(true);
++  const handleClose = () => {
++    setIsOpen(false);
++    props.closeOverlay();
++  };
++
++  return isOpen ? (
++    <Modal
++      variant={ModalVariant.small}
++      isOpen
++      onClose={handleClose}
++      aria-labelledby="console-plugin-modal-title"
++    >
+       <ConsolePluginModal
+-        close={props.closeOverlay}
+-        cancel={props.closeOverlay}
++        close={handleClose}
++        cancel={handleClose}
+         consoleOperatorConfig={props.consoleOperatorConfig}
+         csvPluginsCount={props.csvPluginsCount}
+         pluginName={props.pluginName}
+         trusted={props.trusted}
+       />
+-    </ModalWrapper>
+-  );
++    </Modal>
++  ) : null;
++};
++
++type ConsolePluginModalProviderProps = {
++  consoleOperatorConfig: K8sResourceKind;
++  csvPluginsCount?: number;
++  pluginName: string;
++  trusted: boolean;
+ };
+ 
+ export type ConsolePluginModalProps = {
+diff --git a/frontend/packages/console-shared/src/components/modals/DeleteResourceModal.tsx b/frontend/packages/console-shared/src/components/modals/DeleteResourceModal.tsx
+index 82e8ec104b7..1bce3bc64c0 100644
+--- a/frontend/packages/console-shared/src/components/modals/DeleteResourceModal.tsx
++++ b/frontend/packages/console-shared/src/components/modals/DeleteResourceModal.tsx
+@@ -1,21 +1,26 @@
++import { useState } from 'react';
+ import type { FC } from 'react';
+-import { TextInputTypes } from '@patternfly/react-core';
++import {
++  Button,
++  Content,
++  ContentVariants,
++  Form,
++  Modal,
++  ModalBody,
++  ModalHeader,
++  ModalVariant,
++  TextInputTypes,
++} from '@patternfly/react-core';
+ import type { FormikProps, FormikValues } from 'formik';
+ import { Formik } from 'formik';
+ import { useTranslation, Trans } from 'react-i18next';
+ import { useNavigate } from 'react-router';
+ import type { OverlayComponent } from '@console/dynamic-plugin-sdk/src/app/modal-support/OverlayProvider';
+-import {
+-  ModalTitle,
+-  ModalBody,
+-  ModalSubmitFooter,
+-  ModalWrapper,
+-} from '@console/internal/components/factory/modal';
+ import type { ModalComponentProps } from '@console/internal/components/factory/modal';
+ import type { K8sResourceKind } from '@console/internal/module/k8s';
+ import { usePromiseHandler } from '../../hooks/usePromiseHandler';
+ import { InputField } from '../formik-fields';
+-import { YellowExclamationTriangleIcon } from '../status';
++import { ModalFooterWithAlerts } from './ModalFooterWithAlerts';
+ 
+ const DeleteResourceForm: FC<FormikProps<FormikValues> & DeleteResourceModalProps> = ({
+   handleSubmit,
+@@ -32,34 +37,60 @@ const DeleteResourceForm: FC<FormikProps<FormikValues> & DeleteResourceModalProp
+   const { t } = useTranslation();
+   const isValid = values.resourceName === resourceName;
+   const submitLabel = actionLabel || t(actionLabelKey);
++
++  const onSubmit = (e) => {
++    e.preventDefault();
++    handleSubmit(e);
++  };
++
+   return (
+-    <form onSubmit={handleSubmit} className="modal-content">
+-      <ModalTitle>
+-        <YellowExclamationTriangleIcon className="co-icon-space-r" /> {submitLabel} {resourceType}?
+-      </ModalTitle>
++    <>
++      <ModalHeader
++        title={
++          <>
++            {submitLabel} {resourceType}?
++          </>
++        }
++        titleIconVariant="warning"
++        labelId="delete-resource-modal-title"
++        data-test-id="modal-title"
++      />
+       <ModalBody>
+-        <p>
++        <Content component={ContentVariants.p}>
+           {t(
+             `console-shared~This action cannot be undone. All associated Deployments, Routes, Builds, Pipelines, Storage/PVCs, Secrets, and ConfigMaps will be deleted.`,
+           )}
+-        </p>
+-        <p>
++        </Content>
++        <Content component={ContentVariants.p}>
+           <Trans ns="console-shared">
+-            Confirm deletion by typing <strong className="co-break-word">{{ resourceName }}</strong>{' '}
++            Confirm deletion by typing{' '}
++            <strong className="co-break-word" data-test="resource-name">
++              {{ resourceName }}
++            </strong>{' '}
+             below:
+           </Trans>
+-        </p>
+-        <InputField type={TextInputTypes.text} name="resourceName" />
++        </Content>
++        <Form id="delete-resource-modal-form">
++          <InputField type={TextInputTypes.text} name="resourceName" />
++        </Form>
+       </ModalBody>
+-      <ModalSubmitFooter
+-        submitText={submitLabel}
+-        submitDisabled={(status && !!status.submitError) || !isValid || isSubmitting}
+-        cancel={cancel}
+-        inProgress={isSubmitting}
+-        submitDanger
+-        errorMessage={status && status.submitError}
+-      />
+-    </form>
++      <ModalFooterWithAlerts errorMessage={status && status.submitError}>
++        <Button
++          type="submit"
++          variant="danger"
++          onClick={onSubmit}
++          form="delete-resource-modal-form"
++          isLoading={isSubmitting}
++          isDisabled={(status && !!status.submitError) || !isValid || isSubmitting}
++          data-test="confirm-action"
++        >
++          {submitLabel}
++        </Button>
++        <Button variant="link" onClick={cancel} data-test-id="modal-cancel-action">
++          {t('console-shared~Cancel')}
++        </Button>
++      </ModalFooterWithAlerts>
++    </>
+   );
+ };
+ 
+@@ -97,11 +128,31 @@ const DeleteResourceModal: FC<DeleteResourceModalProps> = (props) => {
+ };
+ 
+ export const DeleteResourceModalOverlay: OverlayComponent<DeleteResourceModalProps> = (props) => {
+-  return (
+-    <ModalWrapper blocking onClose={props.closeOverlay}>
+-      <DeleteResourceModal {...props} close={props.closeOverlay} cancel={props.closeOverlay} />
+-    </ModalWrapper>
+-  );
++  const [isOpen, setIsOpen] = useState(true);
++  const handleClose = () => {
++    setIsOpen(false);
++    props.closeOverlay();
++  };
++
++  return isOpen ? (
++    <Modal
++      variant={ModalVariant.small}
++      isOpen
++      onClose={handleClose}
++      aria-labelledby="delete-resource-modal-title"
++    >
++      <DeleteResourceModal
++        close={handleClose}
++        cancel={handleClose}
++        resourceName={props.resourceName}
++        resourceType={props.resourceType}
++        actionLabel={props.actionLabel}
++        actionLabelKey={props.actionLabelKey}
++        redirect={props.redirect}
++        onSubmit={props.onSubmit}
++      />
++    </Modal>
++  ) : null;
+ };
+ 
+ type DeleteResourceModalProps = ModalComponentProps & {
+diff --git a/frontend/packages/helm-plugin/integration-tests/support/pages/helm/helm-details-page.ts b/frontend/packages/helm-plugin/integration-tests/support/pages/helm/helm-details-page.ts
+index ac2bf00841d..ba1555a3848 100644
+--- a/frontend/packages/helm-plugin/integration-tests/support/pages/helm/helm-details-page.ts
++++ b/frontend/packages/helm-plugin/integration-tests/support/pages/helm/helm-details-page.ts
+@@ -23,15 +23,13 @@ export const helmDetailsPage = {
+     cy.get('dl dt').contains(fieldName).next('dd').should('contain.text', fieldValue);
+   },
+   uninstallHelmRelease: () => {
+-    cy.get('form').within(() => {
+-      cy.byLegacyTestID('modal-title').should('contain.text', 'Delete Helm Release?');
+-      cy.get('button[type=submit]').click({ force: true });
+-    });
++    cy.byLegacyTestID('modal-title').should('contain.text', 'Delete Helm Release?');
++    cy.byTestID('confirm-action').click({ force: true });
+     modal.shouldBeClosed();
+   },
+   enterReleaseNameInUninstallPopup: (releaseName: string = 'nodejs-release') => {
+     modal.modalTitleShouldContain('Delete Helm Release?');
+-    cy.get('form strong').should('have.text', releaseName);
++    cy.byTestID('resource-name').should('have.text', releaseName);
+     cy.get(helmPO.uninstallHelmRelease.releaseName).type(releaseName);
+   },
+   checkHelmTab: (name: string) => {

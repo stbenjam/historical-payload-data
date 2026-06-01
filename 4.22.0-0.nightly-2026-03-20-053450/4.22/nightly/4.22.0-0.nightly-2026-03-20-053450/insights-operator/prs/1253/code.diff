@@ -1,0 +1,168 @@
+diff --git a/pkg/gatherers/clusterconfig/gather_opentelemetry_collectors.go b/pkg/gatherers/clusterconfig/gather_opentelemetry_collectors.go
+index 55e6a2c9d..e63716749 100644
+--- a/pkg/gatherers/clusterconfig/gather_opentelemetry_collectors.go
++++ b/pkg/gatherers/clusterconfig/gather_opentelemetry_collectors.go
+@@ -10,7 +10,6 @@ import (
+ 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
+ 	"k8s.io/client-go/dynamic"
+ 	"k8s.io/klog/v2"
+-	"sigs.k8s.io/yaml"
+ )
+ 
+ // GatherOpenTelemetryCollectors collects up to 5 `opentelemetrycollectors.opentelemetry.io` custom resources
+@@ -48,10 +47,10 @@ func (g *Gatherer) GatherOpenTelemetryCollectors(ctx context.Context) ([]record.
+ 	return gatherOpenTelemetryCollectors(ctx, gatherDynamicClient)
+ }
+ 
+-// parseCollectorSpecConfig function parses the spec.config field data in YAML format
++// cleanCollectorSpecConfig function parses the spec.config field
+ // and removes any possible private data getting only the "service" configuration
+-func parseCollectorSpecConfig(item *unstructured.Unstructured) error {
+-	specConfig, found, err := unstructured.NestedString(item.Object, "spec", "config")
++func cleanCollectorSpecConfig(item *unstructured.Unstructured) error {
++	specConfig, found, err := unstructured.NestedMap(item.Object, "spec", "config")
+ 	if err != nil {
+ 		return err
+ 	} else if !found {
+@@ -59,21 +58,13 @@ func parseCollectorSpecConfig(item *unstructured.Unstructured) error {
+ 		return nil
+ 	}
+ 
+-	// easier than parsing everything and then removing unwanted data
+-	// it only parses the "service" field
+-	var serviceField struct {
+-		Data map[string]interface{} `json:"service"`
++	// instead of dynamically remove every key, set only the desired one
++	cleanConfig := make(map[string]interface{})
++	if _, exists := specConfig["service"]; exists {
++		cleanConfig["service"] = specConfig["service"]
+ 	}
+ 
+-	if err := yaml.Unmarshal([]byte(specConfig), &serviceField); err != nil {
+-		return err
+-	}
+-
+-	// preparing the data to be added back, while keeping the parent fields
+-	parsedField := make(map[string]interface{})
+-	parsedField["service"] = serviceField.Data
+-
+-	if err := unstructured.SetNestedField(item.Object, parsedField, "spec", "config"); err != nil {
++	if err := unstructured.SetNestedField(item.Object, cleanConfig, "spec", "config"); err != nil {
+ 		return err
+ 	}
+ 
+@@ -97,7 +88,7 @@ func gatherOpenTelemetryCollectors(ctx context.Context, dynamicClient dynamic.In
+ 	for i := range collectorsList.Items {
+ 		item := &collectorsList.Items[i]
+ 
+-		if err := parseCollectorSpecConfig(item); err != nil {
++		if err := cleanCollectorSpecConfig(item); err != nil {
+ 			errs = append(errs, err)
+ 			continue
+ 		}
+diff --git a/pkg/gatherers/clusterconfig/gather_opentelemetry_collectors_test.go b/pkg/gatherers/clusterconfig/gather_opentelemetry_collectors_test.go
+index 3d6959be8..87c0865f9 100644
+--- a/pkg/gatherers/clusterconfig/gather_opentelemetry_collectors_test.go
++++ b/pkg/gatherers/clusterconfig/gather_opentelemetry_collectors_test.go
+@@ -7,34 +7,20 @@ import (
+ 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
+ )
+ 
+-func Test_parseCollectorSpecConfig(t *testing.T) {
+-	cfgStub := `
+-service:
+-  telemetry:
+-    logs:
+-      level: info
+-receivers:
+-  hostmetrics:
+-    scrapers:
+-      cpu: {}
+-`
+-	cfgStubNoService := `
+-receivers:
+-  hostmetrics: {}
+-exporters:
+-  debug: {}
+-`
+-
+-	t.Run("valid config with service field - only service is kept", func(t *testing.T) {
++func Test_cleanCollectorSpecConfig(t *testing.T) {
++	t.Run("valid spec.config with service field - only service is kept", func(t *testing.T) {
+ 		// given
+ 		item := &unstructured.Unstructured{
+ 			Object: map[string]interface{}{
+-				"spec": map[string]interface{}{"config": cfgStub},
+-			},
+-		}
++				"spec": map[string]interface{}{
++					"config": map[string]interface{}{
++						"service": map[string]interface{}{
++							"telemetry": "test1",
++							"receivers": "test2",
++						}}}}}
+ 
+ 		// when
+-		test := parseCollectorSpecConfig(item)
++		test := cleanCollectorSpecConfig(item)
+ 
+ 		// assert
+ 		assert.NoError(t, test)
+@@ -59,45 +45,46 @@ exporters:
+ 		}
+ 
+ 		// when
+-		test := parseCollectorSpecConfig(item)
++		test := cleanCollectorSpecConfig(item)
+ 
+ 		// assert
+ 		assert.NoError(t, test)
+ 	})
+ 
+-	t.Run("invalid YAML in spec.config - error", func(t *testing.T) {
++	t.Run("unexpected spec.config value - returns a controlled error", func(t *testing.T) {
+ 		// given
+ 		item := &unstructured.Unstructured{
+ 			Object: map[string]interface{}{
+-				"spec": map[string]interface{}{"config": "invalid: yaml: [unclosed"},
++				"spec": map[string]interface{}{"config": "test1"},
+ 			},
+ 		}
+ 
+ 		// when
+-		test := parseCollectorSpecConfig(item)
++		test := cleanCollectorSpecConfig(item)
+ 
+ 		// assert
+ 		assert.Error(t, test)
+-		assert.ErrorContains(t, test, "error converting YAML")
++		assert.ErrorContains(t, test, "accessor error")
+ 	})
+ 
+-	t.Run("valid YAML with no service key - config becomes service only with null", func(t *testing.T) {
++	t.Run("valid spec.config with NO service field - returns a cleaned field", func(t *testing.T) {
+ 		// given
+ 		item := &unstructured.Unstructured{
+ 			Object: map[string]interface{}{
+-				"spec": map[string]interface{}{"config": cfgStubNoService},
+-			},
+-		}
++				"spec": map[string]interface{}{
++					"config": map[string]interface{}{
++						"receivers": map[string]interface{}{},
++						"exporters": map[string]interface{}{},
++					}}}}
+ 
+ 		// when
+-		test := parseCollectorSpecConfig(item)
++		test := cleanCollectorSpecConfig(item)
+ 
+ 		// assert
+ 		assert.NoError(t, test)
+ 		config, found, err := unstructured.NestedMap(item.Object, "spec", "config")
+ 		assert.NoError(t, err)
+ 		assert.True(t, found)
+-		assert.Contains(t, config, "service")
+ 		// receivers/exporters are always dropped
+ 		assert.NotContains(t, config, "receivers")
+ 		assert.NotContains(t, config, "exporters")

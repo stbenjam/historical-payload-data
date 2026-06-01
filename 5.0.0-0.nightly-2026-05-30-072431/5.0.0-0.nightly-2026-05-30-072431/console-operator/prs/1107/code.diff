@@ -1,0 +1,201 @@
+diff --git a/pkg/console/operator/sync_v400.go b/pkg/console/operator/sync_v400.go
+index 59824c907..e915ce0e1 100644
+--- a/pkg/console/operator/sync_v400.go
++++ b/pkg/console/operator/sync_v400.go
+@@ -6,6 +6,7 @@ import (
+ 	"net/url"
+ 	"os"
+ 	"slices"
++	"sort"
+ 	"strings"
+ 
+ 	// kube
+@@ -17,6 +18,7 @@ import (
+ 	"k8s.io/apimachinery/pkg/labels"
+ 	"k8s.io/apimachinery/pkg/runtime/schema"
+ 	"k8s.io/apimachinery/pkg/util/sets"
++	"k8s.io/client-go/util/retry"
+ 	"k8s.io/klog/v2"
+ 
+ 	// openshift
+@@ -405,7 +407,15 @@ func (co *consoleOperator) SyncConfigMap(
+ 	if err != nil {
+ 		return nil, "FailedConsoleConfigBuilder", err
+ 	}
+-	cm, cmChanged, cmErr := resourceapply.ApplyConfigMap(ctx, co.configMapClient, recorder, defaultConfigmap)
++	var cm *corev1.ConfigMap
++	var cmChanged bool
++	var cmErr error
++
++	// Retry on conflicts to handle concurrent ConfigMap updates
++	cmErr = retry.RetryOnConflict(retry.DefaultBackoff, func() error {
++		cm, cmChanged, cmErr = resourceapply.ApplyConfigMap(ctx, co.configMapClient, recorder, defaultConfigmap)
++		return cmErr
++	})
+ 	if cmErr != nil {
+ 		return nil, "FailedApply", cmErr
+ 	}
+@@ -731,6 +741,10 @@ func (co *consoleOperator) GetAvailablePlugins(enabledPluginsNames []string) []*
+ 		}
+ 		availablePlugins = append(availablePlugins, plugin)
+ 	}
++	// Sort plugins by name to ensure deterministic processing order
++	sort.Slice(availablePlugins, func(i, j int) bool {
++		return availablePlugins[i].Name < availablePlugins[j].Name
++	})
+ 	return availablePlugins
+ }
+ 
+diff --git a/pkg/console/subresource/configmap/configmap.go b/pkg/console/subresource/configmap/configmap.go
+index 8b36689e9..27a8b9125 100644
+--- a/pkg/console/subresource/configmap/configmap.go
++++ b/pkg/console/subresource/configmap/configmap.go
+@@ -179,6 +179,8 @@ func pluginsWithI18nNamespace(availablePlugins []*v1.ConsolePlugin) []string {
+ 			i18nNamespaces = append(i18nNamespaces, fmt.Sprintf("plugin__%s", plugin.Name))
+ 		}
+ 	}
++	// Sort to ensure deterministic YAML output
++	sort.Strings(i18nNamespaces)
+ 	return i18nNamespaces
+ }
+ 
+@@ -192,6 +194,9 @@ func getPluginsEndpointMap(availablePlugins []*v1.ConsolePlugin) map[string]stri
+ 			klog.Errorf("unknown backend type for %q plugin: %q. Currently only %q backend type is supported.", plugin.Name, plugin.Spec.Backend.Type, v1.Service)
+ 		}
+ 	}
++	// Note: Here the YAML output is deterministic because:
++	// - availablePlugins are sorted by name in GetAvailablePlugins()
++	// - sigs.k8s.io/yaml uses json.Marshal which sorts map keys
+ 	return pluginsEndpointMap
+ }
+ 
+@@ -214,6 +219,10 @@ func getPluginsProxyServices(availablePlugins []*v1.ConsolePlugin) []consoleserv
+ 			}
+ 		}
+ 	}
++	// Sort by ConsoleAPIPath to ensure deterministic YAML output
++	sort.Slice(proxyServices, func(i, j int) bool {
++		return proxyServices[i].ConsoleAPIPath < proxyServices[j].ConsoleAPIPath
++	})
+ 	return proxyServices
+ }
+ 
+diff --git a/pkg/console/subresource/configmap/configmap_test.go b/pkg/console/subresource/configmap/configmap_test.go
+index e5872d091..03b96c9e4 100644
+--- a/pkg/console/subresource/configmap/configmap_test.go
++++ b/pkg/console/subresource/configmap/configmap_test.go
+@@ -979,9 +979,9 @@ providers: {}
+ 				},
+ 				inactivityTimeoutSeconds: 0,
+ 				availablePlugins: []*consolev1.ConsolePlugin{
++					testPluginsWithI18nPreloadType("plugin3", "service3", "service-namespace3"),
+ 					testPluginsWithProxy("plugin1", "service1", "service-namespace1"),
+ 					testPluginsWithProxy("plugin2", "service2", "service-namespace2"),
+-					testPluginsWithI18nPreloadType("plugin3", "service3", "service-namespace3"),
+ 				},
+ 			},
+ 			want: &corev1.ConfigMap{
+@@ -1630,3 +1630,103 @@ func TestAggregateCSPDirectives(t *testing.T) {
+ 		})
+ 	}
+ }
++
++func TestPluginsWithI18nNamespaceSorting(t *testing.T) {
++	tests := []struct {
++		name   string
++		input  []*consolev1.ConsolePlugin
++		output []string
++	}{
++		{
++			name: "Returns sorted i18n namespaces from unsorted plugins",
++			input: []*consolev1.ConsolePlugin{
++				testPluginsWithI18nPreloadType("zeta-plugin", "svc-z", "ns-z"),
++				testPluginsWithI18nPreloadType("alpha-plugin", "svc-a", "ns-a"),
++				testPluginsWithI18nPreloadType("mu-plugin", "svc-m", "ns-m"),
++			},
++			output: []string{
++				"plugin__alpha-plugin",
++				"plugin__mu-plugin",
++				"plugin__zeta-plugin",
++			},
++		},
++		{
++			name: "Skips plugins without Preload i18n type",
++			input: []*consolev1.ConsolePlugin{
++				testPluginsWithI18nPreloadType("zeta-plugin", "svc-z", "ns-z"),
++				testPlugins("beta-plugin", "svc-b", "ns-b"),
++				testPluginsWithI18nPreloadType("alpha-plugin", "svc-a", "ns-a"),
++			},
++			output: []string{
++				"plugin__alpha-plugin",
++				"plugin__zeta-plugin",
++			},
++		},
++		{
++			name:   "Returns empty slice for no plugins",
++			input:  []*consolev1.ConsolePlugin{},
++			output: []string{},
++		},
++	}
++
++	for _, tt := range tests {
++		t.Run(tt.name, func(t *testing.T) {
++			result := pluginsWithI18nNamespace(tt.input)
++			if diff := deep.Equal(tt.output, result); diff != nil {
++				t.Error(diff)
++			}
++		})
++	}
++}
++
++func TestGetPluginsProxyServicesSorting(t *testing.T) {
++	tests := []struct {
++		name   string
++		input  []*consolev1.ConsolePlugin
++		output []string
++	}{
++		{
++			name: "Returns proxy services sorted by ConsoleAPIPath from unsorted plugins",
++			input: []*consolev1.ConsolePlugin{
++				testPluginsWithProxy("zeta-plugin", "svc-z", "ns-z"),
++				testPluginsWithProxy("alpha-plugin", "svc-a", "ns-a"),
++				testPluginsWithProxy("mu-plugin", "svc-m", "ns-m"),
++			},
++			output: []string{
++				"/api/proxy/plugin/alpha-plugin/alpha-plugin-alias/",
++				"/api/proxy/plugin/mu-plugin/mu-plugin-alias/",
++				"/api/proxy/plugin/zeta-plugin/zeta-plugin-alias/",
++			},
++		},
++		{
++			name: "Returns sorted proxy services when plugins have no proxies mixed in",
++			input: []*consolev1.ConsolePlugin{
++				testPluginsWithProxy("zeta-plugin", "svc-z", "ns-z"),
++				testPlugins("beta-plugin", "svc-b", "ns-b"),
++				testPluginsWithProxy("alpha-plugin", "svc-a", "ns-a"),
++			},
++			output: []string{
++				"/api/proxy/plugin/alpha-plugin/alpha-plugin-alias/",
++				"/api/proxy/plugin/zeta-plugin/zeta-plugin-alias/",
++			},
++		},
++		{
++			name:   "Returns empty slice for no plugins",
++			input:  []*consolev1.ConsolePlugin{},
++			output: []string{},
++		},
++	}
++
++	for _, tt := range tests {
++		t.Run(tt.name, func(t *testing.T) {
++			result := getPluginsProxyServices(tt.input)
++			actualPaths := make([]string, len(result))
++			for i, ps := range result {
++				actualPaths[i] = ps.ConsoleAPIPath
++			}
++			if diff := deep.Equal(tt.output, actualPaths); diff != nil {
++				t.Error(diff)
++			}
++		})
++	}
++}

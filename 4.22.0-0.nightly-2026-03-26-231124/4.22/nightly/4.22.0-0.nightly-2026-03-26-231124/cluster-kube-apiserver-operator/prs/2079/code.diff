@@ -1,0 +1,152 @@
+diff --git a/pkg/cmd/render/render.go b/pkg/cmd/render/render.go
+index ac32415780..248d665840 100644
+--- a/pkg/cmd/render/render.go
++++ b/pkg/cmd/render/render.go
+@@ -272,19 +272,16 @@ func (r *renderOpts) Run() error {
+ 		}
+ 	}
+ 
+-	if len(renderConfig.ClusterCIDR) > 0 {
+-		anyIPv4 := false
+-		for _, cidr := range renderConfig.ClusterCIDR {
+-			cidrBaseIP, _, err := net.ParseCIDR(cidr)
+-			if err != nil {
+-				return fmt.Errorf("invalid cluster CIDR %q: %v", cidr, err)
+-			}
+-			if cidrBaseIP.To4() != nil {
+-				anyIPv4 = true
+-				break
+-			}
++	if len(renderConfig.ClusterCIDR) > 1 {
++		// dual-stack: bind to [::] which accepts both IPv4 and IPv6
++		renderConfig.BindAddress = "[::]:6443"
++		renderConfig.BindNetwork = "tcp"
++	} else if len(renderConfig.ClusterCIDR) == 1 {
++		cidrBaseIP, _, err := net.ParseCIDR(renderConfig.ClusterCIDR[0])
++		if err != nil {
++			return fmt.Errorf("invalid cluster CIDR %q: %v", renderConfig.ClusterCIDR[0], err)
+ 		}
+-		if !anyIPv4 {
++		if cidrBaseIP.To4() == nil {
+ 			// Single-stack IPv6 cluster, so listen on IPv6 not IPv4.
+ 			renderConfig.BindAddress = "[::]:6443"
+ 			renderConfig.BindNetwork = "tcp6"
+diff --git a/pkg/cmd/render/render_test.go b/pkg/cmd/render/render_test.go
+index 42651f810a..a59b1ac748 100644
+--- a/pkg/cmd/render/render_test.go
++++ b/pkg/cmd/render/render_test.go
+@@ -342,10 +342,10 @@ func TestRenderCommand(t *testing.T) {
+ 				return ioutil.WriteFile(filepath.Join(assetsInputDir, "config-dual.yaml"), []byte(networkConfigDual), 0644)
+ 			},
+ 			testFunction: func(cfg *kubecontrolplanev1.KubeAPIServerConfig) error {
+-				if cfg.ServingInfo.BindAddress != "0.0.0.0:6443" {
++				if cfg.ServingInfo.BindAddress != "[::]:6443" {
+ 					return fmt.Errorf("incorrect dual-stack BindAddress: %s", cfg.ServingInfo.BindAddress)
+ 				}
+-				if cfg.ServingInfo.BindNetwork != "tcp4" {
++				if cfg.ServingInfo.BindNetwork != "tcp" {
+ 					return fmt.Errorf("incorrect dual-stack BindNetwork: %s", cfg.ServingInfo.BindNetwork)
+ 				}
+ 				if cfg.ServicesSubnet != "fd02::/112,172.30.0.0/16" {
+diff --git a/pkg/operator/configobservation/network/observe_network.go b/pkg/operator/configobservation/network/observe_network.go
+index 2cc418803c..6c4afab30f 100644
+--- a/pkg/operator/configobservation/network/observe_network.go
++++ b/pkg/operator/configobservation/network/observe_network.go
+@@ -98,7 +98,11 @@ func ObserveServicesSubnet(genericListers configobserver.Listers, recorder event
+ 	}
+ 	bindAddress := "0.0.0.0:6443"
+ 	bindNetwork := "tcp4"
+-	if len(serviceCIDRs) == 1 && utilnet.IsIPv6CIDRString(serviceCIDRs[0]) {
++	if len(serviceCIDRs) > 1 {
++		// dual-stack: bind to [::] which accepts both IPv4 and IPv6
++		bindAddress = "[::]:6443"
++		bindNetwork = "tcp"
++	} else if len(serviceCIDRs) == 1 && utilnet.IsIPv6CIDRString(serviceCIDRs[0]) {
+ 		bindAddress = "[::]:6443"
+ 		bindNetwork = "tcp6"
+ 	}
+diff --git a/pkg/operator/configobservation/network/observe_network_test.go b/pkg/operator/configobservation/network/observe_network_test.go
+index ad05ad6239..c06a304db0 100644
+--- a/pkg/operator/configobservation/network/observe_network_test.go
++++ b/pkg/operator/configobservation/network/observe_network_test.go
+@@ -214,6 +214,80 @@ func TestObserveServicesSubnet(t *testing.T) {
+ 	if conf != "tcp6" {
+ 		t.Errorf("Unexpected value: %v", conf)
+ 	}
++
++	// Test dual-stack with IPv4 primary
++	if err := indexer.Update(&configv1.Network{
++		ObjectMeta: metav1.ObjectMeta{Name: "cluster"},
++		Status: configv1.NetworkStatus{
++			ClusterNetwork: []configv1.ClusterNetworkEntry{{CIDR: "10.128.0.0/14"}, {CIDR: "fd01::/48"}},
++			ServiceNetwork: []string{"172.30.0.0/16", "fd02::/112"},
++		},
++	}); err != nil {
++		t.Fatal(err.Error())
++	}
++
++	result, errors = ObserveServicesSubnet(listers, events.NewInMemoryRecorder("network", clock.RealClock{}), result)
++	if len(errors) > 0 {
++		t.Errorf("expected len(errors) == 0: %v", errors)
++	}
++	conf, ok, err = unstructured.NestedString(result, "servicesSubnet")
++	if err != nil || !ok {
++		t.Errorf("Unexpected configuration returned: %v", result)
++	}
++	if conf != "172.30.0.0/16,fd02::/112" {
++		t.Errorf("Unexpected value: %v", conf)
++	}
++	conf, ok, err = unstructured.NestedString(result, "servingInfo", "bindAddress")
++	if err != nil || !ok {
++		t.Errorf("Unexpected configuration returned: %v", result)
++	}
++	if conf != "[::]:6443" {
++		t.Errorf("Unexpected value for dual-stack IPv4 primary bindAddress: %v", conf)
++	}
++	conf, ok, err = unstructured.NestedString(result, "servingInfo", "bindNetwork")
++	if err != nil || !ok {
++		t.Errorf("Unexpected configuration returned: %v", result)
++	}
++	if conf != "tcp" {
++		t.Errorf("Unexpected value for dual-stack IPv4 primary bindNetwork: %v", conf)
++	}
++
++	// Test dual-stack with IPv6 primary
++	if err := indexer.Update(&configv1.Network{
++		ObjectMeta: metav1.ObjectMeta{Name: "cluster"},
++		Status: configv1.NetworkStatus{
++			ClusterNetwork: []configv1.ClusterNetworkEntry{{CIDR: "fd01::/48"}, {CIDR: "10.128.0.0/14"}},
++			ServiceNetwork: []string{"fd02::/112", "172.30.0.0/16"},
++		},
++	}); err != nil {
++		t.Fatal(err.Error())
++	}
++
++	result, errors = ObserveServicesSubnet(listers, events.NewInMemoryRecorder("network", clock.RealClock{}), result)
++	if len(errors) > 0 {
++		t.Errorf("expected len(errors) == 0: %v", errors)
++	}
++	conf, ok, err = unstructured.NestedString(result, "servicesSubnet")
++	if err != nil || !ok {
++		t.Errorf("Unexpected configuration returned: %v", result)
++	}
++	if conf != "fd02::/112,172.30.0.0/16" {
++		t.Errorf("Unexpected value: %v", conf)
++	}
++	conf, ok, err = unstructured.NestedString(result, "servingInfo", "bindAddress")
++	if err != nil || !ok {
++		t.Errorf("Unexpected configuration returned: %v", result)
++	}
++	if conf != "[::]:6443" {
++		t.Errorf("Unexpected value for dual-stack IPv6 primary bindAddress: %v", conf)
++	}
++	conf, ok, err = unstructured.NestedString(result, "servingInfo", "bindNetwork")
++	if err != nil || !ok {
++		t.Errorf("Unexpected configuration returned: %v", result)
++	}
++	if conf != "tcp" {
++		t.Errorf("Unexpected value for dual-stack IPv6 primary bindNetwork: %v", conf)
++	}
+ }
+ 
+ func TestObserveExternalIPPolicy(t *testing.T) {

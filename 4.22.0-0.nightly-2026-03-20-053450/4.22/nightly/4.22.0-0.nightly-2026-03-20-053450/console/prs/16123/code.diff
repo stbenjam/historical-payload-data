@@ -1,0 +1,1972 @@
+diff --git a/frontend/packages/console-app/src/actions/hooks/useCommonActions.ts b/frontend/packages/console-app/src/actions/hooks/useCommonActions.ts
+index 7f8c45096b6..51e1414d964 100644
+--- a/frontend/packages/console-app/src/actions/hooks/useCommonActions.ts
++++ b/frontend/packages/console-app/src/actions/hooks/useCommonActions.ts
+@@ -7,10 +7,10 @@ import {
+   LazyAnnotationsModalOverlay,
+   LazyDeleteModalOverlay,
+   LazyLabelsModalOverlay,
++  LazyTaintsModalOverlay,
+   LazyTolerationsModalOverlay,
+ } from '@console/internal/components/modals';
+ import { useConfigureCountModal } from '@console/internal/components/modals/configure-count-modal';
+-import { TaintsModalOverlay } from '@console/internal/components/modals/taints-modal';
+ import { asAccessReview } from '@console/internal/components/utils/rbac';
+ import { resourceObjPath } from '@console/internal/components/utils/resource-link';
+ import type { K8sModel, K8sResourceKind, NodeKind } from '@console/internal/module/k8s';
+@@ -143,7 +143,7 @@ export const useCommonActions = <T extends readonly CommonActionCreator[]>(
+         id: 'edit-taints',
+         label: t('console-app~Edit taints'),
+         cta: () =>
+-          launchModal(TaintsModalOverlay, {
++          launchModal(LazyTaintsModalOverlay, {
+             resourceKind: kind,
+             resource: resource as NodeKind,
+           }),
+diff --git a/frontend/public/components/cluster-settings/cluster-settings.tsx b/frontend/public/components/cluster-settings/cluster-settings.tsx
+index 817fdcfd637..ac3a4c2e7e2 100644
+--- a/frontend/public/components/cluster-settings/cluster-settings.tsx
++++ b/frontend/public/components/cluster-settings/cluster-settings.tsx
+@@ -1,6 +1,6 @@
+ /* eslint-disable @typescript-eslint/no-use-before-define */
+ import type { FC, ReactNode } from 'react';
+-import { useEffect } from 'react';
++import { useEffect, useRef, useMemo } from 'react';
+ import * as _ from 'lodash';
+ import { css } from '@patternfly/react-styles';
+ import * as semver from 'semver';
+@@ -888,7 +888,7 @@ export const ClusterVersionDetailsTable: FC<ClusterVersionDetailsTableProps> = (
+   obj: cv,
+   autoscalers,
+ }) => {
+-  const { removeQueryArgument } = useQueryParamsMutator();
++  const { getQueryArgument, removeQueryArgument } = useQueryParamsMutator();
+   const { history = [] } = cv.status;
+   const clusterID = getClusterID(cv);
+   const desiredImage: string = _.get(cv, 'status.desired.image') || '';
+@@ -908,16 +908,26 @@ export const ClusterVersionDetailsTable: FC<ClusterVersionDetailsTableProps> = (
+   const updateStartedTime = getStartedTimeForCVDesiredVersion(cv, desiredVersion);
+   const workerMachineConfigPool = getMCPByName(machineConfigPools, NodeTypes.worker);
+   const launchModal = useOverlay();
++  const modalOpenedRef = useRef(false);
++
++  // Check URL params once to avoid re-reading on every cv change
++  const hasShowVersions = useMemo(() => !!getQueryArgument('showVersions'), [getQueryArgument]);
++  const hasShowChannels = useMemo(() => !!getQueryArgument('showChannels'), [getQueryArgument]);
+ 
+   useEffect(() => {
+-    if (new URLSearchParams(window.location.search).has('showVersions')) {
++    if (modalOpenedRef.current) {
++      return;
++    }
++    if (hasShowVersions) {
+       launchModal(LazyClusterUpdateModalOverlay, { cv });
+       removeQueryArgument('showVersions');
+-    } else if (new URLSearchParams(window.location.search).has('showChannels')) {
++      modalOpenedRef.current = true;
++    } else if (hasShowChannels) {
+       launchModal(LazyClusterChannelModalOverlay, { cv });
+       removeQueryArgument('showChannels');
++      modalOpenedRef.current = true;
+     }
+-  }, [launchModal, cv, removeQueryArgument]);
++  }, [launchModal, cv, removeQueryArgument, hasShowVersions, hasShowChannels]);
+ 
+   return (
+     <>
+diff --git a/frontend/public/components/modals/__tests__/column-management-modal.spec.tsx b/frontend/public/components/modals/__tests__/column-management-modal.spec.tsx
+index 69d75cf08f5..24f8b873760 100644
+--- a/frontend/public/components/modals/__tests__/column-management-modal.spec.tsx
++++ b/frontend/public/components/modals/__tests__/column-management-modal.spec.tsx
+@@ -141,6 +141,7 @@ describe('ColumnManagementModal component', () => {
+             }, []),
+           ),
+           type: columnManagementType,
++          showNamespaceOverride: true,
+         }}
+         userSettingState={null}
+         setUserSettingState={jest.fn()}
+@@ -205,6 +206,7 @@ describe('ColumnManagementModal component', () => {
+             id: columnManagementID,
+             selectedColumns: new Set(modifiedColumns),
+             type: columnManagementType,
++            showNamespaceOverride: true,
+           }}
+           userSettingState={null}
+           setUserSettingState={jest.fn()}
+diff --git a/frontend/public/components/modals/cluster-channel-modal.tsx b/frontend/public/components/modals/cluster-channel-modal.tsx
+index 28a42666ec0..9e33425d404 100644
+--- a/frontend/public/components/modals/cluster-channel-modal.tsx
++++ b/frontend/public/components/modals/cluster-channel-modal.tsx
+@@ -1,7 +1,21 @@
+ import type { FormEventHandler } from 'react';
+ import { useState } from 'react';
+ import { useTranslation } from 'react-i18next';
+-import { Content, TextInput, ContentVariants } from '@patternfly/react-core';
++import {
++  Button,
++  Content,
++  ContentVariants,
++  Form,
++  FormGroup,
++  FormHelperText,
++  HelperText,
++  HelperTextItem,
++  Modal,
++  ModalBody,
++  ModalHeader,
++  ModalVariant,
++  TextInput,
++} from '@patternfly/react-core';
+ import * as semver from 'semver';
+ 
+ import { OverlayComponent } from '@console/dynamic-plugin-sdk/src/app/modal-support/OverlayProvider';
+@@ -9,13 +23,7 @@ import { ChannelDocLink } from '../cluster-settings/cluster-settings';
+ import { ClusterVersionModel } from '../../models';
+ import { ConsoleSelect } from '@console/internal/components/utils/console-select';
+ import { isManaged } from '../utils/documentation';
+-import {
+-  ModalBody,
+-  ModalComponentProps,
+-  ModalSubmitFooter,
+-  ModalTitle,
+-  ModalWrapper,
+-} from '../factory/modal';
++import { ModalComponentProps } from '../factory/modal';
+ import {
+   ClusterVersionKind,
+   getAvailableClusterChannels,
+@@ -23,8 +31,9 @@ import {
+   k8sPatch,
+ } from '../../module/k8s';
+ import { usePromiseHandler } from '@console/shared/src/hooks/promise-handler';
++import { ModalFooterWithAlerts } from '@console/shared/src/components/modals/ModalFooterWithAlerts';
+ 
+-const ClusterChannelModal = (props: ClusterChannelModalProps) => {
++export const ClusterChannelModal = (props: ClusterChannelModalProps) => {
+   const { cancel, close, cv } = props;
+   const [handlePromise, inProgress, errorMessage] = usePromiseHandler();
+   const [channel, setChannel] = useState(cv.spec.channel);
+@@ -34,6 +43,8 @@ const ClusterChannelModal = (props: ClusterChannelModalProps) => {
+     return o;
+   }, {});
+   const version = semver.parse(getLastCompletedUpdate(cv));
++  const versionMajor = version?.major ?? 4;
++  const versionMinor = version?.minor ?? 0;
+   const channelsExist = cv.status?.desired?.channels?.length;
+   const submit: FormEventHandler<HTMLFormElement> = (e): void => {
+     e.preventDefault();
+@@ -44,76 +55,97 @@ const ClusterChannelModal = (props: ClusterChannelModalProps) => {
+   };
+ 
+   return (
+-    <form onSubmit={submit} name="form" className="modal-content" data-test="channel-modal">
+-      <ModalTitle>
+-        {channelsExist ? t('public~Select channel') : t('public~Input channel')}
+-      </ModalTitle>
++    <>
++      <ModalHeader
++        title={channelsExist ? t('public~Select channel') : t('public~Input channel')}
++        data-test-id="modal-title"
++        labelId="cluster-channel-modal-title"
++      />
+       <ModalBody>
+-        <Content>
+-          <Content component={ContentVariants.p}>
+-            {channelsExist
+-              ? t(
+-                  'public~The current version is available in the channels listed in the dropdown below. Select a channel that reflects the desired version. Critical security updates will be delivered to any vulnerable channels.',
+-                )
+-              : t(
+-                  'public~Input a channel that reflects the desired version. To verify if the version exists in a channel, save and check the update status. Critical security updates will be delivered to any vulnerable channels.',
+-                )}
+-          </Content>
+-          {!isManaged() && (
+-            <Content component={ContentVariants.p} className="pf-v6-u-mb-md">
+-              <ChannelDocLink />
++        <Form id="cluster-channel-form" onSubmit={submit}>
++          <Content>
++            <Content component={ContentVariants.p}>
++              {channelsExist
++                ? t(
++                    'public~The current version is available in the channels listed in the dropdown below. Select a channel that reflects the desired version. Critical security updates will be delivered to any vulnerable channels.',
++                  )
++                : t(
++                    'public~Input a channel that reflects the desired version. To verify if the version exists in a channel, save and check the update status. Critical security updates will be delivered to any vulnerable channels.',
++                  )}
+             </Content>
+-          )}
+-        </Content>
+-        <div className="form-group">
+-          <label htmlFor="channel">{t('public~Channel')}</label>
+-          {channelsExist ? (
+-            <ConsoleSelect
+-              className="cluster-channel-modal__dropdown"
+-              id="channel"
+-              items={availableChannels}
+-              onChange={(newChannel: string) => setChannel(newChannel)}
+-              selectedKey={channel}
+-              title={t('public~Channel')}
+-            />
+-          ) : (
+-            <>
+-              <TextInput
++            {!isManaged() && (
++              <Content component={ContentVariants.p}>
++                <ChannelDocLink />
++              </Content>
++            )}
++          </Content>
++          <FormGroup label={t('public~Channel')} fieldId="channel">
++            {channelsExist ? (
++              <ConsoleSelect
++                className="cluster-channel-modal__dropdown"
+                 id="channel"
+-                onChange={(_event, newChannel) => setChannel(newChannel)}
+-                value={channel}
+-                placeholder={t(`public~e.g., {{version}}`, {
+-                  version: `stable-${version.major}.${version.minor}`,
+-                })}
+-                data-test="channel-modal-input"
++                items={availableChannels}
++                onChange={(newChannel: string) => setChannel(newChannel)}
++                selectedKey={channel}
++                title={t('public~Channel')}
+               />
+-              <p className="help-block">
+-                {t(`public~Potential channels are {{stable}}, {{fast}}, or {{candidate}}.`, {
+-                  stable: `stable-${version.major}.${version.minor}`,
+-                  fast: `fast-${version.major}.${version.minor}`,
+-                  candidate: `candidate-${version.major}.${version.minor}`,
+-                })}
+-              </p>
+-            </>
+-          )}
+-        </div>
++            ) : (
++              <>
++                <TextInput
++                  id="channel"
++                  onChange={(_event, newChannel) => setChannel(newChannel)}
++                  value={channel}
++                  placeholder={t(`public~e.g., {{version}}`, {
++                    version: `stable-${versionMajor}.${versionMinor}`,
++                  })}
++                  data-test="channel-modal-input"
++                />
++                <FormHelperText>
++                  <HelperText>
++                    <HelperTextItem>
++                      {t(`public~Potential channels are {{stable}}, {{fast}}, or {{candidate}}.`, {
++                        stable: `stable-${versionMajor}.${versionMinor}`,
++                        fast: `fast-${versionMajor}.${versionMinor}`,
++                        candidate: `candidate-${versionMajor}.${versionMinor}`,
++                      })}
++                    </HelperTextItem>
++                  </HelperText>
++                </FormHelperText>
++              </>
++            )}
++          </FormGroup>
++        </Form>
+       </ModalBody>
+-      <ModalSubmitFooter
+-        errorMessage={errorMessage}
+-        inProgress={inProgress}
+-        submitText={t('public~Save')}
+-        cancelText={t('public~Cancel')}
+-        cancel={cancel}
+-      />
+-    </form>
++      <ModalFooterWithAlerts errorMessage={errorMessage}>
++        <Button
++          type="submit"
++          variant="primary"
++          isLoading={inProgress}
++          form="cluster-channel-form"
++          data-test="confirm-action"
++          id="confirm-action"
++        >
++          {t('public~Save')}
++        </Button>
++        <Button variant="link" onClick={cancel} type="button" data-test-id="modal-cancel-action">
++          {t('public~Cancel')}
++        </Button>
++      </ModalFooterWithAlerts>
++    </>
+   );
+ };
+ 
+ export const ClusterChannelModalOverlay: OverlayComponent<ClusterChannelModalProps> = (props) => {
+   return (
+-    <ModalWrapper blocking onClose={props.closeOverlay}>
++    <Modal
++      isOpen
++      onClose={props.closeOverlay}
++      variant={ModalVariant.small}
++      data-test="channel-modal"
++      aria-labelledby="cluster-channel-modal-title"
++    >
+       <ClusterChannelModal {...props} close={props.closeOverlay} cancel={props.closeOverlay} />
+-    </ModalWrapper>
++    </Modal>
+   );
+ };
+ 
+diff --git a/frontend/public/components/modals/cluster-more-updates-modal.tsx b/frontend/public/components/modals/cluster-more-updates-modal.tsx
+index 45a3cadc550..8246b8c5f5e 100644
+--- a/frontend/public/components/modals/cluster-more-updates-modal.tsx
++++ b/frontend/public/components/modals/cluster-more-updates-modal.tsx
+@@ -1,6 +1,7 @@
+ import type { FC } from 'react';
+ import { useTranslation } from 'react-i18next';
+-import { ActionGroup, Button } from '@patternfly/react-core';
++import { Button, Modal, ModalBody, ModalHeader, ModalVariant } from '@patternfly/react-core';
++import { Table, Tbody, Td, Th, Thead, Tr } from '@patternfly/react-table';
+ 
+ import { OverlayComponent } from '@console/dynamic-plugin-sdk/src/app/modal-support/OverlayProvider';
+ import { isClusterExternallyManaged } from '@console/shared/src/hooks/useCanClusterUpgrade';
+@@ -13,18 +14,13 @@ import {
+   isMinorVersionNewer,
+   showReleaseNotes,
+ } from '../../module/k8s';
+-import {
+-  ModalBody,
+-  ModalComponentProps,
+-  ModalFooter,
+-  ModalTitle,
+-  ModalWrapper,
+-} from '../factory/modal';
++import { ModalComponentProps } from '../factory/modal';
+ import {
+   ClusterNotUpgradeableAlert,
+   UpdateBlockedLabel,
+ } from '../cluster-settings/cluster-settings';
+ import { ReleaseNotesLink } from '../utils/release-notes-link';
++import { ModalFooterWithAlerts } from '@console/shared/src/components/modals/ModalFooterWithAlerts';
+ 
+ export const ClusterMoreUpdatesModal: FC<ClusterMoreUpdatesModalProps> = ({ cancel, cv }) => {
+   const availableUpdates = getSortedAvailableUpdates(cv);
+@@ -35,58 +31,60 @@ export const ClusterMoreUpdatesModal: FC<ClusterMoreUpdatesModalProps> = ({ canc
+   const { t } = useTranslation();
+ 
+   return (
+-    <div className="modal-content" data-test="more-updates-modal">
+-      <ModalTitle>{t('public~Other available paths')}</ModalTitle>
++    <>
++      <ModalHeader
++        title={t('public~Other available paths')}
++        data-test-id="modal-title"
++        labelId="cluster-more-updates-modal-title"
++      />
+       <ModalBody>
+         {clusterUpgradeableFalseAndNotExternallyManaged && (
+           <ClusterNotUpgradeableAlert cv={cv} onCancel={cancel} />
+         )}
+-        <table className="pf-v6-c-table pf-m-compact pf-m-border-rows">
+-          <thead className="pf-v6-c-table__thead">
+-            <tr className="pf-v6-c-table__tr">
+-              <th className="pf-v6-c-table__th">{t('public~Version')}</th>
+-              {releaseNotes && <th className="pf-v6-c-table__th">{t('public~Release notes')}</th>}
+-            </tr>
+-          </thead>
+-          <tbody className="pf-v6-c-table__tbody">
++        <Table variant="compact" borders>
++          <Thead>
++            <Tr>
++              <Th>{t('public~Version')}</Th>
++              {releaseNotes && <Th>{t('public~Release notes')}</Th>}
++            </Tr>
++          </Thead>
++          <Tbody>
+             {moreAvailableUpdates.map((update) => {
+               return (
+-                <tr className="pf-v6-c-table__tr" key={update.version}>
+-                  <td className="pf-v6-c-table__td">
++                <Tr key={update.version}>
++                  <Td>
+                     {update.version}
+                     {clusterUpgradeableFalseAndNotExternallyManaged &&
+                       isMinorVersionNewer(getLastCompletedUpdate(cv), update.version) && (
+                         <UpdateBlockedLabel />
+                       )}
+-                  </td>
++                  </Td>
+                   {releaseNotes && (
+-                    <td className="pf-v6-c-table__td">
++                    <Td>
+                       {getReleaseNotesLink(update.version) ? (
+                         <ReleaseNotesLink version={update.version} />
+                       ) : (
+                         '-'
+                       )}
+-                    </td>
++                    </Td>
+                   )}
+-                </tr>
++                </Tr>
+               );
+             })}
+-          </tbody>
+-        </table>
++          </Tbody>
++        </Table>
+       </ModalBody>
+-      <ModalFooter inProgress={false}>
+-        <ActionGroup className="pf-v6-c-form pf-v6-c-form__actions--right pf-v6-c-form__group--no-top-margin">
+-          <Button
+-            type="button"
+-            variant="primary"
+-            onClick={cancel}
+-            data-test="more-updates-modal-close-button"
+-          >
+-            {t('Close')}
+-          </Button>
+-        </ActionGroup>
+-      </ModalFooter>
+-    </div>
++      <ModalFooterWithAlerts>
++        <Button
++          type="button"
++          variant="primary"
++          onClick={cancel}
++          data-test="more-updates-modal-close-button"
++        >
++          {t('public~Close')}
++        </Button>
++      </ModalFooterWithAlerts>
++    </>
+   );
+ };
+ 
+@@ -94,9 +92,15 @@ export const ClusterMoreUpdatesModalOverlay: OverlayComponent<ClusterMoreUpdates
+   props,
+ ) => {
+   return (
+-    <ModalWrapper blocking onClose={props.closeOverlay}>
++    <Modal
++      isOpen
++      onClose={props.closeOverlay}
++      variant={ModalVariant.small}
++      aria-labelledby="cluster-more-updates-modal-title"
++      data-test="more-updates-modal"
++    >
+       <ClusterMoreUpdatesModal {...props} cancel={props.closeOverlay} />
+-    </ModalWrapper>
++    </Modal>
+   );
+ };
+ 
+diff --git a/frontend/public/components/modals/cluster-update-modal.tsx b/frontend/public/components/modals/cluster-update-modal.tsx
+index 9f23ced5964..2f2643f95b8 100644
+--- a/frontend/public/components/modals/cluster-update-modal.tsx
++++ b/frontend/public/components/modals/cluster-update-modal.tsx
+@@ -2,7 +2,19 @@ import * as _ from 'lodash';
+ import type { FormEvent, FormEventHandler } from 'react';
+ import { useState, useEffect, useCallback, Fragment } from 'react';
+ import { useTranslation } from 'react-i18next';
+-import { Alert, Radio, Content, ContentVariants } from '@patternfly/react-core';
++import {
++  Alert,
++  Button,
++  Content,
++  ContentVariants,
++  Form,
++  FormGroup,
++  Modal,
++  ModalBody,
++  ModalHeader,
++  ModalVariant,
++  Radio,
++} from '@patternfly/react-core';
+ import { useK8sWatchResource } from '@console/internal/components/utils/k8s-watch-hook';
+ import { DropdownWithSwitch } from '@console/shared/src/components/dropdown';
+ 
+@@ -28,18 +40,13 @@ import {
+   sortMCPsByCreationTimestamp,
+ } from '../../module/k8s';
+ import { OverlayComponent } from '@console/dynamic-plugin-sdk/src/app/modal-support/OverlayProvider';
+-import {
+-  ModalWrapper,
+-  ModalBody,
+-  ModalComponentProps,
+-  ModalSubmitFooter,
+-  ModalTitle,
+-} from '../factory/modal';
++import { ModalComponentProps } from '../factory/modal';
+ import {
+   ClusterNotUpgradeableAlert,
+   UpdateBlockedLabel,
+ } from '../cluster-settings/cluster-settings';
+ import { MachineConfigPoolsSelector } from '../machine-config-pools-selector';
++import { ModalFooterWithAlerts } from '@console/shared/src/components/modals/ModalFooterWithAlerts';
+ 
+ enum upgradeTypes {
+   Full = 'Full',
+@@ -147,7 +154,9 @@ const ClusterUpdateModal = (props: ClusterUpdateModalProps) => {
+           ...MCPsToResumePromises,
+           ...MCPsToPausePromises,
+         ]),
+-      ).then(() => close());
++      )
++        .then(() => close())
++        .catch(() => {});
+     },
+     [
+       desiredRecommendedUpdate,
+@@ -199,151 +208,173 @@ const ClusterUpdateModal = (props: ClusterUpdateModalProps) => {
+   }
+ 
+   return (
+-    <form onSubmit={submit} name="form" className="modal-content" data-test="update-cluster-modal">
+-      <ModalTitle>{t('public~Update cluster')}</ModalTitle>
++    <>
++      <ModalHeader
++        title={t('public~Update cluster')}
++        data-test-id="modal-title"
++        labelId="cluster-update-modal-title"
++      />
+       <ModalBody>
+-        {clusterUpgradeableFalse && <ClusterNotUpgradeableAlert onCancel={cancel} cv={cv} />}
+-        <div className="form-group">
+-          <label>{t('public~Current version')}</label>
+-          <p>{currentVersion}</p>
+-        </div>
+-        <div className="form-group">
+-          <label id="version-label">{t('public~Select new version')}</label>
+-          <DropdownWithSwitch
+-            isFullWidth
+-            onSelect={onSelectVersion}
+-            options={options}
+-            selected={desiredVersion}
+-            switchIsChecked={includeNotRecommended}
+-            switchIsDisabled={notRecommendedOptions.length === 0}
+-            switchLabel={
++        <Form id="cluster-update-form" onSubmit={submit}>
++          {clusterUpgradeableFalse && <ClusterNotUpgradeableAlert onCancel={cancel} cv={cv} />}
++          <FormGroup label={t('public~Current version')} fieldId="current-version">
++            <p>{currentVersion}</p>
++          </FormGroup>
++          <FormGroup label={t('public~Select new version')} fieldId="version-select">
++            <DropdownWithSwitch
++              isFullWidth
++              onSelect={onSelectVersion}
++              options={options}
++              selected={desiredVersion}
++              switchIsChecked={includeNotRecommended}
++              switchIsDisabled={notRecommendedOptions.length === 0}
++              switchLabel={
++                <>
++                  {t('public~Include versions with known issues')}
++                  <FieldLevelHelp>
++                    {t(
++                      'public~These versions are supported, but include known issues. Review the known issues before updating.',
++                    )}
++                  </FieldLevelHelp>
++                </>
++              }
++              switchLabelIsReversed
++              switchOnChange={(val) => setIncludeNotRecommended(val)}
++              toggleLabel={desiredVersion}
++            />
++            {desiredNotRecommendedUpdate && desiredNotRecommendedUpdateConditions?.message && (
++              <Alert
++                className="pf-v6-u-mt-sm"
++                isInline
++                title={t(
++                  'public~Updating this cluster to {{desiredVersion}} is supported, but includes known issues.  Review the known issues before updating.',
++                  { desiredVersion: desiredNotRecommendedUpdate.release.version },
++                )}
++                variant="info"
++                data-test="update-cluster-modal-not-recommended-alert"
++              >
++                <Content>
++                  <Content component={ContentVariants.p}>
++                    <LinkifyExternal>
++                      {desiredNotRecommendedUpdateConditions.message.split('\n').map((item) => (
++                        <Fragment key={item}>
++                          {item}
++                          <br />
++                        </Fragment>
++                      ))}
++                    </LinkifyExternal>
++                  </Content>
++                </Content>
++              </Alert>
++            )}
++          </FormGroup>
++          <FormGroup
++            label={
+               <>
+-                {t('public~Include versions with known issues')}
++                {t('public~Update options')}
+                 <FieldLevelHelp>
+                   {t(
+-                    'public~These versions are supported, but include known issues. Review the known issues before updating.',
++                    'public~Full cluster update allows you to update all your Nodes, but takes longer. Control plane only update allows you to pause worker and custom pool Nodes to accommodate your maintenance schedule.',
+                   )}
+                 </FieldLevelHelp>
+               </>
+             }
+-            switchLabelIsReversed
+-            switchOnChange={(val) => setIncludeNotRecommended(val)}
+-            toggleLabel={desiredVersion}
+-          />
+-          {desiredNotRecommendedUpdate && desiredNotRecommendedUpdateConditions?.message && (
+-            <Alert
+-              className="pf-v6-u-mt-sm"
+-              isInline
+-              title={t(
+-                'public~Updating this cluster to {{desiredVersion}} is supported, but includes known issues.  Review the known issues before updating.',
+-                { desiredVersion: desiredNotRecommendedUpdate.release.version },
++            role="radiogroup"
++          >
++            <Radio
++              isChecked={upgradeType === upgradeTypes.Full}
++              name={upgradeTypes.Full}
++              onChange={() => handleUpgradeTypeChange(upgradeTypes.Full)}
++              label={t('public~Full cluster update')}
++              id={upgradeTypes.Full}
++              value={upgradeTypes.Full}
++              description={t(
++                'public~{{master}}, {{worker}}, and custom pool {{resource}} are updated concurrently. This might take longer, so make sure to allocate enough time for maintenance.',
++                {
++                  master: NodeTypeNames.Master,
++                  worker: NodeTypeNames.Worker,
++                  resource: NodeModel.labelPlural,
++                },
+               )}
+-              variant="info"
+-              data-test="update-cluster-modal-not-recommended-alert"
+-            >
+-              <Content>
+-                <Content component={ContentVariants.p}>
+-                  <LinkifyExternal>
+-                    {desiredNotRecommendedUpdateConditions.message.split('\n').map((item) => (
+-                      <Fragment key={item}>
+-                        {item}
+-                        <br />
+-                      </Fragment>
+-                    ))}
+-                  </LinkifyExternal>
+-                </Content>
+-              </Content>
+-            </Alert>
+-          )}
+-        </div>
+-        <div className="form-group">
+-          <label>
+-            {t('public~Update options')}
+-            <FieldLevelHelp>
+-              {t(
+-                'public~Full cluster update allows you to update all your Nodes, but takes longer. Control plane only update allows you to pause worker and custom pool Nodes to accommodate your maintenance schedule.',
++              className="pf-v6-u-mb-sm"
++              body={
++                machineConfigPoolsLoaded &&
++                pausedMCPs.length > 0 &&
++                upgradeType === upgradeTypes.Full && (
++                  <Alert
++                    variant="warning"
++                    isInline
++                    isPlain
++                    title={t(
++                      'public~Paused {{worker}} or custom pool {{resource}} updates will be resumed. If you want to update only the control plane, select "Control plane only update" below.',
++                      { worker: NodeTypeNames.Worker, resource: NodeModel.label },
++                    )}
++                    data-test="update-cluster-modal-paused-nodes-warning"
++                  />
++                )
++              }
++              data-test="update-cluster-modal-full-update-radio"
++            />
++            <Radio
++              isChecked={upgradeType === upgradeTypes.Partial}
++              name={upgradeTypes.Partial}
++              onChange={() => handleUpgradeTypeChange(upgradeTypes.Partial)}
++              label={t('public~Control plane only update')}
++              id={upgradeTypes.Partial}
++              value={upgradeTypes.Partial}
++              description={t(
++                'public~Pause {{worker}} or custom pool {{resource}} updates to accommodate your maintenance schedule.',
++                { worker: NodeTypeNames.Worker, resource: NodeModel.label },
+               )}
+-            </FieldLevelHelp>
+-          </label>
+-          <Radio
+-            isChecked={upgradeType === upgradeTypes.Full}
+-            name={upgradeTypes.Full}
+-            onChange={() => handleUpgradeTypeChange(upgradeTypes.Full)}
+-            label={t('public~Full cluster update')}
+-            id={upgradeTypes.Full}
+-            value={upgradeTypes.Full}
+-            description={t(
+-              'public~{{master}}, {{worker}}, and custom pool {{resource}} are updated concurrently. This might take longer, so make sure to allocate enough time for maintenance.',
+-              {
+-                master: NodeTypeNames.Master,
+-                worker: NodeTypeNames.Worker,
+-                resource: NodeModel.labelPlural,
+-              },
+-            )}
+-            className="pf-v6-u-mb-sm"
+-            body={
+-              machineConfigPoolsLoaded &&
+-              pausedMCPs.length > 0 &&
+-              upgradeType === upgradeTypes.Full && (
+-                <Alert
+-                  variant="warning"
+-                  isInline
+-                  isPlain
+-                  title={t(
+-                    'public~Paused {{worker}} or custom pool {{resource}} updates will be resumed. If you want to update only the control plane, select "Control plane only update" below.',
+-                    { worker: NodeTypeNames.Worker, resource: NodeModel.label },
+-                  )}
+-                  data-test="update-cluster-modal-paused-nodes-warning"
+-                />
+-              )
+-            }
+-            data-test="update-cluster-modal-full-update-radio"
+-          />
+-          <Radio
+-            isChecked={upgradeType === upgradeTypes.Partial}
+-            name={upgradeTypes.Partial}
+-            onChange={() => handleUpgradeTypeChange(upgradeTypes.Partial)}
+-            label={t('public~Control plane only update')}
+-            id={upgradeTypes.Partial}
+-            value={upgradeTypes.Partial}
+-            description={t(
+-              'public~Pause {{worker}} or custom pool {{resource}} updates to accommodate your maintenance schedule.',
+-              { worker: NodeTypeNames.Worker, resource: NodeModel.label },
+-            )}
+-            className="pf-v6-u-mb-md"
+-            body={
+-              upgradeType === upgradeTypes.Partial && (
+-                <MachineConfigPoolsSelector
+-                  machineConfigPools={pauseableMCPs}
+-                  selected={machineConfigPoolsToPause}
+-                  onChange={handleMCPSelectionChange}
+-                />
+-              )
+-            }
+-            data-test="update-cluster-modal-partial-update-radio"
+-          />
+-        </div>
++              className="pf-v6-u-mb-md"
++              body={
++                upgradeType === upgradeTypes.Partial && (
++                  <MachineConfigPoolsSelector
++                    machineConfigPools={pauseableMCPs}
++                    selected={machineConfigPoolsToPause}
++                    onChange={handleMCPSelectionChange}
++                  />
++                )
++              }
++              data-test="update-cluster-modal-partial-update-radio"
++            />
++          </FormGroup>
++        </Form>
+       </ModalBody>
+-      <ModalSubmitFooter
+-        errorMessage={errorMessage || error}
+-        inProgress={inProgress}
+-        submitText={t('public~Update')}
+-        cancelText={t('public~Cancel')}
+-        cancel={cancel}
+-        submitDisabled={
+-          !desiredVersion ||
+-          (upgradeType === upgradeTypes.Partial && machineConfigPoolsToPause.length === 0)
+-        }
+-      />
+-    </form>
++      <ModalFooterWithAlerts errorMessage={errorMessage || error}>
++        <Button
++          type="submit"
++          variant="primary"
++          isLoading={inProgress}
++          form="cluster-update-form"
++          data-test="confirm-action"
++          id="confirm-action"
++          isDisabled={
++            !desiredVersion ||
++            (upgradeType === upgradeTypes.Partial && machineConfigPoolsToPause.length === 0)
++          }
++        >
++          {t('public~Update')}
++        </Button>
++        <Button variant="link" onClick={cancel} type="button" data-test-id="modal-cancel-action">
++          {t('public~Cancel')}
++        </Button>
++      </ModalFooterWithAlerts>
++    </>
+   );
+ };
+ 
+ export const ClusterUpdateModalOverlay: OverlayComponent<ClusterUpdateModalProps> = (props) => {
+   return (
+-    <ModalWrapper blocking onClose={props.closeOverlay}>
++    <Modal
++      isOpen
++      onClose={props.closeOverlay}
++      variant={ModalVariant.small}
++      aria-labelledby="cluster-update-modal-title"
++      data-test="update-cluster-modal"
++    >
+       <ClusterUpdateModal {...props} close={props.closeOverlay} cancel={props.closeOverlay} />
+-    </ModalWrapper>
++    </Modal>
+   );
+ };
+ 
+diff --git a/frontend/public/components/modals/column-management-modal.tsx b/frontend/public/components/modals/column-management-modal.tsx
+index 0fe16ac6fc3..c09fa1e51dd 100644
+--- a/frontend/public/components/modals/column-management-modal.tsx
++++ b/frontend/public/components/modals/column-management-modal.tsx
+@@ -2,14 +2,20 @@ import type { FC, SyntheticEvent } from 'react';
+ import { useState } from 'react';
+ import {
+   Alert,
++  Button,
+   DataList,
+   DataListCheck,
+   DataListItem,
+   DataListItemRow,
+   DataListCell,
+   DataListItemCells,
++  Form,
+   Grid,
+   GridItem,
++  Modal,
++  ModalBody,
++  ModalHeader,
++  ModalVariant,
+ } from '@patternfly/react-core';
+ import { useTranslation } from 'react-i18next';
+ import { ColumnLayout, ManagedColumn } from '@console/dynamic-plugin-sdk';
+@@ -23,8 +29,8 @@ import {
+   withUserPreferenceCompatibility,
+ } from '@console/shared/src/hoc/withUserPreferenceCompatibility';
+ import { OverlayComponent } from '@console/dynamic-plugin-sdk/src/app/modal-support/OverlayProvider';
++import { ModalFooterWithAlerts } from '@console/shared/src/components/modals/ModalFooterWithAlerts';
+ import type { ModalComponentProps } from '../factory';
+-import { ModalTitle, ModalBody, ModalSubmitFooter, ModalWrapper } from '../factory';
+ 
+ export const MAX_VIEW_COLS = 9;
+ 
+@@ -117,83 +123,90 @@ export const ColumnManagementModal: FC<
+   };
+ 
+   return (
+-    <form onSubmit={submit} name="form" className="modal-content">
+-      <ModalTitle className="modal-header">{t('public~Manage columns')}</ModalTitle>
++    <>
++      <ModalHeader
++        title={t('public~Manage columns')}
++        data-test-id="modal-title"
++        labelId="column-management-modal-title"
++      />
+       <ModalBody>
+-        {!noLimit ? (
+-          <>
+-            <div className="co-m-form-row">
++        <Form id="column-management-form" onSubmit={submit}>
++          {!noLimit ? (
++            <>
+               <p>{t('public~Selected columns will appear in the table.')}</p>
+-            </div>
+-            <div className="co-m-form-row">
+               <Alert
+-                className="co-alert"
+                 isInline
+                 title={t('public~You can select up to {{MAX_VIEW_COLS}} columns', {
+                   MAX_VIEW_COLS,
+                 })}
+                 variant="info"
+               >
+-                {!columnLayout?.showNamespaceOverride && <NamespaceColumnHelpText />}
++                {columnLayout?.showNamespaceOverride && <NamespaceColumnHelpText />}
+               </Alert>
+-            </div>
+-          </>
+-        ) : (
+-          !columnLayout?.showNamespaceOverride && (
+-            <div className="co-m-form-row">
+-              <NamespaceColumnHelpText />
+-            </div>
+-          )
+-        )}
+-        <Grid hasGutter className="co-m-form-row">
+-          <GridItem sm={6}>
+-            <label>
+-              {t('public~Default {{resourceKind}} columns', { resourceKind: columnLayout.type })}
+-            </label>
+-            <DataList
+-              aria-label={t('public~Default column list')}
+-              id="defalt-column-management"
+-              isCompact
+-            >
+-              {defaultColumns.map((defaultColumn) => (
+-                <DataListRow
+-                  key={defaultColumn.id}
+-                  onChange={onColumnChange}
+-                  disableUncheckedRow={!noLimit && areMaxColumnsDisplayed}
+-                  column={defaultColumn}
+-                  checkedColumns={checkedColumns}
+-                />
+-              ))}
+-            </DataList>
+-          </GridItem>
+-          <GridItem sm={6}>
+-            <label>{t('public~Additional columns')}</label>
+-            <DataList
+-              aria-label={t('public~Additional column list')}
+-              id="additional-column-management"
+-              isCompact
+-            >
+-              {additionalColumns.map((additionalColumn) => (
+-                <DataListRow
+-                  key={additionalColumn.id}
+-                  onChange={onColumnChange}
+-                  disableUncheckedRow={!noLimit && areMaxColumnsDisplayed}
+-                  column={additionalColumn}
+-                  checkedColumns={checkedColumns}
+-                />
+-              ))}
+-            </DataList>
+-          </GridItem>
+-        </Grid>
++            </>
++          ) : (
++            columnLayout?.showNamespaceOverride && <NamespaceColumnHelpText />
++          )}
++          <Grid hasGutter>
++            <GridItem sm={6}>
++              <label>
++                {t('public~Default {{resourceKind}} columns', { resourceKind: columnLayout.type })}
++              </label>
++              <DataList
++                aria-label={t('public~Default column list')}
++                id="default-column-management"
++                isCompact
++              >
++                {defaultColumns.map((defaultColumn) => (
++                  <DataListRow
++                    key={defaultColumn.id}
++                    onChange={onColumnChange}
++                    disableUncheckedRow={!noLimit && areMaxColumnsDisplayed}
++                    column={defaultColumn}
++                    checkedColumns={checkedColumns}
++                  />
++                ))}
++              </DataList>
++            </GridItem>
++            <GridItem sm={6}>
++              <label>{t('public~Additional columns')}</label>
++              <DataList
++                aria-label={t('public~Additional column list')}
++                id="additional-column-management"
++                isCompact
++              >
++                {additionalColumns.map((additionalColumn) => (
++                  <DataListRow
++                    key={additionalColumn.id}
++                    onChange={onColumnChange}
++                    disableUncheckedRow={!noLimit && areMaxColumnsDisplayed}
++                    column={additionalColumn}
++                    checkedColumns={checkedColumns}
++                  />
++                ))}
++              </DataList>
++            </GridItem>
++          </Grid>
++        </Form>
+       </ModalBody>
+-      <ModalSubmitFooter
+-        inProgress={false}
+-        cancel={cancel}
+-        submitText={t('public~Save')}
+-        resetText={t('public~Restore default columns')}
+-        reset={resetColumns}
+-      />
+-    </form>
++      <ModalFooterWithAlerts>
++        <Button
++          type="submit"
++          variant="primary"
++          form="column-management-form"
++          data-test="confirm-action"
++          id="confirm-action"
++        >
++          {t('public~Save')}
++        </Button>
++        <Button variant="link" onClick={cancel} type="button" data-test-id="modal-cancel-action">
++          {t('public~Cancel')}
++        </Button>
++        <Button variant="link" onClick={resetColumns} type="button">
++          {t('public~Restore default columns')}
++        </Button>
++      </ModalFooterWithAlerts>
++    </>
+   );
+ };
+ 
+@@ -210,13 +223,18 @@ const ColumnManagementModalWithSettings = withUserPreferenceCompatibility<
+ export const ColumnManagementModalOverlay: OverlayComponent<ColumnManagementModalProps> = (
+   props,
+ ) => (
+-  <ModalWrapper blocking onClose={props.closeOverlay}>
++  <Modal
++    isOpen
++    onClose={props.closeOverlay}
++    variant={ModalVariant.small}
++    aria-labelledby="column-management-modal-title"
++  >
+     <ColumnManagementModalWithSettings
+       {...props}
+       cancel={props.closeOverlay}
+       close={props.closeOverlay}
+     />
+-  </ModalWrapper>
++  </Modal>
+ );
+ 
+ ColumnManagementModal.displayName = 'ColumnManagementModal';
+diff --git a/frontend/public/components/modals/configure-count-modal.tsx b/frontend/public/components/modals/configure-count-modal.tsx
+index ab5250972c9..ed5846ed9d6 100644
+--- a/frontend/public/components/modals/configure-count-modal.tsx
++++ b/frontend/public/components/modals/configure-count-modal.tsx
+@@ -74,7 +74,12 @@ export const ConfigureCountModal: OverlayComponent<ConfigureCountModalProps> = (
+   };
+ 
+   return (
+-    <Modal isOpen onClose={closeOverlay} variant="small">
++    <Modal
++      isOpen
++      onClose={closeOverlay}
++      variant="small"
++      aria-labelledby="configure-count-modal-title"
++    >
+       <ModalHeader
+         title={titleKey ? (t(titleKey, titleVariables) as string) : title}
+         labelId="configure-count-modal-title"
+diff --git a/frontend/public/components/modals/delete-pvc-modal.tsx b/frontend/public/components/modals/delete-pvc-modal.tsx
+index 719ccc4b92a..c8aaa42e177 100644
+--- a/frontend/public/components/modals/delete-pvc-modal.tsx
++++ b/frontend/public/components/modals/delete-pvc-modal.tsx
+@@ -1,22 +1,25 @@
+ import { useNavigate } from 'react-router-dom-v5-compat';
+-import { Stack, StackItem } from '@patternfly/react-core';
++import {
++  Button,
++  Form,
++  Modal,
++  ModalBody,
++  ModalHeader,
++  ModalVariant,
++  Stack,
++  StackItem,
++} from '@patternfly/react-core';
+ import { Trans, useTranslation } from 'react-i18next';
+ import { resourceListPathFromModel } from '../utils/resource-link';
+ import { getName } from '@console/shared/src/selectors/common';
+-import { YellowExclamationTriangleIcon } from '@console/shared/src/components/status/icons';
+ import { useResolvedExtensions } from '@console/dynamic-plugin-sdk/src/api/useResolvedExtensions';
+ import { isPVCDelete, PVCDelete } from '@console/dynamic-plugin-sdk/src/extensions/pvc';
+ import { OverlayComponent } from '@console/dynamic-plugin-sdk/src/app/modal-support/OverlayProvider';
+-import {
+-  ModalTitle,
+-  ModalBody,
+-  ModalSubmitFooter,
+-  ModalWrapper,
+-  ModalComponentProps,
+-} from '../factory';
++import { ModalComponentProps } from '../factory';
+ import { k8sKill, PersistentVolumeClaimKind } from '@console/internal/module/k8s';
+ import { PersistentVolumeClaimModel } from '../../models';
+ import { usePromiseHandler } from '@console/shared/src/hooks/promise-handler';
++import { ModalFooterWithAlerts } from '@console/shared/src/components/modals/ModalFooterWithAlerts';
+ 
+ const DeletePVCModal = (props: DeletePVCModalProps) => {
+   const { pvc, close, cancel } = props;
+@@ -52,30 +55,43 @@ const DeletePVCModal = (props: DeletePVCModalProps) => {
+   );
+ 
+   return (
+-    <form onSubmit={submit} className="modal-content">
+-      <ModalTitle>
+-        <YellowExclamationTriangleIcon className="co-icon-space-r" />{' '}
+-        {t('public~Delete PersistentVolumeClaim')}
+-      </ModalTitle>
++    <>
++      <ModalHeader
++        title={t('public~Delete PersistentVolumeClaim')}
++        titleIconVariant="warning"
++        data-test-id="modal-title"
++        labelId="delete-pvc-modal-title"
++      />
+       <ModalBody>
+-        <Stack hasGutter>
+-          {alertComponents}
+-          <StackItem>
+-            <Trans t={t} ns="public">
+-              Are you sure you want to delete{' '}
+-              <strong className="co-break-word">{{ pvcName }}</strong> PersistentVolumeClaim?
+-            </Trans>
+-          </StackItem>
+-        </Stack>
++        <Form id="delete-pvc-form" onSubmit={submit}>
++          <Stack hasGutter>
++            {alertComponents}
++            <StackItem>
++              <Trans t={t} ns="public">
++                Are you sure you want to delete{' '}
++                <strong className="co-break-word">{{ pvcName }}</strong> PersistentVolumeClaim?
++              </Trans>
++            </StackItem>
++          </Stack>
++        </Form>
+       </ModalBody>
+-      <ModalSubmitFooter
+-        errorMessage={errorMessage}
+-        inProgress={inProgress}
+-        submitText={t('public~Delete')}
+-        submitDanger
+-        cancel={cancel}
+-      />
+-    </form>
++      <ModalFooterWithAlerts errorMessage={errorMessage}>
++        <Button
++          type="submit"
++          variant="danger"
++          isLoading={inProgress}
++          isDisabled={inProgress}
++          form="delete-pvc-form"
++          data-test="confirm-action"
++          id="confirm-action"
++        >
++          {t('public~Delete')}
++        </Button>
++        <Button variant="link" onClick={cancel} type="button" data-test-id="modal-cancel-action">
++          {t('public~Cancel')}
++        </Button>
++      </ModalFooterWithAlerts>
++    </>
+   );
+ };
+ 
+@@ -85,8 +101,13 @@ export type DeletePVCModalProps = {
+ 
+ export const DeletePVCModalOverlay: OverlayComponent<DeletePVCModalProps> = (props) => {
+   return (
+-    <ModalWrapper blocking onClose={props.closeOverlay}>
++    <Modal
++      isOpen
++      onClose={props.closeOverlay}
++      variant={ModalVariant.small}
++      aria-labelledby="delete-pvc-modal-title"
++    >
+       <DeletePVCModal {...props} cancel={props.closeOverlay} close={props.closeOverlay} />
+-    </ModalWrapper>
++    </Modal>
+   );
+ };
+diff --git a/frontend/public/components/modals/error-modal.tsx b/frontend/public/components/modals/error-modal.tsx
+index fb10bf1d49a..1f5a2786af0 100644
+--- a/frontend/public/components/modals/error-modal.tsx
++++ b/frontend/public/components/modals/error-modal.tsx
+@@ -1,54 +1,36 @@
+ import { useCallback } from 'react';
+ import {
+-  ActionGroup,
+   Button,
+   ButtonVariant,
+   Modal,
++  ModalBody,
++  ModalFooter,
+   ModalHeader,
+   ModalVariant,
+-  ModalBody as PfModalBody,
+-  ModalFooter as PfModalFooter,
+ } from '@patternfly/react-core';
+ import { useTranslation } from 'react-i18next';
+ import { OverlayComponent } from '@console/dynamic-plugin-sdk/src/app/modal-support/OverlayProvider';
+ import { useOverlay } from '@console/dynamic-plugin-sdk/src/app/modal-support/useOverlay';
+-import { ModalTitle, ModalBody, ModalFooter, ModalComponentProps } from '../factory/modal';
+-import { YellowExclamationTriangleIcon } from '@console/shared/src/components/status/icons';
+-
+-export const ModalErrorContent = (props: ErrorModalProps) => {
+-  const { t } = useTranslation();
+-  const { error, title, cancel } = props;
+-  const titleText = title || t('public~Error');
+-  return (
+-    <div className="modal-content">
+-      <ModalTitle>
+-        <YellowExclamationTriangleIcon className="co-icon-space-r" /> {titleText}
+-      </ModalTitle>
+-      <ModalBody>{error}</ModalBody>
+-      <ModalFooter inProgress={false} errorMessage="">
+-        <ActionGroup className="pf-v6-c-form pf-v6-c-form__actions--right pf-v6-c-form__group--no-top-margin">
+-          <Button type="button" variant="primary" onClick={cancel}>
+-            {t('public~OK')}
+-          </Button>
+-        </ActionGroup>
+-      </ModalFooter>
+-    </div>
+-  );
+-};
++import { ModalComponentProps } from '../factory/modal';
+ 
+ export const ErrorModal: OverlayComponent<ErrorModalProps> = (props) => {
+   const { t } = useTranslation();
+   const { error, title } = props;
+   const titleText = title || t('public~Error');
+   return (
+-    <Modal isOpen onClose={props.closeOverlay} variant={ModalVariant.small}>
++    <Modal
++      isOpen
++      onClose={props.closeOverlay}
++      variant={ModalVariant.small}
++      aria-labelledby="title-icon-modal-title"
++    >
+       <ModalHeader title={titleText} titleIconVariant="warning" labelId="title-icon-modal-title" />
+-      <PfModalBody>{error}</PfModalBody>
+-      <PfModalFooter>
++      <ModalBody>{error}</ModalBody>
++      <ModalFooter>
+         <Button key="cancel" variant={ButtonVariant.primary} onClick={props.closeOverlay}>
+           {t('public~OK')}
+         </Button>
+-      </PfModalFooter>
++      </ModalFooter>
+     </Modal>
+   );
+ };
+diff --git a/frontend/public/components/modals/index.ts b/frontend/public/components/modals/index.ts
+index 9317fcc388a..7dc83169750 100644
+--- a/frontend/public/components/modals/index.ts
++++ b/frontend/public/components/modals/index.ts
+@@ -87,6 +87,13 @@ export const LazyClusterUpdateModalOverlay = lazy(() =>
+   })),
+ );
+ 
++// Lazy-loaded OverlayComponent for Taints Modal
++export const LazyTaintsModalOverlay = lazy(() =>
++  import('./taints-modal' /* webpackChunkName: "taints-modal" */).then((m) => ({
++    default: m.TaintsModalOverlay,
++  })),
++);
++
+ // Lazy-loaded OverlayComponent for Tolerations Modal
+ export const LazyTolerationsModalOverlay = lazy(() =>
+   import('./tolerations-modal' /* webpackChunkName: "tolerations-modal" */).then((m) => ({
+diff --git a/frontend/public/components/modals/rollback-modal.tsx b/frontend/public/components/modals/rollback-modal.tsx
+index c62163f8d63..aa8a418943a 100644
+--- a/frontend/public/components/modals/rollback-modal.tsx
++++ b/frontend/public/components/modals/rollback-modal.tsx
+@@ -2,15 +2,24 @@ import type { FC, FormEvent } from 'react';
+ import { useState, useEffect } from 'react';
+ import * as _ from 'lodash';
+ import { Trans, useTranslation } from 'react-i18next';
+-import { Alert, Checkbox } from '@patternfly/react-core';
++import {
++  Alert,
++  Button,
++  Checkbox,
++  Form,
++  Modal,
++  ModalBody,
++  ModalHeader,
++  ModalVariant,
++} from '@patternfly/react-core';
+ import type { OverlayComponent } from '@console/dynamic-plugin-sdk/src/app/modal-support/OverlayProvider';
+ import {
+   getDeploymentConfigVersion,
+   getOwnerNameByKind,
+ } from '@console/shared/src/utils/resource-utils';
+ import { usePromiseHandler } from '@console/shared/src/hooks/promise-handler';
+-import { ModalTitle, ModalBody, ModalSubmitFooter, ModalWrapper } from '../factory/modal';
+ import type { ModalComponentProps } from '../factory/modal';
++import { ModalFooterWithAlerts } from '@console/shared/src/components/modals/ModalFooterWithAlerts';
+ import { LoadingInline } from '../utils/status-box';
+ import { DeploymentConfigModel, DeploymentModel, ReplicationControllerModel } from '../../models';
+ import type { K8sResourceKind } from '../../module/k8s';
+@@ -110,9 +119,11 @@ const BaseRollbackModal: FC<RollbackModalProps> = (props) => {
+       { op: 'replace', path: '/metadata/annotations', value: annotations },
+     ];
+ 
+-    handlePromise(k8sPatch(DeploymentModel, deployment, patch)).then(() => {
+-      props.close();
+-    });
++    handlePromise(k8sPatch(DeploymentModel, deployment, patch))
++      .then(() => {
++        props.close();
++      })
++      .catch(() => {});
+   };
+ 
+   const submit = (e: FormEvent) => {
+@@ -187,41 +198,61 @@ const BaseRollbackModal: FC<RollbackModalProps> = (props) => {
+   };
+ 
+   return (
+-    <form onSubmit={submit} name="form" className="modal-content">
+-      <ModalTitle>{t('public~Rollback')}</ModalTitle>
++    <>
++      <ModalHeader
++        title={t('public~Rollback')}
++        data-test-id="modal-title"
++        labelId="rollback-modal-title"
++      />
+       <ModalBody>
+-        {loaded ? (
+-          !loadError && !deploymentError ? (
+-            renderRollbackBody()
++        <Form id="rollback-form" onSubmit={submit}>
++          {loaded ? (
++            !loadError && !deploymentError ? (
++              renderRollbackBody()
++            ) : (
++              <Alert isInline variant="danger" title={t('public~Unable to Rollback')}>
++                <div className="co-pre-line">{loadError?.message || deploymentError}</div>
++              </Alert>
++            )
+           ) : (
+-            <Alert
+-              isInline
+-              className="co-alert co-alert--scrollable"
+-              variant="danger"
+-              title={t('public~Unable to Rollback')}
+-            >
+-              <div className="co-pre-line">{loadError?.message || deploymentError}</div>
+-            </Alert>
+-          )
+-        ) : (
+-          <LoadingInline />
+-        )}
++            <LoadingInline />
++          )}
++        </Form>
+       </ModalBody>
+-      <ModalSubmitFooter
+-        errorMessage={errorMessage}
+-        inProgress={inProgress}
+-        submitText={t('public~Rollback')}
+-        cancel={props.cancel}
+-        submitDisabled={loadError?.message || deploymentError}
+-      />
+-    </form>
++      <ModalFooterWithAlerts errorMessage={errorMessage}>
++        <Button
++          type="submit"
++          variant="primary"
++          isLoading={inProgress}
++          form="rollback-form"
++          data-test="confirm-action"
++          id="confirm-action"
++          isDisabled={!!(loadError || deploymentError)}
++        >
++          {t('public~Rollback')}
++        </Button>
++        <Button
++          variant="link"
++          onClick={props.cancel}
++          type="button"
++          data-test-id="modal-cancel-action"
++        >
++          {t('public~Cancel')}
++        </Button>
++      </ModalFooterWithAlerts>
++    </>
+   );
+ };
+ 
+ export const RollbackModalOverlay: OverlayComponent<RollbackModalProps> = (props) => (
+-  <ModalWrapper blocking onClose={props.closeOverlay}>
++  <Modal
++    isOpen
++    onClose={props.closeOverlay}
++    variant={ModalVariant.small}
++    aria-labelledby="rollback-modal-title"
++  >
+     <BaseRollbackModal {...props} cancel={props.closeOverlay} close={props.closeOverlay} />
+-  </ModalWrapper>
++  </Modal>
+ );
+ 
+ export type RollbackModalProps = {
+diff --git a/frontend/public/components/modals/taints-modal.tsx b/frontend/public/components/modals/taints-modal.tsx
+index 2b4d2f81143..ab2615f144e 100644
+--- a/frontend/public/components/modals/taints-modal.tsx
++++ b/frontend/public/components/modals/taints-modal.tsx
+@@ -1,7 +1,16 @@
+ import * as _ from 'lodash';
+ import type { FormEvent } from 'react';
+ import { useState } from 'react';
+-import { Button, Tooltip } from '@patternfly/react-core';
++import {
++  Button,
++  Form,
++  Modal,
++  ModalBody,
++  ModalHeader,
++  ModalVariant,
++  TextInput,
++  Tooltip,
++} from '@patternfly/react-core';
+ import { Table, Thead, Tr, Th, Td, Tbody } from '@patternfly/react-table';
+ import { MinusCircleIcon } from '@patternfly/react-icons/dist/esm/icons/minus-circle-icon';
+ import { PlusCircleIcon } from '@patternfly/react-icons/dist/esm/icons/plus-circle-icon';
+@@ -10,15 +19,10 @@ import { useTranslation } from 'react-i18next';
+ import { ConsoleSelect } from '@console/internal/components/utils/console-select';
+ import { EmptyBox } from '../utils/status-box';
+ import { K8sKind, NodeKind, k8sPatch, Taint } from '../../module/k8s';
+-import {
+-  ModalBody,
+-  ModalComponentProps,
+-  ModalSubmitFooter,
+-  ModalTitle,
+-  ModalWrapper,
+-} from '../factory';
++import { ModalComponentProps } from '../factory';
+ import { usePromiseHandler } from '@console/shared/src/hooks/promise-handler';
+ import { OverlayComponent } from '@console/dynamic-plugin-sdk/src/app/modal-support/OverlayProvider';
++import { ModalFooterWithAlerts } from '@console/shared/src/components/modals/ModalFooterWithAlerts';
+ 
+ const TaintsModal = (props: TaintsModalProps) => {
+   const [taints, setTaints] = useState(props.resource.spec.taints || []);
+@@ -43,7 +47,8 @@ const TaintsModal = (props: TaintsModalProps) => {
+   };
+ 
+   const change = (e, i: number, field: string) => {
+-    const newValue = e.target ? e.target.value : e;
++    // Handle both native events (from input) and values (from ConsoleSelect)
++    const newValue = typeof e === 'string' ? e : e.target?.value ?? e;
+     setTaints((prevTaints) => {
+       const clonedTaints = _.cloneDeep(prevTaints);
+       clonedTaints[i][field] = newValue;
+@@ -72,91 +77,110 @@ const TaintsModal = (props: TaintsModalProps) => {
+   };
+ 
+   return (
+-    <form onSubmit={submit} name="form" className="modal-content">
+-      <ModalTitle>{t('Edit taints')}</ModalTitle>
++    <>
++      <ModalHeader
++        title={t('Edit taints')}
++        data-test-id="modal-title"
++        labelId="taints-modal-title"
++      />
+       <ModalBody>
+-        {_.isEmpty(taints) ? (
+-          <EmptyBox label={t('Taints')} />
+-        ) : (
+-          <Table
+-            aria-label={t('Taints')}
+-            variant="compact"
+-            borders={false}
+-            className="co-modal-table"
+-          >
+-            <Thead>
+-              <Tr>
+-                <Th>{t('Key')}</Th>
+-                <Th>{t('Value')}</Th>
+-                <Th>{t('Effect')}</Th>
+-              </Tr>
+-            </Thead>
+-
+-            <Tbody>
+-              {_.map(taints, (c, i: number) => (
+-                <Tr key={i}>
+-                  <Td dataLabel={t('Key')}>
+-                    <span className="pf-v6-c-form-control">
+-                      <input
++        <Form id="taints-form" onSubmit={submit}>
++          {_.isEmpty(taints) ? (
++            <EmptyBox label={t('Taints')} />
++          ) : (
++            <Table
++              aria-label={t('Taints')}
++              variant="compact"
++              borders={false}
++              className="co-modal-table"
++            >
++              <Thead>
++                <Tr>
++                  <Th>{t('Key')}</Th>
++                  <Th>{t('Value')}</Th>
++                  <Th>{t('Effect')}</Th>
++                </Tr>
++              </Thead>
++
++              <Tbody>
++                {_.map(taints, (c, i: number) => (
++                  <Tr key={i}>
++                    <Td dataLabel={t('Key')}>
++                      <TextInput
+                         type="text"
+                         value={c.key}
+-                        onChange={(e) => change(e, i, 'key')}
+-                        required
++                        onChange={(_event, value) => change(value, i, 'key')}
++                        isRequired
++                        aria-label={t('Key')}
+                       />
+-                    </span>
+-                  </Td>
+-                  <Td dataLabel={t('Value')}>
+-                    <span className="pf-v6-c-form-control">
+-                      <input type="text" value={c.value} onChange={(e) => change(e, i, 'value')} />
+-                    </span>
+-                  </Td>
+-                  <Td dataLabel={t('Effect')}>
+-                    <ConsoleSelect
+-                      isFullWidth
+-                      items={effects}
+-                      onChange={(e) => change(e, i, 'effect')}
+-                      selectedKey={c.effect}
+-                      title={effects[c.effect]}
+-                      alwaysShowTitle
+-                    />
+-                  </Td>
+-                  <Td isActionCell>
+-                    <Tooltip content="Remove">
+-                      <Button
+-                        icon={
+-                          <MinusCircleIcon className="pairs-list__side-btn pairs-list__delete-icon" />
+-                        }
+-                        className="pf-v6-u-mt-md pf-v6-u-mt-0-on-md"
+-                        type="button"
+-                        onClick={() => remove(i)}
+-                        aria-label={t('Remove')}
+-                        variant="plain"
++                    </Td>
++                    <Td dataLabel={t('Value')}>
++                      <TextInput
++                        type="text"
++                        value={c.value}
++                        onChange={(_event, value) => change(value, i, 'value')}
++                        aria-label={t('Value')}
+                       />
+-                    </Tooltip>
+-                  </Td>
+-                </Tr>
+-              ))}
+-            </Tbody>
+-          </Table>
+-        )}
++                    </Td>
++                    <Td dataLabel={t('Effect')}>
++                      <ConsoleSelect
++                        isFullWidth
++                        items={effects}
++                        onChange={(e) => change(e, i, 'effect')}
++                        selectedKey={c.effect}
++                        title={effects[c.effect]}
++                        alwaysShowTitle
++                      />
++                    </Td>
++                    <Td isActionCell>
++                      <Tooltip content={t('Remove')}>
++                        <Button
++                          icon={
++                            <MinusCircleIcon className="pairs-list__side-btn pairs-list__delete-icon" />
++                          }
++                          className="pf-v6-u-mt-md pf-v6-u-mt-0-on-md"
++                          type="button"
++                          onClick={() => remove(i)}
++                          aria-label={t('Remove')}
++                          variant="plain"
++                        />
++                      </Tooltip>
++                    </Td>
++                  </Tr>
++                ))}
++              </Tbody>
++            </Table>
++          )}
++          <Button
++            icon={
++              <PlusCircleIcon data-test-id="pairs-list__add-icon" className="co-icon-space-r" />
++            }
++            iconPosition="left"
++            onClick={addRow}
++            type="button"
++            variant="link"
++            isInline
++          >
++            {t('Add more')}
++          </Button>
++        </Form>
++      </ModalBody>
++      <ModalFooterWithAlerts errorMessage={errorMessage}>
+         <Button
+-          icon={<PlusCircleIcon data-test-id="pairs-list__add-icon" className="co-icon-space-r" />}
+-          className="pf-v6-u-mt-md"
+-          iconPosition="left"
+-          onClick={addRow}
+-          type="button"
+-          variant="link"
++          type="submit"
++          variant="primary"
++          isLoading={inProgress}
++          form="taints-form"
++          data-test="confirm-action"
++          id="confirm-action"
+         >
+-          {t('Add more')}
++          {t('Save')}
+         </Button>
+-      </ModalBody>
+-      <ModalSubmitFooter
+-        errorMessage={errorMessage}
+-        inProgress={inProgress}
+-        submitText={t('Save')}
+-        cancel={cancel}
+-      />
+-    </form>
++        <Button variant="link" onClick={cancel} type="button" data-test-id="modal-cancel-action">
++          {t('Cancel')}
++        </Button>
++      </ModalFooterWithAlerts>
++    </>
+   );
+ };
+ 
+@@ -167,9 +191,14 @@ export type TaintsModalProps = {
+ 
+ const TaintsModalOverlay: OverlayComponent<TaintsModalProps> = (props) => {
+   return (
+-    <ModalWrapper blocking onClose={props.closeOverlay}>
++    <Modal
++      isOpen
++      onClose={props.closeOverlay}
++      variant={ModalVariant.small}
++      aria-labelledby="taints-modal-title"
++    >
+       <TaintsModal {...props} close={props.closeOverlay} cancel={props.closeOverlay} />
+-    </ModalWrapper>
++    </Modal>
+   );
+ };
+ 
+diff --git a/frontend/public/components/modals/tolerations-modal.tsx b/frontend/public/components/modals/tolerations-modal.tsx
+index 05ea08c13c4..1ee882c0f7d 100644
+--- a/frontend/public/components/modals/tolerations-modal.tsx
++++ b/frontend/public/components/modals/tolerations-modal.tsx
+@@ -2,24 +2,26 @@ import * as _ from 'lodash';
+ import type { FormEvent } from 'react';
+ import { useState } from 'react';
+ import { css } from '@patternfly/react-styles';
+-import { Button, Tooltip } from '@patternfly/react-core';
++import {
++  Button,
++  Form,
++  Modal,
++  ModalBody,
++  ModalHeader,
++  ModalVariant,
++  Tooltip,
++} from '@patternfly/react-core';
+ import { Table, Thead, Tr, Th, Td, Tbody } from '@patternfly/react-table';
+ import { MinusCircleIcon } from '@patternfly/react-icons/dist/esm/icons/minus-circle-icon';
+ import { PlusCircleIcon } from '@patternfly/react-icons/dist/esm/icons/plus-circle-icon';
+ import { useTranslation } from 'react-i18next';
+-
+ import { ConsoleSelect } from '@console/internal/components/utils/console-select';
+ import { EmptyBox } from '../utils/status-box';
+ import { K8sKind, k8sPatch, Toleration, TolerationOperator } from '../../module/k8s';
+ import { OverlayComponent } from '@console/dynamic-plugin-sdk/src/app/modal-support/OverlayProvider';
+-import {
+-  ModalWrapper,
+-  ModalBody,
+-  ModalComponentProps,
+-  ModalSubmitFooter,
+-  ModalTitle,
+-} from '../factory';
++import type { ModalComponentProps } from '../factory';
+ import { usePromiseHandler } from '@console/shared/src/hooks/promise-handler';
++import { ModalFooterWithAlerts } from '@console/shared/src/components/modals/ModalFooterWithAlerts';
+ 
+ const TolerationsModal = (props: TolerationsModalProps) => {
+   const getTolerationsFromResource = (): Toleration[] => {
+@@ -109,141 +111,161 @@ const TolerationsModal = (props: TolerationsModalProps) => {
+   };
+ 
+   return (
+-    <form onSubmit={submit} name="form" className="modal-content">
+-      <ModalTitle>{t('public~Edit tolerations')}</ModalTitle>
++    <>
++      <ModalHeader title={t('public~Edit tolerations')} labelId="tolerations-modal-title" />
+       <ModalBody>
+-        {_.isEmpty(tolerations) ? (
+-          <EmptyBox label={t('public~Tolerations')} />
+-        ) : (
+-          <Table
+-            aria-label={t('public~Tolerations')}
+-            variant="compact"
+-            borders={false}
+-            className="co-modal-table"
+-          >
+-            <Thead>
+-              <Tr>
+-                <Th>{t('public~Key')}</Th>
+-                <Th>{t('public~Operator')}</Th>
+-                <Th>{t('public~Value')}</Th>
+-                <Th>{t('public~Effect')}</Th>
+-              </Tr>
+-            </Thead>
++        <Form id="tolerations-form" onSubmit={submit}>
++          {_.isEmpty(tolerations) ? (
++            <EmptyBox label={t('public~Tolerations')} />
++          ) : (
++            <Table
++              aria-label={t('public~Tolerations')}
++              variant="compact"
++              borders={false}
++              className="co-modal-table"
++            >
++              <Thead>
++                <Tr>
++                  <Th>{t('public~Key')}</Th>
++                  <Th>{t('public~Operator')}</Th>
++                  <Th>{t('public~Value')}</Th>
++                  <Th>{t('public~Effect')}</Th>
++                </Tr>
++              </Thead>
+ 
+-            <Tbody>
+-              {_.map(tolerations, (toleration, i) => {
+-                const { key, operator, value, effect = '' } = toleration;
+-                const keyReadOnly = !isEditable(toleration);
+-                const valueReadOnly = !isEditable(toleration) || operator === 'Exists';
+-                return (
+-                  <Tr key={i}>
+-                    <Td dataLabel={t('public~Key')}>
+-                      <span
+-                        className={css('pf-v6-c-form-control', {
+-                          'pf-m-readonly': keyReadOnly,
+-                        })}
+-                      >
+-                        <input
+-                          type="text"
+-                          value={key}
+-                          onChange={(e) => change(e, i, 'key')}
+-                          readOnly={keyReadOnly}
+-                        />
+-                      </span>
+-                    </Td>
+-                    <Td dataLabel={t('public~Operator')}>
+-                      {isEditable(toleration) ? (
+-                        <ConsoleSelect
+-                          isFullWidth
+-                          items={operators}
+-                          onChange={(op: TolerationOperator) => opChange(op, i)}
+-                          selectedKey={operator}
+-                          title={operators[operator]}
+-                          alwaysShowTitle
+-                        />
+-                      ) : (
+-                        <span className="pf-v6-c-form-control pf-m-readonly">
+-                          <input type="text" value={operator} readOnly />
++              <Tbody>
++                {_.map(tolerations, (toleration, i) => {
++                  const { key, operator, value, effect = '' } = toleration;
++                  const keyReadOnly = !isEditable(toleration);
++                  const valueReadOnly = !isEditable(toleration) || operator === 'Exists';
++                  return (
++                    <Tr key={i}>
++                      <Td dataLabel={t('public~Key')}>
++                        <span
++                          className={css('pf-v6-c-form-control', {
++                            'pf-m-readonly': keyReadOnly,
++                          })}
++                        >
++                          <input
++                            type="text"
++                            value={key}
++                            onChange={(e) => change(e, i, 'key')}
++                            readOnly={keyReadOnly}
++                          />
+                         </span>
+-                      )}
+-                    </Td>
+-                    <Td dataLabel={t('public~Value')}>
+-                      <span
+-                        className={css('pf-v6-c-form-control', {
+-                          'pf-m-readonly': valueReadOnly,
+-                        })}
+-                      >
+-                        <input
+-                          type="text"
+-                          value={value}
+-                          onChange={(e) => change(e, i, 'value')}
+-                          readOnly={valueReadOnly}
+-                        />
+-                      </span>
+-                    </Td>
+-                    <Td dataLabel={t('public~Effect')}>
+-                      {isEditable(toleration) ? (
+-                        <ConsoleSelect
+-                          isFullWidth
+-                          items={effects}
+-                          onChange={(e: string) => change(e, i, 'effect')}
+-                          selectedKey={effect}
+-                          title={effects[effect]}
+-                          alwaysShowTitle
+-                        />
+-                      ) : (
+-                        <span className="pf-v6-c-form-control pf-m-readonly">
+-                          <input type="text" value={effects[effect]} readOnly />
++                      </Td>
++                      <Td dataLabel={t('public~Operator')}>
++                        {isEditable(toleration) ? (
++                          <ConsoleSelect
++                            isFullWidth
++                            items={operators}
++                            onChange={(op: TolerationOperator) => opChange(op, i)}
++                            selectedKey={operator}
++                            title={operators[operator]}
++                            alwaysShowTitle
++                          />
++                        ) : (
++                          <span className="pf-v6-c-form-control pf-m-readonly">
++                            <input type="text" value={operator} readOnly />
++                          </span>
++                        )}
++                      </Td>
++                      <Td dataLabel={t('public~Value')}>
++                        <span
++                          className={css('pf-v6-c-form-control', {
++                            'pf-m-readonly': valueReadOnly,
++                          })}
++                        >
++                          <input
++                            type="text"
++                            value={value}
++                            onChange={(e) => change(e, i, 'value')}
++                            readOnly={valueReadOnly}
++                          />
+                         </span>
+-                      )}
+-                    </Td>
+-                    <Td isActionCell>
+-                      {isEditable(toleration) && (
+-                        <Tooltip content={t('public~Remove')}>
+-                          <Button
+-                            icon={
+-                              <MinusCircleIcon className="pairs-list__side-btn pairs-list__delete-icon" />
+-                            }
+-                            type="button"
+-                            onClick={() => remove(i)}
+-                            aria-label={t('public~Remove')}
+-                            variant="plain"
++                      </Td>
++                      <Td dataLabel={t('public~Effect')}>
++                        {isEditable(toleration) ? (
++                          <ConsoleSelect
++                            isFullWidth
++                            items={effects}
++                            onChange={(e: string) => change(e, i, 'effect')}
++                            selectedKey={effect}
++                            title={effects[effect]}
++                            alwaysShowTitle
+                           />
+-                        </Tooltip>
+-                      )}
+-                    </Td>
+-                  </Tr>
+-                );
+-              })}
+-            </Tbody>
+-          </Table>
+-        )}
++                        ) : (
++                          <span className="pf-v6-c-form-control pf-m-readonly">
++                            <input type="text" value={effects[effect]} readOnly />
++                          </span>
++                        )}
++                      </Td>
++                      <Td isActionCell>
++                        {isEditable(toleration) && (
++                          <Tooltip content={t('public~Remove')}>
++                            <Button
++                              icon={
++                                <MinusCircleIcon className="pairs-list__side-btn pairs-list__delete-icon" />
++                              }
++                              type="button"
++                              onClick={() => remove(i)}
++                              aria-label={t('public~Remove')}
++                              variant="plain"
++                            />
++                          </Tooltip>
++                        )}
++                      </Td>
++                    </Tr>
++                  );
++                })}
++              </Tbody>
++            </Table>
++          )}
++          <Button
++            icon={
++              <PlusCircleIcon data-test-id="pairs-list__add-icon" className="co-icon-space-r" />
++            }
++            iconPosition="left"
++            onClick={addRow}
++            type="button"
++            variant="link"
++            isInline
++          >
++            {t('public~Add more')}
++          </Button>
++        </Form>
++      </ModalBody>
++      <ModalFooterWithAlerts errorMessage={errorMessage}>
+         <Button
+-          icon={<PlusCircleIcon data-test-id="pairs-list__add-icon" className="co-icon-space-r" />}
+-          className="pf-v6-u-mt-md"
+-          iconPosition="left"
+-          onClick={addRow}
+-          type="button"
+-          variant="link"
++          type="submit"
++          variant="primary"
++          isLoading={inProgress}
++          isDisabled={inProgress}
++          form="tolerations-form"
++          data-test="confirm-action"
++          id="confirm-action"
+         >
+-          {t('public~Add more')}
++          {t('public~Save')}
+         </Button>
+-      </ModalBody>
+-      <ModalSubmitFooter
+-        errorMessage={errorMessage}
+-        inProgress={inProgress}
+-        submitText={t('public~Save')}
+-        cancel={cancel}
+-      />
+-    </form>
++        <Button type="button" variant="link" onClick={cancel} data-test-id="modal-cancel-action">
++          {t('public~Cancel')}
++        </Button>
++      </ModalFooterWithAlerts>
++    </>
+   );
+ };
+ 
+ export const TolerationsModalOverlay: OverlayComponent<TolerationsModalProps> = (props) => {
+   return (
+-    <ModalWrapper blocking onClose={props.closeOverlay} className={props.modalClassName}>
++    <Modal
++      isOpen
++      onClose={props.closeOverlay}
++      variant={ModalVariant.large}
++      aria-labelledby="tolerations-modal-title"
++      className={props.modalClassName}
++    >
+       <TolerationsModal {...props} close={props.closeOverlay} />
+-    </ModalWrapper>
++    </Modal>
+   );
+ };
+ 

@@ -1,0 +1,384 @@
+diff --git a/Dockerfile.dev b/Dockerfile.dev
+index bc8323c8581..91e8f0cbee8 100644
+--- a/Dockerfile.dev
++++ b/Dockerfile.dev
+@@ -21,7 +21,8 @@ RUN cd /usr/bin && \
+     ln -s control-plane-operator ignition-server && \
+     ln -s control-plane-operator konnectivity-socks5-proxy && \
+     ln -s control-plane-operator availability-prober && \
+-    ln -s control-plane-operator token-minter
++    ln -s control-plane-operator token-minter && \
++    ln -s control-plane-operator fetch-etcd-certs
+ 
+ ENTRYPOINT ["/usr/bin/hypershift"]
+ 
+diff --git a/control-plane-operator/main.go b/control-plane-operator/main.go
+index 1b5a3caec11..3c8df7b90a7 100644
+--- a/control-plane-operator/main.go
++++ b/control-plane-operator/main.go
+@@ -101,6 +101,8 @@ func commandFor(name string) *cobra.Command {
+ 		cmd = syncfgconfigmap.NewRunCommand()
+ 	case "sync-global-pullsecret":
+ 		cmd = syncglobalpullsecret.NewRunCommand()
++	case "fetch-etcd-certs":
++		cmd = etcdbackup.NewFetchCertsCommand()
+ 	case "endpoint-resolver":
+ 		cmd = endpointresolver.NewStartCommand()
+ 	default:
+@@ -153,6 +155,7 @@ func defaultCommand() *cobra.Command {
+ 	cmd.AddCommand(kubernetesdefaultproxy.NewStartCommand())
+ 	cmd.AddCommand(dnsresolver.NewCommand())
+ 	cmd.AddCommand(etcdbackup.NewStartCommand())
++	cmd.AddCommand(etcdbackup.NewFetchCertsCommand())
+ 	cmd.AddCommand(kasbootstrap.NewRunCommand())
+ 	cmd.AddCommand(syncfgconfigmap.NewRunCommand())
+ 	cmd.AddCommand(syncglobalpullsecret.NewRunCommand())
+diff --git a/etcd-backup/fetchcerts.go b/etcd-backup/fetchcerts.go
+new file mode 100644
+index 00000000000..fe0cb4591fe
+--- /dev/null
++++ b/etcd-backup/fetchcerts.go
+@@ -0,0 +1,135 @@
++package etcdbackup
++
++import (
++	"context"
++	"fmt"
++	"log"
++	"os"
++	"os/signal"
++	"path/filepath"
++	"syscall"
++
++	"github.com/openshift/hypershift/control-plane-operator/controllers/hostedcontrolplane/manifests"
++	"github.com/openshift/hypershift/control-plane-operator/controllers/hostedcontrolplane/pki"
++	"github.com/openshift/hypershift/support/certs"
++
++	"sigs.k8s.io/controller-runtime/pkg/client"
++	"sigs.k8s.io/controller-runtime/pkg/client/config"
++
++	"github.com/spf13/cobra"
++)
++
++type fetchCertsOptions struct {
++	hcpNamespace     string
++	outputDir        string
++	etcdClientSecret string
++	etcdCAConfigMap  string
++}
++
++// NewFetchCertsCommand returns a cobra command that fetches etcd TLS certificates
++// from an HCP namespace and writes them to disk for use by backup Jobs.
++func NewFetchCertsCommand() *cobra.Command {
++	opts := fetchCertsOptions{
++		outputDir:        "/etc/etcd-certs",
++		etcdClientSecret: manifests.EtcdClientSecret("").Name,
++		etcdCAConfigMap:  manifests.EtcdSignerCAConfigMap("").Name,
++	}
++
++	cmd := &cobra.Command{
++		Use:          "fetch-etcd-certs",
++		Short:        "Fetch etcd TLS certificates from an HCP namespace and write them to disk",
++		SilenceUsage: true,
++		RunE: func(cmd *cobra.Command, args []string) error {
++			ctx, cancel := signal.NotifyContext(cmd.Context(), os.Interrupt, syscall.SIGTERM)
++			defer cancel()
++
++			return runFetchCerts(ctx, opts)
++		},
++	}
++
++	cmd.Flags().StringVar(&opts.hcpNamespace, "hcp-namespace", "", "namespace of the HostedControlPlane containing etcd secrets")
++	cmd.Flags().StringVar(&opts.outputDir, "output-dir", opts.outputDir, "directory to write the TLS certificate files")
++	cmd.Flags().StringVar(&opts.etcdClientSecret, "etcd-client-secret", opts.etcdClientSecret, "name of the etcd client TLS Secret")
++	cmd.Flags().StringVar(&opts.etcdCAConfigMap, "etcd-ca-configmap", opts.etcdCAConfigMap, "name of the etcd CA ConfigMap")
++
++	_ = cmd.MarkFlagRequired("hcp-namespace")
++
++	return cmd
++}
++
++func runFetchCerts(ctx context.Context, opts fetchCertsOptions) error {
++	k8sClient, err := newK8sClient()
++	if err != nil {
++		return fmt.Errorf("failed to create Kubernetes client: %w", err)
++	}
++
++	return fetchAndWriteCerts(ctx, k8sClient, opts)
++}
++
++func newK8sClient() (client.Client, error) {
++	cfg, err := config.GetConfig()
++	if err != nil {
++		return nil, fmt.Errorf("failed to get kubeconfig: %w", err)
++	}
++
++	c, err := client.New(cfg, client.Options{})
++	if err != nil {
++		return nil, fmt.Errorf("failed to create client: %w", err)
++	}
++
++	return c, nil
++}
++
++func fetchAndWriteCerts(ctx context.Context, k8sClient client.Client, opts fetchCertsOptions) error {
++	clientSecret := manifests.EtcdClientSecret(opts.hcpNamespace)
++	clientSecret.Name = opts.etcdClientSecret
++	if err := k8sClient.Get(ctx, client.ObjectKeyFromObject(clientSecret), clientSecret); err != nil {
++		return fmt.Errorf("failed to get etcd client TLS secret %s/%s: %w", opts.hcpNamespace, opts.etcdClientSecret, err)
++	}
++
++	caConfigMap := manifests.EtcdSignerCAConfigMap(opts.hcpNamespace)
++	caConfigMap.Name = opts.etcdCAConfigMap
++	if err := k8sClient.Get(ctx, client.ObjectKeyFromObject(caConfigMap), caConfigMap); err != nil {
++		return fmt.Errorf("failed to get etcd CA configmap %s/%s: %w", opts.hcpNamespace, opts.etcdCAConfigMap, err)
++	}
++
++	certData, ok := clientSecret.Data[pki.EtcdClientCrtKey]
++	if !ok {
++		return fmt.Errorf("etcd client secret %s/%s missing key %q", opts.hcpNamespace, opts.etcdClientSecret, pki.EtcdClientCrtKey)
++	}
++
++	keyData, ok := clientSecret.Data[pki.EtcdClientKeyKey]
++	if !ok {
++		return fmt.Errorf("etcd client secret %s/%s missing key %q", opts.hcpNamespace, opts.etcdClientSecret, pki.EtcdClientKeyKey)
++	}
++
++	caData, ok := caConfigMap.Data[certs.CASignerCertMapKey]
++	if !ok {
++		return fmt.Errorf("etcd CA configmap %s/%s missing key %q", opts.hcpNamespace, opts.etcdCAConfigMap, certs.CASignerCertMapKey)
++	}
++
++	if err := os.MkdirAll(opts.outputDir, 0755); err != nil {
++		return fmt.Errorf("failed to create output directory %s: %w", opts.outputDir, err)
++	}
++
++	type certFile struct {
++		name string
++		data []byte
++	}
++	files := []certFile{
++		{pki.EtcdClientCrtKey, certData},
++		{pki.EtcdClientKeyKey, keyData},
++		{certs.CASignerCertMapKey, []byte(caData)},
++	}
++
++	for _, f := range files {
++		name, data := f.name, f.data
++		path := filepath.Join(opts.outputDir, name)
++		if err := os.WriteFile(path, data, 0600); err != nil {
++			return fmt.Errorf("failed to write %s: %w", path, err)
++		}
++		log.Printf("wrote %s (%d bytes)", path, len(data))
++	}
++
++	return nil
++}
+diff --git a/etcd-backup/fetchcerts_test.go b/etcd-backup/fetchcerts_test.go
+new file mode 100644
+index 00000000000..418f2143af1
+--- /dev/null
++++ b/etcd-backup/fetchcerts_test.go
+@@ -0,0 +1,202 @@
++package etcdbackup
++
++import (
++	"context"
++	"os"
++	"path/filepath"
++	"testing"
++
++	. "github.com/onsi/gomega"
++
++	"github.com/openshift/hypershift/control-plane-operator/controllers/hostedcontrolplane/manifests"
++	"github.com/openshift/hypershift/control-plane-operator/controllers/hostedcontrolplane/pki"
++	"github.com/openshift/hypershift/support/certs"
++
++	corev1 "k8s.io/api/core/v1"
++	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
++	"k8s.io/apimachinery/pkg/runtime"
++
++	crclient "sigs.k8s.io/controller-runtime/pkg/client"
++	"sigs.k8s.io/controller-runtime/pkg/client/fake"
++)
++
++func TestFetchAndWriteCerts(t *testing.T) {
++	hcpNamespace := "hcp-test"
++	etcdClientSecretName := manifests.EtcdClientSecret("").Name
++	etcdCAConfigMapName := manifests.EtcdSignerCAConfigMap("").Name
++
++	fullSecret := &corev1.Secret{
++		ObjectMeta: metav1.ObjectMeta{
++			Name:      etcdClientSecretName,
++			Namespace: hcpNamespace,
++		},
++		Data: map[string][]byte{
++			pki.EtcdClientCrtKey: []byte("fake-cert-data"),
++			pki.EtcdClientKeyKey: []byte("fake-key-data"),
++		},
++	}
++
++	fullCAConfigMap := &corev1.ConfigMap{
++		ObjectMeta: metav1.ObjectMeta{
++			Name:      etcdCAConfigMapName,
++			Namespace: hcpNamespace,
++		},
++		Data: map[string]string{
++			certs.CASignerCertMapKey: "fake-ca-data",
++		},
++	}
++
++	tests := []struct {
++		name          string
++		objects       []crclient.Object
++		outputDir     func(t *testing.T) string
++		expectErr     bool
++		errSubstring  string
++		expectedFiles map[string]string
++	}{
++		{
++			name:      "When all resources exist it should write all cert files",
++			objects:   []crclient.Object{fullSecret, fullCAConfigMap},
++			outputDir: func(t *testing.T) string { return t.TempDir() },
++			expectedFiles: map[string]string{
++				pki.EtcdClientCrtKey:     "fake-cert-data",
++				pki.EtcdClientKeyKey:     "fake-key-data",
++				certs.CASignerCertMapKey: "fake-ca-data",
++			},
++		},
++		{
++			name:      "When output directory does not exist it should create it and write files",
++			objects:   []crclient.Object{fullSecret, fullCAConfigMap},
++			outputDir: func(t *testing.T) string { return filepath.Join(t.TempDir(), "nested", "certs") },
++			expectedFiles: map[string]string{
++				pki.EtcdClientCrtKey:     "fake-cert-data",
++				pki.EtcdClientKeyKey:     "fake-key-data",
++				certs.CASignerCertMapKey: "fake-ca-data",
++			},
++		},
++		{
++			name:         "When etcd-client-tls secret is missing it should return an error",
++			objects:      []crclient.Object{fullCAConfigMap},
++			outputDir:    func(t *testing.T) string { return t.TempDir() },
++			expectErr:    true,
++			errSubstring: "failed to get etcd client TLS secret",
++		},
++		{
++			name:         "When etcd-ca configmap is missing it should return an error",
++			objects:      []crclient.Object{fullSecret},
++			outputDir:    func(t *testing.T) string { return t.TempDir() },
++			expectErr:    true,
++			errSubstring: "failed to get etcd CA configmap",
++		},
++		{
++			name: "When etcd-client.crt is missing from the secret it should return an error",
++			objects: []crclient.Object{
++				&corev1.Secret{
++					ObjectMeta: metav1.ObjectMeta{
++						Name:      etcdClientSecretName,
++						Namespace: hcpNamespace,
++					},
++					Data: map[string][]byte{
++						pki.EtcdClientKeyKey: []byte("fake-key-data"),
++					},
++				},
++				fullCAConfigMap,
++			},
++			outputDir:    func(t *testing.T) string { return t.TempDir() },
++			expectErr:    true,
++			errSubstring: "missing key",
++		},
++		{
++			name: "When etcd-client.key is missing from the secret it should return an error",
++			objects: []crclient.Object{
++				&corev1.Secret{
++					ObjectMeta: metav1.ObjectMeta{
++						Name:      etcdClientSecretName,
++						Namespace: hcpNamespace,
++					},
++					Data: map[string][]byte{
++						pki.EtcdClientCrtKey: []byte("fake-cert-data"),
++					},
++				},
++				fullCAConfigMap,
++			},
++			outputDir:    func(t *testing.T) string { return t.TempDir() },
++			expectErr:    true,
++			errSubstring: "missing key",
++		},
++		{
++			name: "When ca.crt is missing from the configmap it should return an error",
++			objects: []crclient.Object{
++				fullSecret,
++				&corev1.ConfigMap{
++					ObjectMeta: metav1.ObjectMeta{
++						Name:      etcdCAConfigMapName,
++						Namespace: hcpNamespace,
++					},
++					Data: map[string]string{},
++				},
++			},
++			outputDir:    func(t *testing.T) string { return t.TempDir() },
++			expectErr:    true,
++			errSubstring: "missing key",
++		},
++	}
++
++	for _, tc := range tests {
++		t.Run(tc.name, func(t *testing.T) {
++			g := NewWithT(t)
++
++			scheme := runtime.NewScheme()
++			g.Expect(corev1.AddToScheme(scheme)).To(Succeed())
++
++			k8sClient := fake.NewClientBuilder().
++				WithScheme(scheme).
++				WithObjects(tc.objects...).
++				Build()
++
++			outputDir := tc.outputDir(t)
++			opts := fetchCertsOptions{
++				hcpNamespace:     hcpNamespace,
++				outputDir:        outputDir,
++				etcdClientSecret: etcdClientSecretName,
++				etcdCAConfigMap:  etcdCAConfigMapName,
++			}
++
++			err := fetchAndWriteCerts(context.Background(), k8sClient, opts)
++
++			if tc.expectErr {
++				g.Expect(err).To(HaveOccurred())
++				g.Expect(err.Error()).To(ContainSubstring(tc.errSubstring))
++				return
++			}
++
++			g.Expect(err).ToNot(HaveOccurred())
++			for name, expectedContent := range tc.expectedFiles {
++				path := filepath.Join(outputDir, name)
++				data, err := os.ReadFile(path)
++				g.Expect(err).ToNot(HaveOccurred(), "failed to read %s", name)
++				g.Expect(string(data)).To(Equal(expectedContent))
++
++				info, err := os.Stat(path)
++				g.Expect(err).ToNot(HaveOccurred())
++				g.Expect(info.Mode().Perm()).To(Equal(os.FileMode(0600)), "file %s should have 0600 permissions", name)
++			}
++		})
++	}
++}
++
++func TestNewFetchCertsCommand(t *testing.T) {
++	g := NewWithT(t)
++	cmd := NewFetchCertsCommand()
++
++	g.Expect(cmd.Use).To(Equal("fetch-etcd-certs"))
++
++	for _, flag := range []string{"hcp-namespace", "output-dir", "etcd-client-secret", "etcd-ca-configmap"} {
++		g.Expect(cmd.Flags().Lookup(flag)).ToNot(BeNil(), "expected flag %q to exist", flag)
++	}
++
++	// hcp-namespace should be required
++	err := cmd.ValidateRequiredFlags()
++	g.Expect(err).To(HaveOccurred())
++	g.Expect(err.Error()).To(ContainSubstring("hcp-namespace"))
++}

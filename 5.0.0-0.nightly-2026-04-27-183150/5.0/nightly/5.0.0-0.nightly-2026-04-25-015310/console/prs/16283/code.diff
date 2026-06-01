@@ -1,0 +1,324 @@
+diff --git a/frontend/packages/integration-tests/mocks/machine-config-pool.ts b/frontend/packages/integration-tests/mocks/machine-config-pool.ts
+new file mode 100644
+index 00000000000..646f85ed809
+--- /dev/null
++++ b/frontend/packages/integration-tests/mocks/machine-config-pool.ts
+@@ -0,0 +1,66 @@
++// Minimal MachineConfigPool list fixtures for update-modal tests (fields the UI actually reads).
++
++const baseMachineConfigPool = {
++  apiVersion: 'machineconfiguration.openshift.io/v1',
++  kind: 'MachineConfigPool',
++  metadata: {
++    name: '',
++    creationTimestamp: '2020-08-06T11:52:19Z',
++  },
++  spec: {
++    paused: false,
++  },
++  status: {
++    conditions: [
++      {
++        status: 'True',
++        type: 'Updated',
++      },
++    ],
++  },
++};
++
++const masterMachineConfigPool = {
++  ...structuredClone(baseMachineConfigPool),
++  metadata: {
++    name: 'master',
++    creationTimestamp: '2020-08-06T11:52:19Z',
++  },
++};
++
++const workerMachineConfigPool = {
++  ...structuredClone(baseMachineConfigPool),
++  metadata: {
++    name: 'worker',
++    creationTimestamp: '2020-08-06T11:52:20Z', // 1 second after master for stable sort order
++  },
++};
++
++const pausedWorkerMachineConfigPool = {
++  ...structuredClone(baseMachineConfigPool),
++  metadata: {
++    name: 'worker',
++    creationTimestamp: '2020-08-06T11:52:20Z',
++  },
++  spec: {
++    paused: true,
++  },
++};
++
++export const machineConfigPoolListWithPausedWorker = {
++  apiVersion: 'machineconfiguration.openshift.io/v1',
++  items: [masterMachineConfigPool, pausedWorkerMachineConfigPool],
++  kind: 'MachineConfigPoolList',
++  metadata: {
++    resourceVersion: '1',
++  },
++};
++
++export const machineConfigPoolListWithUnpausedWorker = {
++  apiVersion: 'machineconfiguration.openshift.io/v1',
++  items: [masterMachineConfigPool, workerMachineConfigPool],
++  kind: 'MachineConfigPoolList',
++  metadata: {
++    resourceVersion: '1',
++  },
++};
+diff --git a/frontend/packages/integration-tests/support/stub-machine-config-pool-watch-ws.ts b/frontend/packages/integration-tests/support/stub-machine-config-pool-watch-ws.ts
+new file mode 100644
+index 00000000000..01b728d1d2c
+--- /dev/null
++++ b/frontend/packages/integration-tests/support/stub-machine-config-pool-watch-ws.ts
+@@ -0,0 +1,42 @@
++/** Stub MCP list watch WebSockets only so intercepted GETs are not overwritten in Redux; other watches use the real WebSocket. */
++export const stubMachineConfigPoolWatchWebSocket = (win: Window) => {
++  const OriginalWebSocket = win.WebSocket;
++
++  class StubWebSocket extends OriginalWebSocket {
++    constructor(url: string | URL, protocols?: string | string[]) {
++      const urlString = url.toString();
++
++      // MCP list watch URL only; all other sockets stay native.
++      if (urlString.includes('machineconfiguration.openshift.io/v1/machineconfigpools')) {
++        // eslint-disable-next-line no-constructor-return
++        return ({
++          close: () => {},
++          send: () => {},
++          addEventListener: () => {},
++          removeEventListener: () => {},
++          dispatchEvent: () => true,
++          readyState: 3, // CLOSED
++          url: urlString,
++          protocol: '',
++          extensions: '',
++          bufferedAmount: 0,
++          binaryType: 'blob' as BinaryType,
++          onopen: null,
++          onerror: null,
++          onclose: null,
++          onmessage: null,
++          CONNECTING: 0,
++          OPEN: 1,
++          CLOSING: 2,
++          CLOSED: 3,
++        } as unknown) as WebSocket;
++      }
++
++      return new OriginalWebSocket(url, protocols);
++    }
++  }
++
++  // Replace the global WebSocket with our stub
++  // eslint-disable-next-line no-param-reassign
++  win.WebSocket = (StubWebSocket as unknown) as typeof WebSocket;
++};
+diff --git a/frontend/packages/integration-tests/tests/cluster-settings/update-modal.cy.ts b/frontend/packages/integration-tests/tests/cluster-settings/update-modal.cy.ts
+index 9b354793370..d2954b01ecc 100644
+--- a/frontend/packages/integration-tests/tests/cluster-settings/update-modal.cy.ts
++++ b/frontend/packages/integration-tests/tests/cluster-settings/update-modal.cy.ts
+@@ -3,22 +3,47 @@ import {
+   clusterVersionWithAvailableAndConditionalUpdates,
+   clusterVersionWithConditionalUpdates,
+ } from '../../mocks/cluster-version';
++import {
++  machineConfigPoolListWithPausedWorker,
++  machineConfigPoolListWithUnpausedWorker,
++} from '../../mocks/machine-config-pool';
+ import { checkErrors } from '../../support';
++import { stubMachineConfigPoolWatchWebSocket } from '../../support/stub-machine-config-pool-watch-ws';
+ import { clusterSettings } from '../../views/cluster-settings';
+ import { isLocalDevEnvironment } from '../../views/common';
+ 
+ const CLUSTER_VERSION_ALIAS = 'clusterVersion';
+-const WAIT_OPTIONS = { timeout: 300000 };
++const WAIT_OPTIONS = { requestTimeout: 300000 };
++// List requests only (not .../machineconfigpools/<name>).
++const MCP_LIST_PATTERN = '**/machineconfiguration.openshift.io/v1/machineconfigpools?*';
++const visitClusterSettingsWithMcpStub = () => {
++  clusterSettings.detailsIsLoaded({
++    onBeforeLoad: (win) => stubMachineConfigPoolWatchWebSocket(win),
++  });
++};
++const reloadClusterSettingsWithMcpStub = () => {
++  cy.reload({
++    onBeforeLoad: (win) => stubMachineConfigPoolWatchWebSocket(win),
++  });
++  cy.byLegacyTestID('horizontal-link-Details').should('exist');
++};
+ 
+-// Disabled due to createRoot concurrent rendering failures (OCPBUGS-82504)
+-xdescribe('Cluster Settings cluster update modal', () => {
++describe('Cluster Settings cluster update modal', () => {
+   before(() => {
+     cy.login();
+     cy.initAdmin();
+   });
+ 
+   beforeEach(() => {
+-    clusterSettings.detailsIsLoaded();
++    cy.intercept(
++      '/api/kubernetes/apis/config.openshift.io/v1/clusterversions/version',
++      clusterVersionWithAvailableUpdates,
++    ).as(CLUSTER_VERSION_ALIAS);
++    cy.intercept('GET', MCP_LIST_PATTERN, {
++      body: machineConfigPoolListWithPausedWorker,
++    });
++    visitClusterSettingsWithMcpStub();
++    cy.wait(`@${CLUSTER_VERSION_ALIAS}`, WAIT_OPTIONS);
+   });
+ 
+   afterEach(() => {
+@@ -28,11 +53,6 @@ xdescribe('Cluster Settings cluster update modal', () => {
+   it('changes based on the cluster', () => {
+     cy.log('with a paused Worker MCP');
+     clusterSettings.pauseMCP();
+-    cy.intercept(
+-      '/api/kubernetes/apis/config.openshift.io/v1/clusterversions/version',
+-      clusterVersionWithAvailableUpdates,
+-    ).as(CLUSTER_VERSION_ALIAS);
+-    cy.wait(`@${CLUSTER_VERSION_ALIAS}`, WAIT_OPTIONS);
+     clusterSettings.openUpdateModalAndOpenDropdown();
+     cy.byTestID('update-cluster-modal')
+       .find('[data-test="dropdown-with-switch-switch"]')
+@@ -40,12 +60,16 @@ xdescribe('Cluster Settings cluster update modal', () => {
+       .and('have.attr', 'disabled');
+     cy.byTestID('update-cluster-modal')
+       .find('[data-test="dropdown-with-switch-menu-item-4.17.1"]')
+-      .should('exist')
++      .should('exist');
++    cy.byTestID('update-cluster-modal')
++      .find('[data-test="dropdown-with-switch-menu-item-4.17.1"]')
+       .click();
+     cy.byTestID('update-cluster-modal-paused-nodes-warning').should('exist');
+-    cy.byTestID('update-cluster-modal-partial-update-radio').should('exist').click();
++    cy.byTestID('update-cluster-modal-partial-update-radio').should('exist');
++    cy.byTestID('update-cluster-modal-partial-update-radio').click();
+     cy.byTestID('pause-mcp-checkbox-worker').should('exist').and('have.attr', 'checked');
+-    cy.byLegacyTestID('modal-cancel-action').should('exist').click();
++    cy.byLegacyTestID('modal-cancel-action').should('exist');
++    cy.byLegacyTestID('modal-cancel-action').click();
+     clusterSettings.pauseMCP('false');
+ 
+     cy.log('with available and conditional updates');
+@@ -53,48 +77,67 @@ xdescribe('Cluster Settings cluster update modal', () => {
+       '/api/kubernetes/apis/config.openshift.io/v1/clusterversions/version',
+       clusterVersionWithAvailableAndConditionalUpdates,
+     ).as(CLUSTER_VERSION_ALIAS);
++    cy.intercept('GET', MCP_LIST_PATTERN, {
++      body: machineConfigPoolListWithUnpausedWorker,
++    });
++    reloadClusterSettingsWithMcpStub();
+     cy.wait(`@${CLUSTER_VERSION_ALIAS}`, WAIT_OPTIONS);
+     clusterSettings.openUpdateModalAndOpenDropdown();
+     cy.byTestID('update-cluster-modal')
+       .find('[data-test="dropdown-with-switch-menu-item-4.17.1"]')
+-      .should('exist')
++      .should('exist');
++    cy.byTestID('update-cluster-modal')
++      .find('[data-test="dropdown-with-switch-menu-item-4.17.1"]')
+       .click();
+     cy.byTestID('update-cluster-modal-not-recommended-alert').should('not.exist');
+     // Only run locally as this is flaking in CI
+     if (isLocalDevEnvironment) {
++      cy.byTestID('update-cluster-modal')
++        .find('[data-test="dropdown-with-switch-toggle"]')
++        .should('exist');
+       cy.byTestID('update-cluster-modal').find('[data-test="dropdown-with-switch-toggle"]').click();
+       cy.byTestID('update-cluster-modal')
+         .find('[data-test="dropdown-with-switch-switch"]')
+-        .should('exist')
+-        .click();
++        .should('exist');
++      cy.byTestID('update-cluster-modal').find('[data-test="dropdown-with-switch-switch"]').click();
++      cy.byTestID('update-cluster-modal')
++        .find('[data-test="dropdown-with-switch-menu-item-4.16.4"]')
++        .should('exist');
+       cy.byTestID('update-cluster-modal')
+         .find('[data-test="dropdown-with-switch-menu-item-4.16.4"]')
+-        .should('exist')
+         .click();
+       cy.byTestID('update-cluster-modal-not-recommended-alert').should('exist');
+     }
+-    cy.byLegacyTestID('modal-cancel-action').should('exist').click();
++    cy.byLegacyTestID('modal-cancel-action').should('exist');
++    cy.byLegacyTestID('modal-cancel-action').click();
+ 
+     cy.log('with conditional updates');
+     cy.intercept(
+       '/api/kubernetes/apis/config.openshift.io/v1/clusterversions/version',
+       clusterVersionWithConditionalUpdates,
+     ).as(CLUSTER_VERSION_ALIAS);
++    cy.intercept('GET', MCP_LIST_PATTERN, {
++      body: machineConfigPoolListWithUnpausedWorker,
++    });
++    reloadClusterSettingsWithMcpStub();
+     cy.wait(`@${CLUSTER_VERSION_ALIAS}`, WAIT_OPTIONS);
+     cy.byTestID('cv-not-recommended-alert').should('exist');
+     clusterSettings.openUpdateModalAndOpenDropdown();
+     cy.byTestID('update-cluster-modal')
+       .find('[data-test="dropdown-with-switch-switch"]')
+-      .should('exist')
+-      .click();
++      .should('exist');
++    cy.byTestID('update-cluster-modal').find('[data-test="dropdown-with-switch-switch"]').click();
+     cy.byTestID('update-cluster-modal')
+       .find('[data-test="dropdown-with-switch-menu-item-4.17.1"]')
+       .should('not.exist');
+     cy.byTestID('update-cluster-modal')
+       .find('[data-test="dropdown-with-switch-menu-item-4.16.4"]')
+-      .should('exist')
++      .should('exist');
++    cy.byTestID('update-cluster-modal')
++      .find('[data-test="dropdown-with-switch-menu-item-4.16.4"]')
+       .click();
+     cy.byTestID('update-cluster-modal-not-recommended-alert').should('exist');
+-    cy.byLegacyTestID('modal-cancel-action').should('exist').click();
++    cy.byLegacyTestID('modal-cancel-action').should('exist');
++    cy.byLegacyTestID('modal-cancel-action').click();
+   });
+ });
+diff --git a/frontend/packages/integration-tests/views/cluster-settings.ts b/frontend/packages/integration-tests/views/cluster-settings.ts
+index 73a81f7a276..3fd59e104c3 100644
+--- a/frontend/packages/integration-tests/views/cluster-settings.ts
++++ b/frontend/packages/integration-tests/views/cluster-settings.ts
+@@ -1,19 +1,30 @@
+ export const clusterSettings = {
+-  detailsIsLoaded: () => {
+-    cy.visit('/settings/cluster');
++  detailsIsLoaded: (visitOptions?: Partial<Cypress.VisitOptions>) => {
++    cy.visit('/settings/cluster', visitOptions);
+     cy.byLegacyTestID('horizontal-link-Details').should('exist'); // wait for page to load
+   },
+   pauseMCP: (value: 'true' | 'false' = 'true') => {
+     cy.exec(
+-      `oc patch machineconfigpools worker --patch '{ "spec": { "paused": ${value} } }' --type=merge`,
++      `oc patch mcp/worker --patch '{ "spec": { "paused": ${value} } }' --type=merge`,
++      // MCO API is absent on non-OCP clusters and some CI profiles; tests still assert UI when MCP exists.
++      { failOnNonZeroExit: false },
+     );
+   },
+   openUpdateModalAndOpenDropdown: () => {
+     cy.byLegacyTestID('cv-update-button').should('exist').click();
+     cy.byLegacyTestID('modal-title').should('contain.text', 'Update cluster');
++    cy.byTestID('update-cluster-modal').should('exist').and('be.visible');
+     cy.byTestID('update-cluster-modal')
+       .find('[data-test="dropdown-with-switch-toggle"]')
+       .should('exist')
+-      .click();
++      .and('be.visible')
++      .and('not.be.disabled')
++      .and('not.have.attr', 'aria-busy', 'true');
++    // Query element again before clicking to ensure it's still in the DOM
++    cy.byTestID('update-cluster-modal')
++      .find('[data-test="dropdown-with-switch-toggle"]')
++      .should('be.visible')
++      .and('not.be.disabled');
++    cy.byTestID('update-cluster-modal').find('[data-test="dropdown-with-switch-toggle"]').click();
+   },
+ };

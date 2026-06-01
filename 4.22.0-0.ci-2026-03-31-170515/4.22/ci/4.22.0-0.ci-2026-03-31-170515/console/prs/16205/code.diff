@@ -1,0 +1,125 @@
+diff --git a/frontend/public/robots.txt b/frontend/public/robots.txt
+new file mode 100644
+index 00000000000..1f53798bb4f
+--- /dev/null
++++ b/frontend/public/robots.txt
+@@ -0,0 +1,2 @@
++User-agent: *
++Disallow: /
+diff --git a/frontend/webpack.config.ts b/frontend/webpack.config.ts
+index dbf428af08b..7a6f062995f 100644
+--- a/frontend/webpack.config.ts
++++ b/frontend/webpack.config.ts
+@@ -3,6 +3,7 @@ import * as ReactRefreshWebpackPlugin from '@pmmmwh/react-refresh-webpack-plugin
+ import * as HtmlWebpackPlugin from 'html-webpack-plugin';
+ import * as _ from 'lodash';
+ import * as MiniCssExtractPlugin from 'mini-css-extract-plugin';
++import * as CopyWebpackPlugin from 'copy-webpack-plugin';
+ import * as path from 'path';
+ import * as webpack from 'webpack';
+ import { WebpackSharedObject, WebpackSharedConfig } from '@openshift/dynamic-plugin-sdk-webpack';
+@@ -24,7 +25,6 @@ interface Configuration extends webpack.Configuration {
+ const ForkTsCheckerWebpackPlugin = require('fork-ts-checker-webpack-plugin');
+ const { BundleAnalyzerPlugin } = require('webpack-bundle-analyzer');
+ const MonacoWebpackPlugin = require('monaco-editor-webpack-plugin');
+-const CopyWebpackPlugin = require('copy-webpack-plugin');
+ const NodePolyfillPlugin = require('node-polyfill-webpack-plugin');
+ 
+ const NODE_ENV = process.env.NODE_ENV || 'development';
+@@ -288,31 +288,16 @@ const config: Configuration = {
+     }),
+     new CopyWebpackPlugin({
+       patterns: [
+-        { from: path.resolve(__dirname, './public/locales'), to: 'locales' },
+-        { from: path.resolve(__dirname, './packages/console-shared/locales'), to: 'locales' },
+-        { from: path.resolve(__dirname, './packages/console-app/locales'), to: 'locales' },
++        { from: path.resolve(__dirname, './public/robots.txt'), to: 'robots.txt' },
+         {
+-          from: path.resolve(__dirname, './packages/operator-lifecycle-manager/locales'),
+-          to: 'locales',
+-        },
+-        {
+-          from: path.resolve(__dirname, './packages/operator-lifecycle-manager-v1/locales'),
+-          to: 'locales',
+-        },
+-        { from: path.resolve(__dirname, './packages/dev-console/locales'), to: 'locales' },
+-        { from: path.resolve(__dirname, './packages/knative-plugin/locales'), to: 'locales' },
+-        { from: path.resolve(__dirname, './packages/container-security/locales'), to: 'locales' },
+-        { from: path.resolve(__dirname, './packages/shipwright-plugin/locales'), to: 'locales' },
+-        { from: path.resolve(__dirname, './packages/webterminal-plugin/locales'), to: 'locales' },
+-        { from: path.resolve(__dirname, './packages/topology/locales'), to: 'locales' },
+-        { from: path.resolve(__dirname, './packages/helm-plugin/locales'), to: 'locales' },
+-        { from: path.resolve(__dirname, './packages/git-service/locales'), to: 'locales' },
+-        { from: path.resolve(__dirname, './packages/metal3-plugin/locales'), to: 'locales' },
+-        { from: path.resolve(__dirname, './packages/vsphere-plugin/locales'), to: 'locales' },
+-        { from: path.resolve(__dirname, './packages/insights-plugin/locales'), to: 'locales' },
+-        {
+-          from: path.resolve(__dirname, './packages/console-telemetry-plugin/locales'),
+-          to: 'locales',
++          from: './{packages/*,public}/locales',
++          // Flat locales directory structure: /static/locales/{en,fr,...}/{namespace}.json
++          to: ({ absoluteFilename }) => {
++            const segments = absoluteFilename.split(path.sep);
++            return segments.slice(segments.lastIndexOf('locales')).join(path.sep);
++          },
++          context: path.resolve(__dirname),
++          filter: (p) => path.extname(p) === '.json',
+         },
+       ],
+     }),
+diff --git a/pkg/server/robots_test.go b/pkg/server/robots_test.go
+new file mode 100644
+index 00000000000..f5b4b8405d9
+--- /dev/null
++++ b/pkg/server/robots_test.go
+@@ -0,0 +1,33 @@
++package server
++
++import (
++	"net/http"
++	"net/http/httptest"
++	"os"
++	"path"
++	"testing"
++)
++
++func TestRobotsTxtHandler(t *testing.T) {
++	dir := t.TempDir()
++	content := "User-agent: *\nDisallow: /\n"
++	if err := os.WriteFile(path.Join(dir, "robots.txt"), []byte(content), 0644); err != nil {
++		t.Fatal(err)
++	}
++
++	mux := http.NewServeMux()
++	mux.HandleFunc("/robots.txt", func(w http.ResponseWriter, r *http.Request) {
++		http.ServeFile(w, r, path.Join(dir, "robots.txt"))
++	})
++
++	req := httptest.NewRequest(http.MethodGet, "/robots.txt", nil)
++	rec := httptest.NewRecorder()
++	mux.ServeHTTP(rec, req)
++
++	if rec.Code != http.StatusOK {
++		t.Errorf("expected status 200, got %d", rec.Code)
++	}
++	if got := rec.Body.String(); got != content {
++		t.Errorf("expected body %q, got %q", content, got)
++	}
++}
+diff --git a/pkg/server/server.go b/pkg/server/server.go
+index 728f0b4d6d0..d2635560772 100644
+--- a/pkg/server/server.go
++++ b/pkg/server/server.go
+@@ -335,6 +335,12 @@ func (s *Server) HTTPHandler() (http.Handler, error) {
+ 	staticHandler := http.StripPrefix(proxy.SingleJoiningSlash(s.BaseURL.Path, "/static/"), disableDirectoryListing(http.FileServer(http.Dir(s.PublicDir))))
+ 	handle("/static/", middleware.WithGZIPEncoding(middleware.WithSecurityHeaders(staticHandler)))
+ 
++	// Register robots.txt at the origin root so crawlers can find it at /robots.txt
++	// regardless of s.BaseURL.Path (e.g., /console/).
++	mux.Handle("/robots.txt", middleware.WithSecurityHeaders(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
++		http.ServeFile(w, r, path.Join(s.PublicDir, "robots.txt"))
++	})))
++
+ 	if s.CustomLogoFiles != nil {
+ 		handleFunc(customLogoEndpoint, func(w http.ResponseWriter, r *http.Request) {
+ 			serverconfig.CustomLogosHandler(w, r, s.CustomLogoFiles, s.CustomFaviconFiles)

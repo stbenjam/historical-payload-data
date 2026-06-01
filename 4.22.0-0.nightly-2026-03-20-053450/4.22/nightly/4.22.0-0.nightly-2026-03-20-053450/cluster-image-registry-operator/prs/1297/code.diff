@@ -1,0 +1,1001 @@
+diff --git a/cmd/cluster-image-registry-operator/main.go b/cmd/cluster-image-registry-operator/main.go
+index f0d8bbefea..8e5e03bf91 100644
+--- a/cmd/cluster-image-registry-operator/main.go
++++ b/cmd/cluster-image-registry-operator/main.go
+@@ -3,6 +3,7 @@ package main
+ import (
+ 	"context"
+ 	"flag"
++	"fmt"
+ 	"log"
+ 	"os"
+ 	"runtime"
+@@ -15,6 +16,7 @@ import (
+ 
+ 	configv1 "github.com/openshift/api/config/v1"
+ 	"github.com/openshift/library-go/pkg/controller/controllercmd"
++	kubeyaml "k8s.io/apimachinery/pkg/util/yaml"
+ 
+ 	"github.com/openshift/cluster-image-registry-operator/pkg/defaults"
+ 	"github.com/openshift/cluster-image-registry-operator/pkg/metrics"
+@@ -23,11 +25,10 @@ import (
+ 	"github.com/openshift/cluster-image-registry-operator/pkg/version"
+ )
+ 
+-const metricsPort = 60000
+-
+ var (
+-	kubeconfig   string
+-	filesToWatch []string
++	controllerConfig string
++	kubeconfig       string
++	filesToWatch     []string
+ )
+ 
+ func printVersion() {
+@@ -36,6 +37,40 @@ func printVersion() {
+ 	klog.Infof("Go OS/Arch: %s/%s", runtime.GOOS, runtime.GOARCH)
+ }
+ 
++// readAndParseControllerConfig reads and parses the controller configuration file.
++// If path is empty, returns default config (for backwards compatibility during
++// migration to file-based configuration).
++func readAndParseControllerConfig(path string) (*configv1.GenericControllerConfig, error) {
++	config := &configv1.GenericControllerConfig{
++		ServingInfo: configv1.HTTPServingInfo{
++			ServingInfo: configv1.ServingInfo{
++				BindAddress: ":60000",
++			},
++		},
++	}
++	if path == "" {
++		return config, nil
++	}
++
++	content, err := os.ReadFile(path)
++	if err != nil {
++		return nil, fmt.Errorf("failed to read config file: %w", err)
++	}
++
++	if err := kubeyaml.Unmarshal(content, config); err != nil {
++		return nil, fmt.Errorf("failed to unmarshal config content: %w", err)
++	}
++
++	// make sure we always have a bind address present in the config. This
++	// is just for the case where the config has an explicitly empty
++	// bindAddress value.
++	if config.ServingInfo.BindAddress == "" {
++		config.ServingInfo.BindAddress = ":60000"
++	}
++
++	return config, nil
++}
++
+ func main() {
+ 	klogFlags := flag.NewFlagSet("klog", flag.ExitOnError)
+ 	klog.InitFlags(klogFlags)
+@@ -64,8 +99,23 @@ func main() {
+ 				"image-registry-operator",
+ 				func(ctx context.Context, cctx *controllercmd.ControllerContext) error {
+ 					printVersion()
++					config, err := readAndParseControllerConfig(controllerConfig)
++					if err != nil {
++						return fmt.Errorf("failed to read config: %w", err)
++					}
++
+ 					klog.Infof("Watching files %v...", filesToWatch)
+-					go metrics.RunServer(metricsPort)
++
++					metricsServer := metrics.NewServer(
++						"/etc/secrets/tls.crt",
++						"/etc/secrets/tls.key",
++						config.ServingInfo,
++					)
++
++					if err := metricsServer.Run(); err != nil {
++						return fmt.Errorf("failed to run metrics server: %w", err)
++					}
++
+ 					return operator.RunOperator(ctx, cctx.KubeConfig)
+ 				},
+ 				clock.RealClock{},
+@@ -87,6 +137,7 @@ func main() {
+ 
+ 	cmd.Flags().StringVar(&kubeconfig, "kubeconfig", "", "Path to a kubeconfig. Only required if out-of-cluster")
+ 	cmd.Flags().StringArrayVar(&filesToWatch, "files", []string{}, "List of files to watch")
++	cmd.Flags().StringVar(&controllerConfig, "config", "", "Path to the controller config file")
+ 
+ 	if err := cmd.Execute(); err != nil {
+ 		klog.Errorf("%v", err)
+diff --git a/cmd/cluster-image-registry-operator/main_test.go b/cmd/cluster-image-registry-operator/main_test.go
+new file mode 100644
+index 0000000000..2894cf7952
+--- /dev/null
++++ b/cmd/cluster-image-registry-operator/main_test.go
+@@ -0,0 +1,185 @@
++package main
++
++import (
++	"os"
++	"testing"
++
++	"github.com/google/go-cmp/cmp"
++	configv1 "github.com/openshift/api/config/v1"
++)
++
++func Test_readAndParseControllerConfig(t *testing.T) {
++	testCases := []struct {
++		name          string
++		configContent string
++		expected      *configv1.GenericControllerConfig
++		expectError   bool
++	}{
++		{
++			name: "valid config with bind address and TLS version",
++			configContent: `apiVersion: config.openshift.io/v1
++kind: GenericControllerConfig
++servingInfo:
++  bindAddress: "0.0.0.0:8443"
++  minTLSVersion: VersionTLS12
++`,
++			expected: &configv1.GenericControllerConfig{
++				ServingInfo: configv1.HTTPServingInfo{
++					ServingInfo: configv1.ServingInfo{
++						BindAddress:   "0.0.0.0:8443",
++						MinTLSVersion: "VersionTLS12",
++					},
++				},
++			},
++			expectError: false,
++		},
++		{
++			name:          "invalid YAML returns error",
++			configContent: `this is not valid yaml: [[[`,
++			expectError:   true,
++		},
++		{
++			name: "partial config with only bind address",
++			configContent: `apiVersion: config.openshift.io/v1
++kind: GenericControllerConfig
++servingInfo:
++  bindAddress: "localhost:9090"
++`,
++			expected: &configv1.GenericControllerConfig{
++				ServingInfo: configv1.HTTPServingInfo{
++					ServingInfo: configv1.ServingInfo{
++						BindAddress: "localhost:9090",
++					},
++				},
++			},
++			expectError: false,
++		},
++		{
++			name: "config with cipher suites",
++			configContent: `apiVersion: config.openshift.io/v1
++kind: GenericControllerConfig
++servingInfo:
++  bindAddress: "0.0.0.0:8443"
++  minTLSVersion: VersionTLS13
++  cipherSuites:
++  - TLS_AES_128_GCM_SHA256
++  - TLS_AES_256_GCM_SHA384
++`,
++			expected: &configv1.GenericControllerConfig{
++				ServingInfo: configv1.HTTPServingInfo{
++					ServingInfo: configv1.ServingInfo{
++						BindAddress:   "0.0.0.0:8443",
++						MinTLSVersion: "VersionTLS13",
++						CipherSuites: []string{
++							"TLS_AES_128_GCM_SHA256",
++							"TLS_AES_256_GCM_SHA384",
++						},
++					},
++				},
++			},
++			expectError: false,
++		},
++		{
++			name: "config with multiple TLS settings",
++			configContent: `apiVersion: config.openshift.io/v1
++kind: GenericControllerConfig
++servingInfo:
++  bindAddress: "127.0.0.1:6443"
++  minTLSVersion: VersionTLS13
++  cipherSuites:
++  - TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256
++`,
++			expected: &configv1.GenericControllerConfig{
++				ServingInfo: configv1.HTTPServingInfo{
++					ServingInfo: configv1.ServingInfo{
++						BindAddress:   "127.0.0.1:6443",
++						MinTLSVersion: "VersionTLS13",
++						CipherSuites: []string{
++							"TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256",
++						},
++					},
++				},
++			},
++			expectError: false,
++		},
++		{
++			name: "empty bind address",
++			configContent: `apiVersion: config.openshift.io/v1
++kind: GenericControllerConfig
++servingInfo:
++  bindAddress: ""
++  minTLSVersion: VersionTLS12
++`,
++			expected: &configv1.GenericControllerConfig{
++				ServingInfo: configv1.HTTPServingInfo{
++					ServingInfo: configv1.ServingInfo{
++						BindAddress:   ":60000",
++						MinTLSVersion: "VersionTLS12",
++					},
++				},
++			},
++			expectError: false,
++		},
++		{
++			name:          "no config path",
++			configContent: "",
++			expected: &configv1.GenericControllerConfig{
++				ServingInfo: configv1.HTTPServingInfo{
++					ServingInfo: configv1.ServingInfo{
++						BindAddress: ":60000",
++					},
++				},
++			},
++			expectError: false,
++		},
++	}
++
++	for _, tc := range testCases {
++		t.Run(tc.name, func(t *testing.T) {
++			var configPath string
++			if tc.configContent == "" {
++				configPath = ""
++			} else {
++				tmpFile, err := os.CreateTemp("", "config-*.yaml")
++				if err != nil {
++					t.Fatalf("failed to create temp file: %v", err)
++				}
++				defer os.Remove(tmpFile.Name())
++
++				if _, err := tmpFile.Write([]byte(tc.configContent)); err != nil {
++					t.Fatalf("failed to write temp file: %v", err)
++				}
++				tmpFile.Close()
++				configPath = tmpFile.Name()
++			}
++
++			config, err := readAndParseControllerConfig(configPath)
++
++			if tc.expectError {
++				if err == nil {
++					t.Error("expected error but got none")
++				}
++				return
++			}
++
++			if err != nil {
++				t.Fatalf("unexpected error: %v", err)
++			}
++
++			if config == nil {
++				t.Fatal("expected config, got nil")
++			}
++
++			if diff := cmp.Diff(tc.expected.ServingInfo, config.ServingInfo); diff != "" {
++				t.Errorf("ServingInfo mismatch (-want +got):\n%s", diff)
++			}
++		})
++	}
++}
++
++func Test_readAndParseControllerConfig_nonExistentFile(t *testing.T) {
++	_, err := readAndParseControllerConfig("/nonexistent/file.yaml")
++	if err == nil {
++		t.Error("expected error for non-existent file")
++	}
++}
+diff --git a/manifests/07-operator-config.yaml b/manifests/07-operator-config.yaml
+new file mode 100644
+index 0000000000..cae6f1f052
+--- /dev/null
++++ b/manifests/07-operator-config.yaml
+@@ -0,0 +1,19 @@
++---
++apiVersion: v1
++kind: ConfigMap
++metadata:
++  annotations:
++    capability.openshift.io/name: ImageRegistry
++    include.release.openshift.io/hypershift: "true"
++    include.release.openshift.io/ibm-cloud-managed: "true"
++    include.release.openshift.io/self-managed-high-availability: "true"
++    include.release.openshift.io/single-node-developer: "true"
++    config.openshift.io/inject-tls: "true"
++  name: image-registry-operator-config
++  namespace: openshift-image-registry
++data:
++  config.yaml: |-
++    apiVersion: config.openshift.io/v1
++    kind: GenericControllerConfig
++    servingInfo:
++      bindAddress: ":60000"
+diff --git a/manifests/07-operator-ibm-cloud-managed.yaml b/manifests/07-operator-ibm-cloud-managed.yaml
+index 82abd95c2d..ea89ac1499 100644
+--- a/manifests/07-operator-ibm-cloud-managed.yaml
++++ b/manifests/07-operator-ibm-cloud-managed.yaml
+@@ -29,6 +29,8 @@ spec:
+         - --files=/var/run/configmaps/trusted-ca/tls-ca-bundle.pem
+         - --files=/etc/secrets/tls.crt
+         - --files=/etc/secrets/tls.key
++        - --files=/var/run/configmaps/image-registry-operator-config/config.yaml
++        - --config=/var/run/configmaps/image-registry-operator-config/config.yaml
+         env:
+         - name: RELEASE_VERSION
+           value: 0.0.1-snapshot
+@@ -77,6 +79,8 @@ spec:
+           name: tmp
+         - mountPath: /etc/pki/ca-trust/extracted/pem
+           name: ca-trust-extracted-pem
++        - mountPath: /var/run/configmaps/image-registry-operator-config
++          name: image-registry-operator-config
+       priorityClassName: system-cluster-critical
+       serviceAccountName: cluster-image-registry-operator
+       shareProcessNamespace: false
+@@ -113,3 +117,6 @@ spec:
+               path: token
+       - emptyDir: {}
+         name: ca-trust-extracted-pem
++      - configMap:
++          name: image-registry-operator-config
++        name: image-registry-operator-config
+diff --git a/manifests/07-operator.yaml b/manifests/07-operator.yaml
+index 91624c21bd..5b67015a60 100644
+--- a/manifests/07-operator.yaml
++++ b/manifests/07-operator.yaml
+@@ -47,6 +47,8 @@ spec:
+           - --files=/var/run/configmaps/trusted-ca/tls-ca-bundle.pem
+           - --files=/etc/secrets/tls.crt
+           - --files=/etc/secrets/tls.key
++          - --files=/var/run/configmaps/image-registry-operator-config/config.yaml
++          - --config=/var/run/configmaps/image-registry-operator-config/config.yaml
+           image: docker.io/openshift/origin-cluster-image-registry-operator:latest
+           ports:
+           - containerPort: 60000
+@@ -94,6 +96,8 @@ spec:
+               mountPath: /tmp
+             - name: ca-trust-extracted-pem
+               mountPath: /etc/pki/ca-trust/extracted/pem
++            - name: image-registry-operator-config
++              mountPath: /var/run/configmaps/image-registry-operator-config
+       volumes:
+         - name: tmp
+           emptyDir: {}
+@@ -118,3 +122,6 @@ spec:
+                 audience: openshift
+         - name: ca-trust-extracted-pem
+           emptyDir: {}
++        - name: image-registry-operator-config
++          configMap:
++            name: image-registry-operator-config
+diff --git a/pkg/metrics/server.go b/pkg/metrics/server.go
+index 13ce98c25d..af61ce3d2f 100644
+--- a/pkg/metrics/server.go
++++ b/pkg/metrics/server.go
+@@ -3,44 +3,99 @@ package metrics
+ import (
+ 	"crypto/tls"
+ 	"fmt"
++	"net"
+ 	"net/http"
+ 
+ 	"github.com/prometheus/client_golang/prometheus/promhttp"
+ 
++	configv1 "github.com/openshift/api/config/v1"
++	"github.com/openshift/library-go/pkg/crypto"
+ 	"k8s.io/klog/v2"
+ )
+ 
+-var (
+-	tlsCRT = "/etc/secrets/tls.crt"
+-	tlsKey = "/etc/secrets/tls.key"
+-)
+-
+-// RunServer starts the metrics server.
+-func RunServer(port int) {
+-	if port <= 0 {
+-		klog.Error("invalid port for metric server")
+-		return
+-	}
++// Server represents a metrics server that exposes Prometheus metrics over
++// HTTPS with configurable TLS settings.
++type Server struct {
++	tlsCRT      string
++	tlsKey      string
++	httpServer  *http.Server
++	servingInfo configv1.HTTPServingInfo
++}
+ 
++// NewServer creates a new metrics server.
++func NewServer(crt, key string, servingInfo configv1.HTTPServingInfo) *Server {
+ 	handler := promhttp.HandlerFor(
+-		registry,
+-		promhttp.HandlerOpts{
++		registry, promhttp.HandlerOpts{
+ 			ErrorHandling: promhttp.HTTPErrorOnError,
+ 		},
+ 	)
+ 
+-	bindAddr := fmt.Sprintf(":%d", port)
+ 	router := http.NewServeMux()
+ 	router.Handle("/metrics", handler)
+-	srv := &http.Server{
+-		Addr:         bindAddr,
+-		Handler:      router,
+-		TLSNextProto: map[string]func(*http.Server, *tls.Conn, http.Handler){}, // disable HTTP/2
++
++	return &Server{
++		tlsCRT:      crt,
++		tlsKey:      key,
++		servingInfo: servingInfo,
++		httpServer: &http.Server{
++			Handler:      router,
++			TLSNextProto: map[string]func(*http.Server, *tls.Conn, http.Handler){}, // disable HTTP/2
++		},
++	}
++}
++
++// Run starts the metrics server in a background goroutine. The server
++// listens on the configured bind address and serves Prometheus metrics
++// at the /metrics endpoint over HTTPS.
++func (s *Server) Run() error {
++	minTLSVersion, err := crypto.TLSVersion(s.servingInfo.MinTLSVersion)
++	if err != nil {
++		return fmt.Errorf("failed to parse min tls version: %w", err)
+ 	}
+ 
+-	if err := srv.ListenAndServeTLS(tlsCRT, tlsKey); err != nil {
+-		klog.Errorf("error starting metrics server: %v", err)
++	var suites []uint16
++	for _, suite := range s.servingInfo.CipherSuites {
++		tmp, err := crypto.CipherSuite(suite)
++		if err != nil {
++			return fmt.Errorf("failed to parse cipher suite %s: %w", suite, err)
++		}
++		suites = append(suites, tmp)
++	}
++
++	cert, err := tls.LoadX509KeyPair(s.tlsCRT, s.tlsKey)
++	if err != nil {
++		return fmt.Errorf("failed to load TLS certificate: %w", err)
++	}
++
++	listener, err := net.Listen("tcp", s.servingInfo.BindAddress)
++	if err != nil {
++		return fmt.Errorf("failed to start metrics listener: %w", err)
++	}
++
++	go func() {
++		tlsConfig := &tls.Config{
++			MinVersion:   minTLSVersion,
++			CipherSuites: suites,
++			Certificates: []tls.Certificate{cert},
++		}
++		if err := s.httpServer.Serve(tls.NewListener(listener, tlsConfig)); err != nil {
++			if err != http.ErrServerClosed {
++				klog.Errorf("error starting metrics server: %v", err)
++			}
++		}
++	}()
++
++	return nil
++}
++
++// Stop immediately shuts down the metrics server. It is safe to call Stop on a
++// server that has not been started. Returns an error if the server fails to
++// close.
++func (s *Server) Stop() error {
++	if s.httpServer == nil {
++		return nil
+ 	}
++	return s.httpServer.Close()
+ }
+ 
+ // StorageReconfigured keeps track of the number of times the operator got its
+diff --git a/pkg/metrics/server_test.go b/pkg/metrics/server_test.go
+index 23cb193e25..83d9069538 100644
+--- a/pkg/metrics/server_test.go
++++ b/pkg/metrics/server_test.go
+@@ -1,109 +1,84 @@
+ package metrics
+ 
+ import (
+-	"crypto/rand"
+-	"crypto/rsa"
+ 	"crypto/tls"
+-	"crypto/x509"
+-	"encoding/pem"
++	"fmt"
+ 	"io"
+-	"log"
+-	"math/big"
+ 	"net/http"
+ 	"os"
+ 	"testing"
+ 	"time"
+ 
++	configv1 "github.com/openshift/api/config/v1"
+ 	io_prometheus_client "github.com/prometheus/client_model/go"
+ 	"github.com/prometheus/common/expfmt"
++	"k8s.io/client-go/util/cert"
+ )
+ 
+-func TestMain(m *testing.M) {
+-	var err error
+-
+-	tlsKey, tlsCRT, err = generateTempCertificates()
++func generateTempCertificates(t *testing.T) (string, string) {
++	certPEM, keyPEM, err := cert.GenerateSelfSignedCertKey("localhost", nil, nil)
+ 	if err != nil {
+-		panic(err)
+-	}
+-
+-	// sets the default http client to skip certificate check.
+-	http.DefaultTransport.(*http.Transport).TLSClientConfig = &tls.Config{
+-		InsecureSkipVerify: true,
+-	}
+-
+-	go RunServer(5000)
+-
+-	// give http handlers/server some time to process certificates and
+-	// get online before running tests.
+-	time.Sleep(time.Second)
+-
+-	code := m.Run()
+-	keyErr := os.Remove(tlsKey)
+-	crtErr := os.Remove(tlsCRT)
+-	if keyErr != nil {
+-		log.Fatal(keyErr)
+-	}
+-	if crtErr != nil {
+-		log.Fatal(crtErr)
++		t.Fatalf("failed to generate self-signed certificate: %v", err)
+ 	}
+-	os.Exit(code)
+-}
+ 
+-func generateTempCertificates() (string, string, error) {
+-	key, err := rsa.GenerateKey(rand.Reader, 1024)
++	certFile, err := os.CreateTemp("", "testcert-")
+ 	if err != nil {
+-		return "", "", err
+-	}
+-
+-	template := x509.Certificate{
+-		SerialNumber: big.NewInt(1),
+-	}
+-	derBytes, err := x509.CreateCertificate(rand.Reader, &template, &template, key.Public(), key)
+-	if err != nil {
+-		return "", "", err
++		t.Fatalf("failed to create temp cert file: %v", err)
+ 	}
++	certPath := certFile.Name()
++	certFile.Close()
++	t.Cleanup(func() {
++		_ = os.Remove(certPath)
++	})
+ 
+-	cert, err := os.CreateTemp("", "testcert-")
++	keyFile, err := os.CreateTemp("", "testkey-")
+ 	if err != nil {
+-		return "", "", err
++		t.Fatalf("failed to create temp key file: %v", err)
+ 	}
+-	defer cert.Close()
+-	err = pem.Encode(cert, &pem.Block{
+-		Type:  "CERTIFICATE",
+-		Bytes: derBytes,
++	keyPath := keyFile.Name()
++	keyFile.Close()
++	t.Cleanup(func() {
++		_ = os.Remove(keyPath)
+ 	})
+-	if err != nil {
+-		return "", "", err
+-	}
+ 
+-	keyPath, err := os.CreateTemp("", "testkey-")
+-	if err != nil {
+-		return "", "", err
++	if err := os.WriteFile(certPath, certPEM, 0o600); err != nil {
++		t.Fatalf("failed to write cert file: %v", err)
+ 	}
+-	defer keyPath.Close()
+-	err = pem.Encode(keyPath, &pem.Block{
+-		Type:  "RSA PRIVATE KEY",
+-		Bytes: x509.MarshalPKCS1PrivateKey(key),
+-	})
+-	if err != nil {
+-		return "", "", err
++
++	if err := os.WriteFile(keyPath, keyPEM, 0o600); err != nil {
++		t.Fatalf("failed to write key file: %v", err)
+ 	}
+ 
+-	return keyPath.Name(), cert.Name(), nil
++	return keyPath, certPath
+ }
+ 
+-func TestRun(t *testing.T) {
+-	resp, err := http.Get("https://localhost:5000/metrics")
+-	if err != nil {
+-		t.Fatalf("error requesting metrics server: %v", err)
++func TestStorageReconfigured(t *testing.T) {
++	tlsKey, tlsCRT := generateTempCertificates(t)
++	servingInfo := configv1.HTTPServingInfo{
++		ServingInfo: configv1.ServingInfo{BindAddress: "localhost:5000"},
+ 	}
+ 
+-	if resp.StatusCode != http.StatusOK {
+-		t.Errorf("expected 200, received %d instead.", resp.StatusCode)
++	server := NewServer(tlsCRT, tlsKey, servingInfo)
++
++	if err := server.Run(); err != nil {
++		t.Fatalf("failed to start server: %v", err)
++	}
++	defer func() {
++		if err := server.Stop(); err != nil {
++			t.Errorf("failed to stop metrics server: %v", err)
++		}
++	}()
++	time.Sleep(100 * time.Millisecond)
++
++	client := &http.Client{
++		Transport: &http.Transport{
++			TLSClientConfig: &tls.Config{
++				InsecureSkipVerify: true,
++			},
++		},
++		Timeout: 100 * time.Millisecond,
+ 	}
+-}
+ 
+-func TestStorageReconfigured(t *testing.T) {
+ 	metricName := "image_registry_operator_storage_reconfigured_total"
+ 	for _, tt := range []struct {
+ 		name string
+@@ -131,7 +106,7 @@ func TestStorageReconfigured(t *testing.T) {
+ 				StorageReconfigured()
+ 			}
+ 
+-			resp, err := http.Get("https://localhost:5000/metrics")
++			resp, err := client.Get("https://localhost:5000/metrics")
+ 			if err != nil {
+ 				t.Fatalf("error requesting metrics server: %v", err)
+ 			}
+@@ -150,6 +125,32 @@ func TestStorageReconfigured(t *testing.T) {
+ }
+ 
+ func TestImagePrunerInstallStatus(t *testing.T) {
++	tlsKey, tlsCRT := generateTempCertificates(t)
++	servingInfo := configv1.HTTPServingInfo{
++		ServingInfo: configv1.ServingInfo{BindAddress: "localhost:5000"},
++	}
++
++	server := NewServer(tlsCRT, tlsKey, servingInfo)
++
++	if err := server.Run(); err != nil {
++		t.Fatalf("failed to start server: %v", err)
++	}
++	defer func() {
++		if err := server.Stop(); err != nil {
++			t.Errorf("failed to stop metrics server: %v", err)
++		}
++	}()
++	time.Sleep(100 * time.Millisecond)
++
++	client := &http.Client{
++		Transport: &http.Transport{
++			TLSClientConfig: &tls.Config{
++				InsecureSkipVerify: true,
++			},
++		},
++		Timeout: 100 * time.Millisecond,
++	}
++
+ 	metricName := "image_registry_operator_image_pruner_install_status"
+ 	testCases := []struct {
+ 		name      string
+@@ -176,7 +177,7 @@ func TestImagePrunerInstallStatus(t *testing.T) {
+ 		t.Run(tc.name, func(t *testing.T) {
+ 			ImagePrunerInstallStatus(tc.installed, tc.enabled)
+ 
+-			resp, err := http.Get("https://localhost:5000/metrics")
++			resp, err := client.Get("https://localhost:5000/metrics")
+ 			if err != nil {
+ 				t.Fatalf("error requesting metrics server: %v", err)
+ 			}
+@@ -212,3 +213,167 @@ func findMetricsByCounter(buf io.ReadCloser, name string) []*io_prometheus_clien
+ 	}
+ 	return nil
+ }
++
++func TestTLSConfiguration(t *testing.T) {
++	tlsKey, tlsCRT := generateTempCertificates(t)
++	for _, tc := range []struct {
++		name              string
++		servingInfo       configv1.HTTPServingInfo
++		clientTLSConfig   *tls.Config
++		expectServerError bool
++		expectSuccess     bool
++	}{
++		{
++			name: "default server config accepts TLS 1.2 client",
++			servingInfo: configv1.HTTPServingInfo{
++				ServingInfo: configv1.ServingInfo{
++					BindAddress: "localhost:5000",
++				},
++			},
++			clientTLSConfig: &tls.Config{
++				InsecureSkipVerify: true,
++				MinVersion:         tls.VersionTLS12,
++				MaxVersion:         tls.VersionTLS12,
++			},
++			expectSuccess: true,
++		},
++		{
++			name: "default server config accepts TLS 1.3 client",
++			servingInfo: configv1.HTTPServingInfo{
++				ServingInfo: configv1.ServingInfo{
++					BindAddress: "localhost:5000",
++				},
++			},
++			clientTLSConfig: &tls.Config{
++				InsecureSkipVerify: true,
++				MinVersion:         tls.VersionTLS13,
++				MaxVersion:         tls.VersionTLS13,
++			},
++			expectSuccess: true,
++		},
++		{
++			name: "TLS 1.2 server accepts TLS 1.2 client",
++			servingInfo: configv1.HTTPServingInfo{
++				ServingInfo: configv1.ServingInfo{
++					BindAddress:   "localhost:5000",
++					MinTLSVersion: "VersionTLS12",
++				},
++			},
++			clientTLSConfig: &tls.Config{
++				InsecureSkipVerify: true,
++				MinVersion:         tls.VersionTLS12,
++				MaxVersion:         tls.VersionTLS12,
++			},
++			expectSuccess: true,
++		},
++		{
++			name: "TLS 1.2 server accepts TLS 1.3 client",
++			servingInfo: configv1.HTTPServingInfo{
++				ServingInfo: configv1.ServingInfo{
++					BindAddress:   "localhost:5000",
++					MinTLSVersion: "VersionTLS12",
++				},
++			},
++			clientTLSConfig: &tls.Config{
++				InsecureSkipVerify: true,
++				MinVersion:         tls.VersionTLS13,
++				MaxVersion:         tls.VersionTLS13,
++			},
++			expectSuccess: true,
++		},
++		{
++			name: "TLS 1.3 server accepts TLS 1.3 client",
++			servingInfo: configv1.HTTPServingInfo{
++				ServingInfo: configv1.ServingInfo{
++					BindAddress:   "localhost:5000",
++					MinTLSVersion: "VersionTLS13",
++				},
++			},
++			clientTLSConfig: &tls.Config{
++				InsecureSkipVerify: true,
++				MinVersion:         tls.VersionTLS13,
++				MaxVersion:         tls.VersionTLS13,
++			},
++			expectSuccess: true,
++		},
++		{
++			name: "TLS 1.3 server rejects TLS 1.2 client",
++			servingInfo: configv1.HTTPServingInfo{
++				ServingInfo: configv1.ServingInfo{
++					BindAddress:   "localhost:5000",
++					MinTLSVersion: "VersionTLS13",
++				},
++			},
++			clientTLSConfig: &tls.Config{
++				InsecureSkipVerify: true,
++				MinVersion:         tls.VersionTLS12,
++				MaxVersion:         tls.VersionTLS12,
++			},
++			expectSuccess: false,
++		},
++		{
++			name: "invalid MinTLSVersion returns error",
++			servingInfo: configv1.HTTPServingInfo{
++				ServingInfo: configv1.ServingInfo{
++					BindAddress:   "localhost:5008",
++					MinTLSVersion: "InvalidTLSVersion",
++				},
++			},
++			expectServerError: true,
++		},
++		{
++			name: "invalid CipherSuites returns error",
++			servingInfo: configv1.HTTPServingInfo{
++				ServingInfo: configv1.ServingInfo{
++					BindAddress:   "localhost:5009",
++					MinTLSVersion: "VersionTLS12",
++					CipherSuites:  []string{"INVALID_CIPHER_SUITE"},
++				},
++			},
++			expectServerError: true,
++		},
++	} {
++		t.Run(tc.name, func(t *testing.T) {
++			server := NewServer(tlsCRT, tlsKey, tc.servingInfo)
++
++			err := server.Run()
++			if tc.expectServerError {
++				if err == nil {
++					t.Error("expected server to return error, but it succeeded")
++				}
++				return
++			}
++			if err != nil {
++				t.Errorf("failed to start server: %v", err)
++				return
++			}
++
++			defer func() {
++				if err := server.Stop(); err != nil {
++					t.Errorf("failed to stop metrics server: %v", err)
++				}
++			}()
++			time.Sleep(100 * time.Millisecond)
++
++			client := &http.Client{
++				Transport: &http.Transport{TLSClientConfig: tc.clientTLSConfig},
++				Timeout:   100 * time.Millisecond,
++			}
++
++			url := fmt.Sprintf("https://%s/metrics", tc.servingInfo.BindAddress)
++			resp, err := client.Get(url)
++			if tc.expectSuccess {
++				if err != nil {
++					t.Errorf("expected successful connection but got error: %v", err)
++					return
++				}
++				resp.Body.Close()
++				return
++			}
++
++			if err == nil {
++				t.Error("expected connection to fail, but it succeeded")
++			}
++		})
++	}
++}
+diff --git a/pkg/operator/bootstrap.go b/pkg/operator/bootstrap.go
+index de207c095a..dab6b79604 100644
+--- a/pkg/operator/bootstrap.go
++++ b/pkg/operator/bootstrap.go
+@@ -30,7 +30,7 @@ import (
+ func (c *Controller) Bootstrap() error {
+ 	cr, err := c.listers.RegistryConfigs.Get(defaults.ImageRegistryResourceName)
+ 	if err != nil && !errors.IsNotFound(err) {
+-		return fmt.Errorf("unable to get the registry custom resources: %s", err)
++		return fmt.Errorf("unable to get the registry custom resources: %w", err)
+ 	}
+ 
+ 	// If the registry resource already exists, no bootstrapping is required
+@@ -43,7 +43,7 @@ func (c *Controller) Bootstrap() error {
+ 
+ 	platformStorage, replicas, err := storage.GetPlatformStorage(&c.listers.StorageListers)
+ 	if err != nil {
+-		return err
++		return fmt.Errorf("unable to get platform storage: %w", err)
+ 	}
+ 
+ 	infra, err := util.GetInfrastructure(c.listers.StorageListers.Infrastructures)
+@@ -110,7 +110,7 @@ func (c *Controller) Bootstrap() error {
+ 	if _, err = c.clients.RegOp.ImageregistryV1().Configs().Create(
+ 		context.TODO(), cr, metav1.CreateOptions{},
+ 	); err != nil {
+-		return err
++		return fmt.Errorf("unable to create registry config: %w", err)
+ 	}
+ 
+ 	return nil
+diff --git a/pkg/operator/bootstrap_test.go b/pkg/operator/bootstrap_test.go
+index 75af60a294..ccbd80b34a 100644
+--- a/pkg/operator/bootstrap_test.go
++++ b/pkg/operator/bootstrap_test.go
+@@ -42,8 +42,7 @@ func TestBootstrapAWS(t *testing.T) {
+ 		t.Fatalf("failed to add api server to tracker: %v", err)
+ 	}
+ 
+-	// Start the controller
+-	setup.start(t, ctx)
++	setup.start(t, ctx, false)
+ 
+ 	if err := setup.controller.Bootstrap(); err != nil {
+ 		t.Fatalf("bootstrap failed: %v", err)
+diff --git a/pkg/operator/controller_test.go b/pkg/operator/controller_test.go
+index 413df89dc4..021b8c6807 100644
+--- a/pkg/operator/controller_test.go
++++ b/pkg/operator/controller_test.go
+@@ -108,8 +108,8 @@ func registryConfigResourceVersionBumper(t *testing.T, regcli *imageregistryfake
+ // newTestControllerSetup creates fake clients and informer factories
+ // with the openshift-image-registry namespace. tests can add additional
+ // objects using setup.kubeClient.Tracker().Add(obj). after adding
+-// objects, call setup.start(ctx) to create the controller and start
+-// informers.
++// objects, call setup.start(t, ctx, startRunLoop) to create the controller
++// and start informers.
+ func newTestControllerSetup(t *testing.T) *testControllerSetup {
+ 	kubeClient := kubefakeclient.NewSimpleClientset()
+ 	configClient := configfakeclient.NewSimpleClientset()
+@@ -164,10 +164,12 @@ func newTestControllerSetup(t *testing.T) *testControllerSetup {
+ 	return setup
+ }
+ 
+-// start creates the controller, starts all informers, and launches the
+-// controller's Run() loop in a goroutine. the controller will
+-// automatically reconcile when changes are detected via its informers.
+-func (s *testControllerSetup) start(t *testing.T, ctx context.Context) {
++// start creates the controller and starts all informers. If startRunLoop is
++// true, it also launches the controller's Run() loop in a goroutine for
++// background reconciliation. If false, only informers are started (useful for
++// testing controller methods directly without background reconciliation
++// racing).
++func (s *testControllerSetup) start(t *testing.T, ctx context.Context, startRunLoop bool) {
+ 	openshiftConfigInformer := kubeinformers.NewSharedInformerFactoryWithOptions(
+ 		s.kubeClient, 0, kubeinformers.WithNamespace(defaults.OpenShiftConfigNamespace),
+ 	)
+@@ -216,9 +218,10 @@ func (s *testControllerSetup) start(t *testing.T, ctx context.Context) {
+ 	openshiftConfigManagedInformer.WaitForCacheSync(ctx.Done())
+ 	kubeSystemInformer.WaitForCacheSync(ctx.Done())
+ 
+-	// start the controller's reconciliation loop in a goroutine. the
+-	// controller will automatically process events from its informers
+-	// and reconcile.
++	if !startRunLoop {
++		return
++	}
++
+ 	stopCh := make(chan struct{})
+ 	go func() {
+ 		<-ctx.Done()
+@@ -276,7 +279,7 @@ func TestGlobalTLSCopy(t *testing.T) {
+ 		},
+ 		apiserver.ObserveTLSSecurityProfile,
+ 	)
+-	setup.start(t, ctx)
++	setup.start(t, ctx, true)
+ 	go configObserverController.Run(ctx, 1)
+ 
+ 	// env helps to evaluate a given environment variable value.
+diff --git a/test/e2e/emptydir_test.go b/test/e2e/emptydir_test.go
+index cfcbd46ffd..91bae1a4b9 100644
+--- a/test/e2e/emptydir_test.go
++++ b/test/e2e/emptydir_test.go
+@@ -51,7 +51,7 @@ func TestBasicEmptyDir(t *testing.T) {
+ 	if !logs.Contains(regexp.MustCompile(`Cluster Image Registry Operator Version: .+`)) {
+ 		t.Error("error: the log doesn't contain the operator's version")
+ 	}
+-	if !logs.Contains(regexp.MustCompile(`Watching files \[/var/run/configmaps/trusted-ca/tls-ca-bundle\.pem /etc/secrets/tls\.crt /etc/secrets/tls\.key\]`)) {
++	if !logs.Contains(regexp.MustCompile(`Watching files \[/var/run/configmaps/trusted-ca/tls-ca-bundle\.pem /etc/secrets/tls\.crt /etc/secrets/tls\.key /var/run/configmaps/image-registry-operator-config/config\.yaml\]`)) {
+ 		t.Error("error: the log doesn't contain correct watch files")
+ 	}
+ 	if !logs.Contains(regexp.MustCompile(`object changed`)) {

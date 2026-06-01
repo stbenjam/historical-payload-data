@@ -1,0 +1,166 @@
+diff --git a/bindata/kube-storage-version-migrator/deployment.yaml b/bindata/kube-storage-version-migrator/deployment.yaml
+index 9cd264d3b..f2ea73d2c 100644
+--- a/bindata/kube-storage-version-migrator/deployment.yaml
++++ b/bindata/kube-storage-version-migrator/deployment.yaml
+@@ -62,6 +62,9 @@ spec:
+         - key: node-role.kubernetes.io/master
+           operator: Exists
+           effect: NoSchedule
++        - key: node-role.kubernetes.io/control-plane
++          operator: Exists
++          effect: NoSchedule
+         - key: node.kubernetes.io/unreachable
+           operator: Exists
+           effect: NoExecute
+diff --git a/bindata/kube-storage-version-migrator/namespace.yaml b/bindata/kube-storage-version-migrator/namespace.yaml
+index df0309fc4..5257c8b36 100644
+--- a/bindata/kube-storage-version-migrator/namespace.yaml
++++ b/bindata/kube-storage-version-migrator/namespace.yaml
+@@ -3,6 +3,7 @@ kind: Namespace
+ metadata:
+   name: openshift-kube-storage-version-migrator
+   annotations:
++    openshift.io/node-selector: ""
+     workload.openshift.io/allowed: "management"
+   labels:
+     openshift.io/cluster-monitoring: "true"
+diff --git a/manifests/07_deployment-ibm-cloud-managed.yaml b/manifests/07_deployment-ibm-cloud-managed.yaml
+index b31556a2b..d0a65727c 100644
+--- a/manifests/07_deployment-ibm-cloud-managed.yaml
++++ b/manifests/07_deployment-ibm-cloud-managed.yaml
+@@ -72,6 +72,9 @@ spec:
+       - effect: NoSchedule
+         key: node-role.kubernetes.io/master
+         operator: Exists
++      - effect: NoSchedule
++        key: node-role.kubernetes.io/control-plane
++        operator: Exists
+       - effect: NoExecute
+         key: node.kubernetes.io/unreachable
+         operator: Exists
+diff --git a/manifests/07_deployment.yaml b/manifests/07_deployment.yaml
+index bc16a6e20..36ca4974e 100644
+--- a/manifests/07_deployment.yaml
++++ b/manifests/07_deployment.yaml
+@@ -68,7 +68,7 @@ spec:
+           configMap:
+             name: config
+       nodeSelector:
+-        node-role.kubernetes.io/master: ""
++        node-role.kubernetes.io/control-plane: ""
+       priorityClassName: "system-cluster-critical"
+       securityContext:
+         runAsNonRoot: true
+@@ -78,6 +78,9 @@ spec:
+       - key: "node-role.kubernetes.io/master"
+         operator: "Exists"
+         effect: "NoSchedule"
++      - key: "node-role.kubernetes.io/control-plane"
++        operator: "Exists"
++        effect: "NoSchedule"
+       - key: "node.kubernetes.io/unreachable"
+         operator: "Exists"
+         effect: "NoExecute"
+diff --git a/pkg/operator/deploymentcontroller/deployment.go b/pkg/operator/deploymentcontroller/deployment.go
+index 52e4d7266..3ed0b2c62 100644
+--- a/pkg/operator/deploymentcontroller/deployment.go
++++ b/pkg/operator/deploymentcontroller/deployment.go
+@@ -50,6 +50,7 @@ func NewMigratorDeploymentController(
+ 		},
+ 		setOperandLogLevel,
+ 		setDesiredReplicas(infrastructureInformer.Lister(), nodeInformer.Lister()),
++		setControlPlaneNodeSelector(infrastructureInformer.Lister()),
+ 	)
+ }
+ 
+@@ -97,6 +98,26 @@ func setOperandLogLevel(spec *operatorv1.OperatorSpec, deployment *appsv1.Deploy
+ 	return nil
+ }
+ 
++func setControlPlaneNodeSelector(infrastructureLister configv1listers.InfrastructureLister) deploymentcontroller.DeploymentHookFunc {
++	return func(spec *operatorv1.OperatorSpec, deployment *appsv1.Deployment) error {
++		infra, err := infrastructureLister.Get("cluster")
++		if err != nil {
++			return fmt.Errorf("failed to get infrastructure resource: %w", err)
++		}
++		// On HyperShift (External topology), no nodes carry control-plane
++		// labels in the guest cluster, so a nodeSelector would leave pods
++		// permanently Pending.
++		if infra.Status.ControlPlaneTopology == configv1.ExternalTopologyMode {
++			return nil
++		}
++		if deployment.Spec.Template.Spec.NodeSelector == nil {
++			deployment.Spec.Template.Spec.NodeSelector = make(map[string]string)
++		}
++		deployment.Spec.Template.Spec.NodeSelector["node-role.kubernetes.io/control-plane"] = ""
++		return nil
++	}
++}
++
+ func setDesiredReplicas(infrastructureLister configv1listers.InfrastructureLister, nodeLister corev1listers.NodeLister) deploymentcontroller.DeploymentHookFunc {
+ 	selector, err := labels.Parse("node-role.kubernetes.io/control-plane")
+ 	if err != nil {
+@@ -116,10 +137,9 @@ func setDesiredReplicas(infrastructureLister configv1listers.InfrastructureListe
+ 			replicas = 2
+ 		} else {
+ 			// Count control-plane nodes to determine the replica count.
+-			// We don't use deployment.Spec.Template.Spec.NodeSelector (as
+-			// library-go's WithReplicasHook does) because the deployment
+-			// does not have a nodeSelector. A previous attempt to add one
+-			// broke HyperShift (https://issues.redhat.com/browse/OCPBUGS-18125).
++			// We count nodes directly rather than relying on the deployment's
++			// NodeSelector (as library-go's WithReplicasHook does) because the
++			// nodeSelector is only set conditionally (see setControlPlaneNodeSelector).
+ 			nodes, err := nodeLister.List(selector)
+ 			if err != nil {
+ 				return err
+diff --git a/pkg/operator/deploymentcontroller/deployment_test.go b/pkg/operator/deploymentcontroller/deployment_test.go
+index d4fbd2166..3506dbd97 100644
+--- a/pkg/operator/deploymentcontroller/deployment_test.go
++++ b/pkg/operator/deploymentcontroller/deployment_test.go
+@@ -204,6 +204,45 @@ func Test_setDesiredReplicas(t *testing.T) {
+ 	}
+ }
+ 
++func Test_setControlPlaneNodeSelector(t *testing.T) {
++	testCases := []struct {
++		name             string
++		topology         configv1.TopologyMode
++		expectedSelector map[string]string
++	}{
++		{
++			name:             "HighlyAvailable sets control-plane nodeSelector",
++			topology:         configv1.HighlyAvailableTopologyMode,
++			expectedSelector: map[string]string{"node-role.kubernetes.io/control-plane": ""},
++		},
++		{
++			name:             "SingleReplica sets control-plane nodeSelector",
++			topology:         configv1.SingleReplicaTopologyMode,
++			expectedSelector: map[string]string{"node-role.kubernetes.io/control-plane": ""},
++		},
++		{
++			name:             "External topology does not set nodeSelector",
++			topology:         configv1.ExternalTopologyMode,
++			expectedSelector: nil,
++		},
++	}
++
++	for _, tc := range testCases {
++		t.Run(tc.name, func(t *testing.T) {
++			infraLister := fakeInfrastructureLister(newInfrastructure(tc.topology))
++			hook := setControlPlaneNodeSelector(infraLister)
++
++			deployment := &appsv1.Deployment{}
++			if err := hook(&operatorv1.OperatorSpec{}, deployment); err != nil {
++				t.Fatalf("unexpected error: %v", err)
++			}
++			if diff := cmp.Diff(tc.expectedSelector, deployment.Spec.Template.Spec.NodeSelector); diff != "" {
++				t.Fatalf("unexpected nodeSelector (-want +got):\n%s", diff)
++			}
++		})
++	}
++}
++
+ // Verify fakeNodeLister only returns nodes matching the control-plane selector.
+ func Test_setDesiredReplicas_nodeFiltering(t *testing.T) {
+ 	// The node lister in setDesiredReplicas uses a label selector, but our fake

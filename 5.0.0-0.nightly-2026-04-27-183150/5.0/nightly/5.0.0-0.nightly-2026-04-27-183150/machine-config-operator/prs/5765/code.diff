@@ -1,0 +1,1707 @@
+diff --git a/cmd/machine-config-controller/start.go b/cmd/machine-config-controller/start.go
+index 71a547e63c..647ad64562 100644
+--- a/cmd/machine-config-controller/start.go
++++ b/cmd/machine-config-controller/start.go
+@@ -7,6 +7,7 @@ import (
+ 	"os"
+ 
+ 	features "github.com/openshift/api/features"
++	mcfginformersv1alpha1 "github.com/openshift/client-go/machineconfiguration/informers/externalversions/machineconfiguration/v1alpha1"
+ 	"github.com/openshift/machine-config-operator/cmd/common"
+ 	"github.com/openshift/machine-config-operator/internal/clients"
+ 	bootimagecontroller "github.com/openshift/machine-config-operator/pkg/controller/bootimage"
+@@ -23,6 +24,7 @@ import (
+ 	"github.com/openshift/machine-config-operator/pkg/version"
+ 	"github.com/spf13/cobra"
+ 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
++	coreinformersv1 "k8s.io/client-go/informers/core/v1"
+ 	"k8s.io/client-go/tools/leaderelection"
+ 	"k8s.io/klog/v2"
+ )
+@@ -201,6 +203,16 @@ func runStartCmd(_ *cobra.Command, _ []string) {
+ }
+ 
+ func createControllers(ctx *ctrlcommon.ControllerContext) []ctrlcommon.Controller {
++	// Only watch IRI informers when the feature gate is enabled. The
++	// InternalReleaseImages CRD is not installed on clusters where the gate is
++	// off, so the informer list call would fail and WaitForCacheSync in the
++	// template controller would block forever.
++	var iriSecretsInformer coreinformersv1.SecretInformer
++	var iriInformer mcfginformersv1alpha1.InternalReleaseImageInformer
++	if ctx.FeatureGatesHandler.Enabled(features.FeatureGateNoRegistryClusterInstall) {
++		iriSecretsInformer = ctx.KubeInformerFactory.Core().V1().Secrets()
++		iriInformer = ctx.InformerFactory.Machineconfiguration().V1alpha1().InternalReleaseImages()
++	}
+ 
+ 	var controllers []ctrlcommon.Controller
+ 	controllers = append(controllers,
+@@ -209,9 +221,12 @@ func createControllers(ctx *ctrlcommon.ControllerContext) []ctrlcommon.Controlle
+ 			rootOpts.templates,
+ 			ctx.InformerFactory.Machineconfiguration().V1().ControllerConfigs(),
+ 			ctx.OpenShiftConfigKubeNamespacedInformerFactory.Core().V1().Secrets(),
++			iriSecretsInformer,
++			iriInformer,
+ 			ctx.ConfigInformerFactory.Config().V1().APIServers(),
+ 			ctx.ClientBuilder.KubeClientOrDie("template-controller"),
+ 			ctx.ClientBuilder.MachineConfigClientOrDie("template-controller"),
++			ctx.FeatureGatesHandler,
+ 		),
+ 		// Add all "sub-renderers here"
+ 		kubeletconfig.New(
+diff --git a/install/0000_80_machine-config_00_service.yaml b/install/0000_80_machine-config_00_service.yaml
+index 80a08e4be3..270b33cf8f 100644
+--- a/install/0000_80_machine-config_00_service.yaml
++++ b/install/0000_80_machine-config_00_service.yaml
+@@ -85,3 +85,23 @@ spec:
+     port: 9637
+     targetPort: 9637
+     protocol: TCP
++---
++apiVersion: v1
++kind: Service
++metadata:
++  name: internal-release-image-registry
++  namespace: openshift-machine-config-operator
++  labels:
++    k8s-app: internal-release-image-registry
++    # This Service has no backing pods. It exists solely to document port 22625
++    # in the OCP communication flows matrix (see enhancements/network/communication-flows-matrix-ingress.md).
++    not-active-service: "true"
++  annotations:
++    include.release.openshift.io/self-managed-high-availability: "true"
++spec:
++  type: ClusterIP
++  ports:
++  - name: https
++    port: 22625
++    targetPort: 22625
++    protocol: TCP
+diff --git a/pkg/controller/bootstrap/bootstrap.go b/pkg/controller/bootstrap/bootstrap.go
+index f155f50725..531b630bb1 100644
+--- a/pkg/controller/bootstrap/bootstrap.go
++++ b/pkg/controller/bootstrap/bootstrap.go
+@@ -118,6 +118,7 @@ func (b *Bootstrap) Run(destDir string) error {
+ 		iri                  *mcfgv1alpha1.InternalReleaseImage
+ 		iriTLSCert           *corev1.Secret
+ 		osImageStream        *mcfgv1alpha1.OSImageStream
++		iriCredentialsSecret        *corev1.Secret
+ 	)
+ 	for _, info := range infos {
+ 		if info.IsDir() {
+@@ -202,6 +203,9 @@ func (b *Bootstrap) Run(destDir string) error {
+ 				if obj.GetName() == ctrlcommon.InternalReleaseImageTLSSecretName {
+ 					iriTLSCert = obj
+ 				}
++				if obj.GetName() == ctrlcommon.InternalReleaseImageAuthSecretName {
++					iriCredentialsSecret = obj
++				}
+ 			case *mcfgv1alpha1.OSImageStream:
+ 				// If given, it's treated as user input with config such as the default stream
+ 				osImageStream = obj
+@@ -259,6 +263,17 @@ func (b *Bootstrap) Run(destDir string) error {
+ 	}
+ 
+ 	pullSecretBytes := pullSecret.Data[corev1.DockerConfigJsonKey]
++
++	// Merge IRI registry credentials into the pull secret for first-boot authentication.
++	// The template controller has not yet run at this point, so machine-config-daemon-pull.service
++	// would otherwise fail to authenticate against the IRI registry.
++	// Merge is a no-op if the feature gate is off or the IRI resource is absent.
++	merger := ctrlcommon.NewIRISecretMergerFromObjects(iriCredentialsSecret, cconfig, fgHandler, iri)
++	pullSecretBytes, err = merger.Merge(pullSecretBytes)
++	if err != nil {
++		return fmt.Errorf("could not merge IRI credentials into pull secret for bootstrap: %w", err)
++	}
++
+ 	iconfigs, err := template.RunBootstrap(b.templatesDir, cconfig, pullSecretBytes, apiServer)
+ 	if err != nil {
+ 		return err
+@@ -321,7 +336,7 @@ func (b *Bootstrap) Run(destDir string) error {
+ 
+ 	if fgHandler != nil && fgHandler.Enabled(features.FeatureGateNoRegistryClusterInstall) {
+ 		if iri != nil {
+-			iriConfigs, err := internalreleaseimage.RunInternalReleaseImageBootstrap(iri, iriTLSCert, cconfig)
++			iriConfigs, err := internalreleaseimage.RunInternalReleaseImageBootstrap(iri, iriTLSCert, iriCredentialsSecret, cconfig)
+ 			if err != nil {
+ 				return err
+ 			}
+diff --git a/pkg/controller/common/constants.go b/pkg/controller/common/constants.go
+index 1f890d0eb8..59801d7ce9 100644
+--- a/pkg/controller/common/constants.go
++++ b/pkg/controller/common/constants.go
+@@ -72,6 +72,15 @@ const (
+ 	// InternalReleaseImageTLSSecretName is the name of the secret manifest containing the InternalReleaseImage TLS certificate.
+ 	InternalReleaseImageTLSSecretName = "internal-release-image-tls"
+ 
++	// InternalReleaseImageAuthSecretName is the name of the secret containing IRI registry htpasswd auth credentials.
++	InternalReleaseImageAuthSecretName = "internal-release-image-registry-auth"
++
++	// IRIRegistryPort is the port on which the IRI registry listens on master nodes.
++	IRIRegistryPort = 22625
++
++	// IRIRegistryUsername is the fixed username used for IRI registry htpasswd authentication.
++	IRIRegistryUsername = "openshift"
++
+ 	// APIServerInstanceName is a singleton name for APIServer configuration
+ 	APIServerBootstrapFileLocation = "/etc/mcs/bootstrap/api-server/api-server.yaml"
+ 
+diff --git a/pkg/controller/common/iri_secret_merger.go b/pkg/controller/common/iri_secret_merger.go
+new file mode 100644
+index 0000000000..87de063a35
+--- /dev/null
++++ b/pkg/controller/common/iri_secret_merger.go
+@@ -0,0 +1,192 @@
++package common
++
++import (
++	"encoding/base64"
++	"encoding/json"
++	"errors"
++	"fmt"
++	"strings"
++
++	features "github.com/openshift/api/features"
++	mcfgv1 "github.com/openshift/api/machineconfiguration/v1"
++	mcfgv1alpha1 "github.com/openshift/api/machineconfiguration/v1alpha1"
++	mcfglistersv1 "github.com/openshift/client-go/machineconfiguration/listers/machineconfiguration/v1"
++	mcfglistersv1alpha1 "github.com/openshift/client-go/machineconfiguration/listers/machineconfiguration/v1alpha1"
++	corev1 "k8s.io/api/core/v1"
++	apierrors "k8s.io/apimachinery/pkg/api/errors"
++	"k8s.io/klog/v2"
++	corelistersv1 "k8s.io/client-go/listers/core/v1"
++)
++
++// errIRIDisabled is returned by resolve when the NoRegistryClusterInstall
++// feature gate is off or the InternalReleaseImage resource is absent.
++// Merge treats it as a skip signal rather than an error.
++var errIRIDisabled = errors.New("IRI not enabled or not present")
++
++// IRISecretMerger merges IRI registry credentials into a pull secret.
++// Construct via NewIRISecretMerger (controller use) or NewIRISecretMergerFromObjects
++// (bootstrap use); then call Merge for each pull secret that needs updating.
++type IRISecretMerger struct {
++	// resolve returns the password and baseDomain needed for merging, or
++	// errIRIDisabled when IRI is not in use on this cluster.
++	resolve func() (password, baseDomain string, err error)
++}
++
++// NewIRISecretMerger creates an IRISecretMerger that resolves the feature gate,
++// IRI resource, credentials secret, and ControllerConfig from the informer cache
++// at merge time. Use this in controllers where informers are available.
++// fgHandler must not be nil.
++func NewIRISecretMerger(
++	secretLister corelistersv1.SecretLister,
++	ccLister mcfglistersv1.ControllerConfigLister,
++	iriLister mcfglistersv1alpha1.InternalReleaseImageLister,
++	fgHandler FeatureGatesHandler,
++) *IRISecretMerger {
++	return &IRISecretMerger{
++		resolve: func() (string, string, error) {
++			if !fgHandler.Enabled(features.FeatureGateNoRegistryClusterInstall) {
++				return "", "", errIRIDisabled
++			}
++			_, err := iriLister.Get(InternalReleaseImageInstanceName)
++			if apierrors.IsNotFound(err) {
++				return "", "", errIRIDisabled
++			}
++			if err != nil {
++				return "", "", fmt.Errorf("could not get InternalReleaseImage: %w", err)
++			}
++			secret, err := secretLister.Secrets(MCONamespace).Get(InternalReleaseImageAuthSecretName)
++			if err != nil {
++				return "", "", fmt.Errorf("could not get IRI auth secret: %w", err)
++			}
++			cconfig, err := ccLister.Get(ControllerConfigName)
++			if err != nil {
++				return "", "", fmt.Errorf("could not get ControllerConfig: %w", err)
++			}
++			return extractIRICredentials(secret, cconfig)
++		},
++	}
++}
++
++// NewIRISecretMergerFromObjects creates an IRISecretMerger from pre-fetched objects.
++// Use this during bootstrap where informer caches are not yet available.
++// The feature gate and iri checks are deferred to Merge time so the constructor
++// never returns an error; if either check fails, Merge skips and logs.
++func NewIRISecretMergerFromObjects(
++	secret *corev1.Secret,
++	cconfig *mcfgv1.ControllerConfig,
++	fgHandler FeatureGatesHandler,
++	iri *mcfgv1alpha1.InternalReleaseImage,
++) *IRISecretMerger {
++	return &IRISecretMerger{
++		resolve: func() (string, string, error) {
++			if fgHandler == nil || !fgHandler.Enabled(features.FeatureGateNoRegistryClusterInstall) {
++				return "", "", errIRIDisabled
++			}
++			if iri == nil {
++				return "", "", errIRIDisabled
++			}
++			return extractIRICredentials(secret, cconfig)
++		},
++	}
++}
++
++// Merge merges IRI registry credentials into pullSecretRaw, adding auth entries
++// for api-int.<baseDomain>:<IRIRegistryPort> (all nodes) and
++// localhost:<IRIRegistryPort> (masters, where the registry runs locally).
++// If the feature gate is disabled or the InternalReleaseImage resource is absent,
++// Merge logs and returns pullSecretRaw unchanged.
++func (m *IRISecretMerger) Merge(pullSecretRaw []byte) ([]byte, error) {
++	password, baseDomain, err := m.resolve()
++	if errors.Is(err, errIRIDisabled) {
++		klog.V(4).Info("Skipping IRI registry credential merge: IRI not enabled or not present")
++		return pullSecretRaw, nil
++	}
++	if err != nil {
++		return nil, err
++	}
++	merged, changed, err := mergeIRIRegistryCredentialsIntoPullSecret(pullSecretRaw, password, baseDomain)
++	if err != nil {
++		return nil, err
++	}
++	if changed {
++		klog.V(4).Info("Merged IRI registry credentials into pull secret")
++	}
++	return merged, nil
++}
++
++// extractIRICredentials validates and extracts the password and baseDomain from
++// the IRI credentials secret and ControllerConfig.
++func extractIRICredentials(secret *corev1.Secret, cconfig *mcfgv1.ControllerConfig) (password, baseDomain string, err error) {
++	if secret == nil {
++		return "", "", fmt.Errorf("IRI registry credentials secret must not be nil")
++	}
++	if cconfig == nil {
++		return "", "", fmt.Errorf("ControllerConfig must not be nil")
++	}
++	if cconfig.Spec.DNS == nil {
++		return "", "", fmt.Errorf("ControllerConfig DNS spec must not be nil")
++	}
++	pw, ok := secret.Data["password"]
++	if !ok || len(pw) == 0 {
++		return "", "", fmt.Errorf("IRI registry credentials secret missing or empty \"password\" field")
++	}
++	bd := cconfig.Spec.DNS.Spec.BaseDomain
++	if strings.TrimSpace(bd) == "" {
++		return "", "", fmt.Errorf("ControllerConfig baseDomain must not be empty")
++	}
++	return string(pw), bd, nil
++}
++
++// mergeIRIRegistryCredentialsIntoPullSecret merges IRI registry authentication
++// credentials into a dockerconfigjson pull secret. It adds auth entries for
++// api-int.<baseDomain>:<IRIRegistryPort> (all nodes) and
++// localhost:<IRIRegistryPort> (masters, where the registry runs locally).
++// Returns the merged bytes, a boolean indicating whether the pull secret was
++// changed, and any error.
++func mergeIRIRegistryCredentialsIntoPullSecret(pullSecretRaw []byte, password, baseDomain string) ([]byte, bool, error) {
++	// The IRI registry is reachable via api-int on all nodes, and also via
++	// localhost on master nodes where it runs locally. registries.conf mirror
++	// rules on masters use localhost:22625, so credentials must be present for
++	// both hostnames to avoid authentication failures.
++	iriRegistryAPIIntHost := fmt.Sprintf("api-int.%s:%d", baseDomain, IRIRegistryPort)
++	iriRegistryLocalHost := fmt.Sprintf("localhost:%d", IRIRegistryPort)
++
++	var dockerConfig map[string]interface{}
++	if err := json.Unmarshal(pullSecretRaw, &dockerConfig); err != nil {
++		return nil, false, fmt.Errorf("could not parse pull secret: %w", err)
++	}
++
++	auths, ok := dockerConfig["auths"].(map[string]interface{})
++	if !ok {
++		return nil, false, fmt.Errorf("pull secret missing 'auths' field")
++	}
++
++	authValue := base64.StdEncoding.EncodeToString([]byte(IRIRegistryUsername + ":" + password))
++
++	// Check if both IRI entries already exist and are current — no update needed.
++	if pullSecretHasAuth(auths, iriRegistryAPIIntHost, authValue) && pullSecretHasAuth(auths, iriRegistryLocalHost, authValue) {
++		return pullSecretRaw, false, nil
++	}
++
++	klog.V(4).Infof("Merging IRI auth credentials into pull secret for %s and %s", iriRegistryAPIIntHost, iriRegistryLocalHost)
++	auths[iriRegistryAPIIntHost] = map[string]interface{}{
++		"auth": authValue,
++	}
++	auths[iriRegistryLocalHost] = map[string]interface{}{
++		"auth": authValue,
++	}
++
++	mergedBytes, err := json.Marshal(dockerConfig)
++	if err != nil {
++		return nil, false, fmt.Errorf("could not marshal merged pull secret: %w", err)
++	}
++
++	return mergedBytes, true, nil
++}
++
++// pullSecretHasAuth returns true if auths[host] exists and its "auth" field
++// matches expected.
++func pullSecretHasAuth(auths map[string]interface{}, host, expected string) bool {
++	e, ok := auths[host].(map[string]interface{})
++	return ok && e["auth"] == expected
++}
+diff --git a/pkg/controller/common/iri_secret_merger_test.go b/pkg/controller/common/iri_secret_merger_test.go
+new file mode 100644
+index 0000000000..b575a20eb2
+--- /dev/null
++++ b/pkg/controller/common/iri_secret_merger_test.go
+@@ -0,0 +1,393 @@
++package common
++
++import (
++	"encoding/base64"
++	"encoding/json"
++	"fmt"
++	"testing"
++
++	configv1 "github.com/openshift/api/config/v1"
++	features "github.com/openshift/api/features"
++	mcfgv1 "github.com/openshift/api/machineconfiguration/v1"
++	mcfgv1alpha1 "github.com/openshift/api/machineconfiguration/v1alpha1"
++	mcfglistersv1 "github.com/openshift/client-go/machineconfiguration/listers/machineconfiguration/v1"
++	mcfglistersv1alpha1 "github.com/openshift/client-go/machineconfiguration/listers/machineconfiguration/v1alpha1"
++	"github.com/stretchr/testify/assert"
++	"github.com/stretchr/testify/require"
++	corev1 "k8s.io/api/core/v1"
++	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
++	"k8s.io/client-go/tools/cache"
++	corelistersv1 "k8s.io/client-go/listers/core/v1"
++)
++
++// --- test helpers ---
++
++func newIRIRegistryCredentialsSecret(password string) *corev1.Secret {
++	return &corev1.Secret{
++		ObjectMeta: metav1.ObjectMeta{
++			Name:      InternalReleaseImageAuthSecretName,
++			Namespace: MCONamespace,
++		},
++		Data: map[string][]byte{
++			"password": []byte(password),
++		},
++	}
++}
++
++func cconfigWithDNS(baseDomain string) *mcfgv1.ControllerConfig {
++	return &mcfgv1.ControllerConfig{
++		ObjectMeta: metav1.ObjectMeta{
++			Name: ControllerConfigName,
++		},
++		Spec: mcfgv1.ControllerConfigSpec{
++			DNS: &configv1.DNS{
++				Spec: configv1.DNSSpec{BaseDomain: baseDomain},
++			},
++		},
++	}
++}
++
++func newIRIObject() *mcfgv1alpha1.InternalReleaseImage {
++	return &mcfgv1alpha1.InternalReleaseImage{
++		ObjectMeta: metav1.ObjectMeta{Name: InternalReleaseImageInstanceName},
++	}
++}
++
++func fgEnabled() FeatureGatesHandler {
++	return NewFeatureGatesHardcodedHandler([]configv1.FeatureGateName{features.FeatureGateNoRegistryClusterInstall}, nil)
++}
++
++func fgDisabled() FeatureGatesHandler {
++	return NewFeatureGatesHardcodedHandler(nil, []configv1.FeatureGateName{features.FeatureGateNoRegistryClusterInstall})
++}
++
++func newSecretLister(secrets ...*corev1.Secret) corelistersv1.SecretLister {
++	indexer := cache.NewIndexer(cache.MetaNamespaceKeyFunc, cache.Indexers{})
++	for _, s := range secrets {
++		indexer.Add(s)
++	}
++	return corelistersv1.NewSecretLister(indexer)
++}
++
++func newCCLister(cconfigs ...*mcfgv1.ControllerConfig) mcfglistersv1.ControllerConfigLister {
++	indexer := cache.NewIndexer(cache.MetaNamespaceKeyFunc, cache.Indexers{})
++	for _, cc := range cconfigs {
++		indexer.Add(cc)
++	}
++	return mcfglistersv1.NewControllerConfigLister(indexer)
++}
++
++func newIRILister(iris ...*mcfgv1alpha1.InternalReleaseImage) mcfglistersv1alpha1.InternalReleaseImageLister {
++	indexer := cache.NewIndexer(cache.MetaNamespaceKeyFunc, cache.Indexers{})
++	for _, iri := range iris {
++		indexer.Add(iri)
++	}
++	return mcfglistersv1alpha1.NewInternalReleaseImageLister(indexer)
++}
++
++// --- object-based constructor tests ---
++
++// TestIRISecretMergerFromObjects covers NewIRISecretMergerFromObjects. All checks
++// (feature gate, iri presence, credential validation) are deferred to Merge time.
++func TestIRISecretMergerFromObjects(t *testing.T) {
++	basePullSecret := `{"auths":{"quay.io":{"auth":"dGVzdDp0ZXN0"}}}`
++	validSecret := newIRIRegistryCredentialsSecret("testpassword")
++	validCconfig := cconfigWithDNS("example.com")
++	iri := newIRIObject()
++
++	tests := []struct {
++		name            string
++		pullSecret      string
++		secret          *corev1.Secret
++		cconfig         *mcfgv1.ControllerConfig
++		fgHandler       FeatureGatesHandler
++		iri             *mcfgv1alpha1.InternalReleaseImage
++		expectUnchanged bool
++		expectError     bool
++		verifyAuthHost  string
++	}{
++		{
++			name:           "adds IRI auth entry",
++			pullSecret:     basePullSecret,
++			secret:         validSecret,
++			cconfig:        validCconfig,
++			fgHandler:      fgEnabled(),
++			iri:            iri,
++			verifyAuthHost: "api-int.example.com:22625",
++		},
++		{
++			name:            "feature gate disabled skips merge",
++			pullSecret:      basePullSecret,
++			secret:          validSecret,
++			cconfig:         validCconfig,
++			fgHandler:       fgDisabled(),
++			iri:             iri,
++			expectUnchanged: true,
++		},
++		{
++			name:            "nil iri skips merge",
++			pullSecret:      basePullSecret,
++			secret:          validSecret,
++			cconfig:         validCconfig,
++			fgHandler:       fgEnabled(),
++			iri:             nil,
++			expectUnchanged: true,
++		},
++		{
++			name:        "nil secret returns error",
++			pullSecret:  basePullSecret,
++			secret:      nil,
++			cconfig:     validCconfig,
++			fgHandler:   fgEnabled(),
++			iri:         iri,
++			expectError: true,
++		},
++		{
++			name:        "nil cconfig returns error",
++			pullSecret:  basePullSecret,
++			secret:      validSecret,
++			cconfig:     nil,
++			fgHandler:   fgEnabled(),
++			iri:         iri,
++			expectError: true,
++		},
++		{
++			name:        "nil DNS returns error",
++			pullSecret:  basePullSecret,
++			secret:      validSecret,
++			cconfig:     &mcfgv1.ControllerConfig{},
++			fgHandler:   fgEnabled(),
++			iri:         iri,
++			expectError: true,
++		},
++		{
++			name:        "empty password returns error",
++			pullSecret:  basePullSecret,
++			secret:      newIRIRegistryCredentialsSecret(""),
++			cconfig:     validCconfig,
++			fgHandler:   fgEnabled(),
++			iri:         iri,
++			expectError: true,
++		},
++		{
++			name:            "already up-to-date returns unchanged",
++			pullSecret:      pullSecretWithIRIRegistryCredentials("example.com", "testpassword"),
++			secret:          validSecret,
++			cconfig:         validCconfig,
++			fgHandler:       fgEnabled(),
++			iri:             iri,
++			expectUnchanged: true,
++		},
++		{
++			name:           "updates stale entry",
++			pullSecret:     pullSecretWithIRIRegistryCredentials("example.com", "oldpassword"),
++			secret:         newIRIRegistryCredentialsSecret("newpassword"),
++			cconfig:        validCconfig,
++			fgHandler:      fgEnabled(),
++			iri:            iri,
++			verifyAuthHost: "api-int.example.com:22625",
++		},
++		{
++			name:        "invalid JSON returns error",
++			pullSecret:  "not-json",
++			secret:      validSecret,
++			cconfig:     validCconfig,
++			fgHandler:   fgEnabled(),
++			iri:         iri,
++			expectError: true,
++		},
++		{
++			name:        `missing "auths" field returns error`,
++			pullSecret:  `{"registry":"quay.io"}`,
++			secret:      validSecret,
++			cconfig:     validCconfig,
++			fgHandler:   fgEnabled(),
++			iri:         iri,
++			expectError: true,
++		},
++	}
++
++	for _, tt := range tests {
++		t.Run(tt.name, func(t *testing.T) {
++			merger := NewIRISecretMergerFromObjects(tt.secret, tt.cconfig, tt.fgHandler, tt.iri)
++			result, err := merger.Merge([]byte(tt.pullSecret))
++
++			if tt.expectError {
++				assert.Error(t, err)
++				return
++			}
++			require.NoError(t, err)
++			assertMergeResult(t, tt.pullSecret, tt.verifyAuthHost, tt.expectUnchanged, tt.secret, result)
++		})
++	}
++}
++
++// --- lister-based constructor tests ---
++
++// TestIRISecretMergerFromListers covers NewIRISecretMerger: lazy resolution from
++// the informer cache, including the feature gate and IRI resource checks.
++func TestIRISecretMergerFromListers(t *testing.T) {
++	basePullSecret := `{"auths":{"quay.io":{"auth":"dGVzdDp0ZXN0"}}}`
++	secret := newIRIRegistryCredentialsSecret("testpassword")
++	cconfig := cconfigWithDNS("example.com")
++	iri := newIRIObject()
++
++	tests := []struct {
++		name            string
++		pullSecret      string
++		secrets         []*corev1.Secret
++		cconfigs        []*mcfgv1.ControllerConfig
++		iris            []*mcfgv1alpha1.InternalReleaseImage
++		fgHandler       FeatureGatesHandler
++		expectUnchanged bool
++		expectError     bool
++		verifyAuthHost  string
++	}{
++		{
++			name:           "adds IRI auth entry",
++			pullSecret:     basePullSecret,
++			secrets:        []*corev1.Secret{secret},
++			cconfigs:       []*mcfgv1.ControllerConfig{cconfig},
++			iris:           []*mcfgv1alpha1.InternalReleaseImage{iri},
++			fgHandler:      fgEnabled(),
++			verifyAuthHost: "api-int.example.com:22625",
++		},
++		{
++			name:            "feature gate disabled skips merge",
++			pullSecret:      basePullSecret,
++			secrets:         []*corev1.Secret{secret},
++			cconfigs:        []*mcfgv1.ControllerConfig{cconfig},
++			iris:            []*mcfgv1alpha1.InternalReleaseImage{iri},
++			fgHandler:       fgDisabled(),
++			expectUnchanged: true,
++		},
++		{
++			name:            "IRI resource not found skips merge",
++			pullSecret:      basePullSecret,
++			secrets:         []*corev1.Secret{secret},
++			cconfigs:        []*mcfgv1.ControllerConfig{cconfig},
++			iris:            nil,
++			fgHandler:       fgEnabled(),
++			expectUnchanged: true,
++		},
++		{
++			name:        "secret not found returns error when IRI is enabled",
++			pullSecret:  basePullSecret,
++			secrets:     nil,
++			cconfigs:    []*mcfgv1.ControllerConfig{cconfig},
++			iris:        []*mcfgv1alpha1.InternalReleaseImage{iri},
++			fgHandler:   fgEnabled(),
++			expectError: true,
++		},
++		{
++			name:            "already up-to-date returns unchanged",
++			pullSecret:      pullSecretWithIRIRegistryCredentials("example.com", "testpassword"),
++			secrets:         []*corev1.Secret{secret},
++			cconfigs:        []*mcfgv1.ControllerConfig{cconfig},
++			iris:            []*mcfgv1alpha1.InternalReleaseImage{iri},
++			fgHandler:       fgEnabled(),
++			expectUnchanged: true,
++		},
++		{
++			name:           "updates stale entry",
++			pullSecret:     pullSecretWithIRIRegistryCredentials("example.com", "oldpassword"),
++			secrets:        []*corev1.Secret{newIRIRegistryCredentialsSecret("newpassword")},
++			cconfigs:       []*mcfgv1.ControllerConfig{cconfig},
++			iris:           []*mcfgv1alpha1.InternalReleaseImage{iri},
++			fgHandler:      fgEnabled(),
++			verifyAuthHost: "api-int.example.com:22625",
++		},
++		{
++			name:        "ControllerConfig missing DNS returns error",
++			pullSecret:  basePullSecret,
++			secrets:     []*corev1.Secret{secret},
++			cconfigs:    []*mcfgv1.ControllerConfig{{ObjectMeta: metav1.ObjectMeta{Name: ControllerConfigName}}},
++			iris:        []*mcfgv1alpha1.InternalReleaseImage{iri},
++			fgHandler:   fgEnabled(),
++			expectError: true,
++		},
++		{
++			name:        "secret missing password field returns error",
++			pullSecret:  basePullSecret,
++			secrets:     []*corev1.Secret{newIRIRegistryCredentialsSecret("")},
++			cconfigs:    []*mcfgv1.ControllerConfig{cconfig},
++			iris:        []*mcfgv1alpha1.InternalReleaseImage{iri},
++			fgHandler:   fgEnabled(),
++			expectError: true,
++		},
++	}
++
++	for _, tt := range tests {
++		t.Run(tt.name, func(t *testing.T) {
++			merger := NewIRISecretMerger(
++				newSecretLister(tt.secrets...),
++				newCCLister(tt.cconfigs...),
++				newIRILister(tt.iris...),
++				tt.fgHandler,
++			)
++			result, err := merger.Merge([]byte(tt.pullSecret))
++
++			if tt.expectError {
++				assert.Error(t, err)
++				return
++			}
++			require.NoError(t, err)
++
++			var resolvedSecret *corev1.Secret
++			if len(tt.secrets) > 0 {
++				resolvedSecret = tt.secrets[0]
++			}
++			assertMergeResult(t, tt.pullSecret, tt.verifyAuthHost, tt.expectUnchanged, resolvedSecret, result)
++		})
++	}
++}
++
++// --- shared assertion helper ---
++
++func assertMergeResult(t *testing.T, originalPullSecret, verifyAuthHost string, expectUnchanged bool, secret *corev1.Secret, result []byte) {
++	t.Helper()
++	if expectUnchanged {
++		assert.Equal(t, originalPullSecret, string(result), "pull secret should not change")
++		return
++	}
++
++	var dockerConfig map[string]interface{}
++	require.NoError(t, json.Unmarshal(result, &dockerConfig))
++
++	auths := dockerConfig["auths"].(map[string]interface{})
++	password := string(secret.Data["password"])
++	expectedAuth := base64.StdEncoding.EncodeToString([]byte("openshift:" + password))
++
++	iriEntry, ok := auths[verifyAuthHost].(map[string]interface{})
++	assert.True(t, ok, "IRI auth entry should be present for %s", verifyAuthHost)
++	assert.Equal(t, expectedAuth, iriEntry["auth"])
++
++	localEntry, ok := auths[fmt.Sprintf("localhost:%d", IRIRegistryPort)].(map[string]interface{})
++	assert.True(t, ok, "IRI auth entry should be present for localhost:%d", IRIRegistryPort)
++	assert.Equal(t, expectedAuth, localEntry["auth"])
++
++	_, hasQuay := auths["quay.io"]
++	assert.True(t, hasQuay, "original quay.io entry should be preserved")
++}
++
++// pullSecretWithIRIRegistryCredentials creates a pull secret JSON that already contains an IRI auth entry.
++func pullSecretWithIRIRegistryCredentials(baseDomain string, password string) string {
++	authValue := base64.StdEncoding.EncodeToString([]byte("openshift:" + password))
++	apiIntHost := fmt.Sprintf("api-int.%s:%d", baseDomain, IRIRegistryPort)
++	localHost := fmt.Sprintf("localhost:%d", IRIRegistryPort)
++	dockerConfig := map[string]interface{}{
++		"auths": map[string]interface{}{
++			"quay.io": map[string]interface{}{
++				"auth": "dGVzdDp0ZXN0",
++			},
++			apiIntHost: map[string]interface{}{
++				"auth": authValue,
++			},
++			localHost: map[string]interface{}{
++				"auth": authValue,
++			},
++		},
++	}
++	b, _ := json.Marshal(dockerConfig)
++	return string(b)
++}
+diff --git a/pkg/controller/internalreleaseimage/internalreleaseimage_bootstrap.go b/pkg/controller/internalreleaseimage/internalreleaseimage_bootstrap.go
+index 6d2a243eab..7bd19f940d 100644
+--- a/pkg/controller/internalreleaseimage/internalreleaseimage_bootstrap.go
++++ b/pkg/controller/internalreleaseimage/internalreleaseimage_bootstrap.go
+@@ -8,11 +8,11 @@ import (
+ )
+ 
+ // RunInternalReleaseImageBootstrap generates the MachineConfig objects for InternalReleaseImage that would have been generated by syncInternalReleaseImage.
+-func RunInternalReleaseImageBootstrap(iri *mcfgv1alpha1.InternalReleaseImage, iriSecret *corev1.Secret, cconfig *mcfgv1.ControllerConfig) ([]*mcfgv1.MachineConfig, error) {
++func RunInternalReleaseImageBootstrap(iri *mcfgv1alpha1.InternalReleaseImage, iriSecret, iriRegistryCredentialsSecret *corev1.Secret, cconfig *mcfgv1.ControllerConfig) ([]*mcfgv1.MachineConfig, error) {
+ 	configs := []*mcfgv1.MachineConfig{}
+ 
+ 	for _, role := range SupportedRoles {
+-		r := NewRendererByRole(role, iri, iriSecret, cconfig)
++		r := NewRendererByRole(role, iri, iriSecret, iriRegistryCredentialsSecret, cconfig)
+ 		mc, err := r.CreateEmptyMachineConfig()
+ 		if err != nil {
+ 			return nil, err
+diff --git a/pkg/controller/internalreleaseimage/internalreleaseimage_bootstrap_test.go b/pkg/controller/internalreleaseimage/internalreleaseimage_bootstrap_test.go
+index be62296f9f..62eb1d8826 100644
+--- a/pkg/controller/internalreleaseimage/internalreleaseimage_bootstrap_test.go
++++ b/pkg/controller/internalreleaseimage/internalreleaseimage_bootstrap_test.go
+@@ -8,7 +8,9 @@ import (
+ )
+ 
+ func TestRunInternalReleaseImageBootstrap(t *testing.T) {
+-	configs, err := RunInternalReleaseImageBootstrap(&mcfgv1alpha1.InternalReleaseImage{}, iriCertSecret().obj, cconfig().obj)
++	configs, err := RunInternalReleaseImageBootstrap(&mcfgv1alpha1.InternalReleaseImage{}, iriCertSecret().obj, iriRegistryCredentialsSecret().obj, cconfig().withDNS("example.com").obj)
+ 	assert.NoError(t, err)
+-	verifyAllInternalReleaseImageMachineConfigs(t, configs)
++	assert.Len(t, configs, 2)
++	verifyInternalReleaseMasterMachineConfig(t, configs[0])
++	verifyInternalReleaseWorkerMachineConfig(t, configs[1])
+ }
+diff --git a/pkg/controller/internalreleaseimage/internalreleaseimage_controller.go b/pkg/controller/internalreleaseimage/internalreleaseimage_controller.go
+index 2e77f56ee6..9f73dbc6bc 100644
+--- a/pkg/controller/internalreleaseimage/internalreleaseimage_controller.go
++++ b/pkg/controller/internalreleaseimage/internalreleaseimage_controller.go
+@@ -118,7 +118,11 @@ func New(
+ 		DeleteFunc: ctrl.deleteMachineConfig,
+ 	})
+ 
++	// Watch IRI secrets (TLS, auth) and the global pull secret. All are served
++	// by the cluster-wide KubeInformerFactory, so a single informer covers all
++	// namespaces.
+ 	secretInformer.Informer().AddEventHandler(cache.ResourceEventHandlerDetailedFuncs{
++		AddFunc:    ctrl.addSecret,
+ 		UpdateFunc: ctrl.updateSecret,
+ 	})
+ 
+@@ -275,15 +279,25 @@ func (ctrl *Controller) processMachineConfigEvent(obj interface{}, logMsg string
+ 	ctrl.queue.Add(ctrlcommon.InternalReleaseImageInstanceName)
+ }
+ 
+-func (ctrl *Controller) updateSecret(obj, _ interface{}) {
++func (ctrl *Controller) addSecret(obj interface{}, _ bool) {
+ 	secret := obj.(*corev1.Secret)
++	if secret.Name != ctrlcommon.InternalReleaseImageTLSSecretName &&
++		secret.Name != ctrlcommon.InternalReleaseImageAuthSecretName {
++		return
++	}
++	klog.V(4).Infof("Secret %s added, re-queuing IRI sync", secret.Name)
++	ctrl.queue.Add(ctrlcommon.InternalReleaseImageInstanceName)
++}
+ 
+-	// Skip any event not related to the InternalReleaseImage secrets
+-	if secret.Name != ctrlcommon.InternalReleaseImageTLSSecretName {
++func (ctrl *Controller) updateSecret(_, cur interface{}) {
++	secret := cur.(*corev1.Secret)
++
++	if secret.Name != ctrlcommon.InternalReleaseImageTLSSecretName &&
++		secret.Name != ctrlcommon.InternalReleaseImageAuthSecretName {
+ 		return
+ 	}
+ 
+-	klog.V(4).Infof("Secret %s update", secret.Name)
++	klog.V(4).Infof("Secret %s updated, re-queuing IRI sync", secret.Name)
+ 	ctrl.queue.Add(ctrlcommon.InternalReleaseImageInstanceName)
+ }
+ 
+@@ -355,8 +369,13 @@ func (ctrl *Controller) syncInternalReleaseImage(key string) (syncErr error) {
+ 		return fmt.Errorf("could not get Secret %s: %w", ctrlcommon.InternalReleaseImageTLSSecretName, err)
+ 	}
+ 
++	iriRegistryCredentialsSecret, err := ctrl.secretLister.Secrets(ctrlcommon.MCONamespace).Get(ctrlcommon.InternalReleaseImageAuthSecretName)
++	if err != nil {
++		return fmt.Errorf("could not get Secret %s: %w", ctrlcommon.InternalReleaseImageAuthSecretName, err)
++	}
++
+ 	for _, role := range SupportedRoles {
+-		r := NewRendererByRole(role, iri, iriSecret, cconfig)
++		r := NewRendererByRole(role, iri, iriSecret, iriRegistryCredentialsSecret, cconfig)
+ 
+ 		mc, err := ctrl.mcLister.Get(r.GetMachineConfigName())
+ 		isNotFound := errors.IsNotFound(err)
+diff --git a/pkg/controller/internalreleaseimage/internalreleaseimage_controller_test.go b/pkg/controller/internalreleaseimage/internalreleaseimage_controller_test.go
+index cb944d70bd..f5840c0bac 100644
+--- a/pkg/controller/internalreleaseimage/internalreleaseimage_controller_test.go
++++ b/pkg/controller/internalreleaseimage/internalreleaseimage_controller_test.go
+@@ -43,7 +43,7 @@ func TestInternalReleaseImageCreate(t *testing.T) {
+ 		},
+ 		{
+ 			name:           "add finalizer if not present",
+-			initialObjects: objs(iri(), clusterVersion(), cconfig(), iriCertSecret()),
++			initialObjects: objs(iri(), clusterVersion(), cconfig().withDNS("example.com"), iriCertSecret(), iriRegistryCredentialsSecret(), pullSecret()),
+ 			verify: func(t *testing.T, actualIRI *mcfgv1alpha1.InternalReleaseImage, actualMasterMC *mcfgv1.MachineConfig, actualWorkerMC *mcfgv1.MachineConfig) {
+ 				assert.Len(t, actualIRI.Finalizers, 2)
+ 				assert.Contains(t, actualIRI.Finalizers, masterName())
+@@ -54,7 +54,7 @@ func TestInternalReleaseImageCreate(t *testing.T) {
+ 			name: "update status if not set",
+ 			initialObjects: objs(
+ 				iri().finalizer(masterName(), workerName()),
+-				clusterVersion(), cconfig(), iriCertSecret()),
++				clusterVersion(), cconfig().withDNS("example.com"), iriCertSecret(), iriRegistryCredentialsSecret(), pullSecret()),
+ 			verify: func(t *testing.T, actualIRI *mcfgv1alpha1.InternalReleaseImage, actualMasterMC *mcfgv1.MachineConfig, actualWorkerMC *mcfgv1.MachineConfig) {
+ 				assert.Len(t, actualIRI.Status.Releases, 1)
+ 				assert.Equal(t, actualIRI.Status.Releases[0].Name, "ocp-release-bundle-4.21.5-x86_64")
+@@ -66,7 +66,7 @@ func TestInternalReleaseImageCreate(t *testing.T) {
+ 		},
+ 		{
+ 			name:           "generate iri machine-config if not present",
+-			initialObjects: objs(iri(), clusterVersion(), cconfig(), iriCertSecret()),
++			initialObjects: objs(iri(), clusterVersion(), cconfig().withDNS("example.com"), iriCertSecret(), iriRegistryCredentialsSecret(), pullSecret()),
+ 			verify: func(t *testing.T, actualIRI *mcfgv1alpha1.InternalReleaseImage, actualMasterMC *mcfgv1.MachineConfig, actualWorkerMC *mcfgv1.MachineConfig) {
+ 				verifyInternalReleaseMasterMachineConfig(t, actualMasterMC)
+ 				verifyInternalReleaseWorkerMachineConfig(t, actualWorkerMC)
+@@ -76,7 +76,7 @@ func TestInternalReleaseImageCreate(t *testing.T) {
+ 			name: "avoid machine-config drifting",
+ 			initialObjects: objs(
+ 				iri().finalizer(masterName(), workerName()),
+-				clusterVersion(), cconfig(), iriCertSecret(),
++				clusterVersion(), cconfig().withDNS("example.com"), iriCertSecret(), iriRegistryCredentialsSecret(), pullSecret(),
+ 				machineconfigmaster().ignition("some garbage"),
+ 				machineconfigworker().ignition("other garbage")),
+ 			verify: func(t *testing.T, actualIRI *mcfgv1alpha1.InternalReleaseImage, actualMasterMC *mcfgv1.MachineConfig, actualWorkerMC *mcfgv1.MachineConfig) {
+@@ -88,7 +88,7 @@ func TestInternalReleaseImageCreate(t *testing.T) {
+ 			name: "refresh machine-config on controllerConfig update",
+ 			initialObjects: objs(
+ 				iri().finalizer(masterName(), workerName()),
+-				clusterVersion(), cconfig().dockerRegistryImage("a-new-docker-registry-image-pullspec"), iriCertSecret(),
++				clusterVersion(), cconfig().dockerRegistryImage("a-new-docker-registry-image-pullspec").withDNS("example.com"), iriCertSecret(), iriRegistryCredentialsSecret(), pullSecret(),
+ 				machineconfigmaster(), machineconfigworker()),
+ 			verify: func(t *testing.T, actualIRI *mcfgv1alpha1.InternalReleaseImage, actualMasterMC *mcfgv1.MachineConfig, actualWorkerMC *mcfgv1.MachineConfig) {
+ 				verifyInternalReleaseMasterMachineConfig(t, actualMasterMC)
+@@ -125,7 +125,7 @@ func TestInternalReleaseImageCreate(t *testing.T) {
+ 			name: "status condition Degraded=False on successful sync",
+ 			initialObjects: objs(
+ 				iri().finalizer(masterName(), workerName()),
+-				clusterVersion(), cconfig(), iriCertSecret(),
++				clusterVersion(), cconfig().withDNS("example.com"), iriCertSecret(), iriRegistryCredentialsSecret(), pullSecret(),
+ 				machineconfigmaster(), machineconfigworker()),
+ 			verify: func(t *testing.T, actualIRI *mcfgv1alpha1.InternalReleaseImage, actualMasterMC *mcfgv1.MachineConfig, actualWorkerMC *mcfgv1.MachineConfig) {
+ 				assert.NotNil(t, actualIRI)
+diff --git a/pkg/controller/internalreleaseimage/internalreleaseimage_helpers_test.go b/pkg/controller/internalreleaseimage/internalreleaseimage_helpers_test.go
+index 77095793b3..0eca00e1e8 100644
+--- a/pkg/controller/internalreleaseimage/internalreleaseimage_helpers_test.go
++++ b/pkg/controller/internalreleaseimage/internalreleaseimage_helpers_test.go
+@@ -18,12 +18,6 @@ import (
+ 	"k8s.io/apimachinery/pkg/runtime"
+ )
+ 
+-func verifyAllInternalReleaseImageMachineConfigs(t *testing.T, configs []*mcfgv1.MachineConfig) {
+-	assert.Len(t, configs, 2)
+-	verifyInternalReleaseMasterMachineConfig(t, configs[0])
+-	verifyInternalReleaseWorkerMachineConfig(t, configs[1])
+-}
+-
+ func verifyInternalReleaseMasterMachineConfig(t *testing.T, mc *mcfgv1.MachineConfig) {
+ 	assert.Equal(t, masterName(), mc.Name)
+ 	assert.Equal(t, ctrlcommon.MachineConfigPoolMaster, mc.Labels[mcfgv1.MachineConfigRoleLabelKey])
+@@ -34,11 +28,14 @@ func verifyInternalReleaseMasterMachineConfig(t *testing.T, mc *mcfgv1.MachineCo
+ 
+ 	assert.Len(t, ignCfg.Systemd.Units, 1)
+ 	assert.Contains(t, *ignCfg.Systemd.Units[0].Contents, "docker-registry-image-pullspec")
++	assert.Contains(t, *ignCfg.Systemd.Units[0].Contents, "REGISTRY_AUTH_HTPASSWD_REALM")
++	assert.Contains(t, *ignCfg.Systemd.Units[0].Contents, "REGISTRY_AUTH_HTPASSWD_PATH")
+ 
+-	assert.Len(t, ignCfg.Storage.Files, 4, "Found an unexpected file")
++	assert.Len(t, ignCfg.Storage.Files, 5, "Found an unexpected file")
+ 	verifyIgnitionFile(t, &ignCfg, "/etc/pki/ca-trust/source/anchors/iri-root-ca.crt", "iri-root-ca-data")
+ 	verifyIgnitionFile(t, &ignCfg, "/etc/iri-registry/certs/tls.key", "iri-tls-key")
+ 	verifyIgnitionFile(t, &ignCfg, "/etc/iri-registry/certs/tls.crt", "iri-tls-crt")
++	verifyIgnitionFile(t, &ignCfg, "/etc/iri-registry/auth/htpasswd", "openshift:$2y$05$testhash")
+ 	verifyIgnitionFileContains(t, &ignCfg, "/usr/local/bin/load-registry-image.sh", "docker-registry-image-pullspec")
+ 	assert.Contains(t, *ignCfg.Systemd.Units[0].Contents, `REGISTRY_STORAGE_MAINTENANCE_READONLY={"enabled":true}`)
+ 	assert.NotContains(t, *ignCfg.Systemd.Units[0].Contents, "REGISTRY_STORAGE_MAINTENANCE_READONLY_ENABLED")
+@@ -69,6 +66,7 @@ func verifyIgnitionFileContains(t *testing.T, ignCfg *ign3types.Config, path str
+ 	assert.Contains(t, string(data), expectedContent, path)
+ }
+ 
++
+ // objs is an helper func to improve the test readability.
+ func objs(builders ...objBuilder) func() []runtime.Object {
+ 	return func() []runtime.Object {
+@@ -142,6 +140,15 @@ func cconfig() *controllerConfigBuilder {
+ 	}
+ }
+ 
++func (ccb *controllerConfigBuilder) withDNS(baseDomain string) *controllerConfigBuilder {
++	ccb.obj.Spec.DNS = &configv1.DNS{
++		Spec: configv1.DNSSpec{
++			BaseDomain: baseDomain,
++		},
++	}
++	return ccb
++}
++
+ func (ccb *controllerConfigBuilder) dockerRegistryImage(image string) *controllerConfigBuilder {
+ 	ccb.obj.Spec.Images[templatectrl.DockerRegistryKey] = image
+ 	return ccb
+@@ -226,6 +233,35 @@ func (sb *secretBuilder) build() runtime.Object {
+ 	return sb.obj
+ }
+ 
++func pullSecret() *secretBuilder {
++	return &secretBuilder{
++		obj: &corev1.Secret{
++			ObjectMeta: v1.ObjectMeta{
++				Namespace: ctrlcommon.OpenshiftConfigNamespace,
++				Name:      ctrlcommon.GlobalPullSecretName,
++			},
++			Data: map[string][]byte{
++				corev1.DockerConfigJsonKey: []byte(`{"auths":{"quay.io":{"auth":"dGVzdDp0ZXN0"}}}`),
++			},
++		},
++	}
++}
++
++func iriRegistryCredentialsSecret() *secretBuilder {
++	return &secretBuilder{
++		obj: &corev1.Secret{
++			ObjectMeta: v1.ObjectMeta{
++				Namespace: ctrlcommon.MCONamespace,
++				Name:      ctrlcommon.InternalReleaseImageAuthSecretName,
++			},
++			Data: map[string][]byte{
++				"htpasswd": []byte("openshift:$2y$05$testhash"),
++				"password": []byte("testpassword"),
++			},
++		},
++	}
++}
++
+ // clusterVersionBuilder simplifies the creation of a Secret resource in the test.
+ type clusterVersionBuilder struct {
+ 	obj *configv1.ClusterVersion
+diff --git a/pkg/controller/internalreleaseimage/internalreleaseimage_renderer.go b/pkg/controller/internalreleaseimage/internalreleaseimage_renderer.go
+index 36806638fc..f642183b31 100644
+--- a/pkg/controller/internalreleaseimage/internalreleaseimage_renderer.go
++++ b/pkg/controller/internalreleaseimage/internalreleaseimage_renderer.go
+@@ -37,20 +37,22 @@ var (
+ // the InternalReleaseImage machine config resources. It can also create
+ // a MachineConfig instance when required.
+ type Renderer struct {
+-	role      string
+-	iri       *mcfgv1alpha1.InternalReleaseImage
+-	iriSecret *corev1.Secret
+-	cconfig   *mcfgv1.ControllerConfig
++	role          string
++	iri           *mcfgv1alpha1.InternalReleaseImage
++	iriSecret     *corev1.Secret
++	iriRegistryCredentialsSecret *corev1.Secret
++	cconfig       *mcfgv1.ControllerConfig
+ }
+ 
+ // NewRendererByRole creates a new Renderer instance for generating
+ // the machine config for the given role.
+-func NewRendererByRole(role string, iri *mcfgv1alpha1.InternalReleaseImage, iriSecret *corev1.Secret, cconfig *mcfgv1.ControllerConfig) *Renderer {
++func NewRendererByRole(role string, iri *mcfgv1alpha1.InternalReleaseImage, iriSecret, iriRegistryCredentialsSecret *corev1.Secret, cconfig *mcfgv1.ControllerConfig) *Renderer {
+ 	return &Renderer{
+-		role:      role,
+-		iri:       iri,
+-		iriSecret: iriSecret,
+-		cconfig:   cconfig,
++		role:          role,
++		iri:           iri,
++		iriSecret:     iriSecret,
++		iriRegistryCredentialsSecret: iriRegistryCredentialsSecret,
++		cconfig:       cconfig,
+ 	}
+ }
+ 
+@@ -103,6 +105,7 @@ type renderContext struct {
+ 	IriTLSKey           string
+ 	IriTLSCert          string
+ 	RootCA              string
++	IriHtpasswd         string
+ }
+ 
+ // newRenderContext creates a new renderContext instance.
+@@ -115,11 +118,16 @@ func (r *Renderer) newRenderContext() (*renderContext, error) {
+ 	if err != nil {
+ 		return nil, err
+ 	}
++	// iriRegistryCredentialsSecret is always non-nil here: the IRI controller
++	// fetches it and fails loudly if not found (auth is mandatory).
++	iriHtpasswd := string(r.iriRegistryCredentialsSecret.Data["htpasswd"])
++
+ 	return &renderContext{
+ 		DockerRegistryImage: r.cconfig.Spec.Images[templatectrl.DockerRegistryKey],
+ 		IriTLSKey:           iriTLSKey,
+ 		IriTLSCert:          iriTLSCert,
+ 		RootCA:              string(r.cconfig.Spec.RootCAData),
++		IriHtpasswd:         iriHtpasswd,
+ 	}, nil
+ }
+ 
+diff --git a/pkg/controller/internalreleaseimage/templates/master/files/iri-registry-auth-htpasswd.yaml b/pkg/controller/internalreleaseimage/templates/master/files/iri-registry-auth-htpasswd.yaml
+new file mode 100644
+index 0000000000..37d62b1b71
+--- /dev/null
++++ b/pkg/controller/internalreleaseimage/templates/master/files/iri-registry-auth-htpasswd.yaml
+@@ -0,0 +1,5 @@
++mode: 0600
++path: "/etc/iri-registry/auth/htpasswd"
++contents:
++  inline: |-
++{{indent 4 .IriHtpasswd}}
+diff --git a/pkg/controller/internalreleaseimage/templates/master/files/usr-local-bin-load-registry-image-sh.yaml b/pkg/controller/internalreleaseimage/templates/master/files/usr-local-bin-load-registry-image-sh.yaml
+index 2d93e79a1f..49f3e07bcc 100644
+--- a/pkg/controller/internalreleaseimage/templates/master/files/usr-local-bin-load-registry-image-sh.yaml
++++ b/pkg/controller/internalreleaseimage/templates/master/files/usr-local-bin-load-registry-image-sh.yaml
+@@ -37,7 +37,7 @@ contents:
+         
+     # As a fallback, let's try to fetch the registry image remotely
+     echo "Trying to pull ${registryImage} from remote registry..."
+-    if podman pull '${registryImage}'; then
++    if podman pull --authfile /var/lib/kubelet/config.json "${registryImage}"; then
+         echo "Successfully pulled ${registryImage} from remote registry"
+         exit 0
+     fi
+diff --git a/pkg/controller/internalreleaseimage/templates/master/units/iri-registry.service.yaml b/pkg/controller/internalreleaseimage/templates/master/units/iri-registry.service.yaml
+index 0494497954..1de412fbad 100644
+--- a/pkg/controller/internalreleaseimage/templates/master/units/iri-registry.service.yaml
++++ b/pkg/controller/internalreleaseimage/templates/master/units/iri-registry.service.yaml
+@@ -11,7 +11,15 @@ contents: |
+   Environment=PODMAN_SYSTEMD_UNIT=%n
+   ExecStartPre=/usr/local/bin/load-registry-image.sh
+   ExecStartPre=/bin/rm -f %t/%n.ctr-id
+-  ExecStart=podman run --net host --cidfile=%t/%n.ctr-id --log-driver=journald --replace --name=iri-registry -v ${REGISTRY_DIR}:/var/lib/registry:ro,Z -v /etc/iri-registry/certs:/certs:ro -e REGISTRY_HTTP_ADDR=0.0.0.0:22625 -e REGISTRY_HTTP_TLS_CERTIFICATE=/certs/tls.crt -e REGISTRY_HTTP_TLS_KEY=/certs/tls.key -e 'REGISTRY_STORAGE_MAINTENANCE_READONLY={"enabled":true}' -u 0 --entrypoint=/usr/bin/distribution {{ .DockerRegistryImage }} serve /etc/registry/config.yaml
++  ExecStart=podman run --net host --cidfile=%t/%n.ctr-id --log-driver=journald --replace --name=iri-registry \
++    -v ${REGISTRY_DIR}:/var/lib/registry:ro,Z -v /etc/iri-registry/certs:/certs:ro \
++    -v /etc/iri-registry/auth:/etc/registry/auth:ro,Z \
++    -e REGISTRY_HTTP_ADDR=0.0.0.0:22625 \
++    -e REGISTRY_HTTP_TLS_CERTIFICATE=/certs/tls.crt -e REGISTRY_HTTP_TLS_KEY=/certs/tls.key \
++    -e 'REGISTRY_STORAGE_MAINTENANCE_READONLY={"enabled":true}' \
++    {{- /* REGISTRY_AUTH_HTPASSWD_REALM is required by the distribution registry but can be any value. It is sent in WWW-Authenticate headers to identify the protected area to clients. */}}
++    -e REGISTRY_AUTH_HTPASSWD_REALM=iri-registry -e REGISTRY_AUTH_HTPASSWD_PATH=/etc/registry/auth/htpasswd \
++    -u 0 --entrypoint=/usr/bin/distribution {{ .DockerRegistryImage }} serve /etc/registry/config.yaml
+   ExecStop=/usr/bin/podman stop --ignore --cidfile=%t/%n.ctr-id
+   ExecStopPost=/usr/bin/podman rm -f --ignore --cidfile=%t/%n.ctr-id
+ 
+diff --git a/pkg/controller/template/template_controller.go b/pkg/controller/template/template_controller.go
+index e874dcc409..c7e2b68e25 100644
+--- a/pkg/controller/template/template_controller.go
++++ b/pkg/controller/template/template_controller.go
+@@ -20,6 +20,7 @@ import (
+ 	mcfgclientset "github.com/openshift/client-go/machineconfiguration/clientset/versioned"
+ 	"github.com/openshift/client-go/machineconfiguration/clientset/versioned/scheme"
+ 	mcfginformersv1 "github.com/openshift/client-go/machineconfiguration/informers/externalversions/machineconfiguration/v1"
++	mcfginformersv1alpha1 "github.com/openshift/client-go/machineconfiguration/informers/externalversions/machineconfiguration/v1alpha1"
+ 	mcfglistersv1 "github.com/openshift/client-go/machineconfiguration/listers/machineconfiguration/v1"
+ 	mcoResourceApply "github.com/openshift/machine-config-operator/lib/resourceapply"
+ 	ctrlcommon "github.com/openshift/machine-config-operator/pkg/controller/common"
+@@ -70,8 +71,12 @@ type Controller struct {
+ 	apiserverLister       configlistersv1.APIServerLister
+ 	apiserverListerSynced cache.InformerSynced
+ 
+-	ccListerSynced        cache.InformerSynced
+-	secretsInformerSynced cache.InformerSynced
++	ccListerSynced           cache.InformerSynced
++	secretsInformerSynced    cache.InformerSynced
++	iriSecretsInformerSynced cache.InformerSynced
++	iriInformerSynced        cache.InformerSynced
++
++	iriMerger *ctrlcommon.IRISecretMerger
+ 
+ 	queue workqueue.TypedRateLimitingInterface[string]
+ 
+@@ -83,9 +88,12 @@ func New(
+ 	templatesDir string,
+ 	ccInformer mcfginformersv1.ControllerConfigInformer,
+ 	secretsInformer coreinformersv1.SecretInformer,
++	iriSecretsInformer coreinformersv1.SecretInformer,
++	iriInformer mcfginformersv1alpha1.InternalReleaseImageInformer,
+ 	apiserverInformer configinformersv1.APIServerInformer,
+ 	kubeClient clientset.Interface,
+ 	mcfgClient mcfgclientset.Interface,
++	fgHandler ctrlcommon.FeatureGatesHandler,
+ ) *Controller {
+ 	eventBroadcaster := record.NewBroadcaster()
+ 	eventBroadcaster.StartLogging(klog.Infof)
+@@ -114,6 +122,20 @@ func New(
+ 		DeleteFunc: ctrl.deleteSecret,
+ 	})
+ 
++	// Watch the IRI auth secret in the MCO namespace so that when credentials
++	// are rotated the pull secret rendered into 00-master/00-worker is updated.
++	// Both informers are nil when the NoRegistryClusterInstall feature gate is
++	// off (the CRD doesn't exist on those clusters).
++	if iriSecretsInformer != nil {
++		iriSecretsInformer.Informer().AddEventHandler(cache.ResourceEventHandlerFuncs{
++			AddFunc:    ctrl.addSecret,
++			UpdateFunc: ctrl.updateSecret,
++		})
++		ctrl.iriSecretsInformerSynced = iriSecretsInformer.Informer().HasSynced
++	} else {
++		ctrl.iriSecretsInformerSynced = func() bool { return true }
++	}
++
+ 	apiserverInformer.Informer().AddEventHandler(cache.ResourceEventHandlerFuncs{
+ 		AddFunc:    ctrl.addAPIServer,
+ 		UpdateFunc: ctrl.updateAPIServer,
+@@ -127,6 +149,14 @@ func New(
+ 	ctrl.ccListerSynced = ccInformer.Informer().HasSynced
+ 	ctrl.secretsInformerSynced = secretsInformer.Informer().HasSynced
+ 
++	if iriInformer != nil {
++		ctrl.iriInformerSynced = iriInformer.Informer().HasSynced
++		ctrl.iriMerger = ctrlcommon.NewIRISecretMerger(iriSecretsInformer.Lister(), ctrl.ccLister, iriInformer.Lister(), fgHandler)
++	} else {
++		ctrl.iriInformerSynced = func() bool { return true }
++		ctrl.iriMerger = ctrlcommon.NewIRISecretMerger(nil, ctrl.ccLister, nil, fgHandler)
++	}
++
+ 	ctrl.apiserverLister = apiserverInformer.Lister()
+ 	ctrl.apiserverListerSynced = apiserverInformer.Informer().HasSynced
+ 
+@@ -134,7 +164,7 @@ func New(
+ }
+ 
+ func (ctrl *Controller) filterSecret(secret *corev1.Secret) {
+-	if secret.Name == "pull-secret" {
++	if secret.Name == "pull-secret" || secret.Name == ctrlcommon.InternalReleaseImageAuthSecretName {
+ 		ctrl.enqueueController()
+ 		klog.Infof("Re-syncing ControllerConfig due to secret %s change", secret.Name)
+ 	}
+@@ -287,7 +317,7 @@ func (ctrl *Controller) Run(workers int, stopCh <-chan struct{}) {
+ 	defer utilruntime.HandleCrash()
+ 	defer ctrl.queue.ShutDown()
+ 
+-	if !cache.WaitForCacheSync(stopCh, ctrl.ccListerSynced, ctrl.secretsInformerSynced) {
++	if !cache.WaitForCacheSync(stopCh, ctrl.ccListerSynced, ctrl.secretsInformerSynced, ctrl.iriSecretsInformerSynced, ctrl.iriInformerSynced) {
+ 		return
+ 	}
+ 
+@@ -555,6 +585,16 @@ func (ctrl *Controller) syncControllerConfig(key string) error {
+ 		clusterPullSecretRaw = clusterPullSecret.Data[corev1.DockerConfigJsonKey]
+ 	}
+ 
++	// If IRI is in use, merge its registry credentials into the pull secret so
++	// that kubelet and CRI-O on all nodes can authenticate to the IRI registry.
++	// Credentials are merged at render time rather than writing back to the
++	// user-controlled global pull secret, avoiding ownership conflicts and the
++	// timing window where 00-master/00-worker could be rendered without IRI creds.
++	clusterPullSecretRaw, err = ctrl.iriMerger.Merge(clusterPullSecretRaw)
++	if err != nil {
++		return ctrl.syncFailingStatus(cfg, fmt.Errorf("could not merge IRI registry credentials into pull secret: %w", err))
++	}
++
+ 	// Grab the tlsSecurityProfile from the apiserver object
+ 	apiServer, err := ctrl.apiserverLister.Get(ctrlcommon.APIServerInstanceName)
+ 	if err != nil && !apierrors.IsNotFound(err) {
+diff --git a/pkg/controller/template/template_controller_test.go b/pkg/controller/template/template_controller_test.go
+index dad96569c4..70655bcb60 100644
+--- a/pkg/controller/template/template_controller_test.go
++++ b/pkg/controller/template/template_controller_test.go
+@@ -1,6 +1,8 @@
+ package template
+ 
+ import (
++	"context"
++	"encoding/base64"
+ 	"fmt"
+ 	"reflect"
+ 	"strings"
+@@ -26,7 +28,9 @@ import (
+ 	"k8s.io/client-go/tools/cache"
+ 	"k8s.io/client-go/tools/record"
+ 
++	features "github.com/openshift/api/features"
+ 	mcfgv1 "github.com/openshift/api/machineconfiguration/v1"
++	mcfgv1alpha1 "github.com/openshift/api/machineconfiguration/v1alpha1"
+ 	ctrlcommon "github.com/openshift/machine-config-operator/pkg/controller/common"
+ 
+ 	"github.com/openshift/client-go/machineconfiguration/clientset/versioned/fake"
+@@ -55,6 +59,13 @@ type fixture struct {
+ 	objects     []runtime.Object
+ 	oseobjects  []runtime.Object
+ 	apiservers  []runtime.Object
++
++	// iriObjects are loaded into a separate fake client used only for the IRI
++	// informer, so that IRI list/watch calls do not pollute the main f.actions list.
++	iriObjects []runtime.Object
++	// fgHandler overrides the feature gate handler used by the controller.
++	// Defaults to all gates disabled (nil, nil) if not set.
++	fgHandler ctrlcommon.FeatureGatesHandler
+ }
+ 
+ func newFixture(t *testing.T) *fixture {
+@@ -63,6 +74,8 @@ func newFixture(t *testing.T) *fixture {
+ 	f.objects = []runtime.Object{}
+ 	f.kubeobjects = []runtime.Object{}
+ 	f.oseobjects = []runtime.Object{}
++	f.iriObjects = []runtime.Object{}
++	f.fgHandler = ctrlcommon.NewFeatureGatesHardcodedHandler(nil, nil)
+ 	return f
+ }
+ 
+@@ -110,11 +123,25 @@ func (f *fixture) newController() *Controller {
+ 	apiserverinformer := configinformers.NewSharedInformerFactory(f.apiserverclient, noResyncPeriodFunc())
+ 
+ 	i := informers.NewSharedInformerFactory(f.client, noResyncPeriodFunc())
++
++	// Use a separate fake client for the IRI informer so that its list/watch
++	// calls do not appear in f.client's action list and break action-count tests.
++	iriClient := fake.NewSimpleClientset(f.iriObjects...)
++	iriInformers := informers.NewSharedInformerFactory(iriClient, noResyncPeriodFunc())
++
+ 	c := New(templateDir,
+-		i.Machineconfiguration().V1().ControllerConfigs(), cinformer.Core().V1().Secrets(),
+-		apiserverinformer.Config().V1().APIServers(), f.kubeclient, f.client)
++		i.Machineconfiguration().V1().ControllerConfigs(),
++		cinformer.Core().V1().Secrets(),
++		cinformer.Core().V1().Secrets(), // iriSecretsInformer: reuse same factory in tests; not exercised here
++		iriInformers.Machineconfiguration().V1alpha1().InternalReleaseImages(),
++		apiserverinformer.Config().V1().APIServers(),
++		f.kubeclient, f.client,
++		f.fgHandler)
+ 
+ 	c.ccListerSynced = alwaysReady
++	c.secretsInformerSynced = alwaysReady
++	c.iriSecretsInformerSynced = alwaysReady
++	c.iriInformerSynced = alwaysReady
+ 	c.apiserverListerSynced = alwaysReady
+ 	c.eventRecorder = &record.FakeRecorder{}
+ 
+@@ -122,10 +149,19 @@ func (f *fixture) newController() *Controller {
+ 	defer close(stopCh)
+ 	i.Start(stopCh)
+ 	i.WaitForCacheSync(stopCh)
++	iriInformers.Start(stopCh)
++	iriInformers.WaitForCacheSync(stopCh)
+ 
+ 	for _, c := range f.ccLister {
+ 		i.Machineconfiguration().V1().ControllerConfigs().Informer().GetIndexer().Add(c)
+ 	}
++	// Pre-populate the secrets informer cache directly to avoid API calls from
++	// starting the informer factory, which would pollute f.kubeclient.Actions().
++	for _, obj := range f.kubeobjects {
++		if s, ok := obj.(*corev1.Secret); ok {
++			cinformer.Core().V1().Secrets().Informer().GetIndexer().Add(s)
++		}
++	}
+ 
+ 	return c
+ }
+@@ -270,6 +306,7 @@ func (f *fixture) expectGetSecretAction(secret *corev1.Secret) {
+ 	f.kubeactions = append(f.kubeactions, core.NewGetAction(schema.GroupVersionResource{Resource: "secrets"}, secret.Namespace, secret.Name))
+ }
+ 
++
+ func (f *fixture) expectUpdateControllerConfigStatus(status *mcfgv1.ControllerConfig) {
+ 	f.actions = append(f.actions, core.NewRootUpdateSubresourceAction(schema.GroupVersionResource{Resource: "controllerconfigs"}, "status", status))
+ }
+@@ -305,7 +342,6 @@ func TestCreatesMachineConfigs(t *testing.T) {
+ 		{Type: mcfgv1.TemplateControllerFailing, Status: corev1.ConditionFalse},
+ 	}
+ 	f.expectUpdateControllerConfigStatus(ccc)
+-
+ 	f.run(getKey(cc, t))
+ }
+ 
+@@ -342,7 +378,6 @@ func TestDoNothing(t *testing.T) {
+ 		{Type: mcfgv1.TemplateControllerFailing, Status: corev1.ConditionFalse},
+ 	}
+ 	f.expectUpdateControllerConfigStatus(ccc)
+-
+ 	f.run(getKey(cc, t))
+ }
+ 
+@@ -564,3 +599,96 @@ func TestKubeletAutoNodeSizingDisabledForHypershift(t *testing.T) {
+ 		t.Errorf("Expected to find %s file in at least one machine config", ctrlcommon.NodeSizingEnabledEnvPath)
+ 	}
+ }
++
++// TestMergesIRIRegistryCredentialsIntoPullSecret verifies that the template controller merges
++// IRI registry credentials into the pull secret when rendering 00-master, so that
++// nodes can authenticate to the IRI registry without writing to the user-controlled
++// global pull secret.
++func TestMergesIRIRegistryCredentialsIntoPullSecret(t *testing.T) {
++	f := newFixture(t)
++
++	cc := newControllerConfig(ctrlcommon.ControllerConfigName)
++	cc.Spec.DNS = &configv1.DNS{
++		Spec: configv1.DNSSpec{BaseDomain: "example.com"},
++	}
++
++	pullSecretJSON := []byte(`{"auths":{"quay.io":{"auth":"dGVzdDp0ZXN0"}}}`)
++	ps := newPullSecret("coreos-pull-secret", pullSecretJSON)
++
++	iriRegistryCredentialsSecret := &corev1.Secret{
++		ObjectMeta: metav1.ObjectMeta{
++			Name:      ctrlcommon.InternalReleaseImageAuthSecretName,
++			Namespace: ctrlcommon.MCONamespace,
++		},
++		Data: map[string][]byte{
++			"password": []byte("testpassword"),
++		},
++	}
++
++	f.ccLister = append(f.ccLister, cc)
++	f.objects = append(f.objects, cc)
++	f.kubeobjects = append(f.kubeobjects, ps, iriRegistryCredentialsSecret)
++	f.iriObjects = append(f.iriObjects, &mcfgv1alpha1.InternalReleaseImage{
++		ObjectMeta: metav1.ObjectMeta{Name: ctrlcommon.InternalReleaseImageInstanceName},
++	})
++	f.fgHandler = ctrlcommon.NewFeatureGatesHardcodedHandler(
++		[]configv1.FeatureGateName{features.FeatureGateNoRegistryClusterInstall}, nil)
++
++	ctrl := f.newController()
++	if err := ctrl.syncHandler(ctrlcommon.ControllerConfigName); err != nil {
++		t.Fatalf("unexpected sync error: %v", err)
++	}
++
++	// Find the 00-master MachineConfig from what was created.
++	mcs, err := f.client.MachineconfigurationV1().MachineConfigs().List(context.TODO(), metav1.ListOptions{})
++	if err != nil {
++		t.Fatalf("failed to list MachineConfigs: %v", err)
++	}
++	var masterMC *mcfgv1.MachineConfig
++	for i := range mcs.Items {
++		if mcs.Items[i].Name == "00-master" {
++			masterMC = &mcs.Items[i]
++			break
++		}
++	}
++	if masterMC == nil {
++		t.Fatal("00-master MachineConfig not found after sync")
++	}
++
++	// Parse the ignition config and extract /var/lib/kubelet/config.json.
++	ignCfg, err := ctrlcommon.ParseAndConvertConfig(masterMC.Spec.Config.Raw)
++	if err != nil {
++		t.Fatalf("failed to parse ignition config: %v", err)
++	}
++	pullSecretData, err := ctrlcommon.GetIgnitionFileDataByPath(&ignCfg, "/var/lib/kubelet/config.json")
++	if err != nil {
++		t.Fatalf("failed to get pull secret file from ignition: %v", err)
++	}
++
++	var dockerConfig map[string]interface{}
++	if err := json.Unmarshal(pullSecretData, &dockerConfig); err != nil {
++		t.Fatalf("failed to parse pull secret JSON: %v", err)
++	}
++	auths, ok := dockerConfig["auths"].(map[string]interface{})
++	if !ok {
++		t.Fatal("pull secret missing 'auths' field")
++	}
++
++	// Verify IRI entries are present for both api-int and localhost with correct credentials.
++	expectedAuth := base64.StdEncoding.EncodeToString([]byte("openshift:testpassword"))
++	for _, host := range []string{"api-int.example.com:22625", "localhost:22625"} {
++		entry, found := auths[host].(map[string]interface{})
++		if !found {
++			t.Errorf("IRI auth entry missing for %s in rendered pull secret", host)
++			continue
++		}
++		if entry["auth"] != expectedAuth {
++			t.Errorf("IRI auth value for %s = %q, want %q", host, entry["auth"], expectedAuth)
++		}
++	}
++
++	// Verify the original quay.io entry is preserved.
++	if _, found := auths["quay.io"]; !found {
++		t.Error("original quay.io auth entry was dropped from pull secret")
++	}
++}
+diff --git a/pkg/daemon/internalreleaseimage/internalreleaseimage_manager.go b/pkg/daemon/internalreleaseimage/internalreleaseimage_manager.go
+index 8767ad4f14..16a43d7202 100644
+--- a/pkg/daemon/internalreleaseimage/internalreleaseimage_manager.go
++++ b/pkg/daemon/internalreleaseimage/internalreleaseimage_manager.go
+@@ -42,6 +42,8 @@ type Manager struct {
+ 
+ 	mcfgClient     mcfgclientset.Interface
+ 	registryClient *http.Client
++	// authToken overrides the token read from the kubelet auth file; used in tests.
++	authToken string
+ 
+ 	syncHandler                 func(iri string) error
+ 	enqueueInternalReleaseImage func(*mcfgv1alpha1.InternalReleaseImage)
+@@ -425,8 +427,17 @@ func (i *Manager) syncInternalReleaseImage(key string) error {
+ 		return err
+ 	}
+ 
+-	iriReg := newIRIRegistry(i.nodeName, i.registryClient)
+-	if registryErr := iriReg.CheckLocalRegistry(); registryErr != nil {
++	authToken := i.authToken
++	var registryErr error
++	if authToken == "" {
++		authToken, registryErr = readIRIAuthToken(fmt.Sprintf("%s:%d", iriRegistryHost, iriRegistryPort))
++	}
++	var iriReg *iriRegistry
++	if registryErr == nil {
++		iriReg = newIRIRegistry(i.nodeName, i.registryClient, authToken)
++		registryErr = iriReg.CheckLocalRegistry()
++	}
++	if registryErr != nil {
+ 		err = i.setMachineConfigNodeAsDegraded(mcn, registryErr)
+ 	} else {
+ 		err = i.refreshMachineConfigNodeStatus(mcn, iriReg)
+diff --git a/pkg/daemon/internalreleaseimage/internalreleaseimage_manager_test.go b/pkg/daemon/internalreleaseimage/internalreleaseimage_manager_test.go
+index 1dca985c1b..289bfa74a7 100644
+--- a/pkg/daemon/internalreleaseimage/internalreleaseimage_manager_test.go
++++ b/pkg/daemon/internalreleaseimage/internalreleaseimage_manager_test.go
+@@ -151,6 +151,9 @@ func TestInternalReleaseImageManager(t *testing.T) {
+ 					},
+ 				},
+ 			}
++			// Provide a dummy auth token so the manager doesn't try to read
++			// /var/lib/kubelet/config.json (which doesn't exist in unit tests).
++			iriManager.authToken = "dGVzdDp0ZXN0" // base64("test:test")
+ 			require.NoError(t, iriManager.syncHandler(common.InternalReleaseImageInstanceName))
+ 
+ 			if tc.mcn != nil {
+diff --git a/pkg/daemon/internalreleaseimage/iriregistry.go b/pkg/daemon/internalreleaseimage/iriregistry.go
+index e8e5572f5b..fa06fbb4ac 100644
+--- a/pkg/daemon/internalreleaseimage/iriregistry.go
++++ b/pkg/daemon/internalreleaseimage/iriregistry.go
+@@ -6,9 +6,12 @@ import (
+ 	"fmt"
+ 	"io"
+ 	"net/http"
++	"os"
+ 	"regexp"
+ 
+ 	"k8s.io/klog/v2"
++
++	"github.com/openshift/machine-config-operator/pkg/daemon/constants"
+ )
+ 
+ const (
+@@ -23,6 +26,9 @@ type iriRegistry struct {
+ 	nodeName         string
+ 	registryHostPort string
+ 	client           *http.Client
++	// authToken is the base64-encoded "user:password" value from the kubelet
++	// auth file for localhost:22625. Empty if the registry is unauthenticated.
++	authToken string
+ }
+ 
+ type registryTagsList struct {
+@@ -40,15 +46,38 @@ type registryErrorResponse struct {
+ 	Errors []registryErrorCode `json:"errors"`
+ }
+ 
+-func newIRIRegistry(nodeName string, client *http.Client) *iriRegistry {
++func newIRIRegistry(nodeName string, client *http.Client, authToken string) *iriRegistry {
+ 	return &iriRegistry{
+-		nodeName: nodeName,
+-		client:   client,
+-		// The IRI registry runs on the current node.
++		nodeName:         nodeName,
++		client:           client,
+ 		registryHostPort: fmt.Sprintf("%s:%d", iriRegistryHost, iriRegistryPort),
++		authToken:        authToken,
+ 	}
+ }
+ 
++// readIRIAuthToken reads the base64-encoded auth token for the IRI registry
++// from the kubelet auth file (/var/lib/kubelet/config.json).
++func readIRIAuthToken(registryHostPort string) (string, error) {
++	data, err := os.ReadFile(constants.KubeletAuthFile)
++	if err != nil {
++		return "", fmt.Errorf("could not read %s for IRI registry auth: %w", constants.KubeletAuthFile, err)
++	}
++
++	var dockerConfig struct {
++		Auths map[string]struct {
++			Auth string `json:"auth"`
++		} `json:"auths"`
++	}
++	if err := json.Unmarshal(data, &dockerConfig); err != nil {
++		return "", fmt.Errorf("could not parse %s for IRI registry auth: %w", constants.KubeletAuthFile, err)
++	}
++
++	if entry, ok := dockerConfig.Auths[registryHostPort]; ok && entry.Auth != "" {
++		return entry.Auth, nil
++	}
++	return "", fmt.Errorf("no auth entry found for %s in %s", registryHostPort, constants.KubeletAuthFile)
++}
++
+ func (r *iriRegistry) query(endpoint string, headers ...map[string]string) (*http.Response, error) {
+ 	regURL := fmt.Sprintf("https://%s/v2%s", r.registryHostPort, endpoint)
+ 
+@@ -56,6 +85,9 @@ func (r *iriRegistry) query(endpoint string, headers ...map[string]string) (*htt
+ 	if err != nil {
+ 		return nil, err
+ 	}
++	if r.authToken != "" {
++		req.Header.Set("Authorization", "Basic "+r.authToken)
++	}
+ 	if len(headers) > 0 {
+ 		for k, v := range headers[0] {
+ 			req.Header.Set(k, v)
+diff --git a/test/e2e-bootstrap/bootstrap_test.go b/test/e2e-bootstrap/bootstrap_test.go
+index 6f0146ebd0..1dac12ba44 100644
+--- a/test/e2e-bootstrap/bootstrap_test.go
++++ b/test/e2e-bootstrap/bootstrap_test.go
+@@ -566,9 +566,12 @@ func createControllers(ctx *ctrlcommon.ControllerContext) []ctrlcommon.Controlle
+ 			templatesDir,
+ 			ctx.InformerFactory.Machineconfiguration().V1().ControllerConfigs(),
+ 			ctx.OpenShiftConfigKubeNamespacedInformerFactory.Core().V1().Secrets(),
++			ctx.KubeInformerFactory.Core().V1().Secrets(),
++			ctx.InformerFactory.Machineconfiguration().V1alpha1().InternalReleaseImages(),
+ 			ctx.ConfigInformerFactory.Config().V1().APIServers(),
+ 			ctx.ClientBuilder.KubeClientOrDie("template-controller"),
+ 			ctx.ClientBuilder.MachineConfigClientOrDie("template-controller"),
++			ctx.FeatureGatesHandler,
+ 		),
+ 		// Add all "sub-renderers here"
+ 		kubeletconfig.New(
+diff --git a/test/e2e-iri/iri_test.go b/test/e2e-iri/iri_test.go
+index 1268279a9d..13903acd4e 100644
+--- a/test/e2e-iri/iri_test.go
++++ b/test/e2e-iri/iri_test.go
+@@ -4,10 +4,12 @@ import (
+ 	"context"
+ 	"crypto/tls"
+ 	"crypto/x509"
++	"encoding/base64"
+ 	"fmt"
+ 	"net/http"
+ 	"os"
+ 	"reflect"
++	"strings"
+ 	"testing"
+ 	"time"
+ 
+@@ -22,6 +24,7 @@ import (
+ 	mcfgv1alpha1 "github.com/openshift/api/machineconfiguration/v1alpha1"
+ 	ctrlcommon "github.com/openshift/machine-config-operator/pkg/controller/common"
+ 	"github.com/openshift/machine-config-operator/test/framework"
++	"github.com/openshift/machine-config-operator/test/helpers"
+ )
+ 
+ func TestIRIResource_Available(t *testing.T) {
+@@ -86,7 +89,12 @@ func TestIRIController_VerifyIRIRegistryOnAllTheMasterNodes_NoCert(t *testing.T)
+ 	skipIfOpenShiftCI(t)
+ 	skipIfNoBaremetal(t)
+ 
+-	masterNodes, err := framework.NewClientSet("").CoreV1Interface.Nodes().List(context.TODO(), v1.ListOptions{LabelSelector: "node-role.kubernetes.io/master="})
++	cs := framework.NewClientSet("")
++	authSecret, err := cs.Secrets(ctrlcommon.MCONamespace).Get(context.TODO(), ctrlcommon.InternalReleaseImageAuthSecretName, v1.GetOptions{})
++	require.NoError(t, err)
++	password := string(authSecret.Data["password"])
++
++	masterNodes, err := cs.CoreV1Interface.Nodes().List(context.TODO(), v1.ListOptions{LabelSelector: "node-role.kubernetes.io/master="})
+ 	require.NoError(t, err)
+ 
+ 	// For every control plane node, ping the IRI registry at port 22625,
+@@ -107,7 +115,7 @@ func TestIRIController_VerifyIRIRegistryOnAllTheMasterNodes_NoCert(t *testing.T)
+ 			},
+ 			Timeout: 30 * time.Second,
+ 		}
+-		pingIRIRegistry(t, client, nodeAddr)
++		pingIRIRegistry(t, client, nodeAddr, ctrlcommon.IRIRegistryUsername, password)
+ 	}
+ }
+ 
+@@ -165,21 +173,87 @@ func TestIRIController_VerifyIRIRegistryOnApiInt_WithCert(t *testing.T) {
+ 	require.NoError(t, err)
+ 	require.NotEmpty(t, infra.Status.PlatformStatus.BareMetal.APIServerInternalIPs)
+ 
+-	pingIRIRegistry(t, client, infra.Status.PlatformStatus.BareMetal.APIServerInternalIPs[0])
++	authSecret, err := cs.Secrets(ctrlcommon.MCONamespace).Get(ctx, ctrlcommon.InternalReleaseImageAuthSecretName, v1.GetOptions{})
++	require.NoError(t, err)
++	pingIRIRegistry(t, client, infra.Status.PlatformStatus.BareMetal.APIServerInternalIPs[0], ctrlcommon.IRIRegistryUsername, string(authSecret.Data["password"]))
+ }
+ 
+-func pingIRIRegistry(t *testing.T, client *http.Client, ipAddr string) {
+-	iriRegistryUrl := fmt.Sprintf("https://%s:%d/v2/", ipAddr, 22625)
++func pingIRIRegistry(t *testing.T, client *http.Client, ipAddr, username, password string) {
++	iriRegistryUrl := fmt.Sprintf("https://%s:%d/v2/", ipAddr, ctrlcommon.IRIRegistryPort)
+ 
+ 	req, err := http.NewRequestWithContext(context.Background(), http.MethodGet, iriRegistryUrl, nil)
+ 	require.NoError(t, err)
++	req.SetBasicAuth(username, password)
+ 	resp, err := client.Do(req)
+ 	require.NoError(t, err)
+ 	defer resp.Body.Close()
+ 
+-	require.Equal(t, resp.StatusCode, http.StatusOK)
++	require.Equal(t, http.StatusOK, resp.StatusCode)
+ 	apiVersion := resp.Header.Get("Docker-Distribution-Api-Version")
+-	require.Equal(t, apiVersion, "registry/2.0")
++	require.Equal(t, "registry/2.0", apiVersion)
++}
++
++// getBaseDomain retrieves the cluster's base domain from the ControllerConfig.
++func getBaseDomain(t *testing.T, cs *framework.ClientSet) string {
++	t.Helper()
++	cconfig, err := cs.ControllerConfigs().Get(context.Background(), ctrlcommon.ControllerConfigName, v1.GetOptions{})
++	require.NoError(t, err)
++	require.NotNil(t, cconfig.Spec.DNS)
++	require.NotEmpty(t, cconfig.Spec.DNS.Spec.BaseDomain)
++	return cconfig.Spec.DNS.Spec.BaseDomain
++}
++
++// curlIRIRegistry runs curl against the IRI registry /v2/ endpoint via
++// ExecCmdOnNode, which executes inside the MCD pod on the given master node.
++// The MCD pod runs on the host network and can reach api-int:22625, making
++// this approach work in CI where the port is not reachable from the test runner.
++// Returns the HTTP status code string (e.g. "200", "401").
++func curlIRIRegistry(t *testing.T, cs *framework.ClientSet, node corev1.Node, baseDomain string, extraArgs ...string) string {
++	t.Helper()
++	const iriRootCAPath = "/rootfs/etc/pki/ca-trust/source/anchors/iri-root-ca.crt"
++	url := fmt.Sprintf("https://api-int.%s:%d/v2/", baseDomain, ctrlcommon.IRIRegistryPort)
++	args := []string{"curl", "-s", "--cacert", iriRootCAPath, "-o", "/dev/null", "-w", "%{http_code}"}
++	args = append(args, extraArgs...)
++	args = append(args, url)
++	return strings.TrimSpace(helpers.ExecCmdOnNode(t, cs, node, args...))
++}
++
++func TestIRIAuth_UnauthenticatedRequestReturns401(t *testing.T) {
++	cs := framework.NewClientSet("")
++	ctx := context.Background()
++
++	_, err := cs.Secrets(ctrlcommon.MCONamespace).Get(ctx, ctrlcommon.InternalReleaseImageAuthSecretName, v1.GetOptions{})
++	if k8serrors.IsNotFound(err) {
++		t.Skip("IRI auth secret not found, authentication is not enabled")
++	}
++	require.NoError(t, err)
++
++	baseDomain := getBaseDomain(t, cs)
++	node := helpers.GetRandomNode(t, cs, "master")
++
++	statusCode := curlIRIRegistry(t, cs, node, baseDomain)
++	require.Equal(t, "401", statusCode, "unauthenticated request should return 401")
++}
++
++func TestIRIAuth_AuthenticatedRequestSucceeds(t *testing.T) {
++	cs := framework.NewClientSet("")
++	ctx := context.Background()
++
++	authSecret, err := cs.Secrets(ctrlcommon.MCONamespace).Get(ctx, ctrlcommon.InternalReleaseImageAuthSecretName, v1.GetOptions{})
++	if k8serrors.IsNotFound(err) {
++		t.Skip("IRI auth secret not found, authentication is not enabled")
++	}
++	require.NoError(t, err)
++
++	password := string(authSecret.Data["password"])
++	require.NotEmpty(t, password)
++
++	baseDomain := getBaseDomain(t, cs)
++	node := helpers.GetRandomNode(t, cs, "master")
++	authHeader := "Basic " + base64.StdEncoding.EncodeToString([]byte(ctrlcommon.IRIRegistryUsername+":"+password))
++
++	statusCode := curlIRIRegistry(t, cs, node, baseDomain, "-H", "Authorization: "+authHeader)
++	require.Equal(t, "200", statusCode, "authenticated request should succeed")
+ }
+ 
+ func TestIRIController_ShouldPreventDeletionWhenInUse(t *testing.T) {

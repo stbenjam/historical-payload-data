@@ -1,0 +1,84 @@
+diff --git a/test/extended/baremetal/common.go b/test/extended/baremetal/common.go
+index 94d98d5ab4b3..f2cf99fcc0b9 100644
+--- a/test/extended/baremetal/common.go
++++ b/test/extended/baremetal/common.go
+@@ -16,10 +16,15 @@ import (
+ 	e2eskipper "k8s.io/kubernetes/test/e2e/framework/skipper"
+ )
+ 
++func clusterInfrastructure(oc *exutil.CLI) (*configv1.Infrastructure, error) {
++	return oc.AdminConfigClient().ConfigV1().Infrastructures().Get(
++		context.Background(), "cluster", metav1.GetOptions{})
++}
++
+ func skipIfNotBaremetal(oc *exutil.CLI) {
+ 	g.By("checking platform type")
+ 
+-	infra, err := oc.AdminConfigClient().ConfigV1().Infrastructures().Get(context.Background(), "cluster", metav1.GetOptions{})
++	infra, err := clusterInfrastructure(oc)
+ 	o.Expect(err).NotTo(o.HaveOccurred())
+ 
+ 	if infra.Status.PlatformStatus.Type != configv1.BareMetalPlatformType {
+@@ -27,6 +32,14 @@ func skipIfNotBaremetal(oc *exutil.CLI) {
+ 	}
+ }
+ 
++func skipIfTwoNode(oc *exutil.CLI) {
++	infra, err := clusterInfrastructure(oc)
++	o.Expect(err).NotTo(o.HaveOccurred())
++	if infra.Status.ControlPlaneTopology == configv1.DualReplicaTopologyMode {
++		e2eskipper.Skipf("This test does not apply to two-node")
++	}
++}
++
+ // Starting from 4.10, metal3 resources could be created in the vSphere, OpenStack and None
+ // Platforms in addition to the Baremetal Platform.
+ // Starting from 4.12, metal3 resources could be created in the AWS Platform too.
+@@ -35,7 +48,7 @@ func skipIfNotBaremetal(oc *exutil.CLI) {
+ func skipIfUnsupportedPlatformOrConfig(oc *exutil.CLI, dc dynamic.Interface) {
+ 	g.By("checking supported platforms")
+ 
+-	infra, err := oc.AdminConfigClient().ConfigV1().Infrastructures().Get(context.Background(), "cluster", metav1.GetOptions{})
++	infra, err := clusterInfrastructure(oc)
+ 	o.Expect(err).NotTo(o.HaveOccurred())
+ 
+ 	switch infra.Status.PlatformStatus.Type {
+diff --git a/test/extended/baremetal/high_availability.go b/test/extended/baremetal/high_availability.go
+index c7a47126f5b0..1ac1681bf9c5 100644
+--- a/test/extended/baremetal/high_availability.go
++++ b/test/extended/baremetal/high_availability.go
+@@ -149,13 +149,21 @@ var _ = g.Describe("[sig-installer][Feature:baremetal][Serial] Baremetal platfor
+ func checkMetal3DeploymentHealthy(oc *exutil.CLI) {
+ 	dc := oc.AdminDynamicClient()
+ 	bmc := baremetalClient(dc)
++	operationalStatus := "OK"
++	infra, err := clusterInfrastructure(oc)
++	o.Expect(err).NotTo(o.HaveOccurred())
++
++	if infra.Status.ControlPlaneTopology == configv1.DualReplicaTopologyMode {
++		g.By("detected DualReplica control plane topology, for DualReplica operationalStatus is expected to be detached, setting to detached")
++		operationalStatus = "detached"
++	}
+ 
+ 	hosts, err := bmc.List(context.Background(), v1.ListOptions{})
+ 	o.Expect(err).NotTo(o.HaveOccurred())
+ 	o.Expect(hosts.Items).ToNot(o.BeEmpty())
+ 
+ 	for _, h := range hosts.Items {
+-		expectStringField(h, "baremetalhost", "status.operationalStatus").To(o.BeEquivalentTo("OK"))
++		expectStringField(h, "baremetalhost", "status.operationalStatus").To(o.BeEquivalentTo(operationalStatus))
+ 		expectStringField(h, "baremetalhost", "status.provisioning.state").To(o.Or(o.BeEquivalentTo("provisioned"), o.BeEquivalentTo("externally provisioned")))
+ 		expectBoolField(h, "baremetalhost", "spec.online").To(o.BeTrue())
+ 	}
+diff --git a/test/extended/baremetal/hosts.go b/test/extended/baremetal/hosts.go
+index 92c908dae54d..4abdcb39a31e 100644
+--- a/test/extended/baremetal/hosts.go
++++ b/test/extended/baremetal/hosts.go
+@@ -165,6 +165,7 @@ var _ = g.Describe("[sig-installer][Feature:baremetal][Serial] Baremetal platfor
+ 
+ 	g.BeforeEach(func() {
+ 		skipIfNotBaremetal(oc)
++		skipIfTwoNode(oc)
+ 		helper = NewBaremetalTestHelper(oc.AdminDynamicClient())
+ 		helper.Setup()
+ 	})

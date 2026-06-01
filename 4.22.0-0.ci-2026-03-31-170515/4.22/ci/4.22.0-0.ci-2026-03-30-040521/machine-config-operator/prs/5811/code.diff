@@ -1,0 +1,99 @@
+diff --git a/test/extended-priv/machineconfig.go b/test/extended-priv/machineconfig.go
+index e867209be3..a2efcf77d5 100644
+--- a/test/extended-priv/machineconfig.go
++++ b/test/extended-priv/machineconfig.go
+@@ -142,3 +142,10 @@ func (mc *MachineConfig) GetAuthorizedKeysByUserAsList(user string) ([]string, e
+ func (mc *MachineConfig) GetIgnitionVersion() (string, error) {
+ 	return mc.Get(`{.spec.config.ignition.version}`)
+ }
++
++func DisableSkew(machineConfiguration *MachineConfiguration) {
++	logger.Infof("Disabling the Skew functionality")
++	o.Expect(machineConfiguration.SetNoneSkew()).To(o.Succeed(), "Error disabling the skew functionality")
++	o.Eventually(machineConfiguration.IsGenerationUpToDate, "2m", "10s").Should(o.BeTrue(), "MachineConfiguration observedGeneration did not catch up to generation")
++	logger.Infof("Skew functionality has been disabled")
++}
+diff --git a/test/extended-priv/mco_bootimages.go b/test/extended-priv/mco_bootimages.go
+index 03dfa113c7..b450c663f3 100644
+--- a/test/extended-priv/mco_bootimages.go
++++ b/test/extended-priv/mco_bootimages.go
+@@ -42,8 +42,7 @@ var _ = g.Describe("[sig-mco][Suite:openshift/machine-config-operator/longdurati
+ 		// Disable skew to avoid collisions
+ 		exutil.By("Disabling skew functionality")
+ 		initialMachineConfiguration := machineConfiguration.GetSpecOrFail()
+-		o.Expect(machineConfiguration.SetNoneSkew()).To(o.Succeed(), "Error disabing the skew functionality")
+-		o.Eventually(machineConfiguration.IsGenerationUpToDate, "2m", "10s").Should(o.BeTrue(), "MachineConfiguration observedGeneration did not catch up to generation")
++		DisableSkew(machineConfiguration)
+ 
+ 		g.DeferCleanup(func() {
+ 			exutil.By("Restoring initial MachineConfiguration spec")
+diff --git a/test/extended-priv/mco_controlplanemachineset.go b/test/extended-priv/mco_controlplanemachineset.go
+index 64c9a2aaf0..0ce4cc3b4a 100644
+--- a/test/extended-priv/mco_controlplanemachineset.go
++++ b/test/extended-priv/mco_controlplanemachineset.go
+@@ -414,10 +414,7 @@ func testMachineConfigurationStatusUpdate(mc *MachineConfiguration, patchConfig
+ 	defer mc.SetSpec(originalSpec)
+ 
+ 	// Disable skew enforcement for the test to avoid boot image configurations causing conflicts
+-	o.Expect(mc.SetNoneSkew()).To(o.Succeed(), "Error disabling skew enforcement on %s", mc)
+-
+-	// Wait for the controller to observe and process the spec change
+-	o.Eventually(mc.IsGenerationUpToDate, "2m", "10s").Should(o.BeTrue(), "MachineConfiguration observedGeneration did not catch up to generation")
++	DisableSkew(mc)
+ 
+ 	originalStatus, err := mc.GetManagedBootImagesStatus()
+ 	o.Expect(err).NotTo(o.HaveOccurred(), "Error getting original status from %s", mc)
+diff --git a/test/extended-priv/mco_scale.go b/test/extended-priv/mco_scale.go
+index 04df20b818..3d3513a3f1 100644
+--- a/test/extended-priv/mco_scale.go
++++ b/test/extended-priv/mco_scale.go
+@@ -178,9 +178,13 @@ var _ = g.Describe("[sig-mco][Suite:openshift/machine-config-operator/longdurati
+ 		architecture.SkipNonAmd64SingleArch(oc)                                 // arm64 is not supported until 4.11
+ 
+ 		if IsBootImageUpdateSupported(oc.AsAdmin()) {
++			defer machineConfiguration.SetSpec(machineConfiguration.GetSpecOrFail())
++			exutil.By("Disabling skew functionality")
++			DisableSkew(machineConfiguration)
++			logger.Infof("OK!\n")
++
+ 			exutil.By("Opt-out boot images update")
+ 			logger.Infof("Disabling the bootimages update so that our images are not overridden by MCO")
+-			defer machineConfiguration.SetSpec(machineConfiguration.GetSpecOrFail())
+ 			o.Expect(
+ 				machineConfiguration.SetNoneManagedBootImagesConfig(MachineSetResource),
+ 			).To(o.Succeed(), "Error configuring None managedBootImages in the 'cluster' MachineConfiguration resource")
+@@ -681,9 +685,14 @@ func SimpleScaleUPTest(oc *exutil.CLI, mcp *MachineConfigPool, imageVersion, ign
+ 	)
+ 
+ 	if IsBootImageUpdateSupported(oc.AsAdmin()) {
++
++		defer machineConfiguration.SetSpec(machineConfiguration.GetSpecOrFail())
++		exutil.By("Disabling skew functionality")
++		DisableSkew(machineConfiguration)
++		logger.Infof("OK!\n")
++
+ 		exutil.By("Opt-out boot images update")
+ 		logger.Infof("Disabling the bootimages update so that our images are not overridden by MCO")
+-		defer machineConfiguration.SetSpec(machineConfiguration.GetSpecOrFail())
+ 		o.Expect(
+ 			machineConfiguration.SetNoneManagedBootImagesConfig(MachineSetResource),
+ 		).To(o.Succeed(), "Error configuring None managedBootImages in the 'cluster' MachineConfiguration resource")
+diff --git a/test/extended-priv/mco_security.go b/test/extended-priv/mco_security.go
+index 96769a0709..6c65897757 100644
+--- a/test/extended-priv/mco_security.go
++++ b/test/extended-priv/mco_security.go
+@@ -954,9 +954,13 @@ var _ = g.Describe("[sig-mco][Suite:openshift/machine-config-operator/longdurati
+ 		)
+ 
+ 		if IsBootImageUpdateSupported(oc.AsAdmin()) {
++			defer machineConfiguration.SetSpec(machineConfiguration.GetSpecOrFail())
++			exutil.By("Disabling skew functionality")
++			DisableSkew(machineConfiguration)
++			logger.Infof("OK!\n")
++
+ 			exutil.By("Opt-out boot images update")
+ 			logger.Infof("Disabling the bootimages update so that our images are not overridden by MCO")
+-			defer machineConfiguration.SetSpec(machineConfiguration.GetSpecOrFail())
+ 			o.Expect(
+ 				machineConfiguration.SetNoneManagedBootImagesConfig(MachineSetResource),
+ 			).To(o.Succeed(), "Error configuring None managedBootImages in the 'cluster' MachineConfiguration resource")

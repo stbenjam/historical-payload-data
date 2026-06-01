@@ -1,0 +1,208 @@
+diff --git a/hypershift-operator/controllers/nodepool/gcp_test.go b/hypershift-operator/controllers/nodepool/gcp_test.go
+index 5408d6af3b3..62919bf2ed4 100644
+--- a/hypershift-operator/controllers/nodepool/gcp_test.go
++++ b/hypershift-operator/controllers/nodepool/gcp_test.go
+@@ -498,7 +498,8 @@ func TestGcpMachineTemplateSpec(t *testing.T) {
+ 						"x86_64": {
+ 							Images: releaseinfo.CoreOSImages{
+ 								GCP: releaseinfo.CoreOSGCPImage{
+-									Image: "projects/rhcos-cloud/global/images/rhcos-x86-64-418",
++									Project: "rhcos-cloud",
++									Name:    "rhcos-x86-64-418",
+ 								},
+ 							},
+ 						},
+@@ -538,7 +539,7 @@ func TestDefaultNodePoolGCPImage(t *testing.T) {
+ 		expectedErrMsg string
+ 	}{
+ 		{
+-			name: "When architecture is x86_64 with valid release metadata, it should return correct image",
++			name: "When stream metadata has project and name for amd64, it should construct image path",
+ 			arch: hyperv1.ArchitectureAMD64,
+ 			releaseImage: &releaseinfo.ReleaseImage{
+ 				StreamMetadata: &releaseinfo.CoreOSStreamMetadata{
+@@ -546,18 +547,19 @@ func TestDefaultNodePoolGCPImage(t *testing.T) {
+ 						"x86_64": {
+ 							Images: releaseinfo.CoreOSImages{
+ 								GCP: releaseinfo.CoreOSGCPImage{
+-									Image: "projects/rhcos-cloud/global/images/rhcos-x86-64-418",
++									Project: "rhcos-cloud",
++									Name:    "rhcos-9-6-20251023-0-gcp-x86-64",
+ 								},
+ 							},
+ 						},
+ 					},
+ 				},
+ 			},
+-			expectedImage: "projects/rhcos-cloud/global/images/rhcos-x86-64-418",
++			expectedImage: "projects/rhcos-cloud/global/images/rhcos-9-6-20251023-0-gcp-x86-64",
+ 			expectedErr:   false,
+ 		},
+ 		{
+-			name: "When architecture is aarch64 with valid release metadata, it should return correct image",
++			name: "When stream metadata has project and name for arm64, it should construct image path",
+ 			arch: hyperv1.ArchitectureARM64,
+ 			releaseImage: &releaseinfo.ReleaseImage{
+ 				StreamMetadata: &releaseinfo.CoreOSStreamMetadata{
+@@ -565,14 +567,15 @@ func TestDefaultNodePoolGCPImage(t *testing.T) {
+ 						"aarch64": {
+ 							Images: releaseinfo.CoreOSImages{
+ 								GCP: releaseinfo.CoreOSGCPImage{
+-									Image: "projects/rhcos-cloud/global/images/rhcos-aarch64-418",
++									Project: "rhcos-cloud",
++									Name:    "rhcos-9-6-20251023-0-gcp-aarch64",
+ 								},
+ 							},
+ 						},
+ 					},
+ 				},
+ 			},
+-			expectedImage: "projects/rhcos-cloud/global/images/rhcos-aarch64-418",
++			expectedImage: "projects/rhcos-cloud/global/images/rhcos-9-6-20251023-0-gcp-aarch64",
+ 			expectedErr:   false,
+ 		},
+ 		{
+@@ -584,7 +587,8 @@ func TestDefaultNodePoolGCPImage(t *testing.T) {
+ 						"x86_64": {
+ 							Images: releaseinfo.CoreOSImages{
+ 								GCP: releaseinfo.CoreOSGCPImage{
+-									Image: "projects/rhcos-cloud/global/images/rhcos-x86-64-418",
++									Project: "rhcos-cloud",
++									Name:    "rhcos-9-6-20251023-0-gcp-x86-64",
+ 								},
+ 							},
+ 						},
+@@ -595,7 +599,43 @@ func TestDefaultNodePoolGCPImage(t *testing.T) {
+ 			expectedErrMsg: "couldn't find OS metadata for architecture \"unsupported-arch\"",
+ 		},
+ 		{
+-			name: "When GCP image is empty in release metadata, it should return error",
++			name: "When GCP project and name are empty, it should return error",
++			arch: hyperv1.ArchitectureAMD64,
++			releaseImage: &releaseinfo.ReleaseImage{
++				StreamMetadata: &releaseinfo.CoreOSStreamMetadata{
++					Architectures: map[string]releaseinfo.CoreOSArchitecture{
++						"x86_64": {
++							Images: releaseinfo.CoreOSImages{
++								GCP: releaseinfo.CoreOSGCPImage{},
++							},
++						},
++					},
++				},
++			},
++			expectedErr:    true,
++			expectedErrMsg: "release image metadata has no GCP image for architecture \"amd64\"",
++		},
++		{
++			name: "When GCP project is empty but name is set, it should return error",
++			arch: hyperv1.ArchitectureAMD64,
++			releaseImage: &releaseinfo.ReleaseImage{
++				StreamMetadata: &releaseinfo.CoreOSStreamMetadata{
++					Architectures: map[string]releaseinfo.CoreOSArchitecture{
++						"x86_64": {
++							Images: releaseinfo.CoreOSImages{
++								GCP: releaseinfo.CoreOSGCPImage{
++									Name: "rhcos-x86-64",
++								},
++							},
++						},
++					},
++				},
++			},
++			expectedErr:    true,
++			expectedErrMsg: "release image metadata has no GCP image for architecture \"amd64\"",
++		},
++		{
++			name: "When GCP name is empty but project is set, it should return error",
+ 			arch: hyperv1.ArchitectureAMD64,
+ 			releaseImage: &releaseinfo.ReleaseImage{
+ 				StreamMetadata: &releaseinfo.CoreOSStreamMetadata{
+@@ -603,7 +643,7 @@ func TestDefaultNodePoolGCPImage(t *testing.T) {
+ 						"x86_64": {
+ 							Images: releaseinfo.CoreOSImages{
+ 								GCP: releaseinfo.CoreOSGCPImage{
+-									Image: "", // Empty image
++									Project: "rhcos-cloud",
+ 								},
+ 							},
+ 						},
+diff --git a/hypershift-operator/controllers/nodepool/nodepool_controller.go b/hypershift-operator/controllers/nodepool/nodepool_controller.go
+index fb0ba5e6dda..61cca6c041a 100644
+--- a/hypershift-operator/controllers/nodepool/nodepool_controller.go
++++ b/hypershift-operator/controllers/nodepool/nodepool_controller.go
+@@ -758,10 +758,10 @@ func defaultNodePoolGCPImage(specifiedArch string, releaseImage *releaseinfo.Rel
+ 		return "", fmt.Errorf("couldn't find OS metadata for architecture %q", specifiedArch)
+ 	}
+ 
+-	if len(arch.Images.GCP.Image) == 0 {
++	if len(arch.Images.GCP.Project) == 0 || len(arch.Images.GCP.Name) == 0 {
+ 		return "", fmt.Errorf("release image metadata has no GCP image for architecture %q", specifiedArch)
+ 	}
+-	return arch.Images.GCP.Image, nil
++	return fmt.Sprintf("projects/%s/global/images/%s", arch.Images.GCP.Project, arch.Images.GCP.Name), nil
+ }
+ 
+ // MachineDeploymentComplete considers a MachineDeployment to be complete once all of its desired replicas
+diff --git a/support/releaseinfo/fake/fake.go b/support/releaseinfo/fake/fake.go
+index 094b5b42b20..8cb043e0e43 100644
+--- a/support/releaseinfo/fake/fake.go
++++ b/support/releaseinfo/fake/fake.go
+@@ -82,7 +82,8 @@ func (f *FakeReleaseProvider) Lookup(_ context.Context, image string, _ []byte)
+ 							},
+ 						},
+ 						GCP: releaseinfo.CoreOSGCPImage{
+-							Image: "projects/rhcos-cloud/global/images/rhcos-x86-64-fake",
++							Project: "rhcos-cloud",
++							Name:    "rhcos-x86-64-fake",
+ 						},
+ 					},
+ 				},
+@@ -101,7 +102,8 @@ func (f *FakeReleaseProvider) Lookup(_ context.Context, image string, _ []byte)
+ 							},
+ 						},
+ 						GCP: releaseinfo.CoreOSGCPImage{
+-							Image: "projects/rhcos-cloud/global/images/rhcos-aarch64-fake",
++							Project: "rhcos-cloud",
++							Name:    "rhcos-aarch64-fake",
+ 						},
+ 					},
+ 				},
+diff --git a/support/releaseinfo/releaseinfo.go b/support/releaseinfo/releaseinfo.go
+index f71859e2537..7e98fff297a 100644
+--- a/support/releaseinfo/releaseinfo.go
++++ b/support/releaseinfo/releaseinfo.go
+@@ -74,9 +74,8 @@ type CoreOSImages struct {
+ 
+ // CoreOSGCPImage contains GCP image information from stream metadata.
+ // GCP images are global (not regional like AWS), so there's a single image reference.
++// The image path is constructed as projects/{Project}/global/images/{Name}.
+ type CoreOSGCPImage struct {
+-	// Image is the full GCP image path (e.g., projects/rhcos-cloud/global/images/rhcos-xxx)
+-	Image string `json:"image"`
+ 	// Project is the GCP project hosting the image (e.g., rhcos-cloud)
+ 	Project string `json:"project"`
+ 	// Name is the image name within the project
+diff --git a/support/releaseinfo/testutils/testutils.go b/support/releaseinfo/testutils/testutils.go
+index acd388a56c8..ac4456c3787 100644
+--- a/support/releaseinfo/testutils/testutils.go
++++ b/support/releaseinfo/testutils/testutils.go
+@@ -71,7 +71,8 @@ func InitReleaseImageOrDie(version string) *releaseinfo.ReleaseImage {
+ 							},
+ 						},
+ 						GCP: releaseinfo.CoreOSGCPImage{
+-							Image: "projects/rhcos-cloud/global/images/rhcos-x86-64-test",
++							Project: "rhcos-cloud",
++							Name:    "rhcos-x86-64-test",
+ 						},
+ 					},
+ 				},
+@@ -90,7 +91,8 @@ func InitReleaseImageOrDie(version string) *releaseinfo.ReleaseImage {
+ 							},
+ 						},
+ 						GCP: releaseinfo.CoreOSGCPImage{
+-							Image: "projects/rhcos-cloud/global/images/rhcos-aarch64-test",
++							Project: "rhcos-cloud",
++							Name:    "rhcos-aarch64-test",
+ 						},
+ 					},
+ 				},

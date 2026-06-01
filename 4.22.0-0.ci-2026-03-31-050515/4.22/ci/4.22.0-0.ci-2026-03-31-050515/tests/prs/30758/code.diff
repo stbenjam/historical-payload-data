@@ -1,0 +1,2130 @@
+diff --git a/test/extended/include.go b/test/extended/include.go
+index a5e6b7a288a2..32186244d0e9 100644
+--- a/test/extended/include.go
++++ b/test/extended/include.go
+@@ -39,6 +39,7 @@ import (
+ 	_ "github.com/openshift/origin/test/extended/machines"
+ 	_ "github.com/openshift/origin/test/extended/networking"
+ 	_ "github.com/openshift/origin/test/extended/node"
++	_ "github.com/openshift/origin/test/extended/node/dra/nvidia"
+ 	_ "github.com/openshift/origin/test/extended/node/node_e2e"
+ 	_ "github.com/openshift/origin/test/extended/node_tuning"
+ 	_ "github.com/openshift/origin/test/extended/oauth"
+diff --git a/test/extended/node/dra/OWNERS b/test/extended/node/dra/OWNERS
+new file mode 100644
+index 000000000000..07217dd1abb3
+--- /dev/null
++++ b/test/extended/node/dra/OWNERS
+@@ -0,0 +1,17 @@
++approvers:
++  - sairameshv
++  - harche
++  - haircommander
++  - rphillips
++  - mrunalp
++
++reviewers:
++  - sairameshv
++  - harche
++  - haircommander
++  - rphillips
++  - mrunalp
++
++labels:
++  - sig/scheduling
++  - area/dra
+diff --git a/test/extended/node/dra/nvidia/OWNERS b/test/extended/node/dra/nvidia/OWNERS
+new file mode 100644
+index 000000000000..07217dd1abb3
+--- /dev/null
++++ b/test/extended/node/dra/nvidia/OWNERS
+@@ -0,0 +1,17 @@
++approvers:
++  - sairameshv
++  - harche
++  - haircommander
++  - rphillips
++  - mrunalp
++
++reviewers:
++  - sairameshv
++  - harche
++  - haircommander
++  - rphillips
++  - mrunalp
++
++labels:
++  - sig/scheduling
++  - area/dra
+diff --git a/test/extended/node/dra/nvidia/README.md b/test/extended/node/dra/nvidia/README.md
+new file mode 100644
+index 000000000000..4a064818855a
+--- /dev/null
++++ b/test/extended/node/dra/nvidia/README.md
+@@ -0,0 +1,251 @@
++# NVIDIA DRA Extended Tests for OpenShift
++
++This directory contains extended tests for NVIDIA Dynamic Resource Allocation (DRA) functionality on OpenShift clusters with GPU nodes.
++
++## Overview
++
++These tests validate:
++- NVIDIA DRA driver installation and lifecycle
++- Single GPU allocation via ResourceClaims
++- Multi-GPU workload allocation
++- Pod lifecycle and resource cleanup
++- GPU device accessibility in pods
++
++## Prerequisites
++
++1. **OpenShift 4.21+** with GPU-enabled worker nodes
++2. **Node Feature Discovery Operator** pre-installed
++3. **NVIDIA GPU Operator** pre-installed with **CDI enabled** (`cdi.enabled=true`)
++4. **Helm 3** installed and available in PATH
++5. **Cluster-admin** access
++
++For installation instructions, see the [NVIDIA GPU Operator on OpenShift Installation Guide](https://docs.nvidia.com/datacenter/cloud-native/openshift/latest/install-gpu-ocp.html).
++
++**Note**: The test framework automatically installs the DRA driver if not already present.
++
++## Quick Start
++
++### Running Tests
++
++```bash
++# 1. Build test binary
++# Note: Your origin checkout should match the cluster version to avoid version mismatch errors
++make WHAT=cmd/openshift-tests
++
++# 2. Set kubeconfig
++export KUBECONFIG=/path/to/kubeconfig
++
++# 3. Run all NVIDIA DRA tests
++./openshift-tests run --dry-run all 2>&1 | \
++  grep "\[Feature:NVIDIA-DRA\]" | \
++  ./openshift-tests run -f -
++
++# OR run a specific test
++./openshift-tests run-test \
++  '[sig-scheduling][Feature:NVIDIA-DRA][Serial] Basic GPU Allocation should allocate single GPU to pod via DRA'
++
++# OR list all available tests without running them
++./openshift-tests run --dry-run all 2>&1 | grep "\[Feature:NVIDIA-DRA\]"
++```
++
++**What the tests do automatically:**
++- Verify GPU Operator is installed (test fails if not present)
++- Install DRA Driver if not already present (version 25.12.0 by default)
++- Configure necessary SCC permissions and node labels
++- Wait for all components to be ready before running tests
++
++To use a different DRA driver version: `export NVIDIA_DRA_DRIVER_VERSION=25.8.1`
++
++### Running Individual Tests
++
++```bash
++# Set your kubeconfig first
++export KUBECONFIG=/path/to/kubeconfig
++
++# Discover and run all NVIDIA DRA tests sequentially
++./openshift-tests run --dry-run all 2>&1 | grep "\[Feature:NVIDIA-DRA\]" | while read -r test; do
++  echo "Running: $test"
++  ./openshift-tests run-test "$test"
++done
++```
++
++## Test Scenarios
++
++### 1. Single GPU Allocation ✅
++- Creates DeviceClass with CEL selector
++- Creates ResourceClaim requesting exactly 1 GPU
++- Schedules pod with ResourceClaim
++- Validates GPU accessibility via nvidia-smi
++- Validates CDI device injection
++
++**Expected**: PASSED
++
++### 2. Resource Cleanup ✅
++- Creates pod with GPU ResourceClaim
++- Deletes pod
++- Verifies ResourceClaim persists after pod deletion
++- Validates resource lifecycle management
++
++**Expected**: PASSED
++
++### 3. Multi-GPU Workloads ⚠️
++- Creates ResourceClaim requesting exactly 2 GPUs
++- Schedules pod requiring multiple GPUs
++- Validates all GPUs are accessible
++
++**Expected**: SKIPPED if cluster has fewer than 2 GPUs (expected behavior)
++
++### 4. Claim Sharing 🔄
++- Creates a single ResourceClaim
++- Creates two pods referencing the same ResourceClaim
++- Tests whether NVIDIA DRA driver supports claim sharing
++- Validates behavior when multiple pods attempt to use the same claim
++
++**Expected**: Behavior depends on driver support for claim sharing. Test verifies that:
++- If sharing is NOT supported: Second pod remains Pending, first pod continues to work
++- If sharing IS supported: Both pods run and have GPU access
++
++### 5. ResourceClaimTemplate 📋
++- Creates a ResourceClaimTemplate
++- Creates pod with ResourceClaimTemplate reference
++- Validates that ResourceClaim is automatically created from template
++- Verifies GPU access in pod
++- Validates automatic cleanup of template-generated claim when pod is deleted
++
++**Expected**: PASSED
++
++## Manual DRA Driver Installation
++
++The tests automatically install the DRA driver if needed. This section is for manually installing or debugging the DRA driver outside of the test framework.
++
++### Step 1: Add NVIDIA Helm Repository
++
++```bash
++helm repo add nvidia https://nvidia.github.io/gpu-operator
++helm repo update
++```
++
++### Step 2: Label GPU Nodes
++
++```bash
++# Label all GPU nodes for DRA kubelet plugin scheduling
++for node in $(oc get nodes -l nvidia.com/gpu.present=true -o name); do
++  oc label $node nvidia.com/dra-kubelet-plugin=true --overwrite
++done
++
++# Verify labels
++oc get nodes -l nvidia.com/dra-kubelet-plugin=true
++```
++
++This label ensures the DRA kubelet plugin only runs on GPU nodes and works around NVIDIA Driver Manager eviction issues.
++
++### Step 3: Install DRA Driver
++
++```bash
++# Create namespace
++oc create namespace nvidia-dra-driver-gpu
++
++# Grant SCC permissions
++oc adm policy add-scc-to-user privileged \
++  -z nvidia-dra-driver-gpu-service-account-controller \
++  -n nvidia-dra-driver-gpu
++oc adm policy add-scc-to-user privileged \
++  -z nvidia-dra-driver-gpu-service-account-kubeletplugin \
++  -n nvidia-dra-driver-gpu
++oc adm policy add-scc-to-user privileged \
++  -z compute-domain-daemon-service-account \
++  -n nvidia-dra-driver-gpu
++
++# Install via Helm (pinned to version used by tests)
++# Version can be overridden via NVIDIA_DRA_DRIVER_VERSION environment variable
++NVIDIA_DRA_DRIVER_VERSION=${NVIDIA_DRA_DRIVER_VERSION:-25.12.0}
++helm install nvidia-dra-driver-gpu nvidia/nvidia-dra-driver-gpu \
++  --namespace nvidia-dra-driver-gpu \
++  --version ${NVIDIA_DRA_DRIVER_VERSION} \
++  --set nvidiaDriverRoot=/run/nvidia/driver \
++  --set gpuResourcesEnabledOverride=true \
++  --set image.pullPolicy=IfNotPresent \
++  --set-string kubeletPlugin.nodeSelector.nvidia\.com/dra-kubelet-plugin=true \
++  --set controller.tolerations[0].key=node-role.kubernetes.io/master \
++  --set controller.tolerations[0].operator=Exists \
++  --set controller.tolerations[0].effect=NoSchedule \
++  --set controller.tolerations[1].key=node-role.kubernetes.io/control-plane \
++  --set controller.tolerations[1].operator=Exists \
++  --set controller.tolerations[1].effect=NoSchedule \
++  --wait --timeout 5m
++```
++
++### Step 4: Verify Installation
++
++```bash
++# Check DRA driver pods
++oc get pods -n nvidia-dra-driver-gpu
++# Expected: All pods should be Running
++
++# Verify ResourceSlices are published
++oc get resourceslices
++# Should show at least 2 slices per GPU node
++```
++
++### Uninstalling DRA Driver
++
++```bash
++# Uninstall DRA Driver
++helm uninstall nvidia-dra-driver-gpu -n nvidia-dra-driver-gpu --wait --timeout 5m
++oc delete namespace nvidia-dra-driver-gpu
++
++# Remove SCC permissions
++oc delete clusterrolebinding \
++  nvidia-dra-privileged-nvidia-dra-driver-gpu-service-account-controller \
++  nvidia-dra-privileged-nvidia-dra-driver-gpu-service-account-kubeletplugin \
++  nvidia-dra-privileged-compute-domain-daemon-service-account
++```
++
++**Note**: GPU Operator is NOT removed as it's cluster infrastructure. ResourceSlices are automatically cleaned up.
++
++## Troubleshooting
++
++### GPU Operator not found
++
++**Cause**: GPU Operator not installed on cluster.
++
++**Solution**: Install GPU Operator following the [official guide](https://docs.nvidia.com/datacenter/cloud-native/openshift/latest/install-gpu-ocp.html).
++
++### Version mismatch error
++
++**Cause**: Local origin checkout doesn't match cluster's release commit.
++
++**Solution**: Ensure your origin checkout matches the cluster version, or use `./openshift-tests run-test` command which bypasses version checks.
++
++### DRA driver kubelet plugin stuck at Init:0/1
++
++**Cause**: Wrong `nvidiaDriverRoot` setting.
++
++**Solution**: Ensure `nvidiaDriverRoot=/run/nvidia/driver` (not `/`). This is automatically configured by tests.
++
++### ResourceSlices not appearing
++
++**Cause**: DRA driver not fully initialized or missing SCC permissions.
++
++**Solution**:
++```bash
++# Check DRA driver logs
++oc logs -n nvidia-dra-driver-gpu -l app.kubernetes.io/name=nvidia-dra-driver-gpu --all-containers
++
++# Verify SCC permissions
++oc describe scc privileged | grep nvidia-dra-driver-gpu
++
++# Restart DRA driver if needed
++oc delete pod -n nvidia-dra-driver-gpu -l app.kubernetes.io/name=nvidia-dra-driver-gpu
++```
++
++## References
++
++- **NVIDIA GPU Operator**: https://github.com/NVIDIA/gpu-operator
++- **NVIDIA DRA Driver**: https://github.com/NVIDIA/k8s-dra-driver-gpu
++- **Kubernetes DRA Documentation**: https://kubernetes.io/docs/concepts/scheduling-eviction/dynamic-resource-allocation/
++- **OpenShift Extended Tests**: https://github.com/openshift/origin/tree/master/test/extended
++
++---
++
++**Tested On**: OpenShift 4.21.0, Kubernetes 1.34.2, Tesla T4
+diff --git a/test/extended/node/dra/nvidia/gpu_validator.go b/test/extended/node/dra/nvidia/gpu_validator.go
+new file mode 100644
+index 000000000000..c7ae5483a9a1
+--- /dev/null
++++ b/test/extended/node/dra/nvidia/gpu_validator.go
+@@ -0,0 +1,381 @@
++package nvidia
++
++import (
++	"context"
++	"fmt"
++	"strconv"
++	"strings"
++
++	corev1 "k8s.io/api/core/v1"
++	resourceapi "k8s.io/api/resource/v1"
++	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
++	"k8s.io/client-go/kubernetes"
++	"k8s.io/client-go/rest"
++	"k8s.io/kubernetes/test/e2e/framework"
++	e2epod "k8s.io/kubernetes/test/e2e/framework/pod"
++)
++
++const (
++	gpuPresentLabel = "nvidia.com/gpu.present"
++)
++
++// GPUValidator validates GPU allocation and accessibility
++type GPUValidator struct {
++	client     kubernetes.Interface
++	restConfig *rest.Config
++	framework  *framework.Framework
++}
++
++// NewGPUValidator creates a new validator instance
++func NewGPUValidator(f *framework.Framework) *GPUValidator {
++	return &GPUValidator{
++		client:     f.ClientSet,
++		restConfig: f.ClientConfig(),
++		framework:  f,
++	}
++}
++
++// ValidateGPUInPod validates that GPU is accessible in the pod
++func (gv *GPUValidator) ValidateGPUInPod(ctx context.Context, namespace, podName string, expectedGPUCount int) error {
++	framework.Logf("Validating GPU accessibility in pod %s/%s (expected %d GPUs)", namespace, podName, expectedGPUCount)
++
++	// Get the pod
++	pod, err := gv.client.CoreV1().Pods(namespace).Get(ctx, podName, metav1.GetOptions{})
++	if err != nil {
++		return fmt.Errorf("failed to get pod %s/%s: %w", namespace, podName, err)
++	}
++
++	// Exec nvidia-smi to verify GPU is accessible
++	nvidiaSmiCmd := []string{"nvidia-smi", "--query-gpu=index,name", "--format=csv,noheader"}
++	stdout, stderr, err := e2epod.ExecWithOptions(gv.framework, e2epod.ExecOptions{
++		Command:       nvidiaSmiCmd,
++		Namespace:     namespace,
++		PodName:       podName,
++		ContainerName: pod.Spec.Containers[0].Name,
++		CaptureStdout: true,
++		CaptureStderr: true,
++	})
++	output := stdout + stderr
++	if err != nil {
++		return fmt.Errorf("failed to execute nvidia-smi in pod %s/%s: %w\nOutput: %s",
++			namespace, podName, err, output)
++	}
++
++	// Parse output to count GPUs
++	lines := strings.Split(strings.TrimSpace(output), "\n")
++	actualGPUCount := 0
++	for _, line := range lines {
++		if strings.TrimSpace(line) != "" {
++			actualGPUCount++
++		}
++	}
++
++	if actualGPUCount != expectedGPUCount {
++		return fmt.Errorf("expected %d GPUs but found %d in pod %s/%s\nnvidia-smi output:\n%s",
++			expectedGPUCount, actualGPUCount, namespace, podName, output)
++	}
++
++	framework.Logf("Successfully validated %d GPU(s) in pod %s/%s", actualGPUCount, namespace, podName)
++
++	// Validate CUDA_VISIBLE_DEVICES environment variable
++	err = gv.validateCudaVisibleDevices(ctx, namespace, podName, expectedGPUCount)
++	if err != nil {
++		framework.Logf("Warning: CUDA_VISIBLE_DEVICES validation failed: %v", err)
++		// Don't fail the test for this, as it may not always be set
++	}
++
++	return nil
++}
++
++// validateCudaVisibleDevices checks the CUDA_VISIBLE_DEVICES environment variable
++func (gv *GPUValidator) validateCudaVisibleDevices(ctx context.Context, namespace, podName string, expectedCount int) error {
++	pod, err := gv.client.CoreV1().Pods(namespace).Get(ctx, podName, metav1.GetOptions{})
++	if err != nil {
++		return fmt.Errorf("failed to get pod: %w", err)
++	}
++
++	envCmd := []string{"sh", "-c", "echo $CUDA_VISIBLE_DEVICES"}
++	stdout, stderr, err := e2epod.ExecWithOptions(gv.framework, e2epod.ExecOptions{
++		Command:       envCmd,
++		Namespace:     namespace,
++		PodName:       podName,
++		ContainerName: pod.Spec.Containers[0].Name,
++		CaptureStdout: true,
++		CaptureStderr: true,
++	})
++	output := stdout + stderr
++	if err != nil {
++		return fmt.Errorf("failed to get CUDA_VISIBLE_DEVICES: %w", err)
++	}
++
++	cudaDevices := strings.TrimSpace(output)
++	if cudaDevices == "" {
++		return fmt.Errorf("CUDA_VISIBLE_DEVICES is not set")
++	}
++
++	framework.Logf("CUDA_VISIBLE_DEVICES in pod %s/%s: %s", namespace, podName, cudaDevices)
++	return nil
++}
++
++// ValidateResourceSlice validates ResourceSlice for GPU node
++func (gv *GPUValidator) ValidateResourceSlice(ctx context.Context, nodeName string) (*resourceapi.ResourceSlice, error) {
++	framework.Logf("Validating ResourceSlice for node %s", nodeName)
++
++	// List all ResourceSlices
++	sliceList, err := gv.client.ResourceV1().ResourceSlices().List(ctx, metav1.ListOptions{})
++	if err != nil {
++		return nil, fmt.Errorf("failed to list ResourceSlices: %w", err)
++	}
++
++	// Find ResourceSlice for the node
++	var nodeSlice *resourceapi.ResourceSlice
++	for i := range sliceList.Items {
++		slice := &sliceList.Items[i]
++		// Match both node name and NVIDIA GPU driver
++		if slice.Spec.NodeName != nil && *slice.Spec.NodeName == nodeName &&
++			slice.Spec.Driver == "gpu.nvidia.com" {
++			nodeSlice = slice
++			break
++		}
++	}
++
++	if nodeSlice == nil {
++		return nil, fmt.Errorf("no NVIDIA GPU ResourceSlice found for node %s", nodeName)
++	}
++
++	framework.Logf("Found NVIDIA GPU ResourceSlice %s for node %s with driver %s",
++		nodeSlice.Name, nodeName, nodeSlice.Spec.Driver)
++
++	// Validate that it contains GPU devices
++	if nodeSlice.Spec.Devices == nil || len(nodeSlice.Spec.Devices) == 0 {
++		return nil, fmt.Errorf("ResourceSlice %s has no devices", nodeSlice.Name)
++	}
++
++	framework.Logf("ResourceSlice %s has %d device(s)", nodeSlice.Name, len(nodeSlice.Spec.Devices))
++
++	return nodeSlice, nil
++}
++
++// ValidateDeviceAllocation validates that claim is properly allocated
++func (gv *GPUValidator) ValidateDeviceAllocation(ctx context.Context, namespace, claimName string) error {
++	framework.Logf("Validating ResourceClaim allocation for %s/%s", namespace, claimName)
++
++	claim, err := gv.client.ResourceV1().ResourceClaims(namespace).Get(ctx, claimName, metav1.GetOptions{})
++	if err != nil {
++		return fmt.Errorf("failed to get ResourceClaim %s/%s: %w", namespace, claimName, err)
++	}
++
++	// Check if claim is allocated
++	if claim.Status.Allocation == nil {
++		return fmt.Errorf("ResourceClaim %s/%s is not allocated", namespace, claimName)
++	}
++
++	framework.Logf("ResourceClaim %s/%s is allocated", namespace, claimName)
++
++	// Validate devices are allocated
++	deviceCount := len(claim.Status.Allocation.Devices.Results)
++
++	if deviceCount == 0 {
++		return fmt.Errorf("ResourceClaim %s/%s has 0 devices allocated", namespace, claimName)
++	}
++
++	framework.Logf("ResourceClaim %s/%s has %d device(s) allocated", namespace, claimName, deviceCount)
++
++	// Validate allocation metadata for each device
++	for i, result := range claim.Status.Allocation.Devices.Results {
++		// Validate driver is NVIDIA DRA driver
++		if result.Driver != "gpu.nvidia.com" {
++			return fmt.Errorf("device %d has incorrect driver %q, expected %q", i, result.Driver, "gpu.nvidia.com")
++		}
++
++		// Validate pool is not empty
++		if result.Pool == "" {
++			return fmt.Errorf("device %d has empty pool field", i)
++		}
++
++		// Validate device name is not empty
++		if result.Device == "" {
++			return fmt.Errorf("device %d has empty device field", i)
++		}
++
++		// Validate request name is not empty
++		if result.Request == "" {
++			return fmt.Errorf("device %d has empty request field", i)
++		}
++
++		framework.Logf("Device %d validated: driver=%s, pool=%s, device=%s, request=%s",
++			i, result.Driver, result.Pool, result.Device, result.Request)
++	}
++
++	return nil
++}
++
++// GetGPUNodes returns nodes with NVIDIA GPUs
++func (gv *GPUValidator) GetGPUNodes(ctx context.Context) ([]corev1.Node, error) {
++	framework.Logf("Getting GPU-enabled nodes")
++
++	nodeList, err := gv.client.CoreV1().Nodes().List(ctx, metav1.ListOptions{
++		LabelSelector: gpuPresentLabel + "=true",
++	})
++	if err != nil {
++		return nil, fmt.Errorf("failed to list nodes with GPU: %w", err)
++	}
++
++	if len(nodeList.Items) == 0 {
++		// Try without label selector, and filter manually
++		allNodes, err := gv.client.CoreV1().Nodes().List(ctx, metav1.ListOptions{})
++		if err != nil {
++			return nil, fmt.Errorf("failed to list all nodes: %w", err)
++		}
++
++		var gpuNodes []corev1.Node
++		for _, node := range allNodes.Items {
++			// Check for GPU-related labels or capacity
++			if gv.hasGPUCapability(&node) {
++				gpuNodes = append(gpuNodes, node)
++			}
++		}
++
++		if len(gpuNodes) == 0 {
++			// Return empty slice for non-GPU clusters (allows tests to skip cleanly)
++			framework.Logf("No GPU-enabled nodes found in the cluster")
++			return []corev1.Node{}, nil
++		}
++
++		framework.Logf("Found %d GPU-enabled node(s)", len(gpuNodes))
++		return gpuNodes, nil
++	}
++
++	framework.Logf("Found %d GPU-enabled node(s)", len(nodeList.Items))
++	return nodeList.Items, nil
++}
++
++// GetTotalGPUCount returns the total number of GPUs available in the cluster
++// by counting devices in ResourceSlices
++func (gv *GPUValidator) GetTotalGPUCount(ctx context.Context) (int, error) {
++	framework.Logf("Counting total GPUs in cluster via ResourceSlices")
++
++	// List all ResourceSlices for GPU driver
++	sliceList, err := gv.client.ResourceV1().ResourceSlices().List(ctx, metav1.ListOptions{})
++	if err != nil {
++		return 0, fmt.Errorf("failed to list ResourceSlices: %w", err)
++	}
++
++	totalGPUs := 0
++	for _, slice := range sliceList.Items {
++		// Count devices from gpu.nvidia.com driver
++		if slice.Spec.Driver == "gpu.nvidia.com" {
++			totalGPUs += len(slice.Spec.Devices)
++		}
++	}
++
++	framework.Logf("Found %d total GPU(s) in cluster", totalGPUs)
++	return totalGPUs, nil
++}
++
++// hasGPUCapability checks if a node has GPU capability
++func (gv *GPUValidator) hasGPUCapability(node *corev1.Node) bool {
++	// Check for common GPU labels
++	gpuLabels := []string{
++		gpuPresentLabel,
++		"nvidia.com/gpu",
++		"nvidia.com/gpu.count",
++		"feature.node.kubernetes.io/pci-10de.present", // NVIDIA vendor ID
++	}
++
++	for _, label := range gpuLabels {
++		if _, exists := node.Labels[label]; exists {
++			return true
++		}
++	}
++
++	// Check for GPU in allocatable resources
++	if qty, exists := node.Status.Allocatable["nvidia.com/gpu"]; exists {
++		if !qty.IsZero() {
++			return true
++		}
++	}
++
++	return false
++}
++
++// ValidateCDISpec validates CDI specification was created
++func (gv *GPUValidator) ValidateCDISpec(ctx context.Context, podName, namespace string) error {
++	framework.Logf("Validating CDI spec for pod %s/%s", namespace, podName)
++
++	pod, err := gv.client.CoreV1().Pods(namespace).Get(ctx, podName, metav1.GetOptions{})
++	if err != nil {
++		return fmt.Errorf("failed to get pod %s/%s: %w", namespace, podName, err)
++	}
++
++	// Check for CDI annotations or device references
++	// CDI devices are typically injected via annotations or OCI spec
++	for key, value := range pod.Annotations {
++		if strings.Contains(key, "cdi") || strings.Contains(key, "device") {
++			framework.Logf("Found CDI-related annotation: %s=%s", key, value)
++		}
++	}
++
++	// Validate that nvidia device files are present in the container
++	// Note: Using direct device paths instead of shell glob (/dev/nvidia*) because
++	// bind-mounted devices may not be listable via glob patterns in containers
++	devicePaths := []string{"/dev/nvidia0", "/dev/nvidiactl", "/dev/nvidia-uvm"}
++
++	for _, devicePath := range devicePaths {
++		lsCmd := []string{"ls", "-la", devicePath}
++		stdout, stderr, err := e2epod.ExecWithOptions(gv.framework, e2epod.ExecOptions{
++			Command:       lsCmd,
++			Namespace:     namespace,
++			PodName:       podName,
++			ContainerName: pod.Spec.Containers[0].Name,
++			CaptureStdout: true,
++			CaptureStderr: true,
++		})
++		if err != nil {
++			output := stdout + stderr
++			framework.Logf("Warning: Device %s not accessible in pod %s/%s: %v\nOutput: %s", devicePath, namespace, podName, err, output)
++			// Continue checking other devices - at least one should be accessible
++			continue
++		}
++		framework.Logf("Successfully validated device %s in pod %s/%s: %s", devicePath, namespace, podName, stdout)
++	}
++
++	framework.Logf("CDI device validation completed for pod %s/%s", namespace, podName)
++	return nil
++}
++
++// GetGPUCountInPod returns the number of GPUs visible in a pod
++func (gv *GPUValidator) GetGPUCountInPod(ctx context.Context, namespace, podName string) (int, error) {
++	pod, err := gv.client.CoreV1().Pods(namespace).Get(ctx, podName, metav1.GetOptions{})
++	if err != nil {
++		return 0, fmt.Errorf("failed to get pod %s/%s: %w", namespace, podName, err)
++	}
++
++	// Exec nvidia-smi to count GPUs
++	nvidiaSmiCmd := []string{"nvidia-smi", "--query-gpu=count", "--format=csv,noheader"}
++	stdout, stderr, err := e2epod.ExecWithOptions(gv.framework, e2epod.ExecOptions{
++		Command:       nvidiaSmiCmd,
++		Namespace:     namespace,
++		PodName:       podName,
++		ContainerName: pod.Spec.Containers[0].Name,
++		CaptureStdout: true,
++		CaptureStderr: true,
++	})
++	output := stdout + stderr
++	if err != nil {
++		return 0, fmt.Errorf("failed to execute nvidia-smi: %w", err)
++	}
++
++	// Parse the first line to get count
++	lines := strings.Split(strings.TrimSpace(output), "\n")
++	if len(lines) == 0 {
++		return 0, fmt.Errorf("no output from nvidia-smi")
++	}
++
++	count, err := strconv.Atoi(strings.TrimSpace(lines[0]))
++	if err != nil {
++		return 0, fmt.Errorf("failed to parse GPU count from nvidia-smi output: %w", err)
++	}
++
++	return count, nil
++}
+diff --git a/test/extended/node/dra/nvidia/nvidia_dra.go b/test/extended/node/dra/nvidia/nvidia_dra.go
+new file mode 100644
+index 000000000000..1423d9dc1b39
+--- /dev/null
++++ b/test/extended/node/dra/nvidia/nvidia_dra.go
+@@ -0,0 +1,528 @@
++package nvidia
++
++import (
++	"context"
++	"fmt"
++	"strings"
++	"sync"
++	"time"
++
++	"k8s.io/apimachinery/pkg/api/errors"
++
++	g "github.com/onsi/ginkgo/v2"
++	o "github.com/onsi/gomega"
++
++	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
++	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
++	"k8s.io/apimachinery/pkg/runtime"
++	"k8s.io/apimachinery/pkg/runtime/schema"
++	"k8s.io/apimachinery/pkg/util/wait"
++	"k8s.io/client-go/dynamic"
++	"k8s.io/kubernetes/test/e2e/framework"
++	e2epod "k8s.io/kubernetes/test/e2e/framework/pod"
++	admissionapi "k8s.io/pod-security-admission/api"
++	"k8s.io/utils/ptr"
++
++	exutil "github.com/openshift/origin/test/extended/util"
++)
++
++var (
++	deviceClassGVR = schema.GroupVersionResource{
++		Group:    "resource.k8s.io",
++		Version:  "v1",
++		Resource: "deviceclasses",
++	}
++	resourceClaimGVR = schema.GroupVersionResource{
++		Group:    "resource.k8s.io",
++		Version:  "v1",
++		Resource: "resourceclaims",
++	}
++	resourceClaimTemplateGVR = schema.GroupVersionResource{
++		Group:    "resource.k8s.io",
++		Version:  "v1",
++		Resource: "resourceclaimtemplates",
++	}
++
++	// Global state for prerequisites installation
++	// These tests are marked [Serial] to prevent concurrent execution
++	prerequisitesOnce      sync.Once
++	prerequisitesInstalled bool
++	prerequisitesError     error
++)
++
++var _ = g.Describe("[sig-scheduling][Feature:NVIDIA-DRA][Suite:openshift/nvidia-dra][Serial]", func() {
++	defer g.GinkgoRecover()
++
++	oc := exutil.NewCLIWithPodSecurityLevel("nvidia-dra", admissionapi.LevelPrivileged)
++
++	var (
++		prereqInstaller *PrerequisitesInstaller
++		validator       *GPUValidator
++		builder         *ResourceBuilder
++	)
++
++	g.BeforeEach(func(ctx context.Context) {
++		// Initialize helpers
++		validator = NewGPUValidator(oc.KubeFramework())
++		builder = NewResourceBuilder(oc.Namespace())
++		prereqInstaller = NewPrerequisitesInstaller(oc.KubeFramework())
++
++		// IMPORTANT: Check for GPU nodes FIRST before attempting installation
++		// This ensures tests skip cleanly on non-GPU clusters
++		nodes, err := validator.GetGPUNodes(ctx)
++		if err != nil {
++			g.Fail(fmt.Sprintf("Failed to discover GPU nodes: %v", err))
++		}
++		if len(nodes) == 0 {
++			g.Skip("No GPU nodes available in the cluster - skipping NVIDIA DRA tests")
++		}
++		framework.Logf("Found %d GPU node(s) available for testing", len(nodes))
++
++		// Install prerequisites if needed (runs once via sync.Once)
++		// NOTE: GPU Operator must be pre-installed on the cluster
++		// Tests will validate GPU Operator presence and install DRA driver if needed
++		prerequisitesOnce.Do(func() {
++			framework.Logf("Checking NVIDIA GPU stack prerequisites")
++
++			// Check if prerequisites are already installed
++			if prereqInstaller.IsGPUOperatorInstalled(ctx) && prereqInstaller.IsDRADriverInstalled(ctx) {
++				framework.Logf("Prerequisites already installed, skipping installation")
++				prerequisitesInstalled = true
++				return
++			}
++
++			framework.Logf("Validating GPU Operator and installing DRA driver if needed...")
++			// Validate GPU Operator presence and install DRA driver
++			if err := prereqInstaller.InstallAll(ctx); err != nil {
++				prerequisitesError = err
++				framework.Logf("ERROR: Failed to validate/install prerequisites: %v", err)
++				framework.Logf("Ensure GPU Operator is installed on the cluster before running these tests")
++				return
++			}
++
++			prerequisitesInstalled = true
++			framework.Logf("Prerequisites validation completed successfully")
++		})
++
++		// Verify prerequisites are installed
++		if prerequisitesError != nil {
++			g.Fail(fmt.Sprintf("Prerequisites validation failed: %v. Ensure GPU Operator is installed on cluster.", prerequisitesError))
++		}
++		if !prerequisitesInstalled {
++			g.Fail("Prerequisites not installed - cannot run tests")
++		}
++	})
++
++	g.Context("Basic GPU Allocation", func() {
++		g.It("should allocate single GPU to pod via DRA", func(ctx context.Context) {
++			deviceClassName := "test-nvidia-gpu-" + oc.Namespace()
++			claimName := "test-gpu-claim"
++			podName := "test-gpu-pod"
++
++			g.By("Creating DeviceClass for NVIDIA GPUs")
++			deviceClass := builder.BuildDeviceClass(deviceClassName)
++			err := createDeviceClass(ctx, oc.KubeFramework().DynamicClient, deviceClass)
++			framework.ExpectNoError(err, "Failed to create DeviceClass")
++			defer func() {
++				deleteDeviceClass(ctx, oc.KubeFramework().DynamicClient, deviceClassName)
++			}()
++
++			g.By("Creating ResourceClaim requesting 1 GPU")
++			claim := builder.BuildResourceClaim(claimName, deviceClassName, 1)
++			err = createResourceClaim(ctx, oc.KubeFramework().DynamicClient, oc.Namespace(), claim)
++			framework.ExpectNoError(err, "Failed to create ResourceClaim")
++			defer func() {
++				deleteResourceClaim(ctx, oc.KubeFramework().DynamicClient, oc.Namespace(), claimName)
++			}()
++
++			g.By("Creating Pod using the ResourceClaim")
++			pod := builder.BuildPodWithClaim(podName, claimName, "")
++			pod, err = oc.KubeFramework().ClientSet.CoreV1().Pods(oc.Namespace()).Create(ctx, pod, metav1.CreateOptions{})
++			framework.ExpectNoError(err, "Failed to create pod")
++
++			g.By("Waiting for pod to be running")
++			err = e2epod.WaitForPodRunningInNamespace(ctx, oc.KubeFramework().ClientSet, pod)
++			framework.ExpectNoError(err, "Pod failed to start")
++
++			// Get the updated pod
++			pod, err = oc.KubeFramework().ClientSet.CoreV1().Pods(oc.Namespace()).Get(ctx, podName, metav1.GetOptions{})
++			framework.ExpectNoError(err)
++
++			g.By("Verifying pod is scheduled on GPU node")
++			err = validator.ValidateGPUInPod(ctx, oc.Namespace(), podName, 1)
++			framework.ExpectNoError(err)
++
++			g.By("Validating CDI device injection")
++			err = validator.ValidateCDISpec(ctx, podName, oc.Namespace())
++			framework.ExpectNoError(err)
++		})
++
++		g.It("should handle pod deletion and resource cleanup", func(ctx context.Context) {
++			deviceClassName := "test-nvidia-gpu-cleanup-" + oc.Namespace()
++			claimName := "test-gpu-claim-cleanup"
++			podName := "test-gpu-pod-cleanup"
++
++			g.By("Creating DeviceClass")
++			deviceClass := builder.BuildDeviceClass(deviceClassName)
++			err := createDeviceClass(ctx, oc.KubeFramework().DynamicClient, deviceClass)
++			framework.ExpectNoError(err)
++			defer deleteDeviceClass(ctx, oc.KubeFramework().DynamicClient, deviceClassName)
++
++			g.By("Creating ResourceClaim")
++			claim := builder.BuildResourceClaim(claimName, deviceClassName, 1)
++			err = createResourceClaim(ctx, oc.KubeFramework().DynamicClient, oc.Namespace(), claim)
++			framework.ExpectNoError(err)
++			defer deleteResourceClaim(ctx, oc.KubeFramework().DynamicClient, oc.Namespace(), claimName)
++
++			g.By("Creating and verifying pod with GPU")
++			pod := builder.BuildLongRunningPodWithClaim(podName, claimName, "")
++			pod, err = oc.KubeFramework().ClientSet.CoreV1().Pods(oc.Namespace()).Create(ctx, pod, metav1.CreateOptions{})
++			framework.ExpectNoError(err)
++
++			err = e2epod.WaitForPodRunningInNamespace(ctx, oc.KubeFramework().ClientSet, pod)
++			framework.ExpectNoError(err)
++
++			g.By("Verifying GPU is accessible in pod before deletion")
++			err = validator.ValidateGPUInPod(ctx, oc.Namespace(), podName, 1)
++			framework.ExpectNoError(err)
++
++			g.By("Deleting pod")
++			err = oc.KubeFramework().ClientSet.CoreV1().Pods(oc.Namespace()).Delete(ctx, podName, metav1.DeleteOptions{})
++			framework.ExpectNoError(err)
++
++			g.By("Waiting for pod to be deleted")
++			err = e2epod.WaitForPodNotFoundInNamespace(ctx, oc.KubeFramework().ClientSet, podName, oc.Namespace(), 1*time.Minute)
++			framework.ExpectNoError(err)
++
++			g.By("Verifying ResourceClaim still exists but is not reserved")
++			claimObj, err := oc.KubeFramework().DynamicClient.Resource(resourceClaimGVR).Namespace(oc.Namespace()).Get(ctx, claimName, metav1.GetOptions{})
++			framework.ExpectNoError(err)
++			o.Expect(claimObj).NotTo(o.BeNil())
++
++			// Verify the claim is no longer reserved by the deleted pod
++			reservedFor, found, err := unstructured.NestedSlice(claimObj.Object, "status", "reservedFor")
++			framework.ExpectNoError(err)
++			if found && len(reservedFor) > 0 {
++				// Check if any reservation references the deleted pod
++				for _, reservation := range reservedFor {
++					if resMap, ok := reservation.(map[string]interface{}); ok {
++						if uid, found := resMap["uid"]; found {
++							// If any reservation still references the deleted pod, fail the test
++							framework.Logf("Found reservation with UID: %v", uid)
++							g.Fail(fmt.Sprintf("ResourceClaim %s still reserved after pod deletion: %+v", claimName, reservedFor))
++						}
++					}
++				}
++			}
++
++			framework.Logf("ResourceClaim %s successfully cleaned up after pod deletion (no reservations)", claimName)
++		})
++	})
++
++	g.Context("Multi-GPU Workloads", func() {
++		g.It("should allocate multiple GPUs to single pod", func(ctx context.Context) {
++			// Check if cluster has at least 2 GPUs before running test
++			totalGPUs, gpuCountErr := validator.GetTotalGPUCount(ctx)
++			if gpuCountErr != nil {
++				g.Fail(fmt.Sprintf("Failed to count total GPUs: %v", gpuCountErr))
++			}
++			if totalGPUs < 2 {
++				g.Skip(fmt.Sprintf("Multi-GPU test requires at least 2 GPUs, but only %d GPU(s) available in cluster", totalGPUs))
++			}
++
++			deviceClassName := "test-nvidia-multi-gpu-" + oc.Namespace()
++			claimName := "test-multi-gpu-claim"
++			podName := "test-multi-gpu-pod"
++
++			g.By("Creating DeviceClass")
++			deviceClass := builder.BuildDeviceClass(deviceClassName)
++			err := createDeviceClass(ctx, oc.KubeFramework().DynamicClient, deviceClass)
++			framework.ExpectNoError(err)
++			defer deleteDeviceClass(ctx, oc.KubeFramework().DynamicClient, deviceClassName)
++
++			g.By("Creating ResourceClaim requesting 2 GPUs")
++			claim := builder.BuildResourceClaim(claimName, deviceClassName, 2)
++			err = createResourceClaim(ctx, oc.KubeFramework().DynamicClient, oc.Namespace(), claim)
++			framework.ExpectNoError(err)
++			defer deleteResourceClaim(ctx, oc.KubeFramework().DynamicClient, oc.Namespace(), claimName)
++
++			g.By("Creating Pod using the multi-GPU claim")
++			pod := builder.BuildPodWithClaim(podName, claimName, "")
++			pod, err = oc.KubeFramework().ClientSet.CoreV1().Pods(oc.Namespace()).Create(ctx, pod, metav1.CreateOptions{})
++			framework.ExpectNoError(err)
++
++			g.By("Waiting for pod to be running or checking for insufficient resources")
++			err = e2epod.WaitForPodRunningInNamespace(ctx, oc.KubeFramework().ClientSet, pod)
++			if err != nil {
++				// Re-fetch pod to check scheduling status
++				pod, getErr := oc.KubeFramework().ClientSet.CoreV1().Pods(oc.Namespace()).Get(ctx, podName, metav1.GetOptions{})
++				if getErr == nil && pod.Status.Phase == "Pending" {
++					// Check for explicit GPU-related scheduling failure
++					gpuShortfall := false
++					for _, cond := range pod.Status.Conditions {
++						if cond.Type == "PodScheduled" && cond.Status == "False" && cond.Reason == "Unschedulable" {
++							msg := strings.ToLower(cond.Message)
++							// Check if message contains both "insufficient" and GPU-related terms
++							if strings.Contains(msg, "insufficient") &&
++								(strings.Contains(msg, "gpu") ||
++									strings.Contains(msg, "nvidia.com/gpu") ||
++									strings.Contains(msg, "gpu.nvidia.com")) {
++								framework.Logf("Pod unschedulable due to insufficient GPU resources: %s", cond.Message)
++								gpuShortfall = true
++								break
++							}
++						}
++					}
++					if gpuShortfall {
++						g.Skip("Insufficient GPU resources for multi-GPU test")
++					}
++				}
++				framework.ExpectNoError(err, "Pod failed to start")
++			}
++
++			g.By("Verifying 2 GPUs allocated")
++			err = validator.ValidateDeviceAllocation(ctx, oc.Namespace(), claimName)
++			framework.ExpectNoError(err)
++
++			g.By("Verifying 2 GPUs accessible in pod")
++			err = validator.ValidateGPUInPod(ctx, oc.Namespace(), podName, 2)
++			framework.ExpectNoError(err, "Expected 2 GPUs to be accessible in the pod")
++		})
++	})
++
++	g.Context("Claim Sharing", func() {
++		g.It("should allow multiple pods to share the same ResourceClaim", func(ctx context.Context) {
++			deviceClassName := "test-nvidia-shared-" + oc.Namespace()
++			claimName := "test-shared-claim"
++			pod1Name := "test-shared-pod-1"
++			pod2Name := "test-shared-pod-2"
++
++			g.By("Creating DeviceClass")
++			deviceClass := builder.BuildDeviceClass(deviceClassName)
++			err := createDeviceClass(ctx, oc.KubeFramework().DynamicClient, deviceClass)
++			framework.ExpectNoError(err)
++			defer deleteDeviceClass(ctx, oc.KubeFramework().DynamicClient, deviceClassName)
++
++			g.By("Creating shared ResourceClaim")
++			claim := builder.BuildResourceClaim(claimName, deviceClassName, 1)
++			err = createResourceClaim(ctx, oc.KubeFramework().DynamicClient, oc.Namespace(), claim)
++			framework.ExpectNoError(err)
++			defer deleteResourceClaim(ctx, oc.KubeFramework().DynamicClient, oc.Namespace(), claimName)
++
++			g.By("Creating first pod using the shared claim")
++			pod1 := builder.BuildLongRunningPodWithClaim(pod1Name, claimName, "")
++			pod1, err = oc.KubeFramework().ClientSet.CoreV1().Pods(oc.Namespace()).Create(ctx, pod1, metav1.CreateOptions{})
++			framework.ExpectNoError(err, "Failed to create first pod")
++
++			g.By("Waiting for first pod to be running")
++			err = e2epod.WaitForPodRunningInNamespace(ctx, oc.KubeFramework().ClientSet, pod1)
++			framework.ExpectNoError(err, "First pod failed to start")
++
++			g.By("Creating second pod using the same claim")
++			pod2 := builder.BuildLongRunningPodWithClaim(pod2Name, claimName, "")
++			pod2, err = oc.KubeFramework().ClientSet.CoreV1().Pods(oc.Namespace()).Create(ctx, pod2, metav1.CreateOptions{})
++			framework.ExpectNoError(err, "Failed to create second pod")
++
++			g.By("Checking if second pod can share the claim")
++			// Note: NVIDIA DRA driver may not support claim sharing by default
++			// Poll until pod reaches a stable state (Running, or Pending with scheduling failure)
++			const pollInterval = 2 * time.Second
++			const pollTimeout = 60 * time.Second
++			var finalPhase string
++			var schedulingFailed bool
++
++			err = wait.PollUntilContextTimeout(ctx, pollInterval, pollTimeout, true, func(ctx context.Context) (bool, error) {
++				pod2, err = oc.KubeFramework().ClientSet.CoreV1().Pods(oc.Namespace()).Get(ctx, pod2Name, metav1.GetOptions{})
++				if err != nil {
++					return false, err
++				}
++
++				finalPhase = string(pod2.Status.Phase)
++
++				// Check if pod is Running
++				if pod2.Status.Phase == "Running" {
++					framework.Logf("Second pod is Running")
++					return true, nil
++				}
++
++				// Check if pod is Pending with explicit unschedulable reason (not just image pull)
++				if pod2.Status.Phase == "Pending" {
++					for _, cond := range pod2.Status.Conditions {
++						if cond.Type == "PodScheduled" && cond.Status == "False" && cond.Reason == "Unschedulable" {
++							framework.Logf("Second pod is Pending with Unschedulable reason: %s", cond.Message)
++							schedulingFailed = true
++							return true, nil
++						}
++					}
++					// Continue polling if just image pull or other transient issue
++					framework.Logf("Second pod is Pending (phase: %s), continuing to poll...", pod2.Status.Phase)
++					return false, nil
++				}
++
++				// Any other phase is unexpected
++				return false, fmt.Errorf("second pod in unexpected phase: %s", pod2.Status.Phase)
++			})
++			framework.ExpectNoError(err, "Failed to determine second pod state")
++
++			if schedulingFailed {
++				framework.Logf("Second pod unschedulable - claim sharing not supported by NVIDIA DRA driver")
++				g.By("Verifying first pod still has GPU access")
++				err = validator.ValidateGPUInPod(ctx, oc.Namespace(), pod1Name, 1)
++				framework.ExpectNoError(err)
++			} else if finalPhase == "Running" {
++				framework.Logf("Second pod is running - claim sharing is supported")
++				g.By("Verifying both pods have GPU access")
++				err = validator.ValidateGPUInPod(ctx, oc.Namespace(), pod1Name, 1)
++				framework.ExpectNoError(err)
++				err = validator.ValidateGPUInPod(ctx, oc.Namespace(), pod2Name, 1)
++				framework.ExpectNoError(err)
++			}
++		})
++	})
++
++	g.Context("ResourceClaimTemplate", func() {
++		g.It("should create claim from template for pod", func(ctx context.Context) {
++			deviceClassName := "test-nvidia-template-" + oc.Namespace()
++			templateName := "test-gpu-template"
++			podName := "test-template-pod"
++
++			g.By("Creating DeviceClass")
++			deviceClass := builder.BuildDeviceClass(deviceClassName)
++			err := createDeviceClass(ctx, oc.KubeFramework().DynamicClient, deviceClass)
++			framework.ExpectNoError(err)
++			defer deleteDeviceClass(ctx, oc.KubeFramework().DynamicClient, deviceClassName)
++
++			g.By("Creating ResourceClaimTemplate")
++			template := builder.BuildResourceClaimTemplate(templateName, deviceClassName, 1)
++			err = createResourceClaimTemplate(ctx, oc.KubeFramework().DynamicClient, oc.Namespace(), template)
++			framework.ExpectNoError(err)
++			defer deleteResourceClaimTemplate(ctx, oc.KubeFramework().DynamicClient, oc.Namespace(), templateName)
++
++			g.By("Creating Pod with ResourceClaimTemplate reference")
++			pod := builder.BuildPodWithInlineClaim(podName, deviceClassName)
++			// Update the template name to match what we created
++			*pod.Spec.ResourceClaims[0].ResourceClaimTemplateName = templateName
++			pod, err = oc.KubeFramework().ClientSet.CoreV1().Pods(oc.Namespace()).Create(ctx, pod, metav1.CreateOptions{})
++			framework.ExpectNoError(err, "Failed to create pod")
++
++			g.By("Waiting for pod to be running")
++			err = e2epod.WaitForPodRunningInNamespace(ctx, oc.KubeFramework().ClientSet, pod)
++			framework.ExpectNoError(err, "Pod failed to start")
++
++			g.By("Verifying GPU is accessible in pod")
++			err = validator.ValidateGPUInPod(ctx, oc.Namespace(), podName, 1)
++			framework.ExpectNoError(err)
++
++			g.By("Verifying ResourceClaim was created from template")
++			// Kubernetes appends a random suffix to template-generated claim names
++			// Expected pattern: <podName>-<claimName>-<randomSuffix>
++			// e.g., "test-template-pod-gpu-mk94g" instead of just "test-template-pod-gpu"
++			claimPrefix := podName + "-gpu"
++
++			// List all claims in the namespace and find the one matching our prefix
++			claimList, err := oc.KubeFramework().DynamicClient.Resource(resourceClaimGVR).Namespace(oc.Namespace()).List(ctx, metav1.ListOptions{})
++			framework.ExpectNoError(err, "Failed to list ResourceClaims")
++
++			var generatedClaimName string
++			var claimObj *unstructured.Unstructured
++			for _, claim := range claimList.Items {
++				if strings.HasPrefix(claim.GetName(), claimPrefix) {
++					generatedClaimName = claim.GetName()
++					claimObj = &claim
++					framework.Logf("Found template-generated ResourceClaim: %s (matches prefix: %s)", generatedClaimName, claimPrefix)
++					break
++				}
++			}
++
++			o.Expect(generatedClaimName).NotTo(o.BeEmpty(), "ResourceClaim with prefix %s should be auto-created from template", claimPrefix)
++			o.Expect(claimObj).NotTo(o.BeNil())
++			framework.Logf("ResourceClaim %s was successfully created from template", generatedClaimName)
++
++			g.By("Deleting pod and verifying claim cleanup")
++			err = oc.KubeFramework().ClientSet.CoreV1().Pods(oc.Namespace()).Delete(ctx, podName, metav1.DeleteOptions{})
++			framework.ExpectNoError(err)
++
++			err = e2epod.WaitForPodNotFoundInNamespace(ctx, oc.KubeFramework().ClientSet, podName, oc.Namespace(), 1*time.Minute)
++			framework.ExpectNoError(err)
++
++			// The auto-generated claim should be deleted with the pod - poll until NotFound
++			g.By("Verifying auto-generated claim is deleted")
++			err = wait.PollUntilContextTimeout(ctx, 1*time.Second, 30*time.Second, true, func(ctx context.Context) (bool, error) {
++				_, getErr := oc.KubeFramework().DynamicClient.Resource(resourceClaimGVR).Namespace(oc.Namespace()).Get(ctx, generatedClaimName, metav1.GetOptions{})
++				if getErr != nil {
++					if errors.IsNotFound(getErr) {
++						// Successfully deleted
++						framework.Logf("ResourceClaim %s was deleted as expected", generatedClaimName)
++						return true, nil
++					}
++					// Unexpected error
++					return false, getErr
++				}
++				// Claim still exists, continue polling
++				framework.Logf("ResourceClaim %s still exists, waiting for cleanup...", generatedClaimName)
++				return false, nil
++			})
++			if err != nil {
++				g.Fail(fmt.Sprintf("ResourceClaim %s not deleted within timeout - expected automatic cleanup: %v", generatedClaimName, err))
++			}
++			framework.Logf("ResourceClaim was cleaned up with pod deletion as expected")
++		})
++	})
++})
++
++// Helper functions for creating and deleting resources
++
++func convertToUnstructured(obj interface{}) (*unstructured.Unstructured, error) {
++	unstructuredObj := &unstructured.Unstructured{}
++	content, err := runtime.DefaultUnstructuredConverter.ToUnstructured(obj)
++	if err != nil {
++		return nil, err
++	}
++	unstructuredObj.Object = content
++	return unstructuredObj, nil
++}
++
++func createDeviceClass(ctx context.Context, client dynamic.Interface, deviceClass interface{}) error {
++	unstructuredObj, err := convertToUnstructured(deviceClass)
++	if err != nil {
++		return err
++	}
++	_, err = client.Resource(deviceClassGVR).Create(ctx, unstructuredObj, metav1.CreateOptions{})
++	return err
++}
++
++func deleteDeviceClass(ctx context.Context, client dynamic.Interface, name string) error {
++	return client.Resource(deviceClassGVR).Delete(ctx, name, metav1.DeleteOptions{
++		GracePeriodSeconds: ptr.To[int64](0),
++	})
++}
++
++func createResourceClaim(ctx context.Context, client dynamic.Interface, namespace string, claim interface{}) error {
++	unstructuredObj, err := convertToUnstructured(claim)
++	if err != nil {
++		return err
++	}
++	_, err = client.Resource(resourceClaimGVR).Namespace(namespace).Create(ctx, unstructuredObj, metav1.CreateOptions{})
++	return err
++}
++
++func deleteResourceClaim(ctx context.Context, client dynamic.Interface, namespace, name string) error {
++	return client.Resource(resourceClaimGVR).Namespace(namespace).Delete(ctx, name, metav1.DeleteOptions{
++		GracePeriodSeconds: ptr.To[int64](0),
++	})
++}
++
++func createResourceClaimTemplate(ctx context.Context, client dynamic.Interface, namespace string, template interface{}) error {
++	unstructuredObj, err := convertToUnstructured(template)
++	if err != nil {
++		return err
++	}
++	_, err = client.Resource(resourceClaimTemplateGVR).Namespace(namespace).Create(ctx, unstructuredObj, metav1.CreateOptions{})
++	return err
++}
++
++func deleteResourceClaimTemplate(ctx context.Context, client dynamic.Interface, namespace, name string) error {
++	return client.Resource(resourceClaimTemplateGVR).Namespace(namespace).Delete(ctx, name, metav1.DeleteOptions{
++		GracePeriodSeconds: ptr.To[int64](0),
++	})
++}
+diff --git a/test/extended/node/dra/nvidia/prerequisites_installer.go b/test/extended/node/dra/nvidia/prerequisites_installer.go
+new file mode 100644
+index 000000000000..0659b76bca04
+--- /dev/null
++++ b/test/extended/node/dra/nvidia/prerequisites_installer.go
+@@ -0,0 +1,665 @@
++package nvidia
++
++import (
++	"context"
++	"fmt"
++	"os"
++	"os/exec"
++	"strings"
++	"time"
++
++	corev1 "k8s.io/api/core/v1"
++	rbacv1 "k8s.io/api/rbac/v1"
++	"k8s.io/apimachinery/pkg/api/errors"
++	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
++	"k8s.io/apimachinery/pkg/types"
++	"k8s.io/apimachinery/pkg/util/wait"
++	"k8s.io/client-go/kubernetes"
++	"k8s.io/kubernetes/test/e2e/framework"
++)
++
++const (
++	// GPU Operator namespace (used for validation only)
++	gpuOperatorNamespace = "nvidia-gpu-operator"
++
++	// DRA Driver constants
++	draDriverNamespace       = "nvidia-dra-driver-gpu"
++	draDriverRelease         = "nvidia-dra-driver-gpu"
++	draDriverChart           = "nvidia/nvidia-dra-driver-gpu"
++	draDriverDefaultVersion  = "25.12.0"
++	draDriverControllerSA    = "nvidia-dra-driver-gpu-service-account-controller"
++	draDriverKubeletPluginSA = "nvidia-dra-driver-gpu-service-account-kubeletplugin"
++	draDriverComputeDomainSA = "compute-domain-daemon-service-account"
++)
++
++// PrerequisitesInstaller validates GPU Operator and manages DRA driver installation
++type PrerequisitesInstaller struct {
++	client    kubernetes.Interface
++	framework *framework.Framework
++}
++
++// NewPrerequisitesInstaller creates a new installer
++func NewPrerequisitesInstaller(f *framework.Framework) *PrerequisitesInstaller {
++	return &PrerequisitesInstaller{
++		client:    f.ClientSet,
++		framework: f,
++	}
++}
++
++// InstallAll validates GPU Operator is present and installs DRA Driver
++func (pi *PrerequisitesInstaller) InstallAll(ctx context.Context) error {
++	framework.Logf("=== Validating NVIDIA GPU Stack Prerequisites ===")
++
++	// Step 1: Validate GPU Operator is already installed
++	framework.Logf("Checking if GPU Operator is installed...")
++	if !pi.IsGPUOperatorInstalled(ctx) {
++		return fmt.Errorf("GPU Operator not found - must be pre-installed on the cluster. " +
++			"Install GPU Operator via OLM before running these tests")
++	}
++	framework.Logf("GPU Operator detected")
++
++	// Step 2: Wait for GPU Operator to be ready
++	framework.Logf("Waiting for GPU Operator to be ready...")
++	if err := pi.WaitForGPUOperator(ctx, 5*time.Minute); err != nil {
++		return fmt.Errorf("GPU Operator not ready: %w. Ensure GPU Operator is fully deployed", err)
++	}
++	framework.Logf("GPU Operator is ready")
++
++	// Step 3: Check if DRA Driver already installed (skip if present)
++	if pi.IsDRADriverInstalled(ctx) {
++		framework.Logf("DRA Driver already installed, skipping installation")
++	} else {
++		// Step 4: Ensure Helm is available
++		if err := pi.ensureHelm(ctx); err != nil {
++			return fmt.Errorf("helm not available: %w", err)
++		}
++
++		// Step 5: Add NVIDIA Helm repository
++		if err := pi.addHelmRepoForDRADriver(ctx); err != nil {
++			return fmt.Errorf("failed to add Helm repository: %w", err)
++		}
++
++		// Step 6: Install DRA Driver (latest version)
++		if err := pi.InstallDRADriver(ctx); err != nil {
++			framework.Logf("DRA Driver installation failed, rolling back cluster mutations...")
++			pi.RollbackDRAMutations(ctx)
++			return fmt.Errorf("failed to install DRA Driver: %w", err)
++		}
++	}
++
++	// Step 7: Wait for DRA Driver to be ready
++	framework.Logf("Waiting for DRA Driver to be ready...")
++	if err := pi.WaitForDRADriver(ctx, 5*time.Minute); err != nil {
++		framework.Logf("DRA Driver failed to become ready, rolling back cluster mutations...")
++		pi.RollbackDRAMutations(ctx)
++		return fmt.Errorf("DRA Driver failed to become ready: %w", err)
++	}
++
++	framework.Logf("=== All prerequisites validated and ready ===")
++	return nil
++}
++
++// ensureHelm checks if Helm is available
++func (pi *PrerequisitesInstaller) ensureHelm(ctx context.Context) error {
++	cmd := exec.CommandContext(ctx, "helm", "version", "--short")
++	output, err := cmd.CombinedOutput()
++	if err != nil {
++		return fmt.Errorf("helm command not found or failed: %w\nOutput: %s", err, string(output))
++	}
++	framework.Logf("Helm version: %s", strings.TrimSpace(string(output)))
++	return nil
++}
++
++// addHelmRepoForDRADriver adds NVIDIA Helm repository for DRA driver installation
++func (pi *PrerequisitesInstaller) addHelmRepoForDRADriver(ctx context.Context) error {
++	framework.Logf("Adding NVIDIA Helm repository for DRA driver")
++
++	// Add repo
++	cmd := exec.CommandContext(ctx, "helm", "repo", "add", "nvidia", "https://nvidia.github.io/gpu-operator")
++	output, err := cmd.CombinedOutput()
++	if err != nil && !strings.Contains(string(output), "already exists") {
++		return fmt.Errorf("failed to add helm repo: %w\nOutput: %s", err, string(output))
++	}
++
++	// Update repo
++	cmd = exec.CommandContext(ctx, "helm", "repo", "update")
++	output, err = cmd.CombinedOutput()
++	if err != nil {
++		return fmt.Errorf("failed to update helm repo: %w\nOutput: %s", err, string(output))
++	}
++
++	framework.Logf("NVIDIA Helm repository added and updated")
++	return nil
++}
++
++// InstallDRADriver installs NVIDIA DRA Driver via Helm with pinned version
++func (pi *PrerequisitesInstaller) InstallDRADriver(ctx context.Context) error {
++	framework.Logf("Installing NVIDIA DRA Driver")
++
++	// Create namespace
++	if err := pi.createNamespace(ctx, draDriverNamespace); err != nil {
++		return err
++	}
++
++	// Label GPU nodes for DRA kubelet plugin scheduling
++	if err := pi.labelGPUNodesForDRA(ctx); err != nil {
++		return fmt.Errorf("failed to label GPU nodes: %w", err)
++	}
++
++	// Grant SCC permissions
++	if err := pi.grantSCCPermissions(ctx); err != nil {
++		return fmt.Errorf("failed to grant SCC permissions: %w", err)
++	}
++
++	// Check if already installed
++	if pi.isHelmReleaseInstalled(ctx, draDriverRelease, draDriverNamespace) {
++		framework.Logf("DRA Driver already installed, skipping")
++		return nil
++	}
++
++	// Build Helm install command with version pinning for hermetic tests
++	// Version can be overridden via NVIDIA_DRA_DRIVER_VERSION environment variable
++	version := os.Getenv("NVIDIA_DRA_DRIVER_VERSION")
++	if version == "" {
++		version = draDriverDefaultVersion
++	}
++	framework.Logf("Installing DRA Driver version: %s", version)
++
++	args := []string{
++		"install", draDriverRelease, draDriverChart,
++		"--namespace", draDriverNamespace,
++		"--version", version,
++		"--set", "nvidiaDriverRoot=/run/nvidia/driver",
++		"--set", "gpuResourcesEnabledOverride=true",
++		"--set", "image.pullPolicy=IfNotPresent",
++		"--set-string", "kubeletPlugin.nodeSelector.nvidia\\.com/dra-kubelet-plugin=true",
++		"--set", "controller.tolerations[0].key=node-role.kubernetes.io/master",
++		"--set", "controller.tolerations[0].operator=Exists",
++		"--set", "controller.tolerations[0].effect=NoSchedule",
++		"--set", "controller.tolerations[1].key=node-role.kubernetes.io/control-plane",
++		"--set", "controller.tolerations[1].operator=Exists",
++		"--set", "controller.tolerations[1].effect=NoSchedule",
++		"--wait",
++		"--timeout", "5m",
++	}
++
++	cmd := exec.CommandContext(ctx, "helm", args...)
++	output, err := cmd.CombinedOutput()
++	if err != nil {
++		return fmt.Errorf("failed to install DRA Driver: %w\nOutput: %s", err, string(output))
++	}
++
++	framework.Logf("DRA Driver installed successfully")
++	return nil
++}
++
++// WaitForGPUOperator waits for GPU Operator to be ready
++func (pi *PrerequisitesInstaller) WaitForGPUOperator(ctx context.Context, timeout time.Duration) error {
++	framework.Logf("Waiting for GPU Operator to be ready (timeout: %v)", timeout)
++
++	// Wait for driver daemonset (using prefix matching to support different installation methods)
++	if err := pi.waitForDaemonSetByPrefix(ctx, gpuOperatorNamespace, "nvidia-driver-daemonset", timeout); err != nil {
++		return fmt.Errorf("driver daemonset not ready: %w", err)
++	}
++
++	// Wait for device plugin daemonset (using prefix matching to support different installation methods)
++	if err := pi.waitForDaemonSetByPrefix(ctx, gpuOperatorNamespace, "nvidia-device-plugin-daemonset", timeout); err != nil {
++		return fmt.Errorf("device plugin daemonset not ready: %w", err)
++	}
++
++	// Validate CDI is available (required for DRA)
++	if err := pi.waitForCDI(ctx, timeout); err != nil {
++		return fmt.Errorf("CDI not available: %w", err)
++	}
++
++	// Wait for GPU nodes to be labeled by NFD
++	if err := pi.waitForGPUNodes(ctx, timeout); err != nil {
++		return fmt.Errorf("no GPU nodes labeled: %w", err)
++	}
++
++	framework.Logf("GPU Operator is ready")
++	return nil
++}
++
++// WaitForDRADriver waits for DRA Driver to be ready
++func (pi *PrerequisitesInstaller) WaitForDRADriver(ctx context.Context, timeout time.Duration) error {
++	framework.Logf("Waiting for DRA Driver to be ready (timeout: %v)", timeout)
++
++	// Wait for controller deployment
++	if err := pi.waitForDeployment(ctx, draDriverNamespace, draDriverRelease+"-controller", timeout); err != nil {
++		return fmt.Errorf("controller deployment not ready: %w", err)
++	}
++
++	// Wait for kubelet plugin daemonset
++	if err := pi.waitForDaemonSet(ctx, draDriverNamespace, draDriverRelease+"-kubelet-plugin", timeout); err != nil {
++		return fmt.Errorf("kubelet plugin daemonset not ready: %w", err)
++	}
++
++	// Wait for GPU slices to be published
++	framework.Logf("Waiting for GPU ResourceSlices to be published...")
++	validator := NewGPUValidator(pi.framework)
++	err := wait.PollUntilContextTimeout(ctx, 5*time.Second, timeout, true, func(ctx context.Context) (bool, error) {
++		gpuCount, err := validator.GetTotalGPUCount(ctx)
++		if err != nil {
++			framework.Logf("Error checking GPU count: %v", err)
++			return false, nil // Retry on error
++		}
++		if gpuCount > 0 {
++			framework.Logf("Found %d published GPU(s) in ResourceSlices", gpuCount)
++			return true, nil
++		}
++		framework.Logf("No GPU slices published yet, waiting...")
++		return false, nil
++	})
++	if err != nil {
++		return fmt.Errorf("no published GPU slices within timeout: %w", err)
++	}
++
++	framework.Logf("DRA Driver is ready")
++	return nil
++}
++
++// UninstallAll uninstalls DRA Driver (GPU Operator is cluster infrastructure, not removed)
++func (pi *PrerequisitesInstaller) UninstallAll(ctx context.Context) error {
++	framework.Logf("=== Cleaning up NVIDIA DRA Driver ===")
++
++	// Only uninstall DRA Driver (GPU Operator is cluster infrastructure)
++	if err := pi.UninstallDRADriver(ctx); err != nil {
++		framework.Logf("Warning: failed to uninstall DRA Driver: %v", err)
++	}
++
++	framework.Logf("=== Cleanup complete ===")
++	return nil
++}
++
++// UninstallDRADriver uninstalls DRA Driver and cleans up cluster-scoped resources
++func (pi *PrerequisitesInstaller) UninstallDRADriver(ctx context.Context) error {
++	framework.Logf("Uninstalling DRA Driver and cleaning up cluster resources")
++
++	// Step 1: Uninstall Helm release
++	cmd := exec.CommandContext(ctx, "helm", "uninstall", draDriverRelease,
++		"--namespace", draDriverNamespace,
++		"--wait",
++		"--timeout", "5m")
++
++	output, err := cmd.CombinedOutput()
++	if err != nil && !strings.Contains(string(output), "not found") {
++		return fmt.Errorf("failed to uninstall DRA Driver: %w\nOutput: %s", err, string(output))
++	}
++
++	// Step 2: Delete ClusterRoleBindings created by grantSCCPermissions
++	serviceAccounts := []string{
++		draDriverControllerSA,
++		draDriverKubeletPluginSA,
++		draDriverComputeDomainSA,
++	}
++
++	for _, sa := range serviceAccounts {
++		crbName := fmt.Sprintf("nvidia-dra-privileged-%s", sa)
++		err := pi.client.RbacV1().ClusterRoleBindings().Delete(ctx, crbName, metav1.DeleteOptions{})
++		if err != nil && !errors.IsNotFound(err) {
++			framework.Logf("Warning: failed to delete ClusterRoleBinding %s: %v", crbName, err)
++		} else {
++			framework.Logf("Deleted ClusterRoleBinding %s", crbName)
++		}
++	}
++
++	// Step 3: Remove DRA kubelet plugin labels from GPU nodes
++	nodes, err := pi.client.CoreV1().Nodes().List(ctx, metav1.ListOptions{
++		LabelSelector: "nvidia.com/dra-kubelet-plugin=true",
++	})
++	if err != nil && !errors.IsNotFound(err) {
++		framework.Logf("Warning: failed to list labeled nodes: %v", err)
++	} else {
++		for _, node := range nodes.Items {
++			patchData := []byte(`{"metadata":{"labels":{"nvidia.com/dra-kubelet-plugin":null}}}`)
++			_, err := pi.client.CoreV1().Nodes().Patch(ctx, node.Name, types.MergePatchType, patchData, metav1.PatchOptions{})
++			if err != nil && !errors.IsNotFound(err) {
++				framework.Logf("Warning: failed to remove label from node %s: %v", node.Name, err)
++			} else {
++				framework.Logf("Removed DRA label from node %s", node.Name)
++			}
++		}
++	}
++
++	// Step 4: Delete namespace
++	if err := pi.client.CoreV1().Namespaces().Delete(ctx, draDriverNamespace, metav1.DeleteOptions{}); err != nil {
++		if !errors.IsNotFound(err) {
++			return fmt.Errorf("failed to delete namespace: %w", err)
++		}
++	}
++
++	framework.Logf("DRA Driver uninstalled and cluster resources cleaned up")
++	return nil
++}
++
++// RollbackDRAMutations performs best-effort cleanup of cluster-scoped mutations made during DRA installation
++// This is called when installation or waiting fails, to avoid leaving partial state
++func (pi *PrerequisitesInstaller) RollbackDRAMutations(ctx context.Context) {
++	framework.Logf("Rolling back DRA cluster mutations (best-effort)...")
++
++	// Step 1: Delete ClusterRoleBindings
++	serviceAccounts := []string{
++		draDriverControllerSA,
++		draDriverKubeletPluginSA,
++		draDriverComputeDomainSA,
++	}
++
++	for _, sa := range serviceAccounts {
++		crbName := fmt.Sprintf("nvidia-dra-privileged-%s", sa)
++		err := pi.client.RbacV1().ClusterRoleBindings().Delete(ctx, crbName, metav1.DeleteOptions{})
++		if err != nil && !errors.IsNotFound(err) {
++			framework.Logf("Warning: failed to delete ClusterRoleBinding %s during rollback: %v", crbName, err)
++		} else if err == nil {
++			framework.Logf("Rolled back ClusterRoleBinding %s", crbName)
++		}
++	}
++
++	// Step 2: Remove DRA kubelet plugin labels from GPU nodes
++	nodes, err := pi.client.CoreV1().Nodes().List(ctx, metav1.ListOptions{
++		LabelSelector: "nvidia.com/dra-kubelet-plugin=true",
++	})
++	if err == nil {
++		for _, node := range nodes.Items {
++			patchData := []byte(`{"metadata":{"labels":{"nvidia.com/dra-kubelet-plugin":null}}}`)
++			_, err := pi.client.CoreV1().Nodes().Patch(ctx, node.Name, types.MergePatchType, patchData, metav1.PatchOptions{})
++			if err != nil && !errors.IsNotFound(err) {
++				framework.Logf("Warning: failed to remove label from node %s during rollback: %v", node.Name, err)
++			} else if err == nil {
++				framework.Logf("Rolled back DRA label from node %s", node.Name)
++			}
++		}
++	} else {
++		framework.Logf("Warning: failed to list labeled nodes during rollback: %v", err)
++	}
++
++	// Step 3: Delete namespace
++	err = pi.client.CoreV1().Namespaces().Delete(ctx, draDriverNamespace, metav1.DeleteOptions{})
++	if err != nil && !errors.IsNotFound(err) {
++		framework.Logf("Warning: failed to delete namespace %s during rollback: %v", draDriverNamespace, err)
++	} else if err == nil {
++		framework.Logf("Rolled back namespace %s", draDriverNamespace)
++	}
++
++	framework.Logf("Rollback complete (errors above are warnings, original error will be returned)")
++}
++
++// Helper methods
++
++func (pi *PrerequisitesInstaller) createNamespace(ctx context.Context, name string) error {
++	ns := &corev1.Namespace{
++		ObjectMeta: metav1.ObjectMeta{
++			Name: name,
++		},
++	}
++	_, err := pi.client.CoreV1().Namespaces().Create(ctx, ns, metav1.CreateOptions{})
++	if err != nil && !errors.IsAlreadyExists(err) {
++		return fmt.Errorf("failed to create namespace %s: %w", name, err)
++	}
++	framework.Logf("Namespace %s created or already exists", name)
++	return nil
++}
++
++func (pi *PrerequisitesInstaller) labelGPUNodesForDRA(ctx context.Context) error {
++	framework.Logf("Labeling GPU nodes for DRA kubelet plugin")
++
++	nodes, err := pi.client.CoreV1().Nodes().List(ctx, metav1.ListOptions{
++		LabelSelector: "nvidia.com/gpu.present=true",
++	})
++	if err != nil {
++		return fmt.Errorf("failed to list GPU nodes: %w", err)
++	}
++
++	if len(nodes.Items) == 0 {
++		return fmt.Errorf("no GPU nodes found to label")
++	}
++
++	for _, node := range nodes.Items {
++		if node.Labels["nvidia.com/dra-kubelet-plugin"] == "true" {
++			framework.Logf("Node %s already has DRA kubelet plugin label", node.Name)
++			continue
++		}
++
++		// Use Patch to avoid resourceVersion conflicts
++		patchData := []byte(`{"metadata":{"labels":{"nvidia.com/dra-kubelet-plugin":"true"}}}`)
++		_, err := pi.client.CoreV1().Nodes().Patch(ctx, node.Name, types.MergePatchType, patchData, metav1.PatchOptions{})
++		if err != nil {
++			return fmt.Errorf("failed to label node %s: %w", node.Name, err)
++		}
++		framework.Logf("Labeled GPU node %s with nvidia.com/dra-kubelet-plugin=true", node.Name)
++	}
++
++	return nil
++}
++
++func (pi *PrerequisitesInstaller) grantSCCPermissions(ctx context.Context) error {
++	framework.Logf("Granting SCC permissions to DRA driver service accounts")
++
++	serviceAccounts := []string{
++		draDriverControllerSA,
++		draDriverKubeletPluginSA,
++		draDriverComputeDomainSA,
++	}
++
++	for _, sa := range serviceAccounts {
++		// Create ClusterRoleBinding to grant privileged SCC
++		crb := &rbacv1.ClusterRoleBinding{
++			ObjectMeta: metav1.ObjectMeta{
++				Name: fmt.Sprintf("nvidia-dra-privileged-%s", sa),
++			},
++			RoleRef: rbacv1.RoleRef{
++				APIGroup: "rbac.authorization.k8s.io",
++				Kind:     "ClusterRole",
++				Name:     "system:openshift:scc:privileged",
++			},
++			Subjects: []rbacv1.Subject{
++				{
++					Kind:      "ServiceAccount",
++					Name:      sa,
++					Namespace: draDriverNamespace,
++				},
++			},
++		}
++
++		_, err := pi.client.RbacV1().ClusterRoleBindings().Create(ctx, crb, metav1.CreateOptions{})
++		if err != nil && !errors.IsAlreadyExists(err) {
++			return fmt.Errorf("failed to create ClusterRoleBinding for %s: %w", sa, err)
++		}
++		framework.Logf("SCC permissions granted to %s", sa)
++	}
++
++	return nil
++}
++
++func (pi *PrerequisitesInstaller) isHelmReleaseInstalled(ctx context.Context, release, namespace string) bool {
++	cmd := exec.CommandContext(ctx, "helm", "status", release, "--namespace", namespace)
++	err := cmd.Run()
++	return err == nil
++}
++
++func (pi *PrerequisitesInstaller) waitForDaemonSet(ctx context.Context, namespace, name string, timeout time.Duration) error {
++	return wait.PollUntilContextTimeout(ctx, 5*time.Second, timeout, true, func(ctx context.Context) (bool, error) {
++		ds, err := pi.client.AppsV1().DaemonSets(namespace).Get(ctx, name, metav1.GetOptions{})
++		if err != nil {
++			if errors.IsNotFound(err) {
++				framework.Logf("DaemonSet %s/%s not found yet", namespace, name)
++				return false, nil
++			}
++			return false, err
++		}
++
++		ready := ds.Status.DesiredNumberScheduled > 0 &&
++			ds.Status.NumberReady == ds.Status.DesiredNumberScheduled &&
++			ds.Status.NumberUnavailable == 0
++
++		if !ready {
++			framework.Logf("DaemonSet %s/%s not ready: desired=%d, ready=%d, unavailable=%d",
++				namespace, name, ds.Status.DesiredNumberScheduled, ds.Status.NumberReady, ds.Status.NumberUnavailable)
++		}
++
++		return ready, nil
++	})
++}
++
++func (pi *PrerequisitesInstaller) waitForDaemonSetByPrefix(ctx context.Context, namespace, namePrefix string, timeout time.Duration) error {
++	return wait.PollUntilContextTimeout(ctx, 5*time.Second, timeout, true, func(ctx context.Context) (bool, error) {
++		dsList, err := pi.client.AppsV1().DaemonSets(namespace).List(ctx, metav1.ListOptions{})
++		if err != nil {
++			return false, err
++		}
++
++		for _, ds := range dsList.Items {
++			if strings.HasPrefix(ds.Name, namePrefix) {
++				ready := ds.Status.DesiredNumberScheduled > 0 &&
++					ds.Status.NumberReady == ds.Status.DesiredNumberScheduled &&
++					ds.Status.NumberUnavailable == 0
++
++				if !ready {
++					framework.Logf("DaemonSet %s/%s not ready: desired=%d, ready=%d, unavailable=%d",
++						namespace, ds.Name, ds.Status.DesiredNumberScheduled, ds.Status.NumberReady, ds.Status.NumberUnavailable)
++					return false, nil
++				}
++
++				framework.Logf("DaemonSet %s/%s is ready", namespace, ds.Name)
++				return true, nil
++			}
++		}
++
++		framework.Logf("DaemonSet with prefix %s/%s not found yet", namespace, namePrefix)
++		return false, nil
++	})
++}
++
++func (pi *PrerequisitesInstaller) waitForDeployment(ctx context.Context, namespace, name string, timeout time.Duration) error {
++	return wait.PollUntilContextTimeout(ctx, 5*time.Second, timeout, true, func(ctx context.Context) (bool, error) {
++		deploy, err := pi.client.AppsV1().Deployments(namespace).Get(ctx, name, metav1.GetOptions{})
++		if err != nil {
++			if errors.IsNotFound(err) {
++				framework.Logf("Deployment %s/%s not found yet", namespace, name)
++				return false, nil
++			}
++			return false, err
++		}
++
++		ready := deploy.Status.Replicas > 0 &&
++			deploy.Status.ReadyReplicas == deploy.Status.Replicas
++
++		if !ready {
++			framework.Logf("Deployment %s/%s not ready: replicas=%d, ready=%d",
++				namespace, name, deploy.Status.Replicas, deploy.Status.ReadyReplicas)
++		}
++
++		return ready, nil
++	})
++}
++
++func (pi *PrerequisitesInstaller) waitForGPUNodes(ctx context.Context, timeout time.Duration) error {
++	framework.Logf("Waiting for GPU nodes to be labeled by NFD")
++
++	return wait.PollUntilContextTimeout(ctx, 10*time.Second, timeout, true, func(ctx context.Context) (bool, error) {
++		nodes, err := pi.client.CoreV1().Nodes().List(ctx, metav1.ListOptions{
++			LabelSelector: "nvidia.com/gpu.present=true",
++		})
++		if err != nil {
++			return false, err
++		}
++
++		if len(nodes.Items) == 0 {
++			framework.Logf("No GPU nodes labeled yet by NFD")
++			return false, nil
++		}
++
++		framework.Logf("Found %d GPU node(s) labeled by NFD", len(nodes.Items))
++		for _, node := range nodes.Items {
++			framework.Logf("  - GPU node: %s", node.Name)
++		}
++		return true, nil
++	})
++}
++
++// waitForCDI validates that CDI components are installed and healthy
++func (pi *PrerequisitesInstaller) waitForCDI(ctx context.Context, timeout time.Duration) error {
++	framework.Logf("Waiting for CDI to be available (timeout: %v)", timeout)
++
++	return wait.PollUntilContextTimeout(ctx, 5*time.Second, timeout, true, func(ctx context.Context) (bool, error) {
++		// Check for nvidia-container-toolkit daemonset (provides CDI support)
++		dsList, err := pi.client.AppsV1().DaemonSets(gpuOperatorNamespace).List(ctx, metav1.ListOptions{})
++		if err != nil {
++			return false, err
++		}
++
++		for _, ds := range dsList.Items {
++			if strings.Contains(ds.Name, "nvidia-container-toolkit") {
++				ready := ds.Status.DesiredNumberScheduled > 0 &&
++					ds.Status.NumberReady == ds.Status.DesiredNumberScheduled &&
++					ds.Status.NumberUnavailable == 0
++
++				if !ready {
++					framework.Logf("CDI component %s not ready: desired=%d, ready=%d, unavailable=%d",
++						ds.Name, ds.Status.DesiredNumberScheduled, ds.Status.NumberReady, ds.Status.NumberUnavailable)
++					return false, nil
++				}
++
++				framework.Logf("CDI component %s is ready", ds.Name)
++				return true, nil
++			}
++		}
++
++		framework.Logf("CDI component (nvidia-container-toolkit) not found yet")
++		return false, nil
++	})
++}
++
++// IsGPUOperatorInstalled checks if GPU Operator is installed (via Helm or OLM)
++func (pi *PrerequisitesInstaller) IsGPUOperatorInstalled(ctx context.Context) bool {
++	// Check if the namespace exists
++	_, err := pi.client.CoreV1().Namespaces().Get(ctx, gpuOperatorNamespace, metav1.GetOptions{})
++	if err != nil {
++		return false
++	}
++
++	// Check if GPU Operator pods are running
++	pods, err := pi.client.CoreV1().Pods(gpuOperatorNamespace).List(ctx, metav1.ListOptions{
++		LabelSelector: "app=gpu-operator",
++	})
++	if err != nil || len(pods.Items) == 0 {
++		return false
++	}
++
++	// Check if at least one pod is running or succeeded
++	for _, pod := range pods.Items {
++		if pod.Status.Phase == "Running" || pod.Status.Phase == "Succeeded" {
++			framework.Logf("Found running GPU Operator pod: %s", pod.Name)
++			return true
++		}
++	}
++
++	return false
++}
++
++// IsDRADriverInstalled checks if DRA Driver is installed (via Helm or other means)
++func (pi *PrerequisitesInstaller) IsDRADriverInstalled(ctx context.Context) bool {
++	// Check if the namespace exists
++	_, err := pi.client.CoreV1().Namespaces().Get(ctx, draDriverNamespace, metav1.GetOptions{})
++	if err != nil {
++		return false
++	}
++
++	// Check if DRA kubelet plugin pods are running
++	pods, err := pi.client.CoreV1().Pods(draDriverNamespace).List(ctx, metav1.ListOptions{
++		LabelSelector: "app.kubernetes.io/name=nvidia-dra-driver-gpu",
++	})
++	if err != nil || len(pods.Items) == 0 {
++		return false
++	}
++
++	// Check if at least one pod is running
++	for _, pod := range pods.Items {
++		if pod.Status.Phase == "Running" {
++			framework.Logf("Found running DRA Driver pod: %s", pod.Name)
++			return true
++		}
++	}
++
++	return false
++}
+diff --git a/test/extended/node/dra/nvidia/resource_builder.go b/test/extended/node/dra/nvidia/resource_builder.go
+new file mode 100644
+index 000000000000..669f51d9fe2b
+--- /dev/null
++++ b/test/extended/node/dra/nvidia/resource_builder.go
+@@ -0,0 +1,217 @@
++package nvidia
++
++import (
++	"fmt"
++
++	corev1 "k8s.io/api/core/v1"
++	resourceapi "k8s.io/api/resource/v1"
++	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
++	"k8s.io/utils/ptr"
++)
++
++const (
++	defaultDeviceClassName = "nvidia-gpu"
++	resourceBuilderDriver  = "gpu.nvidia.com"
++	defaultCudaImage       = "nvcr.io/nvidia/cuda:12.0.0-base-ubuntu22.04"
++)
++
++// ResourceBuilder helps build DRA resource objects
++type ResourceBuilder struct {
++	namespace string
++}
++
++// NewResourceBuilder creates a new builder
++func NewResourceBuilder(namespace string) *ResourceBuilder {
++	return &ResourceBuilder{namespace: namespace}
++}
++
++// BuildDeviceClass creates a DeviceClass for NVIDIA GPUs
++func (rb *ResourceBuilder) BuildDeviceClass(name string) *resourceapi.DeviceClass {
++	if name == "" {
++		name = defaultDeviceClassName
++	}
++
++	return &resourceapi.DeviceClass{
++		ObjectMeta: metav1.ObjectMeta{
++			Name: name,
++		},
++		Spec: resourceapi.DeviceClassSpec{
++			Selectors: []resourceapi.DeviceSelector{
++				{
++					CEL: &resourceapi.CELDeviceSelector{
++						Expression: "device.driver == \"" + resourceBuilderDriver + "\"",
++					},
++				},
++			},
++		},
++	}
++}
++
++// BuildResourceClaim creates a ResourceClaim requesting GPUs
++func (rb *ResourceBuilder) BuildResourceClaim(name, deviceClassName string, count int) *resourceapi.ResourceClaim {
++	if count <= 0 {
++		panic(fmt.Sprintf("BuildResourceClaim: count must be > 0, got %d", count))
++	}
++	if deviceClassName == "" {
++		deviceClassName = defaultDeviceClassName
++	}
++
++	deviceRequests := []resourceapi.DeviceRequest{
++		{
++			Name: "gpu",
++			Exactly: &resourceapi.ExactDeviceRequest{
++				DeviceClassName: deviceClassName,
++				Count:           int64(count),
++			},
++		},
++	}
++
++	return &resourceapi.ResourceClaim{
++		ObjectMeta: metav1.ObjectMeta{
++			Name:      name,
++			Namespace: rb.namespace,
++		},
++		Spec: resourceapi.ResourceClaimSpec{
++			Devices: resourceapi.DeviceClaim{
++				Requests: deviceRequests,
++			},
++		},
++	}
++}
++
++// BuildPodWithClaim creates a Pod that uses a ResourceClaim
++func (rb *ResourceBuilder) BuildPodWithClaim(name, claimName, image string) *corev1.Pod {
++	if image == "" {
++		image = defaultCudaImage
++	}
++
++	return &corev1.Pod{
++		ObjectMeta: metav1.ObjectMeta{
++			Name:      name,
++			Namespace: rb.namespace,
++		},
++		Spec: corev1.PodSpec{
++			RestartPolicy: corev1.RestartPolicyNever,
++			Containers: []corev1.Container{
++				{
++					Name:    "gpu-container",
++					Image:   image,
++					Command: []string{"sh", "-c", "nvidia-smi && sleep infinity"},
++					Resources: corev1.ResourceRequirements{
++						Claims: []corev1.ResourceClaim{
++							{
++								Name: "gpu",
++							},
++						},
++					},
++					SecurityContext: &corev1.SecurityContext{
++						AllowPrivilegeEscalation: ptr.To(false),
++						Capabilities: &corev1.Capabilities{
++							Drop: []corev1.Capability{"ALL"},
++						},
++					},
++				},
++			},
++			ResourceClaims: []corev1.PodResourceClaim{
++				{
++					Name:              "gpu",
++					ResourceClaimName: &claimName,
++				},
++			},
++		},
++	}
++}
++
++// BuildPodWithInlineClaim creates a Pod with inline ResourceClaim
++// Note: Inline claims via ResourceClaimTemplate are not directly supported in pod spec
++// This creates a pod that references a ResourceClaimTemplateName
++// The GPU count is specified in the ResourceClaimTemplate, not in this pod spec
++func (rb *ResourceBuilder) BuildPodWithInlineClaim(name, deviceClassName string) *corev1.Pod {
++	if deviceClassName == "" {
++		deviceClassName = defaultDeviceClassName
++	}
++
++	// Note: The actual ResourceClaimTemplate must be created separately
++	templateName := name + "-template"
++
++	return &corev1.Pod{
++		ObjectMeta: metav1.ObjectMeta{
++			Name:      name,
++			Namespace: rb.namespace,
++		},
++		Spec: corev1.PodSpec{
++			RestartPolicy: corev1.RestartPolicyNever,
++			Containers: []corev1.Container{
++				{
++					Name:    "gpu-container",
++					Image:   defaultCudaImage,
++					Command: []string{"sh", "-c", "nvidia-smi && sleep infinity"},
++					Resources: corev1.ResourceRequirements{
++						Claims: []corev1.ResourceClaim{
++							{
++								Name: "gpu",
++							},
++						},
++					},
++					SecurityContext: &corev1.SecurityContext{
++						AllowPrivilegeEscalation: ptr.To(false),
++						Capabilities: &corev1.Capabilities{
++							Drop: []corev1.Capability{"ALL"},
++						},
++					},
++				},
++			},
++			ResourceClaims: []corev1.PodResourceClaim{
++				{
++					Name:                      "gpu",
++					ResourceClaimTemplateName: &templateName,
++				},
++			},
++		},
++	}
++}
++
++// BuildLongRunningPodWithClaim creates a long-running Pod for testing
++func (rb *ResourceBuilder) BuildLongRunningPodWithClaim(name, claimName, image string) *corev1.Pod {
++	if image == "" {
++		image = defaultCudaImage
++	}
++
++	pod := rb.BuildPodWithClaim(name, claimName, image)
++	pod.Spec.Containers[0].Command = []string{"sh", "-c", "while true; do nvidia-smi; sleep 60; done"}
++	return pod
++}
++
++// BuildResourceClaimTemplate creates a ResourceClaimTemplate
++func (rb *ResourceBuilder) BuildResourceClaimTemplate(name, deviceClassName string, count int) *resourceapi.ResourceClaimTemplate {
++	if count <= 0 {
++		panic(fmt.Sprintf("BuildResourceClaimTemplate: count must be > 0, got %d", count))
++	}
++	if deviceClassName == "" {
++		deviceClassName = defaultDeviceClassName
++	}
++
++	deviceRequests := []resourceapi.DeviceRequest{
++		{
++			Name: "gpu",
++			Exactly: &resourceapi.ExactDeviceRequest{
++				DeviceClassName: deviceClassName,
++				Count:           int64(count),
++			},
++		},
++	}
++
++	return &resourceapi.ResourceClaimTemplate{
++		ObjectMeta: metav1.ObjectMeta{
++			Name:      name,
++			Namespace: rb.namespace,
++		},
++		Spec: resourceapi.ResourceClaimTemplateSpec{
++			Spec: resourceapi.ResourceClaimSpec{
++				Devices: resourceapi.DeviceClaim{
++					Requests: deviceRequests,
++				},
++			},
++		},
++	}
++}

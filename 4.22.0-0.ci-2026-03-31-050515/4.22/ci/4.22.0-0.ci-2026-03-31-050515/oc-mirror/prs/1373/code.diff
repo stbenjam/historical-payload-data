@@ -1,0 +1,1720 @@
+diff --git a/internal/pkg/cincinnati/download.go b/internal/pkg/cincinnati/download.go
+new file mode 100644
+index 0000000000..dfc62e5a04
+--- /dev/null
++++ b/internal/pkg/cincinnati/download.go
+@@ -0,0 +1,215 @@
++package cincinnati
++
++import (
++	"context"
++	"crypto/tls"
++	"crypto/x509"
++	"errors"
++	"fmt"
++	"io"
++	"net/http"
++	"net/url"
++	"time"
++
++	"github.com/google/uuid"
++
++	clog "github.com/openshift/oc-mirror/v2/internal/pkg/log"
++)
++
++const (
++	// Timeout when calling upstream Cincinnati stack.
++	getUpdatesTimeout = time.Minute * 60
++	// UpdateURL is the Cincinnati endpoint for the OpenShift platform.
++	OcpUpdateURL = "https://api.openshift.com/api/upgrades_info/v1/graph"
++	// OkdUpdateURL is the Cincinnati endpoint for the OKD platform.
++	OkdUpdateURL = "https://origin-release.ci.openshift.org/graph"
++)
++
++type Option func(*options) error
++
++type options struct {
++	id            uuid.UUID
++	cincinnatiURL *url.URL
++	arch          string
++	channel       string
++	version       string
++	transport     *http.Transport
++}
++
++func makeOptions(opts ...Option) (*options, error) {
++	o := &options{
++		id: uuid.New(),
++	}
++
++	for _, option := range opts {
++		if err := option(o); err != nil {
++			return nil, err
++		}
++	}
++
++	if len(o.channel) == 0 {
++		return nil, errors.New("channel value must be set")
++	}
++
++	if o.transport == nil {
++		t, err := defaultTransport()
++		if err != nil {
++			return nil, err
++		}
++		o.transport = t
++	}
++
++	if o.cincinnatiURL == nil {
++		u, err := url.Parse(OcpUpdateURL)
++		if err != nil {
++			return nil, fmt.Errorf("%q: %w", OcpUpdateURL, err)
++		}
++		o.cincinnatiURL = u
++	}
++
++	return o, nil
++}
++
++func WithTransport(t *http.Transport) Option {
++	return func(o *options) error {
++		o.transport = t
++		return nil
++	}
++}
++
++func WithArch(arch string) Option {
++	return func(o *options) error {
++		o.arch = arch
++		return nil
++	}
++}
++
++func WithChannel(channel string) Option {
++	return func(o *options) error {
++		o.channel = channel
++		return nil
++	}
++}
++
++func WithVersion(version string) Option {
++	return func(o *options) error {
++		o.version = version
++		return nil
++	}
++}
++
++func WithURL(addr string) Option {
++	return func(o *options) error {
++		u, err := url.Parse(addr)
++		if err != nil {
++			return fmt.Errorf("failed to parse url: %w", err)
++		}
++		o.cincinnatiURL = u
++		return nil
++	}
++}
++
++func WithID(id uuid.UUID) Option {
++	return func(o *options) error {
++		o.id = id
++		return nil
++	}
++}
++
++func defaultTransport() (*http.Transport, error) {
++	certPool, err := x509.SystemCertPool()
++	if err != nil {
++		return nil, fmt.Errorf("failed to get system cert pool: %w", err)
++	}
++
++	return &http.Transport{
++		TLSClientConfig: &tls.Config{
++			RootCAs:    certPool,
++			MinVersion: tls.VersionTLS12,
++		},
++		Proxy: http.ProxyFromEnvironment,
++	}, nil
++}
++
++func (o options) buildURL() (*url.URL, error) {
++	upstream := *o.cincinnatiURL
++
++	query := upstream.Query()
++	query.Set("id", o.id.String())
++
++	if len(o.arch) > 0 {
++		query.Set("arch", o.arch)
++	}
++
++	if len(o.channel) > 0 {
++		query.Set("channel", o.channel)
++	}
++
++	if len(o.version) > 0 {
++		query.Set("version", o.version)
++	}
++
++	upstream.RawQuery = query.Encode()
++
++	return &upstream, nil
++}
++
++func (o options) buildRequest(ctx context.Context, log clog.PluggableLoggerInterface) (*http.Request, error) {
++	upstream, err := o.buildURL()
++	if err != nil {
++		return nil, err
++	}
++	uri := upstream.String()
++
++	req, err := http.NewRequestWithContext(ctx, "GET", uri, nil)
++	if err != nil {
++		return nil, fmt.Errorf("invalid request: %w", err)
++	}
++	req.Header.Add("Accept", "application/json")
++
++	if o.transport.TLSClientConfig != nil && o.transport.TLSClientConfig.ClientCAs == nil {
++		log.Debug("Using a root CA pool with 0 root CA subjects to request updates from %s", uri)
++	}
++
++	if o.transport.Proxy != nil {
++		if proxy, err := o.transport.Proxy(req); err == nil && proxy != nil {
++			log.Debug("Using proxy %s to request updates from %s", proxy.Host, uri)
++		}
++	}
++
++	return req, nil
++}
++
++// DownloadGraphData downloads the Cincinnati graph data.
++func DownloadGraphData(ctx context.Context, log clog.PluggableLoggerInterface, opts ...Option) ([]byte, error) {
++	o, err := makeOptions(opts...)
++	if err != nil {
++		return nil, err
++	}
++
++	req, err := o.buildRequest(ctx, log)
++	if err != nil {
++		return nil, err
++	}
++
++	timeoutCtx, cancel := context.WithTimeout(ctx, getUpdatesTimeout)
++	defer cancel()
++
++	client := http.Client{Transport: o.transport}
++	resp, err := client.Do(req.WithContext(timeoutCtx)) //nolint:gosec // G704: URL validated at construction time
++	if err != nil {
++		return nil, fmt.Errorf("request failed: %w", err)
++	}
++	defer resp.Body.Close()
++
++	if resp.StatusCode != http.StatusOK {
++		return nil, fmt.Errorf("unexpected HTTP status %s", resp.Status)
++	}
++
++	body, err := io.ReadAll(resp.Body)
++	if err != nil {
++		return nil, fmt.Errorf("failed to read response: %w", err)
++	}
++
++	return body, nil
++}
+diff --git a/internal/pkg/cincinnati/download_test.go b/internal/pkg/cincinnati/download_test.go
+new file mode 100644
+index 0000000000..952ae61e5e
+--- /dev/null
++++ b/internal/pkg/cincinnati/download_test.go
+@@ -0,0 +1,93 @@
++package cincinnati
++
++import (
++	"fmt"
++	"net/http"
++	"net/http/httptest"
++	"testing"
++
++	"github.com/google/uuid"
++	"github.com/stretchr/testify/assert"
++
++	clog "github.com/openshift/oc-mirror/v2/internal/pkg/log"
++)
++
++func TestDownloadGraphData(t *testing.T) {
++	log := clog.New("debug")
++	t.Run("should succeed when custom url is valid", func(t *testing.T) {
++		const channel string = "fast-4.20"
++		serverReached := make(chan struct{}, 1)
++		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
++			serverReached <- struct{}{}
++			if r.Header.Get("Accept") != "application/json" {
++				w.WriteHeader(http.StatusBadRequest)
++				fmt.Fprint(w, `{"kind":"invalid_content_type","value":"invalid Content-Type requested"}`)
++				return
++			}
++			query := r.URL.Query()
++			if !query.Has("channel") {
++				w.WriteHeader(http.StatusBadRequest)
++				fmt.Fprint(w, `{"kind":"missing_params","value":"mandatory client parameters missing: channel"}`)
++				return
++			}
++			assert.Equal(t, query.Get("channel"), channel)
++			w.WriteHeader(http.StatusOK)
++			fmt.Fprint(w, `{"version":1,"nodes":[],"edges":[],"conditionalEdges":[]}`)
++		}))
++		defer srv.Close()
++
++		_, err := DownloadGraphData(t.Context(), log, WithChannel(channel), WithURL(srv.URL))
++		assert.NoError(t, err)
++		select {
++		case <-serverReached:
++		default:
++			assert.FailNow(t, "did not contact mock server")
++		}
++	})
++	t.Run("should fail when custom URL is not reachable", func(t *testing.T) {
++		_, err := DownloadGraphData(t.Context(), log, WithURL("http://localhost:9999/v1/graph"), WithChannel("channel"))
++		assert.ErrorContains(t, err, "request failed")
++	})
++}
++
++func TestBuildOptions(t *testing.T) {
++	t.Run("should succeed when ", func(t *testing.T) {
++		t.Run("setting valid parameters", func(t *testing.T) {
++			const idValue string = "01234567-0123-0123-0123-0123456789ab"
++			id, err := uuid.Parse(idValue)
++			assert.NoError(t, err)
++			opts := []Option{
++				WithArch("arch"),
++				WithChannel("channel"),
++				WithID(id),
++				WithURL("quay.io/release/ocp-release"),
++				WithVersion("version"),
++			}
++			o, err := makeOptions(opts...)
++			assert.NoError(t, err)
++			assert.Equal(t, "arch", o.arch)
++			assert.Equal(t, "channel", o.channel)
++			assert.Equal(t, id, o.id)
++			assert.Equal(t, "quay.io/release/ocp-release", o.cincinnatiURL.String())
++			assert.Equal(t, "version", o.version)
++		})
++		t.Run("when custom URL not specified", func(t *testing.T) {
++			o, err := makeOptions(WithChannel("channel"))
++			assert.NoError(t, err)
++			assert.Equal(t, "channel", o.channel)
++			assert.Equal(t, OcpUpdateURL, o.cincinnatiURL.String())
++		})
++	})
++	t.Run("should fail when", func(t *testing.T) {
++		t.Run("invalid url parameter", func(t *testing.T) {
++			o := options{}
++			fn := WithURL("://foobar//")
++			err := fn(&o)
++			assert.ErrorContains(t, err, "failed to parse url")
++		})
++		t.Run("channel is not set", func(t *testing.T) {
++			_, err := makeOptions()
++			assert.ErrorContains(t, err, "channel value must be set")
++		})
++	})
++}
+diff --git a/internal/pkg/cincinnati/graph_data.go b/internal/pkg/cincinnati/graph_data.go
+new file mode 100644
+index 0000000000..fd904179b3
+--- /dev/null
++++ b/internal/pkg/cincinnati/graph_data.go
+@@ -0,0 +1,74 @@
++// Package cincinnati contains functions for working with Cincinnati graph data.
++package cincinnati
++
++import (
++	"encoding/json"
++	"errors"
++	"fmt"
++	"regexp"
++	"slices"
++	"strings"
++
++	"github.com/blang/semver/v4"
++	"k8s.io/apimachinery/pkg/util/sets"
++)
++
++var ErrVersionNotFound = errors.New("node version not found")
++
++type Graph struct {
++	Nodes []node
++	Edges [][]int
++}
++
++type node struct {
++	Version  semver.Version    `json:"version"`
++	Image    string            `json:"payload"`
++	Metadata map[string]string `json:"metadata,omitempty"`
++}
++
++type Update node
++
++func LoadGraphData(data []byte) (Graph, error) {
++	var g Graph
++	if err := json.Unmarshal(data, &g); err != nil {
++		return g, fmt.Errorf("failed to load graph data: %w", err)
++	}
++
++	return g, nil
++}
++
++// GetVersions returns a sorted list of the all versions within the graph.
++// The `versionMatcher` can be used to filter nodes.
++func (o Graph) GetVersions(versionMatcher *regexp.Regexp) []semver.Version {
++	vers := make([]semver.Version, 0, len(o.Nodes))
++	for _, node := range o.Nodes {
++		if versionMatcher == nil || versionMatcher.MatchString(node.Version.String()) {
++			vers = append(vers, node.Version)
++		}
++	}
++	semver.Sort(vers)
++
++	return vers
++}
++
++const channelMetadataKey string = "io.openshift.upgrades.graph.release.channels"
++
++func (o Graph) GetChannels() sets.Set[string] {
++	channels := sets.New[string]()
++	for _, node := range o.Nodes {
++		if values, ok := node.Metadata[channelMetadataKey]; ok {
++			for v := range strings.SplitSeq(values, ",") {
++				channels.Insert(v)
++			}
++		}
++	}
++	return channels
++}
++
++func (o Graph) GetNodeByVersion(version semver.Version) (Update, int, error) {
++	idx := slices.IndexFunc(o.Nodes, func(e node) bool { return version.EQ(e.Version) })
++	if idx == -1 {
++		return Update{}, idx, ErrVersionNotFound
++	}
++	return Update(o.Nodes[idx]), idx, nil
++}
+diff --git a/internal/pkg/cincinnati/graph_data_test.go b/internal/pkg/cincinnati/graph_data_test.go
+new file mode 100644
+index 0000000000..fdab07f89d
+--- /dev/null
++++ b/internal/pkg/cincinnati/graph_data_test.go
+@@ -0,0 +1,188 @@
++package cincinnati
++
++import (
++	"encoding/json"
++	"fmt"
++	"regexp"
++	"testing"
++
++	"github.com/blang/semver/v4"
++	"github.com/stretchr/testify/assert"
++	"github.com/stretchr/testify/require"
++	"k8s.io/apimachinery/pkg/util/sets"
++)
++
++func TestNodeUnmarshalJSON(t *testing.T) {
++	tests := []struct {
++		raw []byte
++		exp node
++		err string
++	}{{
++		raw: []byte(`{
++			"version": "4.0.0-5",
++			"payload": "quay.io/openshift-release-dev/ocp-release:4.0.0-5",
++			"metadata": {}
++		  }`),
++
++		exp: node{
++			Version:  semver.MustParse("4.0.0-5"),
++			Image:    "quay.io/openshift-release-dev/ocp-release:4.0.0-5",
++			Metadata: map[string]string{},
++		},
++	}, {
++		raw: []byte(`{
++			"version": "4.0.0-0.1",
++			"payload": "quay.io/openshift-release-dev/ocp-release:4.0.0-0.1",
++			"metadata": {
++			  "description": "This is the beta1 image based on the 4.0.0-0.nightly-2019-01-15-010905 build"
++			}
++		  }`),
++		exp: node{
++			Version: semver.MustParse("4.0.0-0.1"),
++			Image:   "quay.io/openshift-release-dev/ocp-release:4.0.0-0.1",
++			Metadata: map[string]string{
++				"description": "This is the beta1 image based on the 4.0.0-0.nightly-2019-01-15-010905 build",
++			},
++		},
++	}, {
++		raw: []byte(`{
++			"version": "v4.0.0-0.1",
++			"payload": "quay.io/openshift-release-dev/ocp-release:4.0.0-0.1",
++			"metadata": {
++			  "description": "This is the beta1 image based on the 4.0.0-0.nightly-2019-01-15-010905 build"
++			}
++		  }`),
++		err: `Invalid character(s) found in major number "v4"`,
++	}, {
++		raw: []byte(`{
++			"version": "4-0-0+0.1",
++			"payload": "quay.io/openshift-release-dev/ocp-release:4.0.0-0.1",
++			"metadata": {
++			  "description": "This is the beta1 image based on the 4.0.0-0.nightly-2019-01-15-010905 build"
++			}
++		  }
++	  `),
++
++		err: "No Major.Minor.Patch elements found",
++	}}
++
++	for idx, test := range tests {
++		t.Run(fmt.Sprintf("#%d", idx), func(t *testing.T) {
++			var n node
++			err := json.Unmarshal(test.raw, &n)
++			if test.err == "" {
++				require.NoError(t, err)
++				require.Equal(t, test.exp, n)
++
++			} else {
++				require.EqualError(t, err, test.err)
++			}
++		})
++	}
++}
++
++func TestGetVersions(t *testing.T) {
++	ver4190 := semver.MustParse("4.19.0")
++	ver4200 := semver.MustParse("4.20.0")
++	ver4201 := semver.MustParse("4.20.1")
++	ver4202 := semver.MustParse("4.20.2")
++	ver42012 := semver.MustParse("4.20.12")
++
++	t.Run("should get 0 results when graph data is empty", func(t *testing.T) {
++		g := Graph{
++			Nodes: []node{},
++			Edges: [][]int{},
++		}
++		vers := g.GetVersions(nil)
++		assert.Len(t, vers, 0)
++	})
++	t.Run("should return all versions when versionMatcher not specified", func(t *testing.T) {
++		g := Graph{
++			Nodes: []node{
++				{Version: ver4201},
++				{Version: ver4200},
++			},
++			Edges: [][]int{},
++		}
++		vers := g.GetVersions(nil)
++		assert.Len(t, vers, 2)
++		assert.EqualValues(t, []semver.Version{ver4200, ver4201}, vers, "sorted output")
++	})
++	t.Run("should filter versions when versionMatcher is specified", func(t *testing.T) {
++		g := Graph{
++			Nodes: []node{
++				{Version: ver42012},
++				{Version: ver4202},
++				{Version: ver4201},
++				{Version: ver4200},
++				{Version: ver4202},
++				{Version: ver4190},
++			},
++			Edges: [][]int{},
++		}
++		matcher := regexp.MustCompile(`4\.20\.1\d?`)
++		vers := g.GetVersions(matcher)
++		assert.EqualValues(t, []semver.Version{ver4201, ver42012}, vers)
++	})
++}
++
++func TestGetChannels(t *testing.T) {
++	ver4190 := semver.MustParse("4.19.0")
++	ver4200 := semver.MustParse("4.20.0")
++	ver4201 := semver.MustParse("4.20.1")
++
++	t.Run("should get 0 results when graph data is empty", func(t *testing.T) {
++		g := Graph{
++			Nodes: []node{},
++			Edges: [][]int{},
++		}
++		chs := g.GetChannels()
++		assert.Len(t, chs, 0)
++	})
++	t.Run("should get 0 results when channel metadata not present", func(t *testing.T) {
++		g := Graph{
++			Nodes: []node{
++				{Version: ver4190},
++			},
++			Edges: [][]int{},
++		}
++		chs := g.GetChannels()
++		assert.Len(t, chs, 0)
++	})
++	t.Run("should return all channels in nodes' metadata", func(t *testing.T) {
++		g := Graph{
++			Nodes: []node{
++				{Version: ver4190, Metadata: map[string]string{channelMetadataKey: "stable-4.19"}},
++				{Version: ver4200, Metadata: map[string]string{channelMetadataKey: "stable-4.20"}},
++				{Version: ver4201, Metadata: map[string]string{channelMetadataKey: "fast-4.20"}},
++			},
++			Edges: [][]int{},
++		}
++		chs := g.GetChannels()
++		assert.EqualValues(t, []string{"fast-4.20", "stable-4.19", "stable-4.20"}, sets.List(chs))
++	})
++}
++
++func TestGetNodeByVersion(t *testing.T) {
++	t.Run("should fail when node not found", func(t *testing.T) {
++		g := Graph{
++			Nodes: []node{},
++			Edges: [][]int{},
++		}
++		_, idx, err := g.GetNodeByVersion(semver.MustParse("4.21.0"))
++		assert.ErrorIs(t, err, ErrVersionNotFound)
++		assert.Equal(t, -1, idx)
++	})
++	t.Run("should succeed when node exists", func(t *testing.T) {
++		ver4190 := semver.MustParse("4.19.0")
++		ver4200 := semver.MustParse("4.20.0")
++		ver4201 := semver.MustParse("4.20.1")
++		g := Graph{
++			Nodes: []node{{Version: ver4190}, {Version: ver4200}, {Version: ver4201}},
++			Edges: [][]int{},
++		}
++		_, idx, err := g.GetNodeByVersion(ver4200)
++		assert.NoError(t, err)
++		assert.Equal(t, 1, idx)
++	})
++}
+diff --git a/internal/pkg/cli/list/command.go b/internal/pkg/cli/list/command.go
+index 8fb5bf10ab..01c573eb40 100644
+--- a/internal/pkg/cli/list/command.go
++++ b/internal/pkg/cli/list/command.go
+@@ -15,6 +15,7 @@ func NewListCommand(log clog.PluggableLoggerInterface, opts *mirror.CopyOptions)
+ 	}
+ 
+ 	cmd.AddCommand(NewListOperatorsCommand(log, opts))
++	cmd.AddCommand(NewListReleasesCommand(log, opts))
+ 
+ 	return cmd
+ }
+diff --git a/internal/pkg/cli/list/releases.go b/internal/pkg/cli/list/releases.go
+new file mode 100644
+index 0000000000..03cd21256b
+--- /dev/null
++++ b/internal/pkg/cli/list/releases.go
+@@ -0,0 +1,250 @@
++package list
++
++import (
++	"cmp"
++	"context"
++	"errors"
++	"fmt"
++	"io"
++	"os"
++	"regexp"
++	"slices"
++	"strconv"
++	"strings"
++
++	"github.com/spf13/cobra"
++	"go.podman.io/image/v5/docker"
++	"k8s.io/apimachinery/pkg/util/sets"
++	"k8s.io/kubectl/pkg/util/templates"
++
++	"github.com/openshift/oc-mirror/v2/internal/pkg/api/v2alpha1"
++	"github.com/openshift/oc-mirror/v2/internal/pkg/cincinnati"
++	clog "github.com/openshift/oc-mirror/v2/internal/pkg/log"
++	"github.com/openshift/oc-mirror/v2/internal/pkg/mirror"
++)
++
++const ocpReleaseRepo = "quay.io/openshift-release-dev/ocp-release"
++
++type listReleasesOptions struct {
++	channels    bool
++	channel     string
++	version     string
++	filterArchs []string
++	copyOpts    *mirror.CopyOptions
++}
++
++// NewListReleasesCommand returns a `list releases` command
++func NewListReleasesCommand(log clog.PluggableLoggerInterface, copyOpts *mirror.CopyOptions) *cobra.Command {
++	opts := listReleasesOptions{copyOpts: copyOpts}
++	cmd := &cobra.Command{
++		Use:   "releases",
++		Short: "List available platform content and versions",
++		Example: templates.Examples(`
++			# Output OpenShift release versions
++			oc-mirror --v2 list releases
++
++			# Output all OpenShift releases for a specific version
++			oc-mirror --v2 list releases --version=4.8
++
++			# List all OpenShift releases in a specified channel
++			oc-mirror --v2 list releases --channel=stable-4.8
++
++			# List OpenShift versions for a specific release and one or more architectures. Valid architectures: amd64 (default), arm64, ppc64le, s390x, multi.
++			oc-mirror --v2 list releases --channel=fast-4.13 --version=4.13 --filter-by-archs amd64,arm64,ppc64le,s390x,multi
++
++			# List all OpenShift channels for a specific version
++			oc-mirror --v2 list releases --channels --version=4.8
++
++			# List OpenShift channels for a specific version.
++			oc-mirror --v2 list releases --channels --version=4.13
++		`),
++		PreRunE: func(cmd *cobra.Command, args []string) error {
++			if opts.channels && len(opts.version) == 0 {
++				return errors.New("must specify --version with --channels")
++			}
++			if len(opts.version) > 0 && len(opts.channel) == 0 {
++				opts.channel = fmt.Sprintf("stable-%s", opts.version)
++			}
++			if opts.channel == "stable-" {
++				return errors.New("must specify --version or --channel")
++			}
++			if len(opts.filterArchs) == 0 {
++				opts.filterArchs = append(opts.filterArchs, v2alpha1.DefaultPlatformArchitecture)
++			}
++			validArches := sets.New("amd64", "arm64", "s390x", "ppc64le", "multi")
++			if diff := sets.New(opts.filterArchs...).Difference(validArches); diff.Len() > 0 {
++				return fmt.Errorf("invalid architecture(s) %v. Known architectures: %v", diff.UnsortedList(), sets.List(validArches))
++			}
++
++			return nil
++		},
++		RunE: func(cmd *cobra.Command, args []string) error {
++			// NOTE: we don't want help output on errors from here onwards
++			cmd.SilenceUsage = true
++			return runListReleases(cmd.Context(), log, &opts)
++		},
++	}
++
++	fs := cmd.Flags()
++	fs.StringVar(&opts.version, "version", "", "Specify an Openshift release version.")
++	fs.BoolVar(&opts.channels, "channels", false, "List all channel information. Requires --version.")
++	fs.StringVar(&opts.channel, "channel", "", "List information for a specific channel. Defaults to the stable channel.")
++	fs.StringSliceVar(&opts.filterArchs, "filter-by-archs", []string{v2alpha1.DefaultPlatformArchitecture}, "Architecture list to control the release image picked when multiple variants are available.")
++
++	return cmd
++}
++
++func runListReleases(ctx context.Context, log clog.PluggableLoggerInterface, opts *listReleasesOptions) error {
++	w := os.Stdout
++
++	updateURL := cincinnati.OcpUpdateURL
++	if override := os.Getenv("UPDATE_URL_OVERRIDE"); override != "" {
++		updateURL = override
++	}
++
++	if opts.channels {
++		return listChannelsForVersion(ctx, log, w, updateURL, opts)
++	}
++
++	if len(opts.channel) == 0 {
++		return listReleaseMajorVersions(ctx, w, ocpReleaseRepo, opts)
++	}
++
++	return listVersionsForChannel(ctx, log, w, updateURL, opts)
++}
++
++func listChannelsForVersion(ctx context.Context, log clog.PluggableLoggerInterface, w io.Writer, releaseURL string, opts *listReleasesOptions) error {
++	// Channels are the same for all arches, so we don't need to set `arch` to any specific value
++	graph, err := loadGraphData(ctx, log, releaseURL, "", opts.channel)
++	if err != nil {
++		return fmt.Errorf("channel %q: %w", opts.channel, err)
++	}
++	channels := graph.GetChannels()
++	fmt.Fprintf(w, "Listing channels for version %v:\n\n", opts.version)
++	for _, ch := range sets.List(channels) {
++		fmt.Fprintf(w, "%s\n", ch)
++	}
++
++	return nil
++}
++
++func listReleaseMajorVersions(ctx context.Context, w io.Writer, releaseImage string, opts *listReleasesOptions) error {
++	versions, err := getXYVersionsFromImage(ctx, releaseImage, opts)
++	if err != nil {
++		return err
++	}
++
++	sortedVers := versions.UnsortedList()
++	slices.SortFunc(sortedVers,
++		func(r1 releaseVer, r2 releaseVer) int {
++			if v := cmp.Compare(r1.major, r2.major); v == 0 {
++				return cmp.Compare(r1.minor, r2.minor)
++			} else {
++				return v
++			}
++		},
++	)
++
++	fmt.Fprintf(w, "Available OpenShift Container Platform release versions:\n")
++	for _, ver := range sortedVers {
++		fmt.Fprintf(w, "  %s\n", ver)
++	}
++
++	return nil
++}
++
++type releaseVer struct {
++	major int
++	minor int
++}
++
++func (r releaseVer) String() string {
++	return fmt.Sprintf("%d.%d", r.major, r.minor)
++}
++
++// Go through the container image tags and extract the X.Y versions from them.
++func getXYVersionsFromImage(ctx context.Context, image string, opts *listReleasesOptions) (sets.Set[releaseVer], error) {
++	ref, err := docker.ParseReference("//" + image)
++	if err != nil {
++		return nil, fmt.Errorf("failed to parse release reference: %w", err)
++	}
++
++	sysCtx, err := opts.copyOpts.SrcImage.NewSystemContext()
++	if err != nil {
++		return nil, err
++	}
++
++	tags, err := docker.GetRepositoryTags(ctx, sysCtx, ref)
++	if err != nil {
++		return nil, fmt.Errorf("failed get release tags: %w", err)
++	}
++
++	// Tag format (roughly): X.Y.Z-Patch-Arch
++	versionRegex := regexp.MustCompile(`(\d+)\.(\d+).*`)
++	versions := sets.New[releaseVer]()
++	for _, vt := range tags {
++		// Skip signature tags
++		if strings.HasSuffix(vt, ".sig") {
++			continue
++		}
++		matches := versionRegex.FindStringSubmatch(vt)
++		if len(matches) < 3 {
++			continue
++		}
++		major, err := strconv.Atoi(matches[1])
++		if err != nil {
++			return nil, fmt.Errorf("unable to parse major version from tag %q", vt)
++		}
++		minor, err := strconv.Atoi(matches[2])
++		if err != nil {
++			return nil, fmt.Errorf("unable to parse minor version from tag %q", vt)
++		}
++		versions.Insert(releaseVer{major: major, minor: minor})
++	}
++
++	return versions, nil
++}
++
++func listVersionsForChannel(ctx context.Context, log clog.PluggableLoggerInterface, w io.Writer, remoteURL string, opts *listReleasesOptions) error {
++	if strings.HasPrefix(opts.channel, "stable") {
++		fmt.Fprintln(w, "Listing stable channels. Use --channel=<name> to filter.")
++		fmt.Fprintf(w, "Use oc-mirror --v2 list releases --channels --version=%s to discover other channels.\n", opts.version)
++		fmt.Fprintln(w, "")
++	}
++
++	var errs []error
++	for _, arch := range opts.filterArchs {
++		graph, err := loadGraphData(ctx, log, remoteURL, arch, opts.channel)
++		if err != nil {
++			errs = append(errs, fmt.Errorf("channel %q: %w", opts.channel, err))
++			continue
++		}
++		vers := graph.GetVersions(nil)
++		if len(vers) == 0 {
++			errs = append(errs, fmt.Errorf("channel %q: no versions found", opts.channel))
++			continue
++		}
++
++		fmt.Fprintf(w, "Channel: %s\nArchitecture: %s\n", opts.channel, arch)
++		for _, ver := range vers {
++			fmt.Fprintf(w, "%s\n", ver)
++		}
++
++	}
++
++	return errors.Join(errs...)
++}
++
++func loadGraphData(ctx context.Context, log clog.PluggableLoggerInterface, remote, arch, channel string) (*cincinnati.Graph, error) {
++	data, err := cincinnati.DownloadGraphData(ctx, log, cincinnati.WithArch(arch), cincinnati.WithChannel(channel), cincinnati.WithURL(remote))
++	if err != nil {
++		return nil, fmt.Errorf("failed to get graph data: %w", err)
++	}
++
++	graph, err := cincinnati.LoadGraphData(data)
++	if err != nil {
++		return nil, err
++	}
++
++	return &graph, nil
++}
+diff --git a/internal/pkg/release/cincinnati.go b/internal/pkg/release/cincinnati.go
+index 9f3460dbc7..0b29eef16d 100644
+--- a/internal/pkg/release/cincinnati.go
++++ b/internal/pkg/release/cincinnati.go
+@@ -10,6 +10,7 @@ import (
+ 	"github.com/google/uuid"
+ 
+ 	"github.com/openshift/oc-mirror/v2/internal/pkg/api/v2alpha1"
++	"github.com/openshift/oc-mirror/v2/internal/pkg/cincinnati"
+ 	"github.com/openshift/oc-mirror/v2/internal/pkg/image"
+ 	clog "github.com/openshift/oc-mirror/v2/internal/pkg/log"
+ 	"github.com/openshift/oc-mirror/v2/internal/pkg/manifest"
+@@ -23,8 +24,7 @@ const (
+ 	ApplicationJson     string = "application/json"
+ )
+ 
+-var (
+-	defaultPK = `-----BEGIN PGP PUBLIC KEY BLOCK-----
++var defaultPK = `-----BEGIN PGP PUBLIC KEY BLOCK-----
+ Comment: Use "gpg --dearmor" for unpacking
+ 
+ mQINBErgSTsBEACh2A4b0O9t+vzC9VrVtL1AKvUWi9OPCjkvR7Xd8DtJxeeMZ5eF
+@@ -77,7 +77,6 @@ JRhScNA6Flg3CAc8WFyH4Y+ZhUTBAu4el7HaYpdE9bY0lR0wJsXFIm6+52+LXxYt
+ QhyZAjgzMT6GUvoWrdNeNMCXo4pk+xUNQgVjSFuHGLkfxg40oh8S5R4=
+ =GmdY
+ -----END PGP PUBLIC KEY BLOCK-----`
+-)
+ 
+ type CincinnatiSchema struct {
+ 	Log              clog.PluggableLoggerInterface
+@@ -328,7 +327,7 @@ func getChannelDownloads(ctx context.Context, cs CincinnatiSchema, lastChannels
+ 		if err != nil {
+ 			return allImages, fmt.Errorf("getting update in range %w", err)
+ 		}
+-		newDownloads = gatherUpdates(cs.Log, Update{}, Update{}, versions)
++		newDownloads = gatherUpdates(cs.Log, cincinnati.Update{}, cincinnati.Update{}, versions)
+ 	}
+ 	allImages = append(allImages, newDownloads...)
+ 
+@@ -366,7 +365,7 @@ func getCrossChannelDownloads(ctx context.Context, cs CincinnatiSchema, channels
+ }
+ 
+ // gatherUpdates
+-func gatherUpdates(log clog.PluggableLoggerInterface, current, newest Update, updates []Update) []v2alpha1.CopyImageSchema {
++func gatherUpdates(log clog.PluggableLoggerInterface, current, newest cincinnati.Update, updates []cincinnati.Update) []v2alpha1.CopyImageSchema {
+ 	allImages := []v2alpha1.CopyImageSchema{}
+ 	uniqueImages := make(map[v2alpha1.CopyImageSchema]bool)
+ 
+diff --git a/internal/pkg/release/client.go b/internal/pkg/release/client.go
+index 38cabb5058..944691ed26 100644
+--- a/internal/pkg/release/client.go
++++ b/internal/pkg/release/client.go
+@@ -9,6 +9,7 @@ import (
+ 
+ 	"github.com/google/uuid"
+ 
++	"github.com/openshift/oc-mirror/v2/internal/pkg/cincinnati"
+ 	clog "github.com/openshift/oc-mirror/v2/internal/pkg/log"
+ )
+ 
+@@ -40,12 +41,10 @@ type okdClient struct {
+ 
+ // NewOCPClient creates a new OCP Cincinnati client with the given client identifier.
+ func NewOCPClient(id uuid.UUID, log clog.PluggableLoggerInterface) (Client, error) {
+-	var updateGraphURL string
++	updateGraphURL := cincinnati.OcpUpdateURL
+ 	if updateURLOverride := os.Getenv("UPDATE_URL_OVERRIDE"); len(updateURLOverride) != 0 {
+ 		log.Info("Using the UPDATE_URL_OVERRIDE environment variable")
+ 		updateGraphURL = updateURLOverride
+-	} else {
+-		updateGraphURL = UpdateURL
+ 	}
+ 	upstream, err := url.Parse(updateGraphURL)
+ 	if err != nil {
+@@ -95,7 +94,7 @@ func (o *ocpClient) SetQueryParams(arch, channel, version string) {
+ 
+ // NewOKDClient creates a new OKD Cincinnati client with the given client identifier.
+ func NewOKDClient(id uuid.UUID) (Client, error) {
+-	upstream, err := url.Parse(OkdUpdateURL)
++	upstream, err := url.Parse(cincinnati.OkdUpdateURL)
+ 	if err != nil {
+ 		return &okdClient{}, err
+ 	}
+diff --git a/internal/pkg/release/client_test.go b/internal/pkg/release/client_test.go
+index aea3c66559..6f0fa36a3a 100644
+--- a/internal/pkg/release/client_test.go
++++ b/internal/pkg/release/client_test.go
+@@ -7,12 +7,13 @@ import (
+ 	"github.com/google/uuid"
+ 	"github.com/stretchr/testify/require"
+ 
++	"github.com/openshift/oc-mirror/v2/internal/pkg/cincinnati"
+ 	clog "github.com/openshift/oc-mirror/v2/internal/pkg/log"
+ )
+ 
+ func TestOCPClient(t *testing.T) {
+ 	id := uuid.MustParse("01234567-0123-0123-0123-0123456789ab")
+-	updateAPI, err := url.Parse(UpdateURL)
++	updateAPI, err := url.Parse(cincinnati.OcpUpdateURL)
+ 	require.NoError(t, err)
+ 	client, err := NewOCPClient(id, clog.New("trace"))
+ 	require.NoError(t, err)
+@@ -30,7 +31,7 @@ func TestOCPClient(t *testing.T) {
+ 
+ func TestOKDClient(t *testing.T) {
+ 	id := uuid.MustParse("01234567-0123-0123-0123-0123456789ab")
+-	updateAPI, err := url.Parse(OkdUpdateURL)
++	updateAPI, err := url.Parse(cincinnati.OkdUpdateURL)
+ 	require.NoError(t, err)
+ 	client, err := NewOKDClient(id)
+ 	require.NoError(t, err)
+@@ -48,12 +49,12 @@ func TestOKDClient(t *testing.T) {
+ func TestOCPClientWithOveride(t *testing.T) {
+ 	t.Setenv("UPDATE_URL_OVERRIDE", "http://localhost.localdomain")
+ 	id := uuid.MustParse("01234567-0123-0123-0123-0123456789ab")
+-	//updateAPI, err := url.Parse(UpdateURL)
+-	//require.NoError(t, err)
++	// updateAPI, err := url.Parse(UpdateURL)
++	// require.NoError(t, err)
+ 	client, err := NewOCPClient(id, clog.New("trace"))
+ 	require.NoError(t, err)
+ 	expID := id
+-	//expURL := *updateAPI
++	// expURL := *updateAPI
+ 	actualURL := client.GetURL()
+ 	require.Equal(t, expID, client.GetID())
+ 	require.Equal(t, "http://localhost.localdomain", actualURL.String())
+diff --git a/internal/pkg/release/core-cincinnati.go b/internal/pkg/release/core-cincinnati.go
+index 31aa58bb7f..edc383a3d0 100644
+--- a/internal/pkg/release/core-cincinnati.go
++++ b/internal/pkg/release/core-cincinnati.go
+@@ -2,37 +2,21 @@ package release
+ 
+ import (
+ 	"context"
+-	"encoding/json"
++	"errors"
+ 	"fmt"
+-	"io"
+-	"net/http"
+-	"net/url"
+ 	"os"
+ 	"path"
+ 	"regexp"
+ 	"sort"
+ 	"strings"
+-	"time"
+ 
+ 	"github.com/blang/semver/v4"
+ 
++	"github.com/openshift/oc-mirror/v2/internal/pkg/cincinnati"
+ 	"github.com/openshift/oc-mirror/v2/internal/pkg/mirror"
+ )
+ 
+-const (
+-	// GraphMediaType is the media-type specified in the HTTP Accept header
+-	// of requests sent to the Cincinnati-v1 Graph API.
+-	GraphMediaType = "application/json"
+-
+-	// Timeout when calling upstream Cincinnati stack.
+-	getUpdatesTimeout = time.Minute * 60
+-	// UpdateURL is the Cincinnati endpoint for the OpenShift platform.
+-	UpdateURL = "https://api.openshift.com/api/upgrades_info/v1/graph"
+-	// OkdUpdateURL is the Cincinnati endpoint for the OKD platform.
+-	OkdUpdateURL = "https://origin-release.ci.openshift.org/graph"
+-
+-	ChannelInfo = "channel %q: %v"
+-)
++const ChannelInfo = "channel %q: %v"
+ 
+ // Error is returned when are unable to get updates.
+ type Error struct {
+@@ -46,25 +30,6 @@ type Error struct {
+ 	cause error
+ }
+ 
+-// Update is a single node from the update graph.
+-type Update node
+-
+-type graph struct {
+-	Nodes []node
+-	Edges []edge
+-}
+-
+-type node struct {
+-	Version  semver.Version    `json:"version"`
+-	Image    string            `json:"payload"`
+-	Metadata map[string]string `json:"metadata,omitempty"`
+-}
+-
+-type edge struct {
+-	Origin      int
+-	Destination int
+-}
+-
+ // Error serializes the error as a string, to satisfy the error interface.
+ func (o Error) Error() string {
+ 	return fmt.Sprintf("%s: %s", o.Reason, o.Message)
+@@ -74,50 +39,30 @@ func (o Error) Error() string {
+ // upstream Cincinnati stack given the current version, architecture, and channel.
+ // The shortest path is calculated between the current and requested version from the graph edge
+ // data.
+-func GetUpdates(ctx context.Context, cs CincinnatiSchema, channel string, version semver.Version, reqVer semver.Version) (Update, Update, []Update, error) {
+-	var current Update
+-	var requested Update
+-	// Prepare parametrized cincinnati query.
+-	cs.Client.SetQueryParams(cs.CincinnatiParams.Arch, channel, version.String())
+-
+-	graph, err := getGraphData(ctx, cs)
++func GetUpdates(ctx context.Context, cs CincinnatiSchema, channel string, version semver.Version, reqVer semver.Version) (cincinnati.Update, cincinnati.Update, []cincinnati.Update, error) { //nolint:cyclop // FIXME: needs further refactoring.
++	graph, err := getGraphData(ctx, cs, channel, version.String())
+ 	if err != nil {
+-		return Update{}, Update{}, nil, &Error{
++		return cincinnati.Update{}, cincinnati.Update{}, nil, &Error{
+ 			Reason:  "APIRequestError",
+ 			Message: fmt.Sprintf("version %s in channel %s: %v", version.String(), channel, err),
+ 			cause:   err,
+ 		}
+ 	}
+ 
++	var current cincinnati.Update
++	var requested cincinnati.Update
++
+ 	// Find the current version within the graph.
+-	var currentIdx int
+-	found := false
+-	for i, node := range graph.Nodes {
+-		if version.EQ(node.Version) {
+-			currentIdx = i
+-			current = Update(graph.Nodes[i])
+-			found = true
+-			break
+-		}
+-	}
+-	if !found {
++	current, currentIdx, err := graph.GetNodeByVersion(version)
++	if errors.Is(err, cincinnati.ErrVersionNotFound) {
+ 		return current, requested, nil, &Error{
+ 			Reason:  "VersionNotFound",
+ 			Message: fmt.Sprintf("current version %s not found in the %q channel", version, channel),
+ 		}
+ 	}
+ 
+-	var destinationIdx int
+-	found = false
+-	for i, node := range graph.Nodes {
+-		if reqVer.EQ(node.Version) {
+-			destinationIdx = i
+-			requested = Update(graph.Nodes[i])
+-			found = true
+-			break
+-		}
+-	}
+-	if !found {
++	requested, destinationIdx, err := graph.GetNodeByVersion(reqVer)
++	if errors.Is(err, cincinnati.ErrVersionNotFound) {
+ 		return current, requested, nil, &Error{
+ 			Reason:  "VersionNotFound",
+ 			Message: fmt.Sprintf("requested version %s not found in the %q channel", reqVer, channel),
+@@ -126,7 +71,7 @@ func GetUpdates(ctx context.Context, cs CincinnatiSchema, channel string, versio
+ 
+ 	edgesByOrigin := make(map[int][]int, len(graph.Nodes))
+ 	for _, edge := range graph.Edges {
+-		edgesByOrigin[edge.Origin] = append(edgesByOrigin[edge.Origin], edge.Destination)
++		edgesByOrigin[edge[0]] = append(edgesByOrigin[edge[0]], edge[1])
+ 	}
+ 
+ 	// Sort destination by semver to ensure deterministic result
+@@ -180,9 +125,9 @@ func GetUpdates(ctx context.Context, cs CincinnatiSchema, channel string, versio
+ 
+ 	nextIdxs := shortestPath(edgesByOrigin, currentIdx, destinationIdx)
+ 
+-	var updates []Update
++	var updates []cincinnati.Update
+ 	for _, i := range nextIdxs {
+-		updates = append(updates, Update(graph.Nodes[i]))
++		updates = append(updates, cincinnati.Update(graph.Nodes[i]))
+ 	}
+ 
+ 	return current, requested, updates, nil
+@@ -190,7 +135,7 @@ func GetUpdates(ctx context.Context, cs CincinnatiSchema, channel string, versio
+ 
+ // CalculateUpgrades fetches and calculates all the update payloads from the specified
+ // upstream Cincinnati stack given the current and target version and channel.
+-func CalculateUpgrades(ctx context.Context, cs CincinnatiSchema, sourceChannel, targetChannel string, startVer, reqVer semver.Version) (Update, Update, []Update, error) {
++func CalculateUpgrades(ctx context.Context, cs CincinnatiSchema, sourceChannel, targetChannel string, startVer, reqVer semver.Version) (cincinnati.Update, cincinnati.Update, []cincinnati.Update, error) { //nolint:cyclop // FIXME: needs further refactoring.
+ 	if sourceChannel == targetChannel {
+ 		return GetUpdates(ctx, cs, targetChannel, startVer, reqVer)
+ 	}
+@@ -199,12 +144,12 @@ func CalculateUpgrades(ctx context.Context, cs CincinnatiSchema, sourceChannel,
+ 	// channel prefixes
+ 	source, target, _, err := getSemverFromChannels(sourceChannel, targetChannel)
+ 	if err != nil {
+-		return Update{}, Update{}, nil, err
++		return cincinnati.Update{}, cincinnati.Update{}, nil, err
+ 	}
+ 	if source.EQ(target) {
+ 		isBlocked, err := handleBlockedEdges(ctx, cs, targetChannel, startVer)
+ 		if err != nil {
+-			return Update{}, Update{}, nil, err
++			return cincinnati.Update{}, cincinnati.Update{}, nil, err
+ 		}
+ 
+ 		// If blocked path is found, just return the requested version and any accumulated
+@@ -221,20 +166,20 @@ func CalculateUpgrades(ctx context.Context, cs CincinnatiSchema, sourceChannel,
+ 	// edge is hit.
+ 	latest, err := GetChannelMinOrMax(ctx, cs, sourceChannel, false)
+ 	if err != nil {
+-		return Update{}, Update{}, nil, fmt.Errorf(ChannelInfo, sourceChannel, err)
++		return cincinnati.Update{}, cincinnati.Update{}, nil, fmt.Errorf(ChannelInfo, sourceChannel, err)
+ 	}
+ 	current, _, upgrades, err := GetUpdates(ctx, cs, sourceChannel, startVer, latest)
+ 	if err != nil {
+-		return Update{}, Update{}, nil, fmt.Errorf(ChannelInfo, sourceChannel, err)
++		return cincinnati.Update{}, cincinnati.Update{}, nil, fmt.Errorf(ChannelInfo, sourceChannel, err)
+ 	}
+ 
+ 	requested, newUpgrades, err := calculate(ctx, cs, sourceChannel, targetChannel, latest, reqVer)
+ 	if err != nil {
+-		return Update{}, Update{}, nil, err
++		return cincinnati.Update{}, cincinnati.Update{}, nil, err
+ 	}
+ 	upgrades = append(upgrades, newUpgrades...)
+ 
+-	var finalUpgrades []Update
++	var finalUpgrades []cincinnati.Update
+ 	seen := make(map[string]struct{}, len(upgrades))
+ 	for _, upgrade := range upgrades {
+ 		if _, ok := seen[upgrade.Image]; !ok {
+@@ -248,7 +193,7 @@ func CalculateUpgrades(ctx context.Context, cs CincinnatiSchema, sourceChannel,
+ 
+ // calculate will calculate Cincinnati upgrades between channels by finding the latest versions in the source channels
+ // and incrementing the minor version until the target channel is reached.
+-func calculate(ctx context.Context, cs CincinnatiSchema, sourceChannel, targetChannel string, startVer, reqVer semver.Version) (requested Update, upgrades []Update, err error) {
++func calculate(ctx context.Context, cs CincinnatiSchema, sourceChannel, targetChannel string, startVer, reqVer semver.Version) (requested cincinnati.Update, upgrades []cincinnati.Update, err error) {
+ 	source, target, prefix, err := getSemverFromChannels(sourceChannel, targetChannel)
+ 	if err != nil {
+ 		return requested, upgrades, err
+@@ -347,10 +292,7 @@ func getSemverFromChannels(sourceChannel, targetChannel string) (source, target
+ // GetChannelMinOrMax fetches the minimum or maximum version from the specified
+ // upstream Cincinnati stack given architecture and channel.
+ func GetChannelMinOrMax(ctx context.Context, cs CincinnatiSchema, channel string, min bool) (semver.Version, error) {
+-	// Prepare parametrized cincinnati query.
+-	cs.Client.SetQueryParams(cs.CincinnatiParams.Arch, channel, "")
+-
+-	graph, err := getGraphData(ctx, cs)
++	graph, err := getGraphData(ctx, cs, channel, "")
+ 	if err != nil {
+ 		return semver.Version{}, &Error{
+ 			Reason:  "APIRequestError",
+@@ -373,16 +315,8 @@ func GetChannelMinOrMax(ctx context.Context, cs CincinnatiSchema, channel string
+ 		}
+ 	}
+ 
+-	var Vers []semver.Version
+-	for _, node := range graph.Nodes {
+-		if versionMatcher == nil || versionMatcher.MatchString(node.Version.String()) {
+-			Vers = append(Vers, node.Version)
+-		}
+-	}
+-
+-	semver.Sort(Vers)
+-
+-	if len(Vers) == 0 {
++	vers := graph.GetVersions(versionMatcher)
++	if len(vers) == 0 {
+ 		return semver.Version{}, &Error{
+ 			Reason:  "NoVersionsFound",
+ 			Message: fmt.Sprintf("no cluster versions found for %q in the %q channel", cs.CincinnatiParams.Arch, channel),
+@@ -390,19 +324,16 @@ func GetChannelMinOrMax(ctx context.Context, cs CincinnatiSchema, channel string
+ 	}
+ 
+ 	if min {
+-		return Vers[0], nil
++		return vers[0], nil
+ 	}
+ 
+-	return Vers[len(Vers)-1], nil
++	return vers[len(vers)-1], nil
+ }
+ 
+ // GetVersions will return all update payloads from the specified
+ // upstream Cincinnati stack given architecture and channel.
+ func GetVersions(ctx context.Context, cs CincinnatiSchema, channel string) ([]semver.Version, error) {
+-	// Prepare parametrized cincinnati query.
+-	cs.Client.SetQueryParams(cs.CincinnatiParams.Arch, channel, "")
+-
+-	graph, err := getGraphData(ctx, cs)
++	graph, err := getGraphData(ctx, cs, channel, "")
+ 	if err != nil {
+ 		return nil, &Error{
+ 			Reason:  "APIRequestError",
+@@ -410,30 +341,21 @@ func GetVersions(ctx context.Context, cs CincinnatiSchema, channel string) ([]se
+ 			cause:   err,
+ 		}
+ 	}
+-	// Find the all versions within the graph.
+-	var Vers []semver.Version
+-	for _, node := range graph.Nodes {
+-		Vers = append(Vers, node.Version)
+-	}
+ 
+-	if len(Vers) == 0 {
++	vers := graph.GetVersions(nil)
++	if len(vers) == 0 {
+ 		return nil, &Error{
+ 			Reason:  "NoVersionsFound",
+ 			Message: fmt.Sprintf("no cluster versions found in the %q channel", channel),
+ 		}
+ 	}
+ 
+-	semver.Sort(Vers)
+-
+-	return Vers, nil
++	return vers, nil
+ }
+ 
+ // GetUpdatesInRange will return all update payload within a semver range for a specified channel and architecture.
+-func GetUpdatesInRange(ctx context.Context, cs CincinnatiSchema, channel string, updateRange semver.Range) ([]Update, error) {
+-	// Prepare parametrized cincinnati query.
+-	cs.Client.SetQueryParams(cs.CincinnatiParams.Arch, channel, "")
+-
+-	graph, err := getGraphData(ctx, cs)
++func GetUpdatesInRange(ctx context.Context, cs CincinnatiSchema, channel string, updateRange semver.Range) ([]cincinnati.Update, error) {
++	graph, err := getGraphData(ctx, cs, channel, "")
+ 	if err != nil {
+ 		return nil, &Error{
+ 			Reason:  "APIRequestError",
+@@ -443,132 +365,78 @@ func GetUpdatesInRange(ctx context.Context, cs CincinnatiSchema, channel string,
+ 	}
+ 
+ 	// Find the all updates within the range
+-	var updates []Update
++	var updates []cincinnati.Update
+ 	for _, node := range graph.Nodes {
+ 		if updateRange(node.Version) {
+-			updates = append(updates, Update(node))
++			updates = append(updates, cincinnati.Update(node))
+ 		}
+ 	}
+ 	return updates, nil
+ }
+ 
+ // getGraphData fetches the update graph from the upstream Cincinnati stack given the current version and channel
+-func getGraphData(ctx context.Context, cs CincinnatiSchema) (graph graph, err error) {
++func getGraphData(ctx context.Context, cs CincinnatiSchema, channel string, version string) (graph cincinnati.Graph, err error) {
++	arch := cs.CincinnatiParams.Arch
+ 	if cs.Opts.Mode == mirror.DiskToMirror {
+-		graphDataFiles, err := os.ReadDir(cs.CincinnatiParams.GraphDataDir)
+-		if err != nil {
+-			return graph, &Error{Reason: "ReadDirFailed", Message: err.Error(), cause: err}
+-		}
+-
+-		if len(graphDataFiles) == 0 {
+-			return graph, &Error{Reason: "NoGraphData", Message: "No graph data found on disk"}
+-		}
+-
+-		uri := cs.Client.GetURL()
+-		queryValues := uri.Query()
+-		arch := queryValues.Get("arch")
+-		channel := queryValues.Get("channel")
+-		filename := fmt.Sprintf("%s-%s.json", arch, channel)
+-		filepath := path.Join(cs.CincinnatiParams.GraphDataDir, filename)
+-
+-		fileData, err := os.ReadFile(filepath)
+-		if err != nil {
+-			return graph, &Error{Reason: "ReadFileFailed", Message: err.Error(), cause: err}
+-		}
+-
+-		if err = json.Unmarshal(fileData, &graph); err != nil {
+-			errMsg := fmt.Sprintf("could not parse graph data %s: %v", filepath, err)
+-			return graph, &Error{Reason: "GraphDataInvalid", Message: errMsg, cause: err}
+-		}
+-
+-		return graph, nil
++		return loadGraphDataFromDisk(cs.CincinnatiParams.GraphDataDir, arch, channel)
+ 	}
+ 
+-	transport := cs.Client.GetTransport()
+-	uri := cs.Client.GetURL()
+-	// Download the update graph.
+-	req, err := http.NewRequest("GET", uri.String(), nil)
+-	if err != nil {
+-		return graph, &Error{Reason: "InvalidRequest", Message: err.Error(), cause: err}
++	opts := []cincinnati.Option{
++		cincinnati.WithChannel(channel),
++		cincinnati.WithID(cs.Client.GetID()),
++		cincinnati.WithURL(cs.Client.GetURL().String()),
++		cincinnati.WithTransport(cs.Client.GetTransport()),
+ 	}
+-	req.Header.Add("Accept", GraphMediaType)
+-	if transport != nil && transport.TLSClientConfig != nil {
+-		if cs.Client.GetTransport().TLSClientConfig.ClientCAs == nil {
+-			cs.Log.Debug("Using a root CA pool with 0 root CA subjects to request updates from %s", uri)
+-		}
+-		//else {
+-		//klog.V(5).Infof("Using a root CA pool with %n root CA subjects to request updates from %s", len(transport.TLSClientConfig.RootCAs.Subjects()), uri)
+-		//}
++	if len(arch) > 0 {
++		opts = append(opts, cincinnati.WithArch(arch))
+ 	}
+-
+-	if transport != nil && transport.Proxy != nil {
+-		proxy, err := transport.Proxy(req)
+-		if err == nil && proxy != nil {
+-			cs.Log.Debug("Using proxy %s to request updates from %s", proxy.Host, uri)
+-		}
++	if len(version) > 0 {
++		opts = append(opts, cincinnati.WithVersion(version))
+ 	}
+ 
+-	client := http.Client{}
+-	if transport != nil {
+-		client.Transport = transport
+-	}
+-	timeoutCtx, cancel := context.WithTimeout(ctx, getUpdatesTimeout)
+-	defer cancel()
+-	resp, err := client.Do(req.WithContext(timeoutCtx))
++	// Download the update graph.
++	data, err := cincinnati.DownloadGraphData(ctx, cs.Log, opts...)
+ 	if err != nil {
+-		return graph, &Error{Reason: "RemoteFailed", Message: err.Error(), cause: err}
++		return graph, &Error{Reason: "GetGraphDataFailed", Message: err.Error(), cause: err}
+ 	}
+-	defer resp.Body.Close()
+ 
+-	if resp.StatusCode != http.StatusOK {
+-		return graph, &Error{Reason: "ResponseFailed", Message: fmt.Sprintf("unexpected HTTP status: %s", resp.Status)}
+-	}
+-
+-	// Parse the graph.
+-	body, err := io.ReadAll(resp.Body)
++	graph, err = cincinnati.LoadGraphData(data)
+ 	if err != nil {
+-		return graph, &Error{Reason: "ResponseFailed", Message: err.Error(), cause: err}
+-	}
+-
+-	if err = json.Unmarshal(body, &graph); err != nil {
+ 		return graph, &Error{Reason: "ResponseInvalid", Message: err.Error(), cause: err}
+ 	}
+ 
+-	if err := writeGraphDataToFile(body, *uri, cs.CincinnatiParams.GraphDataDir); err != nil {
++	if err := writeGraphDataToFile(data, arch, channel, cs.CincinnatiParams.GraphDataDir); err != nil {
+ 		return graph, err
+ 	}
+ 
+ 	return graph, nil
+ }
+ 
+-func writeGraphDataToFile(body []byte, uri url.URL, graphDataDir string) error {
+-	queryValues := uri.Query()
+-	arch := queryValues.Get("arch")
+-	channel := queryValues.Get("channel")
++func loadGraphDataFromDisk(graphDataDir, arch, channel string) (cincinnati.Graph, error) {
++	var graph cincinnati.Graph
+ 	filename := fmt.Sprintf("%s-%s.json", arch, channel)
+-	err := os.WriteFile(path.Join(graphDataDir, filename), body, 0644)
+-	if err != nil {
+-		return &Error{Reason: "FileWriteFailed", Message: err.Error(), cause: err}
++	filepath := path.Join(graphDataDir, filename)
++	if _, err := os.Stat(filepath); err != nil {
++		return graph, &Error{Reason: "NoGraphData", Message: "No graph data found on disk"}
+ 	}
+ 
+-	return nil
+-}
+-
+-// UnmarshalJSON unmarshals an edge in the update graph. The edge's JSON
+-// representation is a two-element array of indices, but Go's representation is
+-// a struct with two elements so this custom unmarshal method is required.
+-func (o *edge) UnmarshalJSON(data []byte) error {
+-	var fields []int
+-	if err := json.Unmarshal(data, &fields); err != nil {
+-		return err
++	fileData, err := os.ReadFile(filepath)
++	if err != nil {
++		return graph, &Error{Reason: "ReadFileFailed", Message: err.Error(), cause: err}
+ 	}
+ 
+-	if len(fields) != 2 {
+-		return fmt.Errorf("expected 2 fields, found %d", len(fields))
++	if graph, err = cincinnati.LoadGraphData(fileData); err != nil {
++		return graph, &Error{Reason: "GraphDataInvalid", Message: fmt.Sprintf("graph data %s: %v", filepath, err), cause: err}
+ 	}
+ 
+-	o.Origin = fields[0]
+-	o.Destination = fields[1]
++	return graph, nil
++}
++
++func writeGraphDataToFile(body []byte, arch, channel, graphDataDir string) error {
++	filename := fmt.Sprintf("%s-%s.json", arch, channel)
++	if err := os.WriteFile(path.Join(graphDataDir, filename), body, 0o644); err != nil { //nolint:gosec // no sensitive info
++		return &Error{Reason: "FileWriteFailed", Message: err.Error(), cause: err}
++	}
+ 
+ 	return nil
+ }
+diff --git a/internal/pkg/release/core-cincinnati_test.go b/internal/pkg/release/core-cincinnati_test.go
+index e5cbc85d59..a900357338 100644
+--- a/internal/pkg/release/core-cincinnati_test.go
++++ b/internal/pkg/release/core-cincinnati_test.go
+@@ -2,8 +2,6 @@ package release
+ 
+ import (
+ 	"context"
+-	"encoding/json"
+-	"fmt"
+ 	"net/http"
+ 	"net/http/httptest"
+ 	"net/url"
+@@ -13,6 +11,7 @@ import (
+ 	"github.com/google/uuid"
+ 	"github.com/stretchr/testify/require"
+ 
++	"github.com/openshift/oc-mirror/v2/internal/pkg/cincinnati"
+ 	clog "github.com/openshift/oc-mirror/v2/internal/pkg/log"
+ )
+ 
+@@ -34,18 +33,18 @@ func TestGetUpdates(t *testing.T) {
+ 		reqVer  string
+ 
+ 		expectedQuery string
+-		current       Update
+-		requested     Update
+-		available     []Update
++		current       cincinnati.Update
++		requested     cincinnati.Update
++		available     []cincinnati.Update
+ 		err           string
+ 	}{{
+ 		name:          "Valid/DirectUpdate",
+ 		version:       "4.0.0-4",
+ 		reqVer:        "4.0.0-5",
+ 		expectedQuery: "arch=test-arch&channel=stable-4.0&id=01234567-0123-0123-0123-0123456789ab&version=4.0.0-4",
+-		current:       Update{Version: semver.MustParse("4.0.0-4"), Image: "quay.io/openshift-release-dev/ocp-release:4.0.0-4"},
+-		requested:     Update{Version: semver.MustParse("4.0.0-5"), Image: "quay.io/openshift-release-dev/ocp-release:4.0.0-5"},
+-		available: []Update{
++		current:       cincinnati.Update{Version: semver.MustParse("4.0.0-4"), Image: "quay.io/openshift-release-dev/ocp-release:4.0.0-4"},
++		requested:     cincinnati.Update{Version: semver.MustParse("4.0.0-5"), Image: "quay.io/openshift-release-dev/ocp-release:4.0.0-5"},
++		available: []cincinnati.Update{
+ 			{Version: semver.MustParse("4.0.0-4"), Image: "quay.io/openshift-release-dev/ocp-release:4.0.0-4"},
+ 			{Version: semver.MustParse("4.0.0-5"), Image: "quay.io/openshift-release-dev/ocp-release:4.0.0-5"},
+ 		},
+@@ -54,9 +53,9 @@ func TestGetUpdates(t *testing.T) {
+ 		version:       "4.0.0-4",
+ 		reqVer:        "4.0.0-8",
+ 		expectedQuery: "arch=test-arch&channel=stable-4.0&id=01234567-0123-0123-0123-0123456789ab&version=4.0.0-4",
+-		current:       Update{Version: semver.MustParse("4.0.0-4"), Image: "quay.io/openshift-release-dev/ocp-release:4.0.0-4"},
+-		requested:     Update{Version: semver.MustParse("4.0.0-8"), Image: "quay.io/openshift-release-dev/ocp-release:4.0.0-8"},
+-		available: []Update{
++		current:       cincinnati.Update{Version: semver.MustParse("4.0.0-4"), Image: "quay.io/openshift-release-dev/ocp-release:4.0.0-4"},
++		requested:     cincinnati.Update{Version: semver.MustParse("4.0.0-8"), Image: "quay.io/openshift-release-dev/ocp-release:4.0.0-8"},
++		available: []cincinnati.Update{
+ 			{Version: semver.MustParse("4.0.0-4"), Image: "quay.io/openshift-release-dev/ocp-release:4.0.0-4"},
+ 			{Version: semver.MustParse("4.0.0-5"), Image: "quay.io/openshift-release-dev/ocp-release:4.0.0-5"},
+ 			{Version: semver.MustParse("4.0.0-6"), Image: "quay.io/openshift-release-dev/ocp-release:4.0.0-6"},
+@@ -66,8 +65,8 @@ func TestGetUpdates(t *testing.T) {
+ 		name:          "Valid/NoUpdates",
+ 		version:       "4.0.0-4",
+ 		reqVer:        "4.0.0-0.okd-0",
+-		current:       Update{Version: semver.MustParse("4.0.0-4"), Image: "quay.io/openshift-release-dev/ocp-release:4.0.0-4"},
+-		requested:     Update{Version: semver.MustParse("4.0.0-0.okd-0"), Image: "quay.io/openshift-release-dev/ocp-release:4.0.0-0.okd-0"},
++		current:       cincinnati.Update{Version: semver.MustParse("4.0.0-4"), Image: "quay.io/openshift-release-dev/ocp-release:4.0.0-4"},
++		requested:     cincinnati.Update{Version: semver.MustParse("4.0.0-0.okd-0"), Image: "quay.io/openshift-release-dev/ocp-release:4.0.0-0.okd-0"},
+ 		expectedQuery: "arch=test-arch&channel=stable-4.0&id=01234567-0123-0123-0123-0123456789ab&version=4.0.0-4",
+ 		available:     nil,
+ 	}, {
+@@ -259,14 +258,14 @@ func TestGetUpdatesInRange(t *testing.T) {
+ 	tests := []struct {
+ 		name          string
+ 		expectedQuery string
+-		versions      []Update
++		versions      []cincinnati.Update
+ 		releaseRange  semver.Range
+ 		err           string
+ 	}{
+ 		{
+ 			name:          "Valid/OneChannel",
+ 			expectedQuery: "arch=test-arch&channel=stable-4.0&id=01234567-0123-0123-0123-0123456789ab",
+-			versions: []Update{
++			versions: []cincinnati.Update{
+ 				{Version: semver.MustParse("4.0.0-5"), Image: "quay.io/openshift-release-dev/ocp-release:4.0.0-5"},
+ 				{Version: semver.MustParse("4.0.0-6"), Image: "quay.io/openshift-release-dev/ocp-release:4.0.0-6"},
+ 				{Version: semver.MustParse("4.0.0-7"), Image: "quay.io/openshift-release-dev/ocp-release:4.0.0-7"},
+@@ -324,9 +323,9 @@ func TestCalculateUpgrades(t *testing.T) {
+ 		targetChannel   string
+ 		curr            semver.Version
+ 		req             semver.Version
+-		currentUpdate   Update
+-		requestedUpdate Update
+-		neededUpdates   []Update
++		currentUpdate   cincinnati.Update
++		requestedUpdate cincinnati.Update
++		neededUpdates   []cincinnati.Update
+ 		err             string
+ 	}{{
+ 		name:            "Success/OneChannel",
+@@ -334,9 +333,9 @@ func TestCalculateUpgrades(t *testing.T) {
+ 		targetChannel:   "stable-4.1",
+ 		curr:            semver.MustParse("4.0.0-5"),
+ 		req:             semver.MustParse("4.1.0-6"),
+-		currentUpdate:   Update{Version: semver.MustParse("4.0.0-5"), Image: "quay.io/openshift-release-dev/ocp-release:4.0.0-5"},
+-		requestedUpdate: Update{Version: semver.MustParse("4.1.0-6"), Image: "quay.io/openshift-release-dev/ocp-release:4.1.0-6"},
+-		neededUpdates: []Update{
++		currentUpdate:   cincinnati.Update{Version: semver.MustParse("4.0.0-5"), Image: "quay.io/openshift-release-dev/ocp-release:4.0.0-5"},
++		requestedUpdate: cincinnati.Update{Version: semver.MustParse("4.1.0-6"), Image: "quay.io/openshift-release-dev/ocp-release:4.1.0-6"},
++		neededUpdates: []cincinnati.Update{
+ 			{Version: semver.MustParse("4.0.0-5"), Image: "quay.io/openshift-release-dev/ocp-release:4.0.0-5"},
+ 			{Version: semver.MustParse("4.0.0-6"), Image: "quay.io/openshift-release-dev/ocp-release:4.0.0-6"},
+ 			{Version: semver.MustParse("4.0.0-8"), Image: "quay.io/openshift-release-dev/ocp-release:4.0.0-8"},
+@@ -348,9 +347,9 @@ func TestCalculateUpgrades(t *testing.T) {
+ 		targetChannel:   "stable-4.2",
+ 		curr:            semver.MustParse("4.0.0-5"),
+ 		req:             semver.MustParse("4.2.0-3"),
+-		currentUpdate:   Update{Version: semver.MustParse("4.0.0-5"), Image: "quay.io/openshift-release-dev/ocp-release:4.0.0-5"},
+-		requestedUpdate: Update{Version: semver.MustParse("4.2.0-3"), Image: "quay.io/openshift-release-dev/ocp-release:4.2.0-3"},
+-		neededUpdates: []Update{
++		currentUpdate:   cincinnati.Update{Version: semver.MustParse("4.0.0-5"), Image: "quay.io/openshift-release-dev/ocp-release:4.0.0-5"},
++		requestedUpdate: cincinnati.Update{Version: semver.MustParse("4.2.0-3"), Image: "quay.io/openshift-release-dev/ocp-release:4.2.0-3"},
++		neededUpdates: []cincinnati.Update{
+ 			{Version: semver.MustParse("4.0.0-5"), Image: "quay.io/openshift-release-dev/ocp-release:4.0.0-5"},
+ 			{Version: semver.MustParse("4.0.0-6"), Image: "quay.io/openshift-release-dev/ocp-release:4.0.0-6"},
+ 			{Version: semver.MustParse("4.0.0-8"), Image: "quay.io/openshift-release-dev/ocp-release:4.0.0-8"},
+@@ -363,9 +362,9 @@ func TestCalculateUpgrades(t *testing.T) {
+ 		targetChannel:   "fast-4.3",
+ 		curr:            semver.MustParse("4.3.0"),
+ 		req:             semver.MustParse("4.3.1"),
+-		currentUpdate:   Update{Version: semver.MustParse("4.3.0"), Image: "quay.io/openshift-release-dev/ocp-release:4.3.0"},
+-		requestedUpdate: Update{Version: semver.MustParse("4.3.1"), Image: "quay.io/openshift-release-dev/ocp-release:4.3.1"},
+-		neededUpdates: []Update{
++		currentUpdate:   cincinnati.Update{Version: semver.MustParse("4.3.0"), Image: "quay.io/openshift-release-dev/ocp-release:4.3.0"},
++		requestedUpdate: cincinnati.Update{Version: semver.MustParse("4.3.1"), Image: "quay.io/openshift-release-dev/ocp-release:4.3.1"},
++		neededUpdates: []cincinnati.Update{
+ 			{Version: semver.MustParse("4.3.0"), Image: "quay.io/openshift-release-dev/ocp-release:4.3.0"},
+ 			{Version: semver.MustParse("4.3.1"), Image: "quay.io/openshift-release-dev/ocp-release:4.3.1"},
+ 		},
+@@ -375,9 +374,9 @@ func TestCalculateUpgrades(t *testing.T) {
+ 		targetChannel:   "stable-4.2",
+ 		curr:            semver.MustParse("4.1.0-6"),
+ 		req:             semver.MustParse("4.2.0-2"),
+-		currentUpdate:   Update{Version: semver.MustParse("4.1.0-6"), Image: "quay.io/openshift-release-dev/ocp-release:4.1.0-6"},
+-		requestedUpdate: Update{Version: semver.MustParse("4.2.0-2"), Image: "quay.io/openshift-release-dev/ocp-release:4.2.0-2"},
+-		neededUpdates: []Update{
++		currentUpdate:   cincinnati.Update{Version: semver.MustParse("4.1.0-6"), Image: "quay.io/openshift-release-dev/ocp-release:4.1.0-6"},
++		requestedUpdate: cincinnati.Update{Version: semver.MustParse("4.2.0-2"), Image: "quay.io/openshift-release-dev/ocp-release:4.2.0-2"},
++		neededUpdates: []cincinnati.Update{
+ 			{Version: semver.MustParse("4.1.0-6"), Image: "quay.io/openshift-release-dev/ocp-release:4.1.0-6"},
+ 		},
+ 	}, {
+@@ -386,9 +385,9 @@ func TestCalculateUpgrades(t *testing.T) {
+ 		targetChannel:   "stable-4.3",
+ 		curr:            semver.MustParse("4.2.0-3"),
+ 		req:             semver.MustParse("4.3.0"),
+-		currentUpdate:   Update{Version: semver.MustParse("4.2.0-3"), Image: "quay.io/openshift-release-dev/ocp-release:4.2.0-3"},
+-		requestedUpdate: Update{Version: semver.MustParse("4.3.0"), Image: "quay.io/openshift-release-dev/ocp-release:4.3.0"},
+-		neededUpdates: []Update{
++		currentUpdate:   cincinnati.Update{Version: semver.MustParse("4.2.0-3"), Image: "quay.io/openshift-release-dev/ocp-release:4.2.0-3"},
++		requestedUpdate: cincinnati.Update{Version: semver.MustParse("4.3.0"), Image: "quay.io/openshift-release-dev/ocp-release:4.3.0"},
++		neededUpdates: []cincinnati.Update{
+ 			{Version: semver.MustParse("4.2.0-3"), Image: "quay.io/openshift-release-dev/ocp-release:4.2.0-3"},
+ 			{Version: semver.MustParse("4.2.0-5"), Image: "quay.io/openshift-release-dev/ocp-release:4.2.0-5"},
+ 		},
+@@ -529,76 +528,6 @@ func (c mockClient) GetTransport() *http.Transport {
+ 	return &http.Transport{}
+ }
+ 
+-func TestNodeUnmarshalJSON(t *testing.T) {
+-	tests := []struct {
+-		raw []byte
+-
+-		exp node
+-		err string
+-	}{{
+-		raw: []byte(`{
+-			"version": "4.0.0-5",
+-			"payload": "quay.io/openshift-release-dev/ocp-release:4.0.0-5",
+-			"metadata": {}
+-		  }`),
+-
+-		exp: node{
+-			Version:  semver.MustParse("4.0.0-5"),
+-			Image:    "quay.io/openshift-release-dev/ocp-release:4.0.0-5",
+-			Metadata: map[string]string{},
+-		},
+-	}, {
+-		raw: []byte(`{
+-			"version": "4.0.0-0.1",
+-			"payload": "quay.io/openshift-release-dev/ocp-release:4.0.0-0.1",
+-			"metadata": {
+-			  "description": "This is the beta1 image based on the 4.0.0-0.nightly-2019-01-15-010905 build"
+-			}
+-		  }`),
+-		exp: node{
+-			Version: semver.MustParse("4.0.0-0.1"),
+-			Image:   "quay.io/openshift-release-dev/ocp-release:4.0.0-0.1",
+-			Metadata: map[string]string{
+-				"description": "This is the beta1 image based on the 4.0.0-0.nightly-2019-01-15-010905 build",
+-			},
+-		},
+-	}, {
+-		raw: []byte(`{
+-			"version": "v4.0.0-0.1",
+-			"payload": "quay.io/openshift-release-dev/ocp-release:4.0.0-0.1",
+-			"metadata": {
+-			  "description": "This is the beta1 image based on the 4.0.0-0.nightly-2019-01-15-010905 build"
+-			}
+-		  }`),
+-		err: `Invalid character(s) found in major number "v4"`,
+-	}, {
+-		raw: []byte(`{
+-			"version": "4-0-0+0.1",
+-			"payload": "quay.io/openshift-release-dev/ocp-release:4.0.0-0.1",
+-			"metadata": {
+-			  "description": "This is the beta1 image based on the 4.0.0-0.nightly-2019-01-15-010905 build"
+-			}
+-		  }
+-	  `),
+-
+-		err: "No Major.Minor.Patch elements found",
+-	}}
+-
+-	for idx, test := range tests {
+-		t.Run(fmt.Sprintf("#%d", idx), func(t *testing.T) {
+-			var n node
+-			err := json.Unmarshal(test.raw, &n)
+-			if test.err == "" {
+-				require.NoError(t, err)
+-				require.Equal(t, test.exp, n)
+-
+-			} else {
+-				require.EqualError(t, err, test.err)
+-			}
+-		})
+-	}
+-}
+-
+ func TestGetSemVerFromChannel(t *testing.T) {
+ 	tests := []struct {
+ 		name          string
+@@ -652,7 +581,7 @@ func getHandlerMulti(t *testing.T, requestQuery chan<- string) http.HandlerFunc
+ 		select {
+ 		case requestQuery <- r.URL.RawQuery:
+ 		default:
+-			//t.Fatalf("received multiple requests at upstream URL")
++			// t.Fatalf("received multiple requests at upstream URL")
+ 		}
+ 
+ 		if r.Method != http.MethodGet && r.Method != http.MethodHead {
+@@ -661,7 +590,7 @@ func getHandlerMulti(t *testing.T, requestQuery chan<- string) http.HandlerFunc
+ 		}
+ 
+ 		mtype := r.Header.Get("Accept")
+-		if mtype != GraphMediaType {
++		if mtype != "application/json" {
+ 			w.WriteHeader(http.StatusUnsupportedMediaType)
+ 			return
+ 		}

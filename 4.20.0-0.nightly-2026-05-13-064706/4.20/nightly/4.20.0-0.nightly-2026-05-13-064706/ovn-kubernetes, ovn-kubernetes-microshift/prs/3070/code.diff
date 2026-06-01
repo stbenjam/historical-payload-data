@@ -1,0 +1,412 @@
+diff --git a/docs/features/live-migration.md b/docs/features/live-migration.md
+index adcd2a4f47..c40822e069 100644
+--- a/docs/features/live-migration.md
++++ b/docs/features/live-migration.md
+@@ -123,21 +123,16 @@ Login and check that the VM has receive a proper address `virtctl console fedora
+ Also we can check the neighbours cache to verify it later on
+ ```bash
+ [fedora@fedora ~]arp -a
+-_gateway (169.254.1.1) at 0a:58:a9:fe:01:01 [ether] on eth0
++_gateway (10.244.2.1) at 0a:58:a9:fe:01:01 [ether] on eth0
+ ```
+ 
+-
+-Keep in mind the default gw is a link local address; that is because 
+-the live migration feature is implemented using ARP proxy.
+-
+-The last route is needed since the link local address subnet is not bound to any interface, that
+-route is automatically created by dhcp client.
++The default gateway is the pod network subnet gateway IP. The ARP proxy feature
++ensures the gateway MAC address remains consistent across live migrations.
+ 
+ ```bash
+ [fedora@fedora ~]ip route
+-default via 169.254.1.1 dev eth0 proto dhcp src 10.244.2.26 metric 100
++default via 10.244.2.1 dev eth0 proto dhcp src 10.244.2.26 metric 100
+ 10.244.2.0/24 dev eth0 proto kernel scope link src 10.244.2.26 metric 100
+-169.254.1.1 dev eth0 proto dhcp scope link src 10.244.2.26 metric 100
+ ```
+ 
+ Then a live migration can be initialized with `virtctl migrate fedora` and wait
+@@ -171,7 +166,7 @@ default     fedora   16m   Running   10.244.2.26   ovn-worker   True
+     inet6 fe80::32d2:10d4:f5ed:3064/64 scope link noprefixroute
+        valid_lft forever preferred_lft forever
+ [fedora@fedora ~]arp -a
+-_gateway (169.254.1.1) at 0a:58:a9:fe:01:01 [ether] on eth0
++_gateway (10.244.2.1) at 0a:58:a9:fe:01:01 [ether] on eth0
+ ```
+ 
+ ### Configuring dns server
+@@ -264,9 +259,9 @@ Benefit of the bridge binding is that is able to expose the pod IP to the VM as
+ ### OVN-Kubernetes Implementation Details
+ 
+ To implement live migration ovn-kubernetes do the following:
+-- Send DHCP replies advertising the allocated IP address to the guest VM (via OVN-Kubernetes DHCP options configured for the logical switch ports).
++- Send DHCP replies advertising the allocated IP address and subnet gateway to the guest VM (via OVN-Kubernetes DHCP options configured for the logical switch ports).
+ - A point to point routing is used so one node's subnet IP can be routed from different node
+-- The VM's gateway IP and MAC are independent of the node they are running on using proxy arp
++- The VM's gateway IP (subnet gateway) and MAC are kept consistent across nodes using ARP proxy
+ 
+ **Point to point routing:**
+ 
+@@ -330,16 +325,16 @@ Remote zone:
+ 
+ **Nodes logical switch ports:**
+ 
+-To have a consistent gateway at VMs (keep ip and mac after live migration) 
+-the "arp_proxy" feature is used and it need to be activated at 
+-the logical switch port of type router connects node's logical switch to 
++To have a consistent gateway at VMs (keep ip and mac after live migration)
++the "arp_proxy" feature is used and it need to be activated at
++the logical switch port of type router connects node's logical switch to
+ ovn_cluster_router logical router.
+ 
+ The "arp_proxy" LSP option will include the MAC to answer ARPs with, and the
+-link local ipv4 and ipv6 to answer for and the cluster wide pod CIDR to answer
+-to pod subnets when the node switch do not have the live migrated ip. The
+-flows from arp_proxy has less priority than the ones from the node logical 
+-switch so ARP flows are not overriden.
++link local ipv4 and ipv6 addresses, as well as the cluster wide pod CIDR. This
++allows the proxy to answer ARP requests for the subnet gateway IP when the node
++switch does not have the live migrated IP. The flows from arp_proxy have less
++priority than the ones from the node logical switch so ARP flows are not overriden.
+ 
+ ```text
+     ┌────────────────────┐   ┌────────────────────┐
+@@ -381,7 +376,7 @@ Also the DHCP options will be configured to deliver the address to the VMs
+ ┌─────────────────────────────────┐
+ │ dhcp-options 1234               │
+ │   lease_time: 3500              │
+-│   router: 169.254.1.1           │
++│   router: 10.244.0.1            │
+ │   dns_server: [kubedns]         │
+ │   server_id: 169.254.1.1        │
+ │   server_mac: c0:ff:ee:00:00:01 │
+diff --git a/go-controller/pkg/kubevirt/dhcp.go b/go-controller/pkg/kubevirt/dhcp.go
+index 51cb600ebd..414adaf0d2 100644
+--- a/go-controller/pkg/kubevirt/dhcp.go
++++ b/go-controller/pkg/kubevirt/dhcp.go
+@@ -71,19 +71,6 @@ func WithIPv6DNSServer(dnsServer string) func(*dhcpConfigs) {
+ 	}
+ }
+ 
+-func EnsureDHCPOptionsForMigratablePod(controllerName string, nbClient libovsdbclient.Client, watchFactory *factory.WatchFactory, pod *corev1.Pod, ips []*net.IPNet, lsp *nbdb.LogicalSwitchPort) error {
+-	dnsServerIPv4, dnsServerIPv6, err := RetrieveDNSServiceClusterIPs(watchFactory)
+-	if err != nil {
+-		return fmt.Errorf("failed retrieving dns service cluster ip: %v", err)
+-	}
+-
+-	return EnsureDHCPOptionsForLSP(controllerName, nbClient, pod, ips, lsp,
+-		WithIPv4Router(ARPProxyIPv4),
+-		WithIPv4DNSServer(dnsServerIPv4),
+-		WithIPv6DNSServer(dnsServerIPv6),
+-	)
+-}
+-
+ func EnsureDHCPOptionsForLSP(controllerName string, nbClient libovsdbclient.Client, pod *corev1.Pod, ips []*net.IPNet, lsp *nbdb.LogicalSwitchPort, opts ...DHCPConfigsOpt) error {
+ 	vmKey := ExtractVMNameFromPod(pod)
+ 	if vmKey == nil {
+diff --git a/go-controller/pkg/ovn/base_network_controller.go b/go-controller/pkg/ovn/base_network_controller.go
+index c6a3408e27..43832c31e7 100644
+--- a/go-controller/pkg/ovn/base_network_controller.go
++++ b/go-controller/pkg/ovn/base_network_controller.go
+@@ -230,7 +230,8 @@ func (oc *BaseNetworkController) reconcile(netInfo util.NetInfo, setNodeFailed f
+ // provided on the arguments of the method. This method returns no error and logs them
+ // instead since once the controller NetInfo has been updated there is no point in retrying.
+ func (oc *BaseNetworkController) doReconcile(reconcileRoutes, reconcilePendingPods bool,
+-	reconcileNodes []string, setNodeFailed func(string), reconcileNamespaces []string) {
++	reconcileNodes []string, setNodeFailed func(string), reconcileNamespaces []string,
++) {
+ 	if reconcileRoutes {
+ 		err := oc.routeImportManager.ReconcileNetwork(oc.GetNetworkName())
+ 		if err != nil {
+@@ -322,7 +323,8 @@ func getNetworkControllerName(netName string) string {
+ // NewCommonNetworkControllerInfo creates CommonNetworkControllerInfo shared by controllers
+ func NewCommonNetworkControllerInfo(client clientset.Interface, kube *kube.KubeOVN, wf *factory.WatchFactory,
+ 	recorder record.EventRecorder, nbClient libovsdbclient.Client, sbClient libovsdbclient.Client,
+-	podRecorder *metrics.PodRecorder, SCTPSupport, multicastSupport, svcTemplateSupport bool) (*CommonNetworkControllerInfo, error) {
++	podRecorder *metrics.PodRecorder, SCTPSupport, multicastSupport, svcTemplateSupport bool,
++) (*CommonNetworkControllerInfo, error) {
+ 	zone, err := libovsdbutil.GetNBZone(nbClient)
+ 	if err != nil {
+ 		return nil, fmt.Errorf("error getting NB zone name : err - %w", err)
+@@ -351,7 +353,8 @@ func (bnc *BaseNetworkController) GetLogicalPortName(pod *corev1.Pod, nadName st
+ }
+ 
+ func (bnc *BaseNetworkController) AddConfigDurationRecord(kind, namespace, name string) (
+-	[]ovsdb.Operation, func(), time.Time, error) {
++	[]ovsdb.Operation, func(), time.Time, error,
++) {
+ 	if !bnc.IsUserDefinedNetwork() {
+ 		return recorders.GetConfigDurationRecorder().AddOVN(bnc.nbClient, kind, namespace, name)
+ 	}
+@@ -484,7 +487,8 @@ func (bnc *BaseNetworkController) syncNodeClusterRouterPort(node *corev1.Node, h
+ }
+ 
+ func (bnc *BaseNetworkController) createNodeLogicalSwitch(nodeName string, hostSubnets []*net.IPNet,
+-	clusterLoadBalancerGroupUUID, switchLoadBalancerGroupUUID string) error {
++	clusterLoadBalancerGroupUUID, switchLoadBalancerGroupUUID string,
++) error {
+ 	// logical router port MAC is based on IPv4 subnet if there is one, else IPv6
+ 	var nodeLRPMAC net.HardwareAddr
+ 	switchName := bnc.GetNetworkScopedSwitchName(nodeName)
+@@ -510,8 +514,7 @@ func (bnc *BaseNetworkController) createNodeLogicalSwitch(nodeName string, hostS
+ 		if utilnet.IsIPv6CIDR(hostSubnet) {
+ 			v6Gateway = gwIfAddr.IP
+ 
+-			logicalSwitch.OtherConfig["ipv6_prefix"] =
+-				hostSubnet.IP.String()
++			logicalSwitch.OtherConfig["ipv6_prefix"] = hostSubnet.IP.String()
+ 		} else {
+ 			v4Gateway = gwIfAddr.IP
+ 			excludeIPs := mgmtIfAddr.IP.String()
+@@ -955,7 +958,6 @@ func (bnc *BaseNetworkController) isLocalZoneNode(node *corev1.Node) bool {
+ 
+ // GetNetworkRole returns the role of this controller's network for the given pod
+ func (bnc *BaseNetworkController) GetNetworkRole(pod *corev1.Pod) (string, error) {
+-
+ 	role, err := util.GetNetworkRole(bnc.GetNetInfo(), bnc.networkManager.GetActiveNetworkForNamespace, pod)
+ 	if err != nil {
+ 		if util.IsUnprocessedActiveNetworkError(err) {
+@@ -1113,8 +1115,8 @@ func (bnc *BaseNetworkController) newNetworkQoSController() error {
+ }
+ 
+ func initLoadBalancerGroups(nbClient libovsdbclient.Client, netInfo util.NetInfo) (
+-	clusterLoadBalancerGroupUUID, switchLoadBalancerGroupUUID, routerLoadBalancerGroupUUID string, err error) {
+-
++	clusterLoadBalancerGroupUUID, switchLoadBalancerGroupUUID, routerLoadBalancerGroupUUID string, err error,
++) {
+ 	loadBalancerGroupName := netInfo.GetNetworkScopedLoadBalancerGroupName(types.ClusterLBGroupName)
+ 	clusterLBGroup := nbdb.LoadBalancerGroup{Name: loadBalancerGroupName}
+ 	ops, err := libovsdbops.CreateOrUpdateLoadBalancerGroupOps(nbClient, nil, &clusterLBGroup)
+@@ -1199,3 +1201,25 @@ func (bnc *BaseNetworkController) GetSamplingConfig() *libovsdbops.SamplingConfi
+ 	}
+ 	return nil
+ }
++
++func (bnc *BaseNetworkController) ensureDHCP(pod *corev1.Pod, podAnnotation *util.PodAnnotation, lsp *nbdb.LogicalSwitchPort) error {
++	opts := []kubevirt.DHCPConfigsOpt{}
++
++	ipv4DNSServer, ipv6DNSServer, err := kubevirt.RetrieveDNSServiceClusterIPs(bnc.watchFactory)
++	if err != nil {
++		return err
++	}
++
++	ipv4Gateway, _ := util.MatchFirstIPFamily(false /*ipv4*/, podAnnotation.Gateways)
++	if ipv4Gateway != nil {
++		opts = append(opts, kubevirt.WithIPv4Router(ipv4Gateway.String()))
++	}
++
++	if bnc.MTU() > 0 {
++		opts = append(opts, kubevirt.WithIPv4MTU(bnc.MTU()))
++	}
++
++	opts = append(opts, kubevirt.WithIPv4DNSServer(ipv4DNSServer), kubevirt.WithIPv6DNSServer(ipv6DNSServer))
++
++	return kubevirt.EnsureDHCPOptionsForLSP(bnc.controllerName, bnc.nbClient, pod, podAnnotation.IPs, lsp, opts...)
++}
+diff --git a/go-controller/pkg/ovn/base_network_controller_user_defined.go b/go-controller/pkg/ovn/base_network_controller_user_defined.go
+index 26adc3bd54..e8afb8c4ea 100644
+--- a/go-controller/pkg/ovn/base_network_controller_user_defined.go
++++ b/go-controller/pkg/ovn/base_network_controller_user_defined.go
+@@ -227,7 +227,6 @@ func (bsnc *BaseUserDefinedNetworkController) DeleteUserDefinedNetworkResourceCo
+ // ensurePodForUserDefinedNetwork tries to set up the User Defined Network for a pod. It returns nil on success and error
+ // on failure; failure indicates the pod set up should be retried later.
+ func (bsnc *BaseUserDefinedNetworkController) ensurePodForUserDefinedNetwork(pod *corev1.Pod, addPort bool) error {
+-
+ 	// Try unscheduled pods later
+ 	if !util.PodScheduled(pod) {
+ 		return nil
+@@ -302,7 +301,8 @@ func (bsnc *BaseUserDefinedNetworkController) ensurePodForUserDefinedNetwork(pod
+ }
+ 
+ func (bsnc *BaseUserDefinedNetworkController) addLogicalPortToNetworkForNAD(pod *corev1.Pod, nadName, switchName string,
+-	network *nadapi.NetworkSelectionElement, kubevirtLiveMigrationStatus *kubevirt.LiveMigrationStatus) error {
++	network *nadapi.NetworkSelectionElement, kubevirtLiveMigrationStatus *kubevirt.LiveMigrationStatus,
++) error {
+ 	var libovsdbExecuteTime time.Duration
+ 
+ 	start := time.Now()
+@@ -920,28 +920,6 @@ func getClusterNodesDestinationBasedSNATMatch(ipFamily utilnet.IPFamily, address
+ 	}
+ }
+ 
+-func (bsnc *BaseUserDefinedNetworkController) ensureDHCP(pod *corev1.Pod, podAnnotation *util.PodAnnotation, lsp *nbdb.LogicalSwitchPort) error {
+-	opts := []kubevirt.DHCPConfigsOpt{}
+-
+-	ipv4DNSServer, ipv6DNSServer, err := kubevirt.RetrieveDNSServiceClusterIPs(bsnc.watchFactory)
+-	if err != nil {
+-		return err
+-	}
+-
+-	ipv4Gateway, _ := util.MatchFirstIPFamily(false /*ipv4*/, podAnnotation.Gateways)
+-	if ipv4Gateway != nil {
+-		opts = append(opts, kubevirt.WithIPv4Router(ipv4Gateway.String()))
+-	}
+-
+-	if bsnc.MTU() > 0 {
+-		opts = append(opts, kubevirt.WithIPv4MTU(bsnc.MTU()))
+-	}
+-
+-	opts = append(opts, kubevirt.WithIPv4DNSServer(ipv4DNSServer), kubevirt.WithIPv6DNSServer(ipv6DNSServer))
+-
+-	return kubevirt.EnsureDHCPOptionsForLSP(bsnc.controllerName, bsnc.nbClient, pod, podAnnotation.IPs, lsp, opts...)
+-}
+-
+ func (bsnc *BaseUserDefinedNetworkController) requireDHCP(pod *corev1.Pod) bool {
+ 	// Configure DHCP only for kubevirt VMs layer2 primary udn with subnets
+ 	return kubevirt.IsPodOwnedByVirtualMachine(pod) &&
+@@ -951,7 +929,8 @@ func (bsnc *BaseUserDefinedNetworkController) requireDHCP(pod *corev1.Pod) bool
+ }
+ 
+ func (bsnc *BaseUserDefinedNetworkController) setPodLogicalSwitchPortAddressesAndEnabledField(
+-	pod *corev1.Pod, nadName string, mac string, ips []string, enabled bool, ops []ovsdb.Operation) ([]ovsdb.Operation, *nbdb.LogicalSwitchPort, error) {
++	pod *corev1.Pod, nadName string, mac string, ips []string, enabled bool, ops []ovsdb.Operation,
++) ([]ovsdb.Operation, *nbdb.LogicalSwitchPort, error) {
+ 	lsp := &nbdb.LogicalSwitchPort{Name: bsnc.GetLogicalPortName(pod, nadName)}
+ 	lsp.Enabled = ptr.To(enabled)
+ 	customFields := []libovsdbops.ModelUpdateField{
+@@ -987,7 +966,8 @@ func (bsnc *BaseUserDefinedNetworkController) setPodLogicalSwitchPortAddressesAn
+ 
+ func (bsnc *BaseUserDefinedNetworkController) disableLiveMigrationSourceLSPOps(
+ 	kubevirtLiveMigrationStatus *kubevirt.LiveMigrationStatus,
+-	nadName string, ops []ovsdb.Operation) ([]ovsdb.Operation, error) {
++	nadName string, ops []ovsdb.Operation,
++) ([]ovsdb.Operation, error) {
+ 	// closing the sourcePod lsp to ensure traffic goes to the now ready targetPod.
+ 	ops, _, err := bsnc.setPodLogicalSwitchPortAddressesAndEnabledField(kubevirtLiveMigrationStatus.SourcePod, nadName, "", nil, false, ops)
+ 	return ops, err
+diff --git a/go-controller/pkg/ovn/kubevirt_test.go b/go-controller/pkg/ovn/kubevirt_test.go
+index c311ad657b..5f2ce57b3f 100644
+--- a/go-controller/pkg/ovn/kubevirt_test.go
++++ b/go-controller/pkg/ovn/kubevirt_test.go
+@@ -106,6 +106,8 @@ var _ = Describe("OVN Kubevirt Operations", func() {
+ 		lrpNetworkIPv6        string
+ 		subnetIPv4            string
+ 		subnetIPv6            string
++		gwIPv4                string
++		gwIPv6                string
+ 		transitSwitchPortIPv4 string
+ 		transitSwitchPortIPv6 string
+ 		addressIPv4           string
+@@ -126,6 +128,8 @@ var _ = Describe("OVN Kubevirt Operations", func() {
+ 				nodeID:                "4",
+ 				subnetIPv4:            "10.128.1.0/24",
+ 				subnetIPv6:            "fd11::/64",
++				gwIPv4:                "10.128.1.1",
++				gwIPv6:                "fd11::1",
+ 				lrpNetworkIPv4:        "100.64.0.4/24",
+ 				lrpNetworkIPv6:        "fd98::4/64",
+ 				transitSwitchPortIPv4: "100.65.0.4/24",
+@@ -137,6 +141,8 @@ var _ = Describe("OVN Kubevirt Operations", func() {
+ 				nodeID:                "5",
+ 				subnetIPv4:            "10.128.2.0/24",
+ 				subnetIPv6:            "fd12::/64",
++				gwIPv4:                "10.128.2.1",
++				gwIPv6:                "fd12::1",
+ 				lrpNetworkIPv4:        "100.64.0.5/24",
+ 				lrpNetworkIPv6:        "fd98::5/64",
+ 				transitSwitchPortIPv4: "100.65.0.5/24",
+@@ -148,6 +154,8 @@ var _ = Describe("OVN Kubevirt Operations", func() {
+ 				nodeID:                "6",
+ 				subnetIPv4:            "10.128.3.0/24",
+ 				subnetIPv6:            "fd13::/64",
++				gwIPv4:                "10.128.3.1",
++				gwIPv6:                "fd13::1",
+ 				lrpNetworkIPv4:        "100.64.0.6/24",
+ 				lrpNetworkIPv6:        "fd98::6/64",
+ 				transitSwitchPortIPv4: "100.65.0.6/24",
+@@ -298,7 +306,8 @@ var _ = Describe("OVN Kubevirt Operations", func() {
+ 				pod.Annotations[k] = v
+ 			}
+ 		}
+-		ComposeDHCPv4Options = func(uuid, namespace string, t *testDHCPOptions) *nbdb.DHCPOptions {
++		ComposeDHCPv4Options = func(uuid, namespace string, nodeName string, t *testDHCPOptions) *nbdb.DHCPOptions {
++			GinkgoHelper()
+ 			dhcpOptions := kubevirt.ComposeDHCPv4Options(
+ 				t.cidr,
+ 				DefaultNetworkControllerName,
+@@ -307,8 +316,10 @@ var _ = Describe("OVN Kubevirt Operations", func() {
+ 					Name:      t.hostname,
+ 				},
+ 			)
++
++			dhcpOptions.Options["mtu"] = "1400"
+ 			dhcpOptions.Options["dns_server"] = t.dns
+-			dhcpOptions.Options["router"] = kubevirt.ARPProxyIPv4
++			dhcpOptions.Options["router"] = nodeByName[nodeName].gwIPv4
+ 			dhcpOptions.UUID = uuid
+ 
+ 			return dhcpOptions
+@@ -458,14 +469,14 @@ var _ = Describe("OVN Kubevirt Operations", func() {
+ 				addressIPv4 = vmByName[t.vmName].addressIPv4
+ 				addresses = addressIPv4
+ 				mac = util.IPAddrToHWAddr(net.ParseIP(addressIPv4)).String()
+-				nodeGWIP = kubevirt.ARPProxyIPv4
++				nodeGWIP = nodeByName[t.nodeName].gwIPv4
+ 			} else if config.IPv6Mode && !config.IPv4Mode {
+ 				subnetIPv6 = nodeByName[t.nodeName].subnetIPv6
+ 				subnets = subnetIPv6
+ 				addressIPv6 = vmByName[t.vmName].addressIPv6
+ 				addresses = addressIPv6
+ 				mac = util.IPAddrToHWAddr(net.ParseIP(addressIPv6)).String()
+-				nodeGWIP = kubevirt.ARPProxyIPv6
++				nodeGWIP = nodeByName[t.nodeName].gwIPv6
+ 			} else if config.IPv4Mode && config.IPv6Mode {
+ 				subnetIPv4 = nodeByName[t.nodeName].subnetIPv4
+ 				subnetIPv6 = nodeByName[t.nodeName].subnetIPv6
+@@ -474,7 +485,7 @@ var _ = Describe("OVN Kubevirt Operations", func() {
+ 				addressIPv6 = vmByName[t.vmName].addressIPv6
+ 				addresses = addressIPv4 + " " + addressIPv6
+ 				mac = util.IPAddrToHWAddr(net.ParseIP(addressIPv4)).String()
+-				nodeGWIP = kubevirt.ARPProxyIPv4 + " " + kubevirt.ARPProxyIPv6
++				nodeGWIP = nodeByName[t.nodeName].gwIPv4 + " " + nodeByName[t.nodeName].gwIPv6
+ 			}
+ 			labels := map[string]string{
+ 				kubevirtv1.VirtualMachineNameLabel: t.vmName,
+@@ -489,7 +500,6 @@ var _ = Describe("OVN Kubevirt Operations", func() {
+ 			for k, v := range t.extraAnnotations {
+ 				annotations[k] = v
+ 			}
+-
+ 			t.testPod = newTPod(t.nodeName, subnets, "", nodeGWIP, "virt-launcher-"+t.suffix, addresses, mac, "namespace1")
+ 			t.annotations = annotations
+ 			t.labels = labels
+@@ -642,7 +652,7 @@ var _ = Describe("OVN Kubevirt Operations", func() {
+ 			}
+ 
+ 			for i, d := range t.dhcpv4 {
+-				initialDB.NBData = append(initialDB.NBData, ComposeDHCPv4Options(fmt.Sprintf("dhcpv4%d%s", i, d.hostname), t.namespace, &d))
++				initialDB.NBData = append(initialDB.NBData, ComposeDHCPv4Options(fmt.Sprintf("dhcpv4%d%s", i, d.hostname), t.namespace, t.nodeName, &d))
+ 			}
+ 
+ 			for i, d := range t.dhcpv6 {
+@@ -847,7 +857,7 @@ var _ = Describe("OVN Kubevirt Operations", func() {
+ 					expectedOVN = append(expectedOVN, expectedStaticRoute)
+ 				}
+ 				for _, d := range t.expectedDhcpv4 {
+-					expectedOVN = append(expectedOVN, ComposeDHCPv4Options(dhcpv4OptionsUUID+d.hostname, t.namespace, &d))
++					expectedOVN = append(expectedOVN, ComposeDHCPv4Options(dhcpv4OptionsUUID+d.hostname, t.namespace, t.nodeName, &d))
+ 				}
+ 
+ 				for _, d := range t.expectedDhcpv6 {
+diff --git a/go-controller/pkg/ovn/pods.go b/go-controller/pkg/ovn/pods.go
+index be6001d47a..3e92ffbe5a 100644
+--- a/go-controller/pkg/ovn/pods.go
++++ b/go-controller/pkg/ovn/pods.go
+@@ -381,12 +381,12 @@ func (oc *DefaultNetworkController) addLogicalPort(pod *corev1.Pod) (err error)
+ 	_ = oc.logicalPortCache.add(pod, switchName, types.DefaultNetworkName, lsp.UUID, podAnnotation.MAC, podAnnotation.IPs)
+ 
+ 	if kubevirt.IsPodLiveMigratable(pod) {
+-		if err := kubevirt.EnsureDHCPOptionsForMigratablePod(oc.controllerName, oc.nbClient, oc.watchFactory, pod, podAnnotation.IPs, lsp); err != nil {
+-			return err
++		if err := oc.ensureDHCP(pod, podAnnotation, lsp); err != nil {
++			return fmt.Errorf("failed configuring DHCP for default network at pod %s/%s: %w", pod.Namespace, pod.Name, err)
+ 		}
+ 	}
+ 
+-	//observe the pod creation latency metric for newly created pods only
++	// observe the pod creation latency metric for newly created pods only
+ 	if newlyCreatedPort {
+ 		metrics.RecordPodCreated(pod, oc.GetNetInfo())
+ 	}

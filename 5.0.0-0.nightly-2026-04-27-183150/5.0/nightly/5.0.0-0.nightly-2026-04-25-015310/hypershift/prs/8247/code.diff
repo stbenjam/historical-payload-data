@@ -1,0 +1,1486 @@
+diff --git a/hypershift-operator/controllers/nodepool/conditions.go b/hypershift-operator/controllers/nodepool/conditions.go
+index 68e6046d832..735a21deb9c 100644
+--- a/hypershift-operator/controllers/nodepool/conditions.go
++++ b/hypershift-operator/controllers/nodepool/conditions.go
+@@ -98,11 +98,24 @@ func FindStatusCondition(conditions []hyperv1.NodePoolCondition, conditionType s
+ 	return nil
+ }
+ 
+-// FindStatusCondition finds the conditionType in conditions.
+-func findCAPIStatusCondition(conditions []capiv1.Condition, conditionType capiv1.ConditionType) *capiv1.Condition {
+-	for i := range conditions {
+-		if conditions[i].Type == conditionType {
+-			return &conditions[i]
++// machineConditionResult normalizes a CAPI Machine condition into a common struct.
++type machineConditionResult struct {
++	Status  corev1.ConditionStatus
++	Reason  string
++	Message string
++}
++
++// findMachineStatusCondition looks up a condition on a CAPI Machine from
++// Machine.Status.Conditions ([]capiv1.Condition).
++// Returns nil if the condition is not found.
++func findMachineStatusCondition(machine *capiv1.Machine, conditionType string) *machineConditionResult {
++	for i := range machine.Status.Conditions {
++		if string(machine.Status.Conditions[i].Type) == conditionType {
++			return &machineConditionResult{
++				Status:  machine.Status.Conditions[i].Status,
++				Reason:  machine.Status.Conditions[i].Reason,
++				Message: machine.Status.Conditions[i].Message,
++			}
+ 		}
+ 	}
+ 
+@@ -604,9 +617,9 @@ func (r *NodePoolReconciler) setMachineAndNodeConditions(ctx context.Context, no
+ func (r *NodePoolReconciler) setAllNodesHealthyCondition(nodePool *hyperv1.NodePool, machines []*capiv1.Machine) {
+ 	status := corev1.ConditionTrue
+ 	reason := hyperv1.AsExpectedReason
+-	var message string
++	message := hyperv1.AllIsWellMessage
+ 
+-	if len(machines) < 1 {
++	if numMachines := len(machines); numMachines == 0 {
+ 		status = corev1.ConditionFalse
+ 		reason = hyperv1.NodePoolNotFoundReason
+ 		message = "No Machines are created"
+@@ -614,19 +627,35 @@ func (r *NodePoolReconciler) setAllNodesHealthyCondition(nodePool *hyperv1.NodeP
+ 			reason = hyperv1.AsExpectedReason
+ 			message = "NodePool set to no replicas"
+ 		}
+-	}
++	} else {
++		numNotHealthy := 0
++		messageMap := make(map[string][]string)
+ 
+-	for _, machine := range machines {
+-		condition := findCAPIStatusCondition(machine.Status.Conditions, capiv1.MachineNodeHealthyCondition)
+-		if condition != nil && condition.Status != corev1.ConditionTrue {
+-			status = corev1.ConditionFalse
+-			reason = condition.Reason
+-			message = message + fmt.Sprintf("Machine %s: %s\n", machine.Name, condition.Reason)
++		for _, machine := range machines {
++			condition := findMachineStatusCondition(machine, string(capiv1.MachineNodeHealthyCondition))
++			if condition == nil {
++				// NodeHealthy condition not yet reported; treat as not healthy.
++				status = corev1.ConditionFalse
++				numNotHealthy++
++				mapReason := capiv1.WaitingForNodeRefReason
++				mapMessage := fmt.Sprintf("Machine %s: %s\n", machine.Name, mapReason)
++				messageMap[mapReason] = append(messageMap[mapReason], mapMessage)
++			} else if condition.Status != corev1.ConditionTrue {
++				status = corev1.ConditionFalse
++				numNotHealthy++
++				mapReason := condition.Reason
++				var mapMessage string
++				if condition.Message != "" {
++					mapMessage = fmt.Sprintf("Machine %s: %s: %s\n", machine.Name, condition.Reason, condition.Message)
++				} else {
++					mapMessage = fmt.Sprintf("Machine %s: %s\n", machine.Name, condition.Reason)
++				}
++				messageMap[mapReason] = append(messageMap[mapReason], mapMessage)
++			}
++		}
++		if numNotHealthy > 0 {
++			reason, message = aggregateMachineReasonsAndMessages(messageMap, numMachines, numNotHealthy, aggregatorMachineStateHealthy)
+ 		}
+-	}
+-
+-	if status == corev1.ConditionTrue {
+-		message = hyperv1.AllIsWellMessage
+ 	}
+ 
+ 	allMachinesHealthyCondition := &hyperv1.NodePoolCondition{
+@@ -666,11 +695,18 @@ func (r *NodePoolReconciler) setAllMachinesReadyCondition(nodePool *hyperv1.Node
+ 		messageMap := make(map[string][]string)
+ 
+ 		for _, machine := range machines {
+-			readyCond := findCAPIStatusCondition(machine.Status.Conditions, capiv1.ReadyCondition)
+-			if readyCond != nil && readyCond.Status != corev1.ConditionTrue {
++			readyCond := findMachineStatusCondition(machine, string(capiv1.ReadyCondition))
++			if readyCond == nil {
++				// Ready condition not yet reported; treat as not ready.
++				status = corev1.ConditionFalse
++				numNotReady++
++				mapReason := capiv1.WaitingForInfrastructureFallbackReason
++				mapMessage := fmt.Sprintf("Machine %s: %s\n", machine.Name, mapReason)
++				messageMap[mapReason] = append(messageMap[mapReason], mapMessage)
++			} else if readyCond.Status != corev1.ConditionTrue {
+ 				status = corev1.ConditionFalse
+ 				numNotReady++
+-				infraReadyCond := findCAPIStatusCondition(machine.Status.Conditions, capiv1.InfrastructureReadyCondition)
++				infraReadyCond := findMachineStatusCondition(machine, string(capiv1.InfrastructureReadyCondition))
+ 				// We append the reason as part of the higher Message, since the message is meaningless.
+ 				// This is how a CAPI condition looks like in AWS for an instance deleted out of band failure.
+ 				//	- lastTransitionTime: "2022-11-28T15:14:28Z"
+@@ -685,7 +721,11 @@ func (r *NodePoolReconciler) setAllMachinesReadyCondition(nodePool *hyperv1.Node
+ 					mapMessage = fmt.Sprintf("Machine %s: %s: %s\n", machine.Name, infraReadyCond.Reason, infraReadyCond.Message)
+ 				} else {
+ 					mapReason = readyCond.Reason
+-					mapMessage = fmt.Sprintf("Machine %s: %s\n", machine.Name, readyCond.Reason)
++					if readyCond.Message != "" && !isSetupCounterCondMessage.MatchString(readyCond.Message) {
++						mapMessage = fmt.Sprintf("Machine %s: %s: %s\n", machine.Name, readyCond.Reason, readyCond.Message)
++					} else {
++						mapMessage = fmt.Sprintf("Machine %s: %s\n", machine.Name, readyCond.Reason)
++					}
+ 				}
+ 
+ 				messageMap[mapReason] = append(messageMap[mapReason], mapMessage)
+diff --git a/hypershift-operator/controllers/nodepool/nodepool_controller.go b/hypershift-operator/controllers/nodepool/nodepool_controller.go
+index e07af11a5c5..c272c6162a2 100644
+--- a/hypershift-operator/controllers/nodepool/nodepool_controller.go
++++ b/hypershift-operator/controllers/nodepool/nodepool_controller.go
+@@ -1095,8 +1095,13 @@ func sortedByCreationTimestamp(machines []*capiv1.Machine) []*capiv1.Machine {
+ 
+ const (
+ 	endOfMessage                         = "... too many similar errors\n"
++	endOfGlobalMessage                   = "... message truncated\n"
++	endOfReasons                         = ",ReasonsTruncated"
+ 	maxMessageLength                     = 1000
++	maxGlobalMessageLength               = 3000
++	maxReasonLength                      = 1024 // +kubebuilder:validation:MaxLength on NodePoolCondition.Reason
+ 	aggregatorMachineStateReady          = "ready"
++	aggregatorMachineStateHealthy        = "healthy"
+ 	aggregatorMachineStateLiveMigratable = "live migratable"
+ )
+ 
+@@ -1117,10 +1122,46 @@ func aggregateMachineReasonsAndMessages(messageMap map[string][]string, numMachi
+ 	sort.Strings(reasons)
+ 
+ 	for _, reason := range reasons {
+-		msgBuilder.WriteString(aggregateMachineMessages(messageMap[reason]))
++		// Sort messages within each reason bucket to ensure deterministic output
++		// regardless of Kubernetes list order, avoiding unnecessary status updates.
++		sort.Strings(messageMap[reason])
++		reasonBlock := aggregateMachineMessages(messageMap[reason])
++		if msgBuilder.Len()+len(reasonBlock)+len(endOfGlobalMessage) > maxGlobalMessageLength {
++			msgBuilder.WriteString(endOfGlobalMessage)
++			break
++		}
++		msgBuilder.WriteString(reasonBlock)
+ 	}
+ 
+-	return strings.Join(reasons, ","), msgBuilder.String()
++	return truncateReasons(reasons), msgBuilder.String()
++}
++
++// truncateReasons joins reasons with commas and truncates the result to fit
++// within the NodePoolCondition.Reason MaxLength=1024 validation limit.
++// When truncation occurs, the suffix ",ReasonsTruncated" is appended.
++func truncateReasons(reasons []string) string {
++	joined := strings.Join(reasons, ",")
++	if len(joined) <= maxReasonLength {
++		return joined
++	}
++
++	// Build the truncated reason string by adding reasons one at a time,
++	// reserving space for the endOfReasons suffix.
++	builder := strings.Builder{}
++	for i, reason := range reasons {
++		separator := ""
++		if i > 0 {
++			separator = ","
++		}
++		if builder.Len()+len(separator)+len(reason)+len(endOfReasons) > maxReasonLength {
++			builder.WriteString(endOfReasons)
++			break
++		}
++		builder.WriteString(separator)
++		builder.WriteString(reason)
++	}
++
++	return builder.String()
+ }
+ 
+ func aggregateMachineMessages(msgs []string) string {
+diff --git a/hypershift-operator/controllers/nodepool/nodepool_controller_test.go b/hypershift-operator/controllers/nodepool/nodepool_controller_test.go
+index 6da1240148a..4eeb94091fe 100644
+--- a/hypershift-operator/controllers/nodepool/nodepool_controller_test.go
++++ b/hypershift-operator/controllers/nodepool/nodepool_controller_test.go
+@@ -727,10 +727,127 @@ func TestGetHostedClusterVersion(t *testing.T) {
+ 	}
+ }
+ 
++func TestFindMachineStatusCondition(t *testing.T) {
++	for _, tc := range []struct {
++		name          string
++		machine       *capiv1.Machine
++		conditionType string
++		expected      *machineConditionResult
++	}{
++		{
++			name: "When condition is False it should return the condition values",
++			machine: &capiv1.Machine{
++				Status: capiv1.MachineStatus{
++					Conditions: []capiv1.Condition{
++						{
++							Type:    capiv1.ReadyCondition,
++							Status:  corev1.ConditionFalse,
++							Reason:  "InstanceTerminated",
++							Message: "i-0abc123def456 instance is in terminated state",
++						},
++					},
++				},
++			},
++			conditionType: string(capiv1.ReadyCondition),
++			expected: &machineConditionResult{
++				Status:  corev1.ConditionFalse,
++				Reason:  "InstanceTerminated",
++				Message: "i-0abc123def456 instance is in terminated state",
++			},
++		},
++		{
++			name: "When neither has condition it should return nil",
++			machine: &capiv1.Machine{
++				Status: capiv1.MachineStatus{
++					Conditions: []capiv1.Condition{
++						{
++							Type:   capiv1.InfrastructureReadyCondition,
++							Status: corev1.ConditionTrue,
++						},
++					},
++				},
++			},
++			conditionType: string(capiv1.ReadyCondition),
++			expected:      nil,
++		},
++		{
++			name: "When condition is True it should return the condition values",
++			machine: &capiv1.Machine{
++				Status: capiv1.MachineStatus{
++					Conditions: []capiv1.Condition{
++						{
++							Type:    capiv1.ReadyCondition,
++							Status:  corev1.ConditionTrue,
++							Reason:  "InstanceProvisionStarted",
++							Message: "started provisioning i-0abc123def456",
++						},
++					},
++				},
++			},
++			conditionType: string(capiv1.ReadyCondition),
++			expected: &machineConditionResult{
++				Status:  corev1.ConditionTrue,
++				Reason:  "InstanceProvisionStarted",
++				Message: "started provisioning i-0abc123def456",
++			},
++		},
++		{
++			name: "When machine has no conditions it should return nil",
++			machine: &capiv1.Machine{
++				Status: capiv1.MachineStatus{
++					Conditions: []capiv1.Condition{},
++				},
++			},
++			conditionType: string(capiv1.ReadyCondition),
++			expected:      nil,
++		},
++		{
++			name: "When looking up MachineNodeHealthyCondition it should return matching values",
++			machine: &capiv1.Machine{
++				Status: capiv1.MachineStatus{
++					Conditions: []capiv1.Condition{
++						{
++							Type:   capiv1.ReadyCondition,
++							Status: corev1.ConditionTrue,
++						},
++						{
++							Type:    capiv1.MachineNodeHealthyCondition,
++							Status:  corev1.ConditionFalse,
++							Reason:  capiv1.NodeConditionsFailedReason,
++							Message: "Condition Ready on node is reporting status False",
++						},
++					},
++				},
++			},
++			conditionType: string(capiv1.MachineNodeHealthyCondition),
++			expected: &machineConditionResult{
++				Status:  corev1.ConditionFalse,
++				Reason:  capiv1.NodeConditionsFailedReason,
++				Message: "Condition Ready on node is reporting status False",
++			},
++		},
++	} {
++		t.Run(tc.name, func(tt *testing.T) {
++			g := NewWithT(tt)
++			result := findMachineStatusCondition(tc.machine, tc.conditionType)
++			if tc.expected == nil {
++				g.Expect(result).To(BeNil())
++			} else {
++				g.Expect(result).ToNot(BeNil())
++				g.Expect(result.Status).To(Equal(tc.expected.Status))
++				g.Expect(result.Reason).To(Equal(tc.expected.Reason))
++				g.Expect(result.Message).To(Equal(tc.expected.Message))
++			}
++		})
++	}
++}
++
+ type testCondition struct {
+-	Status   corev1.ConditionStatus
+-	Reason   string
+-	Messages []string
++	Status        corev1.ConditionStatus
++	Reason        string
++	Messages      []string
++	MaxMessageLen int // if > 0, assert that len(cond.Message) <= this value
++	MaxReasonLen  int // if > 0, assert that len(cond.Reason) <= this value
+ }
+ 
+ func (t *testCondition) Compare(g Gomega, cond *hyperv1.NodePoolCondition) {
+@@ -739,11 +856,21 @@ func (t *testCondition) Compare(g Gomega, cond *hyperv1.NodePoolCondition) {
+ 	}
+ 
+ 	g.Expect(cond.Status).To(Equal(t.Status))
+-	g.Expect(cond.Reason).To(Equal(t.Reason))
++	if t.Reason != "" {
++		g.Expect(cond.Reason).To(Equal(t.Reason))
++	}
+ 
+ 	for _, msg := range t.Messages {
+ 		g.ExpectWithOffset(1, cond.Message).To(ContainSubstring(msg))
+ 	}
++
++	if t.MaxMessageLen > 0 {
++		g.ExpectWithOffset(1, len(cond.Message)).To(BeNumerically("<=", t.MaxMessageLen))
++	}
++
++	if t.MaxReasonLen > 0 {
++		g.ExpectWithOffset(1, len(cond.Reason)).To(BeNumerically("<=", t.MaxReasonLen))
++	}
+ }
+ 
+ func TestSetMachineAndNodeConditions(t *testing.T) {
+@@ -790,6 +917,10 @@ func TestSetMachineAndNodeConditions(t *testing.T) {
+ 									Type:   capiv1.ReadyCondition,
+ 									Status: corev1.ConditionTrue,
+ 								},
++								{
++									Type:   capiv1.MachineNodeHealthyCondition,
++									Status: corev1.ConditionTrue,
++								},
+ 							},
+ 						},
+ 					},
+@@ -807,6 +938,10 @@ func TestSetMachineAndNodeConditions(t *testing.T) {
+ 									Type:   capiv1.ReadyCondition,
+ 									Status: corev1.ConditionTrue,
+ 								},
++								{
++									Type:   capiv1.MachineNodeHealthyCondition,
++									Status: corev1.ConditionTrue,
++								},
+ 							},
+ 						},
+ 					},
+@@ -886,8 +1021,8 @@ func TestSetMachineAndNodeConditions(t *testing.T) {
+ 			},
+ 			expectedAllNodes: &testCondition{
+ 				Status:   corev1.ConditionFalse,
+-				Reason:   "TestReasonNode2",
+-				Messages: []string{"TestReasonNode1", "TestReasonNode2"},
++				Reason:   "TestReasonNode1,TestReasonNode2",
++				Messages: []string{"2 of 2 machines are not healthy", "Machine node1: TestReasonNode1: test message node 1", "Machine node2: TestReasonNode2: test message node 2"},
+ 			},
+ 		},
+ 		{
+@@ -989,8 +1124,8 @@ func TestSetMachineAndNodeConditions(t *testing.T) {
+ 			},
+ 			expectedAllNodes: &testCondition{
+ 				Status:   corev1.ConditionFalse,
+-				Reason:   "TestReasonNode2",
+-				Messages: []string{"TestReasonNode1", "TestReasonNode2"},
++				Reason:   "TestReasonNode1,TestReasonNode2",
++				Messages: []string{"2 of 3 machines are not healthy", "Machine node1: TestReasonNode1: test message node 1", "Machine node2: TestReasonNode2: test message node 2"},
+ 			},
+ 		},
+ 		{
+@@ -1092,8 +1227,8 @@ func TestSetMachineAndNodeConditions(t *testing.T) {
+ 			},
+ 			expectedAllNodes: &testCondition{
+ 				Status:   corev1.ConditionFalse,
+-				Reason:   "TestReasonNode2",
+-				Messages: []string{"TestReasonNode1", "TestReasonNode2"},
++				Reason:   "TestReasonNode1,TestReasonNode2",
++				Messages: []string{"2 of 3 machines are not healthy", "Machine node1: TestReasonNode1: test message node 1", "Machine node2: TestReasonNode2: test message node 2"},
+ 			},
+ 		},
+ 		{
+@@ -1232,6 +1367,10 @@ func TestSetMachineAndNodeConditions(t *testing.T) {
+ 									Type:   capiv1.ReadyCondition,
+ 									Status: corev1.ConditionTrue,
+ 								},
++								{
++									Type:   capiv1.MachineNodeHealthyCondition,
++									Status: corev1.ConditionTrue,
++								},
+ 							},
+ 							Addresses: capiv1.MachineAddresses{
+ 								{
+@@ -1255,6 +1394,10 @@ func TestSetMachineAndNodeConditions(t *testing.T) {
+ 									Type:   capiv1.ReadyCondition,
+ 									Status: corev1.ConditionTrue,
+ 								},
++								{
++									Type:   capiv1.MachineNodeHealthyCondition,
++									Status: corev1.ConditionTrue,
++								},
+ 							},
+ 							Addresses: capiv1.MachineAddresses{
+ 								{
+@@ -1285,51 +1428,855 @@ func TestSetMachineAndNodeConditions(t *testing.T) {
+ 				},
+ 			},
+ 		},
+-	} {
+-		t.Run(tc.name, func(tt *testing.T) {
+-			gg := NewWithT(tt)
+-			r := NodePoolReconciler{
+-				Client: fake.NewClientBuilder().WithScheme(s).WithObjects(tc.machinesGenerator()...).Build(),
+-			}
+-
+-			np := &hyperv1.NodePool{
+-				ObjectMeta: metav1.ObjectMeta{Name: "np-name", Namespace: "myns"},
+-				Spec: hyperv1.NodePoolSpec{
+-					ClusterName: "cluster-name",
+-				},
+-			}
+-
+-			hc := &hyperv1.HostedCluster{
+-				ObjectMeta: metav1.ObjectMeta{Name: "cluster-name", Namespace: "myns"},
+-				Spec: hyperv1.HostedClusterSpec{
+-					Networking: hyperv1.ClusterNetworking{
+-						ClusterNetwork: []hyperv1.ClusterNetworkEntry{
+-							{
+-								CIDR: *ipnet.MustParseCIDR("10.10.10.0/14"),
++		{
++			name: "When machines have no NodeHealthy condition it should report WaitingForNodeRef",
++			machinesGenerator: func() []client.Object {
++				return []client.Object{
++					&capiv1.Machine{
++						ObjectMeta: metav1.ObjectMeta{
++							Name:      "node1",
++							Namespace: "myns-cluster-name",
++							Annotations: map[string]string{
++								nodePoolAnnotation: "myns/np-name",
++							},
++						},
++						Status: capiv1.MachineStatus{
++							Conditions: []capiv1.Condition{
++								{
++									Type:   capiv1.ReadyCondition,
++									Status: corev1.ConditionTrue,
++								},
+ 							},
+ 						},
+ 					},
+-				},
+-			}
+-
+-			gg.Expect(r.setMachineAndNodeConditions(t.Context(), np, hc)).To(Succeed())
+-
+-			cond := FindStatusCondition(np.Status.Conditions, hyperv1.NodePoolAllMachinesReadyConditionType)
+-			gg.Expect(cond).ToNot(BeNil())
+-			tc.expectedAllMachine.Compare(gg, cond)
+-
+-			cond = FindStatusCondition(np.Status.Conditions, hyperv1.NodePoolAllNodesHealthyConditionType)
+-			gg.Expect(cond).ToNot(BeNil())
+-			tc.expectedAllNodes.Compare(gg, cond)
+-
+-			cond = FindStatusCondition(np.Status.Conditions, hyperv1.NodePoolClusterNetworkCIDRConflictType)
+-			if tc.expectedCIDRCollision == nil {
+-				gg.Expect(cond).To(BeNil())
+-			} else {
+-				gg.Expect(cond).ToNot(BeNil())
+-				tc.expectedCIDRCollision.Compare(gg, cond)
+-			}
+-
++				}
++			},
++			expectedAllMachine: &testCondition{
++				Status:   corev1.ConditionTrue,
++				Reason:   hyperv1.AsExpectedReason,
++				Messages: []string{hyperv1.AllIsWellMessage},
++			},
++			expectedAllNodes: &testCondition{
++				Status:   corev1.ConditionFalse,
++				Reason:   capiv1.WaitingForNodeRefReason,
++				Messages: []string{"1 of 1 machines are not healthy", "Machine node1: WaitingForNodeRef"},
++			},
++		},
++		{
++			name: "When machines have no Ready condition it should report WaitingForInfrastructure",
++			machinesGenerator: func() []client.Object {
++				return []client.Object{
++					&capiv1.Machine{
++						ObjectMeta: metav1.ObjectMeta{
++							Name:      "node1",
++							Namespace: "myns-cluster-name",
++							Annotations: map[string]string{
++								nodePoolAnnotation: "myns/np-name",
++							},
++						},
++						Status: capiv1.MachineStatus{
++							Conditions: []capiv1.Condition{
++								{
++									Type:   capiv1.MachineNodeHealthyCondition,
++									Status: corev1.ConditionTrue,
++								},
++							},
++						},
++					},
++				}
++			},
++			expectedAllMachine: &testCondition{
++				Status:   corev1.ConditionFalse,
++				Reason:   capiv1.WaitingForInfrastructureFallbackReason,
++				Messages: []string{"1 of 1 machines are not ready", "Machine node1: WaitingForInfrastructure"},
++			},
++			expectedAllNodes: &testCondition{
++				Status:   corev1.ConditionTrue,
++				Reason:   hyperv1.AsExpectedReason,
++				Messages: []string{hyperv1.AllIsWellMessage},
++			},
++		},
++		{
++			name: "When machine has NodeHealthy False with empty message it should report reason only",
++			machinesGenerator: func() []client.Object {
++				return []client.Object{
++					&capiv1.Machine{
++						ObjectMeta: metav1.ObjectMeta{
++							Name:      "node1",
++							Namespace: "myns-cluster-name",
++							Annotations: map[string]string{
++								nodePoolAnnotation: "myns/np-name",
++							},
++						},
++						Status: capiv1.MachineStatus{
++							Conditions: []capiv1.Condition{
++								{
++									Type:   capiv1.ReadyCondition,
++									Status: corev1.ConditionTrue,
++								},
++								{
++									Type:   capiv1.MachineNodeHealthyCondition,
++									Status: corev1.ConditionFalse,
++									Reason: capiv1.NodeProvisioningReason,
++								},
++							},
++						},
++					},
++				}
++			},
++			expectedAllMachine: &testCondition{
++				Status:   corev1.ConditionTrue,
++				Reason:   hyperv1.AsExpectedReason,
++				Messages: []string{hyperv1.AllIsWellMessage},
++			},
++			expectedAllNodes: &testCondition{
++				Status:   corev1.ConditionFalse,
++				Reason:   capiv1.NodeProvisioningReason,
++				Messages: []string{"1 of 1 machines are not healthy", "Machine node1: " + capiv1.NodeProvisioningReason},
++			},
++		},
++		{
++			name: "When machines mix nil and False NodeHealthy it should aggregate both",
++			machinesGenerator: func() []client.Object {
++				return []client.Object{
++					&capiv1.Machine{
++						ObjectMeta: metav1.ObjectMeta{
++							Name:      "node1",
++							Namespace: "myns-cluster-name",
++							Annotations: map[string]string{
++								nodePoolAnnotation: "myns/np-name",
++							},
++						},
++						Status: capiv1.MachineStatus{
++							Conditions: []capiv1.Condition{
++								{
++									Type:   capiv1.ReadyCondition,
++									Status: corev1.ConditionTrue,
++								},
++							},
++						},
++					},
++					&capiv1.Machine{
++						ObjectMeta: metav1.ObjectMeta{
++							Name:      "node2",
++							Namespace: "myns-cluster-name",
++							Annotations: map[string]string{
++								nodePoolAnnotation: "myns/np-name",
++							},
++						},
++						Status: capiv1.MachineStatus{
++							Conditions: []capiv1.Condition{
++								{
++									Type:   capiv1.ReadyCondition,
++									Status: corev1.ConditionTrue,
++								},
++								{
++									Type:    capiv1.MachineNodeHealthyCondition,
++									Status:  corev1.ConditionFalse,
++									Reason:  capiv1.NodeConditionsFailedReason,
++									Message: "Condition Ready on node is reporting status False",
++								},
++							},
++						},
++					},
++					&capiv1.Machine{
++						ObjectMeta: metav1.ObjectMeta{
++							Name:      "node3",
++							Namespace: "myns-cluster-name",
++							Annotations: map[string]string{
++								nodePoolAnnotation: "myns/np-name",
++							},
++						},
++						Status: capiv1.MachineStatus{
++							Conditions: []capiv1.Condition{
++								{
++									Type:   capiv1.ReadyCondition,
++									Status: corev1.ConditionTrue,
++								},
++								{
++									Type:   capiv1.MachineNodeHealthyCondition,
++									Status: corev1.ConditionTrue,
++								},
++							},
++						},
++					},
++				}
++			},
++			expectedAllMachine: &testCondition{
++				Status:   corev1.ConditionTrue,
++				Reason:   hyperv1.AsExpectedReason,
++				Messages: []string{hyperv1.AllIsWellMessage},
++			},
++			expectedAllNodes: &testCondition{
++				Status:   corev1.ConditionFalse,
++				Reason:   capiv1.NodeConditionsFailedReason + "," + capiv1.WaitingForNodeRefReason,
++				Messages: []string{"2 of 3 machines are not healthy", "Machine node1: WaitingForNodeRef", "Machine node2: " + capiv1.NodeConditionsFailedReason + ": Condition Ready on node is reporting status False"},
++			},
++		},
++		{
++			name: "When machine has Ready False with non-counter message and no InfraReady it should include message",
++			machinesGenerator: func() []client.Object {
++				return []client.Object{
++					&capiv1.Machine{
++						ObjectMeta: metav1.ObjectMeta{
++							Name:      "node1",
++							Namespace: "myns-cluster-name",
++							Annotations: map[string]string{
++								nodePoolAnnotation: "myns/np-name",
++							},
++						},
++						Status: capiv1.MachineStatus{
++							Conditions: []capiv1.Condition{
++								{
++									Type:    capiv1.ReadyCondition,
++									Status:  corev1.ConditionFalse,
++									Reason:  "InstanceTerminated",
++									Message: "i-0abc123def456 instance is in terminated state",
++								},
++								{
++									Type:   capiv1.MachineNodeHealthyCondition,
++									Status: corev1.ConditionTrue,
++								},
++							},
++						},
++					},
++				}
++			},
++			expectedAllMachine: &testCondition{
++				Status:   corev1.ConditionFalse,
++				Reason:   "InstanceTerminated",
++				Messages: []string{"1 of 1 machines are not ready", "Machine node1: InstanceTerminated: i-0abc123def456 instance is in terminated state"},
++			},
++			expectedAllNodes: &testCondition{
++				Status:   corev1.ConditionTrue,
++				Reason:   hyperv1.AsExpectedReason,
++				Messages: []string{hyperv1.AllIsWellMessage},
++			},
++		},
++		{
++			name: "When machine has Ready False with setup-counter message and no InfraReady it should omit message",
++			machinesGenerator: func() []client.Object {
++				return []client.Object{
++					&capiv1.Machine{
++						ObjectMeta: metav1.ObjectMeta{
++							Name:      "node1",
++							Namespace: "myns-cluster-name",
++							Annotations: map[string]string{
++								nodePoolAnnotation: "myns/np-name",
++							},
++						},
++						Status: capiv1.MachineStatus{
++							Conditions: []capiv1.Condition{
++								{
++									Type:    capiv1.ReadyCondition,
++									Status:  corev1.ConditionFalse,
++									Reason:  "InstanceProvisionStarted",
++									Message: "3 of 7 completed",
++								},
++								{
++									Type:   capiv1.MachineNodeHealthyCondition,
++									Status: corev1.ConditionTrue,
++								},
++							},
++						},
++					},
++				}
++			},
++			expectedAllMachine: &testCondition{
++				Status:   corev1.ConditionFalse,
++				Reason:   "InstanceProvisionStarted",
++				Messages: []string{"1 of 1 machines are not ready", "Machine node1: InstanceProvisionStarted"},
++			},
++			expectedAllNodes: &testCondition{
++				Status:   corev1.ConditionTrue,
++				Reason:   hyperv1.AsExpectedReason,
++				Messages: []string{hyperv1.AllIsWellMessage},
++			},
++		},
++		{
++			name: "When machines mix nil and False Ready conditions it should aggregate both",
++			machinesGenerator: func() []client.Object {
++				return []client.Object{
++					&capiv1.Machine{
++						ObjectMeta: metav1.ObjectMeta{
++							Name:      "node1",
++							Namespace: "myns-cluster-name",
++							Annotations: map[string]string{
++								nodePoolAnnotation: "myns/np-name",
++							},
++						},
++						Status: capiv1.MachineStatus{
++							Conditions: []capiv1.Condition{
++								{
++									Type:   capiv1.MachineNodeHealthyCondition,
++									Status: corev1.ConditionTrue,
++								},
++							},
++						},
++					},
++					&capiv1.Machine{
++						ObjectMeta: metav1.ObjectMeta{
++							Name:      "node2",
++							Namespace: "myns-cluster-name",
++							Annotations: map[string]string{
++								nodePoolAnnotation: "myns/np-name",
++							},
++						},
++						Status: capiv1.MachineStatus{
++							Conditions: []capiv1.Condition{
++								{
++									Type:    capiv1.ReadyCondition,
++									Status:  corev1.ConditionFalse,
++									Reason:  capiv1.MachineHasFailureReason,
++									Message: "Machine has FailureMessage: i-0abc123def456 is in terminated state",
++								},
++								{
++									Type:   capiv1.MachineNodeHealthyCondition,
++									Status: corev1.ConditionTrue,
++								},
++							},
++						},
++					},
++				}
++			},
++			expectedAllMachine: &testCondition{
++				Status:   corev1.ConditionFalse,
++				Reason:   capiv1.MachineHasFailureReason + "," + capiv1.WaitingForInfrastructureFallbackReason,
++				Messages: []string{"2 of 2 machines are not ready", "Machine node1: WaitingForInfrastructure", "Machine node2: " + capiv1.MachineHasFailureReason + ": Machine has FailureMessage: i-0abc123def456 is in terminated state"},
++			},
++			expectedAllNodes: &testCondition{
++				Status:   corev1.ConditionTrue,
++				Reason:   hyperv1.AsExpectedReason,
++				Messages: []string{hyperv1.AllIsWellMessage},
++			},
++		},
++		{
++			name: "When many machines fail across many reasons it should truncate global message",
++			machinesGenerator: func() []client.Object {
++				longMsg := strings.Repeat("x", 80)
++				// Create 10 distinct reasons with 20 machines each = 200 failing machines.
++				// Each per-reason block can reach ~1000 chars, and 10 blocks would produce
++				// ~10000 chars total, well above maxGlobalMessageLength (3000).
++				numReasons := 10
++				machinesPerReason := 20
++				total := numReasons * machinesPerReason
++				machines := make([]client.Object, total)
++				for r := range numReasons {
++					for m := range machinesPerReason {
++						idx := r*machinesPerReason + m
++						machines[idx] = &capiv1.Machine{
++							ObjectMeta: metav1.ObjectMeta{
++								Name:      fmt.Sprintf("node-%d-%d", r, m),
++								Namespace: "myns-cluster-name",
++								Annotations: map[string]string{
++									nodePoolAnnotation: "myns/np-name",
++								},
++							},
++							Status: capiv1.MachineStatus{
++								Conditions: []capiv1.Condition{
++									{
++										Type:    capiv1.ReadyCondition,
++										Status:  corev1.ConditionFalse,
++										Reason:  fmt.Sprintf("Reason%02d", r),
++										Message: longMsg,
++									},
++									{
++										Type:    capiv1.MachineNodeHealthyCondition,
++										Status:  corev1.ConditionFalse,
++										Reason:  fmt.Sprintf("Reason%02d", r),
++										Message: longMsg,
++									},
++								},
++							},
++						}
++					}
++				}
++				return machines
++			},
++			expectedAllMachine: &testCondition{
++				Status:        corev1.ConditionFalse,
++				Messages:      []string{"200 of 200 machines are not ready", endOfGlobalMessage},
++				MaxMessageLen: maxGlobalMessageLength,
++			},
++			expectedAllNodes: &testCondition{
++				Status:        corev1.ConditionFalse,
++				Messages:      []string{"200 of 200 machines are not healthy", endOfGlobalMessage},
++				MaxMessageLen: maxGlobalMessageLength,
++			},
++		},
++		{
++			name: "When machines fail with many distinct reasons it should truncate the reason field to fit MaxLength=1024",
++			machinesGenerator: func() []client.Object {
++				// Use real CAPI v1beta1 condition reasons plus realistic cloud-provider reasons.
++				// 48 distinct reasons produce a comma-joined string of ~1033 chars, exceeding
++				// the NodePoolCondition.Reason MaxLength=1024 validation limit.
++				failureReasons := []struct {
++					reason  string
++					message string
++				}{
++					{capiv1.WaitingForInfrastructureFallbackReason, ""},
++					{capiv1.MachineHasFailureReason, "Machine has FailureReason: InsufficientCapacity"},
++					{capiv1.DeletingReason, "Waiting for machine volumes to be detached"},
++					{capiv1.DeletionFailedReason, "failed to delete machine"},
++					{capiv1.DrainingReason, "Draining node node-4"},
++					{capiv1.DrainingFailedReason, "failed to drain node: cannot evict pod"},
++					{capiv1.WaitingForVolumeDetachReason, "Waiting for 2 volumes to be detached"},
++					{capiv1.WaitingExternalHookReason, "Waiting for external hook to complete"},
++					{capiv1.PreflightCheckFailedReason, "Machine pre-flight checks failed"},
++					{capiv1.MachineCreationFailedReason, "failed to create machine: quota exceeded"},
++					{capiv1.ScalingUpReason, "Scaling up to 10 replicas"},
++					{capiv1.ScalingDownReason, "Scaling down to 5 replicas"},
++					{capiv1.WaitingForDataSecretFallbackReason, ""},
++					{capiv1.WaitingForControlPlaneFallbackReason, ""},
++					{capiv1.WaitingForControlPlaneAvailableReason, "Control plane is not available"},
++					{capiv1.BootstrapTemplateCloningFailedReason, "failed to clone bootstrap template"},
++					{capiv1.InfrastructureTemplateCloningFailedReason, "failed to clone infrastructure template"},
++					{capiv1.IncorrectExternalRefReason, "external ref is incorrect"},
++					{capiv1.RemediationFailedReason, "remediation failed"},
++					{capiv1.RemediationInProgressReason, "remediation in progress for node-18"},
++					{capiv1.WaitingForRemediationReason, "waiting for remediation to complete"},
++					{capiv1.NodeStartupTimeoutReason, "Node failed to report NodeReady condition within 20m0s"},
++					{capiv1.WaitingForNodeRefReason, ""},
++					{capiv1.NodeProvisioningReason, "Node is provisioning"},
++					{capiv1.NodeNotFoundReason, "node not found in cluster"},
++					{capiv1.NodeConditionsFailedReason, "Condition Ready on node is reporting status False"},
++					{capiv1.NodeInspectionFailedReason, "failed to inspect node"},
++					{capiv1.UnhealthyNodeConditionReason, "Node condition ReadonlyFilesystem is True"},
++					{capiv1.HasRemediateMachineAnnotationReason, "machine has remediate annotation"},
++					{capiv1.TooManyUnhealthyReason, "too many unhealthy machines: 10 of 20"},
++					{capiv1.ExternalRemediationTemplateNotFoundReason, "external remediation template not found"},
++					{capiv1.ExternalRemediationRequestCreationFailedReason, "failed to create external remediation request"},
++					{capiv1.WaitingForControlPlaneProviderInitializedReason, "control plane provider is not initialized"},
++					{capiv1.MissingNodeRefReason, "machine does not have a node ref"},
++					// Realistic cloud-provider reasons (CAPA/CAPZ) — already used in existing tests.
++					{"InstanceTerminated", "i-0abc123def456 instance is in terminated state"},
++					{"InstanceProvisionFailed", "failed to create instance: InsufficientInstanceCapacity"},
++					{"InstanceProvisionStarted", "3 of 7 completed"},
++					{"InsufficientCapacity", "not enough capacity in az us-east-1a"},
++					{"SubnetExhausted", "no available IPs in subnet-0abc123"},
++					{"SecurityGroupNotFound", "security group sg-0abc123 not found"},
++					{"AMINotFound", "AMI ami-0abc123 not found"},
++					{"VPCNotAvailable", "VPC vpc-0abc123 is not available"},
++					{"LaunchTemplateFailed", "failed to create launch template"},
++					{"SpotInstanceTerminated", "spot instance i-0abc123 was terminated"},
++					{"NetworkInterfaceLimitExceeded", "ENI limit reached for instance type m5.xlarge"},
++					{"EBSVolumeLimitExceeded", "EBS volume limit exceeded in us-east-1a"},
++					{"InsufficientInstanceCapacity", "not enough m5.xlarge capacity in us-east-1b"},
++					{"UnsupportedInstanceType", "instance type m5.metal not supported in us-east-1c"},
++				}
++
++				machines := make([]client.Object, len(failureReasons))
++				for i, fr := range failureReasons {
++					machines[i] = &capiv1.Machine{
++						ObjectMeta: metav1.ObjectMeta{
++							Name:      fmt.Sprintf("machine-%d", i),
++							Namespace: "myns-cluster-name",
++							Annotations: map[string]string{
++								nodePoolAnnotation: "myns/np-name",
++							},
++						},
++						Status: capiv1.MachineStatus{
++							Conditions: []capiv1.Condition{
++								{
++									Type:    capiv1.ReadyCondition,
++									Status:  corev1.ConditionFalse,
++									Reason:  fr.reason,
++									Message: fr.message,
++								},
++								{
++									Type:    capiv1.MachineNodeHealthyCondition,
++									Status:  corev1.ConditionFalse,
++									Reason:  fr.reason,
++									Message: fr.message,
++								},
++							},
++						},
++					}
++				}
++				return machines
++			},
++			expectedAllMachine: &testCondition{
++				Status:       corev1.ConditionFalse,
++				MaxReasonLen: maxReasonLength,
++				Messages:     []string{fmt.Sprintf("%d of %d machines are not ready", 48, 48)},
++			},
++			expectedAllNodes: &testCondition{
++				Status:       corev1.ConditionFalse,
++				MaxReasonLen: maxReasonLength,
++				Messages:     []string{fmt.Sprintf("%d of %d machines are not healthy", 48, 48)},
++			},
++		},
++		{
++			name: "When 10 of 20 machines are not ready with different reasons it should aggregate correctly",
++			machinesGenerator: func() []client.Object {
++				machines := make([]client.Object, 20)
++				// Use real CAPI v1beta1 and AWS CAPA reasons with realistic messages.
++				failureReasons := []struct {
++					reason  string
++					message string
++				}{
++					{capiv1.NodeStartupTimeoutReason, "Node failed to report NodeReady condition within 20m0s"},
++					{capiv1.NodeStartupTimeoutReason, "Node failed to report NodeReady condition within 20m0s"},
++					{capiv1.MachineHasFailureReason, "Machine has FailureReason: InsufficientCapacity"},
++					{capiv1.MachineHasFailureReason, "Machine has FailureMessage: i-0abc123def456 is in terminated state"},
++					{"InstanceTerminated", "i-0abc123def456 instance is in terminated state"},
++					{"InstanceTerminated", "i-0def456abc789 instance is in terminated state"},
++					{"InstanceProvisionFailed", "failed to create instance: InsufficientInstanceCapacity: We currently do not have sufficient capacity in the Availability Zone you requested"},
++					{"InstanceProvisionFailed", "failed to create instance: Unsupported: The requested configuration is currently not supported"},
++					{capiv1.WaitingForInfrastructureFallbackReason, ""},
++					{capiv1.WaitingForInfrastructureFallbackReason, ""},
++				}
++				for i := range 10 {
++					machines[i] = &capiv1.Machine{
++						ObjectMeta: metav1.ObjectMeta{
++							Name:      fmt.Sprintf("failing-node-%d", i),
++							Namespace: "myns-cluster-name",
++							Annotations: map[string]string{
++								nodePoolAnnotation: "myns/np-name",
++							},
++						},
++						Status: capiv1.MachineStatus{
++							Conditions: []capiv1.Condition{
++								{
++									Type:    capiv1.ReadyCondition,
++									Status:  corev1.ConditionFalse,
++									Reason:  failureReasons[i].reason,
++									Message: failureReasons[i].message,
++								},
++								{
++									Type:   capiv1.MachineNodeHealthyCondition,
++									Status: corev1.ConditionTrue,
++								},
++							},
++						},
++					}
++				}
++				for i := range 10 {
++					machines[10+i] = &capiv1.Machine{
++						ObjectMeta: metav1.ObjectMeta{
++							Name:      fmt.Sprintf("healthy-node-%d", i),
++							Namespace: "myns-cluster-name",
++							Annotations: map[string]string{
++								nodePoolAnnotation: "myns/np-name",
++							},
++						},
++						Status: capiv1.MachineStatus{
++							Conditions: []capiv1.Condition{
++								{
++									Type:   capiv1.ReadyCondition,
++									Status: corev1.ConditionTrue,
++								},
++								{
++									Type:   capiv1.MachineNodeHealthyCondition,
++									Status: corev1.ConditionTrue,
++								},
++							},
++						},
++					}
++				}
++				return machines
++			},
++			expectedAllMachine: &testCondition{
++				Status: corev1.ConditionFalse,
++				Reason: "InstanceProvisionFailed,InstanceTerminated,MachineHasFailure,NodeStartupTimeout,WaitingForInfrastructure",
++				Messages: []string{
++					"10 of 20 machines are not ready",
++					"Machine failing-node-0: NodeStartupTimeout: Node failed to report NodeReady condition within 20m0s",
++					"Machine failing-node-2: MachineHasFailure: Machine has FailureReason: InsufficientCapacity",
++					"Machine failing-node-4: InstanceTerminated: i-0abc123def456 instance is in terminated state",
++					"Machine failing-node-6: InstanceProvisionFailed: failed to create instance: InsufficientInstanceCapacity",
++					"Machine failing-node-8: WaitingForInfrastructure",
++				},
++			},
++			expectedAllNodes: &testCondition{
++				Status:   corev1.ConditionTrue,
++				Reason:   hyperv1.AsExpectedReason,
++				Messages: []string{hyperv1.AllIsWellMessage},
++			},
++		},
++	} {
++		t.Run(tc.name, func(tt *testing.T) {
++			gg := NewWithT(tt)
++			r := NodePoolReconciler{
++				Client: fake.NewClientBuilder().WithScheme(s).WithObjects(tc.machinesGenerator()...).Build(),
++			}
++
++			np := &hyperv1.NodePool{
++				ObjectMeta: metav1.ObjectMeta{Name: "np-name", Namespace: "myns"},
++				Spec: hyperv1.NodePoolSpec{
++					ClusterName: "cluster-name",
++				},
++			}
++
++			hc := &hyperv1.HostedCluster{
++				ObjectMeta: metav1.ObjectMeta{Name: "cluster-name", Namespace: "myns"},
++				Spec: hyperv1.HostedClusterSpec{
++					Networking: hyperv1.ClusterNetworking{
++						ClusterNetwork: []hyperv1.ClusterNetworkEntry{
++							{
++								CIDR: *ipnet.MustParseCIDR("10.10.10.0/14"),
++							},
++						},
++					},
++				},
++			}
++
++			gg.Expect(r.setMachineAndNodeConditions(t.Context(), np, hc)).To(Succeed())
++
++			cond := FindStatusCondition(np.Status.Conditions, hyperv1.NodePoolAllMachinesReadyConditionType)
++			gg.Expect(cond).ToNot(BeNil())
++			tc.expectedAllMachine.Compare(gg, cond)
++
++			cond = FindStatusCondition(np.Status.Conditions, hyperv1.NodePoolAllNodesHealthyConditionType)
++			gg.Expect(cond).ToNot(BeNil())
++			tc.expectedAllNodes.Compare(gg, cond)
++
++			cond = FindStatusCondition(np.Status.Conditions, hyperv1.NodePoolClusterNetworkCIDRConflictType)
++			if tc.expectedCIDRCollision == nil {
++				gg.Expect(cond).To(BeNil())
++			} else {
++				gg.Expect(cond).ToNot(BeNil())
++				tc.expectedCIDRCollision.Compare(gg, cond)
++			}
++
++		})
++	}
++}
++
++func TestTruncateReasons(t *testing.T) {
++	g := NewWithT(t)
++
++	for _, tc := range []struct {
++		name           string
++		reasons        []string
++		expectSuffix   string
++		expectMaxLen   int
++		expectExactLen int // if > 0, expect exact length
++	}{
++		{
++			name:         "When reasons fit within limit it should return them unchanged",
++			reasons:      []string{capiv1.MachineHasFailureReason, capiv1.NodeConditionsFailedReason, capiv1.WaitingForNodeRefReason},
++			expectSuffix: capiv1.WaitingForNodeRefReason,
++			expectMaxLen: maxReasonLength,
++		},
++		{
++			name:         "When a single reason fits within limit it should return it unchanged",
++			reasons:      []string{capiv1.ExternalRemediationRequestCreationFailedReason},
++			expectSuffix: capiv1.ExternalRemediationRequestCreationFailedReason,
++			expectMaxLen: maxReasonLength,
++		},
++		{
++			name:           "When empty reasons it should return empty string",
++			reasons:        []string{},
++			expectExactLen: 0,
++		},
++		{
++			name: "When many CAPI reasons exceed limit it should truncate with ReasonsTruncated suffix",
++			reasons: []string{
++				capiv1.WaitingForInfrastructureFallbackReason,
++				capiv1.MachineHasFailureReason,
++				capiv1.DeletingReason,
++				capiv1.DeletionFailedReason,
++				capiv1.DrainingReason,
++				capiv1.DrainingFailedReason,
++				capiv1.WaitingForVolumeDetachReason,
++				capiv1.WaitingExternalHookReason,
++				capiv1.PreflightCheckFailedReason,
++				capiv1.MachineCreationFailedReason,
++				capiv1.ScalingUpReason,
++				capiv1.ScalingDownReason,
++				capiv1.WaitingForDataSecretFallbackReason,
++				capiv1.WaitingForControlPlaneFallbackReason,
++				capiv1.WaitingForControlPlaneAvailableReason,
++				capiv1.BootstrapTemplateCloningFailedReason,
++				capiv1.InfrastructureTemplateCloningFailedReason,
++				capiv1.IncorrectExternalRefReason,
++				capiv1.RemediationFailedReason,
++				capiv1.RemediationInProgressReason,
++				capiv1.WaitingForRemediationReason,
++				capiv1.NodeStartupTimeoutReason,
++				capiv1.WaitingForNodeRefReason,
++				capiv1.NodeProvisioningReason,
++				capiv1.NodeNotFoundReason,
++				capiv1.NodeConditionsFailedReason,
++				capiv1.NodeInspectionFailedReason,
++				capiv1.UnhealthyNodeConditionReason,
++				capiv1.HasRemediateMachineAnnotationReason,
++				capiv1.TooManyUnhealthyReason,
++				capiv1.ExternalRemediationTemplateNotFoundReason,
++				capiv1.ExternalRemediationRequestCreationFailedReason,
++				capiv1.WaitingForControlPlaneProviderInitializedReason,
++				capiv1.MissingNodeRefReason,
++				// Realistic cloud-provider reasons (CAPA/CAPZ).
++				"InstanceTerminated",
++				"InstanceProvisionFailed",
++				"InstanceProvisionStarted",
++				"InsufficientCapacity",
++				"SubnetExhausted",
++				"SecurityGroupNotFound",
++				"AMINotFound",
++				"VPCNotAvailable",
++				"LaunchTemplateFailed",
++				"SpotInstanceTerminated",
++				"NetworkInterfaceLimitExceeded",
++				"EBSVolumeLimitExceeded",
++				"InsufficientInstanceCapacity",
++				"UnsupportedInstanceType",
++			},
++			expectSuffix: endOfReasons,
++			expectMaxLen: maxReasonLength,
++		},
++	} {
++		t.Run(tc.name, func(t *testing.T) {
++			result := truncateReasons(tc.reasons)
++
++			if tc.expectMaxLen > 0 {
++				g.Expect(len(result)).To(BeNumerically("<=", tc.expectMaxLen),
++					"reason length %d exceeds max %d: %s", len(result), tc.expectMaxLen, result)
++			}
++			if tc.expectExactLen > 0 {
++				g.Expect(len(result)).To(Equal(tc.expectExactLen))
++			}
++			if tc.expectSuffix != "" {
++				g.Expect(result).To(HaveSuffix(tc.expectSuffix))
++			}
++		})
++	}
++}
++
++func TestAggregateMachineReasonsAndMessages(t *testing.T) {
++	g := NewWithT(t)
++
++	for _, tc := range []struct {
++		name              string
++		messageMap        map[string][]string
++		numMachines       int
++		numNotReady       int
++		state             string
++		expectReason      string
++		expectMessages    []string
++		expectNotContains []string
++		expectMaxMsgLen   int
++	}{
++		{
++			name: "When a single machine fails it should return its reason and message",
++			messageMap: map[string][]string{
++				capiv1.NodeConditionsFailedReason: {
++					"Machine machine-0: NodeConditionsFailed: Condition Ready on node is reporting status False\n",
++				},
++			},
++			numMachines:    3,
++			numNotReady:    1,
++			state:          aggregatorMachineStateHealthy,
++			expectReason:   capiv1.NodeConditionsFailedReason,
++			expectMessages: []string{"1 of 3 machines are not healthy", "Machine machine-0: NodeConditionsFailed: Condition Ready on node is reporting status False"},
++		},
++		{
++			name: "When machines fail with two reasons it should join reasons with comma",
++			messageMap: map[string][]string{
++				capiv1.MachineHasFailureReason: {
++					"Machine machine-0: MachineHasFailure: Machine has FailureReason: InsufficientCapacity\n",
++				},
++				capiv1.WaitingForInfrastructureFallbackReason: {
++					"Machine machine-1: WaitingForInfrastructure\n",
++				},
++			},
++			numMachines:    5,
++			numNotReady:    2,
++			state:          aggregatorMachineStateReady,
++			expectReason:   capiv1.MachineHasFailureReason + "," + capiv1.WaitingForInfrastructureFallbackReason,
++			expectMessages: []string{"2 of 5 machines are not ready", "Machine machine-0: MachineHasFailure", "Machine machine-1: WaitingForInfrastructure"},
++		},
++		{
++			name: "When many machines share one reason it should truncate per-reason messages",
++			messageMap: func() map[string][]string {
++				msgs := make([]string, 30)
++				for i := range 30 {
++					msgs[i] = fmt.Sprintf("Machine machine-%d: MachineHasFailure: Machine has FailureMessage: i-%012d is in terminated state\n", i, i)
++				}
++				return map[string][]string{
++					capiv1.MachineHasFailureReason: msgs,
++				}
++			}(),
++			numMachines:    30,
++			numNotReady:    30,
++			state:          aggregatorMachineStateReady,
++			expectReason:   capiv1.MachineHasFailureReason,
++			expectMessages: []string{"30 of 30 machines are not ready", "Machine machine-0: MachineHasFailure", endOfMessage},
++		},
++		{
++			name: "When many reasons produce large message blocks it should truncate global message",
++			messageMap: func() map[string][]string {
++				m := make(map[string][]string)
++				// 10 distinct reasons, each with 20 machines producing ~1000 char blocks.
++				reasons := []string{
++					capiv1.MachineHasFailureReason,
++					capiv1.NodeConditionsFailedReason,
++					capiv1.WaitingForInfrastructureFallbackReason,
++					capiv1.DeletingReason,
++					capiv1.DrainingReason,
++					capiv1.NodeStartupTimeoutReason,
++					capiv1.WaitingForNodeRefReason,
++					capiv1.RemediationInProgressReason,
++					capiv1.PreflightCheckFailedReason,
++					capiv1.MachineCreationFailedReason,
++				}
++				longMsg := strings.Repeat("x", 80)
++				machineIdx := 0
++				for _, reason := range reasons {
++					msgs := make([]string, 20)
++					for j := range 20 {
++						msgs[j] = fmt.Sprintf("Machine machine-%d: %s: %s\n", machineIdx, reason, longMsg)
++						machineIdx++
++					}
++					m[reason] = msgs
++				}
++				return m
++			}(),
++			numMachines:     200,
++			numNotReady:     200,
++			state:           aggregatorMachineStateReady,
++			expectMessages:  []string{"200 of 200 machines are not ready", endOfGlobalMessage},
++			expectMaxMsgLen: maxGlobalMessageLength,
++		},
++		{
++			name: "When messages within a reason are unsorted it should sort them deterministically",
++			messageMap: map[string][]string{
++				capiv1.NodeConditionsFailedReason: {
++					"Machine machine-2: NodeConditionsFailed: Condition MemoryPressure is True\n",
++					"Machine machine-0: NodeConditionsFailed: Condition Ready is False\n",
++					"Machine machine-1: NodeConditionsFailed: Condition DiskPressure is True\n",
++				},
++			},
++			numMachines:  5,
++			numNotReady:  3,
++			state:        aggregatorMachineStateHealthy,
++			expectReason: capiv1.NodeConditionsFailedReason,
++			// After sorting, machine-0 should come first, then machine-1, then machine-2.
++			expectMessages: []string{
++				"3 of 5 machines are not healthy",
++				"Machine machine-0: NodeConditionsFailed: Condition Ready is False",
++				"Machine machine-1: NodeConditionsFailed: Condition DiskPressure is True",
++				"Machine machine-2: NodeConditionsFailed: Condition MemoryPressure is True",
++			},
++		},
++	} {
++		t.Run(tc.name, func(t *testing.T) {
++			reason, message := aggregateMachineReasonsAndMessages(tc.messageMap, tc.numMachines, tc.numNotReady, tc.state)
++
++			if tc.expectReason != "" {
++				g.Expect(reason).To(Equal(tc.expectReason))
++			}
++			for _, msg := range tc.expectMessages {
++				g.Expect(message).To(ContainSubstring(msg))
++			}
++			for _, msg := range tc.expectNotContains {
++				g.Expect(message).ToNot(ContainSubstring(msg))
++			}
++			if tc.expectMaxMsgLen > 0 {
++				g.Expect(len(message)).To(BeNumerically("<=", tc.expectMaxMsgLen),
++					"message length %d exceeds max %d", len(message), tc.expectMaxMsgLen)
++			}
+ 		})
+ 	}
+ }
+diff --git a/hypershift-operator/controllers/nodepool/version.go b/hypershift-operator/controllers/nodepool/version.go
+index a1380868816..692cf99ee71 100644
+--- a/hypershift-operator/controllers/nodepool/version.go
++++ b/hypershift-operator/controllers/nodepool/version.go
+@@ -52,7 +52,7 @@ func (r *NodePoolReconciler) nodeVersionsFromMachines(_ context.Context, machine
+ 		}
+ 
+ 		// Determine node health from CAPI NodeHealthy condition.
+-		condition := findCAPIStatusCondition(machine.Status.Conditions, capiv1.MachineNodeHealthyCondition)
++		condition := findMachineStatusCondition(machine, string(capiv1.MachineNodeHealthyCondition))
+ 		if condition != nil && condition.Status == corev1.ConditionTrue {
+ 			versionCounts[key].ready++
+ 		} else {
+diff --git a/test/e2e/nodepool_test.go b/test/e2e/nodepool_test.go
+index 5e2ec6b32e4..5cbc7ba98a6 100644
+--- a/test/e2e/nodepool_test.go
++++ b/test/e2e/nodepool_test.go
+@@ -5,6 +5,7 @@ package e2e
+ import (
+ 	"context"
+ 	"fmt"
++	"strings"
+ 	"testing"
+ 	"time"
+ 
+@@ -359,6 +360,13 @@ func executeNodePoolTest(t *testing.T, ctx context.Context, mgmtClient crclient.
+ 		return
+ 	}
+ 
++	// Validate that CAPI v1 condition messages are bubbled up during machine provisioning.
++	// This checks that the AllMachinesReady condition is populated with CAPI-derived
++	// machine-level details before machines are fully ready.
++	if nodePool.Spec.Replicas != nil && *nodePool.Spec.Replicas > 0 {
++		validateCAPIConditionBubblingDuringProvisioning(t, ctx, mgmtClient, nodePool)
++	}
++
+ 	// For supported versions, run full validation including node readiness
+ 	nodes := e2eutil.WaitForReadyNodesByNodePool(t, ctx, hcClient, nodePool, hostedCluster.Spec.Platform.Type)
+ 	// We want to make sure all conditions are met and in a deterministic known state before running the tests to avoid false positives.
+@@ -395,10 +403,24 @@ func validateNodePoolConditions(t *testing.T, ctx context.Context, client crclie
+ 
+ 	var predicates []e2eutil.Predicate[*hyperv1.NodePool]
+ 	for conditionType, conditionStatus := range expectedConditions {
+-		predicates = append(predicates, e2eutil.ConditionPredicate[*hyperv1.NodePool](e2eutil.Condition{
++		condition := e2eutil.Condition{
+ 			Type:   conditionType,
+ 			Status: metav1.ConditionStatus(conditionStatus),
+-		}))
++		}
++
++		// For CAPI-derived conditions in steady state, also validate Reason and Message
++		// to ensure CAPI v1 condition messages are properly aggregated and bubbled up.
++		// When all machines are ready and healthy, the aggregation pipeline should produce
++		// Reason=AsExpected and Message="All is well".
++		if expectedSupportedVersionSkew {
++			switch conditionType {
++			case hyperv1.NodePoolAllMachinesReadyConditionType, hyperv1.NodePoolAllNodesHealthyConditionType:
++				condition.Reason = hyperv1.AsExpectedReason
++				condition.Message = hyperv1.AllIsWellMessage
++			}
++		}
++
++		predicates = append(predicates, e2eutil.ConditionPredicate[*hyperv1.NodePool](condition))
+ 	}
+ 
+ 	e2eutil.EventuallyObject(t, ctx, fmt.Sprintf("NodePool %s/%s to have correct status", nodePool.Namespace, nodePool.Name),
+@@ -409,3 +431,91 @@ func validateNodePoolConditions(t *testing.T, ctx context.Context, client crclie
+ 		predicates, e2eutil.WithoutConditionDump(), e2eutil.WithTimeout(20*time.Minute),
+ 	)
+ }
++
++// validateCAPIConditionBubblingDuringProvisioning validates that during machine provisioning,
++// CAPI v1 Machine conditions are properly bubbled up to the NodePool.
++//
++// This specifically tests the nil-condition handling: when CAPI Machines exist but have not
++// yet reported their Ready or NodeHealthy conditions (nil), the NodePool conditions must
++// show False with machine-level details — not incorrectly True.
++//
++// AllNodesHealthy is the primary signal because the CAPI NodeHealthy condition stays nil
++// until the node actually joins the cluster and kubelet reports health. This takes minutes
++// on any cloud platform, creating a large reliable window where:
++//   - Correct code: AllNodesHealthy=False with "machines are not healthy"
++//   - Broken code:  AllNodesHealthy=True (nil conditions silently ignored)
++//
++// AllMachinesReady is checked as well but the nil window is shorter (CAPI provider sets
++// Ready=False quickly after instance launch), so it uses a softer assertion.
++func validateCAPIConditionBubblingDuringProvisioning(t *testing.T, ctx context.Context, client crclient.Client, nodePool *hyperv1.NodePool) {
++	t.Helper()
++	t.Log("Validating CAPI v1 condition message bubbling during machine provisioning")
++
++	// AllNodesHealthy: hard assertion.
++	// NodeHealthy stays nil until the node joins the cluster (minutes). During this entire
++	// window, AllNodesHealthy MUST be False with the aggregated message format.
++	// If it shows True, nil conditions are being silently ignored.
++	nodesUnhealthyObserved := pollForConditionFalseWithAggregatedMessage(t, ctx, client, nodePool,
++		hyperv1.NodePoolAllNodesHealthyConditionType, "healthy")
++	if !nodesUnhealthyObserved {
++		t.Errorf("AllNodesHealthy was never observed as False with aggregated 'machines are not healthy' message "+
++			"during provisioning. This indicates CAPI Machine nil NodeHealthy conditions are being silently "+
++			"ignored instead of treated as unhealthy. NodePool: %s/%s", nodePool.Namespace, nodePool.Name)
++	}
++
++	// AllMachinesReady: soft assertion (log-only).
++	// The nil window for Ready condition is brief because the CAPI provider sets Ready=False
++	// quickly after instance launch. We may miss it.
++	machinesUnreadyObserved := pollForConditionFalseWithAggregatedMessage(t, ctx, client, nodePool,
++		hyperv1.NodePoolAllMachinesReadyConditionType, "ready")
++	if !machinesUnreadyObserved {
++		t.Logf("AllMachinesReady was not observed as False with aggregated message during provisioning "+
++			"(CAPI provider may have set Ready condition before we could observe nil state)")
++	}
++}
++
++// pollForConditionFalseWithAggregatedMessage polls the NodePool until it observes the given
++// condition as False with a message containing "machines are not <state>" (the format produced
++// by aggregateMachineReasonsAndMessages). Polling stops when either:
++//   - The condition is False with the expected message format → returns true
++//   - The condition transitions to True (machines became ready) → returns false
++//   - The timeout (5 min) is reached → returns false
++func pollForConditionFalseWithAggregatedMessage(t *testing.T, ctx context.Context, client crclient.Client, nodePool *hyperv1.NodePool, conditionType, state string) bool {
++	t.Helper()
++
++	observed := false
++	expectedSubstring := "machines are not " + state
++
++	_ = wait.PollUntilContextTimeout(ctx, 3*time.Second, 5*time.Minute, true, func(ctx context.Context) (bool, error) {
++		np := &hyperv1.NodePool{}
++		if err := client.Get(ctx, crclient.ObjectKeyFromObject(nodePool), np); err != nil {
++			return false, nil
++		}
++
++		for _, cond := range np.Status.Conditions {
++			if cond.Type != conditionType {
++				continue
++			}
++
++			if cond.Status == corev1.ConditionFalse && strings.Contains(cond.Message, expectedSubstring) {
++				t.Logf("CAPI bubbling confirmed for %s: Status=False, Reason=%s", conditionType, cond.Reason)
++				observed = true
++				return true, nil // success — stop polling
++			}
++
++			if cond.Status == corev1.ConditionTrue {
++				// Condition is True — machines became ready before we saw the aggregated False state
++				return true, nil // stop polling
++			}
++
++			// False but without the expected message (e.g. "No Machines are created" before
++			// CAPI machines exist) — keep polling until machines are created
++			return false, nil
++		}
++
++		// Condition not yet set on NodePool — keep polling
++		return false, nil
++	})
++
++	return observed
++}

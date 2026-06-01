@@ -1,0 +1,1246 @@
+diff --git a/control-plane-operator/controllers/hostedcontrolplane/hostedcontrolplane_controller.go b/control-plane-operator/controllers/hostedcontrolplane/hostedcontrolplane_controller.go
+index 6190b7e2200..10fd75f877c 100644
+--- a/control-plane-operator/controllers/hostedcontrolplane/hostedcontrolplane_controller.go
++++ b/control-plane-operator/controllers/hostedcontrolplane/hostedcontrolplane_controller.go
+@@ -1722,6 +1722,13 @@ func (r *HostedControlPlaneReconciler) reconcilePKI(ctx context.Context, hcp *hy
+ 			}
+ 		}
+ 	case hyperv1.AzurePlatform:
++		azureWorkloadIdentityWebhookServingCert := manifests.AzureWorkloadIdentityWebhookServingCert(hcp.Namespace)
++		if _, err := createOrUpdate(ctx, r, azureWorkloadIdentityWebhookServingCert, func() error {
++			return pki.ReconcileAzureWorkloadIdentityWebhookServingCert(azureWorkloadIdentityWebhookServingCert, rootCASecret, p.OwnerRef)
++		}); err != nil {
++			return fmt.Errorf("failed to reconcile %s secret: %w", azureWorkloadIdentityWebhookServingCert.Name, err)
++		}
++
+ 		azureDiskCsiDriverControllerMetricsService := manifests.AzureDiskCsiDriverControllerMetricsService(hcp.Namespace)
+ 		if err = r.Get(ctx, client.ObjectKeyFromObject(azureDiskCsiDriverControllerMetricsService), azureDiskCsiDriverControllerMetricsService); err != nil {
+ 			if !apierrors.IsNotFound(err) {
+diff --git a/control-plane-operator/controllers/hostedcontrolplane/manifests/azure.go b/control-plane-operator/controllers/hostedcontrolplane/manifests/azure.go
+index e2cef7d8058..5bfd45e4e81 100644
+--- a/control-plane-operator/controllers/hostedcontrolplane/manifests/azure.go
++++ b/control-plane-operator/controllers/hostedcontrolplane/manifests/azure.go
+@@ -51,3 +51,12 @@ func AzureFileConfigWithCredentials(ns string) *corev1.Secret {
+ 		},
+ 	}
+ }
++
++func AzureWorkloadIdentityWebhookKubeconfig(ns string) *corev1.Secret {
++	return &corev1.Secret{
++		ObjectMeta: metav1.ObjectMeta{
++			Name:      "azure-workload-identity-webhook-kubeconfig",
++			Namespace: ns,
++		},
++	}
++}
+diff --git a/control-plane-operator/controllers/hostedcontrolplane/manifests/pki.go b/control-plane-operator/controllers/hostedcontrolplane/manifests/pki.go
+index 7a876ec3ab0..e026189fe26 100644
+--- a/control-plane-operator/controllers/hostedcontrolplane/manifests/pki.go
++++ b/control-plane-operator/controllers/hostedcontrolplane/manifests/pki.go
+@@ -352,6 +352,10 @@ func AWSPodIdentityWebhookServingCert(ns string) *corev1.Secret {
+ 	return secretFor(ns, "aws-pod-identity-webhook-serving-cert")
+ }
+ 
++func AzureWorkloadIdentityWebhookServingCert(ns string) *corev1.Secret {
++	return secretFor(ns, "azure-workload-identity-webhook-serving-cert")
++}
++
+ func AzureDiskCsiDriverControllerMetricsServingCert(ns string) *corev1.Secret {
+ 	return secretFor(ns, "azure-disk-csi-driver-controller-metrics-serving-cert")
+ }
+diff --git a/control-plane-operator/controllers/hostedcontrolplane/pki/azure_workload_identity_webhook.go b/control-plane-operator/controllers/hostedcontrolplane/pki/azure_workload_identity_webhook.go
+new file mode 100644
+index 00000000000..3456a42725f
+--- /dev/null
++++ b/control-plane-operator/controllers/hostedcontrolplane/pki/azure_workload_identity_webhook.go
+@@ -0,0 +1,11 @@
++package pki
++
++import (
++	"github.com/openshift/hypershift/support/config"
++
++	corev1 "k8s.io/api/core/v1"
++)
++
++func ReconcileAzureWorkloadIdentityWebhookServingCert(secret, ca *corev1.Secret, ownerRef config.OwnerRef) error {
++	return reconcileSignedCertWithAddresses(secret, ca, ownerRef, "127.0.0.1", nil, X509UsageClientServerAuth, nil, []string{"127.0.0.1"})
++}
+diff --git a/control-plane-operator/controllers/hostedcontrolplane/pki/azure_workload_identity_webhook_test.go b/control-plane-operator/controllers/hostedcontrolplane/pki/azure_workload_identity_webhook_test.go
+new file mode 100644
+index 00000000000..e2290bede2f
+--- /dev/null
++++ b/control-plane-operator/controllers/hostedcontrolplane/pki/azure_workload_identity_webhook_test.go
+@@ -0,0 +1,128 @@
++package pki
++
++import (
++	"testing"
++
++	"github.com/openshift/hypershift/support/certs"
++	"github.com/openshift/hypershift/support/config"
++
++	corev1 "k8s.io/api/core/v1"
++	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
++	"k8s.io/apimachinery/pkg/types"
++	"k8s.io/utils/ptr"
++)
++
++func TestReconcileAzureWorkloadIdentityWebhookServingCert(t *testing.T) {
++	testCases := []struct {
++		name string
++	}{
++		{
++			name: "When reconciling the serving cert it should generate a valid TLS certificate for 127.0.0.1",
++		},
++	}
++
++	for _, tc := range testCases {
++		t.Run(tc.name, func(t *testing.T) {
++			namespace := "test-namespace"
++
++			ownerRef := config.OwnerRef{
++				Reference: &metav1.OwnerReference{
++					APIVersion: "v1",
++					Kind:       "HostedControlPlane",
++					Name:       "test-hcp",
++					UID:        types.UID("test-uid"),
++					Controller: ptr.To(true),
++				},
++			}
++
++			ca := &corev1.Secret{}
++			ca.Name = "test-ca"
++			ca.Namespace = namespace
++			if err := reconcileSelfSignedCA(ca, ownerRef, "test-org", "test-ca"); err != nil {
++				t.Fatalf("failed to create CA: %v", err)
++			}
++
++			secret := &corev1.Secret{}
++			secret.Name = "azure-workload-identity-webhook-serving-cert"
++			secret.Namespace = namespace
++
++			if err := ReconcileAzureWorkloadIdentityWebhookServingCert(secret, ca, ownerRef); err != nil {
++				t.Fatalf("failed to reconcile cert: %v", err)
++			}
++
++			if secret.Data == nil {
++				t.Fatal("secret data is nil")
++			}
++
++			if _, ok := secret.Data[corev1.TLSCertKey]; !ok {
++				t.Fatal("secret missing tls.crt")
++			}
++
++			if _, ok := secret.Data[corev1.TLSPrivateKeyKey]; !ok {
++				t.Fatal("secret missing tls.key")
++			}
++
++			cert, err := certs.PemToCertificate(secret.Data[corev1.TLSCertKey])
++			if err != nil {
++				t.Fatalf("failed to parse certificate: %v", err)
++			}
++
++			// The cert should have 127.0.0.1 as an IP SAN
++			if len(cert.IPAddresses) != 1 || cert.IPAddresses[0].String() != "127.0.0.1" {
++				t.Errorf("expected IP SAN [127.0.0.1], got %v", cert.IPAddresses)
++			}
++
++			// The CN should be 127.0.0.1
++			if cert.Subject.CommonName != "127.0.0.1" {
++				t.Errorf("expected CN 127.0.0.1, got %s", cert.Subject.CommonName)
++			}
++
++			// IP-only certs generated by reconcileSignedCertWithAddresses do not set an organization
++			if len(cert.Subject.Organization) != 0 {
++				t.Errorf("expected empty Organization for IP-based cert, got %v", cert.Subject.Organization)
++			}
++		})
++	}
++}
++
++func TestReconcileAzureWorkloadIdentityWebhookServingCertIdempotent(t *testing.T) {
++	t.Run("When reconciling the serving cert twice it should produce the same certificate", func(t *testing.T) {
++		namespace := "test-namespace"
++
++		ownerRef := config.OwnerRef{
++			Reference: &metav1.OwnerReference{
++				APIVersion: "v1",
++				Kind:       "HostedControlPlane",
++				Name:       "test-hcp",
++				UID:        types.UID("test-uid"),
++				Controller: ptr.To(true),
++			},
++		}
++
++		ca := &corev1.Secret{}
++		ca.Name = "test-ca"
++		ca.Namespace = namespace
++		if err := reconcileSelfSignedCA(ca, ownerRef, "test-org", "test-ca"); err != nil {
++			t.Fatalf("failed to create CA: %v", err)
++		}
++
++		secret := &corev1.Secret{}
++		secret.Name = "azure-workload-identity-webhook-serving-cert"
++		secret.Namespace = namespace
++
++		if err := ReconcileAzureWorkloadIdentityWebhookServingCert(secret, ca, ownerRef); err != nil {
++			t.Fatalf("first reconcile failed: %v", err)
++		}
++
++		firstCert := make([]byte, len(secret.Data[corev1.TLSCertKey]))
++		copy(firstCert, secret.Data[corev1.TLSCertKey])
++
++		if err := ReconcileAzureWorkloadIdentityWebhookServingCert(secret, ca, ownerRef); err != nil {
++			t.Fatalf("second reconcile failed: %v", err)
++		}
++
++		if string(firstCert) != string(secret.Data[corev1.TLSCertKey]) {
++			t.Error("expected idempotent reconciliation to produce the same certificate")
++		}
++	})
++}
+diff --git a/control-plane-operator/controllers/hostedcontrolplane/pki/kas.go b/control-plane-operator/controllers/hostedcontrolplane/pki/kas.go
+index 60cb0b23109..e31b7814b83 100644
+--- a/control-plane-operator/controllers/hostedcontrolplane/pki/kas.go
++++ b/control-plane-operator/controllers/hostedcontrolplane/pki/kas.go
+@@ -70,12 +70,16 @@ func ReconcileHCCOClientCertSecret(secret, ca *corev1.Secret, ownerRef config.Ow
+ }
+ 
+ func ReconcileServiceAccountKubeconfig(secret, csrSigner *corev1.Secret, ca *corev1.ConfigMap, hcp *hyperv1.HostedControlPlane, serviceAccountNamespace, serviceAccountName string) error {
++	svcURL := inClusterKASURL(hcp.Spec.Platform.Type)
++	return ReconcileServiceAccountKubeconfigWithURL(secret, csrSigner, ca, serviceAccountNamespace, serviceAccountName, svcURL)
++}
++
++func ReconcileServiceAccountKubeconfigWithURL(secret, csrSigner *corev1.Secret, ca *corev1.ConfigMap, serviceAccountNamespace, serviceAccountName, kubeconfigURL string) error {
+ 	cn := serviceaccount.MakeUsername(serviceAccountNamespace, serviceAccountName)
+ 	if err := reconcileSignedCert(secret, csrSigner, config.OwnerRef{}, cn, serviceaccount.MakeGroupNames(serviceAccountNamespace), X509UsageClientAuth); err != nil {
+ 		return fmt.Errorf("failed to reconcile serviceaccount client cert: %w", err)
+ 	}
+-	svcURL := inClusterKASURL(hcp.Spec.Platform.Type)
+-	return ReconcileKubeConfig(secret, secret, ca, svcURL, "", manifests.KubeconfigScopeLocal, config.OwnerRef{})
++	return ReconcileKubeConfig(secret, secret, ca, kubeconfigURL, "", manifests.KubeconfigScopeLocal, config.OwnerRef{})
+ }
+ 
+ func ReconcileKubeConfig(secret, cert *corev1.Secret, ca *corev1.ConfigMap, url string, key string, scope manifests.KubeconfigScope, ownerRef config.OwnerRef) error {
+diff --git a/control-plane-operator/controllers/hostedcontrolplane/pki/kas_test.go b/control-plane-operator/controllers/hostedcontrolplane/pki/kas_test.go
+index ab424085f81..cd24f049861 100644
+--- a/control-plane-operator/controllers/hostedcontrolplane/pki/kas_test.go
++++ b/control-plane-operator/controllers/hostedcontrolplane/pki/kas_test.go
+@@ -1,6 +1,15 @@
+ package pki
+ 
+-import "testing"
++import (
++	"crypto/x509/pkix"
++	"testing"
++
++	"github.com/openshift/hypershift/support/certs"
++	"github.com/openshift/hypershift/support/util"
++
++	corev1 "k8s.io/api/core/v1"
++	"k8s.io/client-go/tools/clientcmd"
++)
+ 
+ func TestAddBracketsIfIPv6(t *testing.T) {
+ 	tests := []struct {
+@@ -53,3 +62,59 @@ func TestAddBracketsIfIPv6(t *testing.T) {
+ 		})
+ 	}
+ }
++
++func TestReconcileServiceAccountKubeconfigWithURL(t *testing.T) {
++	t.Parallel()
++
++	caCfg := certs.CertCfg{
++		IsCA:    true,
++		Subject: pkix.Name{CommonName: "root-ca", OrganizationalUnit: []string{"unit"}},
++	}
++	caKey, caCert, err := certs.GenerateSelfSignedCertificate(&caCfg)
++	if err != nil {
++		t.Fatalf("failed to generate CA: %v", err)
++	}
++
++	csrSigner := &corev1.Secret{
++		Data: map[string][]byte{
++			certs.CASignerCertMapKey: certs.CertToPem(caCert),
++			certs.CASignerKeyMapKey:  certs.PrivateKeyToPem(caKey),
++		},
++	}
++	caConfigMap := &corev1.ConfigMap{
++		Data: map[string]string{
++			certs.CASignerCertMapKey: string(certs.CertToPem(caCert)),
++		},
++	}
++	secret := &corev1.Secret{}
++	localhostURL := "https://localhost:9443"
++
++	testCases := []struct {
++		name string
++	}{
++		{
++			name: "When reconciling service account kubeconfig with explicit URL it should use that URL as cluster server",
++		},
++	}
++
++	for _, tc := range testCases {
++		t.Run(tc.name, func(t *testing.T) {
++			if err := ReconcileServiceAccountKubeconfigWithURL(secret, csrSigner, caConfigMap, "openshift-authentication", "azure-workload-identity-webhook", localhostURL); err != nil {
++				t.Fatalf("failed to reconcile kubeconfig: %v", err)
++			}
++
++			kubeconfigData, hasKubeconfig := secret.Data[util.KubeconfigKey]
++			if !hasKubeconfig {
++				t.Fatalf("expected %q key to be present in secret data", util.KubeconfigKey)
++			}
++
++			kubeconfig, err := clientcmd.Load(kubeconfigData)
++			if err != nil {
++				t.Fatalf("failed to parse kubeconfig data: %v", err)
++			}
++			if kubeconfig.Clusters["cluster"].Server != localhostURL {
++				t.Fatalf("expected kubeconfig server %q, got %q", localhostURL, kubeconfig.Clusters["cluster"].Server)
++			}
++		})
++	}
++}
+diff --git a/control-plane-operator/controllers/hostedcontrolplane/testdata/kube-apiserver/AROSwift/zz_fixture_TestControlPlaneComponents_azure_workload_identity_webhook_kubeconfig_secret.yaml b/control-plane-operator/controllers/hostedcontrolplane/testdata/kube-apiserver/AROSwift/zz_fixture_TestControlPlaneComponents_azure_workload_identity_webhook_kubeconfig_secret.yaml
+new file mode 100644
+index 00000000000..ac65c55fbbd
+--- /dev/null
++++ b/control-plane-operator/controllers/hostedcontrolplane/testdata/kube-apiserver/AROSwift/zz_fixture_TestControlPlaneComponents_azure_workload_identity_webhook_kubeconfig_secret.yaml
+@@ -0,0 +1,23 @@
++apiVersion: v1
++data:
++  ca.crt: ""
++  kubeconfig: ""
++  tls.crt: ""
++  tls.key: ""
++kind: Secret
++metadata:
++  annotations:
++    hypershiftlite.openshift.io/ca-hash: ""
++  labels:
++    hypershift.openshift.io/kubeconfig: local
++  name: azure-workload-identity-webhook-kubeconfig
++  namespace: hcp-namespace
++  ownerReferences:
++  - apiVersion: hypershift.openshift.io/v1beta1
++    blockOwnerDeletion: true
++    controller: true
++    kind: HostedControlPlane
++    name: hcp
++    uid: ""
++  resourceVersion: "1"
++type: Opaque
+diff --git a/control-plane-operator/controllers/hostedcontrolplane/testdata/kube-apiserver/AROSwift/zz_fixture_TestControlPlaneComponents_kube_apiserver_controlplanecomponent.yaml b/control-plane-operator/controllers/hostedcontrolplane/testdata/kube-apiserver/AROSwift/zz_fixture_TestControlPlaneComponents_kube_apiserver_controlplanecomponent.yaml
+index d67190f7c2d..756b40ace7c 100644
+--- a/control-plane-operator/controllers/hostedcontrolplane/testdata/kube-apiserver/AROSwift/zz_fixture_TestControlPlaneComponents_kube_apiserver_controlplanecomponent.yaml
++++ b/control-plane-operator/controllers/hostedcontrolplane/testdata/kube-apiserver/AROSwift/zz_fixture_TestControlPlaneComponents_kube_apiserver_controlplanecomponent.yaml
+@@ -31,6 +31,9 @@ status:
+   - group: secrets-store.csi.x-k8s.io
+     kind: SecretProviderClass
+     name: managed-azure-kms
++  - group: ""
++    kind: Secret
++    name: azure-workload-identity-webhook-kubeconfig
+   - group: ""
+     kind: Secret
+     name: bootstrap-kubeconfig
+diff --git a/control-plane-operator/controllers/hostedcontrolplane/testdata/kube-apiserver/AROSwift/zz_fixture_TestControlPlaneComponents_kube_apiserver_deployment.yaml b/control-plane-operator/controllers/hostedcontrolplane/testdata/kube-apiserver/AROSwift/zz_fixture_TestControlPlaneComponents_kube_apiserver_deployment.yaml
+index f15789da8a2..18f63c6fd7c 100644
+--- a/control-plane-operator/controllers/hostedcontrolplane/testdata/kube-apiserver/AROSwift/zz_fixture_TestControlPlaneComponents_kube_apiserver_deployment.yaml
++++ b/control-plane-operator/controllers/hostedcontrolplane/testdata/kube-apiserver/AROSwift/zz_fixture_TestControlPlaneComponents_kube_apiserver_deployment.yaml
+@@ -28,7 +28,7 @@ spec:
+     metadata:
+       annotations:
+         cluster-autoscaler.kubernetes.io/safe-to-evict-local-volumes: bootstrap-manifests,logs,kms-socket,tmp-dir
+-        component.hypershift.openshift.io/config-hash: 0fd3eed819dc307e1d8949e2360eec75794dc8cc8b110e88a2a4098ca7ac042de7e69167
++        component.hypershift.openshift.io/config-hash: 0fd3eed819dc307e1d8949e2360eec75741638a5741638a5741638a5741638a5794dc8cc8b110e88a2a4098ca7ac042de7e69167
+         hypershift.openshift.io/release-image: quay.io/openshift-release-dev/ocp-release:4.16.10-x86_64
+       labels:
+         app: kube-apiserver
+@@ -305,6 +305,65 @@ spec:
+           name: logs
+         - mountPath: /tmp
+           name: tmp-dir
++      - args:
++        - |
++          set -u
++          until curl -kfsS "https://localhost:6443/version" >/dev/null; do
++            echo "waiting for kube-apiserver /version endpoint to become available"
++            sleep 2
++          done
++          exec /usr/bin/azure-workload-identity-webhook \
++            --webhook-cert-dir=/var/run/app/certs \
++            --health-addr=:9440 \
++            --audience=api://AzureADTokenExchange \
++            --kubeconfig=/var/run/app/kubeconfig/kubeconfig \
++            --metrics-addr=:9441 \
++            --log-level=info \
++            --disable-cert-rotation
++        command:
++        - /bin/sh
++        - -ec
++        env:
++        - name: AZURE_TENANT_ID
++        - name: AZURE_ENVIRONMENT
++          value: AzurePublicCloud
++        image: azure-workload-identity-webhook
++        imagePullPolicy: IfNotPresent
++        livenessProbe:
++          httpGet:
++            path: /healthz
++            port: 9440
++            scheme: HTTP
++          periodSeconds: 20
++        name: azure-workload-identity-webhook
++        readinessProbe:
++          httpGet:
++            path: /readyz
++            port: 9440
++            scheme: HTTP
++          initialDelaySeconds: 5
++          periodSeconds: 10
++        resources:
++          requests:
++            cpu: 10m
++            memory: 25Mi
++        securityContext:
++          readOnlyRootFilesystem: true
++        startupProbe:
++          failureThreshold: 30
++          httpGet:
++            path: /healthz
++            port: 9440
++            scheme: HTTP
++          periodSeconds: 10
++        terminationMessagePolicy: FallbackToLogsOnError
++        volumeMounts:
++        - mountPath: /var/run/app/certs
++          name: azure-wi-webhook-serving-certs
++        - mountPath: /var/run/app/kubeconfig
++          name: azure-wi-webhook-kubeconfig
++        - mountPath: /tmp
++          name: tmp-dir
+       - args:
+         - --keyvault-name=test-kms-keyvault
+         - --key-name=test-key
+@@ -585,6 +644,14 @@ spec:
+         secret:
+           defaultMode: 416
+           secretName: konnectivity-cluster
++      - name: azure-wi-webhook-serving-certs
++        secret:
++          defaultMode: 416
++          secretName: azure-workload-identity-webhook-serving-cert
++      - name: azure-wi-webhook-kubeconfig
++        secret:
++          defaultMode: 416
++          secretName: azure-workload-identity-webhook-kubeconfig
+       - name: kas-secret-encryption-config
+         secret:
+           defaultMode: 416
+diff --git a/control-plane-operator/controllers/hostedcontrolplane/v2/assets/kube-apiserver/azure-workload-identity-webhook-kubeconfig.yaml b/control-plane-operator/controllers/hostedcontrolplane/v2/assets/kube-apiserver/azure-workload-identity-webhook-kubeconfig.yaml
+new file mode 100644
+index 00000000000..32a472c1f99
+--- /dev/null
++++ b/control-plane-operator/controllers/hostedcontrolplane/v2/assets/kube-apiserver/azure-workload-identity-webhook-kubeconfig.yaml
+@@ -0,0 +1,14 @@
++apiVersion: v1
++data:
++  kubeconfig: ""
++  ca.crt: ""
++  tls.crt: ""
++  tls.key: ""
++kind: Secret
++metadata:
++  annotations:
++    hypershiftlite.openshift.io/ca-hash: ""
++  labels:
++    hypershift.openshift.io/kubeconfig: local
++  name: azure-workload-identity-webhook-kubeconfig
++type: Opaque
+diff --git a/control-plane-operator/controllers/hostedcontrolplane/v2/kas/azure_workload_identity_webhook_test.go b/control-plane-operator/controllers/hostedcontrolplane/v2/kas/azure_workload_identity_webhook_test.go
+new file mode 100644
+index 00000000000..3931a38df2e
+--- /dev/null
++++ b/control-plane-operator/controllers/hostedcontrolplane/v2/kas/azure_workload_identity_webhook_test.go
+@@ -0,0 +1,194 @@
++package kas
++
++import (
++	"testing"
++
++	. "github.com/onsi/gomega"
++
++	hyperv1 "github.com/openshift/hypershift/api/hypershift/v1beta1"
++	"github.com/openshift/hypershift/control-plane-operator/controllers/hostedcontrolplane/manifests"
++
++	corev1 "k8s.io/api/core/v1"
++	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
++)
++
++func TestApplyAzureWorkloadIdentityWebhookContainer(t *testing.T) {
++	testCases := []struct {
++		name        string
++		hcp         *hyperv1.HostedControlPlane
++		validatePod func(*GomegaWithT, *corev1.PodSpec)
++	}{
++		{
++			name: "When applying the Azure webhook container it should add the sidecar with correct configuration",
++			hcp: &hyperv1.HostedControlPlane{
++				ObjectMeta: metav1.ObjectMeta{
++					Name:      "test-hcp",
++					Namespace: "test-ns",
++				},
++				Spec: hyperv1.HostedControlPlaneSpec{
++					Platform: hyperv1.PlatformSpec{
++						Type: hyperv1.AzurePlatform,
++						Azure: &hyperv1.AzurePlatformSpec{
++							TenantID: "test-tenant-id",
++							Cloud:    "AzurePublicCloud",
++						},
++					},
++				},
++			},
++			validatePod: func(g *GomegaWithT, podSpec *corev1.PodSpec) {
++				var webhookContainer *corev1.Container
++				for i := range podSpec.Containers {
++					if podSpec.Containers[i].Name == "azure-workload-identity-webhook" {
++						webhookContainer = &podSpec.Containers[i]
++						break
++					}
++				}
++				g.Expect(webhookContainer).NotTo(BeNil(), "webhook container should exist")
++
++				g.Expect(webhookContainer.Image).To(Equal("azure-workload-identity-webhook"))
++				g.Expect(webhookContainer.Command).To(Equal([]string{"/bin/sh", "-ec"}))
++
++				g.Expect(webhookContainer.Args).To(HaveLen(1))
++				g.Expect(webhookContainer.Args[0]).To(ContainSubstring(`https://localhost:`))
++				g.Expect(webhookContainer.Args[0]).To(ContainSubstring(`/version`))
++				g.Expect(webhookContainer.Args[0]).To(ContainSubstring(`exec /usr/bin/azure-workload-identity-webhook`))
++			},
++		},
++		{
++			name: "When applying the Azure webhook container it should set AZURE_TENANT_ID and AZURE_ENVIRONMENT env vars",
++			hcp: &hyperv1.HostedControlPlane{
++				ObjectMeta: metav1.ObjectMeta{
++					Name:      "test-hcp",
++					Namespace: "test-ns",
++				},
++				Spec: hyperv1.HostedControlPlaneSpec{
++					Platform: hyperv1.PlatformSpec{
++						Type: hyperv1.AzurePlatform,
++						Azure: &hyperv1.AzurePlatformSpec{
++							TenantID: "my-tenant-123",
++							Cloud:    "AzureUSGovernmentCloud",
++						},
++					},
++				},
++			},
++			validatePod: func(g *GomegaWithT, podSpec *corev1.PodSpec) {
++				var webhookContainer *corev1.Container
++				for i := range podSpec.Containers {
++					if podSpec.Containers[i].Name == "azure-workload-identity-webhook" {
++						webhookContainer = &podSpec.Containers[i]
++						break
++					}
++				}
++				g.Expect(webhookContainer).NotTo(BeNil())
++
++				envMap := make(map[string]string)
++				for _, e := range webhookContainer.Env {
++					envMap[e.Name] = e.Value
++				}
++				g.Expect(envMap).To(HaveKeyWithValue("AZURE_TENANT_ID", "my-tenant-123"))
++				g.Expect(envMap).To(HaveKeyWithValue("AZURE_ENVIRONMENT", "AzureUSGovernmentCloud"))
++			},
++		},
++		{
++			name: "When applying the Azure webhook container it should configure startup, liveness, and readiness probes",
++			hcp: &hyperv1.HostedControlPlane{
++				ObjectMeta: metav1.ObjectMeta{
++					Name:      "test-hcp",
++					Namespace: "test-ns",
++				},
++				Spec: hyperv1.HostedControlPlaneSpec{
++					Platform: hyperv1.PlatformSpec{
++						Type: hyperv1.AzurePlatform,
++						Azure: &hyperv1.AzurePlatformSpec{
++							TenantID: "test-tenant",
++							Cloud:    "AzurePublicCloud",
++						},
++					},
++				},
++			},
++			validatePod: func(g *GomegaWithT, podSpec *corev1.PodSpec) {
++				var webhookContainer *corev1.Container
++				for i := range podSpec.Containers {
++					if podSpec.Containers[i].Name == "azure-workload-identity-webhook" {
++						webhookContainer = &podSpec.Containers[i]
++						break
++					}
++				}
++				g.Expect(webhookContainer).NotTo(BeNil())
++
++				g.Expect(webhookContainer.StartupProbe).NotTo(BeNil())
++				g.Expect(webhookContainer.StartupProbe.HTTPGet.Path).To(Equal("/healthz"))
++				g.Expect(webhookContainer.StartupProbe.HTTPGet.Port.IntValue()).To(Equal(9440))
++				g.Expect(webhookContainer.StartupProbe.PeriodSeconds).To(Equal(int32(10)))
++				g.Expect(webhookContainer.StartupProbe.FailureThreshold).To(Equal(int32(30)))
++
++				g.Expect(webhookContainer.LivenessProbe).NotTo(BeNil())
++				g.Expect(webhookContainer.LivenessProbe.HTTPGet.Path).To(Equal("/healthz"))
++				g.Expect(webhookContainer.LivenessProbe.HTTPGet.Port.IntValue()).To(Equal(9440))
++
++				g.Expect(webhookContainer.ReadinessProbe).NotTo(BeNil())
++				g.Expect(webhookContainer.ReadinessProbe.HTTPGet.Path).To(Equal("/readyz"))
++				g.Expect(webhookContainer.ReadinessProbe.HTTPGet.Port.IntValue()).To(Equal(9440))
++			},
++		},
++		{
++			name: "When applying the Azure webhook container it should add serving cert and kubeconfig volumes",
++			hcp: &hyperv1.HostedControlPlane{
++				ObjectMeta: metav1.ObjectMeta{
++					Name:      "test-hcp",
++					Namespace: "test-ns",
++				},
++				Spec: hyperv1.HostedControlPlaneSpec{
++					Platform: hyperv1.PlatformSpec{
++						Type: hyperv1.AzurePlatform,
++						Azure: &hyperv1.AzurePlatformSpec{
++							TenantID: "test-tenant",
++							Cloud:    "AzurePublicCloud",
++						},
++					},
++				},
++			},
++			validatePod: func(g *GomegaWithT, podSpec *corev1.PodSpec) {
++				volumeNames := make(map[string]string)
++				for _, v := range podSpec.Volumes {
++					if v.Secret != nil {
++						volumeNames[v.Name] = v.Secret.SecretName
++					}
++				}
++				g.Expect(volumeNames).To(HaveKeyWithValue(
++					azureWorkloadIdentityWebhookServingCertVolumeName,
++					manifests.AzureWorkloadIdentityWebhookServingCert("").Name,
++				))
++				g.Expect(volumeNames).To(HaveKeyWithValue(
++					azureWorkloadIdentityWebhookKubeconfigVolumeName,
++					manifests.AzureWorkloadIdentityWebhookKubeconfig("").Name,
++				))
++
++				var webhookContainer *corev1.Container
++				for i := range podSpec.Containers {
++					if podSpec.Containers[i].Name == "azure-workload-identity-webhook" {
++						webhookContainer = &podSpec.Containers[i]
++						break
++					}
++				}
++				g.Expect(webhookContainer).NotTo(BeNil())
++
++				mountPaths := make(map[string]string)
++				for _, vm := range webhookContainer.VolumeMounts {
++					mountPaths[vm.Name] = vm.MountPath
++				}
++				g.Expect(mountPaths).To(HaveKeyWithValue(azureWorkloadIdentityWebhookServingCertVolumeName, "/var/run/app/certs"))
++				g.Expect(mountPaths).To(HaveKeyWithValue(azureWorkloadIdentityWebhookKubeconfigVolumeName, "/var/run/app/kubeconfig"))
++			},
++		},
++	}
++
++	for _, tc := range testCases {
++		t.Run(tc.name, func(t *testing.T) {
++			g := NewWithT(t)
++			podSpec := &corev1.PodSpec{}
++			applyAzureWorkloadIdentityWebhookContainer(podSpec, tc.hcp)
++			tc.validatePod(g, podSpec)
++		})
++	}
++}
+diff --git a/control-plane-operator/controllers/hostedcontrolplane/v2/kas/component.go b/control-plane-operator/controllers/hostedcontrolplane/v2/kas/component.go
+index dcfe5cd5890..8e837309c66 100644
+--- a/control-plane-operator/controllers/hostedcontrolplane/v2/kas/component.go
++++ b/control-plane-operator/controllers/hostedcontrolplane/v2/kas/component.go
+@@ -110,6 +110,12 @@ func NewComponent() component.ControlPlaneComponent {
+ 			component.WithAdaptFunction(adaptAWSPodIdentityWebhookKubeconfigSecret),
+ 			component.ReconcileExisting(),
+ 		).
++		WithManifestAdapter(
++			"azure-workload-identity-webhook-kubeconfig.yaml",
++			component.EnableForPlatform(hyperv1.AzurePlatform),
++			component.WithAdaptFunction(adaptAzureWorkloadIdentityWebhookKubeconfigSecret),
++			component.ReconcileExisting(),
++		).
+ 		WithManifestAdapter(
+ 			"azure-kms-secretprovider.yaml",
+ 			component.WithAdaptFunction(kms.AdaptAzureSecretProvider),
+diff --git a/control-plane-operator/controllers/hostedcontrolplane/v2/kas/deployment.go b/control-plane-operator/controllers/hostedcontrolplane/v2/kas/deployment.go
+index eb171e3c498..ffa76be9843 100644
+--- a/control-plane-operator/controllers/hostedcontrolplane/v2/kas/deployment.go
++++ b/control-plane-operator/controllers/hostedcontrolplane/v2/kas/deployment.go
+@@ -23,6 +23,7 @@ import (
+ 	corev1 "k8s.io/api/core/v1"
+ 	"k8s.io/apimachinery/pkg/api/resource"
+ 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
++	"k8s.io/apimachinery/pkg/util/intstr"
+ 	"k8s.io/utils/ptr"
+ 
+ 	"sigs.k8s.io/controller-runtime/pkg/client"
+@@ -33,6 +34,24 @@ const (
+ 
+ 	awsPodIdentityWebhookServingCertVolumeName = "aws-pod-identity-webhook-serving-certs"
+ 	awsPodIdentityWebhookKubeconfigVolumeName  = "aws-pod-identity-webhook-kubeconfig"
++
++	azureWorkloadIdentityWebhookServingCertVolumeName = "azure-wi-webhook-serving-certs"
++	azureWorkloadIdentityWebhookKubeconfigVolumeName  = "azure-wi-webhook-kubeconfig"
++
++	azureWorkloadIdentityWebhookWaitForKASVersionTemplate = `set -u
++until curl -kfsS "https://localhost:%d/version" >/dev/null; do
++  echo "waiting for kube-apiserver /version endpoint to become available"
++  sleep 2
++done
++exec /usr/bin/azure-workload-identity-webhook \
++  --webhook-cert-dir=/var/run/app/certs \
++  --health-addr=:9440 \
++  --audience=api://AzureADTokenExchange \
++  --kubeconfig=/var/run/app/kubeconfig/kubeconfig \
++  --metrics-addr=:9441 \
++  --log-level=info \
++  --disable-cert-rotation
++`
+ )
+ 
+ func adaptDeployment(cpContext component.WorkloadContext, deployment *appsv1.Deployment) error {
+@@ -91,6 +110,11 @@ func adaptDeployment(cpContext component.WorkloadContext, deployment *appsv1.Dep
+ 	switch hcp.Spec.Platform.Type {
+ 	case hyperv1.AWSPlatform:
+ 		applyAWSPodIdentityWebhookContainer(&deployment.Spec.Template.Spec, hcp)
++	case hyperv1.AzurePlatform:
++		if hcp.Spec.Platform.Azure == nil {
++			return fmt.Errorf("azure platform type requires spec.platform.azure")
++		}
++		applyAzureWorkloadIdentityWebhookContainer(&deployment.Spec.Template.Spec, hcp)
+ 	}
+ 
+ 	if hcp.Spec.AuditWebhook != nil && len(hcp.Spec.AuditWebhook.Name) > 0 {
+@@ -317,6 +341,79 @@ func applyAWSPodIdentityWebhookContainer(podSpec *corev1.PodSpec, hcp *hyperv1.H
+ 	)
+ }
+ 
++func applyAzureWorkloadIdentityWebhookContainer(podSpec *corev1.PodSpec, hcp *hyperv1.HostedControlPlane) {
++	waitForKASScript := fmt.Sprintf(azureWorkloadIdentityWebhookWaitForKASVersionTemplate, util.KASPodPort(hcp))
++
++	podSpec.Containers = append(podSpec.Containers, corev1.Container{
++		Name:            "azure-workload-identity-webhook",
++		Image:           "azure-workload-identity-webhook",
++		ImagePullPolicy: corev1.PullIfNotPresent,
++		Command:         []string{"/bin/sh", "-ec"},
++		Args:            []string{waitForKASScript},
++		Env: []corev1.EnvVar{
++			{Name: "AZURE_TENANT_ID", Value: hcp.Spec.Platform.Azure.TenantID},
++			{Name: "AZURE_ENVIRONMENT", Value: hcp.Spec.Platform.Azure.Cloud},
++		},
++		Resources: corev1.ResourceRequirements{
++			Requests: corev1.ResourceList{
++				corev1.ResourceCPU:    resource.MustParse("10m"),
++				corev1.ResourceMemory: resource.MustParse("25Mi"),
++			},
++		},
++		StartupProbe: &corev1.Probe{
++			ProbeHandler: corev1.ProbeHandler{
++				HTTPGet: &corev1.HTTPGetAction{
++					Path:   "/healthz",
++					Port:   intstr.FromInt(9440),
++					Scheme: corev1.URISchemeHTTP,
++				},
++			},
++			PeriodSeconds:    10,
++			FailureThreshold: 30,
++		},
++		LivenessProbe: &corev1.Probe{
++			ProbeHandler: corev1.ProbeHandler{
++				HTTPGet: &corev1.HTTPGetAction{
++					Path:   "/healthz",
++					Port:   intstr.FromInt(9440),
++					Scheme: corev1.URISchemeHTTP,
++				},
++			},
++			PeriodSeconds: 20,
++		},
++		ReadinessProbe: &corev1.Probe{
++			ProbeHandler: corev1.ProbeHandler{
++				HTTPGet: &corev1.HTTPGetAction{
++					Path:   "/readyz",
++					Port:   intstr.FromInt(9440),
++					Scheme: corev1.URISchemeHTTP,
++				},
++			},
++			InitialDelaySeconds: 5,
++			PeriodSeconds:       10,
++		},
++		VolumeMounts: []corev1.VolumeMount{
++			{Name: azureWorkloadIdentityWebhookServingCertVolumeName, MountPath: "/var/run/app/certs"},
++			{Name: azureWorkloadIdentityWebhookKubeconfigVolumeName, MountPath: "/var/run/app/kubeconfig"},
++		},
++	})
++
++	podSpec.Volumes = append(podSpec.Volumes,
++		corev1.Volume{
++			Name: azureWorkloadIdentityWebhookServingCertVolumeName,
++			VolumeSource: corev1.VolumeSource{
++				Secret: &corev1.SecretVolumeSource{SecretName: manifests.AzureWorkloadIdentityWebhookServingCert("").Name},
++			},
++		},
++		corev1.Volume{
++			Name: azureWorkloadIdentityWebhookKubeconfigVolumeName,
++			VolumeSource: corev1.VolumeSource{
++				Secret: &corev1.SecretVolumeSource{SecretName: manifests.AzureWorkloadIdentityWebhookKubeconfig("").Name},
++			},
++		},
++	)
++}
++
+ func buildKASAuditWebhookConfigFileVolume(auditWebhookRef *corev1.LocalObjectReference) corev1.Volume {
+ 	v := corev1.Volume{
+ 		Name: auditWebhookConfigFileVolumeName,
+diff --git a/control-plane-operator/controllers/hostedcontrolplane/v2/kas/kubeconfig.go b/control-plane-operator/controllers/hostedcontrolplane/v2/kas/kubeconfig.go
+index 5136db4a9b0..75763a890df 100644
+--- a/control-plane-operator/controllers/hostedcontrolplane/v2/kas/kubeconfig.go
++++ b/control-plane-operator/controllers/hostedcontrolplane/v2/kas/kubeconfig.go
+@@ -183,6 +183,29 @@ func adaptAWSPodIdentityWebhookKubeconfigSecret(cpContext component.WorkloadCont
+ 	return nil
+ }
+ 
++func adaptAzureWorkloadIdentityWebhookKubeconfigSecret(cpContext component.WorkloadContext, secret *corev1.Secret) error {
++	csrSigner := manifests.CSRSignerCASecret(cpContext.HCP.Namespace)
++	if err := cpContext.Client.Get(cpContext, client.ObjectKeyFromObject(csrSigner), csrSigner); err != nil {
++		return fmt.Errorf("failed to get cluster-signer-ca secret: %w", err)
++	}
++	rootCA := manifests.RootCASecret(cpContext.HCP.Namespace)
++	if err := cpContext.Client.Get(cpContext, client.ObjectKeyFromObject(rootCA), rootCA); err != nil {
++		return fmt.Errorf("failed to get root ca cert secret: %w", err)
++	}
++	rootCACM := &corev1.ConfigMap{
++		Data: map[string]string{
++			certs.CASignerCertMapKey: string(rootCA.Data[certs.CASignerCertMapKey]),
++		},
++	}
++
++	if !cpContext.SkipCertificateSigning {
++		apiServerPort := util.KASPodPort(cpContext.HCP)
++		localhostURL := fmt.Sprintf("https://localhost:%d", apiServerPort)
++		return pki.ReconcileServiceAccountKubeconfigWithURL(secret, csrSigner, rootCACM, "openshift-authentication", "azure-workload-identity-webhook", localhostURL)
++	}
++	return nil
++}
++
+ func generateKubeConfig(ca, cert *corev1.Secret, url string) ([]byte, error) {
+ 	caPEM := ca.Data[certs.CASignerCertMapKey]
+ 	crtBytes, keyBytes := cert.Data[corev1.TLSCertKey], cert.Data[corev1.TLSPrivateKeyKey]
+diff --git a/control-plane-operator/hostedclusterconfigoperator/controllers/resources/azure_workload_identity_webhook_test.go b/control-plane-operator/hostedclusterconfigoperator/controllers/resources/azure_workload_identity_webhook_test.go
+new file mode 100644
+index 00000000000..b7d4e4b23dc
+--- /dev/null
++++ b/control-plane-operator/hostedclusterconfigoperator/controllers/resources/azure_workload_identity_webhook_test.go
+@@ -0,0 +1,126 @@
++package resources
++
++import (
++	"testing"
++
++	. "github.com/onsi/gomega"
++
++	hyperv1 "github.com/openshift/hypershift/api/hypershift/v1beta1"
++	"github.com/openshift/hypershift/control-plane-operator/hostedclusterconfigoperator/api"
++	"github.com/openshift/hypershift/control-plane-operator/hostedclusterconfigoperator/controllers/resources/manifests"
++
++	admissionregistrationv1 "k8s.io/api/admissionregistration/v1"
++	rbacv1 "k8s.io/api/rbac/v1"
++
++	"sigs.k8s.io/controller-runtime/pkg/client"
++	"sigs.k8s.io/controller-runtime/pkg/client/fake"
++)
++
++func TestReconcileAzureIdentityWebhook(t *testing.T) {
++	testCases := []struct {
++		name   string
++		rootCA string
++	}{
++		{
++			name:   "When reconciling the Azure identity webhook it should create all required resources",
++			rootCA: "test-root-ca-bundle",
++		},
++	}
++
++	for _, tc := range testCases {
++		t.Run(tc.name, func(t *testing.T) {
++			g := NewWithT(t)
++
++			fakeClient := fake.NewClientBuilder().WithScheme(api.Scheme).Build()
++			r := &reconciler{
++				client:                 fakeClient,
++				CreateOrUpdateProvider: &simpleCreateOrUpdater{},
++				rootCA:                 tc.rootCA,
++				platformType:           hyperv1.AzurePlatform,
++			}
++
++			errs := r.reconcileAzureIdentityWebhook(t.Context())
++			g.Expect(errs).To(BeEmpty())
++
++			// Verify ClusterRole
++			clusterRole := manifests.AzureWorkloadIdentityWebhookClusterRole()
++			err := fakeClient.Get(t.Context(), client.ObjectKeyFromObject(clusterRole), clusterRole)
++			g.Expect(err).ToNot(HaveOccurred())
++			g.Expect(clusterRole.Rules).To(HaveLen(1))
++			g.Expect(clusterRole.Rules[0].APIGroups).To(Equal([]string{""}))
++			g.Expect(clusterRole.Rules[0].Resources).To(Equal([]string{"serviceaccounts"}))
++			g.Expect(clusterRole.Rules[0].Verbs).To(Equal([]string{"get", "list", "watch"}))
++
++			// Verify ClusterRoleBinding
++			crb := manifests.AzureWorkloadIdentityWebhookClusterRoleBinding()
++			err = fakeClient.Get(t.Context(), client.ObjectKeyFromObject(crb), crb)
++			g.Expect(err).ToNot(HaveOccurred())
++			g.Expect(crb.RoleRef.Kind).To(Equal("ClusterRole"))
++			g.Expect(crb.RoleRef.Name).To(Equal("azure-workload-identity-webhook"))
++			g.Expect(crb.Subjects).To(HaveLen(1))
++			g.Expect(crb.Subjects[0].Kind).To(Equal("ServiceAccount"))
++			g.Expect(crb.Subjects[0].Name).To(Equal("azure-workload-identity-webhook"))
++			g.Expect(crb.Subjects[0].Namespace).To(Equal("openshift-authentication"))
++
++			// Verify MutatingWebhookConfiguration
++			webhook := manifests.AzureWorkloadIdentityWebhook()
++			err = fakeClient.Get(t.Context(), client.ObjectKeyFromObject(webhook), webhook)
++			g.Expect(err).ToNot(HaveOccurred())
++			g.Expect(webhook.Webhooks).To(HaveLen(1))
++
++			wh := webhook.Webhooks[0]
++			g.Expect(wh.Name).To(Equal("pod-identity-webhook.azure.mutate.io"))
++			g.Expect(wh.AdmissionReviewVersions).To(Equal([]string{"v1", "v1beta1"}))
++			g.Expect(*wh.FailurePolicy).To(Equal(admissionregistrationv1.Fail))
++			g.Expect(*wh.MatchPolicy).To(Equal(admissionregistrationv1.Equivalent))
++			g.Expect(*wh.ReinvocationPolicy).To(Equal(admissionregistrationv1.IfNeededReinvocationPolicy))
++			g.Expect(*wh.SideEffects).To(Equal(admissionregistrationv1.SideEffectClassNone))
++
++			g.Expect(wh.ClientConfig.URL).ToNot(BeNil())
++			g.Expect(*wh.ClientConfig.URL).To(Equal("https://127.0.0.1:9443/mutate-v1-pod"))
++			g.Expect(string(wh.ClientConfig.CABundle)).To(Equal(tc.rootCA))
++
++			g.Expect(wh.ObjectSelector).ToNot(BeNil())
++			g.Expect(wh.ObjectSelector.MatchLabels).To(HaveKeyWithValue("azure.workload.identity/use", "true"))
++
++			g.Expect(wh.Rules).To(HaveLen(1))
++			g.Expect(wh.Rules[0].Operations).To(Equal([]admissionregistrationv1.OperationType{admissionregistrationv1.Create}))
++			g.Expect(wh.Rules[0].Rule.APIGroups).To(Equal([]string{""}))
++			g.Expect(wh.Rules[0].Rule.APIVersions).To(Equal([]string{"v1"}))
++			g.Expect(wh.Rules[0].Rule.Resources).To(Equal([]string{"pods"}))
++		})
++	}
++}
++
++func TestReconcileAzureIdentityWebhookIdempotent(t *testing.T) {
++	t.Run("When reconciling the Azure identity webhook twice it should not produce errors", func(t *testing.T) {
++		g := NewWithT(t)
++
++		fakeClient := fake.NewClientBuilder().WithScheme(api.Scheme).Build()
++		r := &reconciler{
++			client:                 fakeClient,
++			CreateOrUpdateProvider: &simpleCreateOrUpdater{},
++			rootCA:                 "test-ca",
++			platformType:           hyperv1.AzurePlatform,
++		}
++
++		errs := r.reconcileAzureIdentityWebhook(t.Context())
++		g.Expect(errs).To(BeEmpty())
++
++		errs = r.reconcileAzureIdentityWebhook(t.Context())
++		g.Expect(errs).To(BeEmpty())
++
++		// Verify resources still exist after second reconciliation
++		clusterRole := &rbacv1.ClusterRole{}
++		err := fakeClient.Get(t.Context(), client.ObjectKeyFromObject(manifests.AzureWorkloadIdentityWebhookClusterRole()), clusterRole)
++		g.Expect(err).ToNot(HaveOccurred())
++
++		crb := &rbacv1.ClusterRoleBinding{}
++		err = fakeClient.Get(t.Context(), client.ObjectKeyFromObject(manifests.AzureWorkloadIdentityWebhookClusterRoleBinding()), crb)
++		g.Expect(err).ToNot(HaveOccurred())
++
++		webhook := &admissionregistrationv1.MutatingWebhookConfiguration{}
++		err = fakeClient.Get(t.Context(), client.ObjectKeyFromObject(manifests.AzureWorkloadIdentityWebhook()), webhook)
++		g.Expect(err).ToNot(HaveOccurred())
++	})
++}
+diff --git a/control-plane-operator/hostedclusterconfigoperator/controllers/resources/manifests/azure_workload_identity_webhook.go b/control-plane-operator/hostedclusterconfigoperator/controllers/resources/manifests/azure_workload_identity_webhook.go
+new file mode 100644
+index 00000000000..4da42294fc1
+--- /dev/null
++++ b/control-plane-operator/hostedclusterconfigoperator/controllers/resources/manifests/azure_workload_identity_webhook.go
+@@ -0,0 +1,31 @@
++package manifests
++
++import (
++	admissionregistrationv1 "k8s.io/api/admissionregistration/v1"
++	rbacv1 "k8s.io/api/rbac/v1"
++	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
++)
++
++func AzureWorkloadIdentityWebhook() *admissionregistrationv1.MutatingWebhookConfiguration {
++	return &admissionregistrationv1.MutatingWebhookConfiguration{
++		ObjectMeta: metav1.ObjectMeta{
++			Name: "azure-workload-identity-webhook",
++		},
++	}
++}
++
++func AzureWorkloadIdentityWebhookClusterRole() *rbacv1.ClusterRole {
++	return &rbacv1.ClusterRole{
++		ObjectMeta: metav1.ObjectMeta{
++			Name: "azure-workload-identity-webhook",
++		},
++	}
++}
++
++func AzureWorkloadIdentityWebhookClusterRoleBinding() *rbacv1.ClusterRoleBinding {
++	return &rbacv1.ClusterRoleBinding{
++		ObjectMeta: metav1.ObjectMeta{
++			Name: "azure-workload-identity-webhook",
++		},
++	}
++}
+diff --git a/control-plane-operator/hostedclusterconfigoperator/controllers/resources/resources.go b/control-plane-operator/hostedclusterconfigoperator/controllers/resources/resources.go
+index 563ca6f8b7b..223b9c2ac55 100644
+--- a/control-plane-operator/hostedclusterconfigoperator/controllers/resources/resources.go
++++ b/control-plane-operator/hostedclusterconfigoperator/controllers/resources/resources.go
+@@ -735,6 +735,7 @@ func (r *reconciler) Reconcile(ctx context.Context, _ ctrl.Request) (ctrl.Result
+ 	case hyperv1.AzurePlatform:
+ 		log.Info("reconciling Azure specific resources")
+ 		errs = append(errs, r.reconcileAzureCloudNodeManager(ctx, releaseImage.ComponentImages()["azure-cloud-node-manager"])...)
++		errs = append(errs, r.reconcileAzureIdentityWebhook(ctx)...)
+ 	}
+ 
+ 	// Reconcile hostedCluster recovery if the hosted cluster was restored from backup
+@@ -2179,6 +2180,78 @@ func (r *reconciler) reconcileAWSIdentityWebhook(ctx context.Context) []error {
+ 	return errs
+ }
+ 
++func (r *reconciler) reconcileAzureIdentityWebhook(ctx context.Context) []error {
++	var errs []error
++	clusterRole := manifests.AzureWorkloadIdentityWebhookClusterRole()
++	if _, err := r.CreateOrUpdate(ctx, r.client, clusterRole, func() error {
++		clusterRole.Rules = []rbacv1.PolicyRule{{
++			APIGroups: []string{""},
++			Resources: []string{"serviceaccounts"},
++			Verbs: []string{
++				"get",
++				"list",
++				"watch",
++			},
++		}}
++		return nil
++	}); err != nil {
++		errs = append(errs, fmt.Errorf("failed to reconcile %T %s: %w", clusterRole, clusterRole.Name, err))
++	}
++
++	clusterRoleBinding := manifests.AzureWorkloadIdentityWebhookClusterRoleBinding()
++	if _, err := r.CreateOrUpdate(ctx, r.client, clusterRoleBinding, func() error {
++		clusterRoleBinding.RoleRef.APIGroup = "rbac.authorization.k8s.io"
++		clusterRoleBinding.RoleRef.Kind = "ClusterRole"
++		clusterRoleBinding.RoleRef.Name = clusterRole.Name
++		clusterRoleBinding.Subjects = []rbacv1.Subject{{
++			Kind:      "ServiceAccount",
++			Name:      "azure-workload-identity-webhook",
++			Namespace: "openshift-authentication",
++		}}
++		return nil
++	}); err != nil {
++		errs = append(errs, fmt.Errorf("failed to reconcile %T %s: %w", clusterRoleBinding, clusterRoleBinding.Name, err))
++	}
++
++	failFailurePolicy := admissionregistrationv1.Fail
++	sideEffectsNone := admissionregistrationv1.SideEffectClassNone
++	matchEquivalent := admissionregistrationv1.Equivalent
++	reinvocationIfNeeded := admissionregistrationv1.IfNeededReinvocationPolicy
++	webhook := manifests.AzureWorkloadIdentityWebhook()
++	if _, err := r.CreateOrUpdate(ctx, r.client, webhook, func() error {
++		webhook.Webhooks = []admissionregistrationv1.MutatingWebhook{{
++			AdmissionReviewVersions: []string{"v1", "v1beta1"},
++			Name:                    "pod-identity-webhook.azure.mutate.io",
++			ClientConfig: admissionregistrationv1.WebhookClientConfig{
++				CABundle: []byte(r.rootCA),
++				URL:      ptr.To("https://127.0.0.1:9443/mutate-v1-pod"),
++			},
++			FailurePolicy:      &failFailurePolicy,
++			MatchPolicy:        &matchEquivalent,
++			ReinvocationPolicy: &reinvocationIfNeeded,
++			ObjectSelector: &metav1.LabelSelector{
++				MatchLabels: map[string]string{
++					"azure.workload.identity/use": "true",
++				},
++			},
++			Rules: []admissionregistrationv1.RuleWithOperations{{
++				Operations: []admissionregistrationv1.OperationType{admissionregistrationv1.Create},
++				Rule: admissionregistrationv1.Rule{
++					APIGroups:   []string{""},
++					APIVersions: []string{"v1"},
++					Resources:   []string{"pods"},
++				},
++			}},
++			SideEffects: &sideEffectsNone,
++		}}
++		return nil
++	}); err != nil {
++		errs = append(errs, fmt.Errorf("failed to reconcile %T %s: %w", webhook, webhook.Name, err))
++	}
++
++	return errs
++}
++
+ func (r *reconciler) destroyCloudResources(ctx context.Context, hcp *hyperv1.HostedControlPlane) (ctrl.Result, error) {
+ 	remaining, skipReason, err := r.ensureCloudResourcesDestroyed(ctx, hcp)
+ 
+diff --git a/test/e2e/create_cluster_test.go b/test/e2e/create_cluster_test.go
+index fdb73671393..9d949dcb814 100644
+--- a/test/e2e/create_cluster_test.go
++++ b/test/e2e/create_cluster_test.go
+@@ -2502,6 +2502,7 @@ func TestCreateCluster(t *testing.T) {
+ 
+ 		if globalOpts.Platform == hyperv1.AzurePlatform {
+ 			e2eutil.EnsureKubeAPIServerAllowedCIDRs(t, ctx, mgtClient, guestConfig, hostedCluster)
++			e2eutil.EnsureAzureWorkloadIdentityWebhookMutation(t, ctx, guestClient)
+ 		}
+ 
+ 		e2eutil.EnsureGlobalPullSecret(t, ctx, mgtClient, hostedCluster)
+diff --git a/test/e2e/util/azure.go b/test/e2e/util/azure.go
+new file mode 100644
+index 00000000000..3688317a7dc
+--- /dev/null
++++ b/test/e2e/util/azure.go
+@@ -0,0 +1,126 @@
++package util
++
++import (
++	"context"
++	"fmt"
++	"strings"
++	"testing"
++	"time"
++
++	. "github.com/onsi/gomega"
++
++	corev1 "k8s.io/api/core/v1"
++	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
++	"k8s.io/apimachinery/pkg/types"
++	"k8s.io/utils/ptr"
++
++	crclient "sigs.k8s.io/controller-runtime/pkg/client"
++)
++
++func EnsureAzureWorkloadIdentityWebhookMutation(t *testing.T, ctx context.Context, guestClient crclient.Client) {
++	t.Run("EnsureAzureWorkloadIdentityWebhookMutation", func(t *testing.T) {
++		AtLeast(t, Version422)
++		g := NewWithT(t)
++
++		nsName := fmt.Sprintf("azure-wi-e2e-%d", time.Now().UnixNano())
++		testNamespace := &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: nsName}}
++		g.Expect(guestClient.Create(ctx, testNamespace)).To(Succeed(), "failed to create test namespace")
++
++		serviceAccount := &corev1.ServiceAccount{
++			ObjectMeta: metav1.ObjectMeta{
++				Name:      "azure-wi-test-sa",
++				Namespace: nsName,
++				Annotations: map[string]string{
++					"azure.workload.identity/client-id": "00000000-0000-0000-0000-000000000000",
++				},
++			},
++		}
++		g.Expect(guestClient.Create(ctx, serviceAccount)).To(Succeed(), "failed to create test service account")
++
++		pod := &corev1.Pod{
++			ObjectMeta: metav1.ObjectMeta{
++				Name:      "azure-wi-webhook-test-pod",
++				Namespace: nsName,
++				Labels: map[string]string{
++					"azure.workload.identity/use": "true",
++				},
++			},
++			Spec: corev1.PodSpec{
++				ServiceAccountName: serviceAccount.Name,
++				SecurityContext: &corev1.PodSecurityContext{
++					RunAsNonRoot: ptr.To(true),
++					SeccompProfile: &corev1.SeccompProfile{
++						Type: corev1.SeccompProfileTypeRuntimeDefault,
++					},
++				},
++				Containers: []corev1.Container{
++					{
++						Name:    "app",
++						Image:   "registry.k8s.io/pause:3.10",
++						Command: []string{"/pause"},
++						SecurityContext: &corev1.SecurityContext{
++							AllowPrivilegeEscalation: ptr.To(false),
++							Capabilities: &corev1.Capabilities{
++								Drop: []corev1.Capability{"ALL"},
++							},
++						},
++					},
++				},
++				RestartPolicy: corev1.RestartPolicyNever,
++			},
++		}
++		g.Expect(guestClient.Create(ctx, pod)).To(Succeed(), "failed to create pod for webhook mutation test")
++
++		EventuallyObject(
++			t,
++			ctx,
++			"Azure workload identity webhook to mutate test pod",
++			func(ctx context.Context) (*corev1.Pod, error) {
++				mutatedPod := &corev1.Pod{}
++				err := guestClient.Get(ctx, types.NamespacedName{Name: pod.Name, Namespace: pod.Namespace}, mutatedPod)
++				return mutatedPod, err
++			},
++			[]Predicate[*corev1.Pod]{
++				func(mutatedPod *corev1.Pod) (bool, string, error) {
++					if hasProjectedTokenVolume(mutatedPod.Spec.Volumes) {
++						return true, "", nil
++					}
++					return false, "expected projected service account token volume to be injected", nil
++				},
++				func(mutatedPod *corev1.Pod) (bool, string, error) {
++					if hasAzureFederatedTokenEnv(mutatedPod.Spec.Containers) {
++						return true, "", nil
++					}
++					return false, "expected AZURE_FEDERATED_TOKEN_FILE env var in pod containers", nil
++				},
++			},
++			WithTimeout(3*time.Minute),
++			WithInterval(5*time.Second),
++		)
++	})
++}
++
++func hasProjectedTokenVolume(volumes []corev1.Volume) bool {
++	for _, volume := range volumes {
++		if volume.Name != "azure-identity-token" || volume.Projected == nil {
++			continue
++		}
++		for _, source := range volume.Projected.Sources {
++			if source.ServiceAccountToken != nil {
++				return true
++			}
++		}
++	}
++	return false
++}
++
++func hasAzureFederatedTokenEnv(containers []corev1.Container) bool {
++	for _, container := range containers {
++		for _, env := range container.Env {
++			if env.Name == "AZURE_FEDERATED_TOKEN_FILE" && strings.HasPrefix(env.Value, "/var/run/secrets/azure/tokens/") {
++				return true
++			}
++		}
++	}
++	return false
++}

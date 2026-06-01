@@ -1,0 +1,121 @@
+diff --git a/bindata/network/ovn-kubernetes/common/008-script-lib.yaml b/bindata/network/ovn-kubernetes/common/008-script-lib.yaml
+index 96a70613db..a4a2480db3 100644
+--- a/bindata/network/ovn-kubernetes/common/008-script-lib.yaml
++++ b/bindata/network/ovn-kubernetes/common/008-script-lib.yaml
+@@ -537,6 +537,9 @@ data:
+       # Ensure openflow_probe_flag is always defined
+       openflow_probe_flag=
+ 
++      # Ensure allow_icmp_network_policy_flag is always defined
++      allow_icmp_network_policy_flag=
++
+       if [[ $# -ne 3 ]]; then
+         echo "Expected three arguments but got $#"
+         exit 1
+@@ -705,6 +708,10 @@ data:
+         openflow_probe_flag="--openflow-probe={{.OpenFlowProbe}}"
+       fi
+ 
++      if [[ "{{.AllowICMPNetworkPolicy}}" != "" ]]; then
++        allow_icmp_network_policy_flag="--allow-icmp-network-policy={{.AllowICMPNetworkPolicy}}"
++      fi
++
+       NETWORK_NODE_IDENTITY_ENABLE=
+       if [[ "{{.NETWORK_NODE_IDENTITY_ENABLE}}" == "true" ]]; then
+         NETWORK_NODE_IDENTITY_ENABLE="
+@@ -775,6 +782,7 @@ data:
+         ${ip_forwarding_flag} \
+         ${ovn_advertised_udn_isolation_mode_flag} \
+         ${openflow_probe_flag} \
++        ${allow_icmp_network_policy_flag} \
+         ${NETWORK_NODE_IDENTITY_ENABLE} \
+         ${ovn_v4_join_subnet_opt} \
+         ${ovn_v6_join_subnet_opt} \
+diff --git a/pkg/network/ovn_kubernetes.go b/pkg/network/ovn_kubernetes.go
+index 9ae07d1b73..52fdcc4d4f 100644
+--- a/pkg/network/ovn_kubernetes.go
++++ b/pkg/network/ovn_kubernetes.go
+@@ -189,6 +189,17 @@ func renderOVNKubernetes(conf *operv1.NetworkSpec, bootstrapResult *bootstrap.Bo
+ 			}
+ 		}
+ 	}
++	data.Data["AllowICMPNetworkPolicy"] = ""
++	if raw, ok := bootstrapResult.OVN.OVNKubernetesConfig.ConfigOverrides["allow-icmp-network-policy"]; ok {
++		allowICMPNetworkPolicy := strings.TrimSpace(raw)
++		if allowICMPNetworkPolicy != "" {
++			if _, err := strconv.ParseBool(allowICMPNetworkPolicy); err != nil {
++				klog.Warningf("Ignoring invalid allow-icmp-network-policy override %q: expected boolean", raw)
++			} else {
++				data.Data["AllowICMPNetworkPolicy"] = allowICMPNetworkPolicy
++			}
++		}
++	}
+ 
+ 	if conf.Migration != nil {
+ 		if conf.Migration.MTU != nil {
+diff --git a/pkg/network/ovn_kubernetes_test.go b/pkg/network/ovn_kubernetes_test.go
+index 87ae5e833b..f950bf3f19 100644
+--- a/pkg/network/ovn_kubernetes_test.go
++++ b/pkg/network/ovn_kubernetes_test.go
+@@ -4338,6 +4338,61 @@ func TestRenderOVNKubernetes_OpenFlowProbeOverride(t *testing.T) {
+ 	})
+ }
+ 
++func TestRenderOVNKubernetes_AllowICMPNetworkPolicyOverride(t *testing.T) {
++	g := NewGomegaWithT(t)
++
++	crd := OVNKubernetesConfig.DeepCopy()
++	config := &crd.Spec
++	fillDefaults(config, nil)
++
++	renderWithOverrides := func(overrides map[string]string) string {
++		bootstrapResult := fakeBootstrapResult()
++		bootstrapResult.OVN = bootstrap.OVNBootstrapResult{
++			ControlPlaneReplicaCount: 3,
++			OVNKubernetesConfig: &bootstrap.OVNConfigBoostrapResult{
++				DpuHostModeLabel:     OVN_NODE_SELECTOR_DEFAULT_DPU_HOST,
++				DpuModeLabel:         OVN_NODE_SELECTOR_DEFAULT_DPU,
++				SmartNicModeLabel:    OVN_NODE_SELECTOR_DEFAULT_SMART_NIC,
++				MgmtPortResourceName: "",
++				HyperShiftConfig: &bootstrap.OVNHyperShiftBootstrapResult{
++					Enabled: false,
++				},
++				ConfigOverrides: overrides,
++			},
++		}
++		featureGatesCNO := getDefaultFeatureGates()
++		fakeClient := cnofake.NewFakeClient()
++
++		objs, _, err := renderOVNKubernetes(config, bootstrapResult, manifestDirOvn, fakeClient, featureGatesCNO)
++		g.Expect(err).NotTo(HaveOccurred())
++		return extractOVNScriptLib(g, objs)
++	}
++
++	t.Run("with allow-icmp-network-policy override", func(t *testing.T) {
++		ovnkubeScriptLib := renderWithOverrides(map[string]string{"allow-icmp-network-policy": "true"})
++		g.Expect(ovnkubeScriptLib).To(ContainSubstring(`
++  if [[ "true" != "" ]]; then
++    allow_icmp_network_policy_flag="--allow-icmp-network-policy=true"
++  fi`))
++	})
++
++	t.Run("without allow-icmp-network-policy override", func(t *testing.T) {
++		ovnkubeScriptLib := renderWithOverrides(nil)
++		g.Expect(ovnkubeScriptLib).To(ContainSubstring(`
++  if [[ "" != "" ]]; then
++    allow_icmp_network_policy_flag="--allow-icmp-network-policy="
++  fi`))
++	})
++
++	t.Run("with invalid allow-icmp-network-policy override", func(t *testing.T) {
++		ovnkubeScriptLib := renderWithOverrides(map[string]string{"allow-icmp-network-policy": "-60"})
++		g.Expect(ovnkubeScriptLib).To(ContainSubstring(`
++  if [[ "" != "" ]]; then
++    allow_icmp_network_policy_flag="--allow-icmp-network-policy="
++  fi`))
++	})
++}
++
+ func TestOVNKubernetesControlPlaneFlags(t *testing.T) {
+ 	g := NewGomegaWithT(t)
+ 

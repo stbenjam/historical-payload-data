@@ -1,0 +1,454 @@
+diff --git a/web/cypress.config.ts b/web/cypress.config.ts
+index 99f391490..add189f0c 100644
+--- a/web/cypress.config.ts
++++ b/web/cypress.config.ts
+@@ -52,6 +52,7 @@ export default defineConfig({
+     typeDelay: 200,
+   },
+   fixturesFolder: 'cypress/fixtures',
++  pageLoadTimeout: 60000,
+   defaultCommandTimeout: 80000, //due to performance loading issue on console
+   readyTimeoutMilliseconds: 120000,
+   installTimeoutMilliseconds: 600000,
+diff --git a/web/cypress/e2e/incidents/01.incidents.cy.ts b/web/cypress/e2e/incidents/01.incidents.cy.ts
+index b1819ec35..29fdd6109 100644
+--- a/web/cypress/e2e/incidents/01.incidents.cy.ts
++++ b/web/cypress/e2e/incidents/01.incidents.cy.ts
+@@ -2,13 +2,11 @@
+ The test verifies the basic functionality of the Incidents page and serves
+ as a verification that the Incidents View is working as expected.
+ 
+-Currently, it depends on an alert being present in the cluster.
+-In the future, mocking requests / injecting alerts should be considered.
+-Natural creation of the alert is done in the 00.coo_incidents_e2e.cy.ts test, 
+-but takes significant time.
++All tests use mocked data. Tests 1-3 use a default fixture (incident content
++is irrelevant for toolbar/filter verification). Tests 4-5 switch mocks
++mid-test for empty state and traversal scenarios.
+ */
+ 
+-import { commonPages } from '../../views/common';
+ import { incidentsPage } from '../../views/incidents-page';
+ 
+ const MCP = {
+@@ -26,24 +24,13 @@ const MP = {
+   operatorName: 'Cluster Monitoring Operator',
+ };
+ 
+-const ALERTNAME = 'Watchdog';
+-const NAMESPACE = 'openshift-monitoring';
+-const SEVERITY = 'Critical';
+-const ALERT_DESC = 'This is an alert meant to ensure that the entire alerting pipeline is functional. This alert is always firing, therefore it should always be firing in Alertmanager and always fire against a receiver. There are integrations with various notification mechanisms that send a notification when this alert is not firing. For example the "DeadMansSnitch" integration in PagerDuty.'
+-const ALERT_SUMMARY = 'An alert that should always be firing to certify that Alertmanager is working properly.'
+ describe('BVT: Incidents - UI', { tags: ['@smoke', '@incidents'] }, () => {
+   before(() => {
+     cy.beforeBlockCOO(MCP, MP, { dashboards: false, troubleshootingPanel: false });
++    cy.mockIncidentFixture('incident-scenarios/1-single-incident-firing-critical-and-warning-alerts.yaml');
+   });
+ 
+ 
+-  beforeEach(() => {
+-    cy.log('Navigate to Observe → Incidents');
+-    incidentsPage.goTo();
+-    // Temporary workaround for testing against locally built instances.
+-    cy.transformMetrics();
+-  });
+-
+   it('1. Admin perspective - Incidents page - Toolbar and charts toggle functionality', () => {
+     cy.log('1.1 Verify toolbar and toggle charts button');
+     incidentsPage.elements.toolbar().should('be.visible');
+@@ -80,14 +67,14 @@ describe('BVT: Incidents - UI', { tags: ['@smoke', '@incidents'] }, () => {
+     cy.log('4.1 Verify chart titles are visible');
+     incidentsPage.elements.incidentsChartTitle().should('be.visible');
+     incidentsPage.elements.alertsChartTitle().should('be.visible');
+-    
+     cy.log('4.2 Verify alerts chart shows empty state');
+     incidentsPage.elements.alertsChartEmptyState().should('exist');
+   });
+ 
+   it('5. Admin perspective - Incidents page - Traverse Incident Table', () => {
++    incidentsPage.goTo();
++
+     cy.log('5.1 Traverse incident table');
+-    incidentsPage.clearAllFilters();
+     cy.mockIncidents([]);
+     incidentsPage.findIncidentWithAlert('TargetAlert').should('be.false');
+ 
+@@ -95,9 +82,8 @@ describe('BVT: Incidents - UI', { tags: ['@smoke', '@incidents'] }, () => {
+     cy.mockIncidentFixture('incident-scenarios/1-single-incident-firing-critical-and-warning-alerts.yaml');
+     incidentsPage.findIncidentWithAlert('TargetAlert').should('be.false');
+ 
+-    incidentsPage.clearAllFilters
+     cy.log('5.3 Verify traversing incident table works when the alert is present');
+     cy.mockIncidentFixture('incident-scenarios/6-multi-incident-target-alert-scenario.yaml');
+-    incidentsPage.findIncidentWithAlert('TargetAlert').should('be.true');    
++    incidentsPage.findIncidentWithAlert('TargetAlert').should('be.true');
+   });
+ });
+\ No newline at end of file
+diff --git a/web/cypress/e2e/incidents/regression/01.reg_filtering.cy.ts b/web/cypress/e2e/incidents/regression/01.reg_filtering.cy.ts
+index 200b4e9fc..c69542ed7 100644
+--- a/web/cypress/e2e/incidents/regression/01.reg_filtering.cy.ts
++++ b/web/cypress/e2e/incidents/regression/01.reg_filtering.cy.ts
+@@ -32,8 +32,6 @@ describe('Regression: Incidents Filtering', { tags: ['@incidents'] }, () => {
+   });
+ 
+   beforeEach(() => {
+-    cy.log('Navigate to Observe → Incidents');
+-    incidentsPage.goTo();
+     cy.log('Setting up comprehensive filtering test scenarios');
+     cy.mockIncidentFixture('incident-scenarios/7-comprehensive-filtering-test-scenarios.yaml');
+   });
+diff --git a/web/cypress/e2e/incidents/regression/02.reg_ui_charts_comprehensive.cy.ts b/web/cypress/e2e/incidents/regression/02.reg_ui_charts_comprehensive.cy.ts
+index 34dc9f386..447b3838b 100644
+--- a/web/cypress/e2e/incidents/regression/02.reg_ui_charts_comprehensive.cy.ts
++++ b/web/cypress/e2e/incidents/regression/02.reg_ui_charts_comprehensive.cy.ts
+@@ -92,7 +92,6 @@ describe('Regression: Charts UI - Comprehensive', { tags: ['@incidents'] }, () =
+   });
+ 
+   beforeEach(() => {
+-    incidentsPage.goTo();
+     cy.mockIncidentFixture('incident-scenarios/12-charts-ui-comprehensive.yaml');
+   });
+ 
+diff --git a/web/cypress/e2e/incidents/regression/03-04.reg_e2e_firing_alerts.cy.ts b/web/cypress/e2e/incidents/regression/03-04.reg_e2e_firing_alerts.cy.ts
+index 55af0c584..a6537df66 100644
+--- a/web/cypress/e2e/incidents/regression/03-04.reg_e2e_firing_alerts.cy.ts
++++ b/web/cypress/e2e/incidents/regression/03-04.reg_e2e_firing_alerts.cy.ts
+@@ -36,11 +36,13 @@ const MP = {
+ describe('Regression: Time-Based Alert Resolution (E2E with Firing Alerts)', { tags: ['@incidents', '@slow', '@e2e-real'] }, () => {
+   let currentAlertName: string;
+ 
++
+   before(() => {
+     cy.beforeBlockCOO(MCP, MP, { dashboards: false, troubleshootingPanel: false });
+     
+-    cy.log('Create or reuse firing alert for testing');
+-    cy.createKubePodCrashLoopingAlert('TimeBasedResolution2').then((alertName) => {
++    cy.log('Create firing alert for testing');
++    cy.cleanupIncidentPrometheusRules();
++    cy.createKubePodCrashLoopingAlert().then((alertName) => {
+       currentAlertName = alertName;
+       cy.log(`Test will monitor alert: ${currentAlertName}`);
+     });
+@@ -50,6 +52,7 @@ describe('Regression: Time-Based Alert Resolution (E2E with Firing Alerts)', { t
+   it('1. Section 3.3 - Alert not incorrectly marked as resolved after time passes', () => {
+     cy.log('1.1 Navigate to Incidents page and clear filters');
+     incidentsPage.goTo();
++    cy.wait(10000);
+     incidentsPage.clearAllFilters();
+     
+     const intervalMs = 60_000;
+@@ -161,6 +164,7 @@ describe('Regression: Time-Based Alert Resolution (E2E with Firing Alerts)', { t
+   it('2. Section 4.7 - Prometheus query end time updates to current time on filter refresh', () => {
+     cy.log('2.1 Navigate to Incidents page and clear filters');
+     incidentsPage.goTo();
++    cy.wait(10000);
+     incidentsPage.clearAllFilters();
+ 
+     cy.log('2.2 Capture initial page load time');
+@@ -262,6 +266,7 @@ describe('Regression: Time-Based Alert Resolution (E2E with Firing Alerts)', { t
+   it('3. Verify alert lifecycle - alert continues firing throughout test', () => {
+     cy.log('3.1 Navigate to Incidents page');
+     incidentsPage.goTo();
++    cy.wait(10000);
+     incidentsPage.clearAllFilters();
+ 
+     cy.log('3.2 Search for and select incident with custom alert');
+diff --git a/web/cypress/e2e/incidents/regression/03.reg_api_calls.cy.ts b/web/cypress/e2e/incidents/regression/03.reg_api_calls.cy.ts
+index cb91c1e3f..3d29c5f32 100644
+--- a/web/cypress/e2e/incidents/regression/03.reg_api_calls.cy.ts
++++ b/web/cypress/e2e/incidents/regression/03.reg_api_calls.cy.ts
+@@ -33,8 +33,6 @@ describe('Regression: Silences Not Applied Correctly', { tags: ['@incidents'] },
+   });
+ 
+   beforeEach(() => {
+-    cy.log('Navigate to Observe → Incidents');
+-    incidentsPage.goTo();
+     cy.log('Setting up silenced alerts mixed scenario');
+     cy.mockIncidentFixture('incident-scenarios/9-silenced-alerts-mixed-scenario.yaml');
+   });
+diff --git a/web/cypress/e2e/incidents/regression/04.reg_redux_effects.cy.ts b/web/cypress/e2e/incidents/regression/04.reg_redux_effects.cy.ts
+index dec7b90b1..aa06dd737 100644
+--- a/web/cypress/e2e/incidents/regression/04.reg_redux_effects.cy.ts
++++ b/web/cypress/e2e/incidents/regression/04.reg_redux_effects.cy.ts
+@@ -37,8 +37,6 @@ describe('Regression: Redux State Management', { tags: ['@incidents', '@incident
+   });
+ 
+   beforeEach(() => {
+-    cy.log('Navigate to Observe → Incidents');
+-    incidentsPage.goTo();
+     cy.log('Setting up comprehensive filtering test scenarios');
+     cy.mockIncidentFixture('incident-scenarios/7-comprehensive-filtering-test-scenarios.yaml');
+   });
+@@ -144,10 +142,8 @@ describe('Regression: Redux State Management', { tags: ['@incidents', '@incident
+   it('3. Adding filter when incident selected should not remove the incident ID filter', () => {
+     cy.log('3.1 Clear all filters and ensure critical incidents exist');
+     incidentsPage.clearAllFilters();
+-    
+     cy.log('3.2 Apply critical severity filter');
+     incidentsPage.toggleFilter('Critical');
+-    
+     incidentsPage.elements.incidentsChartBarsGroups().should('have.length.greaterThan', 0);
+     
+     cy.log('3.3 Click on the first critical incident to select it by ID');
+@@ -161,9 +157,12 @@ describe('Regression: Redux State Management', { tags: ['@incidents', '@incident
+     cy.log('3.5 Verify both Critical and Incident ID chips are present');
+     incidentsPage.elements.filterChipValue('Critical').should('be.visible');
+     incidentsPage.elements.incidentIdFilterChip().should('be.visible');
+-    
++  
+     cy.log('3.6 Deselect Critical and Apply Warning filter (which does not match the critical incident)');
++    cy.wait(500);
+     incidentsPage.toggleFilter('Critical');
++    incidentsPage.elements.filterChipValue('Critical').should('not.exist');
++
+     incidentsPage.toggleFilter('Warning');
+     
+     cy.log('3.7 Verify incident is filtered out (no bars visible)');
+@@ -177,7 +176,9 @@ describe('Regression: Redux State Management', { tags: ['@incidents', '@incident
+     cy.log('SUCCESS: Incident ID filter was not removed when non-matching severity filter was added');
+     
+     cy.log('3.9 Remove Warning filter and verify incident reappears');
+-    incidentsPage.toggleFilter('Warning');
++    // Legacy path for quick rollback:
++    // incidentsPage.toggleFilter('Warning');
++    incidentsPage.deselectFilterValue('Warning');
+     
+     cy.log('3.10 With only Incident ID filter, incident should be visible again');
+     incidentsPage.elements.incidentsChartBarsGroups().should('have.length', 1);
+diff --git a/web/cypress/support/incidents_prometheus_query_mocks/prometheus-mocks.ts b/web/cypress/support/incidents_prometheus_query_mocks/prometheus-mocks.ts
+index bf35bb09d..ff77979d5 100644
+--- a/web/cypress/support/incidents_prometheus_query_mocks/prometheus-mocks.ts
++++ b/web/cypress/support/incidents_prometheus_query_mocks/prometheus-mocks.ts
+@@ -1,6 +1,7 @@
+ import { IncidentDefinition, PrometheusResponse, IncidentScenarioFixture } from './types';
+ import { createIncidentMock, createAlertDetailsMock } from './mock-generators';
+ import { convertFixtureToIncidents, parseYamlFixture } from './schema/fixture-converter';
++import { incidentsPage } from '../../views/incidents-page';
+ 
+ declare global {
+   namespace Cypress {
+@@ -63,9 +64,15 @@ export function mockPrometheusQueryRange(incidents: IncidentDefinition[]): void
+       console.log(`Responding with ${results.length} incident alerts from ${incidents.length} incidents`);
+       req.reply(response);
+ 
+-  });
++  }).as('prometheusQueryMock');
+ }
+ 
++/**
++ * Mock commands: register intercepts and navigate via goTo() to trigger a fresh data fetch.
++ * Using SPA navigation instead of cy.reload() avoids the dynamic-plugin chunk loading
++ * race condition that causes flaky empty-page failures in headless CI.
++ */
++
+ Cypress.Commands.add('mockIncidents', (incidents: IncidentDefinition[]) => {
+   cy.log(`=== SETTING UP INCIDENT MOCKING (${incidents.length} incidents) ===`);
+   if (!Array.isArray(incidents)) {
+@@ -81,8 +88,7 @@ Cypress.Commands.add('mockIncidents', (incidents: IncidentDefinition[]) => {
+ 
+   cy.log(`=== SETTING UP INCIDENT MOCKING (${incidents.length} incidents) ===`);
+   mockPrometheusQueryRange(incidents);
+-  // The mocking is not applied until the page is reloaded and the components fetch the new data
+-  cy.reload();
++  incidentsPage.goTo();
+ });
+ 
+ Cypress.Commands.add('mockIncidentFixture', (fixturePath: string) => {
+@@ -101,9 +107,8 @@ Cypress.Commands.add('mockIncidentFixture', (fixturePath: string) => {
+     });
+   }
+ 
+-
+-  // The mocking is not applied until the page is reloaded and the components fetch the new data
+-  cy.reload();
++  incidentsPage.goTo();
++  cy.wait('@prometheusQueryMock', { timeout: 30000 });
+ });
+ 
+ Cypress.Commands.add('transformMetrics', () => {
+diff --git a/web/cypress/views/incidents-page.ts b/web/cypress/views/incidents-page.ts
+index 92cd8ca92..4142a63d3 100644
+--- a/web/cypress/views/incidents-page.ts
++++ b/web/cypress/views/incidents-page.ts
+@@ -154,42 +154,131 @@ export const incidentsPage = {
+     cy.log('incidentsPage.goTo');
+     nav.sidenav.clickNavLink(['Observe', 'Alerting']);
+     nav.tabs.switchTab('Incidents');
+-
++    incidentsPage.elements.daysSelectToggle().should('be.visible');
+   },
+ 
+   setDays: (value: '1 day' | '3 days' | '7 days' | '15 days') => {
+     cy.log('incidentsPage.setDays');
+-
+     incidentsPage.elements.daysSelectToggle().scrollIntoView().click();
+     const dayKey = value.replace(' ', '-');
+     cy.byTestID(`${DataTestIDs.IncidentsPage.DaysSelectOption}-${dayKey}`).should('be.visible').click();
+     incidentsPage.elements.daysSelectToggle().should('contain.text', value);
+   },
+ 
++  toggleFilterValueFromDropdown: (
++    kind: 'severity' | 'state',
++    name: 'Critical' | 'Warning' | 'Informative' | 'Firing' | 'Resolved',
++  ) => {
++    const listSelector = kind === 'severity'
++      ? `[data-test="${DataTestIDs.IncidentsPage.FiltersSelectList}-severity"]`
++      : `[data-test="${DataTestIDs.IncidentsPage.FiltersSelectList}-state"]`;
++
++    if (kind === 'severity') {
++      incidentsPage.elements.severityFilterToggle().click();
++      incidentsPage.elements.severityFilterList().should('be.visible');
++      cy.wait(250);
++      incidentsPage.elements.severityFilterOption(name as 'Critical' | 'Warning' | 'Informative').click();
++    } else {
++      incidentsPage.elements.stateFilterToggle().click();
++      incidentsPage.elements.stateFilterList().should('be.visible');
++      cy.wait(250);
++      incidentsPage.elements.stateFilterOption(name as 'Firing' | 'Resolved').click();
++    }
++
++    // Always close the dropdown after selection and give the UI a moment to settle.
++    cy.get('body').type('{esc}');
++    cy.wait(250);
++    cy.get('body').then(($updatedBody) => {
++      expect($updatedBody.find(listSelector).filter(':visible').length).to.equal(0);
++    });
++  },
++
++  selectFilterValue: (name: 'Critical' | 'Warning' | 'Informative' | 'Firing' | 'Resolved') => {
++    cy.log(`incidentsPage.selectFilterValue: ${name}`);
++    cy.get('body').then(($body) => {
++      const chipExists =
++        $body
++          .find(`[data-test="${DataTestIDs.IncidentsPage.Toolbar}"] span`)
++          .filter((_, element) => Cypress.$(element).text().trim() === name).length > 0;
++
++      if (!chipExists) {
++        incidentsPage.toggleFilter(name);
++      }
++
++      incidentsPage.elements.filterChipValue(name).should('be.visible');
++    });
++  },
++
++  deselectFilterValue: (name: 'Critical' | 'Warning' | 'Informative' | 'Firing' | 'Resolved') => {
++    cy.log(`incidentsPage.deselectFilterValue: ${name}`);
++    const chipSelector = `[data-test="${DataTestIDs.IncidentsPage.Toolbar}"] span`;
++    const isChipPresent = ($body: JQuery<HTMLElement>) =>
++      $body.find(chipSelector).filter((_, element) => Cypress.$(element).text().trim() === name).length > 0;
++
++    cy.get('body').then(($body) => {
++      if (!isChipPresent($body)) {
++        incidentsPage.elements.toolbar().should('not.contain.text', name);
++        return;
++      }
++
++      const attemptDeselect = (attempt: number) => {
++        cy.log(`Deselecting "${name}" via dropdown (attempt ${attempt})`);
++        incidentsPage.toggleFilter(name);
++
++        return cy.get('body').then(($updatedBody) => {
++          if (!isChipPresent($updatedBody)) {
++            incidentsPage.elements.toolbar().should('not.contain.text', name);
++            return cy.wrap(undefined);
++          }
++
++          if (attempt >= 2) {
++            throw new Error(`Failed to deselect "${name}" via dropdown after ${attempt} attempts`);
++          }
++
++          cy.log(
++            `Retrying deselection for "${name}" because option click was visible but selection state did not change`,
++          );
++          return attemptDeselect(attempt + 1);
++        });
++      };
++
++      return attemptDeselect(1);
++    });
++  },
++
+   toggleFilter: (name: 'Critical' | 'Warning' | 'Informative' | 'Firing' | 'Resolved') => {
+     cy.log('incidentsPage.toggleFilter');
+     
+-    // Determine filter type based on the filter name
+     const isSeverityFilter = ['Critical', 'Warning', 'Informative'].includes(name);
+     const filterType = isSeverityFilter ? 'Severity' : 'State';
+-    
+-    // Step 1: Select filter type if not already selected
+-    incidentsPage.elements.filtersSelectToggle().click();
+-    incidentsPage.elements.filtersSelectOption(filterType).click();
+-    
+-    // Step 2: Select the specific filter value
+-    if (isSeverityFilter) {
+-      incidentsPage.elements.severityFilterToggle().click();
+-      incidentsPage.elements.severityFilterOption(name).click();
+-    } else {
+-      incidentsPage.elements.stateFilterToggle().click();
+-      incidentsPage.elements.stateFilterOption(name).click();
+-    }
++    const valueToggleSelector = isSeverityFilter
++      ? `[data-test="${DataTestIDs.IncidentsPage.FiltersSelectToggle}-severity"]`
++      : `[data-test="${DataTestIDs.IncidentsPage.FiltersSelectToggle}-state"]`;
++
++    cy.wait(500);
++
++    // If the value toggle is already visible (filter type already selected), skip
++    // re-selecting the filter type. Re-selecting triggers a React re-render and can
++    // leave PatternFly Select in a stale state where options render but ignore clicks.
++    cy.get('body').then(($body) => {
++      const isToggleVisible = $body.find(valueToggleSelector).filter(':visible').length > 0;
++
++      if (!isToggleVisible) {
++        incidentsPage.elements.filtersSelectToggle().click();
++        incidentsPage.elements.filtersSelectOption(filterType).click();
++      }
++
++      if (isSeverityFilter) {
++        incidentsPage.toggleFilterValueFromDropdown('severity', name);
++      } else {
++        incidentsPage.toggleFilterValueFromDropdown('state', name);
++      }
++    });
+   },
+ 
+   clearAllFilters: () => {
+     cy.log('incidentsPage.clearAllFilters');
+-    incidentsPage.elements.clearAllFiltersButton().click({ force: true });
++    incidentsPage.elements.clearAllFiltersButton().should('be.visible').click({ force: true });
+   },
+ 
+   removeFilter: (category: 'Severity' | 'State' | 'Incident ID', value: string) => {
+@@ -239,8 +328,6 @@ export const incidentsPage = {
+           .click({ force: true });
+       })
+       .then(() => {
+-        // The incident table loads the alerts for the previous incident first, then hides them and shows the alerts for the new incident
+-        // This is why we need to wait for 2 seconds and can not use should or conditional testing semantics
+         cy.wait(2000);
+         return incidentsPage.elements.incidentsTable()
+           .scrollIntoView()
+@@ -413,7 +500,7 @@ export const incidentsPage = {
+ 
+   prepareIncidentsPageForSearch: () => {
+     cy.log('incidentsPage.prepareIncidentsPageForSearch: Setting up page for search');
+-    cy.reload();
++    incidentsPage.goTo();
+     incidentsPage.setDays(incidentsPage.SEARCH_CONFIG.DEFAULT_DAYS);
+     incidentsPage.elements.incidentsChartContainer().should('be.visible');
+     cy.wait(incidentsPage.SEARCH_CONFIG.CHART_LOAD_WAIT);
+diff --git a/web/cypress/views/nav.ts b/web/cypress/views/nav.ts
+index b4543083e..16fab1abc 100644
+--- a/web/cypress/views/nav.ts
++++ b/web/cypress/views/nav.ts
+@@ -40,7 +40,7 @@ export const nav = {
+      * @param tabname - The name of the tab to switch to
+      */
+     switchTab: (tabname: string) => {
+-      cy.get(Classes.HorizontalNav).contains(tabname).should('be.visible').click();
++      cy.get(Classes.HorizontalNav).contains(tabname).should('be.visible').click({force: true});
+       cy.wait(2000);
+   }
+ }

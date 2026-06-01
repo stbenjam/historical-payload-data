@@ -1,0 +1,390 @@
+diff --git a/Makefile b/Makefile
+index 5dd3e593a..bccdd984a 100644
+--- a/Makefile
++++ b/Makefile
+@@ -71,9 +71,15 @@ TEST_DIRS ?= ./pkg/... ./manifests-gen/...
+ unit: .localtestenv ## Run unit tests
+ 	./hack/test.sh "$(TEST_DIRS)" 20m
+ 
++.PHONY: test-e2e-diagnostics
++test-e2e-diagnostics: ## Run e2e diagnostics unit tests (no cluster required)
++	go test -count=1 -race -run TestDiagnostics ./e2e/...
++
+ .PHONY: e2e
+ e2e: ## Run e2e tests against active kubeconfig
+-	./hack/test.sh "./e2e/..." 120m
++	# --tags=e2e excludes e2e_diagnostics_test.go (//go:build !e2e) which
++	# runs separately via test-e2e-diagnostics without a cluster.
++	GINKGO_EXTRA_ARGS="--tags=e2e $(GINKGO_EXTRA_ARGS)" ./hack/test.sh "./e2e/..." 120m
+ 
+ run: ## Run the operator against the configured Kubernetes cluster
+ 	oc -n openshift-cluster-api patch lease cluster-capi-operator-leader -p '{"spec":{"acquireTime": null, "holderIdentity": null, "renewTime": null}}' --type=merge
+diff --git a/e2e/e2e_common.go b/e2e/e2e_common.go
+index 4482c876c..03cda1c31 100644
+--- a/e2e/e2e_common.go
++++ b/e2e/e2e_common.go
+@@ -113,44 +113,40 @@ func trackResource(obj client.Object) {
+ 	resourcesUnderTest = append(resourcesUnderTest, obj)
+ }
+ 
+-// dumpTrackedResources writes detailed diagnostics for each tracked resource
+-// to GinkgoWriter. For each resource it fetches current state, marshals it as
++// collectTrackedResourceDiagnostics builds a diagnostics string for each
++// tracked resource. For each resource it fetches current state, marshals it as
+ // YAML, and lists events specific to that object. It also dumps all
+ // AWSMachineTemplates (on AWS) and all events in both namespaces.
+-// Best-effort: panics are recovered and individual errors are logged without
+-// aborting the dump.
+-func dumpTrackedResources() {
++func collectTrackedResourceDiagnostics(parentCtx context.Context) (result string) {
++	var buf strings.Builder
+ 	defer func() {
+ 		if r := recover(); r != nil {
+-			GinkgoWriter.Printf("WARNING: dumpTrackedResources panicked: %v\n", r)
++			fmt.Fprintf(&buf, "\n--- diagnostics collection panicked: %v ---\n", r)
+ 		}
++
++		buf.WriteString("\n=== End Test Failure Diagnostics ===\n")
++		result = buf.String()
+ 	}()
+ 
+-	var buf strings.Builder
++	diagCtx, cancel := context.WithTimeout(parentCtx, 5*time.Minute)
++	defer cancel()
++
+ 	buf.WriteString("\n=== Test Failure Diagnostics ===\n")
+ 
+ 	for _, obj := range resourcesUnderTest {
+-		dumpSingleResource(&buf, obj)
++		dumpSingleResource(diagCtx, &buf, obj)
+ 	}
+ 
+ 	if platform == configv1.AWSPlatformType {
+-		dumpAllAWSMachineTemplates(&buf)
++		dumpAllAWSMachineTemplates(diagCtx, &buf)
+ 	}
+-	dumpNamespaceEvents(&buf, capiframework.CAPINamespace)
+-	dumpNamespaceEvents(&buf, capiframework.MAPINamespace)
+-
+-	buf.WriteString("\n=== End Test Failure Diagnostics ===\n")
++	dumpNamespaceEvents(diagCtx, &buf, capiframework.CAPINamespace)
++	dumpNamespaceEvents(diagCtx, &buf, capiframework.MAPINamespace)
+ 
+-	GinkgoWriter.Print(buf.String())
++	return buf.String()
+ }
+ 
+-func dumpSingleResource(buf *strings.Builder, obj client.Object) {
+-	defer func() {
+-		if r := recover(); r != nil {
+-			fmt.Fprintf(buf, "\n--- (panic dumping %T): %v ---\n", obj, r)
+-		}
+-	}()
+-
++func dumpSingleResource(ctx context.Context, buf *strings.Builder, obj client.Object) {
+ 	key := client.ObjectKeyFromObject(obj)
+ 	typeName := reflect.TypeOf(obj).Elem().Name()
+ 
+@@ -169,7 +165,7 @@ func dumpSingleResource(buf *strings.Builder, obj client.Object) {
+ 
+ 	fmt.Fprintf(buf, "\n--- %s %s/%s ---\n", typeName, key.Namespace, key.Name)
+ 	describeObject(buf, fresh)
+-	describeObjectEvents(buf, key)
++	describeObjectEvents(ctx, buf, key)
+ }
+ 
+ func describeObject(buf *strings.Builder, obj client.Object) {
+@@ -193,7 +189,7 @@ func describeObject(buf *strings.Builder, obj client.Object) {
+ // describeObjectEvents lists events for the given object. Matching is by name
+ // only; events for different resource kinds with the same name in the same
+ // namespace will be included.
+-func describeObjectEvents(buf *strings.Builder, key client.ObjectKey) {
++func describeObjectEvents(ctx context.Context, buf *strings.Builder, key client.ObjectKey) {
+ 	list := &corev1.EventList{}
+ 	if err := cl.List(ctx, list, client.InNamespace(key.Namespace)); err != nil {
+ 		fmt.Fprintf(buf, "  Events: error listing: %v\n", err)
+@@ -230,13 +226,7 @@ func describeObjectEvents(buf *strings.Builder, key client.ObjectKey) {
+ // dumpAllAWSMachineTemplates lists all AWSMachineTemplates in the CAPI namespace
+ // and describes each one. Templates use generated names so we list rather than
+ // trying to predict names.
+-func dumpAllAWSMachineTemplates(buf *strings.Builder) {
+-	defer func() {
+-		if r := recover(); r != nil {
+-			fmt.Fprintf(buf, "\n--- (panic dumping AWSMachineTemplates): %v ---\n", r)
+-		}
+-	}()
+-
++func dumpAllAWSMachineTemplates(ctx context.Context, buf *strings.Builder) {
+ 	list := &awsv1.AWSMachineTemplateList{}
+ 	if err := cl.List(ctx, list, client.InNamespace(capiframework.CAPINamespace)); err != nil {
+ 		fmt.Fprintf(buf, "\n--- AWSMachineTemplates: error listing: %v ---\n", err)
+@@ -254,19 +244,13 @@ func dumpAllAWSMachineTemplates(buf *strings.Builder) {
+ 		key := client.ObjectKeyFromObject(t)
+ 		fmt.Fprintf(buf, "\n  %s:\n", t.Name)
+ 		describeObject(buf, t)
+-		describeObjectEvents(buf, key)
++		describeObjectEvents(ctx, buf, key)
+ 	}
+ }
+ 
+ // dumpNamespaceEvents lists all events in a namespace. This catches events not
+ // associated with tracked resources (e.g. from controllers acting on other objects).
+-func dumpNamespaceEvents(buf *strings.Builder, namespace string) {
+-	defer func() {
+-		if r := recover(); r != nil {
+-			fmt.Fprintf(buf, "\n--- (panic dumping events in %s): %v ---\n", namespace, r)
+-		}
+-	}()
+-
++func dumpNamespaceEvents(ctx context.Context, buf *strings.Builder, namespace string) {
+ 	list := &corev1.EventList{}
+ 	if err := cl.List(ctx, list, client.InNamespace(namespace)); err != nil {
+ 		fmt.Fprintf(buf, "\n--- Events in %s: error listing: %v ---\n", namespace, err)
+diff --git a/e2e/e2e_diagnostics_test.go b/e2e/e2e_diagnostics_test.go
+new file mode 100644
+index 000000000..97ce1ad26
+--- /dev/null
++++ b/e2e/e2e_diagnostics_test.go
+@@ -0,0 +1,137 @@
++//go:build !e2e
++
++// Copyright 2026 Red Hat, Inc.
++//
++// Licensed under the Apache License, Version 2.0 (the "License");
++// you may not use this file except in compliance with the License.
++// You may obtain a copy of the License at
++//
++// 	http://www.apache.org/licenses/LICENSE-2.0
++//
++// Unless required by applicable law or agreed to in writing, software
++// distributed under the License is distributed on an "AS IS" BASIS,
++// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++// See the License for the specific language governing permissions and
++// limitations under the License.
++
++package e2e
++
++import (
++	"context"
++	"encoding/json"
++	"testing"
++
++	"github.com/onsi/ginkgo/v2/types"
++	"github.com/onsi/gomega"
++	corev1 "k8s.io/api/core/v1"
++	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
++	"k8s.io/client-go/kubernetes/scheme"
++	"sigs.k8s.io/controller-runtime/pkg/client"
++	"sigs.k8s.io/controller-runtime/pkg/client/fake"
++)
++
++// TestDiagnostics exercises the diagnostics-to-JUnit reporting logic
++// without a live cluster. Run independently via:
++//
++//	go test -run TestDiagnostics ./e2e/...
++//
++// BeforeSuite (which requires a cluster) does not fire because RunSpecs
++// is not called.
++func TestDiagnostics(t *testing.T) {
++	t.Run("live resource appears in output", func(t *testing.T) {
++		g := gomega.NewWithT(t)
++		withFakeClient(t, func() {
++			cm := &corev1.ConfigMap{
++				ObjectMeta: metav1.ObjectMeta{Name: "test-cm", Namespace: "default"},
++				Data:       map[string]string{"key": "value"},
++			}
++			g.Expect(cl.Create(ctx, cm)).To(gomega.Succeed())
++
++			resourcesUnderTest = []client.Object{cm}
++
++			diag := collectTrackedResourceDiagnostics(ctx)
++			g.Expect(diag).To(gomega.ContainSubstring("test-cm"))
++			g.Expect(diag).To(gomega.ContainSubstring("Test Failure Diagnostics"))
++		})
++	})
++
++	t.Run("deleted resource shows not found", func(t *testing.T) {
++		g := gomega.NewWithT(t)
++		withFakeClient(t, func() {
++			cm := &corev1.ConfigMap{
++				ObjectMeta: metav1.ObjectMeta{Name: "gone-cm", Namespace: "default"},
++			}
++			resourcesUnderTest = []client.Object{cm}
++
++			diag := collectTrackedResourceDiagnostics(ctx)
++			g.Expect(diag).To(gomega.ContainSubstring("not found (deleted)"))
++			g.Expect(diag).To(gomega.ContainSubstring("gone-cm"))
++		})
++	})
++
++	t.Run("diagnosticsFromReport extracts entry", func(t *testing.T) {
++		g := gomega.NewWithT(t)
++
++		diagText := "\n=== Test Failure Diagnostics ===\nsome output\n=== End Test Failure Diagnostics ===\n"
++		sr := types.SpecReport{
++			ReportEntries: types.ReportEntries{
++				{Name: diagnosticsEntryName, Value: types.WrapEntryValue(diagText)},
++			},
++		}
++
++		result, found := diagnosticsFromReport(sr)
++		g.Expect(found).To(gomega.BeTrue())
++		g.Expect(result).To(gomega.Equal(diagText))
++	})
++
++	t.Run("diagnosticsFromReport returns false when absent", func(t *testing.T) {
++		g := gomega.NewWithT(t)
++
++		sr := types.SpecReport{}
++
++		_, found := diagnosticsFromReport(sr)
++		g.Expect(found).To(gomega.BeFalse())
++	})
++
++	t.Run("diagnostics survive JSON round-trip", func(t *testing.T) {
++		g := gomega.NewWithT(t)
++
++		diagText := "\n=== Test Failure Diagnostics ===\nresource YAML here\n=== End Test Failure Diagnostics ===\n"
++		sr := types.SpecReport{
++			ReportEntries: types.ReportEntries{
++				{Name: diagnosticsEntryName, Value: types.WrapEntryValue(diagText)},
++			},
++		}
++
++		data, err := json.Marshal(sr)
++		g.Expect(err).NotTo(gomega.HaveOccurred())
++
++		var deserialized types.SpecReport
++		g.Expect(json.Unmarshal(data, &deserialized)).To(gomega.Succeed())
++
++		result, found := diagnosticsFromReport(deserialized)
++		g.Expect(found).To(gomega.BeTrue())
++		g.Expect(result).To(gomega.Equal(diagText))
++	})
++}
++
++// withFakeClient swaps the package-level cl, ctx, and test state to a fake
++// client for the duration of fn, restoring originals via t.Cleanup.
++func withFakeClient(t *testing.T, fn func()) {
++	t.Helper()
++
++	origCl, origCtx := cl, ctx
++	origResources, origPlatform := resourcesUnderTest, platform
++
++	cl = fake.NewClientBuilder().WithScheme(scheme.Scheme).Build()
++	ctx = context.Background()
++	resourcesUnderTest = nil
++	platform = ""
++
++	t.Cleanup(func() {
++		cl, ctx = origCl, origCtx
++		resourcesUnderTest, platform = origResources, origPlatform
++	})
++
++	fn()
++}
+diff --git a/e2e/e2e_test.go b/e2e/e2e_test.go
+index 491176931..ad49ef8a7 100644
+--- a/e2e/e2e_test.go
++++ b/e2e/e2e_test.go
+@@ -19,12 +19,15 @@ import (
+ 	"os"
+ 	"path/filepath"
+ 	"testing"
++	"time"
+ 
+ 	. "github.com/onsi/ginkgo/v2"
+ 	. "github.com/onsi/gomega"
+ 	"github.com/onsi/ginkgo/v2/reporters"
+ )
+ 
++const diagnosticsEntryName = "diagnostics"
++
+ func TestAPIs(t *testing.T) {
+ 	RegisterFailHandler(Fail)
+ 	RunSpecs(t, "Cluster API Suite")
+@@ -34,48 +37,67 @@ var _ = BeforeSuite(func() {
+ 	InitCommonVariables()
+ })
+ 
+-var _ = ReportAfterEach(func(report SpecReport) {
++// JustAfterEach runs before AfterEach/DeferCleanup, so tracked resources are
++// still present when we collect diagnostics for spec-body failures.
++var _ = JustAfterEach(func(ctx SpecContext) {
++	if CurrentSpecReport().Failed() {
++		AddReportEntry(diagnosticsEntryName,
++			collectTrackedResourceDiagnostics(ctx),
++			ReportEntryVisibilityNever)
++	}
++}, NodeTimeout(5*time.Minute))
++
++// ReportAfterEach catches cleanup flakes (e.g. a rogue finalizer preventing
++// deletion). Tracked resources may still exist since cleanup failed to remove
++// them.
++var _ = ReportAfterEach(func(ctx SpecContext, report SpecReport) {
+ 	if report.Failed() {
+-		dumpTrackedResources()
++		if _, found := diagnosticsFromReport(report); !found {
++			AddReportEntry(diagnosticsEntryName,
++				collectTrackedResourceDiagnostics(ctx),
++				ReportEntryVisibilityNever)
++		}
+ 	}
+ 
+ 	resourcesUnderTest = nil
+-})
++}, NodeTimeout(5*time.Minute))
+ 
+ // ReportAfterSuite generates a JUnit XML report with tracked resource
+ // diagnostics appended to the failure description. This replaces the
+ // --junit-report ginkgo flag so that Spyglass renders diagnostics inline
+ // with the failure instead of hiding them behind "open stderr".
+ var _ = ReportAfterSuite("junit with diagnostics", func(report Report) {
+-	defer func() {
+-		if r := recover(); r != nil {
+-			fmt.Fprintf(os.Stderr, "WARNING: ReportAfterSuite panicked: %v\n", r)
+-		}
+-	}()
+-
+ 	artifactDir := os.Getenv("ARTIFACT_DIR")
+ 	if artifactDir == "" {
+ 		return
+ 	}
+ 
+-	// Append GinkgoWriter output (which contains our tracked resource dump)
+-	// to the failure description so it appears in the <failure> element of
+-	// the JUnit XML, which is what Spyglass renders by default.
+ 	for i := range report.SpecReports {
+ 		sr := &report.SpecReports[i]
+ 		if !sr.Failed() {
+ 			continue
+ 		}
+ 
+-		if sr.CapturedGinkgoWriterOutput == "" {
+-			continue
++		if diag, found := diagnosticsFromReport(*sr); found {
++			sr.Failure.Message += "\n\n" + diag
+ 		}
+-
+-		sr.Failure.Message += "\n\n" + sr.CapturedGinkgoWriterOutput
+ 	}
+ 
+ 	dst := filepath.Join(artifactDir, "junit_cluster_capi_operator.xml")
+-	if err := reporters.GenerateJUnitReport(report, dst); err != nil {
++	cfg := reporters.JunitReportConfig{OmitFailureMessageAttr: true}
++	if err := reporters.GenerateJUnitReportWithConfig(report, dst, cfg); err != nil {
+ 		fmt.Fprintf(os.Stderr, "WARNING: failed to write JUnit report to %s: %v\n", dst, err)
+ 	}
+ })
++
++// diagnosticsFromReport extracts the diagnostics string from a SpecReport's
++// report entries. Returns the diagnostics and true if found.
++func diagnosticsFromReport(sr SpecReport) (string, bool) {
++	for _, entry := range sr.ReportEntries {
++		if entry.Name == diagnosticsEntryName {
++			return entry.StringRepresentation(), true
++		}
++	}
++
++	return "", false
++}

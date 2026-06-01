@@ -1,0 +1,1629 @@
+diff --git a/frontend/packages/console-app/locales/en/console-app.json b/frontend/packages/console-app/locales/en/console-app.json
+index ec500c4ffdb..01d2961a9d4 100644
+--- a/frontend/packages/console-app/locales/en/console-app.json
++++ b/frontend/packages/console-app/locales/en/console-app.json
+@@ -365,6 +365,8 @@
+   "This action cannot be undone. Deleting a node will instruct Kubernetes that the node is down or unrecoverable and delete all pods scheduled to that node. If the node is still running but unresponsive and the node is deleted, stateful workloads and persistent volumes may suffer corruption or data loss. Only delete a node that you have confirmed is completely stopped and cannot be restored.": "This action cannot be undone. Deleting a node will instruct Kubernetes that the node is down or unrecoverable and delete all pods scheduled to that node. If the node is still running but unresponsive and the node is deleted, stateful workloads and persistent volumes may suffer corruption or data loss. Only delete a node that you have confirmed is completely stopped and cannot be restored.",
+   "Mark as schedulable": "Mark as schedulable",
+   "Mark as unschedulable": "Mark as unschedulable",
++  "Mark <1>{{count}}</1> nodes as unschedulable?": "Mark <1>{{count}}</1> nodes as unschedulable?",
++  "Unschedulable nodes won't accept new pods. By blocking new pod assignments, you can isolate nodes to perform maintenance or decommission them without disrupting new traffic.": "Unschedulable nodes won't accept new pods. By blocking new pod assignments, you can isolate nodes to perform maintenance or decommission them without disrupting new traffic.",
+   "Unschedulable nodes won't accept new pods. By blocking new pod assignments, you can isolate a node to perform maintenance or decommission it without disrupting new traffic.": "Unschedulable nodes won't accept new pods. By blocking new pod assignments, you can isolate a node to perform maintenance or decommission it without disrupting new traffic.",
+   "Mark unschedulable": "Mark unschedulable",
+   "Error updating {{nodeName}}": "Error updating {{nodeName}}",
+@@ -475,6 +477,10 @@
+   "Certificate approval required": "Certificate approval required",
+   "An error occurred. Please try again": "An error occurred. Please try again",
+   "No new Pods or workloads will be placed on this Node until it's marked as schedulable.": "No new Pods or workloads will be placed on this Node until it's marked as schedulable.",
++  "Applies to {{nodeCount}} selected nodes that are currently unschedulable.": "Applies to {{nodeCount}} selected nodes that are currently unschedulable.",
++  "Mark schedulable": "Mark schedulable",
++  "Applies to {{nodeCount}} selected nodes that are currently schedulable.": "Applies to {{nodeCount}} selected nodes that are currently schedulable.",
++  "Scheduling": "Scheduling",
+   "Identity providers": "Identity providers",
+   "Mapping method": "Mapping method",
+   "Remove identity provider": "Remove identity provider",
+diff --git a/frontend/packages/console-app/src/components/data-view/ConsoleDataView.tsx b/frontend/packages/console-app/src/components/data-view/ConsoleDataView.tsx
+index 275ba39df14..71c2a9288d8 100644
+--- a/frontend/packages/console-app/src/components/data-view/ConsoleDataView.tsx
++++ b/frontend/packages/console-app/src/components/data-view/ConsoleDataView.tsx
+@@ -1,12 +1,19 @@
+ import type { FC, ReactNode } from 'react';
+-import { useCallback, useMemo, useState } from 'react';
++import { useCallback, useMemo, useState, useEffect } from 'react';
+ import './ConsoleDataView.scss';
+ import {
+   ResponsiveAction,
+   ResponsiveActions,
+   SkeletonTableBody,
+ } from '@patternfly/react-component-groups';
+-import { Bullseye, Pagination, PaginationVariant, Tooltip } from '@patternfly/react-core';
++import {
++  Banner,
++  Bullseye,
++  Button,
++  Pagination,
++  PaginationVariant,
++  Tooltip,
++} from '@patternfly/react-core';
+ import {
+   DataView,
+   DataViewFilters,
+@@ -17,7 +24,7 @@ import {
+ import { ColumnsIcon, UndoIcon } from '@patternfly/react-icons';
+ import { css } from '@patternfly/react-styles';
+ import { InnerScrollContainer, Tbody, Td, Tr } from '@patternfly/react-table';
+-import { useTranslation } from 'react-i18next';
++import { Trans, useTranslation } from 'react-i18next';
+ import type {
+   ResourceFilters,
+   ConsoleDataViewProps,
+@@ -80,6 +87,10 @@ export const ConsoleDataView = <
+   mock,
+   isResizable,
+   resetAllColumnWidths,
++  additionalActions,
++  customActions,
++  selection,
++  actionsBreakpoint = 'md',
+ }: ConsoleDataViewProps<TData, TCustomRowData, TFilters>) => {
+   const { t } = useTranslation();
+   const launchModal = useOverlay();
+@@ -100,7 +111,23 @@ export const ConsoleDataView = <
+     matchesAdditionalFilters,
+   });
+ 
+-  const { dataViewColumns, dataViewRows, pagination } = useConsoleDataViewData<
++  // Notify parent of filtered selected items when filters or selection changes
++  useEffect(() => {
++    if (selection?.onFilteredSelectionChange) {
++      const filteredSelectedItems = filteredData.filter((item) =>
++        selection.selectedItems.has(selection.getItemId(item)),
++      );
++      selection.onFilteredSelectionChange(filteredSelectedItems);
++    }
++    // eslint-disable-next-line react-hooks/exhaustive-deps -- the rule cannot statically verify optional chaining on `selection`; listing the full object would cause re-runs on every render
++  }, [
++    filteredData,
++    selection?.selectedItems,
++    selection?.getItemId,
++    selection?.onFilteredSelectionChange,
++  ]);
++
++  const { dataViewColumns, dataViewRows, pagination, visibleItems } = useConsoleDataViewData<
+     TData,
+     TCustomRowData,
+     TFilters
+@@ -113,6 +140,7 @@ export const ConsoleDataView = <
+     columnManagementID,
+     customRowData,
+     isResizable,
++    selection,
+   });
+ 
+   const bodyLoading = useMemo(() => <BodyLoading columns={dataViewColumns.length} />, [
+@@ -136,17 +164,52 @@ export const ConsoleDataView = <
+ 
+   const paginationTitles = useMemo(
+     () => ({
++      paginationAriaLabel: t('public~Pagination'),
+       ofWord: t('public~of'),
+       itemsPerPage: t('public~Items per page'),
+       perPageSuffix: t('public~per page'),
+-      toFirstPageAriaLabel: t('public~Go to first page'),
++      optionsToggleAriaLabel: t('public~Items per page'),
+       toPreviousPageAriaLabel: t('public~Go to previous page'),
+       toNextPageAriaLabel: t('public~Go to next page'),
+-      toLastPageAriaLabel: t('public~Go to last page'),
+     }),
+     [t],
+   );
+ 
++  // Calculate whether to show the "select all" banner
++  const bannerState = useMemo(() => {
++    if (!selection || !loaded || filteredData.length === 0) {
++      return { show: false, allSelected: false };
++    }
++
++    const allVisibleSelected = visibleItems.every((item) =>
++      selection.selectedItems.has(selection.getItemId(item)),
++    );
++
++    const visibleCount = visibleItems.length;
++    const totalCount = filteredData.length;
++    const selectedCount = filteredData.filter((item) =>
++      selection.selectedItems.has(selection.getItemId(item)),
++    ).length;
++
++    // Show banner if all visible items are selected and there are more items than visible
++    const shouldShow = allVisibleSelected && visibleCount > 0 && totalCount > visibleCount;
++    const allSelected = selectedCount === totalCount;
++
++    return { show: shouldShow, allSelected };
++  }, [selection, loaded, filteredData, visibleItems]);
++
++  const handleSelectAllMatching = useCallback(() => {
++    if (selection?.onSelectAll) {
++      selection.onSelectAll(true, filteredData);
++    }
++  }, [selection, filteredData]);
++
++  const handleUnselectAll = useCallback(() => {
++    if (selection?.onSelectAll) {
++      selection.onSelectAll(false, filteredData);
++    }
++  }, [selection, filteredData]);
++
+   const dataViewFilterNodes = useMemo<React.ReactNode[]>(() => {
+     const basicFilters: ReactNode[] = [];
+ 
+@@ -199,44 +262,93 @@ export const ConsoleDataView = <
+           }
+           clearAllFilters={clearAllFilters}
+           actions={
+-            <ResponsiveActions breakpoint="lg">
+-              {!hideColumnManagement && (
+-                <ResponsiveAction
+-                  isPersistent
+-                  variant="plain"
+-                  onClick={() =>
+-                    launchModal(LazyColumnManagementModalOverlay, {
+-                      columnLayout,
+-                      noLimit: true,
+-                    })
+-                  }
+-                  aria-label={t('public~Column management')}
+-                  data-test="manage-columns"
+-                >
+-                  <Tooltip content={t('public~Manage columns')} trigger="mouseenter">
+-                    <ColumnsIcon />
+-                  </Tooltip>
+-                </ResponsiveAction>
+-              )}
+-              {isResizable && resetAllColumnWidths && (
+-                <ResponsiveAction
+-                  isPersistent
+-                  variant="plain"
+-                  onClick={handleResetColumnWidths}
+-                  aria-label={t('public~Reset column widths')}
+-                  data-test="reset-column-widths"
+-                >
+-                  <Tooltip content={t('public~Reset column widths')} trigger="mouseenter">
+-                    <UndoIcon />
+-                  </Tooltip>
+-                </ResponsiveAction>
+-              )}
+-            </ResponsiveActions>
++            <>
++              <ResponsiveActions breakpoint={actionsBreakpoint}>
++                {!hideColumnManagement && (
++                  <ResponsiveAction
++                    isPersistent
++                    variant="plain"
++                    onClick={() =>
++                      launchModal(LazyColumnManagementModalOverlay, {
++                        columnLayout,
++                        noLimit: true,
++                      })
++                    }
++                    aria-label={t('public~Column management')}
++                    data-test="manage-columns"
++                  >
++                    <Tooltip content={t('public~Manage columns')} trigger="mouseenter">
++                      <ColumnsIcon />
++                    </Tooltip>
++                  </ResponsiveAction>
++                )}
++                {isResizable && resetAllColumnWidths && (
++                  <ResponsiveAction
++                    isPersistent
++                    variant="plain"
++                    onClick={handleResetColumnWidths}
++                    aria-label={t('public~Reset column widths')}
++                    data-test="reset-column-widths"
++                  >
++                    <Tooltip content={t('public~Reset column widths')} trigger="mouseenter">
++                      <UndoIcon />
++                    </Tooltip>
++                  </ResponsiveAction>
++                )}
++                {additionalActions}
++              </ResponsiveActions>
++              {customActions}
++            </>
+           }
+           pagination={
+-            <Pagination itemCount={filteredData.length} titles={paginationTitles} {...pagination} />
++            <Pagination
++              itemCount={filteredData.length}
++              titles={paginationTitles}
++              variant={PaginationVariant.top}
++              isCompact
++              {...pagination}
++            />
+           }
+         />
++        {bannerState.show && (
++          <Banner
++            className="pf-v6-u-mb-md"
++            screenReaderText={
++              bannerState.allSelected
++                ? t('public~You selected all {{count}} {{label}}.', {
++                    count: filteredData.length,
++                    label: label || t('public~items'),
++                  })
++                : t('public~You selected all {{label}} on this page.', {
++                    label: label || t('public~items'),
++                  })
++            }
++          >
++            {bannerState.allSelected ? (
++              <>
++                <Trans ns="public" i18nKey="You selected all <1>{{count}}</1> {{label}}.">
++                  You selected all <strong>{{ count: filteredData.length }}</strong>{' '}
++                  {{ label: label || t('public~items') }}.
++                </Trans>{' '}
++                <Button variant="link" isInline onClick={handleUnselectAll}>
++                  {t('public~Clear all.')}
++                </Button>
++              </>
++            ) : (
++              <>
++                <Trans ns="public" i18nKey="You selected all {{label}} on this page.">
++                  You selected all {{ label: label || t('public~items') }} on this page.
++                </Trans>{' '}
++                <Button variant="link" isInline onClick={handleSelectAllMatching}>
++                  <Trans ns="public" i18nKey="Select all <1>{{count}}</1> {{label}}.">
++                    Select all <strong>{{ count: filteredData.length }}</strong>{' '}
++                    {{ label: label || t('public~items') }}.
++                  </Trans>
++                </Button>
++              </>
++            )}
++          </Banner>
++        )}
+         <InnerScrollContainer>
+           <DataViewTable
+             key={tableKey}
+@@ -255,6 +367,7 @@ export const ConsoleDataView = <
+           itemCount={filteredData.length}
+           titles={paginationTitles}
+           variant={PaginationVariant.bottom}
++          isCompact
+           {...pagination}
+         />
+       </DataView>
+@@ -262,22 +375,45 @@ export const ConsoleDataView = <
+   );
+ };
+ 
++export const SELECTION_COLUMN_WIDTH = '45px';
++
+ export const cellIsStickyProps = {
+   isStickyColumn: true,
+   stickyMinWidth: '0',
+ };
+ 
++export const selectionColumnProps = {
++  ...cellIsStickyProps,
++  stickyLeftOffset: '0',
++};
++
+ export const nameCellProps = {
+   ...cellIsStickyProps,
+   hasRightBorder: true,
+ };
+ 
+-export const getNameCellProps = (name: string) => {
+-  return {
+-    ...nameCellProps,
+-    'data-test': `data-view-cell-${name}-name`,
+-  };
+-};
++/**
++ * Returns name column props with appropriate offset based on whether bulk select is enabled.
++ * Use this for column definitions.
++ * @param hasRightBorder - Whether to include hasRightBorder (default: true)
++ * @param withBulkSelect - Whether the table has bulk selection enabled (default: false)
++ */
++export const getNameColumnProps = (hasRightBorder = true, withBulkSelect = false) => ({
++  ...cellIsStickyProps,
++  ...(hasRightBorder && { hasRightBorder: true }),
++  ...(withBulkSelect && { stickyLeftOffset: SELECTION_COLUMN_WIDTH }),
++});
++
++/**
++ * Returns name cell props with appropriate offset based on whether bulk select is enabled.
++ * Use this for row cell definitions.
++ * @param name - The name to use in the data-test attribute
++ * @param withBulkSelect - Whether the table has bulk selection enabled (default: false)
++ */
++export const getNameCellProps = (name: string, withBulkSelect = false) => ({
++  ...getNameColumnProps(true, withBulkSelect),
++  'data-test': `data-view-cell-${name}-name`,
++});
+ 
+ export const actionsCellProps = {
+   ...cellIsStickyProps,
+diff --git a/frontend/packages/console-app/src/components/data-view/dataViewSelectionHelpers.ts b/frontend/packages/console-app/src/components/data-view/dataViewSelectionHelpers.ts
+new file mode 100644
+index 00000000000..4e01ddc6186
+--- /dev/null
++++ b/frontend/packages/console-app/src/components/data-view/dataViewSelectionHelpers.ts
+@@ -0,0 +1,77 @@
++import type { FormEvent } from 'react';
++import type { TableColumn } from '@console/dynamic-plugin-sdk/src/extensions/console-types';
++import { selectionColumnProps } from './ConsoleDataView';
++
++/**
++ * Creates a selection column definition for DataView tables.
++ * This column displays checkboxes for row selection.
++ * The select-all checkbox in the header is automatically added by ConsoleDataView
++ * when the selection prop is provided.
++ *
++ * @example
++ * ```typescript
++ * const columns = [
++ *   createSelectionColumn(),
++ *   { title: 'Name', id: 'name', ... },
++ *   ...
++ * ];
++ * ```
++ */
++export const createSelectionColumn = <T>(): TableColumn<T> => ({
++  title: '',
++  id: 'select',
++  props: selectionColumnProps,
++});
++
++type CreateSelectionCellOptions = {
++  /** Row index in the table */
++  rowIndex: number;
++  /** Unique ID for the item being selected */
++  itemId: string;
++  /** Whether the item is currently selected */
++  isSelected: boolean;
++  /** Callback when selection state changes */
++  onSelect: (itemId: string, isSelecting: boolean) => void;
++  /** Whether the checkbox should be disabled */
++  disabled?: boolean;
++};
++
++/**
++ * Creates a selection cell object for a DataView row.
++ * This cell contains the checkbox for row selection.
++ *
++ * @example
++ * ```typescript
++ * const rowCells = {
++ *   select: createSelectionCell({
++ *     rowIndex: 0,
++ *     itemId: getUID(node),
++ *     isSelected: selectedIds.has(getUID(node)),
++ *     onSelect: onSelectItem,
++ *   }),
++ *   name: { cell: <NodeName node={node} /> },
++ *   ...
++ * };
++ * ```
++ */
++export const createSelectionCell = ({
++  rowIndex,
++  itemId,
++  isSelected,
++  onSelect,
++  disabled = false,
++}: CreateSelectionCellOptions) => ({
++  cell: '', // Checkbox is rendered via props, no content needed
++  props: {
++    ...selectionColumnProps,
++    select: {
++      rowIndex,
++      onSelect: (_event: FormEvent<HTMLInputElement>, isSelecting: boolean) => {
++        onSelect(itemId, isSelecting);
++      },
++      // Ensure isSelected is always a boolean to prevent controlled/uncontrolled warnings
++      isSelected: Boolean(isSelected),
++      isDisabled: disabled,
++    },
++  },
++});
+diff --git a/frontend/packages/console-app/src/components/data-view/useConsoleDataViewData.tsx b/frontend/packages/console-app/src/components/data-view/useConsoleDataViewData.tsx
+index 3fcf269d1a4..2052b32cac9 100644
+--- a/frontend/packages/console-app/src/components/data-view/useConsoleDataViewData.tsx
++++ b/frontend/packages/console-app/src/components/data-view/useConsoleDataViewData.tsx
+@@ -1,4 +1,4 @@
+-import type { ReactNode } from 'react';
++import type { FormEvent, ReactNode } from 'react';
+ import { useRef, useEffect, useMemo } from 'react';
+ import { useDataViewPagination } from '@patternfly/react-data-view';
+ import type { DataViewTh } from '@patternfly/react-data-view/dist/esm/DataViewTable/DataViewTable';
+@@ -37,6 +37,7 @@ export const useConsoleDataViewData = <
+   columnManagementID,
+   customRowData,
+   isResizable = true,
++  selection,
+ }: {
+   columns: TableColumn<TData>[];
+   filteredData: TData[];
+@@ -46,6 +47,11 @@ export const useConsoleDataViewData = <
+   columnManagementID?: string;
+   customRowData?: TCustomRowData;
+   isResizable?: boolean;
++  selection?: {
++    selectedItems: Set<string>;
++    onSelectAll?: (isSelecting: boolean, filteredItems: TData[]) => void;
++    getItemId: (item: TData) => string;
++  };
+ }) => {
+   const { t } = useTranslation();
+   const [searchParams, setSearchParams] = useSearchParams();
+@@ -87,43 +93,59 @@ export const useConsoleDataViewData = <
+     columnManagementID,
+   });
+ 
+-  const dataViewColumns = useMemo<ConsoleDataViewColumn<TData>[]>(
+-    () =>
+-      activeColumns.map(({ id, title, sort, props, resizableProps }, index) => {
+-        // Filter out custom Console props that aren't valid PatternFly ThProps
+-        const { isActionCell, ...validThProps } = props || {};
+-
+-        const headerProps: ThProps = {
+-          ...validThProps,
+-          dataLabel: title,
++  const dataViewColumns = useMemo<ConsoleDataViewColumn<TData>[]>(() => {
++    // Calculate selection state across all filtered items
++    const totalCount = filteredData.length;
++
++    return activeColumns.map(({ id, title, sort, props, resizableProps }, index) => {
++      // Filter out custom Console props that aren't valid PatternFly ThProps
++      const { isActionCell, ...validThProps } = props || {};
++
++      const headerProps: ThProps = {
++        ...validThProps,
++        dataLabel: title,
++      };
++
++      if (sort) {
++        headerProps.sort = {
++          columnIndex: index,
++          sortBy: {
++            index: 0,
++            direction: SortByDirection.asc,
++            defaultDirection: SortByDirection.asc,
++          },
+         };
+-
+-        if (sort) {
+-          headerProps.sort = {
+-            columnIndex: index,
+-            sortBy: {
+-              index: 0,
+-              direction: SortByDirection.asc,
+-              defaultDirection: SortByDirection.asc,
+-            },
+-          };
+-        }
+-
+-        return {
+-          id,
+-          title,
+-          sortFunction: sort,
+-          props: headerProps,
+-          resizableProps: isResizable ? resizableProps : undefined,
+-          cell: title ? (
+-            <span>{title}</span>
+-          ) : (
+-            <span className="pf-v6-u-screen-reader">{t('public~Actions')}</span>
+-          ),
++      }
++
++      // Add select-all checkbox to selection column header
++      // Note: onSelect handler is updated later with visibleItems via dataViewColumnsWithSortApplied
++      // The checkbox state is determined by visible items only, not all items
++      if (id === 'select' && selection?.onSelectAll) {
++        headerProps['data-test'] = 'select-all-header';
++        headerProps.select = {
++          onSelect: (_event: FormEvent<HTMLInputElement>, isSelecting: boolean) => {
++            // This will be replaced with the actual handler in dataViewColumnsWithSortApplied
++            selection.onSelectAll(isSelecting, filteredData);
++          },
++          isSelected: false, // Will be updated based on visible items
++          isDisabled: totalCount === 0,
+         };
+-      }),
+-    [activeColumns, t, isResizable],
+-  );
++      }
++
++      return {
++        id,
++        title,
++        sortFunction: sort,
++        props: headerProps,
++        resizableProps: isResizable ? resizableProps : undefined,
++        cell: title ? (
++          <span>{title}</span>
++        ) : (
++          <span className="pf-v6-u-screen-reader">{t('public~Actions')}</span>
++        ),
++      };
++    });
++  }, [activeColumns, t, isResizable, selection, filteredData]);
+ 
+   const { sortBy, onSort } = useConsoleDataViewSort<TData>({
+     columns: dataViewColumns,
+@@ -162,37 +184,65 @@ export const useConsoleDataViewData = <
+       (pagination.page - 1) * pagination.perPage + pagination.perPage,
+     );
+ 
++  const visibleItems = transformedData.map((item) => item.obj);
+   const dataViewRows = getDataViewRows(transformedData, dataViewColumns);
+ 
+-  // This code fixes a sorting issue but should be revisited to add more clarity
++  // Apply sort state and select-all handler updates to columns independently
+   const dataViewColumnsWithSortApplied = useMemo(
+     () =>
+       dataViewColumns.map((column) => {
+-        const shouldApplySort =
+-          isDataViewConfigurableColumn(column) &&
+-          column.sortFunction !== undefined &&
+-          column.props.sort;
+-
+-        return shouldApplySort
+-          ? {
+-              ...column,
+-              props: {
+-                ...column.props,
+-                sort: {
+-                  ...column.props.sort,
+-                  sortBy: {
+-                    ...column.props.sort.sortBy,
+-                    index: sortBy.index,
+-                    direction: sortBy.direction,
+-                  },
+-                  onSort,
+-                },
++        if (!isDataViewConfigurableColumn(column)) {
++          return column;
++        }
++
++        let updatedProps = column.props;
++
++        if (column.sortFunction !== undefined && column.props.sort) {
++          updatedProps = {
++            ...updatedProps,
++            sort: {
++              ...updatedProps.sort,
++              sortBy: {
++                ...updatedProps.sort.sortBy,
++                index: sortBy.index,
++                direction: sortBy.direction,
++              },
++              onSort,
++            },
++          };
++        }
++
++        if (column.id === 'select' && column.props.select && selection?.onSelectAll) {
++          const visibleSelectedCount = visibleItems.filter((item) =>
++            selection.selectedItems.has(selection.getItemId(item)),
++          ).length;
++          const allVisibleSelected =
++            visibleItems.length > 0 && visibleSelectedCount === visibleItems.length;
++          const isIndeterminate =
++            visibleSelectedCount > 0 && visibleSelectedCount < visibleItems.length;
++
++          updatedProps = {
++            ...updatedProps,
++            select: {
++              ...updatedProps.select,
++              onSelect: (_event: FormEvent<HTMLInputElement>, isSelecting: boolean) => {
++                selection.onSelectAll(isSelecting, visibleItems);
+               },
+-            }
+-          : column;
++              isSelected: Boolean(allVisibleSelected),
++              isIndeterminate,
++            },
++          };
++        }
++
++        return updatedProps !== column.props ? { ...column, props: updatedProps } : column;
+       }),
+-    [dataViewColumns, sortBy.index, sortBy.direction, onSort],
++    [dataViewColumns, sortBy.index, sortBy.direction, onSort, selection, visibleItems],
+   );
+ 
+-  return { dataViewRows, dataViewColumns: dataViewColumnsWithSortApplied, pagination };
++  return {
++    dataViewRows,
++    dataViewColumns: dataViewColumnsWithSortApplied,
++    pagination,
++    visibleItems,
++  };
+ };
+diff --git a/frontend/packages/console-app/src/components/data-view/useDataViewSelection.ts b/frontend/packages/console-app/src/components/data-view/useDataViewSelection.ts
+new file mode 100644
+index 00000000000..da9840b493a
+--- /dev/null
++++ b/frontend/packages/console-app/src/components/data-view/useDataViewSelection.ts
+@@ -0,0 +1,106 @@
++import { useState, useCallback, useMemo, useEffect } from 'react';
++
++type UseDataViewSelectionOptions<T> = {
++  /** All data items */
++  data: T[];
++  /** Function to extract unique ID from an item */
++  getItemId: (item: T) => string;
++  /** Optional filter to exclude certain items from selection (e.g., filter out CSRs) */
++  filterSelectable?: (item: T) => boolean;
++};
++
++type UseDataViewSelectionResult<T> = {
++  /** Set of selected item IDs */
++  selectedIds: Set<string>;
++  /** Array of selected item objects */
++  selectedItems: T[];
++  /** Callback to select/deselect a single item */
++  onSelectItem: (itemId: string, isSelecting: boolean) => void;
++  /** Callback to select/deselect all filtered items */
++  onSelectAll: (isSelecting: boolean, filteredItems: T[]) => void;
++  /** Clear all selections */
++  clearSelection: () => void;
++};
++
++/**
++ * Custom hook for managing selection state in DataView components.
++ * Provides selection state, callbacks, and selected item objects.
++ *
++ * @example
++ * ```typescript
++ * const { selectedIds, selectedItems, onSelectItem, onSelectAll, clearSelection } =
++ *   useDataViewSelection({
++ *     data,
++ *     getItemId: (node) => getUID(node),
++ *     filterSelectable: (item) => !isCSRResource(item),
++ *   });
++ * ```
++ */
++export const useDataViewSelection = <T>({
++  data,
++  getItemId,
++  filterSelectable,
++}: UseDataViewSelectionOptions<T>): UseDataViewSelectionResult<T> => {
++  const [selectedIds, setSelectedIds] = useState<Set<string>>(new Set());
++
++  // Update selection to only include items that still exist in the current data
++  useEffect(() => {
++    const selectableData = filterSelectable ? data.filter(filterSelectable) : data;
++    const currentValidIds = new Set(selectableData.map(getItemId));
++
++    setSelectedIds((prev) => {
++      const filtered = new Set<string>();
++      prev.forEach((id) => {
++        if (currentValidIds.has(id)) {
++          filtered.add(id);
++        }
++      });
++      // Only update if the selection actually changed
++      return filtered.size === prev.size ? prev : filtered;
++    });
++  }, [data, getItemId, filterSelectable]);
++
++  const onSelectItem = useCallback((itemId: string, isSelecting: boolean) => {
++    setSelectedIds((prev) => {
++      const newSet = new Set(prev);
++      if (isSelecting) {
++        newSet.add(itemId);
++      } else {
++        newSet.delete(itemId);
++      }
++      return newSet;
++    });
++  }, []);
++
++  const onSelectAll = useCallback(
++    (isSelecting: boolean, filteredItems: T[]) => {
++      if (isSelecting) {
++        const selectableItems = filterSelectable
++          ? filteredItems.filter(filterSelectable)
++          : filteredItems;
++        const itemIds = selectableItems.map(getItemId);
++        setSelectedIds(new Set(itemIds));
++      } else {
++        setSelectedIds(new Set());
++      }
++    },
++    [getItemId, filterSelectable],
++  );
++
++  const clearSelection = useCallback(() => {
++    setSelectedIds(new Set());
++  }, []);
++
++  const selectedItems = useMemo(() => {
++    const selectableData = filterSelectable ? data.filter(filterSelectable) : data;
++    return selectableData.filter((item) => selectedIds.has(getItemId(item)));
++  }, [data, selectedIds, getItemId, filterSelectable]);
++
++  return {
++    selectedIds,
++    selectedItems,
++    onSelectItem,
++    onSelectAll,
++    clearSelection,
++  };
++};
+diff --git a/frontend/packages/console-app/src/components/nodes/NodesPage.tsx b/frontend/packages/console-app/src/components/nodes/NodesPage.tsx
+index e7f5fb794f3..2540c95bae9 100644
+--- a/frontend/packages/console-app/src/components/nodes/NodesPage.tsx
++++ b/frontend/packages/console-app/src/components/nodes/NodesPage.tsx
+@@ -1,5 +1,5 @@
+ import type { FC } from 'react';
+-import { useMemo, useCallback, useEffect, Suspense } from 'react';
++import { useMemo, useCallback, useEffect, useState, Suspense } from 'react';
+ import { Button, ButtonVariant } from '@patternfly/react-core';
+ import { DataViewCheckboxFilter } from '@patternfly/react-data-view';
+ import type { DataViewFilterOption } from '@patternfly/react-data-view/dist/esm/DataViewFilters';
+@@ -8,16 +8,21 @@ import { useTranslation } from 'react-i18next';
+ import {
+   actionsCellProps,
+   getNameCellProps,
++  getNameColumnProps,
+   initialFiltersDefault,
+   ConsoleDataView,
+-  nameCellProps,
+   getLabelsColumnWidthStyleProp,
+ } from '@console/app/src/components/data-view/ConsoleDataView';
++import {
++  createSelectionColumn,
++  createSelectionCell,
++} from '@console/app/src/components/data-view/dataViewSelectionHelpers';
+ import type {
+   ConsoleDataViewColumn,
+   ConsoleDataViewRow,
+   ResourceFilters,
+ } from '@console/app/src/components/data-view/types';
++import { useDataViewSelection } from '@console/app/src/components/data-view/useDataViewSelection';
+ import { useColumnWidthSettings } from '@console/app/src/components/data-view/useResizableColumnProps';
+ import { FLAG_NODE_MGMT_V1 } from '@console/app/src/consts';
+ import type { K8sModel } from '@console/dynamic-plugin-sdk/src/api/core-api';
+@@ -105,6 +110,7 @@ import {
+   useWatchVirtualMachineInstances,
+ } from './NodeVmUtils';
+ import ClientCSRStatus from './status/CSRStatus';
++import { useCustomNodeActions } from './useCustomNodeActions';
+ import type { GetNodeStatusExtensions } from './useNodeStatusExtensions';
+ import { useNodeStatusExtensions } from './useNodeStatusExtensions';
+ 
+@@ -179,13 +185,14 @@ const useNodesColumns = (
+ 
+   const columns = useMemo(() => {
+     return [
++      createSelectionColumn<NodeRowItem>(),
+       {
+         title: t('console-app~Name'),
+         id: nodeColumnInfo.name.id,
+         sort: 'metadata.name',
+         resizableProps: getResizableProps(nodeColumnInfo.name.id),
+         props: {
+-          ...nameCellProps,
++          ...getNameColumnProps(true, true),
+           modifier: 'nowrap',
+         },
+       },
+@@ -401,8 +408,12 @@ const getNodeDataViewRows = (
+   tableColumns: ConsoleDataViewColumn<NodeRowItem>[],
+   nodeMetrics: NodeMetrics,
+   statusExtensions: GetNodeStatusExtensions,
++  selection?: {
++    selectedItems: Set<string>;
++    onSelect: (itemId: string, isSelecting: boolean) => void;
++  },
+ ): ConsoleDataViewRow[] => {
+-  return rowData.map(({ obj }) => {
++  return rowData.map(({ obj }, rowIndex) => {
+     const isCSR = isCSRResource(obj);
+     const node = isCSR ? null : (obj as NodeKind);
+     const csr = isCSR ? (obj as NodeCertificateSigningRequestKind) : null;
+@@ -434,6 +445,15 @@ const getNodeDataViewRows = (
+     const context = node ? { [resourceKind]: node } : {};
+ 
+     const rowCells = {
++      select:
++        selection && node
++          ? createSelectionCell({
++              rowIndex,
++              itemId: nodeUID,
++              isSelected: selection.selectedItems.has(nodeUID),
++              onSelect: selection.onSelect,
++            })
++          : undefined,
+       [nodeColumnInfo.name.id]: {
+         cell: node ? (
+           <ResourceLink
+@@ -447,7 +467,7 @@ const getNodeDataViewRows = (
+         ) : (
+           csr?.metadata.name || DASH
+         ),
+-        props: getNameCellProps(nodeName),
++        props: getNameCellProps(nodeName, true),
+       },
+       [nodeColumnInfo.status.id]: {
+         cell: node ? (
+@@ -547,11 +567,19 @@ const getNodeDataViewRows = (
+     };
+ 
+     return tableColumns.map(({ id }) => {
+-      const cell = rowCells[id]?.cell || DASH;
++      const rowCell = rowCells[id];
++      if (!rowCell) {
++        return {
++          id,
++          cell: DASH,
++        };
++      }
++      // For select column, don't default to DASH - checkbox is rendered via props
++      const cellContent = id === 'select' ? rowCell.cell ?? '' : rowCell.cell ?? DASH;
+       return {
+         id,
+-        props: rowCells[id]?.props,
+-        cell,
++        props: rowCell.props,
++        cell: cellContent,
+       };
+     });
+   });
+@@ -637,21 +665,57 @@ const NodeList: FC<NodeListProps> = ({
+ }) => {
+   const { t } = useTranslation();
+   const { columns, resetAllColumnWidths } = useNodesColumns(vmsEnabled, nodeMgmtV1Enabled);
+-  const nodeMetrics = useConsoleSelector<NodeMetrics>(({ UI }) => {
+-    return UI.getIn(['metrics', 'node']);
+-  });
++  const nodeMetrics = useConsoleSelector<NodeMetrics>(({ UI }) => UI.getIn(['metrics', 'node']));
+   const columnManagementID = referenceForModel(NodeModel);
+   const statusExtensions = useNodeStatusExtensions();
+ 
++  // Selection state
++  const { selectedIds, onSelectItem, onSelectAll, clearSelection } = useDataViewSelection({
++    data,
++    getItemId: getUID,
++    filterSelectable: (item) => !isCSRResource(item),
++  });
++
++  // Track filtered selected nodes for custom actions
++  const [filteredSelectedNodes, setFilteredSelectedNodes] = useState<NodeKind[]>([]);
++
++  const handleFilteredSelectionChange = useCallback((items: NodeRowItem[]) => {
++    // Filter out CSRs and cast to NodeKind
++    const nodes = items.filter((item) => !isCSRResource(item)) as NodeKind[];
++    setFilteredSelectedNodes(nodes);
++  }, []);
++
++  const customActions = useCustomNodeActions({
++    selectedNodes: filteredSelectedNodes,
++    onComplete: clearSelection,
++  });
++
++  const getDataViewRows = useCallback(
++    (rowData: RowProps<NodeRowItem>[], tableColumns: ConsoleDataViewColumn<NodeRowItem>[]) =>
++      getNodeDataViewRows(
++        rowData as RowProps<NodeRowItem, GetNodeStatusExtensions>[],
++        tableColumns,
++        nodeMetrics,
++        statusExtensions,
++        {
++          selectedItems: selectedIds,
++          onSelect: onSelectItem,
++        },
++      ),
++    [nodeMetrics, statusExtensions, selectedIds, onSelectItem],
++  );
++
+   const columnLayout = useMemo(
+     () => ({
+       id: columnManagementID,
+       type: t('console-app~Node'),
+-      columns: columns.map((col) => ({
+-        id: col.id,
+-        title: col.title,
+-        additional: col.additional,
+-      })),
++      columns: columns
++        .filter((col) => col.id !== 'select' && col.id !== nodeColumnInfo.actions.id)
++        .map((col) => ({
++          id: col.id,
++          title: col.title,
++          additional: col.additional,
++        })),
+       selectedColumns:
+         selectedColumns?.[columnManagementID]?.length > 0
+           ? new Set(selectedColumns[columnManagementID] as string[])
+@@ -853,19 +917,20 @@ const NodeList: FC<NodeListProps> = ({
+         initialFilters={initialFilters}
+         additionalFilterNodes={additionalFilterNodes}
+         matchesAdditionalFilters={matchesAdditionalFilters}
+-        getDataViewRows={(rowData, tableColumns) =>
+-          getNodeDataViewRows(
+-            (rowData as unknown) as RowProps<NodeRowItem, GetNodeStatusExtensions>[],
+-            tableColumns,
+-            nodeMetrics,
+-            statusExtensions,
+-          )
+-        }
++        getDataViewRows={getDataViewRows}
+         hideNameLabelFilters={hideNameLabelFilters}
+         hideLabelFilter={hideLabelFilter}
+         hideColumnManagement={hideColumnManagement}
+         isResizable
+         resetAllColumnWidths={resetAllColumnWidths}
++        customActions={customActions}
++        selection={{
++          selectedItems: selectedIds,
++          onSelect: onSelectItem,
++          onSelectAll,
++          getItemId: getUID,
++          onFilteredSelectionChange: handleFilteredSelectionChange,
++        }}
+       />
+     </Suspense>
+   );
+@@ -972,7 +1037,7 @@ export const NodesPage: FC<NodesPageProps> = ({ selector }) => {
+         filterVirtualMachineInstancesByNode(vmis, node.metadata.name),
+       ]),
+     );
+-  }, [isKubevirtPluginActive, nodes, nodesLoadError, nodesLoaded, vmis, vmisLoadError, vmisLoaded]);
++  }, [isKubevirtPluginActive, nodes, nodesLoaded, nodesLoadError, vmis, vmisLoaded, vmisLoadError]);
+ 
+   useEffect(() => {
+     const updateMetrics = async () => {
+diff --git a/frontend/packages/console-app/src/components/nodes/menu-actions.tsx b/frontend/packages/console-app/src/components/nodes/menu-actions.tsx
+index 3f51abca933..8086f391957 100644
+--- a/frontend/packages/console-app/src/components/nodes/menu-actions.tsx
++++ b/frontend/packages/console-app/src/components/nodes/menu-actions.tsx
+@@ -14,8 +14,8 @@ import type {
+ } from '@console/internal/module/k8s';
+ import { referenceFor } from '@console/internal/module/k8s';
+ import { isNodeUnschedulable } from '@console/shared/src/selectors/node';
+-import { makeNodeSchedulable } from '../../k8s/requests/nodes';
+ import { LazyConfigureUnschedulableModalOverlay } from './modals';
++import { markNodesSchedulable } from './nodeSchedulingActions';
+ 
+ const updateCSR = (csr: CertificateSigningRequestKind, type: 'Approved' | 'Denied') => {
+   const approvedCSR = {
+@@ -66,7 +66,7 @@ export const useNodeActions: ExtensionHook<Action[], NodeKind> = (obj) => {
+       actions.push({
+         id: 'mark-as-schedulable',
+         label: t('console-app~Mark as schedulable'),
+-        cta: () => makeNodeSchedulable(obj),
++        cta: () => markNodesSchedulable(obj),
+         accessReview: asAccessReview(kindObj, obj, 'patch'),
+       });
+     } else {
+diff --git a/frontend/packages/console-app/src/components/nodes/modals/ConfigureUnschedulableModal.tsx b/frontend/packages/console-app/src/components/nodes/modals/ConfigureUnschedulableModal.tsx
+index ff06e0c9113..2af2d5508a4 100644
+--- a/frontend/packages/console-app/src/components/nodes/modals/ConfigureUnschedulableModal.tsx
++++ b/frontend/packages/console-app/src/components/nodes/modals/ConfigureUnschedulableModal.tsx
+@@ -1,32 +1,70 @@
+ import type { FC } from 'react';
+-import { useState } from 'react';
+-import { Button, Modal, ModalBody, ModalHeader, ModalVariant } from '@patternfly/react-core';
+-import { useTranslation } from 'react-i18next';
++import { useState, useMemo } from 'react';
++import {
++  Button,
++  Content,
++  ContentVariants,
++  Modal,
++  ModalBody,
++  ModalHeader,
++  ModalVariant,
++} from '@patternfly/react-core';
++import { Trans, useTranslation } from 'react-i18next';
+ import type { OverlayComponent } from '@console/dynamic-plugin-sdk/src/app/modal-support/OverlayProvider';
+ import type { NodeKind } from '@console/internal/module/k8s';
+ import { ModalFooterWithAlerts } from '@console/shared/src/components/modals/ModalFooterWithAlerts';
+ import { usePromiseHandler } from '@console/shared/src/hooks/usePromiseHandler';
++import { isNodeUnschedulable } from '@console/shared/src/selectors/node';
+ import type { ModalComponentProps } from '@console/shared/src/types/modal';
+-import { makeNodeUnschedulable } from '../../../k8s/requests/nodes';
++import { markNodesUnschedulable } from '../nodeSchedulingActions';
+ 
+ type ConfigureUnschedulableModalProps = {
+-  resource: NodeKind;
++  /** Single node or array of nodes to mark as unschedulable */
++  resource?: NodeKind;
++  /** Array of nodes to mark as unschedulable (for bulk operations) */
++  nodes?: NodeKind[];
++  /** Callback invoked after successful operation */
++  onComplete?: () => void;
+ } & ModalComponentProps;
+ 
+ const ConfigureUnschedulableModal: FC<ConfigureUnschedulableModalProps> = ({
+   resource,
++  nodes,
++  onComplete,
+   close,
+   cancel,
+ }) => {
+   const [handlePromise, inProgress, errorMessage] = usePromiseHandler();
++  const { t } = useTranslation();
++
++  // Support both single node (resource) and multiple nodes (nodes array)
++  const targetNodes = useMemo(() => {
++    if (nodes) {
++      return nodes;
++    }
++    if (resource) {
++      return [resource];
++    }
++    return [];
++  }, [resource, nodes]);
++
++  // Filter nodes that will actually be affected (not already unschedulable)
++  const nodesToMark = useMemo(() => targetNodes.filter((node) => !isNodeUnschedulable(node)), [
++    targetNodes,
++  ]);
++
++  const isBulk = targetNodes.length > 1;
+ 
+   const handleSubmit = (): void => {
+-    handlePromise(makeNodeUnschedulable(resource))
+-      .then(() => close())
++    handlePromise(markNodesUnschedulable(targetNodes))
++      .then(() => {
++        onComplete?.();
++        close();
++      })
+       // Errors are surfaced by usePromiseHandler/ModalFooterWithAlerts
+       .catch(() => {});
+   };
+-  const { t } = useTranslation();
++
+   return (
+     <>
+       <ModalHeader
+@@ -34,11 +72,22 @@ const ConfigureUnschedulableModal: FC<ConfigureUnschedulableModalProps> = ({
+         labelId="configure-unschedulable-modal-title"
+       />
+       <ModalBody>
+-        <p>
+-          {t(
+-            "console-app~Unschedulable nodes won't accept new pods. By blocking new pod assignments, you can isolate a node to perform maintenance or decommission it without disrupting new traffic.",
+-          )}
+-        </p>
++        {isBulk && (
++          <Content component={ContentVariants.p}>
++            <Trans ns="console-app" i18nKey="Mark <1>{{count}}</1> nodes as unschedulable?">
++              Mark <strong>{{ count: nodesToMark.length }}</strong> nodes as unschedulable?
++            </Trans>
++          </Content>
++        )}
++        <Content component={ContentVariants.p}>
++          {isBulk
++            ? t(
++                "console-app~Unschedulable nodes won't accept new pods. By blocking new pod assignments, you can isolate nodes to perform maintenance or decommission them without disrupting new traffic.",
++              )
++            : t(
++                "console-app~Unschedulable nodes won't accept new pods. By blocking new pod assignments, you can isolate a node to perform maintenance or decommission it without disrupting new traffic.",
++              )}
++        </Content>
+       </ModalBody>
+       <ModalFooterWithAlerts errorMessage={errorMessage}>
+         <Button
+diff --git a/frontend/packages/console-app/src/components/nodes/nodeSchedulingActions.ts b/frontend/packages/console-app/src/components/nodes/nodeSchedulingActions.ts
+new file mode 100644
+index 00000000000..4bdf8c9391d
+--- /dev/null
++++ b/frontend/packages/console-app/src/components/nodes/nodeSchedulingActions.ts
+@@ -0,0 +1,48 @@
++import type { NodeKind } from '@console/internal/module/k8s';
++import { isNodeUnschedulable } from '@console/shared/src/selectors/node';
++import { makeNodeSchedulable, makeNodeUnschedulable } from '../../k8s/requests/nodes';
++
++/**
++ * Shared scheduling action logic for nodes.
++ * Can be used for both individual node actions and bulk operations.
++ */
++
++/**
++ * Mark one or more nodes as schedulable.
++ * Only affects nodes that are currently unschedulable.
++ */
++export const markNodesSchedulable = (nodes: NodeKind | NodeKind[]) => {
++  const nodeArray = Array.isArray(nodes) ? nodes : [nodes];
++  const unschedulableNodes = nodeArray.filter((node) => isNodeUnschedulable(node));
++  return Promise.all(unschedulableNodes.map((node) => makeNodeSchedulable(node)));
++};
++
++/**
++ * Mark one or more nodes as unschedulable.
++ * Only affects nodes that are currently schedulable.
++ */
++export const markNodesUnschedulable = (nodes: NodeKind | NodeKind[]) => {
++  const nodeArray = Array.isArray(nodes) ? nodes : [nodes];
++  const schedulableNodes = nodeArray.filter((node) => !isNodeUnschedulable(node));
++  return Promise.all(schedulableNodes.map((node) => makeNodeUnschedulable(node)));
++};
++
++/**
++ * Count schedulable vs unschedulable nodes in an array.
++ */
++export const getSchedulingCounts = (
++  nodes: NodeKind[],
++): { schedulableCount: number; unschedulableCount: number } => {
++  let schedulable = 0;
++  let unschedulable = 0;
++
++  nodes.forEach((node) => {
++    if (isNodeUnschedulable(node)) {
++      unschedulable++;
++    } else {
++      schedulable++;
++    }
++  });
++
++  return { schedulableCount: schedulable, unschedulableCount: unschedulable };
++};
+diff --git a/frontend/packages/console-app/src/components/nodes/useCustomNodeActions.tsx b/frontend/packages/console-app/src/components/nodes/useCustomNodeActions.tsx
+new file mode 100644
+index 00000000000..be37b6f6010
+--- /dev/null
++++ b/frontend/packages/console-app/src/components/nodes/useCustomNodeActions.tsx
+@@ -0,0 +1,109 @@
++import { useMemo, useCallback } from 'react';
++import { DropdownItem } from '@patternfly/react-core';
++import { useTranslation } from 'react-i18next';
++import { useOverlay } from '@console/dynamic-plugin-sdk/src/app/modal-support/useOverlay';
++import type { NodeKind } from '@console/internal/module/k8s';
++import { ResponsiveActionDropdown } from '@console/shared/src/components/dropdown/ResponsiveActionDropdown';
++import { usePromiseHandler } from '@console/shared/src/hooks/usePromiseHandler';
++import { LazyConfigureUnschedulableModalOverlay } from './modals';
++import { markNodesSchedulable, getSchedulingCounts } from './nodeSchedulingActions';
++
++type UseCustomNodeActionsOptions = {
++  selectedNodes: NodeKind[];
++  onComplete: () => void;
++};
++
++/**
++ * Hook for custom node actions dropdown.
++ * Returns a ResponsiveActionDropdown that should be used with customActions prop.
++ * Shows as primary button on desktop (md breakpoint and above), kebab button on mobile.
++ */
++export const useCustomNodeActions = ({
++  selectedNodes,
++  onComplete,
++}: UseCustomNodeActionsOptions) => {
++  const { t } = useTranslation();
++  const [handlePromise, inProgress] = usePromiseHandler();
++  const launchModal = useOverlay();
++
++  const { schedulableCount, unschedulableCount } = useMemo(
++    () => getSchedulingCounts(selectedNodes),
++    [selectedNodes],
++  );
++
++  const handleMarkSchedulable = useCallback(() => {
++    handlePromise(markNodesSchedulable(selectedNodes))
++      .then(() => {
++        onComplete();
++      })
++      .catch(() => {
++        // Errors are handled by usePromiseHandler
++      });
++  }, [selectedNodes, handlePromise, onComplete]);
++
++  const handleMarkUnschedulable = useCallback(() => {
++    launchModal(LazyConfigureUnschedulableModalOverlay, {
++      nodes: selectedNodes,
++      onComplete,
++    });
++  }, [selectedNodes, launchModal, onComplete]);
++
++  return useMemo(() => {
++    const dropdownItems: JSX.Element[] = [];
++
++    if (unschedulableCount > 0) {
++      dropdownItems.push(
++        <DropdownItem
++          key="mark-schedulable"
++          onClick={handleMarkSchedulable}
++          isDisabled={inProgress}
++          data-test="bulk-mark-schedulable"
++          description={t(
++            'console-app~Applies to {{nodeCount}} selected nodes that are currently unschedulable.',
++            { nodeCount: unschedulableCount },
++          )}
++        >
++          {t('console-app~Mark schedulable')}
++        </DropdownItem>,
++      );
++    }
++
++    if (schedulableCount > 0) {
++      dropdownItems.push(
++        <DropdownItem
++          key="mark-unschedulable"
++          onClick={handleMarkUnschedulable}
++          isDisabled={inProgress}
++          data-test="bulk-mark-unschedulable"
++          description={t(
++            'console-app~Applies to {{nodeCount}} selected nodes that are currently schedulable.',
++            { nodeCount: schedulableCount },
++          )}
++        >
++          {t('console-app~Mark unschedulable')}
++        </DropdownItem>,
++      );
++    }
++
++    const hasNoApplicableActions = dropdownItems.length === 0;
++    const isDisabled = inProgress || selectedNodes.length === 0 || hasNoApplicableActions;
++
++    return (
++      <ResponsiveActionDropdown
++        label={t('console-app~Scheduling')}
++        isDisabled={isDisabled}
++        data-test="bulk-actions-dropdown"
++      >
++        {dropdownItems}
++      </ResponsiveActionDropdown>
++    );
++  }, [
++    unschedulableCount,
++    schedulableCount,
++    inProgress,
++    selectedNodes.length,
++    t,
++    handleMarkSchedulable,
++    handleMarkUnschedulable,
++  ]);
++};
+diff --git a/frontend/packages/console-dynamic-plugin-sdk/src/api/internal-api.ts b/frontend/packages/console-dynamic-plugin-sdk/src/api/internal-api.ts
+index 5a44d8e2c0a..30b1b138a39 100644
+--- a/frontend/packages/console-dynamic-plugin-sdk/src/api/internal-api.ts
++++ b/frontend/packages/console-dynamic-plugin-sdk/src/api/internal-api.ts
+@@ -99,6 +99,12 @@ export const ConsoleDataView: <
+ export const cellIsStickyProps: CellIsStickyProps = require('@console/app/src/components/data-view/ConsoleDataView')
+   .cellIsStickyProps;
+ 
++export const getNameColumnProps: (
++  hasRightBorder?: boolean,
++  withBulkSelect?: boolean,
++) => CellIsStickyProps = require('@console/app/src/components/data-view/ConsoleDataView')
++  .getNameColumnProps;
++
+ export const getNameCellProps: GetNameCellProps = require('@console/app/src/components/data-view/ConsoleDataView')
+   .getNameCellProps;
+ 
+diff --git a/frontend/packages/console-dynamic-plugin-sdk/src/api/internal-types.ts b/frontend/packages/console-dynamic-plugin-sdk/src/api/internal-types.ts
+index 36d124fe460..a836df7aacc 100644
+--- a/frontend/packages/console-dynamic-plugin-sdk/src/api/internal-types.ts
++++ b/frontend/packages/console-dynamic-plugin-sdk/src/api/internal-types.ts
+@@ -1,5 +1,6 @@
+ import type { ReactNode, ComponentType, SetStateAction, Dispatch } from 'react';
+ import type { QuickStart } from '@patternfly/quickstarts';
++import type { OverflowMenuProps } from '@patternfly/react-core';
+ import type { DataViewTh } from '@patternfly/react-data-view/dist/esm/DataViewTable/DataViewTable';
+ import type { SortByDirection, ThProps } from '@patternfly/react-table';
+ import type { Map as ImmutableMap } from 'immutable';
+@@ -358,6 +359,25 @@ export type ConsoleDataViewProps<
+   isResizable?: boolean;
+   /** When provided and isResizable is true, a toolbar action is shown to reset all column widths. */
+   resetAllColumnWidths?: () => void;
++  /** Additional actions to display in the toolbar when items are selected (inside ResponsiveActions). */
++  additionalActions?: ReactNode;
++  /** Custom actions to display in the toolbar outside ResponsiveActions (for actions that should not be responsive via ResponsiveActions). */
++  customActions?: ReactNode;
++  /** Selection configuration for enabling row selection via checkboxes. When provided, a checkbox column is added to the table with select-all in the header. */
++  selection?: {
++    /** Set of selected item IDs. */
++    selectedItems: Set<string>;
++    /** Callback when a single row is selected/deselected. */
++    onSelect: (itemId: string, isSelecting: boolean) => void;
++    /** Callback when select all is toggled. Receives filtered items matching current filters. */
++    onSelectAll?: (isSelecting: boolean, filteredItems: TData[]) => void;
++    /** Function to extract unique ID from an item for selection tracking. */
++    getItemId: (item: TData) => string;
++    /** Callback to receive filtered selected items whenever filters or selection changes. */
++    onFilteredSelectionChange?: (filteredSelectedItems: TData[]) => void;
++  };
++  /** Breakpoint at which toolbar actions switch between horizontal and dropdown layout. Default is 'md'. */
++  actionsBreakpoint?: OverflowMenuProps['breakpoint'];
+ };
+ 
+ // ConsoleDataView helper types
+@@ -368,6 +388,7 @@ export type CellIsStickyProps = {
+ 
+ export type GetNameCellProps = (
+   name: string,
++  withBulkSelect?: boolean,
+ ) => CellIsStickyProps & {
+   hasRightBorder: true;
+   'data-test': string;
+diff --git a/frontend/packages/console-shared/src/components/dropdown/ResponsiveActionDropdown.tsx b/frontend/packages/console-shared/src/components/dropdown/ResponsiveActionDropdown.tsx
+new file mode 100644
+index 00000000000..4a55ad041ed
+--- /dev/null
++++ b/frontend/packages/console-shared/src/components/dropdown/ResponsiveActionDropdown.tsx
+@@ -0,0 +1,130 @@
++import type { FC, ReactNode, Ref } from 'react';
++import { useCallback, useContext, useState } from 'react';
++import {
++  Dropdown,
++  DropdownList,
++  MenuToggle,
++  OverflowMenu,
++  OverflowMenuContent,
++} from '@patternfly/react-core';
++import type { MenuToggleElement } from '@patternfly/react-core';
++// Import context from source since it's not in public API
++import { OverflowMenuContext } from '@patternfly/react-core/dist/esm/components/OverflowMenu/OverflowMenuContext';
++import { EllipsisVIcon } from '@patternfly/react-icons';
++
++export type ResponsiveActionDropdownProps = {
++  /** Label for the action button (shown on desktop) */
++  label: string;
++  /** Dropdown items to display */
++  children: ReactNode;
++  /** Whether the dropdown is disabled */
++  isDisabled?: boolean;
++  /** Optional test ID for the toggle button */
++  'data-test'?: string;
++  /** Optional aria-label for the kebab toggle (mobile). If not provided, uses label. */
++  'aria-label'?: string;
++  /** Breakpoint at which to switch between primary button and kebab menu */
++  breakpoint?: 'sm' | 'md' | 'lg' | 'xl' | '2xl';
++  /** Button variant for desktop view. Mobile always uses 'plain' for kebab menu. Defaults to 'primary'. */
++  variant?: 'default' | 'primary' | 'secondary' | 'plainText' | 'typeahead';
++};
++
++type InternalDropdownProps = {
++  label: string;
++  children: ReactNode;
++  isDisabled?: boolean;
++  'data-test'?: string;
++  'aria-label'?: string;
++  variant: 'default' | 'primary' | 'secondary' | 'plainText' | 'typeahead';
++};
++
++/**
++ * Internal component that consumes OverflowMenuContext to render the dropdown
++ * with breakpoint-aware styling.
++ */
++const InternalDropdown: FC<InternalDropdownProps> = ({
++  label,
++  children,
++  isDisabled,
++  'data-test': dataTest,
++  'aria-label': ariaLabel,
++  variant,
++}) => {
++  const [isOpen, setIsOpen] = useState(false);
++  const { isBelowBreakpoint } = useContext(OverflowMenuContext);
++
++  const onToggle = useCallback(() => {
++    setIsOpen((prev) => !prev);
++  }, []);
++
++  const onSelect = useCallback(() => {
++    setIsOpen(false);
++  }, []);
++
++  return (
++    <Dropdown
++      isOpen={isOpen}
++      onSelect={onSelect}
++      onOpenChange={setIsOpen}
++      toggle={(toggleRef: Ref<MenuToggleElement>) => (
++        <MenuToggle
++          ref={toggleRef}
++          onClick={onToggle}
++          isExpanded={isOpen}
++          variant={isBelowBreakpoint ? 'plain' : variant}
++          isDisabled={isDisabled}
++          data-test={dataTest}
++          aria-label={isBelowBreakpoint ? ariaLabel || label : undefined}
++        >
++          {isBelowBreakpoint ? <EllipsisVIcon /> : label}
++        </MenuToggle>
++      )}
++    >
++      <DropdownList>{children}</DropdownList>
++    </Dropdown>
++  );
++};
++
++/**
++ * A responsive action dropdown that switches between a button (desktop)
++ * and a kebab menu (mobile) based on breakpoint.
++ *
++ * Uses PatternFly's OverflowMenu to handle breakpoint detection automatically.
++ *
++ * @example
++ * ```tsx
++ * <ResponsiveActionDropdown
++ *   label="Actions"
++ *   variant="primary"
++ *   data-test="actions-dropdown"
++ * >
++ *   <DropdownItem onClick={handleAction1}>Action 1</DropdownItem>
++ *   <DropdownItem onClick={handleAction2}>Action 2</DropdownItem>
++ * </ResponsiveActionDropdown>
++ * ```
++ */
++export const ResponsiveActionDropdown: FC<ResponsiveActionDropdownProps> = ({
++  label,
++  children,
++  isDisabled = false,
++  'data-test': dataTest,
++  'aria-label': ariaLabel,
++  breakpoint = 'md',
++  variant = 'primary',
++}) => {
++  return (
++    <OverflowMenu breakpoint={breakpoint}>
++      <OverflowMenuContent isPersistent>
++        <InternalDropdown
++          label={label}
++          isDisabled={isDisabled}
++          data-test={dataTest}
++          aria-label={ariaLabel}
++          variant={variant}
++        >
++          {children}
++        </InternalDropdown>
++      </OverflowMenuContent>
++    </OverflowMenu>
++  );
++};
+diff --git a/frontend/packages/console-shared/src/components/dropdown/__tests__/ResponsiveActionDropdown.spec.tsx b/frontend/packages/console-shared/src/components/dropdown/__tests__/ResponsiveActionDropdown.spec.tsx
+new file mode 100644
+index 00000000000..ec49210128f
+--- /dev/null
++++ b/frontend/packages/console-shared/src/components/dropdown/__tests__/ResponsiveActionDropdown.spec.tsx
+@@ -0,0 +1,87 @@
++import { createContext } from 'react';
++import { DropdownItem } from '@patternfly/react-core';
++import { render, screen } from '@testing-library/react';
++import { ResponsiveActionDropdown } from '../ResponsiveActionDropdown';
++
++// Mock OverflowMenuContext with createContext
++jest.mock('@patternfly/react-core/dist/esm/components/OverflowMenu/OverflowMenuContext', () => ({
++  OverflowMenuContext: createContext({ isBelowBreakpoint: false }),
++}));
++
++describe('ResponsiveActionDropdown', () => {
++  const originalInnerWidth = window.innerWidth;
++
++  beforeAll(() => {
++    Object.defineProperty(window, 'innerWidth', {
++      writable: true,
++      configurable: true,
++      value: 1024,
++    });
++  });
++
++  afterAll(() => {
++    Object.defineProperty(window, 'innerWidth', {
++      writable: true,
++      configurable: true,
++      value: originalInnerWidth,
++    });
++    jest.restoreAllMocks();
++  });
++
++  it('renders with label', () => {
++    render(
++      <ResponsiveActionDropdown label="Actions" data-test="test-dropdown">
++        <DropdownItem>Action 1</DropdownItem>
++        <DropdownItem>Action 2</DropdownItem>
++      </ResponsiveActionDropdown>,
++    );
++
++    expect(screen.getByTestId('test-dropdown')).toBeInTheDocument();
++  });
++
++  it('renders in disabled state', () => {
++    render(
++      <ResponsiveActionDropdown label="Actions" isDisabled data-test="test-dropdown">
++        <DropdownItem>Action 1</DropdownItem>
++      </ResponsiveActionDropdown>,
++    );
++
++    const toggle = screen.getByTestId('test-dropdown');
++    expect(toggle).toBeDisabled();
++  });
++
++  it('uses default md breakpoint', () => {
++    render(
++      <ResponsiveActionDropdown label="Actions" data-test="test-dropdown">
++        <DropdownItem>Action 1</DropdownItem>
++      </ResponsiveActionDropdown>,
++    );
++
++    // Component renders successfully with default breakpoint
++    expect(screen.getByTestId('test-dropdown')).toBeInTheDocument();
++  });
++
++  it('applies custom variant prop', () => {
++    render(
++      <ResponsiveActionDropdown label="Actions" variant="secondary" data-test="actions-dropdown">
++        <DropdownItem>Action 1</DropdownItem>
++      </ResponsiveActionDropdown>,
++    );
++
++    // MenuToggle should have secondary variant class
++    const toggle = screen.getByTestId('actions-dropdown');
++    expect(toggle).toHaveClass('pf-m-secondary');
++  });
++
++  it('defaults to primary variant', () => {
++    render(
++      <ResponsiveActionDropdown label="Actions" data-test="actions-dropdown">
++        <DropdownItem>Action 1</DropdownItem>
++      </ResponsiveActionDropdown>,
++    );
++
++    // MenuToggle should have primary variant class
++    const toggle = screen.getByTestId('actions-dropdown');
++    expect(toggle).toHaveClass('pf-m-primary');
++  });
++});
+diff --git a/frontend/public/kinds.ts b/frontend/public/kinds.ts
+index b12a91bcacd..ac5ade442d1 100644
+--- a/frontend/public/kinds.ts
++++ b/frontend/public/kinds.ts
+@@ -23,6 +23,12 @@ export const connectToModel = connect(
+ /**
+  * @deprecated TODO(alecmerdler): `plural` is not a unique lookup key, remove uses of this.
+  * FIXME(alecmerdler): Not returning correctly typed `WrappedComponent`
++ *
++ * NOTE: This connect() call triggers a reselect dev-mode warning:
++ * "The result function returned its own inputs without modification"
++ * This is a false positive - the mapStateToProps does transform state (finding models, extracting values).
++ * The warning only appears in development and does not affect functionality.
++ * See: https://github.com/reduxjs/reselect/issues/635
+  */
+ export const connectToPlural = connect(
+   (
+diff --git a/frontend/public/locales/en/public.json b/frontend/public/locales/en/public.json
+index d02a7a19389..21201f56813 100644
+--- a/frontend/public/locales/en/public.json
++++ b/frontend/public/locales/en/public.json
+@@ -1766,12 +1766,18 @@
+   "Admission Webhook Warning": "Admission Webhook Warning",
+   "{{kind}} {{name}} violates policy {{warning}}": "{{kind}} {{name}} violates policy {{warning}}",
+   "Learn more": "Learn more",
+-  "Go to first page": "Go to first page",
++  "Pagination": "Pagination",
+   "Go to previous page": "Go to previous page",
+   "Go to next page": "Go to next page",
+-  "Go to last page": "Go to last page",
+   "Filter by name": "Filter by name",
+   "Reset column widths": "Reset column widths",
++  "You selected all {{count}} {{label}}._one": "You selected all {{count}} {{label}}.",
++  "You selected all {{count}} {{label}}._other": "You selected all {{count}} {{label}}.s",
++  "You selected all {{label}} on this page.": "You selected all {{label}} on this page.",
++  "You selected all <1>{{count}}</1> {{label}}.": "You selected all <1>{{count}}</1> {{label}}.",
++  "items": "items",
++  "Clear all.": "Clear all.",
++  "Select all <1>{{count}}</1> {{label}}.": "Select all <1>{{count}}</1> {{label}}.",
+   "{{label}} table": "{{label}} table",
+   "Filter by label": "Filter by label",
+   "Selected group is unavailable": "Selected group is unavailable",
+diff --git a/frontend/public/style/ancillary/_bootstrap-residual.scss b/frontend/public/style/ancillary/_bootstrap-residual.scss
+index ab3ea0e0eab..b34588b1817 100644
+--- a/frontend/public/style/ancillary/_bootstrap-residual.scss
++++ b/frontend/public/style/ancillary/_bootstrap-residual.scss
+@@ -8,7 +8,7 @@
+   margin-top: var(--pf-t--global--spacer--xs);
+ }
+ 
+-:where(:not([class*='pf-v6-c-'])) {
++:where(:not([class*='pf-v6-c-'], .pf-v6-c-table label)) {
+   @at-root label#{&} {
+     display: inline-block;
+     max-width: 100%;

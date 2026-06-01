@@ -1,0 +1,1931 @@
+diff --git a/Makefile b/Makefile
+index c77f99e5c6..ec828929bb 100644
+--- a/Makefile
++++ b/Makefile
+@@ -240,6 +240,17 @@ verify-crd-compatibility: $(CRD_DIFF) manifests
+ 
+ #SECTION Test
+ 
++define install-sh
++.PHONY: $(1)/install.sh
++$(1)/install.sh: manifests
++	@echo -e "\n\U1F4D8 Using $(1).yaml as source manifest\n"
++	sed "s/cert-git-version/cert-$$(VERSION)/g" manifests/$(1).yaml > $(2)
++	MANIFEST=$(2) INSTALL_DEFAULT_CATALOGS=false DEFAULT_CATALOG=$$(RELEASE_CATALOGS) envsubst '$$$$DEFAULT_CATALOG,$$$$CERT_MGR_VERSION,$$$$INSTALL_DEFAULT_CATALOGS,$$$$MANIFEST' < scripts/install.tpl.sh > $(1)-install.sh
++endef
++
++$(eval $(call install-sh,experimental,operator-controller-experimental.yaml))
++$(eval $(call install-sh,standard,operator-controller-standard.yaml))
++
+ .PHONY: test
+ test: manifests generate fmt lint test-unit test-e2e test-regression #HELP Run all tests.
+ 
+@@ -346,52 +357,43 @@ run-latest-release:
+ 	@echo -e "\n\U23EC Using $(RELEASE_INSTALL) as release installer\n"
+ 	curl -L -s https://github.com/operator-framework/operator-controller/releases/latest/download/$(notdir $(RELEASE_INSTALL)) | bash -s
+ 
+-.PHONY: pre-upgrade-setup
+-pre-upgrade-setup:
+-	./hack/test/pre-upgrade-setup.sh $(CATALOG_IMG) $(TEST_CLUSTER_CATALOG_NAME) $(TEST_CLUSTER_EXTENSION_NAME)
+-
+-.PHONY: post-upgrade-checks
+-post-upgrade-checks:
+-	go test -count=1 -v ./test/upgrade-e2e/...
++.PHONY: test-upgrade-e2e
++test-upgrade-e2e:
++	RELEASE_INSTALL=$(RELEASE_INSTALL) \
++	RELEASE_UPGRADE=$(RELEASE_UPGRADE) \
++	KIND_CLUSTER_NAME=$(KIND_CLUSTER_NAME) \
++	ROOT_DIR=$(ROOT_DIR) \
++	go test -count=1 -v ./test/upgrade-e2e/upgrade_test.go
+ 
+ 
+-TEST_UPGRADE_E2E_TASKS := kind-cluster run-latest-release image-registry pre-upgrade-setup docker-build kind-load kind-deploy post-upgrade-checks kind-clean
++TEST_UPGRADE_E2E_TASKS := kind-cluster docker-build kind-load test-upgrade-e2e kind-clean
+ 
+ .PHONY: test-upgrade-st2st-e2e
+-test-upgrade-st2st-e2e: SOURCE_MANIFEST := $(STANDARD_MANIFEST)
+-test-upgrade-st2st-e2e: RELEASE_INSTALL := $(STANDARD_RELEASE_INSTALL)
++test-upgrade-st2st-e2e: RELEASE_INSTALL := https://github.com/operator-framework/operator-controller/releases/latest/download/install.sh
++test-upgrade-st2st-e2e: RELEASE_UPGRADE := $(ROOT_DIR)/standard-install.sh
+ test-upgrade-st2st-e2e: KIND_CLUSTER_NAME := operator-controller-upgrade-st2st-e2e
+-test-upgrade-st2st-e2e: export MANIFEST := $(STANDARD_RELEASE_MANIFEST)
+-test-upgrade-st2st-e2e: export TEST_CLUSTER_CATALOG_NAME := test-catalog
+-test-upgrade-st2st-e2e: export TEST_CLUSTER_EXTENSION_NAME := test-package
+-test-upgrade-st2st-e2e: $(TEST_UPGRADE_E2E_TASKS) #HELP Run upgrade (standard -> standard) e2e tests on a local kind cluster
++test-upgrade-st2st-e2e: standard/install.sh $(TEST_UPGRADE_E2E_TASKS) #HELP Run upgrade (standard -> standard) e2e tests on a local kind cluster
+ 
+ .PHONY: test-upgrade-ex2ex-e2e
+-test-upgrade-ex2ex-e2e: SOURCE_MANIFEST := $(EXPERIMENTAL_MANIFEST)
+-test-upgrade-ex2ex-e2e: RELEASE_INSTALL := $(EXPERIMENTAL_RELEASE_INSTALL)
++test-upgrade-ex2ex-e2e: RELEASE_INSTALL := https://github.com/operator-framework/operator-controller/releases/latest/download/install-experimental.sh
+ test-upgrade-ex2ex-e2e: KIND_CLUSTER_NAME := operator-controller-upgrade-ex2ex-e2e
+-test-upgrade-ex2ex-e2e: export MANIFEST := $(EXPERIMENTAL_RELEASE_MANIFEST)
+-test-upgrade-ex2ex-e2e: export TEST_CLUSTER_CATALOG_NAME := test-catalog
+-test-upgrade-ex2ex-e2e: export TEST_CLUSTER_EXTENSION_NAME := test-package
+-test-upgrade-ex2ex-e2e: $(TEST_UPGRADE_E2E_TASKS) #HELP Run upgrade (experimental -> experimental) e2e tests on a local kind cluster
++test-upgrade-ex2ex-e2e: RELEASE_UPGRADE := $(ROOT_DIR)/experimental-install.sh
++test-upgrade-ex2ex-e2e: experimental/install.sh $(TEST_UPGRADE_E2E_TASKS) #HELP Run upgrade (experimental -> experimental) e2e tests on a local kind cluster
+ 
+ .PHONY: test-upgrade-st2ex-e2e
+-test-upgrade-st2ex-e2e: SOURCE_MANIFEST := $(EXPERIMENTAL_MANIFEST)
+-test-upgrade-st2ex-e2e: RELEASE_INSTALL := $(STANDARD_RELEASE_INSTALL)
++test-upgrade-st2ex-e2e: RELEASE_INSTALL := https://github.com/operator-framework/operator-controller/releases/latest/download/install.sh
++test-upgrade-st2ex-e2e: RELEASE_UPGRADE := $(ROOT_DIR)/experimental-install.sh
+ test-upgrade-st2ex-e2e: KIND_CLUSTER_NAME := operator-controller-upgrade-st2ex-e2e
+-test-upgrade-st2ex-e2e: export MANIFEST := $(EXPERIMENTAL_RELEASE_MANIFEST)
+-test-upgrade-st2ex-e2e: export TEST_CLUSTER_CATALOG_NAME := test-catalog
+-test-upgrade-st2ex-e2e: export TEST_CLUSTER_EXTENSION_NAME := test-package
+-test-upgrade-st2ex-e2e: $(TEST_UPGRADE_E2E_TASKS) #HELP Run upgrade (standard -> experimental) e2e tests on a local kind cluster
++test-upgrade-st2ex-e2e: experimental/install.sh $(TEST_UPGRADE_E2E_TASKS) #HELP Run upgrade (standard -> experimental) e2e tests on a local kind cluster
+ 
+ .PHONY: test-st2ex-e2e
+-test-st2ex-e2e: SOURCE_MANIFEST := $(STANDARD_MANIFEST)
+-test-st2ex-e2e: RELEASE_INSTALL := $(STANDARD_RELEASE_INSTALL)
++test-st2ex-e2e: RELEASE_INSTALL := $(ROOT_DIR)/standard-install.sh
++test-st2ex-e2e: RELEASE_UPGRADE := $(ROOT_DIR)/experimental-install.sh
+ test-st2ex-e2e: KIND_CLUSTER_NAME := operator-controller-st2ex-e2e
+ test-st2ex-e2e: export MANIFEST := $(STANDARD_RELEASE_MANIFEST)
+ test-st2ex-e2e: export TEST_CLUSTER_CATALOG_NAME := test-catalog
+ test-st2ex-e2e: export TEST_CLUSTER_EXTENSION_NAME := test-package
+-test-st2ex-e2e: run-internal image-registry pre-upgrade-setup kind-deploy-experimental post-upgrade-checks kind-clean #HELP Run swichover (standard -> experimental) e2e tests on a local kind cluster
++test-st2ex-e2e: experimental/install.sh standard/install.sh $(TEST_UPGRADE_E2E_TASKS) #HELP Run swichover (standard -> experimental) e2e tests on a local kind cluster
+ 
+ .PHONY: e2e-coverage
+ e2e-coverage:
+diff --git a/api/v1/clusterextension_types.go b/api/v1/clusterextension_types.go
+index ee55109f86..18f982725b 100644
+--- a/api/v1/clusterextension_types.go
++++ b/api/v1/clusterextension_types.go
+@@ -105,6 +105,7 @@ type ClusterExtensionSpec struct {
+ 	// a configuration schema the bundle is deemed to not be configurable. More information on how
+ 	// to configure bundles can be found in the OLM documentation associated with your current OLM version.
+ 	//
++	// <opcon:experimental>
+ 	// +optional
+ 	Config *ClusterExtensionConfig `json:"config,omitempty"`
+ 
+diff --git a/applyconfigurations/api/v1/clusterextensionspec.go b/applyconfigurations/api/v1/clusterextensionspec.go
+index 56c6533923..5dfaf1883a 100644
+--- a/applyconfigurations/api/v1/clusterextensionspec.go
++++ b/applyconfigurations/api/v1/clusterextensionspec.go
+@@ -63,6 +63,8 @@ type ClusterExtensionSpecApplyConfiguration struct {
+ 	// config is validated against a configuration schema provided by the resolved bundle. If the bundle does not provide
+ 	// a configuration schema the bundle is deemed to not be configurable. More information on how
+ 	// to configure bundles can be found in the OLM documentation associated with your current OLM version.
++	//
++	// <opcon:experimental>
+ 	Config *ClusterExtensionConfigApplyConfiguration `json:"config,omitempty"`
+ 	// progressDeadlineMinutes is an optional field that defines the maximum period
+ 	// of time in minutes after which an installation should be considered failed and
+diff --git a/commitchecker.yaml b/commitchecker.yaml
+index 1c55c863fb..1bfb552fdb 100644
+--- a/commitchecker.yaml
++++ b/commitchecker.yaml
+@@ -1,4 +1,4 @@
+-expectedMergeBase: 147cfa8b1fecd158967ebfb6926aba64f56ca9cb
++expectedMergeBase: e7a9611c223953790248abe22b42879c180949f6
+ upstreamBranch: main
+ upstreamOrg: operator-framework
+ upstreamRepo: operator-controller
+diff --git a/docs/api-reference/olmv1-api-reference.md b/docs/api-reference/olmv1-api-reference.md
+index 3ee7f19386..01ee6f0ee8 100644
+--- a/docs/api-reference/olmv1-api-reference.md
++++ b/docs/api-reference/olmv1-api-reference.md
+@@ -343,7 +343,7 @@ _Appears in:_
+ | `serviceAccount` _[ServiceAccountReference](#serviceaccountreference)_ | serviceAccount specifies a ServiceAccount used to perform all interactions with the cluster<br />that are required to manage the extension.<br />The ServiceAccount must be configured with the necessary permissions to perform these interactions.<br />The ServiceAccount must exist in the namespace referenced in the spec.<br />The serviceAccount field is required. |  | Required: \{\} <br /> |
+ | `source` _[SourceConfig](#sourceconfig)_ | source is required and selects the installation source of content for this ClusterExtension.<br />Set the sourceType field to perform the selection.<br />Catalog is currently the only implemented sourceType.<br />Setting sourceType to "Catalog" requires the catalog field to also be defined.<br />Below is a minimal example of a source definition (in yaml):<br />source:<br />  sourceType: Catalog<br />  catalog:<br />    packageName: example-package |  | Required: \{\} <br /> |
+ | `install` _[ClusterExtensionInstallConfig](#clusterextensioninstallconfig)_ | install is optional and configures installation options for the ClusterExtension,<br />such as the pre-flight check configuration. |  | Optional: \{\} <br /> |
+-| `config` _[ClusterExtensionConfig](#clusterextensionconfig)_ | config is optional and specifies bundle-specific configuration.<br />Configuration is bundle-specific and a bundle may provide a configuration schema.<br />When not specified, the default configuration of the resolved bundle is used.<br />config is validated against a configuration schema provided by the resolved bundle. If the bundle does not provide<br />a configuration schema the bundle is deemed to not be configurable. More information on how<br />to configure bundles can be found in the OLM documentation associated with your current OLM version. |  | Optional: \{\} <br /> |
++| `config` _[ClusterExtensionConfig](#clusterextensionconfig)_ | config is optional and specifies bundle-specific configuration.<br />Configuration is bundle-specific and a bundle may provide a configuration schema.<br />When not specified, the default configuration of the resolved bundle is used.<br />config is validated against a configuration schema provided by the resolved bundle. If the bundle does not provide<br />a configuration schema the bundle is deemed to not be configurable. More information on how<br />to configure bundles can be found in the OLM documentation associated with your current OLM version.<br /><opcon:experimental> |  | Optional: \{\} <br /> |
+ | `progressDeadlineMinutes` _integer_ | progressDeadlineMinutes is an optional field that defines the maximum period<br />of time in minutes after which an installation should be considered failed and<br />require manual intervention. This functionality is disabled when no value<br />is provided. The minimum period is 10 minutes, and the maximum is 720 minutes (12 hours).<br /><opcon:experimental> |  | Maximum: 720 <br />Minimum: 10 <br />Optional: \{\} <br /> |
+ 
+ 
+diff --git a/docs/draft/howto/single-ownnamespace-install.md b/docs/draft/howto/single-ownnamespace-install.md
+index 4152946871..8e6f00fe49 100644
+--- a/docs/draft/howto/single-ownnamespace-install.md
++++ b/docs/draft/howto/single-ownnamespace-install.md
+@@ -1,7 +1,8 @@
+ ## Description
+ 
+ !!! note
+-The `SingleOwnNamespaceInstallSupport` feature-gate is enabled by default. Use this guide to configure bundles that need Single or Own namespace install modes.
++This feature is still in *alpha* the `SingleOwnNamespaceInstallSupport` feature-gate must be enabled to make use of it.
++See the instructions below on how to enable it.
+ 
+ ---
+ 
+@@ -30,6 +31,28 @@ include *installModes*.
+ 
+ [![OwnNamespace Install Demo](https://asciinema.org/a/Rxx6WUwAU016bXFDW74XLcM5i.svg)](https://asciinema.org/a/Rxx6WUwAU016bXFDW74XLcM5i)
+ 
++## Enabling the Feature-Gate
++
++!!! tip
++
++This guide assumes OLMv1 is already installed. If that is not the case,
++you can follow the [getting started](../../getting-started/olmv1_getting_started.md) guide to install OLMv1.
++
++---
++
++Patch the `operator-controller` `Deployment` adding `--feature-gates=SingleOwnNamespaceInstallSupport=true` to the
++controller container arguments:
++
++```terminal title="Enable SingleOwnNamespaceInstallSupport feature-gate"
++kubectl patch deployment -n olmv1-system operator-controller-controller-manager --type='json' -p='[{"op": "add", "path": "/spec/template/spec/containers/0/args/-", "value": "--feature-gates=SingleOwnNamespaceInstallSupport=true"}]'
++```
++
++Wait for `Deployment` rollout:
++
++```terminal title="Wait for Deployment rollout"
++kubectl rollout status -n olmv1-system deployment/operator-controller-controller-manager
++```
++
+ ## Configuring the `ClusterExtension`
+ 
+ A `ClusterExtension` can be configured to install bundle in `Single-` or `OwnNamespace` mode through the
+diff --git a/docs/draft/tutorials/explore-available-content-metas-endpoint.md b/docs/draft/tutorials/explore-available-content-metas-endpoint.md
+index 5d04b02df1..f17271d3e4 100644
+--- a/docs/draft/tutorials/explore-available-content-metas-endpoint.md
++++ b/docs/draft/tutorials/explore-available-content-metas-endpoint.md
+@@ -91,6 +91,9 @@ Then you can query the catalog by using `curl` commands and the `jq` CLI tool to
+         ...
+         ```
+ 
++    !!! important
++        OLM 1.0 supports installing extensions that define webhooks. Targeting a single or specified set of namespaces requires enabling the `SingleOwnNamespaceInstallSupport` feature-gate.
++
+ 3. Return list of packages which support `AllNamespaces` install mode, do not use webhooks, and where the channel head version uses `olm.csv.metadata` format:
+ 
+     ``` terminal
+diff --git a/docs/tutorials/explore-available-content.md b/docs/tutorials/explore-available-content.md
+index 98bb7733c6..36e3cf8834 100644
+--- a/docs/tutorials/explore-available-content.md
++++ b/docs/tutorials/explore-available-content.md
+@@ -91,6 +91,9 @@ Then you can query the catalog by using `curl` commands and the `jq` CLI tool to
+         ...
+         ```
+ 
++    !!! important
++        OLM 1.0 supports installing extensions that define webhooks. Targeting a single or specified set of namespaces requires enabling the `SingleOwnNamespaceInstallSupport` feature-gate.
++
+ 3. Return list of packages that support `AllNamespaces` install mode and do not use webhooks:
+ 
+     ``` terminal
+diff --git a/hack/demo/own-namespace-demo-script.sh b/hack/demo/own-namespace-demo-script.sh
+index 86b3d28760..611c6dfb05 100755
+--- a/hack/demo/own-namespace-demo-script.sh
++++ b/hack/demo/own-namespace-demo-script.sh
+@@ -6,14 +6,16 @@
+ set -e
+ trap 'echo "Demo ran into error"; trap - SIGTERM && kill -- -$$; exit 1' ERR SIGINT SIGTERM EXIT
+ 
+-# install standard CRDs
+-echo "Install standard CRDs..."
+-kubectl apply -f "$(dirname "${BASH_SOURCE[0]}")/../../manifests/standard.yaml"
++# install experimental CRDs with config field support
++kubectl apply -f "$(dirname "${BASH_SOURCE[0]}")/../../manifests/experimental.yaml"
+ 
+-# wait for standard CRDs to be available
++# wait for experimental CRDs to be available
+ kubectl wait --for condition=established --timeout=60s crd/clusterextensions.olm.operatorframework.io
+ 
+-# Ensure controller is healthy
++# enable 'SingleOwnNamespaceInstallSupport' feature gate
++kubectl patch deployment -n olmv1-system operator-controller-controller-manager --type='json' -p='[{"op": "add", "path": "/spec/template/spec/containers/0/args/-", "value": "--feature-gates=SingleOwnNamespaceInstallSupport=true"}]'
++
++# wait for operator-controller to become available
+ kubectl rollout status -n olmv1-system deployment/operator-controller-controller-manager
+ 
+ # create install namespace
+@@ -55,6 +57,17 @@ kubectl delete clusterextension argocd-operator --ignore-not-found=true
+ kubectl delete namespace argocd-system --ignore-not-found=true
+ kubectl delete clusterrolebinding argocd-installer-crb --ignore-not-found=true
+ 
++# remove feature gate from deployment
++echo "Removing feature gate from operator-controller..."
++kubectl patch deployment -n olmv1-system operator-controller-controller-manager --type='json' -p='[{"op": "remove", "path": "/spec/template/spec/containers/0/args", "value": "--feature-gates=SingleOwnNamespaceInstallSupport=true"}]' || true
++
++# restore standard CRDs
++echo "Restoring standard CRDs..."
++kubectl apply -f "$(dirname "${BASH_SOURCE[0]}")/../../manifests/base.yaml"
++
++# wait for standard CRDs to be available
++kubectl wait --for condition=established --timeout=60s crd/clusterextensions.olm.operatorframework.io
++
+ # wait for operator-controller to become available with standard config
+ kubectl rollout status -n olmv1-system deployment/operator-controller-controller-manager
+ 
+diff --git a/hack/demo/single-namespace-demo-script.sh b/hack/demo/single-namespace-demo-script.sh
+index 885854dd9d..9702684152 100755
+--- a/hack/demo/single-namespace-demo-script.sh
++++ b/hack/demo/single-namespace-demo-script.sh
+@@ -6,14 +6,16 @@
+ set -e
+ trap 'echo "Demo ran into error"; trap - SIGTERM && kill -- -$$; exit 1' ERR SIGINT SIGTERM EXIT
+ 
+-# install standard CRDs
+-echo "Install standard CRDs..."
+-kubectl apply -f "$(dirname "${BASH_SOURCE[0]}")/../../manifests/standard.yaml"
++# install experimental CRDs with config field support
++kubectl apply -f "$(dirname "${BASH_SOURCE[0]}")/../../manifests/experimental.yaml"
+ 
+-# wait for standard CRDs to be available
++# wait for experimental CRDs to be available
+ kubectl wait --for condition=established --timeout=60s crd/clusterextensions.olm.operatorframework.io
+ 
+-# Ensure controller is healthy
++# enable 'SingleOwnNamespaceInstallSupport' feature gate
++kubectl patch deployment -n olmv1-system operator-controller-controller-manager --type='json' -p='[{"op": "add", "path": "/spec/template/spec/containers/0/args/-", "value": "--feature-gates=SingleOwnNamespaceInstallSupport=true"}]'
++
++# wait for operator-controller to become available
+ kubectl rollout status -n olmv1-system deployment/operator-controller-controller-manager
+ 
+ # create install namespace
+@@ -58,6 +60,17 @@ kubectl delete clusterextension argocd-operator --ignore-not-found=true
+ kubectl delete namespace argocd-system argocd --ignore-not-found=true
+ kubectl delete clusterrolebinding argocd-installer-crb --ignore-not-found=true
+ 
++# remove feature gate from deployment
++echo "Removing feature gate from operator-controller..."
++kubectl patch deployment -n olmv1-system operator-controller-controller-manager --type='json' -p='[{"op": "remove", "path": "/spec/template/spec/containers/0/args", "value": "--feature-gates=SingleOwnNamespaceInstallSupport=true"}]' || true
++
++# restore standard CRDs
++echo "Restoring standard CRDs..."
++kubectl apply -f "$(dirname "${BASH_SOURCE[0]}")/../../manifests/base.yaml"
++
++# wait for standard CRDs to be available
++kubectl wait --for condition=established --timeout=60s crd/clusterextensions.olm.operatorframework.io
++
+ # wait for operator-controller to become available with standard config
+ kubectl rollout status -n olmv1-system deployment/operator-controller-controller-manager
+ 
+diff --git a/hack/test/pre-upgrade-setup.sh b/hack/test/pre-upgrade-setup.sh
+deleted file mode 100755
+index f2dc28761c..0000000000
+--- a/hack/test/pre-upgrade-setup.sh
++++ /dev/null
+@@ -1,172 +0,0 @@
+-#!/bin/bash
+-
+-set -euo pipefail
+-
+-help="pre-upgrade-setup.sh is used to create some basic resources
+-which will later be used in upgrade testing.
+-
+-Usage:
+-  post-upgrade-checks.sh [TEST_CATALOG_IMG] [TEST_CATALOG_NAME] [TEST_CLUSTER_EXTENSION_NAME]
+-"
+-
+-if [[ "$#" -ne 3 ]]; then
+-  echo "Illegal number of arguments passed"
+-  echo "${help}"
+-  exit 1
+-fi
+-
+-TEST_CATALOG_IMG=$1
+-TEST_CLUSTER_CATALOG_NAME=$2
+-TEST_CLUSTER_EXTENSION_NAME=$3
+-
+-kubectl apply -f - << EOF
+-apiVersion: olm.operatorframework.io/v1
+-kind: ClusterCatalog
+-metadata:
+-  name: ${TEST_CLUSTER_CATALOG_NAME}
+-spec:
+-  source:
+-    type: Image
+-    image:
+-      ref: ${TEST_CATALOG_IMG}
+-      pollIntervalMinutes: 1440
+-EOF
+-
+-kubectl apply -f - <<EOF
+-apiVersion: v1
+-kind: ServiceAccount
+-metadata:
+-  name: upgrade-e2e
+-  namespace: default
+-EOF
+-
+-kubectl apply -f - <<EOF
+-apiVersion: rbac.authorization.k8s.io/v1
+-kind: ClusterRole
+-metadata:
+-  name: upgrade-e2e
+-rules:
+-  - apiGroups:
+-    - ""
+-    resources:
+-    - "configmaps"
+-    - "secrets"
+-    - "services"
+-    - "serviceaccounts"
+-    verbs:
+-    - "create"
+-    - "update"
+-    - "patch"
+-    - "delete"
+-    - "get"
+-    - "list"
+-    - "watch"
+-  - apiGroups:
+-    - "apps"
+-    resources:
+-    - "deployments"
+-    verbs:
+-    - "create"
+-    - "update"
+-    - "patch"
+-    - "delete"
+-    - "get"
+-    - "list"
+-    - "watch"
+-  - apiGroups:
+-    - "apiextensions.k8s.io"
+-    resources:
+-    - "customresourcedefinitions"
+-    verbs:
+-    - "create"
+-    - "update"
+-    - "patch"
+-    - "delete"
+-    - "get"
+-    - "list"
+-    - "watch"
+-  - apiGroups:
+-    - "rbac.authorization.k8s.io"
+-    resources:
+-    - "clusterroles"
+-    - "clusterrolebindings"
+-    - "roles"
+-    - "rolebindings"
+-    verbs:
+-    - "create"
+-    - "update"
+-    - "patch"
+-    - "delete"
+-    - "get"
+-    - "list"
+-    - "watch"
+-    - "bind"
+-    - "escalate"
+-  - apiGroups:
+-    - networking.k8s.io
+-    resources:
+-    - networkpolicies
+-    verbs:
+-    - get
+-    - list
+-    - watch
+-    - create
+-    - update
+-    - patch
+-    - delete
+-  - apiGroups:
+-    - "olm.operatorframework.io"
+-    resources:
+-    - "clusterextensions/finalizers"
+-    verbs:
+-    - "update"
+-    resourceNames:
+-    - "${TEST_CLUSTER_EXTENSION_NAME}"
+-  - apiGroups:
+-    - "olm.operatorframework.io"
+-    resources:
+-    - "clusterextensionrevisions"
+-    - "clusterextensionrevisions/finalizers"
+-    verbs:
+-    - "create"
+-    - "update"
+-    - "patch"
+-    - "delete"
+-    - "get"
+-    - "list"
+-    - "watch"
+-EOF
+-
+-kubectl apply -f - <<EOF
+-apiVersion: rbac.authorization.k8s.io/v1
+-kind: ClusterRoleBinding
+-metadata:
+-  name: upgrade-e2e
+-subjects:
+-  - kind: ServiceAccount
+-    name: upgrade-e2e
+-    namespace: default
+-roleRef:
+-  apiGroup: rbac.authorization.k8s.io
+-  kind: ClusterRole
+-  name: upgrade-e2e
+-EOF
+-
+-kubectl apply -f - << EOF
+-apiVersion: olm.operatorframework.io/v1
+-kind: ClusterExtension
+-metadata:
+-  name: ${TEST_CLUSTER_EXTENSION_NAME}
+-spec:
+-  namespace: default
+-  serviceAccount:
+-    name: upgrade-e2e
+-  source:
+-    sourceType: Catalog
+-    catalog:
+-      packageName: test
+-      version: 1.0.0
+-EOF
+-
+-kubectl wait --for=condition=Serving --timeout=60s ClusterCatalog $TEST_CLUSTER_CATALOG_NAME
+-kubectl wait --for=condition=Installed --timeout=60s ClusterExtension $TEST_CLUSTER_EXTENSION_NAME
+diff --git a/helm/experimental.yaml b/helm/experimental.yaml
+index e1c7f37cb6..b158389d48 100644
+--- a/helm/experimental.yaml
++++ b/helm/experimental.yaml
+@@ -9,6 +9,7 @@ options:
+   operatorController:
+     features:
+       enabled:
++        - SingleOwnNamespaceInstallSupport
+         - PreflightPermissions
+         - HelmChartSupport
+         - BoxcutterRuntime
+diff --git a/helm/olmv1/base/operator-controller/crd/standard/olm.operatorframework.io_clusterextensions.yaml b/helm/olmv1/base/operator-controller/crd/standard/olm.operatorframework.io_clusterextensions.yaml
+index 0b824025eb..aca133f732 100644
+--- a/helm/olmv1/base/operator-controller/crd/standard/olm.operatorframework.io_clusterextensions.yaml
++++ b/helm/olmv1/base/operator-controller/crd/standard/olm.operatorframework.io_clusterextensions.yaml
+@@ -57,44 +57,6 @@ spec:
+             description: spec is an optional field that defines the desired state
+               of the ClusterExtension.
+             properties:
+-              config:
+-                description: |-
+-                  config is optional and specifies bundle-specific configuration.
+-                  Configuration is bundle-specific and a bundle may provide a configuration schema.
+-                  When not specified, the default configuration of the resolved bundle is used.
+-
+-                  config is validated against a configuration schema provided by the resolved bundle. If the bundle does not provide
+-                  a configuration schema the bundle is deemed to not be configurable. More information on how
+-                  to configure bundles can be found in the OLM documentation associated with your current OLM version.
+-                properties:
+-                  configType:
+-                    description: |-
+-                      configType is required and specifies the type of configuration source.
+-
+-                      The only allowed value is "Inline".
+-
+-                      When set to "Inline", the cluster extension configuration is defined inline within the ClusterExtension resource.
+-                    enum:
+-                    - Inline
+-                    type: string
+-                  inline:
+-                    description: |-
+-                      inline contains JSON or YAML values specified directly in the ClusterExtension.
+-
+-                      It is used to specify arbitrary configuration values for the ClusterExtension.
+-                      It must be set if configType is 'Inline' and must be a valid JSON/YAML object containing at least one property.
+-                      The configuration values are validated at runtime against a JSON schema provided by the bundle.
+-                    minProperties: 1
+-                    type: object
+-                    x-kubernetes-preserve-unknown-fields: true
+-                required:
+-                - configType
+-                type: object
+-                x-kubernetes-validations:
+-                - message: inline is required when configType is Inline, and forbidden
+-                    otherwise
+-                  rule: 'has(self.configType) && self.configType == ''Inline'' ?has(self.inline)
+-                    : !has(self.inline)'
+               install:
+                 description: |-
+                   install is optional and configures installation options for the ClusterExtension,
+diff --git a/helm/tilt.yaml b/helm/tilt.yaml
+index 0fe3bec1f7..aaed7c71fb 100644
+--- a/helm/tilt.yaml
++++ b/helm/tilt.yaml
+@@ -14,6 +14,7 @@ options:
+   operatorController:
+     features:
+       enabled:
++        - SingleOwnNamespaceInstallSupport
+         - PreflightPermissions
+         - HelmChartSupport
+       disabled:
+diff --git a/internal/operator-controller/features/features.go b/internal/operator-controller/features/features.go
+index 53ee2626ae..0f99c1b28e 100644
+--- a/internal/operator-controller/features/features.go
++++ b/internal/operator-controller/features/features.go
+@@ -34,8 +34,8 @@ var operatorControllerFeatureGates = map[featuregate.Feature]featuregate.Feature
+ 	// registry+v1 cluster extensions with single or own namespaces modes
+ 	// i.e. with a single watch namespace.
+ 	SingleOwnNamespaceInstallSupport: {
+-		Default:       true,
+-		PreRelease:    featuregate.GA,
++		Default:       false,
++		PreRelease:    featuregate.Alpha,
+ 		LockToDefault: false,
+ 	},
+ 
+diff --git a/manifests/experimental-e2e.yaml b/manifests/experimental-e2e.yaml
+index 74fcc399f9..f308be7535 100644
+--- a/manifests/experimental-e2e.yaml
++++ b/manifests/experimental-e2e.yaml
+@@ -2452,6 +2452,7 @@ spec:
+             - --metrics-bind-address=:8443
+             - --pprof-bind-address=:6060
+             - --leader-elect
++            - --feature-gates=SingleOwnNamespaceInstallSupport=true
+             - --feature-gates=PreflightPermissions=true
+             - --feature-gates=HelmChartSupport=true
+             - --feature-gates=BoxcutterRuntime=true
+diff --git a/manifests/experimental.yaml b/manifests/experimental.yaml
+index 12ae10d9bc..2163b698e1 100644
+--- a/manifests/experimental.yaml
++++ b/manifests/experimental.yaml
+@@ -2358,6 +2358,7 @@ spec:
+             - --health-probe-bind-address=:8081
+             - --metrics-bind-address=:8443
+             - --leader-elect
++            - --feature-gates=SingleOwnNamespaceInstallSupport=true
+             - --feature-gates=PreflightPermissions=true
+             - --feature-gates=HelmChartSupport=true
+             - --feature-gates=BoxcutterRuntime=true
+diff --git a/manifests/standard-e2e.yaml b/manifests/standard-e2e.yaml
+index 0d6060a1b9..f68e17f746 100644
+--- a/manifests/standard-e2e.yaml
++++ b/manifests/standard-e2e.yaml
+@@ -669,44 +669,6 @@ spec:
+             description: spec is an optional field that defines the desired state
+               of the ClusterExtension.
+             properties:
+-              config:
+-                description: |-
+-                  config is optional and specifies bundle-specific configuration.
+-                  Configuration is bundle-specific and a bundle may provide a configuration schema.
+-                  When not specified, the default configuration of the resolved bundle is used.
+-
+-                  config is validated against a configuration schema provided by the resolved bundle. If the bundle does not provide
+-                  a configuration schema the bundle is deemed to not be configurable. More information on how
+-                  to configure bundles can be found in the OLM documentation associated with your current OLM version.
+-                properties:
+-                  configType:
+-                    description: |-
+-                      configType is required and specifies the type of configuration source.
+-
+-                      The only allowed value is "Inline".
+-
+-                      When set to "Inline", the cluster extension configuration is defined inline within the ClusterExtension resource.
+-                    enum:
+-                    - Inline
+-                    type: string
+-                  inline:
+-                    description: |-
+-                      inline contains JSON or YAML values specified directly in the ClusterExtension.
+-
+-                      It is used to specify arbitrary configuration values for the ClusterExtension.
+-                      It must be set if configType is 'Inline' and must be a valid JSON/YAML object containing at least one property.
+-                      The configuration values are validated at runtime against a JSON schema provided by the bundle.
+-                    minProperties: 1
+-                    type: object
+-                    x-kubernetes-preserve-unknown-fields: true
+-                required:
+-                - configType
+-                type: object
+-                x-kubernetes-validations:
+-                - message: inline is required when configType is Inline, and forbidden
+-                    otherwise
+-                  rule: 'has(self.configType) && self.configType == ''Inline'' ?has(self.inline)
+-                    : !has(self.inline)'
+               install:
+                 description: |-
+                   install is optional and configures installation options for the ClusterExtension,
+diff --git a/manifests/standard.yaml b/manifests/standard.yaml
+index b337169e27..6db6b21ad9 100644
+--- a/manifests/standard.yaml
++++ b/manifests/standard.yaml
+@@ -630,44 +630,6 @@ spec:
+             description: spec is an optional field that defines the desired state
+               of the ClusterExtension.
+             properties:
+-              config:
+-                description: |-
+-                  config is optional and specifies bundle-specific configuration.
+-                  Configuration is bundle-specific and a bundle may provide a configuration schema.
+-                  When not specified, the default configuration of the resolved bundle is used.
+-
+-                  config is validated against a configuration schema provided by the resolved bundle. If the bundle does not provide
+-                  a configuration schema the bundle is deemed to not be configurable. More information on how
+-                  to configure bundles can be found in the OLM documentation associated with your current OLM version.
+-                properties:
+-                  configType:
+-                    description: |-
+-                      configType is required and specifies the type of configuration source.
+-
+-                      The only allowed value is "Inline".
+-
+-                      When set to "Inline", the cluster extension configuration is defined inline within the ClusterExtension resource.
+-                    enum:
+-                    - Inline
+-                    type: string
+-                  inline:
+-                    description: |-
+-                      inline contains JSON or YAML values specified directly in the ClusterExtension.
+-
+-                      It is used to specify arbitrary configuration values for the ClusterExtension.
+-                      It must be set if configType is 'Inline' and must be a valid JSON/YAML object containing at least one property.
+-                      The configuration values are validated at runtime against a JSON schema provided by the bundle.
+-                    minProperties: 1
+-                    type: object
+-                    x-kubernetes-preserve-unknown-fields: true
+-                required:
+-                - configType
+-                type: object
+-                x-kubernetes-validations:
+-                - message: inline is required when configType is Inline, and forbidden
+-                    otherwise
+-                  rule: 'has(self.configType) && self.configType == ''Inline'' ?has(self.inline)
+-                    : !has(self.inline)'
+               install:
+                 description: |-
+                   install is optional and configures installation options for the ClusterExtension,
+diff --git a/openshift/operator-controller/manifests.yaml b/openshift/operator-controller/manifests.yaml
+index 9ff57a0896..a92a899bfb 100644
+--- a/openshift/operator-controller/manifests.yaml
++++ b/openshift/operator-controller/manifests.yaml
+@@ -144,42 +144,6 @@ spec:
+             spec:
+               description: spec is an optional field that defines the desired state of the ClusterExtension.
+               properties:
+-                config:
+-                  description: |-
+-                    config is optional and specifies bundle-specific configuration.
+-                    Configuration is bundle-specific and a bundle may provide a configuration schema.
+-                    When not specified, the default configuration of the resolved bundle is used.
+-
+-                    config is validated against a configuration schema provided by the resolved bundle. If the bundle does not provide
+-                    a configuration schema the bundle is deemed to not be configurable. More information on how
+-                    to configure bundles can be found in the OLM documentation associated with your current OLM version.
+-                  properties:
+-                    configType:
+-                      description: |-
+-                        configType is required and specifies the type of configuration source.
+-
+-                        The only allowed value is "Inline".
+-
+-                        When set to "Inline", the cluster extension configuration is defined inline within the ClusterExtension resource.
+-                      enum:
+-                        - Inline
+-                      type: string
+-                    inline:
+-                      description: |-
+-                        inline contains JSON or YAML values specified directly in the ClusterExtension.
+-
+-                        It is used to specify arbitrary configuration values for the ClusterExtension.
+-                        It must be set if configType is 'Inline' and must be a valid JSON/YAML object containing at least one property.
+-                        The configuration values are validated at runtime against a JSON schema provided by the bundle.
+-                      minProperties: 1
+-                      type: object
+-                      x-kubernetes-preserve-unknown-fields: true
+-                  required:
+-                    - configType
+-                  type: object
+-                  x-kubernetes-validations:
+-                    - message: inline is required when configType is Inline, and forbidden otherwise
+-                      rule: 'has(self.configType) && self.configType == ''Inline'' ?has(self.inline) : !has(self.inline)'
+                 install:
+                   description: |-
+                     install is optional and configures installation options for the ClusterExtension,
+diff --git a/openshift/tests-extension/vendor/github.com/operator-framework/operator-controller/api/v1/clusterextension_types.go b/openshift/tests-extension/vendor/github.com/operator-framework/operator-controller/api/v1/clusterextension_types.go
+index ee55109f86..18f982725b 100644
+--- a/openshift/tests-extension/vendor/github.com/operator-framework/operator-controller/api/v1/clusterextension_types.go
++++ b/openshift/tests-extension/vendor/github.com/operator-framework/operator-controller/api/v1/clusterextension_types.go
+@@ -105,6 +105,7 @@ type ClusterExtensionSpec struct {
+ 	// a configuration schema the bundle is deemed to not be configurable. More information on how
+ 	// to configure bundles can be found in the OLM documentation associated with your current OLM version.
+ 	//
++	// <opcon:experimental>
+ 	// +optional
+ 	Config *ClusterExtensionConfig `json:"config,omitempty"`
+ 
+diff --git a/requirements.txt b/requirements.txt
+index 71b41fcce5..ae48a8a27c 100644
+--- a/requirements.txt
++++ b/requirements.txt
+@@ -27,7 +27,7 @@ python-dateutil==2.9.0.post0
+ PyYAML==6.0.3
+ pyyaml_env_tag==1.1
+ readtime==3.0.0
+-regex==2026.2.19
++regex==2026.2.28
+ requests==2.32.5
+ six==1.17.0
+ soupsieve==2.8.3
+diff --git a/test/e2e/README.md b/test/e2e/README.md
+index f41b612fd0..01dbca7026 100644
+--- a/test/e2e/README.md
++++ b/test/e2e/README.md
+@@ -33,12 +33,14 @@ test/e2e/
+     ├── steps.go                # Step definition implementations
+     ├── hooks.go                # Test hooks and scenario context
+     └── testdata/               # Test data (RBAC templates, catalogs)
+-        ├── rbac-template.yaml
++        ├── serviceaccount-template.yaml
++        ├── olm-sa-helm-rbac-template.yaml
++        ├── olm-sa-boxcutter-rbac-template.yaml
++        ├── pvc-probe-sa-boxcutter-rbac-template.yaml
+         ├── cluster-admin-rbac-template.yaml
+         ├── metrics-reader-rbac-template.yaml
+         ├── test-catalog-template.yaml
+-        ├── extra-catalog-template.yaml
+-        └── ...
++        └── extra-catalog-template.yaml
+ ```
+ 
+ ## Architecture
+diff --git a/test/e2e/steps/hooks.go b/test/e2e/steps/hooks.go
+index a4f518e4f8..f38559cb2f 100644
+--- a/test/e2e/steps/hooks.go
++++ b/test/e2e/steps/hooks.go
+@@ -31,9 +31,12 @@ type scenarioContext struct {
+ 	namespace                    string
+ 	clusterExtensionName         string
+ 	clusterExtensionRevisionName string
++	clusterCatalogName           string
++	addedResources               []resource
+ 	removedResources             []unstructured.Unstructured
+ 	backGroundCmds               []*exec.Cmd
+ 	metricsResponse              map[string]string
++	leaderPods                   map[string]string // component name -> leader pod name
+ 
+ 	extensionObjects []client.Object
+ }
+@@ -67,7 +70,7 @@ var (
+ 	featureGates = map[featuregate.Feature]bool{
+ 		features.WebhookProviderCertManager:        true,
+ 		features.PreflightPermissions:              false,
+-		features.SingleOwnNamespaceInstallSupport:  true,
++		features.SingleOwnNamespaceInstallSupport:  false,
+ 		features.SyntheticPermissions:              false,
+ 		features.WebhookProviderOpenshiftServiceCA: false,
+ 		features.HelmChartSupport:                  false,
+@@ -89,30 +92,37 @@ func RegisterHooks(sc *godog.ScenarioContext) {
+ 	sc.After(ScenarioCleanup)
+ }
+ 
+-func BeforeSuite() {
+-	if devMode {
+-		logger = textlogger.NewLogger(textlogger.NewConfig(textlogger.Verbosity(1)))
+-	} else {
+-		logger = textlogger.NewLogger(textlogger.NewConfig())
+-	}
+-
++func detectOLMDeployment() (*appsv1.Deployment, error) {
+ 	raw, err := k8sClient("get", "deployments", "-A", "-l", "app.kubernetes.io/part-of=olm", "-o", "jsonpath={.items}")
+ 	if err != nil {
+-		panic(fmt.Errorf("failed to get OLM deployments: %v", err))
++		return nil, err
+ 	}
+ 	dl := []appsv1.Deployment{}
+ 	if err := json.Unmarshal([]byte(raw), &dl); err != nil {
+-		panic(fmt.Errorf("failed to unmarshal OLM deployments: %v", err))
++		return nil, fmt.Errorf("failed to unmarshal OLM deployments: %v", err)
+ 	}
+-	var olm *appsv1.Deployment
+ 
+ 	for _, d := range dl {
+ 		if d.Name == olmDeploymentName {
+-			olm = &d
+-			olmNamespace = d.Namespace
+-			break
++			return &d, nil
+ 		}
+ 	}
++	return nil, fmt.Errorf("failed to detect OLM Deployment")
++}
++
++func BeforeSuite() {
++	if devMode {
++		logger = textlogger.NewLogger(textlogger.NewConfig(textlogger.Verbosity(1)))
++	} else {
++		logger = textlogger.NewLogger(textlogger.NewConfig())
++	}
++
++	olm, err := detectOLMDeployment()
++	if err != nil {
++		logger.Info("OLM deployments not found; skipping feature gate detection (upgrade scenarios will install OLM in Background)")
++		return
++	}
++	olmNamespace = olm.Namespace
+ 
+ 	featureGatePattern := regexp.MustCompile(`--feature-gates=([[:alnum:]]+)=(true|false)`)
+ 	for _, c := range olm.Spec.Template.Spec.Containers {
+@@ -147,6 +157,7 @@ func CreateScenarioContext(ctx context.Context, sc *godog.Scenario) (context.Con
+ 		namespace:                    fmt.Sprintf("ns-%s", sc.Id),
+ 		clusterExtensionName:         fmt.Sprintf("ce-%s", sc.Id),
+ 		clusterExtensionRevisionName: fmt.Sprintf("cer-%s", sc.Id),
++		leaderPods:                   make(map[string]string),
+ 	}
+ 	return context.WithValue(ctx, scenarioContextKey, scCtx), nil
+ }
+@@ -174,7 +185,7 @@ func ScenarioCleanup(ctx context.Context, _ *godog.Scenario, err error) (context
+ 		return ctx, err
+ 	}
+ 
+-	forDeletion := []resource{}
++	forDeletion := sc.addedResources
+ 	if sc.clusterExtensionName != "" {
+ 		forDeletion = append(forDeletion, resource{name: sc.clusterExtensionName, kind: "clusterextension"})
+ 	}
+diff --git a/test/e2e/steps/steps.go b/test/e2e/steps/steps.go
+index fd5ac12111..79cb8257a0 100644
+--- a/test/e2e/steps/steps.go
++++ b/test/e2e/steps/steps.go
+@@ -14,7 +14,9 @@ import (
+ 	"os/exec"
+ 	"path/filepath"
+ 	"reflect"
++	"runtime"
+ 	"strings"
++	"sync"
+ 	"time"
+ 
+ 	"github.com/cucumber/godog"
+@@ -47,9 +49,24 @@ const (
+ )
+ 
+ var (
+-	olmNamespace   = "olmv1-system"
+-	kubeconfigPath string
+-	k8sCli         string
++	olmNamespace        = "olmv1-system"
++	kubeconfigPath      string
++	k8sCli              string
++	deployImageRegistry = sync.OnceValue(func() error {
++		if os.Getenv("KIND_CLUSTER_NAME") == "" {
++			return nil
++		}
++		cmd := exec.Command("bash", "-c", "make image-registry")
++		dir, _ := os.LookupEnv("ROOT_DIR")
++		if dir == "" {
++			return fmt.Errorf("ROOT_DIR environment variable not set")
++		}
++		cmd.Dir = dir
++		cmd.Env = append(os.Environ(), fmt.Sprintf("KUBECONFIG=%s", kubeconfigPath))
++		cmd.Stdout = os.Stdout
++		cmd.Stderr = os.Stderr
++		return cmd.Run()
++	})
+ )
+ 
+ func RegisterSteps(sc *godog.ScenarioContext) {
+@@ -91,8 +108,9 @@ func RegisterSteps(sc *godog.ScenarioContext) {
+ 	sc.Step(`^(?i)resource "([^"]+)" is eventually restored$`, ResourceRestored)
+ 	sc.Step(`^(?i)resource "([^"]+)" matches$`, ResourceMatches)
+ 
+-	sc.Step(`^(?i)ServiceAccount "([^"]*)" with needed permissions is available in test namespace$`, ServiceAccountWithNeededPermissionsIsAvailableInNamespace)
+-	sc.Step(`^(?i)ServiceAccount "([^"]*)" with needed permissions is available in \${TEST_NAMESPACE}$`, ServiceAccountWithNeededPermissionsIsAvailableInNamespace)
++	sc.Step(`^(?i)ServiceAccount "([^"]*)" with permissions to install extensions is available in "([^"]*)" namespace$`, ServiceAccountWithNeededPermissionsIsAvailableInGivenNamespace)
++	sc.Step(`^(?i)ServiceAccount "([^"]*)" with needed permissions is available in test namespace$`, ServiceAccountWithNeededPermissionsIsAvailableInTestNamespace)
++	sc.Step(`^(?i)ServiceAccount "([^"]*)" with needed permissions is available in \${TEST_NAMESPACE}$`, ServiceAccountWithNeededPermissionsIsAvailableInTestNamespace)
+ 	sc.Step(`^(?i)ServiceAccount "([^"]*)" is available in \${TEST_NAMESPACE}$`, ServiceAccountIsAvailableInNamespace)
+ 	sc.Step(`^(?i)ServiceAccount "([^"]*)" in test namespace is cluster admin$`, ServiceAccountWithClusterAdminPermissionsIsAvailableInNamespace)
+ 	sc.Step(`^(?i)ServiceAccount "([^"]+)" in test namespace has permissions to fetch "([^"]+)" metrics$`, ServiceAccountWithFetchMetricsPermissions)
+@@ -110,6 +128,14 @@ func RegisterSteps(sc *godog.ScenarioContext) {
+ 	sc.Step(`^(?i)Prometheus metrics are returned in the response$`, PrometheusMetricsAreReturned)
+ 
+ 	sc.Step(`^(?i)min value for (ClusterExtension|ClusterExtensionRevision) ((?:\.[a-zA-Z]+)+) is set to (\d+)$`, SetCRDFieldMinValue)
++
++	// Upgrade-specific steps
++	sc.Step(`^(?i)the latest stable OLM release is installed$`, LatestStableOLMReleaseIsInstalled)
++	sc.Step(`^(?i)OLM is upgraded$`, OLMIsUpgraded)
++	sc.Step(`^(?i)(catalogd|operator-controller) is ready to reconcile resources$`, ComponentIsReadyToReconcile)
++	sc.Step(`^(?i)all (ClusterCatalog|ClusterExtension) resources are reconciled$`, allResourcesAreReconciled)
++	sc.Step(`^(?i)(ClusterCatalog|ClusterExtension) is reconciled$`, ResourceTypeIsReconciled)
++	sc.Step(`^(?i)ClusterCatalog reports ([[:alnum:]]+) as ([[:alnum:]]+) with Reason ([[:alnum:]]+)$`, ClusterCatalogReportsCondition)
+ }
+ 
+ func init() {
+@@ -775,15 +801,16 @@ func ResourceRestored(ctx context.Context, resource string) error {
+ 	return nil
+ }
+ 
+-func applyServiceAccount(ctx context.Context, serviceAccount string) error {
++func applyServiceAccount(ctx context.Context, serviceAccount string, keyValue ...string) error {
+ 	sc := scenarioCtx(ctx)
+ 	vars := extendMap(map[string]string{
+ 		"TEST_NAMESPACE":       sc.namespace,
+ 		"SERVICE_ACCOUNT_NAME": serviceAccount,
+ 		"SERVICEACCOUNT_NAME":  serviceAccount,
+-	})
++	}, keyValue...)
+ 
+-	yaml, err := templateYaml(filepath.Join("steps", "testdata", "serviceaccount-template.yaml"), vars)
++	_, thisFile, _, _ := runtime.Caller(0)
++	yaml, err := templateYaml(filepath.Join(filepath.Dir(thisFile), "testdata", "serviceaccount-template.yaml"), vars)
+ 	if err != nil {
+ 		return fmt.Errorf("failed to template ServiceAccount yaml: %v", err)
+ 	}
+@@ -810,7 +837,8 @@ func applyPermissionsToServiceAccount(ctx context.Context, serviceAccount, rbacT
+ 		"CLUSTEREXTENSION_NAME":  sc.clusterExtensionName,
+ 	}, keyValue...)
+ 
+-	yaml, err := templateYaml(filepath.Join("steps", "testdata", rbacTemplate), vars)
++	_, thisFile, _, _ := runtime.Caller(0)
++	yaml, err := templateYaml(filepath.Join(filepath.Dir(thisFile), "testdata", rbacTemplate), vars)
+ 	if err != nil {
+ 		return fmt.Errorf("failed to template RBAC yaml: %v", err)
+ 	}
+@@ -829,9 +857,9 @@ func ServiceAccountIsAvailableInNamespace(ctx context.Context, serviceAccount st
+ 	return applyServiceAccount(ctx, serviceAccount)
+ }
+ 
+-// ServiceAccountWithNeededPermissionsIsAvailableInNamespace creates a ServiceAccount and applies standard RBAC permissions.
++// ServiceAccountWithNeededPermissionsIsAvailableInTestNamespace creates a ServiceAccount and applies standard RBAC permissions.
+ // The RBAC template is selected based on the service account and BoxcutterRuntime feature gate: <service-account>-<helm|boxcutter>-rbac-template.yaml
+-func ServiceAccountWithNeededPermissionsIsAvailableInNamespace(ctx context.Context, serviceAccount string) error {
++func ServiceAccountWithNeededPermissionsIsAvailableInTestNamespace(ctx context.Context, serviceAccount string) error {
+ 	kernel := "helm"
+ 	if enabled, found := featureGates[features.BoxcutterRuntime]; found && enabled {
+ 		kernel = "boxcutter"
+@@ -840,6 +868,16 @@ func ServiceAccountWithNeededPermissionsIsAvailableInNamespace(ctx context.Conte
+ 	return applyPermissionsToServiceAccount(ctx, serviceAccount, rbacTemplate)
+ }
+ 
++// ServiceAccountWithNeededPermissionsIsAvailableInGivenNamespace creates a ServiceAccount and enables creation of any cluster extension on behalf of this account.
++func ServiceAccountWithNeededPermissionsIsAvailableInGivenNamespace(ctx context.Context, serviceAccount string, ns string) error {
++	sc := scenarioCtx(ctx)
++	sc.addedResources = append(sc.addedResources, resource{name: ns, kind: "namespace"})
++	if err := applyServiceAccount(ctx, serviceAccount, "TEST_NAMESPACE", ns); err != nil {
++		return err
++	}
++	return applyPermissionsToServiceAccount(ctx, serviceAccount, "rbac-template-for-all-extensions.yaml", "TEST_NAMESPACE", ns)
++}
++
+ // ServiceAccountWithClusterAdminPermissionsIsAvailableInNamespace creates a ServiceAccount and applies cluster-admin RBAC.
+ func ServiceAccountWithClusterAdminPermissionsIsAvailableInNamespace(ctx context.Context, serviceAccount string) error {
+ 	return applyPermissionsToServiceAccount(ctx, serviceAccount, "cluster-admin-rbac-template.yaml")
+@@ -993,12 +1031,19 @@ func CatalogIsUpdatedToVersion(name, version string) error {
+ 
+ // CatalogServesBundles applies the ClusterCatalog YAML template to create a catalog that serves bundles.
+ func CatalogServesBundles(ctx context.Context, catalogName string) error {
+-	yamlContent, err := os.ReadFile(filepath.Join("steps", "testdata", fmt.Sprintf("%s-catalog-template.yaml", catalogName)))
++	if err := deployImageRegistry(); err != nil {
++		return err
++	}
++	sc := scenarioCtx(ctx)
++	sc.clusterCatalogName = fmt.Sprintf("%s-catalog", catalogName)
++
++	_, thisFile, _, _ := runtime.Caller(0)
++	yamlContent, err := os.ReadFile(filepath.Join(filepath.Dir(thisFile), "testdata", fmt.Sprintf("%s-catalog-template.yaml", catalogName)))
+ 	if err != nil {
+ 		return fmt.Errorf("failed to read catalog yaml: %v", err)
+ 	}
+ 
+-	_, err = k8scliWithInput(substituteScenarioVars(string(yamlContent), scenarioCtx(ctx)), "apply", "-f", "-")
++	_, err = k8scliWithInput(substituteScenarioVars(string(yamlContent), sc), "apply", "-f", "-")
+ 	if err != nil {
+ 		return fmt.Errorf("failed to apply catalog: %v", err)
+ 	}
+diff --git a/test/e2e/steps/testdata/rbac-template-for-all-extensions.yaml b/test/e2e/steps/testdata/rbac-template-for-all-extensions.yaml
+new file mode 100644
+index 0000000000..fa27689828
+--- /dev/null
++++ b/test/e2e/steps/testdata/rbac-template-for-all-extensions.yaml
+@@ -0,0 +1,67 @@
++---
++apiVersion: v1
++kind: Namespace
++metadata:
++  name: ${TEST_NAMESPACE}
++---
++apiVersion: rbac.authorization.k8s.io/v1
++kind: ClusterRole
++metadata:
++  name: ${TEST_NAMESPACE}-${SERVICEACCOUNT_NAME}-olm-admin-clusterrole
++rules:
++  - apiGroups: [olm.operatorframework.io]
++    resources: [clusterextensions, clusterextensions/finalizers]
++    verbs: [update]
++  # Allow ClusterExtensionRevisions to set blockOwnerDeletion ownerReferences
++  - apiGroups: [olm.operatorframework.io]
++    resources: [clusterextensionrevisions, clusterextensionrevisions/finalizers]
++    verbs: [update, create, list, watch, get, delete, patch]
++  - apiGroups: [apiextensions.k8s.io]
++    resources: [customresourcedefinitions]
++    verbs: [update, create, list, watch, get, delete, patch]
++  - apiGroups: [""]
++    resources:
++      - configmaps
++      - secrets
++      - services
++      - serviceaccounts
++      - events
++      - namespaces
++    verbs: [update, create, list, watch, get, delete, patch]
++  - apiGroups: ["apps"]
++    resources:
++      - deployments
++    verbs: [ update, create, list, watch, get, delete, patch ]
++  - apiGroups: ["networking.k8s.io"]
++    resources:
++      - networkpolicies
++    verbs: [ update, create, list, watch, get, delete, patch ]
++  - apiGroups: ["rbac.authorization.k8s.io"]
++    resources:
++      - clusterroles
++      - roles
++      - clusterrolebindings
++      - rolebindings
++    verbs: [ update, create, list, watch, get, delete, patch ]
++  - apiGroups: ["coordination.k8s.io"]
++    resources: ["leases"]
++    verbs: [ update, create, list, watch, get, delete, patch ]
++  - apiGroups: ["authorization.k8s.io"]
++    resources: ["subjectaccessreviews"]
++    verbs: [create]
++  - apiGroups: ["authentication.k8s.io"]
++    resources: ["tokenreviews"]
++    verbs: [create]
++---
++apiVersion: rbac.authorization.k8s.io/v1
++kind: ClusterRoleBinding
++metadata:
++  name: ${TEST_NAMESPACE}-${SERVICEACCOUNT_NAME}-install-binding
++roleRef:
++  apiGroup: rbac.authorization.k8s.io
++  kind: ClusterRole
++  name: ${TEST_NAMESPACE}-${SERVICEACCOUNT_NAME}-olm-admin-clusterrole
++subjects:
++  - kind: ServiceAccount
++    name: ${SERVICEACCOUNT_NAME}
++    namespace: ${TEST_NAMESPACE}
+diff --git a/test/e2e/steps/upgrade_steps.go b/test/e2e/steps/upgrade_steps.go
+new file mode 100644
+index 0000000000..3868479a84
+--- /dev/null
++++ b/test/e2e/steps/upgrade_steps.go
+@@ -0,0 +1,264 @@
++package steps
++
++import (
++	"context"
++	"encoding/json"
++	"fmt"
++	"net/url"
++	"os"
++	"os/exec"
++	"strings"
++	"sync"
++
++	corev1 "k8s.io/api/core/v1"
++	apimeta "k8s.io/apimachinery/pkg/api/meta"
++	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
++
++	catalogdv1 "github.com/operator-framework/operator-controller/api/v1"
++)
++
++// leaseNames maps component labels to their leader election lease names.
++var leaseNames = map[string]string{
++	"catalogd":            "catalogd-operator-lock",
++	"operator-controller": "9c4404e7.operatorframework.io",
++}
++
++var (
++	installOperator = sync.OnceValue(func() error {
++		err := runInstallScript("RELEASE_INSTALL")
++		if err != nil {
++			return err
++		}
++		olm, err := detectOLMDeployment()
++		if err != nil {
++			return err
++		}
++		olmNamespace = olm.Namespace
++		return nil
++	})
++	upgradeOperator = sync.OnceValue(func() error {
++		return runInstallScript("RELEASE_UPGRADE")
++	})
++)
++
++// LatestStableOLMReleaseIsInstalled downloads and executes the latest stable OLM release install script.
++// Uses sync.Once to ensure the install only happens once across multiple scenarios.
++func LatestStableOLMReleaseIsInstalled(_ context.Context) error {
++	return installOperator()
++}
++
++func runInstallScript(envVar string) error {
++	scriptPath, found := os.LookupEnv(envVar)
++	if !found {
++		return fmt.Errorf("missing %s env variable", envVar)
++	}
++	if scriptPath == "" {
++		return fmt.Errorf("%s environment variable must contain install script location", envVar)
++	}
++	var cmd *exec.Cmd
++	if u, err := url.Parse(scriptPath); err == nil && u.Scheme != "" {
++		cmd = exec.Command("bash", "-c", fmt.Sprintf("curl -L -s %s | bash -s", scriptPath)) //nolint:gosec // scriptPath is from a trusted env variable
++	} else {
++		cmd = exec.Command("bash", scriptPath)
++	}
++	dir, _ := os.LookupEnv("ROOT_DIR")
++	if dir == "" {
++		return fmt.Errorf("ROOT_DIR environment variable not set")
++	}
++	cmd.Dir = dir
++	cmd.Env = append(os.Environ(), fmt.Sprintf("KUBECONFIG=%s", kubeconfigPath))
++	cmd.Stdout = os.Stdout
++	cmd.Stderr = os.Stderr
++	return cmd.Run()
++}
++
++// OLMIsUpgraded applies the locally built OLM manifest to upgrade OLM.
++// Uses sync.Once to ensure the upgrade only happens once across multiple scenarios.
++func OLMIsUpgraded(ctx context.Context) error {
++	return upgradeOperator()
++}
++
++// ComponentIsReadyToReconcile waits for the named component's deployment to be fully rolled out,
++// then checks the leader election lease and stores the leader pod name in the scenario context.
++func ComponentIsReadyToReconcile(ctx context.Context, component string) error {
++	sc := scenarioCtx(ctx)
++
++	// Wait for deployment rollout to complete
++	depName, err := k8sClient("get", "deployments", "-n", olmNamespace,
++		"-l", fmt.Sprintf("app.kubernetes.io/name=%s", component),
++		"-o", "jsonpath={.items[0].metadata.name}")
++	if err != nil {
++		return fmt.Errorf("failed to find deployment for component %s: %w", component, err)
++	}
++	if depName == "" {
++		return fmt.Errorf("failed to find deployment for component %s: no matching deployments found", component)
++	}
++	if _, err := k8sClient("rollout", "status", fmt.Sprintf("deployment/%s", depName),
++		"-n", olmNamespace, fmt.Sprintf("--timeout=%s", timeout)); err != nil {
++		return fmt.Errorf("deployment rollout failed for %s: %w", component, err)
++	}
++
++	// Check leader election lease
++	leaseName, ok := leaseNames[component]
++	if !ok {
++		return fmt.Errorf("no lease name for component: %s", component)
++	}
++
++	// Leader election can take up to LeaseDuration (137s) + RetryPeriod (26s) ≈ 163s in the worst case
++	waitFor(ctx, func() bool {
++		output, err := k8sClient("get", "lease", leaseName, "-n", olmNamespace,
++			"-o", "jsonpath={.spec.holderIdentity}")
++		if err != nil || output == "" {
++			return false
++		}
++		// Extract pod name from lease holder identity (format: <pod-name>_<suffix>)
++		podName := strings.Split(output, "_")[0]
++		sc.leaderPods[component] = podName
++		return true
++	})
++
++	logger.V(1).Info("Component is ready to reconcile", "component", component, "leaderPod", sc.leaderPods[component])
++	return nil
++}
++
++// resourceTypeToComponent maps resource type names to their controller component labels.
++var resourceTypeToComponent = map[string]string{
++	"ClusterCatalog":   "catalogd",
++	"ClusterExtension": "operator-controller",
++}
++
++// reconcileEndingCheck returns a function that checks whether the leader pod's logs
++// contain a "reconcile ending" entry for the given resource name.
++func reconcileEndingCheck(leaderPod, resourceName string) func() bool {
++	return func() bool {
++		logs, err := k8sClient("logs", leaderPod, "-n", olmNamespace, "--all-containers=true", "--tail=1000")
++		if err != nil {
++			return false
++		}
++		for _, line := range strings.Split(logs, "\n") {
++			if strings.Contains(line, "reconcile ending") && strings.Contains(line, resourceName) {
++				return true
++			}
++		}
++		return false
++	}
++}
++
++// ResourceTypeIsReconciled waits for the component's deployment to be ready and
++// then verifies that the scenario's resource of the given type has been reconciled
++// by checking the leader pod's logs for a "reconcile ending" entry.
++func ResourceTypeIsReconciled(ctx context.Context, resourceType string) error {
++	sc := scenarioCtx(ctx)
++
++	component, ok := resourceTypeToComponent[resourceType]
++	if !ok {
++		return fmt.Errorf("unknown resource type: %s", resourceType)
++	}
++
++	var resourceName string
++	switch resourceType {
++	case "ClusterCatalog":
++		resourceName = sc.clusterCatalogName
++	case "ClusterExtension":
++		resourceName = sc.clusterExtensionName
++	}
++	if resourceName == "" {
++		return fmt.Errorf("no %s found in scenario context", resourceType)
++	}
++
++	if err := ComponentIsReadyToReconcile(ctx, component); err != nil {
++		return err
++	}
++
++	leaderPod := sc.leaderPods[component]
++	waitFor(ctx, reconcileEndingCheck(leaderPod, resourceName))
++
++	// For ClusterCatalog, also verify that lastUnpacked is after the leader pod's creation.
++	// This mitigates flakiness caused by https://github.com/operator-framework/operator-controller/issues/1626
++	if resourceType == "ClusterCatalog" {
++		waitFor(ctx, clusterCatalogUnpackedAfterPodCreation(resourceName, leaderPod))
++	}
++
++	return nil
++}
++
++// clusterCatalogUnpackedAfterPodCreation returns a check function that verifies the
++// ClusterCatalog is serving and its lastUnpacked timestamp is after the leader pod's creation.
++func clusterCatalogUnpackedAfterPodCreation(resourceName, leaderPod string) func() bool {
++	return func() bool {
++		catalogJSON, err := k8sClient("get", "clustercatalog", resourceName, "-o", "json")
++		if err != nil {
++			return false
++		}
++		var catalog catalogdv1.ClusterCatalog
++		if err := json.Unmarshal([]byte(catalogJSON), &catalog); err != nil {
++			return false
++		}
++
++		serving := apimeta.FindStatusCondition(catalog.Status.Conditions, catalogdv1.TypeServing)
++		if serving == nil || serving.Status != metav1.ConditionTrue || serving.Reason != catalogdv1.ReasonAvailable {
++			return false
++		}
++		progressing := apimeta.FindStatusCondition(catalog.Status.Conditions, catalogdv1.TypeProgressing)
++		if progressing == nil || progressing.Status != metav1.ConditionTrue || progressing.Reason != catalogdv1.ReasonSucceeded {
++			return false
++		}
++
++		if catalog.Status.LastUnpacked == nil {
++			return false
++		}
++
++		podJSON, err := k8sClient("get", "pod", leaderPod, "-n", olmNamespace, "-o", "json")
++		if err != nil {
++			return false
++		}
++		var pod corev1.Pod
++		if err := json.Unmarshal([]byte(podJSON), &pod); err != nil {
++			return false
++		}
++
++		return catalog.Status.LastUnpacked.After(pod.CreationTimestamp.Time)
++	}
++}
++
++// allResourcesAreReconciled discovers all cluster-scoped resources of the given type and verifies
++// that the leader pod's logs contain a "reconcile ending" entry for each resource.
++func allResourcesAreReconciled(ctx context.Context, resourceType string) error {
++	sc := scenarioCtx(ctx)
++
++	component, ok := resourceTypeToComponent[resourceType]
++	if !ok {
++		return fmt.Errorf("unknown resource type: %s", resourceType)
++	}
++
++	leaderPod, ok := sc.leaderPods[component]
++	if !ok {
++		return fmt.Errorf("leader pod not found for component %s; run '%s is ready to reconcile resources' first", component, component)
++	}
++
++	// Discover all resources
++	pluralType := strings.ToLower(resourceType) + "s"
++	output, err := k8sClient("get", pluralType, "-o", "jsonpath={.items[*].metadata.name}")
++	if err != nil {
++		return fmt.Errorf("failed to list %s resources: %w", resourceType, err)
++	}
++	resourceNames := strings.Fields(output)
++	if len(resourceNames) == 0 {
++		return fmt.Errorf("no %s resources found", resourceType)
++	}
++
++	for _, name := range resourceNames {
++		waitFor(ctx, reconcileEndingCheck(leaderPod, name))
++	}
++
++	return nil
++}
++
++// ClusterCatalogReportsCondition waits for the ClusterCatalog to have the specified condition type, status, and reason.
++func ClusterCatalogReportsCondition(ctx context.Context, conditionType, conditionStatus, conditionReason string) error {
++	sc := scenarioCtx(ctx)
++	if sc.clusterCatalogName == "" {
++		return fmt.Errorf("cluster catalog name not set; run 'ClusterCatalog serves bundles' first")
++	}
++	return waitForCondition(ctx, "clustercatalog", sc.clusterCatalogName, conditionType, conditionStatus, &conditionReason, nil)
++}
+diff --git a/test/upgrade-e2e/README.md b/test/upgrade-e2e/README.md
+new file mode 100644
+index 0000000000..d2edf87cbe
+--- /dev/null
++++ b/test/upgrade-e2e/README.md
+@@ -0,0 +1,43 @@
++# Upgrade E2E Tests
++
++End-to-end tests that verify OLM upgrades don't break pre-existing ClusterCatalogs and ClusterExtensions.
++
++These tests use the [Godog](https://github.com/cucumber/godog) BDD framework with shared step definitions
++from `test/e2e/steps/`. The upgrade-specific steps live in `test/e2e/steps/upgrade_steps.go`.
++See [test/e2e/README.md](../e2e/README.md) for more information on the Godog framework and writing tests.
++
++## Structure
++
++```
++test/upgrade-e2e/
++├── upgrade_test.go                     # Test runner (reuses shared steps from test/e2e/steps/)
++└── features/
++    └── operator-upgrade.feature        # Upgrade verification scenarios
++```
++
++## Running Tests
++
++OLM ships two deployment profiles:
++
++- **Standard** - core OLM functionality only
++- **Experimental** - includes experimental feature gates (e.g., BoxcutterRuntime, WebhookProviderCertManager)
++
++The following Makefile targets run upgrade tests for different upgrade paths:
++
++| Target | Description |
++|---|---|
++| `make test-upgrade-st2st-e2e` | Upgrade from the latest stable **standard** release to a locally built **standard** build |
++| `make test-upgrade-st2ex-e2e` | Upgrade from the latest stable **standard** release to a locally built **experimental** build |
++| `make test-st2ex-e2e` | Switchover from a locally built **standard** install to a locally built **experimental** install |
++
++Each target handles kind cluster creation, image building/loading, test execution, and cleanup.
++
++## Environment Variables
++
++| Variable | Description |
++|---|---|
++| `RELEASE_INSTALL` | Path or URL to the install script for the stable OLM release |
++| `RELEASE_UPGRADE` | Path or URL to the upgrade install script (locally built) |
++| `ROOT_DIR` | Project root directory (working directory for install scripts) |
++| `KIND_CLUSTER_NAME` | Name of the kind cluster to use |
++| `KUBECONFIG` | Path to kubeconfig file (defaults to `~/.kube/config`) |
+diff --git a/test/upgrade-e2e/features/operator-upgrade.feature b/test/upgrade-e2e/features/operator-upgrade.feature
+new file mode 100644
+index 0000000000..117211b612
+--- /dev/null
++++ b/test/upgrade-e2e/features/operator-upgrade.feature
+@@ -0,0 +1,44 @@
++Feature: Operator upgrade verification
++
++  As an OLM developer I would like to verify that after upgrading OLM itself,
++  pre-existing ClusterCatalogs and ClusterExtensions continue to function
++  and can be updated.
++
++  Background:
++    Given the latest stable OLM release is installed
++    And ClusterCatalog "test" serves bundles
++    And ServiceAccount "olm-sa" with permissions to install extensions is available in "upgrade-ns" namespace
++    And ClusterExtension is applied
++      """
++      apiVersion: olm.operatorframework.io/v1
++      kind: ClusterExtension
++      metadata:
++        name: upgrade-ce
++      spec:
++        namespace: upgrade-ns
++        serviceAccount:
++          name: olm-sa
++        source:
++          sourceType: Catalog
++          catalog:
++            packageName: test
++            selector:
++              matchLabels:
++                "olm.operatorframework.io/metadata.name": test-catalog
++            version: 1.0.0
++      """
++    And ClusterExtension is available
++    And OLM is upgraded
++    And catalogd is ready to reconcile resources
++    And operator-controller is ready to reconcile resources
++
++  Scenario: ClusterCatalog continues unpacking after OLM upgrade
++    When ClusterCatalog is reconciled
++    Then ClusterCatalog reports Progressing as True with Reason Succeeded
++    And ClusterCatalog reports Serving as True with Reason Available
++
++  Scenario: ClusterExtension remains functional after OLM upgrade
++    Given ClusterExtension is reconciled
++    When ClusterExtension is updated to version "1.0.1"
++    Then ClusterExtension is available
++    And bundle "test-operator.1.0.1" is installed in version "1.0.1"
+diff --git a/test/upgrade-e2e/post_upgrade_test.go b/test/upgrade-e2e/post_upgrade_test.go
+deleted file mode 100644
+index 8293a6a493..0000000000
+--- a/test/upgrade-e2e/post_upgrade_test.go
++++ /dev/null
+@@ -1,341 +0,0 @@
+-package upgradee2e
+-
+-import (
+-	"bufio"
+-	"context"
+-	"fmt"
+-	"strings"
+-	"testing"
+-	"time"
+-
+-	"github.com/stretchr/testify/assert"
+-	"github.com/stretchr/testify/require"
+-	appsv1 "k8s.io/api/apps/v1"
+-	coordinationv1 "k8s.io/api/coordination/v1"
+-	corev1 "k8s.io/api/core/v1"
+-	apimeta "k8s.io/apimachinery/pkg/api/meta"
+-	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+-	"k8s.io/apimachinery/pkg/labels"
+-	"k8s.io/apimachinery/pkg/types"
+-	"k8s.io/utils/ptr"
+-	"sigs.k8s.io/controller-runtime/pkg/client"
+-
+-	ocv1 "github.com/operator-framework/operator-controller/api/v1"
+-	testutil "github.com/operator-framework/operator-controller/internal/shared/util/test"
+-)
+-
+-const (
+-	artifactName = "operator-controller-upgrade-e2e"
+-	container    = "manager"
+-)
+-
+-func TestClusterCatalogUnpacking(t *testing.T) {
+-	ctx := context.Background()
+-
+-	t.Log("Checking that the controller-manager deployment is updated")
+-	managerLabelSelector := labels.Set{"app.kubernetes.io/name": "catalogd"}
+-	var managerDeployment appsv1.Deployment
+-	require.EventuallyWithT(t, func(ct *assert.CollectT) {
+-		var managerDeployments appsv1.DeploymentList
+-		err := c.List(ctx, &managerDeployments, client.MatchingLabels(managerLabelSelector), client.InNamespace("olmv1-system"))
+-		require.NoError(ct, err)
+-		require.Len(ct, managerDeployments.Items, 1)
+-		managerDeployment = managerDeployments.Items[0]
+-		require.Equal(ct, *managerDeployment.Spec.Replicas, managerDeployment.Status.UpdatedReplicas)
+-		require.Equal(ct, *managerDeployment.Spec.Replicas, managerDeployment.Status.Replicas)
+-		require.Equal(ct, *managerDeployment.Spec.Replicas, managerDeployment.Status.AvailableReplicas)
+-		require.Equal(ct, *managerDeployment.Spec.Replicas, managerDeployment.Status.ReadyReplicas)
+-	}, time.Minute, time.Second)
+-
+-	var managerPod corev1.Pod
+-	t.Log("Waiting for only one controller-manager pod to remain")
+-	require.EventuallyWithT(t, func(ct *assert.CollectT) {
+-		var managerPods corev1.PodList
+-		err := c.List(ctx, &managerPods, client.MatchingLabels(managerLabelSelector))
+-		require.NoError(ct, err)
+-		require.Len(ct, managerPods.Items, 1)
+-		managerPod = managerPods.Items[0]
+-	}, time.Minute, time.Second)
+-
+-	t.Logf("Waiting for acquired leader election by checking lease")
+-	// Instead of watching logs (which has timing issues in controller-runtime v0.23.1+),
+-	// directly check the lease object to confirm leader election occurred
+-	require.EventuallyWithT(t, func(ct *assert.CollectT) {
+-		var lease coordinationv1.Lease
+-		err := c.Get(ctx, types.NamespacedName{Name: "catalogd-operator-lock", Namespace: "olmv1-system"}, &lease)
+-		require.NoError(ct, err)
+-		require.NotNil(ct, lease.Spec.HolderIdentity, "lease should have a holder")
+-		require.NotEmpty(ct, *lease.Spec.HolderIdentity, "lease holder identity should not be empty")
+-	}, 3*time.Minute, time.Second)
+-
+-	t.Log("Reading logs to make sure that ClusterCatalog was reconciled by catalogdv1")
+-	logCtx, cancel := context.WithTimeout(ctx, time.Minute)
+-	defer cancel()
+-	substrings := []string{
+-		"reconcile ending",
+-		fmt.Sprintf(`ClusterCatalog=%q`, testClusterCatalogName),
+-	}
+-	found, err := watchPodLogsForSubstring(logCtx, &managerPod, substrings...)
+-	require.NoError(t, err)
+-	require.True(t, found)
+-
+-	catalog := &ocv1.ClusterCatalog{}
+-	t.Log("Ensuring ClusterCatalog has Status.Condition of Progressing with a status == True, reason == Succeeded")
+-	require.EventuallyWithT(t, func(ct *assert.CollectT) {
+-		err := c.Get(ctx, types.NamespacedName{Name: testClusterCatalogName}, catalog)
+-		require.NoError(ct, err)
+-		cond := apimeta.FindStatusCondition(catalog.Status.Conditions, ocv1.TypeProgressing)
+-		require.NotNil(ct, cond)
+-		require.Equal(ct, metav1.ConditionTrue, cond.Status)
+-		require.Equal(ct, ocv1.ReasonSucceeded, cond.Reason)
+-	}, time.Minute, time.Second)
+-
+-	t.Log("Ensuring ClusterCatalog has Status.Condition of Serving with a status == True, reason == Available")
+-	require.EventuallyWithT(t, func(ct *assert.CollectT) {
+-		err := c.Get(ctx, types.NamespacedName{Name: testClusterCatalogName}, catalog)
+-		require.NoError(ct, err)
+-		cond := apimeta.FindStatusCondition(catalog.Status.Conditions, ocv1.TypeServing)
+-		require.NotNil(ct, cond)
+-		require.Equal(ct, metav1.ConditionTrue, cond.Status)
+-		require.Equal(ct, ocv1.ReasonAvailable, cond.Reason)
+-	}, time.Minute, time.Second)
+-}
+-
+-func TestClusterExtensionAfterOLMUpgrade(t *testing.T) {
+-	t.Log("Starting checks after OLM upgrade")
+-	ctx := context.Background()
+-	defer testutil.CollectTestArtifacts(t, artifactName, c, cfg)
+-
+-	// wait for catalogd deployment to finish
+-	t.Log("Wait for catalogd deployment to be ready")
+-	catalogdManagerPod := waitForDeployment(t, ctx, "catalogd")
+-
+-	// wait for operator-controller deployment to finish
+-	t.Log("Wait for operator-controller deployment to be ready")
+-	managerPod := waitForDeployment(t, ctx, "operator-controller")
+-
+-	t.Log("Wait for acquired leader election by checking lease")
+-	// Instead of watching logs (which has timing issues in controller-runtime v0.23.1+),
+-	// directly check the lease object to confirm leader election occurred
+-	// Average case is under 1 minute but in the worst case: (previous leader crashed)
+-	// we could have LeaseDuration (137s) + RetryPeriod (26s) +/- 163s
+-	require.EventuallyWithT(t, func(ct *assert.CollectT) {
+-		var lease coordinationv1.Lease
+-		err := c.Get(ctx, types.NamespacedName{Name: "9c4404e7.operatorframework.io", Namespace: "olmv1-system"}, &lease)
+-		require.NoError(ct, err)
+-		require.NotNil(ct, lease.Spec.HolderIdentity, "lease should have a holder")
+-		require.NotEmpty(ct, *lease.Spec.HolderIdentity, "lease holder identity should not be empty")
+-	}, 3*time.Minute, time.Second)
+-
+-	t.Log("Reading logs to make sure that ClusterExtension was reconciled by operator-controller before we update it")
+-	// Make sure that after we upgrade OLM itself we can still reconcile old objects without any changes
+-	logCtx, cancel := context.WithTimeout(ctx, time.Minute)
+-	defer cancel()
+-	substrings := []string{
+-		"reconcile ending",
+-		fmt.Sprintf(`ClusterExtension=%q`, testClusterExtensionName),
+-	}
+-	found, err := watchPodLogsForSubstring(logCtx, managerPod, substrings...)
+-	require.NoError(t, err)
+-	require.True(t, found)
+-
+-	t.Log("Checking that the ClusterCatalog is unpacked")
+-	require.EventuallyWithT(t, func(ct *assert.CollectT) {
+-		var clusterCatalog ocv1.ClusterCatalog
+-		require.NoError(ct, c.Get(ctx, types.NamespacedName{Name: testClusterCatalogName}, &clusterCatalog))
+-
+-		// check serving condition
+-		cond := apimeta.FindStatusCondition(clusterCatalog.Status.Conditions, ocv1.TypeServing)
+-		require.NotNil(ct, cond)
+-		require.Equal(ct, metav1.ConditionTrue, cond.Status)
+-		require.Equal(ct, ocv1.ReasonAvailable, cond.Reason)
+-
+-		// mitigation for upgrade-e2e flakiness caused by the following bug
+-		// https://github.com/operator-framework/operator-controller/issues/1626
+-		// wait until the unpack time > than the catalogd controller pod creation time
+-		cond = apimeta.FindStatusCondition(clusterCatalog.Status.Conditions, ocv1.TypeProgressing)
+-		if cond == nil {
+-			return
+-		}
+-		require.Equal(ct, metav1.ConditionTrue, cond.Status)
+-		require.Equal(ct, ocv1.ReasonSucceeded, cond.Reason)
+-
+-		require.True(ct, clusterCatalog.Status.LastUnpacked.After(catalogdManagerPod.CreationTimestamp.Time))
+-	}, time.Minute, time.Second)
+-
+-	// TODO: if we change the underlying revision storage mechanism, the new version
+-	//   will not detect any installed versions, we need to make sure that the upgrade
+-	//   test fails across revision storage mechanism changes that are not also accompanied
+-	//   by code that automatically migrates the revision storage.
+-
+-	t.Log("Checking that the ClusterExtension is installed")
+-	var clusterExtension ocv1.ClusterExtension
+-	require.EventuallyWithT(t, func(ct *assert.CollectT) {
+-		require.NoError(ct, c.Get(ctx, types.NamespacedName{Name: testClusterExtensionName}, &clusterExtension))
+-		cond := apimeta.FindStatusCondition(clusterExtension.Status.Conditions, ocv1.TypeInstalled)
+-		require.NotNil(ct, cond)
+-		require.Equal(ct, metav1.ConditionTrue, cond.Status)
+-		require.Equal(ct, ocv1.ReasonSucceeded, cond.Reason)
+-		require.Contains(ct, cond.Message, "Installed bundle")
+-		require.NotNil(ct, clusterExtension.Status.Install)
+-		require.NotEmpty(ct, clusterExtension.Status.Install.Bundle.Version)
+-	}, time.Minute, time.Second)
+-
+-	previousVersion := clusterExtension.Status.Install.Bundle.Version
+-
+-	t.Log("Updating the ClusterExtension to change version")
+-	// Make sure that after we upgrade OLM itself we can still reconcile old objects if we change them
+-	clusterExtension.Spec.Source.Catalog.Version = "1.0.1"
+-	require.NoError(t, c.Update(ctx, &clusterExtension))
+-
+-	t.Log("Checking that the ClusterExtension installs successfully")
+-	require.EventuallyWithT(t, func(ct *assert.CollectT) {
+-		require.NoError(ct, c.Get(ctx, types.NamespacedName{Name: testClusterExtensionName}, &clusterExtension))
+-		cond := apimeta.FindStatusCondition(clusterExtension.Status.Conditions, ocv1.TypeInstalled)
+-		require.NotNil(ct, cond)
+-		require.Equal(ct, ocv1.ReasonSucceeded, cond.Reason)
+-		require.Contains(ct, cond.Message, "Installed bundle")
+-		require.Equal(ct, ocv1.BundleMetadata{Name: "test-operator.1.0.1", Version: "1.0.1"}, clusterExtension.Status.Install.Bundle)
+-		require.NotEqual(ct, previousVersion, clusterExtension.Status.Install.Bundle.Version)
+-	}, time.Minute, time.Second)
+-}
+-
+-// waitForDeployment checks that the updated deployment with the given app.kubernetes.io/name label
+-// has reached the desired number of replicas and that the number pods matches that number
+-// i.e. no old pods remain. It will return a pointer to the leader pod. This is only necessary
+-// to facilitate the mitigation put in place for https://github.com/operator-framework/operator-controller/issues/1626
+-func waitForDeployment(t *testing.T, ctx context.Context, controlPlaneLabel string) *corev1.Pod {
+-	deploymentLabelSelector := labels.Set{"app.kubernetes.io/name": controlPlaneLabel}.AsSelector()
+-
+-	t.Log("Checking that the deployment is updated and available")
+-	var desiredNumReplicas int32
+-	var deploymentNamespace string
+-	require.EventuallyWithT(t, func(ct *assert.CollectT) {
+-		var managerDeployments appsv1.DeploymentList
+-		require.NoError(ct, c.List(ctx, &managerDeployments, client.MatchingLabelsSelector{Selector: deploymentLabelSelector}))
+-		require.Len(ct, managerDeployments.Items, 1)
+-		managerDeployment := managerDeployments.Items[0]
+-
+-		require.True(ct,
+-			managerDeployment.Status.UpdatedReplicas == *managerDeployment.Spec.Replicas &&
+-				managerDeployment.Status.Replicas == *managerDeployment.Spec.Replicas &&
+-				managerDeployment.Status.AvailableReplicas == *managerDeployment.Spec.Replicas &&
+-				managerDeployment.Status.ReadyReplicas == *managerDeployment.Spec.Replicas,
+-		)
+-
+-		// Check that the deployment has the Available condition set to True
+-		var availableCond *appsv1.DeploymentCondition
+-		for i := range managerDeployment.Status.Conditions {
+-			if managerDeployment.Status.Conditions[i].Type == appsv1.DeploymentAvailable {
+-				availableCond = &managerDeployment.Status.Conditions[i]
+-				break
+-			}
+-		}
+-		require.NotNil(ct, availableCond, "Available condition not found")
+-		require.Equal(ct, corev1.ConditionTrue, availableCond.Status, "Deployment Available condition is not True")
+-
+-		desiredNumReplicas = *managerDeployment.Spec.Replicas
+-		deploymentNamespace = managerDeployment.Namespace
+-	}, time.Minute, time.Second)
+-
+-	var managerPods corev1.PodList
+-	t.Logf("Ensure the number of remaining pods equal the desired number of replicas (%d)", desiredNumReplicas)
+-	require.EventuallyWithT(t, func(ct *assert.CollectT) {
+-		require.NoError(ct, c.List(ctx, &managerPods, client.MatchingLabelsSelector{Selector: deploymentLabelSelector}))
+-		require.Len(ct, managerPods.Items, int(desiredNumReplicas))
+-	}, time.Minute, time.Second)
+-
+-	// Find the leader pod by checking the lease
+-	t.Log("Finding the leader pod")
+-	// Map component labels to their leader election lease names
+-	leaseNames := map[string]string{
+-		"catalogd":            "catalogd-operator-lock",
+-		"operator-controller": "9c4404e7.operatorframework.io",
+-	}
+-
+-	leaseName, ok := leaseNames[controlPlaneLabel]
+-	if !ok {
+-		t.Fatalf("Unknown control plane component: %s", controlPlaneLabel)
+-	}
+-
+-	var leaderPod *corev1.Pod
+-	require.EventuallyWithT(t, func(ct *assert.CollectT) {
+-		var lease coordinationv1.Lease
+-		require.NoError(ct, c.Get(ctx, types.NamespacedName{Name: leaseName, Namespace: deploymentNamespace}, &lease))
+-		require.NotNil(ct, lease.Spec.HolderIdentity)
+-
+-		leaderIdentity := *lease.Spec.HolderIdentity
+-		// The lease holder identity format is: <pod-name>_<leader-election-id-suffix>
+-		// Extract just the pod name by splitting on '_'
+-		podName := strings.Split(leaderIdentity, "_")[0]
+-
+-		// Find the pod with matching name
+-		for i := range managerPods.Items {
+-			if managerPods.Items[i].Name == podName {
+-				leaderPod = &managerPods.Items[i]
+-				break
+-			}
+-		}
+-		require.NotNil(ct, leaderPod, "leader pod not found with identity: %s (pod name: %s)", leaderIdentity, podName)
+-	}, time.Minute, time.Second)
+-
+-	return leaderPod
+-}
+-
+-func watchPodLogsForSubstring(ctx context.Context, pod *corev1.Pod, substrings ...string) (bool, error) {
+-	// Use a polling approach to periodically check pod logs for the substrings
+-	// This handles controller-runtime v0.23.1+ where leader election happens faster
+-	// and the message may be emitted before we start watching with Follow
+-	ticker := time.NewTicker(2 * time.Second)
+-	defer ticker.Stop()
+-
+-	for {
+-		select {
+-		case <-ctx.Done():
+-			return false, ctx.Err()
+-		case <-ticker.C:
+-			// Get recent logs without Follow to check if message exists
+-			logOpts := corev1.PodLogOptions{
+-				Container: container,
+-				TailLines: ptr.To(int64(1000)),
+-			}
+-
+-			req := kclientset.CoreV1().Pods(pod.Namespace).GetLogs(pod.Name, &logOpts)
+-			// Use a per-poll timeout derived from ctx so reads don't outlive the caller's context
+-			pollCtx, pollCancel := context.WithTimeout(ctx, 5*time.Second)
+-			podLogs, err := req.Stream(pollCtx)
+-			if err != nil {
+-				pollCancel()
+-				// Pod might not be ready yet, or the context timed out; continue polling
+-				continue
+-			}
+-
+-			scanner := bufio.NewScanner(podLogs)
+-			for scanner.Scan() {
+-				line := scanner.Text()
+-
+-				foundCount := 0
+-				for _, substring := range substrings {
+-					if strings.Contains(line, substring) {
+-						foundCount++
+-					}
+-				}
+-				if foundCount == len(substrings) {
+-					podLogs.Close()
+-					pollCancel()
+-					return true, nil
+-				}
+-			}
+-
+-			// Check for scanning errors before closing
+-			if err := scanner.Err(); err != nil {
+-				podLogs.Close()
+-				pollCancel()
+-				// Log the error but continue polling - might be transient
+-				continue
+-			}
+-			podLogs.Close()
+-			pollCancel()
+-		}
+-	}
+-}
+diff --git a/test/upgrade-e2e/upgrade_e2e_suite_test.go b/test/upgrade-e2e/upgrade_e2e_suite_test.go
+deleted file mode 100644
+index a2acee4cda..0000000000
+--- a/test/upgrade-e2e/upgrade_e2e_suite_test.go
++++ /dev/null
+@@ -1,60 +0,0 @@
+-package upgradee2e
+-
+-import (
+-	"fmt"
+-	"os"
+-	"testing"
+-
+-	"k8s.io/client-go/kubernetes"
+-	"k8s.io/client-go/rest"
+-	ctrl "sigs.k8s.io/controller-runtime"
+-	"sigs.k8s.io/controller-runtime/pkg/client"
+-
+-	"github.com/operator-framework/operator-controller/internal/operator-controller/scheme"
+-)
+-
+-const (
+-	testClusterCatalogNameEnv   = "TEST_CLUSTER_CATALOG_NAME"
+-	testClusterExtensionNameEnv = "TEST_CLUSTER_EXTENSION_NAME"
+-)
+-
+-var (
+-	c          client.Client
+-	kclientset kubernetes.Interface
+-
+-	cfg                      *rest.Config
+-	testClusterCatalogName   string
+-	testClusterExtensionName string
+-)
+-
+-func TestMain(m *testing.M) {
+-	var ok bool
+-	cfg = ctrl.GetConfigOrDie()
+-	testClusterCatalogName, ok = os.LookupEnv(testClusterCatalogNameEnv)
+-	if !ok {
+-		fmt.Printf("%q is not set", testClusterCatalogNameEnv)
+-		os.Exit(1)
+-	}
+-	testClusterExtensionName, ok = os.LookupEnv(testClusterExtensionNameEnv)
+-	if !ok {
+-		fmt.Printf("%q is not set", testClusterExtensionNameEnv)
+-		os.Exit(1)
+-	}
+-
+-	cfg := ctrl.GetConfigOrDie()
+-
+-	var err error
+-	c, err = client.New(cfg, client.Options{Scheme: scheme.Scheme})
+-	if err != nil {
+-		fmt.Printf("failed to create client: %s\n", err)
+-		os.Exit(1)
+-	}
+-
+-	kclientset, err = kubernetes.NewForConfig(cfg)
+-	if err != nil {
+-		fmt.Printf("failed to create kubernetes clientset: %s\n", err)
+-		os.Exit(1)
+-	}
+-
+-	os.Exit(m.Run())
+-}
+diff --git a/test/upgrade-e2e/upgrade_test.go b/test/upgrade-e2e/upgrade_test.go
+new file mode 100644
+index 0000000000..17a24a0734
+--- /dev/null
++++ b/test/upgrade-e2e/upgrade_test.go
+@@ -0,0 +1,42 @@
++package upgradee2e
++
++import (
++	"log"
++	"os"
++	"testing"
++
++	"github.com/cucumber/godog"
++	"github.com/cucumber/godog/colors"
++	"github.com/spf13/pflag"
++
++	"github.com/operator-framework/operator-controller/test/e2e/steps"
++)
++
++var opts = godog.Options{
++	Format:      "pretty",
++	Paths:       []string{"features"},
++	Output:      colors.Colored(os.Stdout),
++	Concurrency: 1,
++	NoColors:    true,
++}
++
++func init() {
++	godog.BindCommandLineFlags("godog.", &opts)
++}
++
++func TestMain(m *testing.M) {
++	pflag.Parse()
++	opts.Paths = pflag.Args()
++
++	sc := godog.TestSuite{
++		ScenarioInitializer: func(sc *godog.ScenarioContext) {
++			sc.Before(steps.CreateScenarioContext)
++			steps.RegisterSteps(sc)
++		},
++		Options: &opts,
++	}.Run()
++
++	if sc != 0 {
++		log.Fatalf("non-zero status returned (%d), failed to run upgrade feature tests", sc)
++	}
++}

@@ -1,0 +1,331 @@
+diff --git a/tests-extension/test/qe/util/client.go b/tests-extension/test/qe/util/client.go
+index 3204b68f07..e46221c1cf 100644
+--- a/tests-extension/test/qe/util/client.go
++++ b/tests-extension/test/qe/util/client.go
+@@ -16,6 +16,7 @@ import (
+ 	"path/filepath"
+ 	"runtime/debug"
+ 	"strings"
++	"sync"
+ 	"time"
+ 
+ 	g "github.com/onsi/ginkgo/v2"
+@@ -54,6 +55,12 @@ import (
+ 	e2edebug "k8s.io/kubernetes/test/e2e/framework/debug"
+ )
+ 
++var (
++	// Global cache for admin context name to avoid repeated parsing across all test suites
++	globalAdmContextName string
++	globalAdmContextOnce sync.Once
++)
++
+ // CLI provides function to call the OpenShift CLI and Kubernetes and OpenShift
+ // clients.
+ type CLI struct {
+@@ -62,6 +69,9 @@ type CLI struct {
+ 	configPath       string
+ 	guestConfigPath  string
+ 	adminConfigPath  string
++	tempAdmConfPath  string // Temporary admin config for this test to avoid concurrent access
++	admContextName   string // Cached admin context name (parsed once, lazy-loaded in AsAdmin)
++	isUseAdminCxt    bool
+ 	username         string
+ 	globalArgs       []string
+ 	commandArgs      []string
+@@ -105,6 +115,8 @@ func NewCLI(project, adminConfigPath string) *CLI {
+ 	client.execPath = "oc"
+ 	client.showInfo = true
+ 	client.adminConfigPath = adminConfigPath
++	// Get cached admin context name (parsed only once globally for efficiency)
++	client.admContextName = getAdminContextNameCached(client.adminConfigPath)
+ 
+ 	g.BeforeEach(client.SetupProject)
+ 
+@@ -128,6 +140,10 @@ func NewCLIWithoutNamespace(project string) *CLI {
+ 	client.execPath = "oc"
+ 	client.adminConfigPath = KubeConfigPath()
+ 	client.showInfo = true
++	// Get cached admin context name (parsed only once globally for efficiency)
++	client.admContextName = getAdminContextNameCached(client.adminConfigPath)
++	client.tempAdmConfPath = duplicateFileToTempOrEmpty(client.adminConfigPath, "admin-config-")
++
+ 	return client
+ }
+ 
+@@ -171,9 +187,20 @@ func (c *CLI) Username() string {
+ }
+ 
+ // AsAdmin changes current config file path to the admin config.
++// If a temporary admin config was created for this test (to avoid concurrent access),
++// it will be used instead of the shared admin config.
++// Lazy-loads admin context name on first call for automatic --context specification.
+ func (c *CLI) AsAdmin() *CLI {
+ 	nc := *c
+-	nc.configPath = c.adminConfigPath
++	// Use temporary admin config if available (created in SetupProject for concurrent safety)
++	if c.tempAdmConfPath != "" {
++		nc.configPath = c.tempAdmConfPath
++	} else {
++		nc.configPath = c.adminConfigPath
++	}
++
++	nc.isUseAdminCxt = true
++
+ 	return &nc
+ }
+ 
+@@ -286,6 +313,9 @@ func (c *CLI) GetGuestKubeconf() string {
+ // SetAdminKubeconf instructs the admin cluster kubeconf file is set
+ func (c *CLI) SetAdminKubeconf(adminKubeconf string) *CLI {
+ 	c.adminConfigPath = adminKubeconf
++	// Refresh derived fields to match new admin kubeconfig
++	c.admContextName = getAdminContextNameCached(adminKubeconf)
++	c.tempAdmConfPath = duplicateFileToTempOrEmpty(adminKubeconf, "admin-config-")
+ 	return c
+ }
+ 
+@@ -331,6 +361,10 @@ func (c *CLI) SetupProject() {
+ 	newNamespace := names.SimpleNameGenerator.GenerateName(fmt.Sprintf("e2e-test-%s-", c.kubeFramework.BaseName))
+ 	c.SetNamespace(newNamespace)
+ 
++	if c.tempAdmConfPath == "" {
++		c.tempAdmConfPath = duplicateFileToTempOrEmpty(c.adminConfigPath, "admin-config-")
++	}
++
+ 	// The user.openshift.io and oauth.openshift.io APIs are unavailable on external OIDC clusters by design.
+ 	// We will create and switch to a temporary user for non-external-oidc clusters only.
+ 	//
+@@ -518,11 +552,20 @@ func (c *CLI) TeardownProject() {
+ 		}
+ 	}
+ 
++	// Use AdminDynamicClient to delete resources (needs tempAdmConfPath)
+ 	dynamicClient := c.AdminDynamicClient()
+ 	for _, resource := range c.resourcesToDelete {
+ 		err := dynamicClient.Resource(resource.Resource).Namespace(resource.Namespace).Delete(context.Background(), resource.Name, metav1.DeleteOptions{})
+ 		e2e.Logf("Deleted %v, err: %v", resource, err)
+ 	}
++
++	// Clean up temporary admin config after all admin operations complete
++	if len(c.tempAdmConfPath) > 0 {
++		if err := os.Remove(c.tempAdmConfPath); err != nil {
++			e2e.Logf("Failed to remove temporary admin config file %s: %v", c.tempAdmConfPath, err)
++		}
++		c.tempAdmConfPath = "" // Clear the path after removal
++	}
+ }
+ 
+ // CreateNamespace creates and returns a test namespace, automatically torn down after the test.
+@@ -615,7 +658,12 @@ func (c *CLI) UserConfig() *rest.Config {
+ 
+ // AdminConfig method
+ func (c *CLI) AdminConfig() *rest.Config {
+-	clientConfig, err := getClientConfig(c.adminConfigPath)
++	// Use temporary admin config if available (for concurrent safety)
++	configPath := c.adminConfigPath
++	if c.tempAdmConfPath != "" {
++		configPath = c.tempAdmConfPath
++	}
++	clientConfig, err := getClientConfig(configPath)
+ 	if err != nil {
+ 		FatalErr(err)
+ 	}
+@@ -661,6 +709,9 @@ func (c *CLI) Run(commands ...string) *CLI {
+ 		verb:            commands[0],
+ 		kubeFramework:   c.KubeFramework(),
+ 		adminConfigPath: c.adminConfigPath,
++		tempAdmConfPath: c.tempAdmConfPath,
++		admContextName:  c.admContextName,
++		isUseAdminCxt:   c.isUseAdminCxt,
+ 		configPath:      c.configPath,
+ 		showInfo:        c.showInfo,
+ 		guestConfigPath: c.guestConfigPath,
+@@ -671,7 +722,16 @@ func (c *CLI) Run(commands ...string) *CLI {
+ 		if c.asGuestKubeconf {
+ 			nc.globalArgs = c.appendGuestKubeconfig(nc.globalArgs)
+ 		} else {
+-			nc.globalArgs = append([]string{fmt.Sprintf("--kubeconfig=%s", c.configPath)}, nc.globalArgs...)
++			// Use configPath if available, fallback to tempAdmConfPath if configPath is empty
++			kubeConfigPath := c.configPath
++			if kubeConfigPath == "" && c.tempAdmConfPath != "" {
++				kubeConfigPath = c.tempAdmConfPath
++			}
++			nc.globalArgs = append([]string{fmt.Sprintf("--kubeconfig=%s", kubeConfigPath)}, nc.globalArgs...)
++			// If admin context is cached (from AsAdmin call), use it explicitly (double insurance)
++			if c.admContextName != "" && c.isUseAdminCxt {
++				nc.globalArgs = append([]string{fmt.Sprintf("--context=%s", c.admContextName)}, nc.globalArgs...)
++			}
+ 		}
+ 	}
+ 	if c.asGuestKubeconf && !c.withoutNamespace {
+@@ -1123,3 +1183,50 @@ func (c *CLI) SilentOutput() (string, error) {
+ 	FatalErr(fmt.Errorf("unable to execute %q: %v", c.execPath, err))
+ 	return "", nil
+ }
++
++// getAdminContextName reads the kubeconfig file and searches for a context with "admin" in its name.
++// This is used to explicitly specify the admin context in oc commands for concurrent safety.
++// Returns empty string if no admin context is found.
++func getAdminContextName(kubeConfigFile string) string {
++	if kubeConfigFile == "" {
++		return ""
++	}
++
++	kubeConfigBytes, err := os.ReadFile(kubeConfigFile)
++	if err != nil {
++		e2e.Logf("Failed to read kubeconfig for admin context search: %v", err)
++		return ""
++	}
++
++	kubeConfig, err := clientcmd.Load(kubeConfigBytes)
++	if err != nil {
++		e2e.Logf("Failed to parse kubeconfig for admin context search: %v", err)
++		return ""
++	}
++
++	// Search for admin context with exact matching
++	// Common patterns: "admin", "system:admin", "<cluster>/admin"
++	for contextName := range kubeConfig.Contexts {
++		lowerName := strings.ToLower(contextName)
++		// Match exact "admin", "system:admin", or contexts ending with "/admin"
++		if lowerName == "admin" || lowerName == "system:admin" || strings.HasSuffix(lowerName, "/admin") {
++			e2e.Logf("Found admin context: %s", contextName)
++			return contextName
++		}
++	}
++
++	e2e.Logf("No admin context found in kubeconfig")
++	return ""
++}
++
++// getAdminContextNameCached returns the cached admin context name, parsing only once globally.
++// This ensures that across all test suites, the kubeconfig is parsed only once for efficiency.
++func getAdminContextNameCached(kubeConfigFile string) string {
++	globalAdmContextOnce.Do(func() {
++		globalAdmContextName = getAdminContextName(kubeConfigFile)
++		if globalAdmContextName != "" {
++			e2e.Logf("Cached admin context for all test suites: %s", globalAdmContextName)
++		}
++	})
++	return globalAdmContextName
++}
+diff --git a/tests-extension/test/qe/util/tools.go b/tests-extension/test/qe/util/tools.go
+index 1593d196c1..6a2fbc7db2 100644
+--- a/tests-extension/test/qe/util/tools.go
++++ b/tests-extension/test/qe/util/tools.go
+@@ -20,36 +20,73 @@ import (
+ 	e2e "k8s.io/kubernetes/test/e2e/framework"
+ )
+ 
+-// DuplicateFileToPath copies a file from source path to destination path with error handling
+-// Parameters:
+-//   - srcPath: path to the source file to copy
+-//   - destPath: path where the file will be copied (created with mode 0666 if not exists, truncated if exists)
+-func DuplicateFileToPath(srcPath string, destPath string) {
+-	// Validate and clean paths to prevent path traversal attacks
++// duplicateFileToPathSafe copies a file without using Gomega (safe for initialization phase).
++// Returns error instead of using Expect, suitable for calling in var initialization.
++func duplicateFileToPathSafe(srcPath, destPath string) error {
+ 	srcPath = filepath.Clean(srcPath)
+ 	destPath = filepath.Clean(destPath)
+ 
+-	// Ensure source file exists and is readable
+-	srcInfo, err := os.Stat(srcPath)
+-	o.Expect(err).NotTo(o.HaveOccurred(), "Source file does not exist or is not accessible")
+-	o.Expect(srcInfo.Mode().IsRegular()).To(o.BeTrue(), "Source path is not a regular file")
+-
+ 	srcFile, err := os.Open(srcPath)
+-	o.Expect(err).NotTo(o.HaveOccurred())
+-	defer func() {
+-		o.Expect(srcFile.Close()).NotTo(o.HaveOccurred())
+-	}()
++	if err != nil {
++		return fmt.Errorf("failed to open source file: %w", err)
++	}
++	defer func() { _ = srcFile.Close() }()
+ 
+-	// Create destination file with restrictive permissions (0644)
+ 	destFile, err := os.OpenFile(destPath, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0644)
+-	o.Expect(err).NotTo(o.HaveOccurred())
+-	defer func() {
+-		o.Expect(destFile.Close()).NotTo(o.HaveOccurred())
+-	}()
++	if err != nil {
++		return fmt.Errorf("failed to create destination file: %w", err)
++	}
++	defer func() { _ = destFile.Close() }()
+ 
+-	_, err = io.Copy(destFile, srcFile)
+-	o.Expect(err).NotTo(o.HaveOccurred())
+-	o.Expect(destFile.Sync()).NotTo(o.HaveOccurred())
++	if _, err := io.Copy(destFile, srcFile); err != nil {
++		return fmt.Errorf("failed to copy file: %w", err)
++	}
++
++	return destFile.Sync()
++}
++
++// DuplicateFileToTemp creates a temporary duplicate of a file with a specified prefix
++// Safe version for initialization phase (returns error instead of using Gomega)
++func duplicateFileToTempSafe(srcPath, destPrefix string) (string, error) {
++	if srcPath == "" {
++		return "", nil
++	}
++
++	destFile, err := os.CreateTemp(os.TempDir(), destPrefix)
++	if err != nil {
++		return "", fmt.Errorf("failed to create temporary file: %w", err)
++	}
++	destPath := destFile.Name()
++	_ = destFile.Close()
++
++	if err := duplicateFileToPathSafe(srcPath, destPath); err != nil {
++		_ = os.Remove(destPath) // best-effort cleanup on error
++		return "", err
++	}
++
++	return destPath, nil
++}
++
++// duplicateFileToTempOrEmpty creates a temporary duplicate of a file, returns empty string on error.
++// Logs warning on failure. Safe for initialization phase (doesn't use Gomega).
++func duplicateFileToTempOrEmpty(srcPath, destPrefix string) string {
++	tempPath, err := duplicateFileToTempSafe(srcPath, destPrefix)
++	if err != nil {
++		e2e.Logf("Warning: failed to create temporary admin config: %v", err)
++		return ""
++	}
++	return tempPath
++}
++
++// DuplicateFileToPath copies a file from source path to destination path with error handling
++// Parameters:
++//   - srcPath: path to the source file to copy
++//   - destPath: path where the file will be copied (created with mode 0666 if not exists, truncated if exists)
++//
++// Uses Gomega assertions - only call in test execution phase (It, BeforeEach, etc.)
++func DuplicateFileToPath(srcPath string, destPath string) {
++	err := duplicateFileToPathSafe(srcPath, destPath)
++	o.Expect(err).NotTo(o.HaveOccurred(), "Failed to duplicate file from %s to %s", srcPath, destPath)
+ }
+ 
+ // DuplicateFileToTemp creates a temporary duplicate of a file with a specified prefix
+@@ -59,13 +96,11 @@ func DuplicateFileToPath(srcPath string, destPath string) {
+ //
+ // Returns:
+ //   - string: path to the created temporary file
++//
++// Uses Gomega assertions - only call in test execution phase (It, BeforeEach, etc.)
+ func DuplicateFileToTemp(srcPath string, destPrefix string) string {
+-	destFile, err := os.CreateTemp(os.TempDir(), destPrefix)
+-	o.Expect(err).NotTo(o.HaveOccurred(), "Failed to create temporary file")
+-	o.Expect(destFile.Close()).NotTo(o.HaveOccurred(), "Failed to close temporary file")
+-
+-	destPath := destFile.Name()
+-	DuplicateFileToPath(srcPath, destPath)
++	destPath, err := duplicateFileToTempSafe(srcPath, destPrefix)
++	o.Expect(err).NotTo(o.HaveOccurred(), "Failed to duplicate file %s to temp", srcPath)
+ 	return destPath
+ }
+ 

@@ -1,0 +1,467 @@
+diff --git a/.claude/commands/README.md b/.agents/commands/README.md
+similarity index 88%
+rename from .claude/commands/README.md
+rename to .agents/commands/README.md
+index 7604d68990..54190cc241 100644
+--- a/.claude/commands/README.md
++++ b/.agents/commands/README.md
+@@ -1,6 +1,6 @@
+-# Claude Commands for oc-mirror
++# Agent Commands for oc-mirror
+ 
+-This directory contains custom Claude slash commands to help with oc-mirror development and configuration.
++This directory contains custom agent commands to help with oc-mirror development and configuration.
+ 
+ ## Available Commands
+ 
+@@ -14,9 +14,9 @@ This command provides an interactive workflow to create properly formatted confi
+ 
+ #### Usage
+ 
+-Simply type `/generate-imageset` in your conversation with Claude Code and follow the prompts.
++Invoke `/generate-imageset` and follow the prompts.
+ 
+-Claude will ask you questions about:
++The agent will ask you questions about:
+ 
+ 1. **Configuration type** - Choose between:
+    - `ImageSetConfiguration` - for mirroring container images
+@@ -40,15 +40,15 @@ Claude will ask you questions about:
+ 
+ ```
+ User: /generate-imageset
+-Claude: Which type of configuration do you want to generate?
++Agent: Which type of configuration do you want to generate?
+ User: ImageSetConfiguration
+-Claude: Which components do you want to configure?
++Agent: Which components do you want to configure?
+ User: Just platform
+-Claude: What channel name? (e.g., stable-4.18)
++Agent: What channel name? (e.g., stable-4.18)
+ User: stable-4.18
+-Claude: Min version?
++Agent: Min version?
+ User: 4.18.0
+-Claude: Max version?
++Agent: Max version?
+ User: 4.18.5
+ ...
+ ```
+@@ -81,7 +81,7 @@ This generates a complete configuration with multiple sections.
+ 
+ ```
+ User: /generate-imageset
+-Claude: Which type of configuration do you want to generate?
++Agent: Which type of configuration do you want to generate?
+ User: DeleteImageSetConfiguration
+ ...
+ ```
+diff --git a/.claude/commands/generate-imageset.md b/.agents/commands/generate-imageset.md
+similarity index 100%
+rename from .claude/commands/generate-imageset.md
+rename to .agents/commands/generate-imageset.md
+diff --git a/.agents/skills/automate-integration-test/SKILL.md b/.agents/skills/automate-integration-test/SKILL.md
+new file mode 100644
+index 0000000000..176f5ca889
+--- /dev/null
++++ b/.agents/skills/automate-integration-test/SKILL.md
+@@ -0,0 +1,81 @@
++---
++name: automate-integration-test
++description: Convert a manual test case description into a Ginkgo oc-v2 integration test for oc-mirror
++user-invocable: true
++---
++
++# Automate Manual Test Case to Go
++
++Convert a manual test case description into a Ginkgo v2 integration test for the oc-mirror integration test suite.
++
++## Test Images
++
++These are minimal images we generated and host ourselves to keep tests fast and self-contained, avoiding dependencies on external images that might change frequently.
++
++- Catalog: `quay.io/oc-mirror/oc-mirror-dev:test-catalog-latest`
++- Release: `quay.io/oc-mirror/release/test-release-index:v0.0.1`
++- Additional: `quay.io/openshifttest/hello-openshift@sha256:61b8f5...`
++
++## Step-by-step process
++
++### 1. Read project conventions
++
++Read `AGENTS.md` at the project root for architecture, conventions, and pitfalls.
++
++### 2. Clarify if needed
++
++If the test case is ambiguous, ask before writing code:
++- Which mirror mode? (`mirrorToMirror`, `mirrorToDisk` + `diskToMirror`, or both)
++- Does it include a delete workflow (phase 1 + phase 2)?
++- Is a new ISC or DISC YAML needed, or does an existing one suffice?
++- Should the test go in an existing file or a new one?
++
++### 3. Check for duplicate or superfluous coverage
++
++Read existing test files to ensure the scenario isn't already covered. If it is, tell the user and suggest what would add value instead.
++Also consider if one of the existing tests could be extended to cover the scenario, without blurring the testing boundaries.
++
++### 4. Discover available APIs
++
++Read these files to learn the current patterns - do not guess or reinvent:
++- `tests/integration/integration_suite_test.go` - globals and lifecycle
++- `tests/integration/helpers_test.go` - assertion helpers
++- An existing test file matching the scenario type - to see calling conventions
++
++Prefer existing helpers. If a new one is needed, follow the `expect*` naming pattern.
++
++### 5. Analyze oc-mirror APIs if needed
++
++If technical details are unclear:
++- Check for a local copy at `./oc-mirror`
++- Otherwise ask the user for a path or permission to clone from `github.com:openshift/oc-mirror.git`
++
++### 6. Write the test
++
++Follow the patterns from existing tests. Key rules:
++- Match the structure of existing tests in the target file - `Describe`, `BeforeEach`/`AfterEach`, `It`, `By` steps
++- Consider if the scenario covers all critical paths, and suggest new ones
++- Implement meaningful assertions - avoid surface-level or redundant checks
++- For error scenarios, assert on `result.ExitCode` and `result.Stderr` content
++
++### 7. Choose or create ISC/DISC configs
++
++Check existing configs in `tests/integration/testdata/imagesetconfigs/` first. Only create new ones if needed, using the same YAML structure and the test images listed in `AGENTS.md`.
++
++### 8. Review the code
++
++Before running, review the generated code for:
++- **Correctness**: assertions actually verify the scenario, no false positives or dead steps
++- **Efficiency**: no redundant operations, unnecessary variables, or repeated lookups
++- **Cleanliness**: no superfluous comments, unused variables, or boilerplate that adds nothing - every line should earn its place
++
++### 9. Run the tests
++
++Ask for permission, then run.
++```bash
++go test -v ./tests/integration/ --ginkgo.focus "<test label>"
++```
++
++### 10. Output
++
++Provide the complete Go test code, any new YAML configs, and a one-line summary of where each file goes. Be concise - the user knows the project.
+diff --git a/.agents/skills/check-test-coverage/SKILL.md b/.agents/skills/check-test-coverage/SKILL.md
+new file mode 100644
+index 0000000000..bf26c5c74c
+--- /dev/null
++++ b/.agents/skills/check-test-coverage/SKILL.md
+@@ -0,0 +1,90 @@
++---
++name: check-test-coverage
++description: Analyze oc-mirror CLI feature coverage across integration and e2e tests, identifying untested features and gaps
++user-invocable: true
++---
++
++# Check Test Coverage
++
++Analyze which oc-mirror CLI features are tested at the integration and e2e levels, and which have gaps.
++
++## Step-by-step process
++
++### 1. Discover CLI features
++
++Run these commands to enumerate all subcommands and flags:
++
++```bash
++oc-mirror --v2 --help
++oc-mirror --v2 delete --help
++oc-mirror --v2 list operators --help
++oc-mirror --v2 list releases --help
++oc-mirror --v2 version --help
++```
++
++If `oc-mirror` is not in PATH, build it first with `make build` and use `./bin/oc-mirror`.
++
++From the output, extract:
++- **Workflows**: mirrorToMirror (m2m), mirrorToDisk (m2d), diskToMirror (d2m)
++- **Subcommands**: delete, list operators, list releases, version
++- **Flags**: every flag from each subcommand's help output (skip hidden/deprecated flags unless they appear in tests)
++
++### 2. Parse integration tests
++
++Read all `*_test.go` files in `tests/integration/`. For each file, extract:
++- Ginkgo `Describe`, `Context`, and `It` block labels
++- Flags and workflows referenced in the test body (e.g., `--dry-run`, `--delete-id`, `--from`)
++- Helper function calls that exercise specific features
++
++Build a map of **feature -> test file + test label**.
++
++### 3. Parse e2e tests
++
++Read test files in `tests/e2e/test/e2e/` (primarily `oc_mirror_v2.go`). Extract:
++- Test case descriptions and case IDs
++- Workflows and flags exercised in each case
++- Test data configs referenced from `tests/e2e/test/e2e/testdata/`
++
++### 4. Cross-reference and classify
++
++For each CLI feature (subcommand, flag, workflow), classify coverage:
++
++| Level | Meaning |
++|-------|---------|
++| **Covered** | Tested at integration and/or e2e level with meaningful assertions |
++| **Partially covered** | Only happy path, or tested at only one level when both would be appropriate |
++| **Not covered** | No test exercises this feature |
++
++Consider a feature "partially covered" if:
++- It's only tested in the happy path but has error handling worth verifying
++- It's a flag that modifies behavior but is only tested implicitly (e.g., the flag is set but its effect isn't asserted)
++
++### 5. Produce the report
++
++Present results in this format:
++
++#### Summary table
++
++```text
++| Feature / Flag       | Integration | E2E  | Status           |
++|----------------------|-------------|------|------------------|
++| m2m workflow         | m2m_test.go | 73359| Covered          |
++| --dry-run            | dry_run_... | -    | Partially covered|
++| --secure-policy      | -           | -    | Not covered      |
++| ...                  |             |      |                  |
++```
++
++#### Priority gaps
++
++List the top uncovered or partially covered features, ordered by importance:
++1. Features that affect data correctness (e.g., signature verification, archive integrity)
++2. Features that affect user-facing behavior (e.g., filtering, error codes)
++3. Features that are operational concerns (e.g., parallelism, profiling)
++
++For each gap, recommend:
++- Which test level is appropriate (integration vs. e2e)
++- A one-line description of what the test should verify
++
++### 6. Optional: compare with previous run
++
++If a previous coverage report exists in the conversation history, highlight what changed: new tests added, features that moved from "not covered" to "covered", and any regressions.
+diff --git a/.agents/skills/migrate-e2e-to-integration/SKILL.md b/.agents/skills/migrate-e2e-to-integration/SKILL.md
+new file mode 100644
+index 0000000000..ddf91d7af3
+--- /dev/null
++++ b/.agents/skills/migrate-e2e-to-integration/SKILL.md
+@@ -0,0 +1,122 @@
++---
++name: migrate-e2e-to-integration
++description: Migrate an oc-mirror e2e test case to the integration test suite, translating framework, registry, invocation, and assertion patterns
++user-invocable: true
++---
++
++# Migrate E2E Test Case to Integration
++
++Convert an existing e2e test case from `tests/e2e/test/e2e/oc_mirror_v2.go` into an integration test under `tests/integration/`.
++
++## Input
++
++The user provides one of:
++- An e2e case number (e.g., 72973)
++- A test description or keyword
++
++## Step-by-step process
++
++### 1. Read project conventions
++
++Read `AGENTS.md` at the project root, and the documents at `docs/testing` for architecture, conventions, and pitfalls.
++
++### 2. Locate and analyze the e2e test case
++
++Search `tests/e2e/test/e2e/oc_mirror_v2.go` for the case number or description. Extract:
++- What scenario it tests (workflow, flags, edge case)
++- How oc-mirror is invoked (subcommand, flags, config)
++- What it asserts (images mirrored, files created, errors expected)
++- What test data config it uses (from `tests/e2e/test/e2e/testdata/`)
++
++Do not attempt a 1:1 translation of the test case, consider if it makes sense at a high level, if it's already covered at the integration or unit levels, if the assertions are sound, if it could be made more efficient, etc.
++
++### 3. Check for existing integration coverage
++
++Read integration test files in `tests/integration/` to verify the scenario isn't already covered. If it is, tell the user and suggest what additional value the e2e case provides, if any.
++
++### 4. Present the migration plan
++
++Before writing any code, present a detailed plan to the user and wait for approval. The plan must include:
++
++- **E2E summary**: What the original test does — scenario, flags, config, assertions.
++- **Translation approach**: How each part maps to integration patterns (runner method, assertion helpers, test structure). Call out anything that won't translate 1:1 and explain why.
++- **Test data**: Which existing ISC/DISC configs will be reused, and whether new ones are needed.
++- **Target file**: Where the new test will live and why (existing file vs new file).
++- **Assertion coverage**: List every assertion from the e2e case and the corresponding integration check. Flag any assertions that will be dropped or changed, with justification.
++- **Improvements**: Any improvements over the original (removing unnecessary polling, better assertions, broader coverage, etc.).
++
++Do not proceed to implementation until the user approves the plan. If the user requests changes, revise and re-present.
++
++### 5. Translate the test
++
++Apply these conversions:
++
++#### Registry setup
++- **E2E**: Manual pod deployment via `createregistry()`, TLS trust via `trustCert()`, pull secret extraction.
++- **Integration**: Use the suite's `testRegistry` global — it's started in `BeforeEach` and stopped in `AfterEach` automatically. No TLS or pull secret setup needed.
++
++#### oc-mirror invocation
++- **E2E**: `oc.WithoutNamespace().WithoutKubeconf().Run("mirror").Args(...)` with manual flag construction.
++- **Integration**: Use `runner` methods from `tests/integration/pkg/ocmirror/`:
++  - `runner.MirrorToMirror(ctx, iscPath, workDir, registryEndpoint, ...extraFlags)`
++  - `runner.MirrorToDisk(ctx, iscPath, workDir, ...extraFlags)`
++  - `runner.DiskToMirror(ctx, iscPath, workDir, registryEndpoint, ...extraFlags)`
++  - `runner.DeletePhaseOne(ctx, discPath, workDir, registryEndpoint, ...extraFlags)`
++  - `runner.DeletePhaseTwo(ctx, deleteYaml, registryEndpoint, ...extraFlags)`
++  - `runner.ListOperators(ctx, ...args)`
++  - `runner.ListReleases(ctx, ...args)`
++
++#### Polling and retries
++- **E2E**: Uses `wait.Poll()` and manual retry loops.
++- **Integration**: Remove all polling — integration calls are synchronous. The runner returns when oc-mirror exits.
++
++#### Assertions
++- **E2E**: Raw `o.Expect(...)` on command output, manual image inspection.
++- **Integration**: Use helpers from `tests/integration/helpers_test.go`:
++  - `expectOcMirrorCommandSuccess(result, err)`
++  - `expectSuccessfulMirrorInRegistry(iscPath, registry)`
++  - `expectCorrectIDMS(workDir, iscPath)`
++  - `expectValidDeleteImagesFiles(workDir, deleteID)`
++  - `expectEmptyRegistry(registry)`
++  - Follow the `expect*` naming pattern for any new helpers.
++
++#### Test images
++- **E2E**: Often uses real release images and production operator catalogs.
++- **Integration**: Use the self-hosted test images:
++  - Catalog: `quay.io/oc-mirror/oc-mirror-dev:test-catalog-latest`
++  - Release: `quay.io/oc-mirror/release/test-release-index:v0.0.1`
++  - Additional: `quay.io/openshifttest/hello-openshift@sha256:61b8f5...`
++
++#### Test data configs
++- Check existing ISC/DISC configs in `tests/integration/testdata/imagesetconfigs/` first.
++- Only create new ones if the scenario needs a config that doesn't exist.
++- Use test images (above) instead of production images.
++
++### 6. Write the integration test
++
++Follow the `automate-integration-test` skill for the writing conventions:
++- Read `tests/integration/integration_suite_test.go` and `tests/integration/helpers_test.go` for current patterns
++- Use Ginkgo v2 structure: `Describe` / `Context` / `It` / `By`
++- Place the test in the appropriate existing file, or create a new one if it's a new category
++- Every line should earn its place — no superfluous comments, unused variables, or boilerplate
++
++### 7. Review the code
++
++Before running, verify:
++- Assertions actually test what the e2e case tested — don't lose coverage in the translation
++- No e2e-specific patterns leaked in (manual polling, cluster assumptions, production images)
++- Helpers are reused where possible
++
++### 8. Run the test
++
++Ask permission, then run:
++```bash
++PATH=$PATH:<path-to-registry-bin> go test -v ./tests/integration/ --ginkgo.focus "<test label>"
++```
++
++### 9. Recommend e2e disposition
++
++After the integration test passes, advise the user:
++- **Remove the e2e case** if it doesn't exercise anything cluster-specific (most common)
++- **Keep the e2e case** if it tests cluster-level behavior (IDMS application, node reboot, operator deployment to a real cluster)
++- **Keep both temporarily** if unsure, with a note to revisit
+diff --git a/docs/testing/README.md b/docs/testing/README.md
+new file mode 100644
+index 0000000000..20388621a6
+--- /dev/null
++++ b/docs/testing/README.md
+@@ -0,0 +1,88 @@
++# oc-mirror Testing Strategy
++
++## Overview
++
++The goal of the `oc-mirror` testing strategy is to define a set of principles and guidelines that allows us to ensure the quality of `oc-mirror` in an efficient way. 
++
++All the `oc-mirror` tests live in this repository and are executed in Prow.
++
++---
++
++## Testing Levels
++
++### Unit Tests
++
++Isolated checks that verify the correctness of individual functions or components, representing the smallest testable parts of the application.
++
++> **Examples:**
++> - Test the function that validates the format of the image reference string (e.g., checks for valid registry, repository, and tag).
++> - Test the valid range of an integer flag.
++
++### Low-level Integration Tests
++
++Similar to the unit tests, these are still white-box tests, but instead of testing a single function they test the integration of more than one function.
++
++> **Example:** Test that parsing an ImageSetConfiguration and then validating it correctly rejects a config where minVersion is greater than maxVersion.
++
++### High-level Integration Tests
++
++Tests that focus on verifying the core logic, behavior and external dependencies of the oc-mirror CLI by using a local registry.
++
++These are black-box tests that do not have direct access to the `oc-mirror` internal code.
++
++All the images used in these tests are built by us, in order to control their content and size.
++
++In these tests we assert the tangible outputs of `oc-mirror`: archive contents, mirrored images present on the target registry, etc.
++
++> **Example:** Execute the oc-mirror CLI command to successfully copy one image from a source registry to a target registry, and then verify the image exists in the target registry.
++
++### End-to-end Tests
++
++Tests that validate the complete end-to-end behavior of `oc-mirror` and its integration with OpenShift components by running on a fully provisioned OpenShift cluster, and mirroring realistic images.
++
++Since E2E tests are expensive and slow, we should add them sparingly to cover critically important scenarios only. Anything else should be covered at the integration or unit levels.
++
++> **Example:** Run the full oc-mirror process to mirror one image to a disconnected OpenShift cluster, then deploy a sample application using that mirrored image, and confirm the pod is running successfully on the cluster.
++
++---
++
++## Project Principles
++
++| Principle                            | Description                                                                                                                                        |
++|--------------------------------------|----------------------------------------------------------------------------------------------------------------------------------------------------|
++| 🤝 **Quality as a team responsibility** | Ensuring the quality of the project is a team effort. There is no single owner of quality.                                                         |
++| 📦 **Self-contained PRs**               | Every pull request should include all the necessary tests at all the relevant testing levels. Reviewers should make sure that PRs are well covered. |
++| 🤖 **Automation first**                 | All testing should be automated. A feature is not complete until it has all the necessary automated tests in place. Leverage AI to speed up generating and reviewing tests, while critically reviewing the agent's output. |
++| 🎯 **Test at the right level**          | Don't implement an E2E test to check the range of a flag. Complex features might need tests at more than one level.                                |
++
++---
++
++## Principles for Efficient Testing
++
++### ⬅️ Early testing/Shift-left
++
++Catch defects as early as possible in the development cycle. The earlier a bug is found, the cheaper it is to fix.
++
++### 📐 Testing Pyramid
++
++Follow the testing pyramid: many unit tests at the base, fewer integration tests in the middle, and the fewest E2E tests at the top. Each level should test what it is best suited for — don't push scenarios up the pyramid unnecessarily.
++
++```text
++                    /\
++                   /  \
++                  /    \
++                 / E2E  \                 Few, slow, expensive
++                /--------\
++               /          \
++              /            \
++             / Integration  \             Moderate count and speed
++            /----------------\
++           /                  \
++          /                    \
++         /     Unit Tests       \         Many, fast, cheap
++        /________________________\
++```
++
++### ⚠️ Risk-based testing
++
++Prioritize testing efforts based on the risk and impact of failures. Features that are critical to users or have a history of bugs should get more coverage.

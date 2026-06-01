@@ -1,0 +1,194 @@
+diff --git a/.github/actions/warm-go-cache/action.yaml b/.github/actions/warm-go-cache/action.yaml
+deleted file mode 100644
+index 5a2cb19c7d7..00000000000
+--- a/.github/actions/warm-go-cache/action.yaml
++++ /dev/null
+@@ -1,17 +0,0 @@
+-name: 'Warm Go build cache'
+-description: 'Set GOCACHEPROG to use EFS-backed read-only cache with local writable overlay'
+-runs:
+-  using: composite
+-  steps:
+-    - shell: bash
+-      run: |
+-        if command -v gocacheprog >/dev/null 2>&1; then
+-          mkdir -p /tmp/go-build-cache
+-          args="--rw /tmp/go-build-cache"
+-          if [ -d /cache/go-build ]; then
+-            args="--ro /cache/go-build $args"
+-          fi
+-          echo "GOCACHEPROG=gocacheprog $args" >> "$GITHUB_ENV"
+-        else
+-          echo "::warning::gocacheprog not found, using default cache"
+-        fi
+diff --git a/.github/workflows/envtest-kube-reusable.yaml b/.github/workflows/envtest-kube-reusable.yaml
+index 7e19f51213a..e38fe093c06 100644
+--- a/.github/workflows/envtest-kube-reusable.yaml
++++ b/.github/workflows/envtest-kube-reusable.yaml
+@@ -57,7 +57,6 @@ jobs:
+       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+         with:
+           persist-credentials: false
+-      - uses: ./.github/actions/warm-go-cache
+       - run: make test-envtest-kube ENVTEST_KUBE_VERSIONS="${{ matrix.version }}"
+ 
+   conclusion:
+diff --git a/.github/workflows/envtest-ocp-reusable.yaml b/.github/workflows/envtest-ocp-reusable.yaml
+index b44ac05c40e..2f001758c43 100644
+--- a/.github/workflows/envtest-ocp-reusable.yaml
++++ b/.github/workflows/envtest-ocp-reusable.yaml
+@@ -58,7 +58,6 @@ jobs:
+       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+         with:
+           persist-credentials: false
+-      - uses: ./.github/actions/warm-go-cache
+       - run: make test-envtest-ocp ENVTEST_OCP_K8S_VERSIONS="${{ matrix.version }}"
+ 
+   conclusion:
+diff --git a/.github/workflows/lint-reusable.yaml b/.github/workflows/lint-reusable.yaml
+index 3efe807ff57..e969b494fa8 100644
+--- a/.github/workflows/lint-reusable.yaml
++++ b/.github/workflows/lint-reusable.yaml
+@@ -20,7 +20,6 @@ jobs:
+           if [ -n "${{ github.base_ref }}" ]; then
+             git fetch origin "${{ github.base_ref }}:${{ github.base_ref }}"
+           fi
+-      - uses: ./.github/actions/warm-go-cache
+       - name: Use pre-built lint tools
+         run: |
+           if [ -d /opt/lint-tools ]; then
+diff --git a/.github/workflows/test-reusable.yaml b/.github/workflows/test-reusable.yaml
+index ccc9e237992..76f0595fca1 100644
+--- a/.github/workflows/test-reusable.yaml
++++ b/.github/workflows/test-reusable.yaml
+@@ -85,7 +85,6 @@ jobs:
+         with:
+           go-version-file: go.mod
+           cache: false
+-      - uses: ./.github/actions/warm-go-cache
+       - name: Run tests
+         run: make test-shard TEST_PACKAGES="${{ matrix.packages }}" COVER_PROFILE="cover-${{ matrix.shard }}.out"
+       - name: Upload to Codecov
+diff --git a/.github/workflows/verify-reusable.yaml b/.github/workflows/verify-reusable.yaml
+index a9972031bfb..f543d537bff 100644
+--- a/.github/workflows/verify-reusable.yaml
++++ b/.github/workflows/verify-reusable.yaml
+@@ -15,7 +15,6 @@ jobs:
+       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+         with:
+           persist-credentials: false
+-      - uses: ./.github/actions/warm-go-cache
+       - run: make generate update
+       - run: make staticcheck
+       - run: make fmt
+diff --git a/hack/github-actions-runner/cache-warming-cronjob.yaml b/hack/github-actions-runner/cache-warming-cronjob.yaml
+deleted file mode 100644
+index e6cbd03af7c..00000000000
+--- a/hack/github-actions-runner/cache-warming-cronjob.yaml
++++ /dev/null
+@@ -1,78 +0,0 @@
+-apiVersion: batch/v1
+-kind: CronJob
+-metadata:
+-  name: go-cache-warmer
+-  namespace: arc-runners
+-  labels:
+-    app.kubernetes.io/component: cache-warmer
+-    app.kubernetes.io/part-of: arc-runner-set
+-spec:
+-  schedule: "0 2 * * *"
+-  concurrencyPolicy: Forbid
+-  successfulJobsHistoryLimit: 3
+-  failedJobsHistoryLimit: 1
+-  jobTemplate:
+-    spec:
+-      activeDeadlineSeconds: 3600
+-      backoffLimit: 1
+-      template:
+-        spec:
+-          restartPolicy: Never
+-          securityContext:
+-            runAsNonRoot: true
+-            seccompProfile:
+-              type: RuntimeDefault
+-          containers:
+-            - name: cache-warmer
+-              image: quay.io/redhat-user-workloads/crt-redhat-acm-tenant/hypershift-gh-actions-runner:latest
+-              securityContext:
+-                allowPrivilegeEscalation: false
+-                capabilities:
+-                  drop:
+-                    - ALL
+-              command:
+-                - /bin/bash
+-                - -c
+-                - |
+-                  set -euo pipefail
+-
+-                  echo "=== Cloning openshift/hypershift main branch ==="
+-                  git clone --depth 1 --branch main https://github.com/openshift/hypershift.git /tmp/hypershift
+-                  cd /tmp/hypershift
+-
+-                  echo "=== Compiling all packages ==="
+-                  go build ./...
+-
+-                  echo "=== Compiling all test binaries ==="
+-                  go test -c -o /dev/null ./... 2>/dev/null || true
+-
+-                  echo "=== Cleaning stale cache entries (older than 7 days) ==="
+-                  find /cache/go-build -type f -mtime +7 -delete
+-                  find /cache/go-build -mindepth 1 -type d -empty -delete
+-
+-                  echo "=== Syncing build cache to PV ==="
+-                  cp -a "${GOCACHE}"/* /cache/go-build/
+-
+-                  echo "=== Cache warming complete ==="
+-                  du -sh /cache/go-build/
+-              env:
+-                - name: GOCACHE
+-                  value: /tmp/go-build-cache
+-                - name: GOMODCACHE
+-                  value: /tmp/go-mod-cache
+-                - name: HOME
+-                  value: /tmp
+-              resources:
+-                requests:
+-                  cpu: "4"
+-                  memory: "16Gi"
+-                limits:
+-                  cpu: "4"
+-                  memory: "16Gi"
+-              volumeMounts:
+-                - name: go-cache
+-                  mountPath: /cache/go-build
+-          volumes:
+-            - name: go-cache
+-              persistentVolumeClaim:
+-                claimName: go-cache-pvc
+diff --git a/hack/github-actions-runner/values.yaml b/hack/github-actions-runner/values.yaml
+index bdcd8bf6e29..0d5eac17933 100644
+--- a/hack/github-actions-runner/values.yaml
++++ b/hack/github-actions-runner/values.yaml
+@@ -10,10 +10,6 @@ template:
+       - name: runner
+         image: quay.io/redhat-user-workloads/crt-redhat-acm-tenant/hypershift-gh-actions-runner:latest
+         command: ["/home/runner/run.sh"]
+-        volumeMounts:
+-          - name: go-cache
+-            mountPath: /cache/go-build
+-            readOnly: true
+         resources:
+           requests:
+             cpu: "4"
+@@ -21,11 +17,6 @@ template:
+           limits:
+             cpu: "4"
+             memory: "16Gi"
+-    volumes:
+-      - name: go-cache
+-        persistentVolumeClaim:
+-          claimName: go-cache-pvc
+-          readOnly: true
+     topologySpreadConstraints:
+       - maxSkew: 1
+         topologyKey: kubernetes.io/hostname

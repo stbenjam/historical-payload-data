@@ -1,0 +1,1564 @@
+diff --git a/tests/integration/image-builders/operator/Makefile b/tests/integration/image-builders/operator/Makefile
+index 1acc38b40..7a91b2bd2 100644
+--- a/tests/integration/image-builders/operator/Makefile
++++ b/tests/integration/image-builders/operator/Makefile
+@@ -2,11 +2,18 @@ REGISTRY ?= quay.io/oc-mirror/oc-mirror-dev
+ RUNTIME ?= podman
+ OUTPUT = _output
+ 
++CATALOGDIRS := $(foreach DIR,$(shell find catalogs -maxdepth 1 -mindepth 1 -type d),$(subst catalogs/,,$(DIR)))
++CATALOG_TARGETS := $(addprefix build-catalog.,$(CATALOGDIRS))
++CATALOG_PUSH_TARGETS := $(addprefix push-catalog.,$(CATALOGDIRS))
++
+ all: build
+ .PHONY: all
+ 
+-build:
+-	go run ./cmd/build-catalogs
++build: $(CATALOG_TARGETS)
++$(CATALOG_TARGETS): build-catalog.%:
++	@echo "Building catalog $*"
++	cd "catalogs" && $(RUNTIME) build --format=docker -f "./catalog.Dockerfile" --build-arg "CATALOG=$*" -t "$(REGISTRY):$*" .
++
+ .PHONY: build
+ 
+ push: push-bundles push-related push-catalogs
+@@ -33,14 +40,10 @@ push-related: push-bundles
+ 	done
+ .PHONY: push-related
+ 
+-push-catalogs: build
+-	@for dir in $(OUTPUT)/test-catalog-*/; do \
+-		name=$$(basename "$$dir"); \
+-		echo "Pushing catalog $$name"; \
+-		$(RUNTIME) build --format=docker -t "$(REGISTRY):$$name" \
+-			-f "$(OUTPUT)/$$name.Dockerfile" $(OUTPUT); \
+-		$(RUNTIME) push --format=docker "$(REGISTRY):$$name"; \
+-	done
++push-catalogs: $(CATALOG_PUSH_TARGETS)
++$(CATALOG_PUSH_TARGETS): push-catalog.%:
++	@echo "Pushing catalog $*"
++	$(RUNTIME) push --format=docker "$(REGISTRY):$*"
+ .PHONY: push-catalogs
+ 
+ clean:
+diff --git a/tests/integration/image-builders/operator/catalogs/README.md b/tests/integration/image-builders/operator/catalogs/README.md
+new file mode 100644
+index 000000000..4b4cbe585
+--- /dev/null
++++ b/tests/integration/image-builders/operator/catalogs/README.md
+@@ -0,0 +1,122 @@
++# Catalogs
++
++Mock catalogs to be used in tests.
++
++## test-catalog-latest
++
++### Contents
++ * Packages: foo, bar, baz
++ * Channels:
++    - foo: beta
++    - bar: alpha, stable
++    - baz: stable
++ * Bundles:
++    - foo: v0.1.0, v0.2.0, v0.3.0, v0.3.1
++    - bar: v0.1.0, v0.2.0, v1.0.0
++    - baz: v1.0.0, v1.0.1, v1.1.0
++
++### Creating
++```bash
++CATALOG=test-catalog-latest
++mkdir -p ${CATALOG}/{foo,bar,baz}
++
++opm init foo -c beta -o yaml > ${CATALOG}/foo/operator.yaml
++opm init bar -c stable -o yaml > ${CATALOG}/bar/operator.yaml
++opm init baz -c stable -o yaml > ${CATALOG}/baz/operator.yaml
++
++REPO="quay.io/oc-mirror/oc-mirror-dev"
++opm render ${REPO}:foo-bundle-v0.1.0 ${REPO}:foo-bundle-v0.2.0 ${REPO}:foo-bundle-v0.3.0 ${REPO}:foo-bundle-v0.3.1 --output=yaml > ${CATALOG}/foo/bundles.yaml
++opm render ${REPO}:bar-bundle-v0.1.0 ${REPO}:bar-bundle-v0.2.0 ${REPO}:bar-bundle-v1.0.0 --output=yaml > ${CATALOG}/bar/bundles.yaml
++opm render ${REPO}:baz-bundle-v1.0.0 ${REPO}:baz-bundle-v1.0.1 ${REPO}:baz-bundle-v1.1.0 --output=yaml > ${CATALOG}/baz/bundles.yaml
++```
++
++
++## test-catalog-diff
++
++### Contents
++ * Packages: foo, bar, baz
++ * Channels:
++    - foo: beta
++    - bar: alpha, stable
++    - baz: stable
++ * Bundles:
++    - foo: v0.1.0, v0.2.0, v0.3.0, v0.3.1, v0.3.2
++    - bar: v0.1.0, v0.2.0, v1.0.0
++    - baz: v1.0.0, v1.0.1, v1.1.0
++
++### Creating
++```bash
++CATALOG=test-catalog-diff
++mkdir -p ${CATALOG}/{foo,bar,baz}
++
++opm init foo -c beta -o yaml > ${CATALOG}/foo/operator.yaml
++opm init bar -c stable -o yaml > ${CATALOG}/bar/operator.yaml
++opm init baz -c stable -o yaml > ${CATALOG}/baz/operator.yaml
++
++REPO="quay.io/oc-mirror/oc-mirror-dev"
++opm render ${REPO}:foo-bundle-v0.1.0 ${REPO}:foo-bundle-v0.2.0 ${REPO}:foo-bundle-v0.3.0 ${REPO}:foo-bundle-v0.3.1 ${REPO}:foo-bundle-v0.3.2 --output=yaml > ${CATALOG}/foo/bundles.yaml
++opm render ${REPO}:bar-bundle-v0.1.0 ${REPO}:bar-bundle-v0.2.0 ${REPO}:bar-bundle-v1.0.0 --output=yaml > ${CATALOG}/bar/bundles.yaml
++opm render ${REPO}:baz-bundle-v1.0.0 ${REPO}:baz-bundle-v1.0.1 ${REPO}:baz-bundle-v1.1.0 --output=yaml > ${CATALOG}/baz/bundles.yaml
++```
++
++
++## test-catalog-prune
++
++### Contents
++ * Packages: foo, bar
++ * Channels:
++    - foo: beta
++    - bar: alpha
++ * Bundles:
++    - foo: v0.1.0, v0.1.1
++    - bar: v0.1.0
++
++### Creating
++```bash
++CATALOG=test-catalog-prune
++mkdir -p ${CATALOG}/{foo,bar}
++
++opm init foo -c beta -o yaml > ${CATALOG}/foo/operator.yaml
++opm init bar -c alpha -o yaml > ${CATALOG}/bar/operator.yaml
++
++REPO="quay.io/oc-mirror/oc-mirror-dev"
++opm render ${REPO}:foo-bundle-v0.1.0 ${REPO}:foo-bundle-v0.1.1 --output=yaml > ${CATALOG}/foo/bundles.yaml
++opm render ${REPO}:bar-bundle-v0.1.0 --output=yaml > ${CATALOG}/bar/bundles.yaml
++```
++
++
++## test-catalog-prune-diff
++
++### Contents
++ * Packages: foo, bar
++ * Channels:
++    - foo: beta
++    - bar: alpha, stable
++ * Bundles:
++    - foo: v0.2.0
++    - bar: v0.1.0
++
++### Creating
++```bash
++CATALOG=test-catalog-prune-diff
++mkdir -p ${CATALOG}/{foo,bar}
++
++opm init foo -c beta -o yaml > ${CATALOG}/foo/operator.yaml
++opm init bar -c alpha -o yaml > ${CATALOG}/bar/operator.yaml
++
++REPO="quay.io/oc-mirror/oc-mirror-dev"
++opm render ${REPO}:foo-bundle-v0.2.0 --output=yaml > ${CATALOG}/foo/bundles.yaml
++opm render ${REPO}:bar-bundle-v0.1.0 --output=yaml > ${CATALOG}/bar/bundles.yaml
++```
++
++
++## Catalog building
++```bash
++make build # for all catalogs
++make build-catalog.<catalog-name> # for specific catalog
++```
++
++## Catalog validation
++```bash
++opm validate <catalog>
++```
+diff --git a/tests/integration/image-builders/operator/catalogs/catalog.Dockerfile b/tests/integration/image-builders/operator/catalogs/catalog.Dockerfile
+new file mode 100644
+index 000000000..d08583157
+--- /dev/null
++++ b/tests/integration/image-builders/operator/catalogs/catalog.Dockerfile
+@@ -0,0 +1,11 @@
++ARG CATALOG="catalog"
++
++FROM quay.io/operator-framework/opm:latest
++
++COPY ${CATALOG} /configs
++
++ENTRYPOINT ["/bin/opm"]
++CMD ["serve", "/configs", "--cache-dir=/tmp/cache", "--cache-only"]
++
++# DC-specific label for the location of the DC root directory in the image
++LABEL operators.operatorframework.io.index.configs.v1=/configs
+diff --git a/tests/integration/image-builders/operator/catalogs/test-catalog-diff/bar/bundles.yaml b/tests/integration/image-builders/operator/catalogs/test-catalog-diff/bar/bundles.yaml
+new file mode 100644
+index 000000000..0833f7405
+--- /dev/null
++++ b/tests/integration/image-builders/operator/catalogs/test-catalog-diff/bar/bundles.yaml
+@@ -0,0 +1,65 @@
++---
++image: quay.io/oc-mirror/oc-mirror-dev:bar-bundle-v0.1.0
++name: bar.v0.1.0
++package: bar
++properties:
++- type: olm.gvk
++  value:
++    group: test.bar
++    kind: Bar
++    version: v1alpha1
++- type: olm.package
++  value:
++    packageName: bar
++    version: 0.1.0
++relatedImages:
++- image: quay.io/oc-mirror/oc-mirror-dev:bar-bundle-v0.1.0
++  name: ""
++- image: quay.io/oc-mirror/oc-mirror-dev@sha256:1ce8c0187c8fe6b4be327dc848b8baf062ce1baa5096b4f5d955893d126d5b58
++  name: operator
++schema: olm.bundle
++---
++image: quay.io/oc-mirror/oc-mirror-dev:bar-bundle-v0.2.0
++name: bar.v0.2.0
++package: bar
++properties:
++- type: olm.gvk
++  value:
++    group: test.bar
++    kind: Bar
++    version: v1alpha1
++- type: olm.package
++  value:
++    packageName: bar
++    version: 0.2.0
++relatedImages:
++- image: quay.io/oc-mirror/oc-mirror-dev:bar-bundle-v0.2.0
++  name: ""
++- image: quay.io/oc-mirror/oc-mirror-dev@sha256:1ce8c0187c8fe6b4be327dc848b8baf062ce1baa5096b4f5d955893d126d5b58
++  name: operator
++schema: olm.bundle
++---
++image: quay.io/oc-mirror/oc-mirror-dev:bar-bundle-v1.0.0
++name: bar.v1.0.0
++package: bar
++properties:
++- type: olm.gvk
++  value:
++    group: test.bar
++    kind: Bar
++    version: v1
++- type: olm.gvk
++  value:
++    group: test.bar
++    kind: Bar
++    version: v1alpha1
++- type: olm.package
++  value:
++    packageName: bar
++    version: 1.0.0
++relatedImages:
++- image: quay.io/oc-mirror/oc-mirror-dev:bar-bundle-v1.0.0
++  name: ""
++- image: quay.io/oc-mirror/oc-mirror-dev@sha256:1ce8c0187c8fe6b4be327dc848b8baf062ce1baa5096b4f5d955893d126d5b58
++  name: operator
++schema: olm.bundle
+diff --git a/tests/integration/image-builders/operator/catalogs/test-catalog-diff/bar/channels.yaml b/tests/integration/image-builders/operator/catalogs/test-catalog-diff/bar/channels.yaml
+new file mode 100644
+index 000000000..889998a64
+--- /dev/null
++++ b/tests/integration/image-builders/operator/catalogs/test-catalog-diff/bar/channels.yaml
+@@ -0,0 +1,22 @@
++---
++schema: olm.channel
++package: bar
++name: alpha
++entries:
++  - name: bar.v0.1.0
++    skipRange: <0.1.0
++  - name: bar.v0.2.0
++    skipRange: <0.2.0
++    skips:
++      - bar.v0.1.0
++    replaces: bar.v0.1.0
++  - name: bar.v1.0.0
++    skipRange: <1.0.0
++    replaces: bar.v0.2.0
++---
++schema: olm.channel
++package: bar
++name: stable
++entries:
++  - name: bar.v1.0.0
++    skipRange: <1.0.0
+diff --git a/tests/integration/image-builders/operator/catalogs/test-catalog-diff/bar/operator.yaml b/tests/integration/image-builders/operator/catalogs/test-catalog-diff/bar/operator.yaml
+new file mode 100644
+index 000000000..58a1b978c
+--- /dev/null
++++ b/tests/integration/image-builders/operator/catalogs/test-catalog-diff/bar/operator.yaml
+@@ -0,0 +1,4 @@
++---
++defaultChannel: stable
++name: bar
++schema: olm.package
+diff --git a/tests/integration/image-builders/operator/catalogs/test-catalog-diff/baz/bundles.yaml b/tests/integration/image-builders/operator/catalogs/test-catalog-diff/baz/bundles.yaml
+new file mode 100644
+index 000000000..a83b0d5e1
+--- /dev/null
++++ b/tests/integration/image-builders/operator/catalogs/test-catalog-diff/baz/bundles.yaml
+@@ -0,0 +1,78 @@
++---
++image: quay.io/oc-mirror/oc-mirror-dev:baz-bundle-v1.0.0
++name: baz.v1.0.0
++package: baz
++properties:
++- type: olm.gvk
++  value:
++    group: test.baz
++    kind: Baz
++    version: v1
++- type: olm.package
++  value:
++    packageName: baz
++    version: 1.0.0
++- type: olm.bundle.object
++  value:
++    data: eyJhcGlWZXJzaW9uIjoiYXBpZXh0ZW5zaW9ucy5rOHMuaW8vdjEiLCJraW5kIjoiQ3VzdG9tUmVzb3VyY2VEZWZpbml0aW9uIiwibWV0YWRhdGEiOnsibmFtZSI6ImJhenMudGVzdC5iYXoifSwic3BlYyI6eyJncm91cCI6InRlc3QuYmF6IiwibmFtZXMiOnsia2luZCI6IkJheiIsInBsdXJhbCI6ImJhenMifSwic2NvcGUiOiJOYW1lc3BhY2VkIiwidmVyc2lvbnMiOlt7Im5hbWUiOiJ2MSIsInNjaGVtYSI6eyJvcGVuQVBJVjNTY2hlbWEiOnsidHlwZSI6Im9iamVjdCIsIngta3ViZXJuZXRlcy1wcmVzZXJ2ZS11bmtub3duLWZpZWxkcyI6dHJ1ZX19LCJzZXJ2ZWQiOnRydWUsInN0b3JhZ2UiOnRydWV9XX19
++- type: olm.bundle.object
++  value:
++    data: eyJhcGlWZXJzaW9uIjoib3BlcmF0b3JzLmNvcmVvcy5jb20vdjFhbHBoYTEiLCJraW5kIjoiQ2x1c3RlclNlcnZpY2VWZXJzaW9uIiwibWV0YWRhdGEiOnsiYW5ub3RhdGlvbnMiOnsiY2FwYWJpbGl0aWVzIjoiQmFzaWNJbnN0YWxsIiwiY2VydGlmaWVkIjoiZmFsc2UiLCJjb250YWluZXJJbWFnZSI6InF1YXkuaW8vb2MtbWlycm9yL29jLW1pcnJvci1kZXZAc2hhMjU2OjFjZThjMDE4N2M4ZmU2YjRiZTMyN2RjODQ4YjhiYWYwNjJjZTFiYWE1MDk2YjRmNWQ5NTU4OTNkMTI2ZDViNTgiLCJkZXNjcmlwdGlvbiI6IlRoZSBCYXogT3BlcmF0b3IgZG9lcyBCYXogdGhpbmdzLiIsIm9sbS5za2lwUmFuZ2UiOiJcdTAwM2MxLjAuMCIsInJlcG9zaXRvcnkiOiJodHRwczovL2dpdGh1Yi5jb20vb3BlbnNoaWZ0L29jLW1pcnJvciJ9LCJuYW1lIjoiYmF6LnYxLjAuMCJ9LCJzcGVjIjp7ImN1c3RvbXJlc291cmNlZGVmaW5pdGlvbnMiOnsib3duZWQiOlt7Imdyb3VwIjoidGVzdC5iYXoiLCJraW5kIjoiQmF6IiwibmFtZSI6ImJhenMudGVzdC5iYXoiLCJ2ZXJzaW9uIjoidjEifV19LCJkZXNjcmlwdGlvbiI6IlRoZSBCYXogT3BlcmF0b3IgZG9lcyBCYXogdGhpbmdzLiIsImRpc3BsYXlOYW1lIjoiQmF6IE9wZXJhdG9yIiwiaWNvbiI6W3siYmFzZTY0ZGF0YSI6IlBEOTRiV3dnZG1WeWMybHZiajBpTVM0d0lpQmxibU52WkdsdVp6MGlkWFJtTFRnaVB6NEtQSE4yWnlCMlpYSnphVzl1UFNJeExqRWlJR2xrUFNKcFkyOXVJaUI0Yld4dWN6MGlhSFIwY0RvdkwzZDNkeTUzTXk1dmNtY3ZNakF3TUM5emRtY2lJSGh0Ykc1ek9uaHNhVzVyUFNKb2RIUndPaTh2ZDNkM0xuY3pMbTl5Wnk4eE9UazVMM2hzYVc1cklpQjRQU0l3Y0hnaUlIazlJakJ3ZUNJS0lDQWdJSFpwWlhkQ2IzZzlJakFnTUNBeE1qZ3dJREV5T0RBaUlITjBlV3hsUFNKbGJtRmliR1V0WW1GamEyZHliM1Z1WkRwdVpYY2dNQ0F3SURFeU9EQWdNVEk0TURzaUlIaHRiRHB6Y0dGalpUMGljSEpsYzJWeWRtVWlQZ284YzNSNWJHVWdkSGx3WlQwaWRHVjRkQzlqYzNNaVBnb2dJQzV6Y1hWcGNtTnNaU0I3SUdacGJHdzZJQ00zUWpnM09UUTdJSFJ5WVc1elptOXliVG9nZEhKaGJuTnNZWFJsS0RWd2VDd2dNWEI0S1RzZ2ZRb2dJQzV1WVcxbElIc2dabTl1ZERvZ1ltOXNaQ0EwTURCd2VDQnpZVzV6SUhObGNtbG1PeUJtYVd4c09pQnlaV1E3SUhSeVlXNXpabTl5YlRvZ2RISmhibk5zWVhSbEtERXpNSEI0TENBMU1EQndlQ2tnY205MFlYUmxLREl3WkdWbktUc2dmUW84TDNOMGVXeGxQZ284Wno0S0lDQThjR0YwYUNCamJHRnpjejBpYzNGMWFYSmpiR1VpSUdROUlrMGdNQ3dnTlRBd0NpQWdJQ0FnSUNBZ0lDQWdJQ0FnSUNBZ0lDQWdJQ0FnSUNBZ0lDQkRJREFzSURVZ05Td2dNQ0ExTURBc0lEQUtJQ0FnSUNBZ0lDQWdJQ0FnSUNBZ0lDQWdJQ0FnSUNBZ0lDQWdJRk1nTVRBd01Dd2dOU0F4TURBd0xDQTFNREFLSUNBZ0lDQWdJQ0FnSUNBZ0lDQWdJQ0FnSUNBZ0lDQWdJQ0FnSUNBZ01UQXdNQ3dnTVRBd01DQTFNREFzSURFd01EQUtJQ0FnSUNBZ0lDQWdJQ0FnSUNBZ0lDQWdJQ0FnSUNBZ0lDQWdJQ0FnTUN3Z01UQXdNQ0F3TENBMU1EQWlMejRLSUNBOGRHVjRkQ0JqYkdGemN6MGlibUZ0WlNJK1ltRjZQQzkwWlhoMFBnbzhMMmMrQ2p3dmMzWm5QZ289IiwibWVkaWF0eXBlIjoiaW1hZ2Uvc3ZnK3htbCJ9XSwiaW5zdGFsbCI6eyJzcGVjIjp7ImRlcGxveW1lbnRzIjpbeyJuYW1lIjoiYmF6LW9wZXJhdG9yIiwic3BlYyI6eyJyZXBsaWNhcyI6MSwic2VsZWN0b3IiOnsibWF0Y2hMYWJlbHMiOnsiYXBwIjoiYmF6LW9wZXJhdG9yIn19LCJ0ZW1wbGF0ZSI6eyJtZXRhZGF0YSI6eyJsYWJlbHMiOnsiYXBwIjoiYmF6LW9wZXJhdG9yIiwidmVyc2lvbiI6InYxLjAuMCJ9LCJuYW1lIjoiYmF6LW9wZXJhdG9yIn0sInNwZWMiOnsiY29udGFpbmVycyI6W3siY29tbWFuZCI6WyIvcnVuLnNoIl0sImltYWdlIjoicXVheS5pby9vYy1taXJyb3Ivb2MtbWlycm9yLWRldkBzaGEyNTY6MWNlOGMwMTg3YzhmZTZiNGJlMzI3ZGM4NDhiOGJhZjA2MmNlMWJhYTUwOTZiNGY1ZDk1NTg5M2QxMjZkNWI1OCIsImltYWdlUHVsbFBvbGljeSI6IkFsd2F5cyIsIm5hbWUiOiJiYXoifV19fX19XX0sInN0cmF0ZWd5IjoiZGVwbG95bWVudCJ9LCJpbnN0YWxsTW9kZXMiOlt7InN1cHBvcnRlZCI6dHJ1ZSwidHlwZSI6Ik93bk5hbWVzcGFjZSJ9LHsic3VwcG9ydGVkIjp0cnVlLCJ0eXBlIjoiU2luZ2xlTmFtZXNwYWNlIn0seyJzdXBwb3J0ZWQiOmZhbHNlLCJ0eXBlIjoiTXVsdGlOYW1lc3BhY2UifSx7InN1cHBvcnRlZCI6dHJ1ZSwidHlwZSI6IkFsbE5hbWVzcGFjZXMifV0sImtleXdvcmRzIjpbImJheiJdLCJsYWJlbHMiOnsibmFtZSI6ImJhei1vcGVyYXRvciJ9LCJtYWludGFpbmVycyI6W3siZW1haWwiOiJvYy1taXJyb3JAb3BlbnNoaWZ0Lm9yZyIsIm5hbWUiOiJvYy1taXJyb3IgZGV2ZWxvcGVycyJ9XSwibWF0dXJpdHkiOiJiZXRhIiwicHJvdmlkZXIiOnsibmFtZSI6IkJheiJ9LCJyZWxhdGVkSW1hZ2VzIjpbeyJpbWFnZSI6InF1YXkuaW8vb2MtbWlycm9yL29jLW1pcnJvci1kZXZAc2hhMjU2OjFjZThjMDE4N2M4ZmU2YjRiZTMyN2RjODQ4YjhiYWYwNjJjZTFiYWE1MDk2YjRmNWQ5NTU4OTNkMTI2ZDViNTgiLCJuYW1lIjoib3BlcmF0b3IifV0sInZlcnNpb24iOiIxLjAuMCJ9fQ==
++relatedImages:
++- image: quay.io/oc-mirror/oc-mirror-dev:baz-bundle-v1.0.0
++  name: ""
++- image: quay.io/oc-mirror/oc-mirror-dev@sha256:1ce8c0187c8fe6b4be327dc848b8baf062ce1baa5096b4f5d955893d126d5b58
++  name: operator
++schema: olm.bundle
++---
++image: quay.io/oc-mirror/oc-mirror-dev:baz-bundle-v1.0.1
++name: baz.v1.0.1
++package: baz
++properties:
++- type: olm.gvk
++  value:
++    group: test.baz
++    kind: Baz
++    version: v1
++- type: olm.package
++  value:
++    packageName: baz
++    version: 1.0.1
++- type: olm.bundle.object
++  value:
++    data: eyJhcGlWZXJzaW9uIjoiYXBpZXh0ZW5zaW9ucy5rOHMuaW8vdjEiLCJraW5kIjoiQ3VzdG9tUmVzb3VyY2VEZWZpbml0aW9uIiwibWV0YWRhdGEiOnsibmFtZSI6ImJhenMudGVzdC5iYXoifSwic3BlYyI6eyJncm91cCI6InRlc3QuYmF6IiwibmFtZXMiOnsia2luZCI6IkJheiIsInBsdXJhbCI6ImJhenMifSwic2NvcGUiOiJOYW1lc3BhY2VkIiwidmVyc2lvbnMiOlt7Im5hbWUiOiJ2MSIsInNjaGVtYSI6eyJvcGVuQVBJVjNTY2hlbWEiOnsidHlwZSI6Im9iamVjdCIsIngta3ViZXJuZXRlcy1wcmVzZXJ2ZS11bmtub3duLWZpZWxkcyI6dHJ1ZX19LCJzZXJ2ZWQiOnRydWUsInN0b3JhZ2UiOnRydWV9XX19
++- type: olm.bundle.object
++  value:
++    data: eyJhcGlWZXJzaW9uIjoib3BlcmF0b3JzLmNvcmVvcy5jb20vdjFhbHBoYTEiLCJraW5kIjoiQ2x1c3RlclNlcnZpY2VWZXJzaW9uIiwibWV0YWRhdGEiOnsiYW5ub3RhdGlvbnMiOnsiY2FwYWJpbGl0aWVzIjoiQmFzaWNJbnN0YWxsIiwiY2VydGlmaWVkIjoiZmFsc2UiLCJjb250YWluZXJJbWFnZSI6InF1YXkuaW8vb2MtbWlycm9yL29jLW1pcnJvci1kZXZAc2hhMjU2OjFjZThjMDE4N2M4ZmU2YjRiZTMyN2RjODQ4YjhiYWYwNjJjZTFiYWE1MDk2YjRmNWQ5NTU4OTNkMTI2ZDViNTgiLCJkZXNjcmlwdGlvbiI6IlRoZSBCYXogT3BlcmF0b3IgZG9lcyBCYXogdGhpbmdzLiIsIm9sbS5za2lwUmFuZ2UiOiJcdTAwM2MxLjAuMSIsInJlcG9zaXRvcnkiOiJodHRwczovL2dpdGh1Yi5jb20vb3BlbnNoaWZ0L29jLW1pcnJvciJ9LCJuYW1lIjoiYmF6LnYxLjAuMSJ9LCJzcGVjIjp7ImN1c3RvbXJlc291cmNlZGVmaW5pdGlvbnMiOnsib3duZWQiOlt7Imdyb3VwIjoidGVzdC5iYXoiLCJraW5kIjoiQmF6IiwibmFtZSI6ImJhenMudGVzdC5iYXoiLCJ2ZXJzaW9uIjoidjEifV19LCJkZXNjcmlwdGlvbiI6IlRoZSBCYXogT3BlcmF0b3IgZG9lcyBCYXogdGhpbmdzLiIsImRpc3BsYXlOYW1lIjoiQmF6IE9wZXJhdG9yIiwiaWNvbiI6W3siYmFzZTY0ZGF0YSI6IlBEOTRiV3dnZG1WeWMybHZiajBpTVM0d0lpQmxibU52WkdsdVp6MGlkWFJtTFRnaVB6NEtQSE4yWnlCMlpYSnphVzl1UFNJeExqRWlJR2xrUFNKcFkyOXVJaUI0Yld4dWN6MGlhSFIwY0RvdkwzZDNkeTUzTXk1dmNtY3ZNakF3TUM5emRtY2lJSGh0Ykc1ek9uaHNhVzVyUFNKb2RIUndPaTh2ZDNkM0xuY3pMbTl5Wnk4eE9UazVMM2hzYVc1cklpQjRQU0l3Y0hnaUlIazlJakJ3ZUNJS0lDQWdJSFpwWlhkQ2IzZzlJakFnTUNBeE1qZ3dJREV5T0RBaUlITjBlV3hsUFNKbGJtRmliR1V0WW1GamEyZHliM1Z1WkRwdVpYY2dNQ0F3SURFeU9EQWdNVEk0TURzaUlIaHRiRHB6Y0dGalpUMGljSEpsYzJWeWRtVWlQZ284YzNSNWJHVWdkSGx3WlQwaWRHVjRkQzlqYzNNaVBnb2dJQzV6Y1hWcGNtTnNaU0I3SUdacGJHdzZJQ00zUWpnM09UUTdJSFJ5WVc1elptOXliVG9nZEhKaGJuTnNZWFJsS0RWd2VDd2dNWEI0S1RzZ2ZRb2dJQzV1WVcxbElIc2dabTl1ZERvZ1ltOXNaQ0EwTURCd2VDQnpZVzV6SUhObGNtbG1PeUJtYVd4c09pQnlaV1E3SUhSeVlXNXpabTl5YlRvZ2RISmhibk5zWVhSbEtERXpNSEI0TENBMU1EQndlQ2tnY205MFlYUmxLREl3WkdWbktUc2dmUW84TDNOMGVXeGxQZ284Wno0S0lDQThjR0YwYUNCamJHRnpjejBpYzNGMWFYSmpiR1VpSUdROUlrMGdNQ3dnTlRBd0NpQWdJQ0FnSUNBZ0lDQWdJQ0FnSUNBZ0lDQWdJQ0FnSUNBZ0lDQkRJREFzSURVZ05Td2dNQ0ExTURBc0lEQUtJQ0FnSUNBZ0lDQWdJQ0FnSUNBZ0lDQWdJQ0FnSUNBZ0lDQWdJRk1nTVRBd01Dd2dOU0F4TURBd0xDQTFNREFLSUNBZ0lDQWdJQ0FnSUNBZ0lDQWdJQ0FnSUNBZ0lDQWdJQ0FnSUNBZ01UQXdNQ3dnTVRBd01DQTFNREFzSURFd01EQUtJQ0FnSUNBZ0lDQWdJQ0FnSUNBZ0lDQWdJQ0FnSUNBZ0lDQWdJQ0FnTUN3Z01UQXdNQ0F3TENBMU1EQWlMejRLSUNBOGRHVjRkQ0JqYkdGemN6MGlibUZ0WlNJK1ltRjZQQzkwWlhoMFBnbzhMMmMrQ2p3dmMzWm5QZ289IiwibWVkaWF0eXBlIjoiaW1hZ2Uvc3ZnK3htbCJ9XSwiaW5zdGFsbCI6eyJzcGVjIjp7ImRlcGxveW1lbnRzIjpbeyJuYW1lIjoiYmF6LW9wZXJhdG9yIiwic3BlYyI6eyJyZXBsaWNhcyI6MSwic2VsZWN0b3IiOnsibWF0Y2hMYWJlbHMiOnsiYXBwIjoiYmF6LW9wZXJhdG9yIn19LCJ0ZW1wbGF0ZSI6eyJtZXRhZGF0YSI6eyJsYWJlbHMiOnsiYXBwIjoiYmF6LW9wZXJhdG9yIiwidmVyc2lvbiI6InYxLjAuMSJ9LCJuYW1lIjoiYmF6LW9wZXJhdG9yIn0sInNwZWMiOnsiY29udGFpbmVycyI6W3siY29tbWFuZCI6WyIvcnVuLnNoIl0sImltYWdlIjoicXVheS5pby9vYy1taXJyb3Ivb2MtbWlycm9yLWRldkBzaGEyNTY6MWNlOGMwMTg3YzhmZTZiNGJlMzI3ZGM4NDhiOGJhZjA2MmNlMWJhYTUwOTZiNGY1ZDk1NTg5M2QxMjZkNWI1OCIsImltYWdlUHVsbFBvbGljeSI6IkFsd2F5cyIsIm5hbWUiOiJiYXoifV19fX19XX0sInN0cmF0ZWd5IjoiZGVwbG95bWVudCJ9LCJpbnN0YWxsTW9kZXMiOlt7InN1cHBvcnRlZCI6dHJ1ZSwidHlwZSI6Ik93bk5hbWVzcGFjZSJ9LHsic3VwcG9ydGVkIjp0cnVlLCJ0eXBlIjoiU2luZ2xlTmFtZXNwYWNlIn0seyJzdXBwb3J0ZWQiOmZhbHNlLCJ0eXBlIjoiTXVsdGlOYW1lc3BhY2UifSx7InN1cHBvcnRlZCI6dHJ1ZSwidHlwZSI6IkFsbE5hbWVzcGFjZXMifV0sImtleXdvcmRzIjpbImJheiJdLCJsYWJlbHMiOnsibmFtZSI6ImJhei1vcGVyYXRvciJ9LCJtYWludGFpbmVycyI6W3siZW1haWwiOiJvYy1taXJyb3JAb3BlbnNoaWZ0Lm9yZyIsIm5hbWUiOiJvYy1taXJyb3IgZGV2ZWxvcGVycyJ9XSwibWF0dXJpdHkiOiJiZXRhIiwicHJvdmlkZXIiOnsibmFtZSI6IkJheiJ9LCJyZWxhdGVkSW1hZ2VzIjpbeyJpbWFnZSI6InF1YXkuaW8vb2MtbWlycm9yL29jLW1pcnJvci1kZXZAc2hhMjU2OjFjZThjMDE4N2M4ZmU2YjRiZTMyN2RjODQ4YjhiYWYwNjJjZTFiYWE1MDk2YjRmNWQ5NTU4OTNkMTI2ZDViNTgiLCJuYW1lIjoib3BlcmF0b3IifV0sInNraXBzIjpbImJhei52MS4wLjAiXSwidmVyc2lvbiI6IjEuMC4xIn19
++relatedImages:
++- image: quay.io/oc-mirror/oc-mirror-dev:baz-bundle-v1.0.1
++  name: ""
++- image: quay.io/oc-mirror/oc-mirror-dev@sha256:1ce8c0187c8fe6b4be327dc848b8baf062ce1baa5096b4f5d955893d126d5b58
++  name: operator
++schema: olm.bundle
++---
++image: quay.io/oc-mirror/oc-mirror-dev:baz-bundle-v1.1.0
++name: baz.v1.1.0
++package: baz
++properties:
++- type: olm.gvk
++  value:
++    group: test.baz
++    kind: Baz
++    version: v1
++- type: olm.package
++  value:
++    packageName: baz
++    version: 1.1.0
++- type: olm.bundle.object
++  value:
++    data: eyJhcGlWZXJzaW9uIjoiYXBpZXh0ZW5zaW9ucy5rOHMuaW8vdjEiLCJraW5kIjoiQ3VzdG9tUmVzb3VyY2VEZWZpbml0aW9uIiwibWV0YWRhdGEiOnsibmFtZSI6ImJhenMudGVzdC5iYXoifSwic3BlYyI6eyJncm91cCI6InRlc3QuYmF6IiwibmFtZXMiOnsia2luZCI6IkJheiIsInBsdXJhbCI6ImJhenMifSwic2NvcGUiOiJOYW1lc3BhY2VkIiwidmVyc2lvbnMiOlt7Im5hbWUiOiJ2MSIsInNjaGVtYSI6eyJvcGVuQVBJVjNTY2hlbWEiOnsidHlwZSI6Im9iamVjdCIsIngta3ViZXJuZXRlcy1wcmVzZXJ2ZS11bmtub3duLWZpZWxkcyI6dHJ1ZX19LCJzZXJ2ZWQiOnRydWUsInN0b3JhZ2UiOnRydWV9XX19
++- type: olm.bundle.object
++  value:
++    data: eyJhcGlWZXJzaW9uIjoib3BlcmF0b3JzLmNvcmVvcy5jb20vdjFhbHBoYTEiLCJraW5kIjoiQ2x1c3RlclNlcnZpY2VWZXJzaW9uIiwibWV0YWRhdGEiOnsiYW5ub3RhdGlvbnMiOnsiY2FwYWJpbGl0aWVzIjoiQmFzaWNJbnN0YWxsIiwiY2VydGlmaWVkIjoiZmFsc2UiLCJjb250YWluZXJJbWFnZSI6InF1YXkuaW8vb2MtbWlycm9yL29jLW1pcnJvci1kZXZAc2hhMjU2OjFjZThjMDE4N2M4ZmU2YjRiZTMyN2RjODQ4YjhiYWYwNjJjZTFiYWE1MDk2YjRmNWQ5NTU4OTNkMTI2ZDViNTgiLCJkZXNjcmlwdGlvbiI6IlRoZSBCYXogT3BlcmF0b3IgZG9lcyBCYXogdGhpbmdzLiIsIm9sbS5za2lwUmFuZ2UiOiJcdTAwM2MxLjEuMCIsInJlcG9zaXRvcnkiOiJodHRwczovL2dpdGh1Yi5jb20vb3BlbnNoaWZ0L29jLW1pcnJvciJ9LCJuYW1lIjoiYmF6LnYxLjEuMCJ9LCJzcGVjIjp7ImN1c3RvbXJlc291cmNlZGVmaW5pdGlvbnMiOnsib3duZWQiOlt7Imdyb3VwIjoidGVzdC5iYXoiLCJraW5kIjoiQmF6IiwibmFtZSI6ImJhenMudGVzdC5iYXoiLCJ2ZXJzaW9uIjoidjEifV19LCJkZXNjcmlwdGlvbiI6IlRoZSBCYXogT3BlcmF0b3IgZG9lcyBCYXogdGhpbmdzLiIsImRpc3BsYXlOYW1lIjoiQmF6IE9wZXJhdG9yIiwiaWNvbiI6W3siYmFzZTY0ZGF0YSI6IlBEOTRiV3dnZG1WeWMybHZiajBpTVM0d0lpQmxibU52WkdsdVp6MGlkWFJtTFRnaVB6NEtQSE4yWnlCMlpYSnphVzl1UFNJeExqRWlJR2xrUFNKcFkyOXVJaUI0Yld4dWN6MGlhSFIwY0RvdkwzZDNkeTUzTXk1dmNtY3ZNakF3TUM5emRtY2lJSGh0Ykc1ek9uaHNhVzVyUFNKb2RIUndPaTh2ZDNkM0xuY3pMbTl5Wnk4eE9UazVMM2hzYVc1cklpQjRQU0l3Y0hnaUlIazlJakJ3ZUNJS0lDQWdJSFpwWlhkQ2IzZzlJakFnTUNBeE1qZ3dJREV5T0RBaUlITjBlV3hsUFNKbGJtRmliR1V0WW1GamEyZHliM1Z1WkRwdVpYY2dNQ0F3SURFeU9EQWdNVEk0TURzaUlIaHRiRHB6Y0dGalpUMGljSEpsYzJWeWRtVWlQZ284YzNSNWJHVWdkSGx3WlQwaWRHVjRkQzlqYzNNaVBnb2dJQzV6Y1hWcGNtTnNaU0I3SUdacGJHdzZJQ00zUWpnM09UUTdJSFJ5WVc1elptOXliVG9nZEhKaGJuTnNZWFJsS0RWd2VDd2dNWEI0S1RzZ2ZRb2dJQzV1WVcxbElIc2dabTl1ZERvZ1ltOXNaQ0EwTURCd2VDQnpZVzV6SUhObGNtbG1PeUJtYVd4c09pQnlaV1E3SUhSeVlXNXpabTl5YlRvZ2RISmhibk5zWVhSbEtERXpNSEI0TENBMU1EQndlQ2tnY205MFlYUmxLREl3WkdWbktUc2dmUW84TDNOMGVXeGxQZ284Wno0S0lDQThjR0YwYUNCamJHRnpjejBpYzNGMWFYSmpiR1VpSUdROUlrMGdNQ3dnTlRBd0NpQWdJQ0FnSUNBZ0lDQWdJQ0FnSUNBZ0lDQWdJQ0FnSUNBZ0lDQkRJREFzSURVZ05Td2dNQ0ExTURBc0lEQUtJQ0FnSUNBZ0lDQWdJQ0FnSUNBZ0lDQWdJQ0FnSUNBZ0lDQWdJRk1nTVRBd01Dd2dOU0F4TURBd0xDQTFNREFLSUNBZ0lDQWdJQ0FnSUNBZ0lDQWdJQ0FnSUNBZ0lDQWdJQ0FnSUNBZ01UQXdNQ3dnTVRBd01DQTFNREFzSURFd01EQUtJQ0FnSUNBZ0lDQWdJQ0FnSUNBZ0lDQWdJQ0FnSUNBZ0lDQWdJQ0FnTUN3Z01UQXdNQ0F3TENBMU1EQWlMejRLSUNBOGRHVjRkQ0JqYkdGemN6MGlibUZ0WlNJK1ltRjZQQzkwWlhoMFBnbzhMMmMrQ2p3dmMzWm5QZ289IiwibWVkaWF0eXBlIjoiaW1hZ2Uvc3ZnK3htbCJ9XSwiaW5zdGFsbCI6eyJzcGVjIjp7ImRlcGxveW1lbnRzIjpbeyJuYW1lIjoiYmF6LW9wZXJhdG9yIiwic3BlYyI6eyJyZXBsaWNhcyI6MSwic2VsZWN0b3IiOnsibWF0Y2hMYWJlbHMiOnsiYXBwIjoiYmF6LW9wZXJhdG9yIn19LCJ0ZW1wbGF0ZSI6eyJtZXRhZGF0YSI6eyJsYWJlbHMiOnsiYXBwIjoiYmF6LW9wZXJhdG9yIiwidmVyc2lvbiI6InYxLjEuMCJ9LCJuYW1lIjoiYmF6LW9wZXJhdG9yIn0sInNwZWMiOnsiY29udGFpbmVycyI6W3siY29tbWFuZCI6WyIvcnVuLnNoIl0sImltYWdlIjoicXVheS5pby9vYy1taXJyb3Ivb2MtbWlycm9yLWRldkBzaGEyNTY6MWNlOGMwMTg3YzhmZTZiNGJlMzI3ZGM4NDhiOGJhZjA2MmNlMWJhYTUwOTZiNGY1ZDk1NTg5M2QxMjZkNWI1OCIsImltYWdlUHVsbFBvbGljeSI6IkFsd2F5cyIsIm5hbWUiOiJiYXoifV19fX19XX0sInN0cmF0ZWd5IjoiZGVwbG95bWVudCJ9LCJpbnN0YWxsTW9kZXMiOlt7InN1cHBvcnRlZCI6dHJ1ZSwidHlwZSI6Ik93bk5hbWVzcGFjZSJ9LHsic3VwcG9ydGVkIjp0cnVlLCJ0eXBlIjoiU2luZ2xlTmFtZXNwYWNlIn0seyJzdXBwb3J0ZWQiOmZhbHNlLCJ0eXBlIjoiTXVsdGlOYW1lc3BhY2UifSx7InN1cHBvcnRlZCI6dHJ1ZSwidHlwZSI6IkFsbE5hbWVzcGFjZXMifV0sImtleXdvcmRzIjpbImJheiJdLCJsYWJlbHMiOnsibmFtZSI6ImJhei1vcGVyYXRvciJ9LCJtYWludGFpbmVycyI6W3siZW1haWwiOiJvYy1taXJyb3JAb3BlbnNoaWZ0Lm9yZyIsIm5hbWUiOiJvYy1taXJyb3IgZGV2ZWxvcGVycyJ9XSwibWF0dXJpdHkiOiJiZXRhIiwicHJvdmlkZXIiOnsibmFtZSI6IkJheiJ9LCJyZWxhdGVkSW1hZ2VzIjpbeyJpbWFnZSI6InF1YXkuaW8vb2MtbWlycm9yL29jLW1pcnJvci1kZXZAc2hhMjU2OjFjZThjMDE4N2M4ZmU2YjRiZTMyN2RjODQ4YjhiYWYwNjJjZTFiYWE1MDk2YjRmNWQ5NTU4OTNkMTI2ZDViNTgiLCJuYW1lIjoib3BlcmF0b3IifV0sInJlcGxhY2VzIjoiYmF6LnYxLjAuMSIsInZlcnNpb24iOiIxLjEuMCJ9fQ==
++relatedImages:
++- image: quay.io/oc-mirror/oc-mirror-dev:baz-bundle-v1.1.0
++  name: ""
++- image: quay.io/oc-mirror/oc-mirror-dev@sha256:1ce8c0187c8fe6b4be327dc848b8baf062ce1baa5096b4f5d955893d126d5b58
++  name: operator
++schema: olm.bundle
+diff --git a/tests/integration/image-builders/operator/catalogs/test-catalog-diff/baz/channels.yaml b/tests/integration/image-builders/operator/catalogs/test-catalog-diff/baz/channels.yaml
+new file mode 100644
+index 000000000..269ad0bc6
+--- /dev/null
++++ b/tests/integration/image-builders/operator/catalogs/test-catalog-diff/baz/channels.yaml
+@@ -0,0 +1,13 @@
++schema: olm.channel
++package: baz
++name: stable
++entries:
++  - name: baz.v1.0.0
++    skipRange: <1.0.0
++  - name: baz.v1.0.1
++    skipRange: <1.0.1
++    skips:
++      - baz.v1.0.0
++  - name: baz.v1.1.0
++    skipRange: <1.1.0
++    replaces: baz.v1.0.1
+diff --git a/tests/integration/image-builders/operator/catalogs/test-catalog-diff/baz/operator.yaml b/tests/integration/image-builders/operator/catalogs/test-catalog-diff/baz/operator.yaml
+new file mode 100644
+index 000000000..291227530
+--- /dev/null
++++ b/tests/integration/image-builders/operator/catalogs/test-catalog-diff/baz/operator.yaml
+@@ -0,0 +1,4 @@
++---
++defaultChannel: stable
++name: baz
++schema: olm.package
+diff --git a/tests/integration/image-builders/operator/catalogs/test-catalog-diff/foo/bundles.yaml b/tests/integration/image-builders/operator/catalogs/test-catalog-diff/foo/bundles.yaml
+new file mode 100644
+index 000000000..8dd5d7826
+--- /dev/null
++++ b/tests/integration/image-builders/operator/catalogs/test-catalog-diff/foo/bundles.yaml
+@@ -0,0 +1,190 @@
++---
++image: quay.io/oc-mirror/oc-mirror-dev:foo-bundle-v0.1.0
++name: foo.v0.1.0
++package: foo
++properties:
++- type: olm.gvk
++  value:
++    group: test.foo
++    kind: Foo
++    version: v1
++- type: olm.gvk.required
++  value:
++    group: test.bar
++    kind: Bar
++    version: v1alpha1
++- type: olm.package
++  value:
++    packageName: foo
++    version: 0.1.0
++- type: olm.package.required
++  value:
++    packageName: bar
++    versionRange: <0.2.0
++- type: olm.bundle.object
++  value:
++    data: eyJhcGlWZXJzaW9uIjoiYXBpZXh0ZW5zaW9ucy5rOHMuaW8vdjEiLCJraW5kIjoiQ3VzdG9tUmVzb3VyY2VEZWZpbml0aW9uIiwibWV0YWRhdGEiOnsibmFtZSI6ImZvb3MudGVzdC5mb28ifSwic3BlYyI6eyJncm91cCI6InRlc3QuZm9vIiwibmFtZXMiOnsia2luZCI6IkZvbyIsInBsdXJhbCI6ImZvb3MifSwic2NvcGUiOiJOYW1lc3BhY2VkIiwidmVyc2lvbnMiOlt7Im5hbWUiOiJ2MSIsInNjaGVtYSI6eyJvcGVuQVBJVjNTY2hlbWEiOnsidHlwZSI6Im9iamVjdCIsIngta3ViZXJuZXRlcy1wcmVzZXJ2ZS11bmtub3duLWZpZWxkcyI6dHJ1ZX19LCJzZXJ2ZWQiOnRydWUsInN0b3JhZ2UiOnRydWV9XX19
++- type: olm.bundle.object
++  value:
++    data: eyJhcGlWZXJzaW9uIjoib3BlcmF0b3JzLmNvcmVvcy5jb20vdjFhbHBoYTEiLCJraW5kIjoiQ2x1c3RlclNlcnZpY2VWZXJzaW9uIiwibWV0YWRhdGEiOnsiYW5ub3RhdGlvbnMiOnsiY2FwYWJpbGl0aWVzIjoiQmFzaWNJbnN0YWxsIiwiY2VydGlmaWVkIjoiZmFsc2UiLCJjb250YWluZXJJbWFnZSI6InF1YXkuaW8vb2MtbWlycm9yL29jLW1pcnJvci1kZXZAc2hhMjU2OjFjZThjMDE4N2M4ZmU2YjRiZTMyN2RjODQ4YjhiYWYwNjJjZTFiYWE1MDk2YjRmNWQ5NTU4OTNkMTI2ZDViNTgiLCJkZXNjcmlwdGlvbiI6IlRoZSBGb28gT3BlcmF0b3IgZG9lcyBGb28gdGhpbmdzLiIsIm9sbS5za2lwUmFuZ2UiOiJcdTAwM2MwLjEuMCIsInJlcG9zaXRvcnkiOiJodHRwczovL2dpdGh1Yi5jb20vb3BlbnNoaWZ0L29jLW1pcnJvciJ9LCJuYW1lIjoiZm9vLnYwLjEuMCJ9LCJzcGVjIjp7ImN1c3RvbXJlc291cmNlZGVmaW5pdGlvbnMiOnsib3duZWQiOlt7Imdyb3VwIjoidGVzdC5mb28iLCJraW5kIjoiRm9vIiwibmFtZSI6ImZvb3MudGVzdC5mb28iLCJ2ZXJzaW9uIjoidjEifV19LCJkZXNjcmlwdGlvbiI6IlRoZSBGb28gT3BlcmF0b3IgZG9lcyBGb28gdGhpbmdzLiIsImRpc3BsYXlOYW1lIjoiRm9vIE9wZXJhdG9yIiwiaWNvbiI6W3siYmFzZTY0ZGF0YSI6IlBEOTRiV3dnZG1WeWMybHZiajBpTVM0d0lpQmxibU52WkdsdVp6MGlkWFJtTFRnaVB6NEtQSE4yWnlCMlpYSnphVzl1UFNJeExqRWlJR2xrUFNKcFkyOXVJaUI0Yld4dWN6MGlhSFIwY0RvdkwzZDNkeTUzTXk1dmNtY3ZNakF3TUM5emRtY2lJSGh0Ykc1ek9uaHNhVzVyUFNKb2RIUndPaTh2ZDNkM0xuY3pMbTl5Wnk4eE9UazVMM2hzYVc1cklpQjRQU0l3Y0hnaUlIazlJakJ3ZUNJS0lDQWdJSFpwWlhkQ2IzZzlJakFnTUNBeE1qZ3dJREV5T0RBaUlITjBlV3hsUFNKbGJtRmliR1V0WW1GamEyZHliM1Z1WkRwdVpYY2dNQ0F3SURFeU9EQWdNVEk0TURzaUlIaHRiRHB6Y0dGalpUMGljSEpsYzJWeWRtVWlQZ284YzNSNWJHVWdkSGx3WlQwaWRHVjRkQzlqYzNNaVBnb2dJQzV6Y1hWcGNtTnNaU0I3SUdacGJHdzZJQ00zUWpnM09UUTdJSFJ5WVc1elptOXliVG9nZEhKaGJuTnNZWFJsS0RWd2VDd2dNWEI0S1RzZ2ZRb2dJQzV1WVcxbElIc2dabTl1ZERvZ1ltOXNaQ0EwTURCd2VDQnpZVzV6SUhObGNtbG1PeUJtYVd4c09pQnlaV1E3SUhSeVlXNXpabTl5YlRvZ2RISmhibk5zWVhSbEtERXpNSEI0TENBMU1EQndlQ2tnY205MFlYUmxLREl3WkdWbktUc2dmUW84TDNOMGVXeGxQZ284Wno0S0lDQThjR0YwYUNCamJHRnpjejBpYzNGMWFYSmpiR1VpSUdROUlrMGdNQ3dnTlRBd0NpQWdJQ0FnSUNBZ0lDQWdJQ0FnSUNBZ0lDQWdJQ0FnSUNBZ0lDQkRJREFzSURVZ05Td2dNQ0ExTURBc0lEQUtJQ0FnSUNBZ0lDQWdJQ0FnSUNBZ0lDQWdJQ0FnSUNBZ0lDQWdJRk1nTVRBd01Dd2dOU0F4TURBd0xDQTFNREFLSUNBZ0lDQWdJQ0FnSUNBZ0lDQWdJQ0FnSUNBZ0lDQWdJQ0FnSUNBZ01UQXdNQ3dnTVRBd01DQTFNREFzSURFd01EQUtJQ0FnSUNBZ0lDQWdJQ0FnSUNBZ0lDQWdJQ0FnSUNBZ0lDQWdJQ0FnTUN3Z01UQXdNQ0F3TENBMU1EQWlMejRLSUNBOGRHVjRkQ0JqYkdGemN6MGlibUZ0WlNJK1ptOXZQQzkwWlhoMFBnbzhMMmMrQ2p3dmMzWm5QZ289IiwibWVkaWF0eXBlIjoiaW1hZ2Uvc3ZnK3htbCJ9XSwiaW5zdGFsbCI6eyJzcGVjIjp7ImRlcGxveW1lbnRzIjpbeyJuYW1lIjoiZm9vLW9wZXJhdG9yIiwic3BlYyI6eyJyZXBsaWNhcyI6MSwic2VsZWN0b3IiOnsibWF0Y2hMYWJlbHMiOnsiYXBwIjoiZm9vLW9wZXJhdG9yIn19LCJ0ZW1wbGF0ZSI6eyJtZXRhZGF0YSI6eyJsYWJlbHMiOnsiYXBwIjoiZm9vLW9wZXJhdG9yIiwidmVyc2lvbiI6InYwLjEuMCJ9LCJuYW1lIjoiZm9vLW9wZXJhdG9yIn0sInNwZWMiOnsiY29udGFpbmVycyI6W3siY29tbWFuZCI6WyIvcnVuLnNoIl0sImltYWdlIjoicXVheS5pby9vYy1taXJyb3Ivb2MtbWlycm9yLWRldkBzaGEyNTY6MWNlOGMwMTg3YzhmZTZiNGJlMzI3ZGM4NDhiOGJhZjA2MmNlMWJhYTUwOTZiNGY1ZDk1NTg5M2QxMjZkNWI1OCIsImltYWdlUHVsbFBvbGljeSI6IkFsd2F5cyIsIm5hbWUiOiJmb28ifV19fX19XX0sInN0cmF0ZWd5IjoiZGVwbG95bWVudCJ9LCJpbnN0YWxsTW9kZXMiOlt7InN1cHBvcnRlZCI6dHJ1ZSwidHlwZSI6Ik93bk5hbWVzcGFjZSJ9LHsic3VwcG9ydGVkIjp0cnVlLCJ0eXBlIjoiU2luZ2xlTmFtZXNwYWNlIn0seyJzdXBwb3J0ZWQiOmZhbHNlLCJ0eXBlIjoiTXVsdGlOYW1lc3BhY2UifSx7InN1cHBvcnRlZCI6dHJ1ZSwidHlwZSI6IkFsbE5hbWVzcGFjZXMifV0sImtleXdvcmRzIjpbImZvbyJdLCJsYWJlbHMiOnsibmFtZSI6ImZvby1vcGVyYXRvciJ9LCJtYWludGFpbmVycyI6W3siZW1haWwiOiJvYy1taXJyb3JAb3BlbnNoaWZ0Lm9yZyIsIm5hbWUiOiJvYy1taXJyb3IgZGV2ZWxvcGVycyJ9XSwibWF0dXJpdHkiOiJiZXRhIiwicHJvdmlkZXIiOnsibmFtZSI6IkZvbyJ9LCJyZWxhdGVkSW1hZ2VzIjpbeyJpbWFnZSI6InF1YXkuaW8vb2MtbWlycm9yL29jLW1pcnJvci1kZXZAc2hhMjU2OjFjZThjMDE4N2M4ZmU2YjRiZTMyN2RjODQ4YjhiYWYwNjJjZTFiYWE1MDk2YjRmNWQ5NTU4OTNkMTI2ZDViNTgiLCJuYW1lIjoib3BlcmF0b3IifV0sInZlcnNpb24iOiIwLjEuMCJ9fQ==
++relatedImages:
++- image: quay.io/oc-mirror/oc-mirror-dev:foo-bundle-v0.1.0
++  name: ""
++- image: quay.io/oc-mirror/oc-mirror-dev@sha256:1ce8c0187c8fe6b4be327dc848b8baf062ce1baa5096b4f5d955893d126d5b58
++  name: operator
++schema: olm.bundle
++---
++image: quay.io/oc-mirror/oc-mirror-dev:foo-bundle-v0.2.0
++name: foo.v0.2.0
++package: foo
++properties:
++- type: olm.gvk
++  value:
++    group: test.foo
++    kind: Foo
++    version: v1
++- type: olm.gvk.required
++  value:
++    group: test.bar
++    kind: Bar
++    version: v1alpha1
++- type: olm.package
++  value:
++    packageName: foo
++    version: 0.2.0
++- type: olm.package.required
++  value:
++    packageName: bar
++    versionRange: <0.2.0
++- type: olm.bundle.object
++  value:
++    data: eyJhcGlWZXJzaW9uIjoiYXBpZXh0ZW5zaW9ucy5rOHMuaW8vdjEiLCJraW5kIjoiQ3VzdG9tUmVzb3VyY2VEZWZpbml0aW9uIiwibWV0YWRhdGEiOnsibmFtZSI6ImZvb3MudGVzdC5mb28ifSwic3BlYyI6eyJncm91cCI6InRlc3QuZm9vIiwibmFtZXMiOnsia2luZCI6IkZvbyIsInBsdXJhbCI6ImZvb3MifSwic2NvcGUiOiJOYW1lc3BhY2VkIiwidmVyc2lvbnMiOlt7Im5hbWUiOiJ2MSIsInNjaGVtYSI6eyJvcGVuQVBJVjNTY2hlbWEiOnsidHlwZSI6Im9iamVjdCIsIngta3ViZXJuZXRlcy1wcmVzZXJ2ZS11bmtub3duLWZpZWxkcyI6dHJ1ZX19LCJzZXJ2ZWQiOnRydWUsInN0b3JhZ2UiOnRydWV9XX19
++- type: olm.bundle.object
++  value:
++    data: eyJhcGlWZXJzaW9uIjoib3BlcmF0b3JzLmNvcmVvcy5jb20vdjFhbHBoYTEiLCJraW5kIjoiQ2x1c3RlclNlcnZpY2VWZXJzaW9uIiwibWV0YWRhdGEiOnsiYW5ub3RhdGlvbnMiOnsiY2FwYWJpbGl0aWVzIjoiQmFzaWNJbnN0YWxsIiwiY2VydGlmaWVkIjoiZmFsc2UiLCJjb250YWluZXJJbWFnZSI6InF1YXkuaW8vb2MtbWlycm9yL29jLW1pcnJvci1kZXZAc2hhMjU2OjFjZThjMDE4N2M4ZmU2YjRiZTMyN2RjODQ4YjhiYWYwNjJjZTFiYWE1MDk2YjRmNWQ5NTU4OTNkMTI2ZDViNTgiLCJkZXNjcmlwdGlvbiI6IlRoZSBGb28gT3BlcmF0b3IgZG9lcyBGb28gdGhpbmdzLiIsIm9sbS5za2lwUmFuZ2UiOiJcdTAwM2MwLjIuMCIsInJlcG9zaXRvcnkiOiJodHRwczovL2dpdGh1Yi5jb20vb3BlbnNoaWZ0L29jLW1pcnJvciJ9LCJuYW1lIjoiZm9vLnYwLjIuMCJ9LCJzcGVjIjp7ImN1c3RvbXJlc291cmNlZGVmaW5pdGlvbnMiOnsib3duZWQiOlt7Imdyb3VwIjoidGVzdC5mb28iLCJraW5kIjoiRm9vIiwibmFtZSI6ImZvb3MudGVzdC5mb28iLCJ2ZXJzaW9uIjoidjEifV19LCJkZXNjcmlwdGlvbiI6IlRoZSBGb28gT3BlcmF0b3IgZG9lcyBGb28gdGhpbmdzLiIsImRpc3BsYXlOYW1lIjoiRm9vIE9wZXJhdG9yIiwiaWNvbiI6W3siYmFzZTY0ZGF0YSI6IlBEOTRiV3dnZG1WeWMybHZiajBpTVM0d0lpQmxibU52WkdsdVp6MGlkWFJtTFRnaVB6NEtQSE4yWnlCMlpYSnphVzl1UFNJeExqRWlJR2xrUFNKcFkyOXVJaUI0Yld4dWN6MGlhSFIwY0RvdkwzZDNkeTUzTXk1dmNtY3ZNakF3TUM5emRtY2lJSGh0Ykc1ek9uaHNhVzVyUFNKb2RIUndPaTh2ZDNkM0xuY3pMbTl5Wnk4eE9UazVMM2hzYVc1cklpQjRQU0l3Y0hnaUlIazlJakJ3ZUNJS0lDQWdJSFpwWlhkQ2IzZzlJakFnTUNBeE1qZ3dJREV5T0RBaUlITjBlV3hsUFNKbGJtRmliR1V0WW1GamEyZHliM1Z1WkRwdVpYY2dNQ0F3SURFeU9EQWdNVEk0TURzaUlIaHRiRHB6Y0dGalpUMGljSEpsYzJWeWRtVWlQZ284YzNSNWJHVWdkSGx3WlQwaWRHVjRkQzlqYzNNaVBnb2dJQzV6Y1hWcGNtTnNaU0I3SUdacGJHdzZJQ00zUWpnM09UUTdJSFJ5WVc1elptOXliVG9nZEhKaGJuTnNZWFJsS0RWd2VDd2dNWEI0S1RzZ2ZRb2dJQzV1WVcxbElIc2dabTl1ZERvZ1ltOXNaQ0EwTURCd2VDQnpZVzV6SUhObGNtbG1PeUJtYVd4c09pQnlaV1E3SUhSeVlXNXpabTl5YlRvZ2RISmhibk5zWVhSbEtERXpNSEI0TENBMU1EQndlQ2tnY205MFlYUmxLREl3WkdWbktUc2dmUW84TDNOMGVXeGxQZ284Wno0S0lDQThjR0YwYUNCamJHRnpjejBpYzNGMWFYSmpiR1VpSUdROUlrMGdNQ3dnTlRBd0NpQWdJQ0FnSUNBZ0lDQWdJQ0FnSUNBZ0lDQWdJQ0FnSUNBZ0lDQkRJREFzSURVZ05Td2dNQ0ExTURBc0lEQUtJQ0FnSUNBZ0lDQWdJQ0FnSUNBZ0lDQWdJQ0FnSUNBZ0lDQWdJRk1nTVRBd01Dd2dOU0F4TURBd0xDQTFNREFLSUNBZ0lDQWdJQ0FnSUNBZ0lDQWdJQ0FnSUNBZ0lDQWdJQ0FnSUNBZ01UQXdNQ3dnTVRBd01DQTFNREFzSURFd01EQUtJQ0FnSUNBZ0lDQWdJQ0FnSUNBZ0lDQWdJQ0FnSUNBZ0lDQWdJQ0FnTUN3Z01UQXdNQ0F3TENBMU1EQWlMejRLSUNBOGRHVjRkQ0JqYkdGemN6MGlibUZ0WlNJK1ptOXZQQzkwWlhoMFBnbzhMMmMrQ2p3dmMzWm5QZ289IiwibWVkaWF0eXBlIjoiaW1hZ2Uvc3ZnK3htbCJ9XSwiaW5zdGFsbCI6eyJzcGVjIjp7ImRlcGxveW1lbnRzIjpbeyJuYW1lIjoiZm9vLW9wZXJhdG9yIiwic3BlYyI6eyJyZXBsaWNhcyI6MSwic2VsZWN0b3IiOnsibWF0Y2hMYWJlbHMiOnsiYXBwIjoiZm9vLW9wZXJhdG9yIn19LCJ0ZW1wbGF0ZSI6eyJtZXRhZGF0YSI6eyJsYWJlbHMiOnsiYXBwIjoiZm9vLW9wZXJhdG9yIiwidmVyc2lvbiI6InYwLjIuMCJ9LCJuYW1lIjoiZm9vLW9wZXJhdG9yIn0sInNwZWMiOnsiY29udGFpbmVycyI6W3siY29tbWFuZCI6WyIvcnVuLnNoIl0sImltYWdlIjoicXVheS5pby9vYy1taXJyb3Ivb2MtbWlycm9yLWRldkBzaGEyNTY6MWNlOGMwMTg3YzhmZTZiNGJlMzI3ZGM4NDhiOGJhZjA2MmNlMWJhYTUwOTZiNGY1ZDk1NTg5M2QxMjZkNWI1OCIsImltYWdlUHVsbFBvbGljeSI6IkFsd2F5cyIsIm5hbWUiOiJmb28ifV19fX19XX0sInN0cmF0ZWd5IjoiZGVwbG95bWVudCJ9LCJpbnN0YWxsTW9kZXMiOlt7InN1cHBvcnRlZCI6dHJ1ZSwidHlwZSI6Ik93bk5hbWVzcGFjZSJ9LHsic3VwcG9ydGVkIjp0cnVlLCJ0eXBlIjoiU2luZ2xlTmFtZXNwYWNlIn0seyJzdXBwb3J0ZWQiOmZhbHNlLCJ0eXBlIjoiTXVsdGlOYW1lc3BhY2UifSx7InN1cHBvcnRlZCI6dHJ1ZSwidHlwZSI6IkFsbE5hbWVzcGFjZXMifV0sImtleXdvcmRzIjpbImZvbyJdLCJsYWJlbHMiOnsibmFtZSI6ImZvby1vcGVyYXRvciJ9LCJtYWludGFpbmVycyI6W3siZW1haWwiOiJvYy1taXJyb3JAb3BlbnNoaWZ0Lm9yZyIsIm5hbWUiOiJvYy1taXJyb3IgZGV2ZWxvcGVycyJ9XSwibWF0dXJpdHkiOiJiZXRhIiwicHJvdmlkZXIiOnsibmFtZSI6IkZvbyJ9LCJyZWxhdGVkSW1hZ2VzIjpbeyJpbWFnZSI6InF1YXkuaW8vb2MtbWlycm9yL29jLW1pcnJvci1kZXZAc2hhMjU2OjFjZThjMDE4N2M4ZmU2YjRiZTMyN2RjODQ4YjhiYWYwNjJjZTFiYWE1MDk2YjRmNWQ5NTU4OTNkMTI2ZDViNTgiLCJuYW1lIjoib3BlcmF0b3IifV0sInJlcGxhY2VzIjoiZm9vLnYwLjEuMCIsInNraXBzIjpbImZvby52MC4xLjEiLCJmb28udjAuMS4yIl0sInZlcnNpb24iOiIwLjIuMCJ9fQ==
++relatedImages:
++- image: quay.io/oc-mirror/oc-mirror-dev:foo-bundle-v0.2.0
++  name: ""
++- image: quay.io/oc-mirror/oc-mirror-dev@sha256:1ce8c0187c8fe6b4be327dc848b8baf062ce1baa5096b4f5d955893d126d5b58
++  name: operator
++schema: olm.bundle
++---
++image: quay.io/oc-mirror/oc-mirror-dev:foo-bundle-v0.3.0
++name: foo.v0.3.0
++package: foo
++properties:
++- type: olm.gvk
++  value:
++    group: test.foo
++    kind: Foo
++    version: v1
++- type: olm.gvk
++  value:
++    group: test.foo
++    kind: Foo
++    version: v2
++- type: olm.gvk.required
++  value:
++    group: test.bar
++    kind: Bar
++    version: v1alpha1
++- type: olm.package
++  value:
++    packageName: foo
++    version: 0.3.0
++- type: olm.package.required
++  value:
++    packageName: bar
++    versionRange: <0.3.0
++- type: olm.bundle.object
++  value:
++    data: eyJhcGlWZXJzaW9uIjoiYXBpZXh0ZW5zaW9ucy5rOHMuaW8vdjEiLCJraW5kIjoiQ3VzdG9tUmVzb3VyY2VEZWZpbml0aW9uIiwibWV0YWRhdGEiOnsibmFtZSI6ImZvb3MudGVzdC5mb28ifSwic3BlYyI6eyJncm91cCI6InRlc3QuZm9vIiwibmFtZXMiOnsia2luZCI6IkZvbyIsInBsdXJhbCI6ImZvb3MifSwic2NvcGUiOiJOYW1lc3BhY2VkIiwidmVyc2lvbnMiOlt7Im5hbWUiOiJ2MSIsInNjaGVtYSI6eyJvcGVuQVBJVjNTY2hlbWEiOnsidHlwZSI6Im9iamVjdCIsIngta3ViZXJuZXRlcy1wcmVzZXJ2ZS11bmtub3duLWZpZWxkcyI6dHJ1ZX19LCJzZXJ2ZWQiOnRydWUsInN0b3JhZ2UiOmZhbHNlfSx7Im5hbWUiOiJ2MiIsInNjaGVtYSI6eyJvcGVuQVBJVjNTY2hlbWEiOnsidHlwZSI6Im9iamVjdCIsIngta3ViZXJuZXRlcy1wcmVzZXJ2ZS11bmtub3duLWZpZWxkcyI6dHJ1ZX19LCJzZXJ2ZWQiOnRydWUsInN0b3JhZ2UiOnRydWV9XX19
++- type: olm.bundle.object
++  value:
++    data: eyJhcGlWZXJzaW9uIjoib3BlcmF0b3JzLmNvcmVvcy5jb20vdjFhbHBoYTEiLCJraW5kIjoiQ2x1c3RlclNlcnZpY2VWZXJzaW9uIiwibWV0YWRhdGEiOnsiYW5ub3RhdGlvbnMiOnsiY2FwYWJpbGl0aWVzIjoiQmFzaWNJbnN0YWxsIiwiY2VydGlmaWVkIjoiZmFsc2UiLCJjb250YWluZXJJbWFnZSI6InF1YXkuaW8vb2MtbWlycm9yL29jLW1pcnJvci1kZXZAc2hhMjU2OjFjZThjMDE4N2M4ZmU2YjRiZTMyN2RjODQ4YjhiYWYwNjJjZTFiYWE1MDk2YjRmNWQ5NTU4OTNkMTI2ZDViNTgiLCJkZXNjcmlwdGlvbiI6IlRoZSBGb28gT3BlcmF0b3IgZG9lcyBGb28gdGhpbmdzLiIsIm9sbS5za2lwUmFuZ2UiOiJcdTAwM2MwLjMuMCIsInJlcG9zaXRvcnkiOiJodHRwczovL2dpdGh1Yi5jb20vb3BlbnNoaWZ0L29jLW1pcnJvciJ9LCJuYW1lIjoiZm9vLnYwLjMuMCJ9LCJzcGVjIjp7ImN1c3RvbXJlc291cmNlZGVmaW5pdGlvbnMiOnsib3duZWQiOlt7Imdyb3VwIjoidGVzdC5mb28iLCJraW5kIjoiRm9vIiwibmFtZSI6ImZvb3MudGVzdC5mb28iLCJ2ZXJzaW9uIjoidjEifSx7Imdyb3VwIjoidGVzdC5mb28iLCJraW5kIjoiRm9vIiwibmFtZSI6ImZvb3MudGVzdC5mb28iLCJ2ZXJzaW9uIjoidjIifV19LCJkZXNjcmlwdGlvbiI6IlRoZSBGb28gT3BlcmF0b3IgZG9lcyBGb28gdGhpbmdzLiIsImRpc3BsYXlOYW1lIjoiRm9vIE9wZXJhdG9yIiwiaWNvbiI6W3siYmFzZTY0ZGF0YSI6IlBEOTRiV3dnZG1WeWMybHZiajBpTVM0d0lpQmxibU52WkdsdVp6MGlkWFJtTFRnaVB6NEtQSE4yWnlCMlpYSnphVzl1UFNJeExqRWlJR2xrUFNKcFkyOXVJaUI0Yld4dWN6MGlhSFIwY0RvdkwzZDNkeTUzTXk1dmNtY3ZNakF3TUM5emRtY2lJSGh0Ykc1ek9uaHNhVzVyUFNKb2RIUndPaTh2ZDNkM0xuY3pMbTl5Wnk4eE9UazVMM2hzYVc1cklpQjRQU0l3Y0hnaUlIazlJakJ3ZUNJS0lDQWdJSFpwWlhkQ2IzZzlJakFnTUNBeE1qZ3dJREV5T0RBaUlITjBlV3hsUFNKbGJtRmliR1V0WW1GamEyZHliM1Z1WkRwdVpYY2dNQ0F3SURFeU9EQWdNVEk0TURzaUlIaHRiRHB6Y0dGalpUMGljSEpsYzJWeWRtVWlQZ284YzNSNWJHVWdkSGx3WlQwaWRHVjRkQzlqYzNNaVBnb2dJQzV6Y1hWcGNtTnNaU0I3SUdacGJHdzZJQ00zUWpnM09UUTdJSFJ5WVc1elptOXliVG9nZEhKaGJuTnNZWFJsS0RWd2VDd2dNWEI0S1RzZ2ZRb2dJQzV1WVcxbElIc2dabTl1ZERvZ1ltOXNaQ0EwTURCd2VDQnpZVzV6SUhObGNtbG1PeUJtYVd4c09pQnlaV1E3SUhSeVlXNXpabTl5YlRvZ2RISmhibk5zWVhSbEtERXpNSEI0TENBMU1EQndlQ2tnY205MFlYUmxLREl3WkdWbktUc2dmUW84TDNOMGVXeGxQZ284Wno0S0lDQThjR0YwYUNCamJHRnpjejBpYzNGMWFYSmpiR1VpSUdROUlrMGdNQ3dnTlRBd0NpQWdJQ0FnSUNBZ0lDQWdJQ0FnSUNBZ0lDQWdJQ0FnSUNBZ0lDQkRJREFzSURVZ05Td2dNQ0ExTURBc0lEQUtJQ0FnSUNBZ0lDQWdJQ0FnSUNBZ0lDQWdJQ0FnSUNBZ0lDQWdJRk1nTVRBd01Dd2dOU0F4TURBd0xDQTFNREFLSUNBZ0lDQWdJQ0FnSUNBZ0lDQWdJQ0FnSUNBZ0lDQWdJQ0FnSUNBZ01UQXdNQ3dnTVRBd01DQTFNREFzSURFd01EQUtJQ0FnSUNBZ0lDQWdJQ0FnSUNBZ0lDQWdJQ0FnSUNBZ0lDQWdJQ0FnTUN3Z01UQXdNQ0F3TENBMU1EQWlMejRLSUNBOGRHVjRkQ0JqYkdGemN6MGlibUZ0WlNJK1ptOXZQQzkwWlhoMFBnbzhMMmMrQ2p3dmMzWm5QZ289IiwibWVkaWF0eXBlIjoiaW1hZ2Uvc3ZnK3htbCJ9XSwiaW5zdGFsbCI6eyJzcGVjIjp7ImRlcGxveW1lbnRzIjpbeyJuYW1lIjoiZm9vLW9wZXJhdG9yIiwic3BlYyI6eyJyZXBsaWNhcyI6MSwic2VsZWN0b3IiOnsibWF0Y2hMYWJlbHMiOnsiYXBwIjoiZm9vLW9wZXJhdG9yIn19LCJ0ZW1wbGF0ZSI6eyJtZXRhZGF0YSI6eyJsYWJlbHMiOnsiYXBwIjoiZm9vLW9wZXJhdG9yIiwidmVyc2lvbiI6InYwLjMuMCJ9LCJuYW1lIjoiZm9vLW9wZXJhdG9yIn0sInNwZWMiOnsiY29udGFpbmVycyI6W3siY29tbWFuZCI6WyIvcnVuLnNoIl0sImltYWdlIjoicXVheS5pby9vYy1taXJyb3Ivb2MtbWlycm9yLWRldkBzaGEyNTY6MWNlOGMwMTg3YzhmZTZiNGJlMzI3ZGM4NDhiOGJhZjA2MmNlMWJhYTUwOTZiNGY1ZDk1NTg5M2QxMjZkNWI1OCIsImltYWdlUHVsbFBvbGljeSI6IkFsd2F5cyIsIm5hbWUiOiJmb28ifV19fX19XX0sInN0cmF0ZWd5IjoiZGVwbG95bWVudCJ9LCJpbnN0YWxsTW9kZXMiOlt7InN1cHBvcnRlZCI6dHJ1ZSwidHlwZSI6Ik93bk5hbWVzcGFjZSJ9LHsic3VwcG9ydGVkIjp0cnVlLCJ0eXBlIjoiU2luZ2xlTmFtZXNwYWNlIn0seyJzdXBwb3J0ZWQiOmZhbHNlLCJ0eXBlIjoiTXVsdGlOYW1lc3BhY2UifSx7InN1cHBvcnRlZCI6dHJ1ZSwidHlwZSI6IkFsbE5hbWVzcGFjZXMifV0sImtleXdvcmRzIjpbImZvbyJdLCJsYWJlbHMiOnsibmFtZSI6ImZvby1vcGVyYXRvciJ9LCJtYWludGFpbmVycyI6W3siZW1haWwiOiJvYy1taXJyb3JAb3BlbnNoaWZ0Lm9yZyIsIm5hbWUiOiJvYy1taXJyb3IgZGV2ZWxvcGVycyJ9XSwibWF0dXJpdHkiOiJiZXRhIiwicHJvdmlkZXIiOnsibmFtZSI6IkZvbyJ9LCJyZWxhdGVkSW1hZ2VzIjpbeyJpbWFnZSI6InF1YXkuaW8vb2MtbWlycm9yL29jLW1pcnJvci1kZXZAc2hhMjU2OjFjZThjMDE4N2M4ZmU2YjRiZTMyN2RjODQ4YjhiYWYwNjJjZTFiYWE1MDk2YjRmNWQ5NTU4OTNkMTI2ZDViNTgiLCJuYW1lIjoib3BlcmF0b3IifV0sInJlcGxhY2VzIjoiZm9vLnYwLjIuMCIsInZlcnNpb24iOiIwLjMuMCJ9fQ==
++relatedImages:
++- image: quay.io/oc-mirror/oc-mirror-dev:foo-bundle-v0.3.0
++  name: ""
++- image: quay.io/oc-mirror/oc-mirror-dev@sha256:1ce8c0187c8fe6b4be327dc848b8baf062ce1baa5096b4f5d955893d126d5b58
++  name: operator
++schema: olm.bundle
++---
++image: quay.io/oc-mirror/oc-mirror-dev:foo-bundle-v0.3.1
++name: foo.v0.3.1
++package: foo
++properties:
++- type: olm.gvk
++  value:
++    group: test.foo
++    kind: Foo
++    version: v1
++- type: olm.gvk
++  value:
++    group: test.foo
++    kind: Foo
++    version: v2
++- type: olm.gvk.required
++  value:
++    group: test.bar
++    kind: Bar
++    version: v1alpha1
++- type: olm.package
++  value:
++    packageName: foo
++    version: 0.3.1
++- type: olm.package.required
++  value:
++    packageName: bar
++    versionRange: <0.2.0
++- type: olm.bundle.object
++  value:
++    data: eyJhcGlWZXJzaW9uIjoiYXBpZXh0ZW5zaW9ucy5rOHMuaW8vdjEiLCJraW5kIjoiQ3VzdG9tUmVzb3VyY2VEZWZpbml0aW9uIiwibWV0YWRhdGEiOnsibmFtZSI6ImZvb3MudGVzdC5mb28ifSwic3BlYyI6eyJncm91cCI6InRlc3QuZm9vIiwibmFtZXMiOnsia2luZCI6IkZvbyIsInBsdXJhbCI6ImZvb3MifSwic2NvcGUiOiJOYW1lc3BhY2VkIiwidmVyc2lvbnMiOlt7Im5hbWUiOiJ2MSIsInNjaGVtYSI6eyJvcGVuQVBJVjNTY2hlbWEiOnsidHlwZSI6Im9iamVjdCIsIngta3ViZXJuZXRlcy1wcmVzZXJ2ZS11bmtub3duLWZpZWxkcyI6dHJ1ZX19LCJzZXJ2ZWQiOnRydWUsInN0b3JhZ2UiOmZhbHNlfSx7Im5hbWUiOiJ2MiIsInNjaGVtYSI6eyJvcGVuQVBJVjNTY2hlbWEiOnsidHlwZSI6Im9iamVjdCIsIngta3ViZXJuZXRlcy1wcmVzZXJ2ZS11bmtub3duLWZpZWxkcyI6dHJ1ZX19LCJzZXJ2ZWQiOnRydWUsInN0b3JhZ2UiOnRydWV9XX19
++- type: olm.bundle.object
++  value:
++    data: eyJhcGlWZXJzaW9uIjoib3BlcmF0b3JzLmNvcmVvcy5jb20vdjFhbHBoYTEiLCJraW5kIjoiQ2x1c3RlclNlcnZpY2VWZXJzaW9uIiwibWV0YWRhdGEiOnsiYW5ub3RhdGlvbnMiOnsiY2FwYWJpbGl0aWVzIjoiQmFzaWNJbnN0YWxsIiwiY2VydGlmaWVkIjoiZmFsc2UiLCJjb250YWluZXJJbWFnZSI6InF1YXkuaW8vb2MtbWlycm9yL29jLW1pcnJvci1kZXZAc2hhMjU2OjFjZThjMDE4N2M4ZmU2YjRiZTMyN2RjODQ4YjhiYWYwNjJjZTFiYWE1MDk2YjRmNWQ5NTU4OTNkMTI2ZDViNTgiLCJkZXNjcmlwdGlvbiI6IlRoZSBGb28gT3BlcmF0b3IgZG9lcyBGb28gdGhpbmdzLiIsIm9sbS5za2lwUmFuZ2UiOiJcdTAwM2MwLjMuMSIsInJlcG9zaXRvcnkiOiJodHRwczovL2dpdGh1Yi5jb20vb3BlbnNoaWZ0L29jLW1pcnJvciJ9LCJuYW1lIjoiZm9vLnYwLjMuMSJ9LCJzcGVjIjp7ImN1c3RvbXJlc291cmNlZGVmaW5pdGlvbnMiOnsib3duZWQiOlt7Imdyb3VwIjoidGVzdC5mb28iLCJraW5kIjoiRm9vIiwibmFtZSI6ImZvb3MudGVzdC5mb28iLCJ2ZXJzaW9uIjoidjEifSx7Imdyb3VwIjoidGVzdC5mb28iLCJraW5kIjoiRm9vIiwibmFtZSI6ImZvb3MudGVzdC5mb28iLCJ2ZXJzaW9uIjoidjIifV19LCJkZXNjcmlwdGlvbiI6IlRoZSBGb28gT3BlcmF0b3IgZG9lcyBGb28gdGhpbmdzLiIsImRpc3BsYXlOYW1lIjoiRm9vIE9wZXJhdG9yIiwiaWNvbiI6W3siYmFzZTY0ZGF0YSI6IlBEOTRiV3dnZG1WeWMybHZiajBpTVM0d0lpQmxibU52WkdsdVp6MGlkWFJtTFRnaVB6NEtQSE4yWnlCMlpYSnphVzl1UFNJeExqRWlJR2xrUFNKcFkyOXVJaUI0Yld4dWN6MGlhSFIwY0RvdkwzZDNkeTUzTXk1dmNtY3ZNakF3TUM5emRtY2lJSGh0Ykc1ek9uaHNhVzVyUFNKb2RIUndPaTh2ZDNkM0xuY3pMbTl5Wnk4eE9UazVMM2hzYVc1cklpQjRQU0l3Y0hnaUlIazlJakJ3ZUNJS0lDQWdJSFpwWlhkQ2IzZzlJakFnTUNBeE1qZ3dJREV5T0RBaUlITjBlV3hsUFNKbGJtRmliR1V0WW1GamEyZHliM1Z1WkRwdVpYY2dNQ0F3SURFeU9EQWdNVEk0TURzaUlIaHRiRHB6Y0dGalpUMGljSEpsYzJWeWRtVWlQZ284YzNSNWJHVWdkSGx3WlQwaWRHVjRkQzlqYzNNaVBnb2dJQzV6Y1hWcGNtTnNaU0I3SUdacGJHdzZJQ00zUWpnM09UUTdJSFJ5WVc1elptOXliVG9nZEhKaGJuTnNZWFJsS0RWd2VDd2dNWEI0S1RzZ2ZRb2dJQzV1WVcxbElIc2dabTl1ZERvZ1ltOXNaQ0EwTURCd2VDQnpZVzV6SUhObGNtbG1PeUJtYVd4c09pQnlaV1E3SUhSeVlXNXpabTl5YlRvZ2RISmhibk5zWVhSbEtERXpNSEI0TENBMU1EQndlQ2tnY205MFlYUmxLREl3WkdWbktUc2dmUW84TDNOMGVXeGxQZ284Wno0S0lDQThjR0YwYUNCamJHRnpjejBpYzNGMWFYSmpiR1VpSUdROUlrMGdNQ3dnTlRBd0NpQWdJQ0FnSUNBZ0lDQWdJQ0FnSUNBZ0lDQWdJQ0FnSUNBZ0lDQkRJREFzSURVZ05Td2dNQ0ExTURBc0lEQUtJQ0FnSUNBZ0lDQWdJQ0FnSUNBZ0lDQWdJQ0FnSUNBZ0lDQWdJRk1nTVRBd01Dd2dOU0F4TURBd0xDQTFNREFLSUNBZ0lDQWdJQ0FnSUNBZ0lDQWdJQ0FnSUNBZ0lDQWdJQ0FnSUNBZ01UQXdNQ3dnTVRBd01DQTFNREFzSURFd01EQUtJQ0FnSUNBZ0lDQWdJQ0FnSUNBZ0lDQWdJQ0FnSUNBZ0lDQWdJQ0FnTUN3Z01UQXdNQ0F3TENBMU1EQWlMejRLSUNBOGRHVjRkQ0JqYkdGemN6MGlibUZ0WlNJK1ptOXZQQzkwWlhoMFBnbzhMMmMrQ2p3dmMzWm5QZ289IiwibWVkaWF0eXBlIjoiaW1hZ2Uvc3ZnK3htbCJ9XSwiaW5zdGFsbCI6eyJzcGVjIjp7ImRlcGxveW1lbnRzIjpbeyJuYW1lIjoiZm9vLW9wZXJhdG9yIiwic3BlYyI6eyJyZXBsaWNhcyI6MSwic2VsZWN0b3IiOnsibWF0Y2hMYWJlbHMiOnsiYXBwIjoiZm9vLW9wZXJhdG9yIn19LCJ0ZW1wbGF0ZSI6eyJtZXRhZGF0YSI6eyJsYWJlbHMiOnsiYXBwIjoiZm9vLW9wZXJhdG9yIiwidmVyc2lvbiI6InYwLjMuMSJ9LCJuYW1lIjoiZm9vLW9wZXJhdG9yIn0sInNwZWMiOnsiY29udGFpbmVycyI6W3siY29tbWFuZCI6WyIvcnVuLnNoIl0sImltYWdlIjoicXVheS5pby9vYy1taXJyb3Ivb2MtbWlycm9yLWRldkBzaGEyNTY6MWNlOGMwMTg3YzhmZTZiNGJlMzI3ZGM4NDhiOGJhZjA2MmNlMWJhYTUwOTZiNGY1ZDk1NTg5M2QxMjZkNWI1OCIsImltYWdlUHVsbFBvbGljeSI6IkFsd2F5cyIsIm5hbWUiOiJmb28ifV19fX19XX0sInN0cmF0ZWd5IjoiZGVwbG95bWVudCJ9LCJpbnN0YWxsTW9kZXMiOlt7InN1cHBvcnRlZCI6dHJ1ZSwidHlwZSI6Ik93bk5hbWVzcGFjZSJ9LHsic3VwcG9ydGVkIjp0cnVlLCJ0eXBlIjoiU2luZ2xlTmFtZXNwYWNlIn0seyJzdXBwb3J0ZWQiOmZhbHNlLCJ0eXBlIjoiTXVsdGlOYW1lc3BhY2UifSx7InN1cHBvcnRlZCI6dHJ1ZSwidHlwZSI6IkFsbE5hbWVzcGFjZXMifV0sImtleXdvcmRzIjpbImZvbyJdLCJsYWJlbHMiOnsibmFtZSI6ImZvby1vcGVyYXRvciJ9LCJtYWludGFpbmVycyI6W3siZW1haWwiOiJvYy1taXJyb3JAb3BlbnNoaWZ0Lm9yZyIsIm5hbWUiOiJvYy1taXJyb3IgZGV2ZWxvcGVycyJ9XSwibWF0dXJpdHkiOiJiZXRhIiwicHJvdmlkZXIiOnsibmFtZSI6IkZvbyJ9LCJyZWxhdGVkSW1hZ2VzIjpbeyJpbWFnZSI6InF1YXkuaW8vb2MtbWlycm9yL29jLW1pcnJvci1kZXZAc2hhMjU2OjFjZThjMDE4N2M4ZmU2YjRiZTMyN2RjODQ4YjhiYWYwNjJjZTFiYWE1MDk2YjRmNWQ5NTU4OTNkMTI2ZDViNTgiLCJuYW1lIjoib3BlcmF0b3IifV0sInJlcGxhY2VzIjoiZm9vLnYwLjIuMCIsInNraXBzIjpbImZvby52MC4zLjAiXSwidmVyc2lvbiI6IjAuMy4xIn19
++relatedImages:
++- image: quay.io/oc-mirror/oc-mirror-dev:foo-bundle-v0.3.1
++  name: ""
++- image: quay.io/oc-mirror/oc-mirror-dev@sha256:1ce8c0187c8fe6b4be327dc848b8baf062ce1baa5096b4f5d955893d126d5b58
++  name: operator
++schema: olm.bundle
++---
++image: quay.io/oc-mirror/oc-mirror-dev:foo-bundle-v0.3.2
++name: foo.v0.3.2
++package: foo
++properties:
++- type: olm.gvk
++  value:
++    group: test.foo
++    kind: Foo
++    version: v1
++- type: olm.gvk
++  value:
++    group: test.foo
++    kind: Foo
++    version: v2
++- type: olm.gvk.required
++  value:
++    group: test.bar
++    kind: Bar
++    version: v1alpha1
++- type: olm.package
++  value:
++    packageName: foo
++    version: 0.3.2
++- type: olm.package.required
++  value:
++    packageName: bar
++    versionRange: <0.3.0
++- type: olm.bundle.object
++  value:
++    data: eyJhcGlWZXJzaW9uIjoiYXBpZXh0ZW5zaW9ucy5rOHMuaW8vdjEiLCJraW5kIjoiQ3VzdG9tUmVzb3VyY2VEZWZpbml0aW9uIiwibWV0YWRhdGEiOnsibmFtZSI6ImZvb3MudGVzdC5mb28ifSwic3BlYyI6eyJncm91cCI6InRlc3QuZm9vIiwibmFtZXMiOnsia2luZCI6IkZvbyIsInBsdXJhbCI6ImZvb3MifSwic2NvcGUiOiJOYW1lc3BhY2VkIiwidmVyc2lvbnMiOlt7Im5hbWUiOiJ2MSIsInNjaGVtYSI6eyJvcGVuQVBJVjNTY2hlbWEiOnsidHlwZSI6Im9iamVjdCIsIngta3ViZXJuZXRlcy1wcmVzZXJ2ZS11bmtub3duLWZpZWxkcyI6dHJ1ZX19LCJzZXJ2ZWQiOnRydWUsInN0b3JhZ2UiOmZhbHNlfSx7Im5hbWUiOiJ2MiIsInNjaGVtYSI6eyJvcGVuQVBJVjNTY2hlbWEiOnsidHlwZSI6Im9iamVjdCIsIngta3ViZXJuZXRlcy1wcmVzZXJ2ZS11bmtub3duLWZpZWxkcyI6dHJ1ZX19LCJzZXJ2ZWQiOnRydWUsInN0b3JhZ2UiOnRydWV9XX19
++- type: olm.bundle.object
++  value:
++    data: eyJhcGlWZXJzaW9uIjoib3BlcmF0b3JzLmNvcmVvcy5jb20vdjFhbHBoYTEiLCJraW5kIjoiQ2x1c3RlclNlcnZpY2VWZXJzaW9uIiwibWV0YWRhdGEiOnsiYW5ub3RhdGlvbnMiOnsiY2FwYWJpbGl0aWVzIjoiQmFzaWNJbnN0YWxsIiwiY2VydGlmaWVkIjoiZmFsc2UiLCJjb250YWluZXJJbWFnZSI6InF1YXkuaW8vb2MtbWlycm9yL29jLW1pcnJvci1kZXZAc2hhMjU2OjFjZThjMDE4N2M4ZmU2YjRiZTMyN2RjODQ4YjhiYWYwNjJjZTFiYWE1MDk2YjRmNWQ5NTU4OTNkMTI2ZDViNTgiLCJkZXNjcmlwdGlvbiI6IlRoZSBGb28gT3BlcmF0b3IgZG9lcyBGb28gdGhpbmdzLiIsIm9sbS5za2lwUmFuZ2UiOiJcdTAwM2MwLjMuMSIsInJlcG9zaXRvcnkiOiJodHRwczovL2dpdGh1Yi5jb20vb3BlbnNoaWZ0L29jLW1pcnJvciJ9LCJuYW1lIjoiZm9vLnYwLjMuMiJ9LCJzcGVjIjp7ImN1c3RvbXJlc291cmNlZGVmaW5pdGlvbnMiOnsib3duZWQiOlt7Imdyb3VwIjoidGVzdC5mb28iLCJraW5kIjoiRm9vIiwibmFtZSI6ImZvb3MudGVzdC5mb28iLCJ2ZXJzaW9uIjoidjEifSx7Imdyb3VwIjoidGVzdC5mb28iLCJraW5kIjoiRm9vIiwibmFtZSI6ImZvb3MudGVzdC5mb28iLCJ2ZXJzaW9uIjoidjIifV19LCJkZXNjcmlwdGlvbiI6IlRoZSBGb28gT3BlcmF0b3IgZG9lcyBGb28gdGhpbmdzLiIsImRpc3BsYXlOYW1lIjoiRm9vIE9wZXJhdG9yIiwiaWNvbiI6W3siYmFzZTY0ZGF0YSI6IlBEOTRiV3dnZG1WeWMybHZiajBpTVM0d0lpQmxibU52WkdsdVp6MGlkWFJtTFRnaVB6NEtQSE4yWnlCMlpYSnphVzl1UFNJeExqRWlJR2xrUFNKcFkyOXVJaUI0Yld4dWN6MGlhSFIwY0RvdkwzZDNkeTUzTXk1dmNtY3ZNakF3TUM5emRtY2lJSGh0Ykc1ek9uaHNhVzVyUFNKb2RIUndPaTh2ZDNkM0xuY3pMbTl5Wnk4eE9UazVMM2hzYVc1cklpQjRQU0l3Y0hnaUlIazlJakJ3ZUNJS0lDQWdJSFpwWlhkQ2IzZzlJakFnTUNBeE1qZ3dJREV5T0RBaUlITjBlV3hsUFNKbGJtRmliR1V0WW1GamEyZHliM1Z1WkRwdVpYY2dNQ0F3SURFeU9EQWdNVEk0TURzaUlIaHRiRHB6Y0dGalpUMGljSEpsYzJWeWRtVWlQZ284YzNSNWJHVWdkSGx3WlQwaWRHVjRkQzlqYzNNaVBnb2dJQzV6Y1hWcGNtTnNaU0I3SUdacGJHdzZJQ00zUWpnM09UUTdJSFJ5WVc1elptOXliVG9nZEhKaGJuTnNZWFJsS0RWd2VDd2dNWEI0S1RzZ2ZRb2dJQzV1WVcxbElIc2dabTl1ZERvZ1ltOXNaQ0EwTURCd2VDQnpZVzV6SUhObGNtbG1PeUJtYVd4c09pQnlaV1E3SUhSeVlXNXpabTl5YlRvZ2RISmhibk5zWVhSbEtERXpNSEI0TENBMU1EQndlQ2tnY205MFlYUmxLREl3WkdWbktUc2dmUW84TDNOMGVXeGxQZ284Wno0S0lDQThjR0YwYUNCamJHRnpjejBpYzNGMWFYSmpiR1VpSUdROUlrMGdNQ3dnTlRBd0NpQWdJQ0FnSUNBZ0lDQWdJQ0FnSUNBZ0lDQWdJQ0FnSUNBZ0lDQkRJREFzSURVZ05Td2dNQ0ExTURBc0lEQUtJQ0FnSUNBZ0lDQWdJQ0FnSUNBZ0lDQWdJQ0FnSUNBZ0lDQWdJRk1nTVRBd01Dd2dOU0F4TURBd0xDQTFNREFLSUNBZ0lDQWdJQ0FnSUNBZ0lDQWdJQ0FnSUNBZ0lDQWdJQ0FnSUNBZ01UQXdNQ3dnTVRBd01DQTFNREFzSURFd01EQUtJQ0FnSUNBZ0lDQWdJQ0FnSUNBZ0lDQWdJQ0FnSUNBZ0lDQWdJQ0FnTUN3Z01UQXdNQ0F3TENBMU1EQWlMejRLSUNBOGRHVjRkQ0JqYkdGemN6MGlibUZ0WlNJK1ptOXZQQzkwWlhoMFBnbzhMMmMrQ2p3dmMzWm5QZ289IiwibWVkaWF0eXBlIjoiaW1hZ2Uvc3ZnK3htbCJ9XSwiaW5zdGFsbCI6eyJzcGVjIjp7ImRlcGxveW1lbnRzIjpbeyJuYW1lIjoiZm9vLW9wZXJhdG9yIiwic3BlYyI6eyJyZXBsaWNhcyI6MSwic2VsZWN0b3IiOnsibWF0Y2hMYWJlbHMiOnsiYXBwIjoiZm9vLW9wZXJhdG9yIn19LCJ0ZW1wbGF0ZSI6eyJtZXRhZGF0YSI6eyJsYWJlbHMiOnsiYXBwIjoiZm9vLW9wZXJhdG9yIiwidmVyc2lvbiI6InYwLjMuMiJ9LCJuYW1lIjoiZm9vLW9wZXJhdG9yIn0sInNwZWMiOnsiY29udGFpbmVycyI6W3siY29tbWFuZCI6WyIvcnVuLnNoIl0sImltYWdlIjoicXVheS5pby9vYy1taXJyb3Ivb2MtbWlycm9yLWRldkBzaGEyNTY6MWNlOGMwMTg3YzhmZTZiNGJlMzI3ZGM4NDhiOGJhZjA2MmNlMWJhYTUwOTZiNGY1ZDk1NTg5M2QxMjZkNWI1OCIsImltYWdlUHVsbFBvbGljeSI6IkFsd2F5cyIsIm5hbWUiOiJmb28ifV19fX19XX0sInN0cmF0ZWd5IjoiZGVwbG95bWVudCJ9LCJpbnN0YWxsTW9kZXMiOlt7InN1cHBvcnRlZCI6dHJ1ZSwidHlwZSI6Ik93bk5hbWVzcGFjZSJ9LHsic3VwcG9ydGVkIjp0cnVlLCJ0eXBlIjoiU2luZ2xlTmFtZXNwYWNlIn0seyJzdXBwb3J0ZWQiOmZhbHNlLCJ0eXBlIjoiTXVsdGlOYW1lc3BhY2UifSx7InN1cHBvcnRlZCI6dHJ1ZSwidHlwZSI6IkFsbE5hbWVzcGFjZXMifV0sImtleXdvcmRzIjpbImZvbyJdLCJsYWJlbHMiOnsibmFtZSI6ImZvby1vcGVyYXRvciJ9LCJtYWludGFpbmVycyI6W3siZW1haWwiOiJvYy1taXJyb3JAb3BlbnNoaWZ0Lm9yZyIsIm5hbWUiOiJvYy1taXJyb3IgZGV2ZWxvcGVycyJ9XSwibWF0dXJpdHkiOiJiZXRhIiwicHJvdmlkZXIiOnsibmFtZSI6IkZvbyJ9LCJyZWxhdGVkSW1hZ2VzIjpbeyJpbWFnZSI6InF1YXkuaW8vb2MtbWlycm9yL29jLW1pcnJvci1kZXZAc2hhMjU2OjFjZThjMDE4N2M4ZmU2YjRiZTMyN2RjODQ4YjhiYWYwNjJjZTFiYWE1MDk2YjRmNWQ5NTU4OTNkMTI2ZDViNTgiLCJuYW1lIjoib3BlcmF0b3IifV0sInJlcGxhY2VzIjoiZm9vLnYwLjIuMCIsInNraXBzIjpbImZvby52MC4zLjAiLCJmb28udjAuMy4xIl0sInZlcnNpb24iOiIwLjMuMiJ9fQ==
++relatedImages:
++- image: quay.io/oc-mirror/oc-mirror-dev:foo-bundle-v0.3.2
++  name: ""
++- image: quay.io/oc-mirror/oc-mirror-dev@sha256:1ce8c0187c8fe6b4be327dc848b8baf062ce1baa5096b4f5d955893d126d5b58
++  name: operator
++schema: olm.bundle
+diff --git a/tests/integration/image-builders/operator/catalogs/test-catalog-diff/foo/channels.yaml b/tests/integration/image-builders/operator/catalogs/test-catalog-diff/foo/channels.yaml
+new file mode 100644
+index 000000000..cc8631d41
+--- /dev/null
++++ b/tests/integration/image-builders/operator/catalogs/test-catalog-diff/foo/channels.yaml
+@@ -0,0 +1,26 @@
++schema: olm.channel
++package: foo
++name: beta
++entries:
++  - name: foo.v0.1.0
++    skipRange: <0.1.0
++  - name: foo.v0.2.0
++    skipRange: <0.2.0
++    skips:
++      - foo.v0.1.1
++      - foo.v0.1.2
++    replaces: foo.v0.1.0
++  - name: foo.v0.3.0
++    skipRange: <0.3.0
++    replaces: foo.v0.2.0
++  - name: foo.v0.3.1
++    skipRange: <0.3.1
++    skips:
++      - foo.v0.3.0
++    replaces: foo.v0.2.0
++  - name: foo.v0.3.2
++    skipRange: <0.3.1
++    skips:
++      - foo.v0.3.0
++      - foo.v0.3.1
++    replaces: foo.v0.2.0
+diff --git a/tests/integration/image-builders/operator/catalogs/test-catalog-diff/foo/operator.yaml b/tests/integration/image-builders/operator/catalogs/test-catalog-diff/foo/operator.yaml
+new file mode 100644
+index 000000000..960d2aa79
+--- /dev/null
++++ b/tests/integration/image-builders/operator/catalogs/test-catalog-diff/foo/operator.yaml
+@@ -0,0 +1,4 @@
++---
++defaultChannel: beta
++name: foo
++schema: olm.package
+diff --git a/tests/integration/image-builders/operator/catalogs/test-catalog-latest/bar/bundles.yaml b/tests/integration/image-builders/operator/catalogs/test-catalog-latest/bar/bundles.yaml
+new file mode 100644
+index 000000000..0833f7405
+--- /dev/null
++++ b/tests/integration/image-builders/operator/catalogs/test-catalog-latest/bar/bundles.yaml
+@@ -0,0 +1,65 @@
++---
++image: quay.io/oc-mirror/oc-mirror-dev:bar-bundle-v0.1.0
++name: bar.v0.1.0
++package: bar
++properties:
++- type: olm.gvk
++  value:
++    group: test.bar
++    kind: Bar
++    version: v1alpha1
++- type: olm.package
++  value:
++    packageName: bar
++    version: 0.1.0
++relatedImages:
++- image: quay.io/oc-mirror/oc-mirror-dev:bar-bundle-v0.1.0
++  name: ""
++- image: quay.io/oc-mirror/oc-mirror-dev@sha256:1ce8c0187c8fe6b4be327dc848b8baf062ce1baa5096b4f5d955893d126d5b58
++  name: operator
++schema: olm.bundle
++---
++image: quay.io/oc-mirror/oc-mirror-dev:bar-bundle-v0.2.0
++name: bar.v0.2.0
++package: bar
++properties:
++- type: olm.gvk
++  value:
++    group: test.bar
++    kind: Bar
++    version: v1alpha1
++- type: olm.package
++  value:
++    packageName: bar
++    version: 0.2.0
++relatedImages:
++- image: quay.io/oc-mirror/oc-mirror-dev:bar-bundle-v0.2.0
++  name: ""
++- image: quay.io/oc-mirror/oc-mirror-dev@sha256:1ce8c0187c8fe6b4be327dc848b8baf062ce1baa5096b4f5d955893d126d5b58
++  name: operator
++schema: olm.bundle
++---
++image: quay.io/oc-mirror/oc-mirror-dev:bar-bundle-v1.0.0
++name: bar.v1.0.0
++package: bar
++properties:
++- type: olm.gvk
++  value:
++    group: test.bar
++    kind: Bar
++    version: v1
++- type: olm.gvk
++  value:
++    group: test.bar
++    kind: Bar
++    version: v1alpha1
++- type: olm.package
++  value:
++    packageName: bar
++    version: 1.0.0
++relatedImages:
++- image: quay.io/oc-mirror/oc-mirror-dev:bar-bundle-v1.0.0
++  name: ""
++- image: quay.io/oc-mirror/oc-mirror-dev@sha256:1ce8c0187c8fe6b4be327dc848b8baf062ce1baa5096b4f5d955893d126d5b58
++  name: operator
++schema: olm.bundle
+diff --git a/tests/integration/image-builders/operator/catalogs/test-catalog-latest/bar/channels.yaml b/tests/integration/image-builders/operator/catalogs/test-catalog-latest/bar/channels.yaml
+new file mode 100644
+index 000000000..2901069f7
+--- /dev/null
++++ b/tests/integration/image-builders/operator/catalogs/test-catalog-latest/bar/channels.yaml
+@@ -0,0 +1,21 @@
++schema: olm.channel
++package: bar
++name: alpha
++entries:
++  - name: bar.v0.1.0
++    skipRange: <0.1.0
++  - name: bar.v0.2.0
++    skipRange: <0.2.0
++    skips:
++      - bar.v0.1.0
++    replaces: bar.v0.1.0
++  - name: bar.v1.0.0
++    skipRange: <1.0.0
++    replaces: bar.v0.2.0
++---
++schema: olm.channel
++package: bar
++name: stable
++entries:
++  - name: bar.v1.0.0
++    skipRange: <1.0.0
+diff --git a/tests/integration/image-builders/operator/catalogs/test-catalog-latest/bar/operator.yaml b/tests/integration/image-builders/operator/catalogs/test-catalog-latest/bar/operator.yaml
+new file mode 100644
+index 000000000..58a1b978c
+--- /dev/null
++++ b/tests/integration/image-builders/operator/catalogs/test-catalog-latest/bar/operator.yaml
+@@ -0,0 +1,4 @@
++---
++defaultChannel: stable
++name: bar
++schema: olm.package
+diff --git a/tests/integration/image-builders/operator/catalogs/test-catalog-latest/baz/bundles.yaml b/tests/integration/image-builders/operator/catalogs/test-catalog-latest/baz/bundles.yaml
+new file mode 100644
+index 000000000..a83b0d5e1
+--- /dev/null
++++ b/tests/integration/image-builders/operator/catalogs/test-catalog-latest/baz/bundles.yaml
+@@ -0,0 +1,78 @@
++---
++image: quay.io/oc-mirror/oc-mirror-dev:baz-bundle-v1.0.0
++name: baz.v1.0.0
++package: baz
++properties:
++- type: olm.gvk
++  value:
++    group: test.baz
++    kind: Baz
++    version: v1
++- type: olm.package
++  value:
++    packageName: baz
++    version: 1.0.0
++- type: olm.bundle.object
++  value:
++    data: eyJhcGlWZXJzaW9uIjoiYXBpZXh0ZW5zaW9ucy5rOHMuaW8vdjEiLCJraW5kIjoiQ3VzdG9tUmVzb3VyY2VEZWZpbml0aW9uIiwibWV0YWRhdGEiOnsibmFtZSI6ImJhenMudGVzdC5iYXoifSwic3BlYyI6eyJncm91cCI6InRlc3QuYmF6IiwibmFtZXMiOnsia2luZCI6IkJheiIsInBsdXJhbCI6ImJhenMifSwic2NvcGUiOiJOYW1lc3BhY2VkIiwidmVyc2lvbnMiOlt7Im5hbWUiOiJ2MSIsInNjaGVtYSI6eyJvcGVuQVBJVjNTY2hlbWEiOnsidHlwZSI6Im9iamVjdCIsIngta3ViZXJuZXRlcy1wcmVzZXJ2ZS11bmtub3duLWZpZWxkcyI6dHJ1ZX19LCJzZXJ2ZWQiOnRydWUsInN0b3JhZ2UiOnRydWV9XX19
++- type: olm.bundle.object
++  value:
++    data: eyJhcGlWZXJzaW9uIjoib3BlcmF0b3JzLmNvcmVvcy5jb20vdjFhbHBoYTEiLCJraW5kIjoiQ2x1c3RlclNlcnZpY2VWZXJzaW9uIiwibWV0YWRhdGEiOnsiYW5ub3RhdGlvbnMiOnsiY2FwYWJpbGl0aWVzIjoiQmFzaWNJbnN0YWxsIiwiY2VydGlmaWVkIjoiZmFsc2UiLCJjb250YWluZXJJbWFnZSI6InF1YXkuaW8vb2MtbWlycm9yL29jLW1pcnJvci1kZXZAc2hhMjU2OjFjZThjMDE4N2M4ZmU2YjRiZTMyN2RjODQ4YjhiYWYwNjJjZTFiYWE1MDk2YjRmNWQ5NTU4OTNkMTI2ZDViNTgiLCJkZXNjcmlwdGlvbiI6IlRoZSBCYXogT3BlcmF0b3IgZG9lcyBCYXogdGhpbmdzLiIsIm9sbS5za2lwUmFuZ2UiOiJcdTAwM2MxLjAuMCIsInJlcG9zaXRvcnkiOiJodHRwczovL2dpdGh1Yi5jb20vb3BlbnNoaWZ0L29jLW1pcnJvciJ9LCJuYW1lIjoiYmF6LnYxLjAuMCJ9LCJzcGVjIjp7ImN1c3RvbXJlc291cmNlZGVmaW5pdGlvbnMiOnsib3duZWQiOlt7Imdyb3VwIjoidGVzdC5iYXoiLCJraW5kIjoiQmF6IiwibmFtZSI6ImJhenMudGVzdC5iYXoiLCJ2ZXJzaW9uIjoidjEifV19LCJkZXNjcmlwdGlvbiI6IlRoZSBCYXogT3BlcmF0b3IgZG9lcyBCYXogdGhpbmdzLiIsImRpc3BsYXlOYW1lIjoiQmF6IE9wZXJhdG9yIiwiaWNvbiI6W3siYmFzZTY0ZGF0YSI6IlBEOTRiV3dnZG1WeWMybHZiajBpTVM0d0lpQmxibU52WkdsdVp6MGlkWFJtTFRnaVB6NEtQSE4yWnlCMlpYSnphVzl1UFNJeExqRWlJR2xrUFNKcFkyOXVJaUI0Yld4dWN6MGlhSFIwY0RvdkwzZDNkeTUzTXk1dmNtY3ZNakF3TUM5emRtY2lJSGh0Ykc1ek9uaHNhVzVyUFNKb2RIUndPaTh2ZDNkM0xuY3pMbTl5Wnk4eE9UazVMM2hzYVc1cklpQjRQU0l3Y0hnaUlIazlJakJ3ZUNJS0lDQWdJSFpwWlhkQ2IzZzlJakFnTUNBeE1qZ3dJREV5T0RBaUlITjBlV3hsUFNKbGJtRmliR1V0WW1GamEyZHliM1Z1WkRwdVpYY2dNQ0F3SURFeU9EQWdNVEk0TURzaUlIaHRiRHB6Y0dGalpUMGljSEpsYzJWeWRtVWlQZ284YzNSNWJHVWdkSGx3WlQwaWRHVjRkQzlqYzNNaVBnb2dJQzV6Y1hWcGNtTnNaU0I3SUdacGJHdzZJQ00zUWpnM09UUTdJSFJ5WVc1elptOXliVG9nZEhKaGJuTnNZWFJsS0RWd2VDd2dNWEI0S1RzZ2ZRb2dJQzV1WVcxbElIc2dabTl1ZERvZ1ltOXNaQ0EwTURCd2VDQnpZVzV6SUhObGNtbG1PeUJtYVd4c09pQnlaV1E3SUhSeVlXNXpabTl5YlRvZ2RISmhibk5zWVhSbEtERXpNSEI0TENBMU1EQndlQ2tnY205MFlYUmxLREl3WkdWbktUc2dmUW84TDNOMGVXeGxQZ284Wno0S0lDQThjR0YwYUNCamJHRnpjejBpYzNGMWFYSmpiR1VpSUdROUlrMGdNQ3dnTlRBd0NpQWdJQ0FnSUNBZ0lDQWdJQ0FnSUNBZ0lDQWdJQ0FnSUNBZ0lDQkRJREFzSURVZ05Td2dNQ0ExTURBc0lEQUtJQ0FnSUNBZ0lDQWdJQ0FnSUNBZ0lDQWdJQ0FnSUNBZ0lDQWdJRk1nTVRBd01Dd2dOU0F4TURBd0xDQTFNREFLSUNBZ0lDQWdJQ0FnSUNBZ0lDQWdJQ0FnSUNBZ0lDQWdJQ0FnSUNBZ01UQXdNQ3dnTVRBd01DQTFNREFzSURFd01EQUtJQ0FnSUNBZ0lDQWdJQ0FnSUNBZ0lDQWdJQ0FnSUNBZ0lDQWdJQ0FnTUN3Z01UQXdNQ0F3TENBMU1EQWlMejRLSUNBOGRHVjRkQ0JqYkdGemN6MGlibUZ0WlNJK1ltRjZQQzkwWlhoMFBnbzhMMmMrQ2p3dmMzWm5QZ289IiwibWVkaWF0eXBlIjoiaW1hZ2Uvc3ZnK3htbCJ9XSwiaW5zdGFsbCI6eyJzcGVjIjp7ImRlcGxveW1lbnRzIjpbeyJuYW1lIjoiYmF6LW9wZXJhdG9yIiwic3BlYyI6eyJyZXBsaWNhcyI6MSwic2VsZWN0b3IiOnsibWF0Y2hMYWJlbHMiOnsiYXBwIjoiYmF6LW9wZXJhdG9yIn19LCJ0ZW1wbGF0ZSI6eyJtZXRhZGF0YSI6eyJsYWJlbHMiOnsiYXBwIjoiYmF6LW9wZXJhdG9yIiwidmVyc2lvbiI6InYxLjAuMCJ9LCJuYW1lIjoiYmF6LW9wZXJhdG9yIn0sInNwZWMiOnsiY29udGFpbmVycyI6W3siY29tbWFuZCI6WyIvcnVuLnNoIl0sImltYWdlIjoicXVheS5pby9vYy1taXJyb3Ivb2MtbWlycm9yLWRldkBzaGEyNTY6MWNlOGMwMTg3YzhmZTZiNGJlMzI3ZGM4NDhiOGJhZjA2MmNlMWJhYTUwOTZiNGY1ZDk1NTg5M2QxMjZkNWI1OCIsImltYWdlUHVsbFBvbGljeSI6IkFsd2F5cyIsIm5hbWUiOiJiYXoifV19fX19XX0sInN0cmF0ZWd5IjoiZGVwbG95bWVudCJ9LCJpbnN0YWxsTW9kZXMiOlt7InN1cHBvcnRlZCI6dHJ1ZSwidHlwZSI6Ik93bk5hbWVzcGFjZSJ9LHsic3VwcG9ydGVkIjp0cnVlLCJ0eXBlIjoiU2luZ2xlTmFtZXNwYWNlIn0seyJzdXBwb3J0ZWQiOmZhbHNlLCJ0eXBlIjoiTXVsdGlOYW1lc3BhY2UifSx7InN1cHBvcnRlZCI6dHJ1ZSwidHlwZSI6IkFsbE5hbWVzcGFjZXMifV0sImtleXdvcmRzIjpbImJheiJdLCJsYWJlbHMiOnsibmFtZSI6ImJhei1vcGVyYXRvciJ9LCJtYWludGFpbmVycyI6W3siZW1haWwiOiJvYy1taXJyb3JAb3BlbnNoaWZ0Lm9yZyIsIm5hbWUiOiJvYy1taXJyb3IgZGV2ZWxvcGVycyJ9XSwibWF0dXJpdHkiOiJiZXRhIiwicHJvdmlkZXIiOnsibmFtZSI6IkJheiJ9LCJyZWxhdGVkSW1hZ2VzIjpbeyJpbWFnZSI6InF1YXkuaW8vb2MtbWlycm9yL29jLW1pcnJvci1kZXZAc2hhMjU2OjFjZThjMDE4N2M4ZmU2YjRiZTMyN2RjODQ4YjhiYWYwNjJjZTFiYWE1MDk2YjRmNWQ5NTU4OTNkMTI2ZDViNTgiLCJuYW1lIjoib3BlcmF0b3IifV0sInZlcnNpb24iOiIxLjAuMCJ9fQ==
++relatedImages:
++- image: quay.io/oc-mirror/oc-mirror-dev:baz-bundle-v1.0.0
++  name: ""
++- image: quay.io/oc-mirror/oc-mirror-dev@sha256:1ce8c0187c8fe6b4be327dc848b8baf062ce1baa5096b4f5d955893d126d5b58
++  name: operator
++schema: olm.bundle
++---
++image: quay.io/oc-mirror/oc-mirror-dev:baz-bundle-v1.0.1
++name: baz.v1.0.1
++package: baz
++properties:
++- type: olm.gvk
++  value:
++    group: test.baz
++    kind: Baz
++    version: v1
++- type: olm.package
++  value:
++    packageName: baz
++    version: 1.0.1
++- type: olm.bundle.object
++  value:
++    data: eyJhcGlWZXJzaW9uIjoiYXBpZXh0ZW5zaW9ucy5rOHMuaW8vdjEiLCJraW5kIjoiQ3VzdG9tUmVzb3VyY2VEZWZpbml0aW9uIiwibWV0YWRhdGEiOnsibmFtZSI6ImJhenMudGVzdC5iYXoifSwic3BlYyI6eyJncm91cCI6InRlc3QuYmF6IiwibmFtZXMiOnsia2luZCI6IkJheiIsInBsdXJhbCI6ImJhenMifSwic2NvcGUiOiJOYW1lc3BhY2VkIiwidmVyc2lvbnMiOlt7Im5hbWUiOiJ2MSIsInNjaGVtYSI6eyJvcGVuQVBJVjNTY2hlbWEiOnsidHlwZSI6Im9iamVjdCIsIngta3ViZXJuZXRlcy1wcmVzZXJ2ZS11bmtub3duLWZpZWxkcyI6dHJ1ZX19LCJzZXJ2ZWQiOnRydWUsInN0b3JhZ2UiOnRydWV9XX19
++- type: olm.bundle.object
++  value:
++    data: eyJhcGlWZXJzaW9uIjoib3BlcmF0b3JzLmNvcmVvcy5jb20vdjFhbHBoYTEiLCJraW5kIjoiQ2x1c3RlclNlcnZpY2VWZXJzaW9uIiwibWV0YWRhdGEiOnsiYW5ub3RhdGlvbnMiOnsiY2FwYWJpbGl0aWVzIjoiQmFzaWNJbnN0YWxsIiwiY2VydGlmaWVkIjoiZmFsc2UiLCJjb250YWluZXJJbWFnZSI6InF1YXkuaW8vb2MtbWlycm9yL29jLW1pcnJvci1kZXZAc2hhMjU2OjFjZThjMDE4N2M4ZmU2YjRiZTMyN2RjODQ4YjhiYWYwNjJjZTFiYWE1MDk2YjRmNWQ5NTU4OTNkMTI2ZDViNTgiLCJkZXNjcmlwdGlvbiI6IlRoZSBCYXogT3BlcmF0b3IgZG9lcyBCYXogdGhpbmdzLiIsIm9sbS5za2lwUmFuZ2UiOiJcdTAwM2MxLjAuMSIsInJlcG9zaXRvcnkiOiJodHRwczovL2dpdGh1Yi5jb20vb3BlbnNoaWZ0L29jLW1pcnJvciJ9LCJuYW1lIjoiYmF6LnYxLjAuMSJ9LCJzcGVjIjp7ImN1c3RvbXJlc291cmNlZGVmaW5pdGlvbnMiOnsib3duZWQiOlt7Imdyb3VwIjoidGVzdC5iYXoiLCJraW5kIjoiQmF6IiwibmFtZSI6ImJhenMudGVzdC5iYXoiLCJ2ZXJzaW9uIjoidjEifV19LCJkZXNjcmlwdGlvbiI6IlRoZSBCYXogT3BlcmF0b3IgZG9lcyBCYXogdGhpbmdzLiIsImRpc3BsYXlOYW1lIjoiQmF6IE9wZXJhdG9yIiwiaWNvbiI6W3siYmFzZTY0ZGF0YSI6IlBEOTRiV3dnZG1WeWMybHZiajBpTVM0d0lpQmxibU52WkdsdVp6MGlkWFJtTFRnaVB6NEtQSE4yWnlCMlpYSnphVzl1UFNJeExqRWlJR2xrUFNKcFkyOXVJaUI0Yld4dWN6MGlhSFIwY0RvdkwzZDNkeTUzTXk1dmNtY3ZNakF3TUM5emRtY2lJSGh0Ykc1ek9uaHNhVzVyUFNKb2RIUndPaTh2ZDNkM0xuY3pMbTl5Wnk4eE9UazVMM2hzYVc1cklpQjRQU0l3Y0hnaUlIazlJakJ3ZUNJS0lDQWdJSFpwWlhkQ2IzZzlJakFnTUNBeE1qZ3dJREV5T0RBaUlITjBlV3hsUFNKbGJtRmliR1V0WW1GamEyZHliM1Z1WkRwdVpYY2dNQ0F3SURFeU9EQWdNVEk0TURzaUlIaHRiRHB6Y0dGalpUMGljSEpsYzJWeWRtVWlQZ284YzNSNWJHVWdkSGx3WlQwaWRHVjRkQzlqYzNNaVBnb2dJQzV6Y1hWcGNtTnNaU0I3SUdacGJHdzZJQ00zUWpnM09UUTdJSFJ5WVc1elptOXliVG9nZEhKaGJuTnNZWFJsS0RWd2VDd2dNWEI0S1RzZ2ZRb2dJQzV1WVcxbElIc2dabTl1ZERvZ1ltOXNaQ0EwTURCd2VDQnpZVzV6SUhObGNtbG1PeUJtYVd4c09pQnlaV1E3SUhSeVlXNXpabTl5YlRvZ2RISmhibk5zWVhSbEtERXpNSEI0TENBMU1EQndlQ2tnY205MFlYUmxLREl3WkdWbktUc2dmUW84TDNOMGVXeGxQZ284Wno0S0lDQThjR0YwYUNCamJHRnpjejBpYzNGMWFYSmpiR1VpSUdROUlrMGdNQ3dnTlRBd0NpQWdJQ0FnSUNBZ0lDQWdJQ0FnSUNBZ0lDQWdJQ0FnSUNBZ0lDQkRJREFzSURVZ05Td2dNQ0ExTURBc0lEQUtJQ0FnSUNBZ0lDQWdJQ0FnSUNBZ0lDQWdJQ0FnSUNBZ0lDQWdJRk1nTVRBd01Dd2dOU0F4TURBd0xDQTFNREFLSUNBZ0lDQWdJQ0FnSUNBZ0lDQWdJQ0FnSUNBZ0lDQWdJQ0FnSUNBZ01UQXdNQ3dnTVRBd01DQTFNREFzSURFd01EQUtJQ0FnSUNBZ0lDQWdJQ0FnSUNBZ0lDQWdJQ0FnSUNBZ0lDQWdJQ0FnTUN3Z01UQXdNQ0F3TENBMU1EQWlMejRLSUNBOGRHVjRkQ0JqYkdGemN6MGlibUZ0WlNJK1ltRjZQQzkwWlhoMFBnbzhMMmMrQ2p3dmMzWm5QZ289IiwibWVkaWF0eXBlIjoiaW1hZ2Uvc3ZnK3htbCJ9XSwiaW5zdGFsbCI6eyJzcGVjIjp7ImRlcGxveW1lbnRzIjpbeyJuYW1lIjoiYmF6LW9wZXJhdG9yIiwic3BlYyI6eyJyZXBsaWNhcyI6MSwic2VsZWN0b3IiOnsibWF0Y2hMYWJlbHMiOnsiYXBwIjoiYmF6LW9wZXJhdG9yIn19LCJ0ZW1wbGF0ZSI6eyJtZXRhZGF0YSI6eyJsYWJlbHMiOnsiYXBwIjoiYmF6LW9wZXJhdG9yIiwidmVyc2lvbiI6InYxLjAuMSJ9LCJuYW1lIjoiYmF6LW9wZXJhdG9yIn0sInNwZWMiOnsiY29udGFpbmVycyI6W3siY29tbWFuZCI6WyIvcnVuLnNoIl0sImltYWdlIjoicXVheS5pby9vYy1taXJyb3Ivb2MtbWlycm9yLWRldkBzaGEyNTY6MWNlOGMwMTg3YzhmZTZiNGJlMzI3ZGM4NDhiOGJhZjA2MmNlMWJhYTUwOTZiNGY1ZDk1NTg5M2QxMjZkNWI1OCIsImltYWdlUHVsbFBvbGljeSI6IkFsd2F5cyIsIm5hbWUiOiJiYXoifV19fX19XX0sInN0cmF0ZWd5IjoiZGVwbG95bWVudCJ9LCJpbnN0YWxsTW9kZXMiOlt7InN1cHBvcnRlZCI6dHJ1ZSwidHlwZSI6Ik93bk5hbWVzcGFjZSJ9LHsic3VwcG9ydGVkIjp0cnVlLCJ0eXBlIjoiU2luZ2xlTmFtZXNwYWNlIn0seyJzdXBwb3J0ZWQiOmZhbHNlLCJ0eXBlIjoiTXVsdGlOYW1lc3BhY2UifSx7InN1cHBvcnRlZCI6dHJ1ZSwidHlwZSI6IkFsbE5hbWVzcGFjZXMifV0sImtleXdvcmRzIjpbImJheiJdLCJsYWJlbHMiOnsibmFtZSI6ImJhei1vcGVyYXRvciJ9LCJtYWludGFpbmVycyI6W3siZW1haWwiOiJvYy1taXJyb3JAb3BlbnNoaWZ0Lm9yZyIsIm5hbWUiOiJvYy1taXJyb3IgZGV2ZWxvcGVycyJ9XSwibWF0dXJpdHkiOiJiZXRhIiwicHJvdmlkZXIiOnsibmFtZSI6IkJheiJ9LCJyZWxhdGVkSW1hZ2VzIjpbeyJpbWFnZSI6InF1YXkuaW8vb2MtbWlycm9yL29jLW1pcnJvci1kZXZAc2hhMjU2OjFjZThjMDE4N2M4ZmU2YjRiZTMyN2RjODQ4YjhiYWYwNjJjZTFiYWE1MDk2YjRmNWQ5NTU4OTNkMTI2ZDViNTgiLCJuYW1lIjoib3BlcmF0b3IifV0sInNraXBzIjpbImJhei52MS4wLjAiXSwidmVyc2lvbiI6IjEuMC4xIn19
++relatedImages:
++- image: quay.io/oc-mirror/oc-mirror-dev:baz-bundle-v1.0.1
++  name: ""
++- image: quay.io/oc-mirror/oc-mirror-dev@sha256:1ce8c0187c8fe6b4be327dc848b8baf062ce1baa5096b4f5d955893d126d5b58
++  name: operator
++schema: olm.bundle
++---
++image: quay.io/oc-mirror/oc-mirror-dev:baz-bundle-v1.1.0
++name: baz.v1.1.0
++package: baz
++properties:
++- type: olm.gvk
++  value:
++    group: test.baz
++    kind: Baz
++    version: v1
++- type: olm.package
++  value:
++    packageName: baz
++    version: 1.1.0
++- type: olm.bundle.object
++  value:
++    data: eyJhcGlWZXJzaW9uIjoiYXBpZXh0ZW5zaW9ucy5rOHMuaW8vdjEiLCJraW5kIjoiQ3VzdG9tUmVzb3VyY2VEZWZpbml0aW9uIiwibWV0YWRhdGEiOnsibmFtZSI6ImJhenMudGVzdC5iYXoifSwic3BlYyI6eyJncm91cCI6InRlc3QuYmF6IiwibmFtZXMiOnsia2luZCI6IkJheiIsInBsdXJhbCI6ImJhenMifSwic2NvcGUiOiJOYW1lc3BhY2VkIiwidmVyc2lvbnMiOlt7Im5hbWUiOiJ2MSIsInNjaGVtYSI6eyJvcGVuQVBJVjNTY2hlbWEiOnsidHlwZSI6Im9iamVjdCIsIngta3ViZXJuZXRlcy1wcmVzZXJ2ZS11bmtub3duLWZpZWxkcyI6dHJ1ZX19LCJzZXJ2ZWQiOnRydWUsInN0b3JhZ2UiOnRydWV9XX19
++- type: olm.bundle.object
++  value:
++    data: eyJhcGlWZXJzaW9uIjoib3BlcmF0b3JzLmNvcmVvcy5jb20vdjFhbHBoYTEiLCJraW5kIjoiQ2x1c3RlclNlcnZpY2VWZXJzaW9uIiwibWV0YWRhdGEiOnsiYW5ub3RhdGlvbnMiOnsiY2FwYWJpbGl0aWVzIjoiQmFzaWNJbnN0YWxsIiwiY2VydGlmaWVkIjoiZmFsc2UiLCJjb250YWluZXJJbWFnZSI6InF1YXkuaW8vb2MtbWlycm9yL29jLW1pcnJvci1kZXZAc2hhMjU2OjFjZThjMDE4N2M4ZmU2YjRiZTMyN2RjODQ4YjhiYWYwNjJjZTFiYWE1MDk2YjRmNWQ5NTU4OTNkMTI2ZDViNTgiLCJkZXNjcmlwdGlvbiI6IlRoZSBCYXogT3BlcmF0b3IgZG9lcyBCYXogdGhpbmdzLiIsIm9sbS5za2lwUmFuZ2UiOiJcdTAwM2MxLjEuMCIsInJlcG9zaXRvcnkiOiJodHRwczovL2dpdGh1Yi5jb20vb3BlbnNoaWZ0L29jLW1pcnJvciJ9LCJuYW1lIjoiYmF6LnYxLjEuMCJ9LCJzcGVjIjp7ImN1c3RvbXJlc291cmNlZGVmaW5pdGlvbnMiOnsib3duZWQiOlt7Imdyb3VwIjoidGVzdC5iYXoiLCJraW5kIjoiQmF6IiwibmFtZSI6ImJhenMudGVzdC5iYXoiLCJ2ZXJzaW9uIjoidjEifV19LCJkZXNjcmlwdGlvbiI6IlRoZSBCYXogT3BlcmF0b3IgZG9lcyBCYXogdGhpbmdzLiIsImRpc3BsYXlOYW1lIjoiQmF6IE9wZXJhdG9yIiwiaWNvbiI6W3siYmFzZTY0ZGF0YSI6IlBEOTRiV3dnZG1WeWMybHZiajBpTVM0d0lpQmxibU52WkdsdVp6MGlkWFJtTFRnaVB6NEtQSE4yWnlCMlpYSnphVzl1UFNJeExqRWlJR2xrUFNKcFkyOXVJaUI0Yld4dWN6MGlhSFIwY0RvdkwzZDNkeTUzTXk1dmNtY3ZNakF3TUM5emRtY2lJSGh0Ykc1ek9uaHNhVzVyUFNKb2RIUndPaTh2ZDNkM0xuY3pMbTl5Wnk4eE9UazVMM2hzYVc1cklpQjRQU0l3Y0hnaUlIazlJakJ3ZUNJS0lDQWdJSFpwWlhkQ2IzZzlJakFnTUNBeE1qZ3dJREV5T0RBaUlITjBlV3hsUFNKbGJtRmliR1V0WW1GamEyZHliM1Z1WkRwdVpYY2dNQ0F3SURFeU9EQWdNVEk0TURzaUlIaHRiRHB6Y0dGalpUMGljSEpsYzJWeWRtVWlQZ284YzNSNWJHVWdkSGx3WlQwaWRHVjRkQzlqYzNNaVBnb2dJQzV6Y1hWcGNtTnNaU0I3SUdacGJHdzZJQ00zUWpnM09UUTdJSFJ5WVc1elptOXliVG9nZEhKaGJuTnNZWFJsS0RWd2VDd2dNWEI0S1RzZ2ZRb2dJQzV1WVcxbElIc2dabTl1ZERvZ1ltOXNaQ0EwTURCd2VDQnpZVzV6SUhObGNtbG1PeUJtYVd4c09pQnlaV1E3SUhSeVlXNXpabTl5YlRvZ2RISmhibk5zWVhSbEtERXpNSEI0TENBMU1EQndlQ2tnY205MFlYUmxLREl3WkdWbktUc2dmUW84TDNOMGVXeGxQZ284Wno0S0lDQThjR0YwYUNCamJHRnpjejBpYzNGMWFYSmpiR1VpSUdROUlrMGdNQ3dnTlRBd0NpQWdJQ0FnSUNBZ0lDQWdJQ0FnSUNBZ0lDQWdJQ0FnSUNBZ0lDQkRJREFzSURVZ05Td2dNQ0ExTURBc0lEQUtJQ0FnSUNBZ0lDQWdJQ0FnSUNBZ0lDQWdJQ0FnSUNBZ0lDQWdJRk1nTVRBd01Dd2dOU0F4TURBd0xDQTFNREFLSUNBZ0lDQWdJQ0FnSUNBZ0lDQWdJQ0FnSUNBZ0lDQWdJQ0FnSUNBZ01UQXdNQ3dnTVRBd01DQTFNREFzSURFd01EQUtJQ0FnSUNBZ0lDQWdJQ0FnSUNBZ0lDQWdJQ0FnSUNBZ0lDQWdJQ0FnTUN3Z01UQXdNQ0F3TENBMU1EQWlMejRLSUNBOGRHVjRkQ0JqYkdGemN6MGlibUZ0WlNJK1ltRjZQQzkwWlhoMFBnbzhMMmMrQ2p3dmMzWm5QZ289IiwibWVkaWF0eXBlIjoiaW1hZ2Uvc3ZnK3htbCJ9XSwiaW5zdGFsbCI6eyJzcGVjIjp7ImRlcGxveW1lbnRzIjpbeyJuYW1lIjoiYmF6LW9wZXJhdG9yIiwic3BlYyI6eyJyZXBsaWNhcyI6MSwic2VsZWN0b3IiOnsibWF0Y2hMYWJlbHMiOnsiYXBwIjoiYmF6LW9wZXJhdG9yIn19LCJ0ZW1wbGF0ZSI6eyJtZXRhZGF0YSI6eyJsYWJlbHMiOnsiYXBwIjoiYmF6LW9wZXJhdG9yIiwidmVyc2lvbiI6InYxLjEuMCJ9LCJuYW1lIjoiYmF6LW9wZXJhdG9yIn0sInNwZWMiOnsiY29udGFpbmVycyI6W3siY29tbWFuZCI6WyIvcnVuLnNoIl0sImltYWdlIjoicXVheS5pby9vYy1taXJyb3Ivb2MtbWlycm9yLWRldkBzaGEyNTY6MWNlOGMwMTg3YzhmZTZiNGJlMzI3ZGM4NDhiOGJhZjA2MmNlMWJhYTUwOTZiNGY1ZDk1NTg5M2QxMjZkNWI1OCIsImltYWdlUHVsbFBvbGljeSI6IkFsd2F5cyIsIm5hbWUiOiJiYXoifV19fX19XX0sInN0cmF0ZWd5IjoiZGVwbG95bWVudCJ9LCJpbnN0YWxsTW9kZXMiOlt7InN1cHBvcnRlZCI6dHJ1ZSwidHlwZSI6Ik93bk5hbWVzcGFjZSJ9LHsic3VwcG9ydGVkIjp0cnVlLCJ0eXBlIjoiU2luZ2xlTmFtZXNwYWNlIn0seyJzdXBwb3J0ZWQiOmZhbHNlLCJ0eXBlIjoiTXVsdGlOYW1lc3BhY2UifSx7InN1cHBvcnRlZCI6dHJ1ZSwidHlwZSI6IkFsbE5hbWVzcGFjZXMifV0sImtleXdvcmRzIjpbImJheiJdLCJsYWJlbHMiOnsibmFtZSI6ImJhei1vcGVyYXRvciJ9LCJtYWludGFpbmVycyI6W3siZW1haWwiOiJvYy1taXJyb3JAb3BlbnNoaWZ0Lm9yZyIsIm5hbWUiOiJvYy1taXJyb3IgZGV2ZWxvcGVycyJ9XSwibWF0dXJpdHkiOiJiZXRhIiwicHJvdmlkZXIiOnsibmFtZSI6IkJheiJ9LCJyZWxhdGVkSW1hZ2VzIjpbeyJpbWFnZSI6InF1YXkuaW8vb2MtbWlycm9yL29jLW1pcnJvci1kZXZAc2hhMjU2OjFjZThjMDE4N2M4ZmU2YjRiZTMyN2RjODQ4YjhiYWYwNjJjZTFiYWE1MDk2YjRmNWQ5NTU4OTNkMTI2ZDViNTgiLCJuYW1lIjoib3BlcmF0b3IifV0sInJlcGxhY2VzIjoiYmF6LnYxLjAuMSIsInZlcnNpb24iOiIxLjEuMCJ9fQ==
++relatedImages:
++- image: quay.io/oc-mirror/oc-mirror-dev:baz-bundle-v1.1.0
++  name: ""
++- image: quay.io/oc-mirror/oc-mirror-dev@sha256:1ce8c0187c8fe6b4be327dc848b8baf062ce1baa5096b4f5d955893d126d5b58
++  name: operator
++schema: olm.bundle
+diff --git a/tests/integration/image-builders/operator/catalogs/test-catalog-latest/baz/channels.yaml b/tests/integration/image-builders/operator/catalogs/test-catalog-latest/baz/channels.yaml
+new file mode 100644
+index 000000000..269ad0bc6
+--- /dev/null
++++ b/tests/integration/image-builders/operator/catalogs/test-catalog-latest/baz/channels.yaml
+@@ -0,0 +1,13 @@
++schema: olm.channel
++package: baz
++name: stable
++entries:
++  - name: baz.v1.0.0
++    skipRange: <1.0.0
++  - name: baz.v1.0.1
++    skipRange: <1.0.1
++    skips:
++      - baz.v1.0.0
++  - name: baz.v1.1.0
++    skipRange: <1.1.0
++    replaces: baz.v1.0.1
+diff --git a/tests/integration/image-builders/operator/catalogs/test-catalog-latest/baz/operator.yaml b/tests/integration/image-builders/operator/catalogs/test-catalog-latest/baz/operator.yaml
+new file mode 100644
+index 000000000..291227530
+--- /dev/null
++++ b/tests/integration/image-builders/operator/catalogs/test-catalog-latest/baz/operator.yaml
+@@ -0,0 +1,4 @@
++---
++defaultChannel: stable
++name: baz
++schema: olm.package
+diff --git a/tests/integration/image-builders/operator/catalogs/test-catalog-latest/foo/bundles.yaml b/tests/integration/image-builders/operator/catalogs/test-catalog-latest/foo/bundles.yaml
+new file mode 100644
+index 000000000..ffe3cbc42
+--- /dev/null
++++ b/tests/integration/image-builders/operator/catalogs/test-catalog-latest/foo/bundles.yaml
+@@ -0,0 +1,150 @@
++---
++image: quay.io/oc-mirror/oc-mirror-dev:foo-bundle-v0.1.0
++name: foo.v0.1.0
++package: foo
++properties:
++- type: olm.gvk
++  value:
++    group: test.foo
++    kind: Foo
++    version: v1
++- type: olm.gvk.required
++  value:
++    group: test.bar
++    kind: Bar
++    version: v1alpha1
++- type: olm.package
++  value:
++    packageName: foo
++    version: 0.1.0
++- type: olm.package.required
++  value:
++    packageName: bar
++    versionRange: <0.2.0
++- type: olm.bundle.object
++  value:
++    data: eyJhcGlWZXJzaW9uIjoiYXBpZXh0ZW5zaW9ucy5rOHMuaW8vdjEiLCJraW5kIjoiQ3VzdG9tUmVzb3VyY2VEZWZpbml0aW9uIiwibWV0YWRhdGEiOnsibmFtZSI6ImZvb3MudGVzdC5mb28ifSwic3BlYyI6eyJncm91cCI6InRlc3QuZm9vIiwibmFtZXMiOnsia2luZCI6IkZvbyIsInBsdXJhbCI6ImZvb3MifSwic2NvcGUiOiJOYW1lc3BhY2VkIiwidmVyc2lvbnMiOlt7Im5hbWUiOiJ2MSIsInNjaGVtYSI6eyJvcGVuQVBJVjNTY2hlbWEiOnsidHlwZSI6Im9iamVjdCIsIngta3ViZXJuZXRlcy1wcmVzZXJ2ZS11bmtub3duLWZpZWxkcyI6dHJ1ZX19LCJzZXJ2ZWQiOnRydWUsInN0b3JhZ2UiOnRydWV9XX19
++- type: olm.bundle.object
++  value:
++    data: eyJhcGlWZXJzaW9uIjoib3BlcmF0b3JzLmNvcmVvcy5jb20vdjFhbHBoYTEiLCJraW5kIjoiQ2x1c3RlclNlcnZpY2VWZXJzaW9uIiwibWV0YWRhdGEiOnsiYW5ub3RhdGlvbnMiOnsiY2FwYWJpbGl0aWVzIjoiQmFzaWNJbnN0YWxsIiwiY2VydGlmaWVkIjoiZmFsc2UiLCJjb250YWluZXJJbWFnZSI6InF1YXkuaW8vb2MtbWlycm9yL29jLW1pcnJvci1kZXZAc2hhMjU2OjFjZThjMDE4N2M4ZmU2YjRiZTMyN2RjODQ4YjhiYWYwNjJjZTFiYWE1MDk2YjRmNWQ5NTU4OTNkMTI2ZDViNTgiLCJkZXNjcmlwdGlvbiI6IlRoZSBGb28gT3BlcmF0b3IgZG9lcyBGb28gdGhpbmdzLiIsIm9sbS5za2lwUmFuZ2UiOiJcdTAwM2MwLjEuMCIsInJlcG9zaXRvcnkiOiJodHRwczovL2dpdGh1Yi5jb20vb3BlbnNoaWZ0L29jLW1pcnJvciJ9LCJuYW1lIjoiZm9vLnYwLjEuMCJ9LCJzcGVjIjp7ImN1c3RvbXJlc291cmNlZGVmaW5pdGlvbnMiOnsib3duZWQiOlt7Imdyb3VwIjoidGVzdC5mb28iLCJraW5kIjoiRm9vIiwibmFtZSI6ImZvb3MudGVzdC5mb28iLCJ2ZXJzaW9uIjoidjEifV19LCJkZXNjcmlwdGlvbiI6IlRoZSBGb28gT3BlcmF0b3IgZG9lcyBGb28gdGhpbmdzLiIsImRpc3BsYXlOYW1lIjoiRm9vIE9wZXJhdG9yIiwiaWNvbiI6W3siYmFzZTY0ZGF0YSI6IlBEOTRiV3dnZG1WeWMybHZiajBpTVM0d0lpQmxibU52WkdsdVp6MGlkWFJtTFRnaVB6NEtQSE4yWnlCMlpYSnphVzl1UFNJeExqRWlJR2xrUFNKcFkyOXVJaUI0Yld4dWN6MGlhSFIwY0RvdkwzZDNkeTUzTXk1dmNtY3ZNakF3TUM5emRtY2lJSGh0Ykc1ek9uaHNhVzVyUFNKb2RIUndPaTh2ZDNkM0xuY3pMbTl5Wnk4eE9UazVMM2hzYVc1cklpQjRQU0l3Y0hnaUlIazlJakJ3ZUNJS0lDQWdJSFpwWlhkQ2IzZzlJakFnTUNBeE1qZ3dJREV5T0RBaUlITjBlV3hsUFNKbGJtRmliR1V0WW1GamEyZHliM1Z1WkRwdVpYY2dNQ0F3SURFeU9EQWdNVEk0TURzaUlIaHRiRHB6Y0dGalpUMGljSEpsYzJWeWRtVWlQZ284YzNSNWJHVWdkSGx3WlQwaWRHVjRkQzlqYzNNaVBnb2dJQzV6Y1hWcGNtTnNaU0I3SUdacGJHdzZJQ00zUWpnM09UUTdJSFJ5WVc1elptOXliVG9nZEhKaGJuTnNZWFJsS0RWd2VDd2dNWEI0S1RzZ2ZRb2dJQzV1WVcxbElIc2dabTl1ZERvZ1ltOXNaQ0EwTURCd2VDQnpZVzV6SUhObGNtbG1PeUJtYVd4c09pQnlaV1E3SUhSeVlXNXpabTl5YlRvZ2RISmhibk5zWVhSbEtERXpNSEI0TENBMU1EQndlQ2tnY205MFlYUmxLREl3WkdWbktUc2dmUW84TDNOMGVXeGxQZ284Wno0S0lDQThjR0YwYUNCamJHRnpjejBpYzNGMWFYSmpiR1VpSUdROUlrMGdNQ3dnTlRBd0NpQWdJQ0FnSUNBZ0lDQWdJQ0FnSUNBZ0lDQWdJQ0FnSUNBZ0lDQkRJREFzSURVZ05Td2dNQ0ExTURBc0lEQUtJQ0FnSUNBZ0lDQWdJQ0FnSUNBZ0lDQWdJQ0FnSUNBZ0lDQWdJRk1nTVRBd01Dd2dOU0F4TURBd0xDQTFNREFLSUNBZ0lDQWdJQ0FnSUNBZ0lDQWdJQ0FnSUNBZ0lDQWdJQ0FnSUNBZ01UQXdNQ3dnTVRBd01DQTFNREFzSURFd01EQUtJQ0FnSUNBZ0lDQWdJQ0FnSUNBZ0lDQWdJQ0FnSUNBZ0lDQWdJQ0FnTUN3Z01UQXdNQ0F3TENBMU1EQWlMejRLSUNBOGRHVjRkQ0JqYkdGemN6MGlibUZ0WlNJK1ptOXZQQzkwWlhoMFBnbzhMMmMrQ2p3dmMzWm5QZ289IiwibWVkaWF0eXBlIjoiaW1hZ2Uvc3ZnK3htbCJ9XSwiaW5zdGFsbCI6eyJzcGVjIjp7ImRlcGxveW1lbnRzIjpbeyJuYW1lIjoiZm9vLW9wZXJhdG9yIiwic3BlYyI6eyJyZXBsaWNhcyI6MSwic2VsZWN0b3IiOnsibWF0Y2hMYWJlbHMiOnsiYXBwIjoiZm9vLW9wZXJhdG9yIn19LCJ0ZW1wbGF0ZSI6eyJtZXRhZGF0YSI6eyJsYWJlbHMiOnsiYXBwIjoiZm9vLW9wZXJhdG9yIiwidmVyc2lvbiI6InYwLjEuMCJ9LCJuYW1lIjoiZm9vLW9wZXJhdG9yIn0sInNwZWMiOnsiY29udGFpbmVycyI6W3siY29tbWFuZCI6WyIvcnVuLnNoIl0sImltYWdlIjoicXVheS5pby9vYy1taXJyb3Ivb2MtbWlycm9yLWRldkBzaGEyNTY6MWNlOGMwMTg3YzhmZTZiNGJlMzI3ZGM4NDhiOGJhZjA2MmNlMWJhYTUwOTZiNGY1ZDk1NTg5M2QxMjZkNWI1OCIsImltYWdlUHVsbFBvbGljeSI6IkFsd2F5cyIsIm5hbWUiOiJmb28ifV19fX19XX0sInN0cmF0ZWd5IjoiZGVwbG95bWVudCJ9LCJpbnN0YWxsTW9kZXMiOlt7InN1cHBvcnRlZCI6dHJ1ZSwidHlwZSI6Ik93bk5hbWVzcGFjZSJ9LHsic3VwcG9ydGVkIjp0cnVlLCJ0eXBlIjoiU2luZ2xlTmFtZXNwYWNlIn0seyJzdXBwb3J0ZWQiOmZhbHNlLCJ0eXBlIjoiTXVsdGlOYW1lc3BhY2UifSx7InN1cHBvcnRlZCI6dHJ1ZSwidHlwZSI6IkFsbE5hbWVzcGFjZXMifV0sImtleXdvcmRzIjpbImZvbyJdLCJsYWJlbHMiOnsibmFtZSI6ImZvby1vcGVyYXRvciJ9LCJtYWludGFpbmVycyI6W3siZW1haWwiOiJvYy1taXJyb3JAb3BlbnNoaWZ0Lm9yZyIsIm5hbWUiOiJvYy1taXJyb3IgZGV2ZWxvcGVycyJ9XSwibWF0dXJpdHkiOiJiZXRhIiwicHJvdmlkZXIiOnsibmFtZSI6IkZvbyJ9LCJyZWxhdGVkSW1hZ2VzIjpbeyJpbWFnZSI6InF1YXkuaW8vb2MtbWlycm9yL29jLW1pcnJvci1kZXZAc2hhMjU2OjFjZThjMDE4N2M4ZmU2YjRiZTMyN2RjODQ4YjhiYWYwNjJjZTFiYWE1MDk2YjRmNWQ5NTU4OTNkMTI2ZDViNTgiLCJuYW1lIjoib3BlcmF0b3IifV0sInZlcnNpb24iOiIwLjEuMCJ9fQ==
++relatedImages:
++- image: quay.io/oc-mirror/oc-mirror-dev:foo-bundle-v0.1.0
++  name: ""
++- image: quay.io/oc-mirror/oc-mirror-dev@sha256:1ce8c0187c8fe6b4be327dc848b8baf062ce1baa5096b4f5d955893d126d5b58
++  name: operator
++schema: olm.bundle
++---
++image: quay.io/oc-mirror/oc-mirror-dev:foo-bundle-v0.2.0
++name: foo.v0.2.0
++package: foo
++properties:
++- type: olm.gvk
++  value:
++    group: test.foo
++    kind: Foo
++    version: v1
++- type: olm.gvk.required
++  value:
++    group: test.bar
++    kind: Bar
++    version: v1alpha1
++- type: olm.package
++  value:
++    packageName: foo
++    version: 0.2.0
++- type: olm.package.required
++  value:
++    packageName: bar
++    versionRange: <0.2.0
++- type: olm.bundle.object
++  value:
++    data: eyJhcGlWZXJzaW9uIjoiYXBpZXh0ZW5zaW9ucy5rOHMuaW8vdjEiLCJraW5kIjoiQ3VzdG9tUmVzb3VyY2VEZWZpbml0aW9uIiwibWV0YWRhdGEiOnsibmFtZSI6ImZvb3MudGVzdC5mb28ifSwic3BlYyI6eyJncm91cCI6InRlc3QuZm9vIiwibmFtZXMiOnsia2luZCI6IkZvbyIsInBsdXJhbCI6ImZvb3MifSwic2NvcGUiOiJOYW1lc3BhY2VkIiwidmVyc2lvbnMiOlt7Im5hbWUiOiJ2MSIsInNjaGVtYSI6eyJvcGVuQVBJVjNTY2hlbWEiOnsidHlwZSI6Im9iamVjdCIsIngta3ViZXJuZXRlcy1wcmVzZXJ2ZS11bmtub3duLWZpZWxkcyI6dHJ1ZX19LCJzZXJ2ZWQiOnRydWUsInN0b3JhZ2UiOnRydWV9XX19
++- type: olm.bundle.object
++  value:
++    data: eyJhcGlWZXJzaW9uIjoib3BlcmF0b3JzLmNvcmVvcy5jb20vdjFhbHBoYTEiLCJraW5kIjoiQ2x1c3RlclNlcnZpY2VWZXJzaW9uIiwibWV0YWRhdGEiOnsiYW5ub3RhdGlvbnMiOnsiY2FwYWJpbGl0aWVzIjoiQmFzaWNJbnN0YWxsIiwiY2VydGlmaWVkIjoiZmFsc2UiLCJjb250YWluZXJJbWFnZSI6InF1YXkuaW8vb2MtbWlycm9yL29jLW1pcnJvci1kZXZAc2hhMjU2OjFjZThjMDE4N2M4ZmU2YjRiZTMyN2RjODQ4YjhiYWYwNjJjZTFiYWE1MDk2YjRmNWQ5NTU4OTNkMTI2ZDViNTgiLCJkZXNjcmlwdGlvbiI6IlRoZSBGb28gT3BlcmF0b3IgZG9lcyBGb28gdGhpbmdzLiIsIm9sbS5za2lwUmFuZ2UiOiJcdTAwM2MwLjIuMCIsInJlcG9zaXRvcnkiOiJodHRwczovL2dpdGh1Yi5jb20vb3BlbnNoaWZ0L29jLW1pcnJvciJ9LCJuYW1lIjoiZm9vLnYwLjIuMCJ9LCJzcGVjIjp7ImN1c3RvbXJlc291cmNlZGVmaW5pdGlvbnMiOnsib3duZWQiOlt7Imdyb3VwIjoidGVzdC5mb28iLCJraW5kIjoiRm9vIiwibmFtZSI6ImZvb3MudGVzdC5mb28iLCJ2ZXJzaW9uIjoidjEifV19LCJkZXNjcmlwdGlvbiI6IlRoZSBGb28gT3BlcmF0b3IgZG9lcyBGb28gdGhpbmdzLiIsImRpc3BsYXlOYW1lIjoiRm9vIE9wZXJhdG9yIiwiaWNvbiI6W3siYmFzZTY0ZGF0YSI6IlBEOTRiV3dnZG1WeWMybHZiajBpTVM0d0lpQmxibU52WkdsdVp6MGlkWFJtTFRnaVB6NEtQSE4yWnlCMlpYSnphVzl1UFNJeExqRWlJR2xrUFNKcFkyOXVJaUI0Yld4dWN6MGlhSFIwY0RvdkwzZDNkeTUzTXk1dmNtY3ZNakF3TUM5emRtY2lJSGh0Ykc1ek9uaHNhVzVyUFNKb2RIUndPaTh2ZDNkM0xuY3pMbTl5Wnk4eE9UazVMM2hzYVc1cklpQjRQU0l3Y0hnaUlIazlJakJ3ZUNJS0lDQWdJSFpwWlhkQ2IzZzlJakFnTUNBeE1qZ3dJREV5T0RBaUlITjBlV3hsUFNKbGJtRmliR1V0WW1GamEyZHliM1Z1WkRwdVpYY2dNQ0F3SURFeU9EQWdNVEk0TURzaUlIaHRiRHB6Y0dGalpUMGljSEpsYzJWeWRtVWlQZ284YzNSNWJHVWdkSGx3WlQwaWRHVjRkQzlqYzNNaVBnb2dJQzV6Y1hWcGNtTnNaU0I3SUdacGJHdzZJQ00zUWpnM09UUTdJSFJ5WVc1elptOXliVG9nZEhKaGJuTnNZWFJsS0RWd2VDd2dNWEI0S1RzZ2ZRb2dJQzV1WVcxbElIc2dabTl1ZERvZ1ltOXNaQ0EwTURCd2VDQnpZVzV6SUhObGNtbG1PeUJtYVd4c09pQnlaV1E3SUhSeVlXNXpabTl5YlRvZ2RISmhibk5zWVhSbEtERXpNSEI0TENBMU1EQndlQ2tnY205MFlYUmxLREl3WkdWbktUc2dmUW84TDNOMGVXeGxQZ284Wno0S0lDQThjR0YwYUNCamJHRnpjejBpYzNGMWFYSmpiR1VpSUdROUlrMGdNQ3dnTlRBd0NpQWdJQ0FnSUNBZ0lDQWdJQ0FnSUNBZ0lDQWdJQ0FnSUNBZ0lDQkRJREFzSURVZ05Td2dNQ0ExTURBc0lEQUtJQ0FnSUNBZ0lDQWdJQ0FnSUNBZ0lDQWdJQ0FnSUNBZ0lDQWdJRk1nTVRBd01Dd2dOU0F4TURBd0xDQTFNREFLSUNBZ0lDQWdJQ0FnSUNBZ0lDQWdJQ0FnSUNBZ0lDQWdJQ0FnSUNBZ01UQXdNQ3dnTVRBd01DQTFNREFzSURFd01EQUtJQ0FnSUNBZ0lDQWdJQ0FnSUNBZ0lDQWdJQ0FnSUNBZ0lDQWdJQ0FnTUN3Z01UQXdNQ0F3TENBMU1EQWlMejRLSUNBOGRHVjRkQ0JqYkdGemN6MGlibUZ0WlNJK1ptOXZQQzkwWlhoMFBnbzhMMmMrQ2p3dmMzWm5QZ289IiwibWVkaWF0eXBlIjoiaW1hZ2Uvc3ZnK3htbCJ9XSwiaW5zdGFsbCI6eyJzcGVjIjp7ImRlcGxveW1lbnRzIjpbeyJuYW1lIjoiZm9vLW9wZXJhdG9yIiwic3BlYyI6eyJyZXBsaWNhcyI6MSwic2VsZWN0b3IiOnsibWF0Y2hMYWJlbHMiOnsiYXBwIjoiZm9vLW9wZXJhdG9yIn19LCJ0ZW1wbGF0ZSI6eyJtZXRhZGF0YSI6eyJsYWJlbHMiOnsiYXBwIjoiZm9vLW9wZXJhdG9yIiwidmVyc2lvbiI6InYwLjIuMCJ9LCJuYW1lIjoiZm9vLW9wZXJhdG9yIn0sInNwZWMiOnsiY29udGFpbmVycyI6W3siY29tbWFuZCI6WyIvcnVuLnNoIl0sImltYWdlIjoicXVheS5pby9vYy1taXJyb3Ivb2MtbWlycm9yLWRldkBzaGEyNTY6MWNlOGMwMTg3YzhmZTZiNGJlMzI3ZGM4NDhiOGJhZjA2MmNlMWJhYTUwOTZiNGY1ZDk1NTg5M2QxMjZkNWI1OCIsImltYWdlUHVsbFBvbGljeSI6IkFsd2F5cyIsIm5hbWUiOiJmb28ifV19fX19XX0sInN0cmF0ZWd5IjoiZGVwbG95bWVudCJ9LCJpbnN0YWxsTW9kZXMiOlt7InN1cHBvcnRlZCI6dHJ1ZSwidHlwZSI6Ik93bk5hbWVzcGFjZSJ9LHsic3VwcG9ydGVkIjp0cnVlLCJ0eXBlIjoiU2luZ2xlTmFtZXNwYWNlIn0seyJzdXBwb3J0ZWQiOmZhbHNlLCJ0eXBlIjoiTXVsdGlOYW1lc3BhY2UifSx7InN1cHBvcnRlZCI6dHJ1ZSwidHlwZSI6IkFsbE5hbWVzcGFjZXMifV0sImtleXdvcmRzIjpbImZvbyJdLCJsYWJlbHMiOnsibmFtZSI6ImZvby1vcGVyYXRvciJ9LCJtYWludGFpbmVycyI6W3siZW1haWwiOiJvYy1taXJyb3JAb3BlbnNoaWZ0Lm9yZyIsIm5hbWUiOiJvYy1taXJyb3IgZGV2ZWxvcGVycyJ9XSwibWF0dXJpdHkiOiJiZXRhIiwicHJvdmlkZXIiOnsibmFtZSI6IkZvbyJ9LCJyZWxhdGVkSW1hZ2VzIjpbeyJpbWFnZSI6InF1YXkuaW8vb2MtbWlycm9yL29jLW1pcnJvci1kZXZAc2hhMjU2OjFjZThjMDE4N2M4ZmU2YjRiZTMyN2RjODQ4YjhiYWYwNjJjZTFiYWE1MDk2YjRmNWQ5NTU4OTNkMTI2ZDViNTgiLCJuYW1lIjoib3BlcmF0b3IifV0sInJlcGxhY2VzIjoiZm9vLnYwLjEuMCIsInNraXBzIjpbImZvby52MC4xLjEiLCJmb28udjAuMS4yIl0sInZlcnNpb24iOiIwLjIuMCJ9fQ==
++relatedImages:
++- image: quay.io/oc-mirror/oc-mirror-dev:foo-bundle-v0.2.0
++  name: ""
++- image: quay.io/oc-mirror/oc-mirror-dev@sha256:1ce8c0187c8fe6b4be327dc848b8baf062ce1baa5096b4f5d955893d126d5b58
++  name: operator
++schema: olm.bundle
++---
++image: quay.io/oc-mirror/oc-mirror-dev:foo-bundle-v0.3.0
++name: foo.v0.3.0
++package: foo
++properties:
++- type: olm.gvk
++  value:
++    group: test.foo
++    kind: Foo
++    version: v1
++- type: olm.gvk
++  value:
++    group: test.foo
++    kind: Foo
++    version: v2
++- type: olm.gvk.required
++  value:
++    group: test.bar
++    kind: Bar
++    version: v1alpha1
++- type: olm.package
++  value:
++    packageName: foo
++    version: 0.3.0
++- type: olm.package.required
++  value:
++    packageName: bar
++    versionRange: <0.3.0
++- type: olm.bundle.object
++  value:
++    data: eyJhcGlWZXJzaW9uIjoiYXBpZXh0ZW5zaW9ucy5rOHMuaW8vdjEiLCJraW5kIjoiQ3VzdG9tUmVzb3VyY2VEZWZpbml0aW9uIiwibWV0YWRhdGEiOnsibmFtZSI6ImZvb3MudGVzdC5mb28ifSwic3BlYyI6eyJncm91cCI6InRlc3QuZm9vIiwibmFtZXMiOnsia2luZCI6IkZvbyIsInBsdXJhbCI6ImZvb3MifSwic2NvcGUiOiJOYW1lc3BhY2VkIiwidmVyc2lvbnMiOlt7Im5hbWUiOiJ2MSIsInNjaGVtYSI6eyJvcGVuQVBJVjNTY2hlbWEiOnsidHlwZSI6Im9iamVjdCIsIngta3ViZXJuZXRlcy1wcmVzZXJ2ZS11bmtub3duLWZpZWxkcyI6dHJ1ZX19LCJzZXJ2ZWQiOnRydWUsInN0b3JhZ2UiOmZhbHNlfSx7Im5hbWUiOiJ2MiIsInNjaGVtYSI6eyJvcGVuQVBJVjNTY2hlbWEiOnsidHlwZSI6Im9iamVjdCIsIngta3ViZXJuZXRlcy1wcmVzZXJ2ZS11bmtub3duLWZpZWxkcyI6dHJ1ZX19LCJzZXJ2ZWQiOnRydWUsInN0b3JhZ2UiOnRydWV9XX19
++- type: olm.bundle.object
++  value:
++    data: eyJhcGlWZXJzaW9uIjoib3BlcmF0b3JzLmNvcmVvcy5jb20vdjFhbHBoYTEiLCJraW5kIjoiQ2x1c3RlclNlcnZpY2VWZXJzaW9uIiwibWV0YWRhdGEiOnsiYW5ub3RhdGlvbnMiOnsiY2FwYWJpbGl0aWVzIjoiQmFzaWNJbnN0YWxsIiwiY2VydGlmaWVkIjoiZmFsc2UiLCJjb250YWluZXJJbWFnZSI6InF1YXkuaW8vb2MtbWlycm9yL29jLW1pcnJvci1kZXZAc2hhMjU2OjFjZThjMDE4N2M4ZmU2YjRiZTMyN2RjODQ4YjhiYWYwNjJjZTFiYWE1MDk2YjRmNWQ5NTU4OTNkMTI2ZDViNTgiLCJkZXNjcmlwdGlvbiI6IlRoZSBGb28gT3BlcmF0b3IgZG9lcyBGb28gdGhpbmdzLiIsIm9sbS5za2lwUmFuZ2UiOiJcdTAwM2MwLjMuMCIsInJlcG9zaXRvcnkiOiJodHRwczovL2dpdGh1Yi5jb20vb3BlbnNoaWZ0L29jLW1pcnJvciJ9LCJuYW1lIjoiZm9vLnYwLjMuMCJ9LCJzcGVjIjp7ImN1c3RvbXJlc291cmNlZGVmaW5pdGlvbnMiOnsib3duZWQiOlt7Imdyb3VwIjoidGVzdC5mb28iLCJraW5kIjoiRm9vIiwibmFtZSI6ImZvb3MudGVzdC5mb28iLCJ2ZXJzaW9uIjoidjEifSx7Imdyb3VwIjoidGVzdC5mb28iLCJraW5kIjoiRm9vIiwibmFtZSI6ImZvb3MudGVzdC5mb28iLCJ2ZXJzaW9uIjoidjIifV19LCJkZXNjcmlwdGlvbiI6IlRoZSBGb28gT3BlcmF0b3IgZG9lcyBGb28gdGhpbmdzLiIsImRpc3BsYXlOYW1lIjoiRm9vIE9wZXJhdG9yIiwiaWNvbiI6W3siYmFzZTY0ZGF0YSI6IlBEOTRiV3dnZG1WeWMybHZiajBpTVM0d0lpQmxibU52WkdsdVp6MGlkWFJtTFRnaVB6NEtQSE4yWnlCMlpYSnphVzl1UFNJeExqRWlJR2xrUFNKcFkyOXVJaUI0Yld4dWN6MGlhSFIwY0RvdkwzZDNkeTUzTXk1dmNtY3ZNakF3TUM5emRtY2lJSGh0Ykc1ek9uaHNhVzVyUFNKb2RIUndPaTh2ZDNkM0xuY3pMbTl5Wnk4eE9UazVMM2hzYVc1cklpQjRQU0l3Y0hnaUlIazlJakJ3ZUNJS0lDQWdJSFpwWlhkQ2IzZzlJakFnTUNBeE1qZ3dJREV5T0RBaUlITjBlV3hsUFNKbGJtRmliR1V0WW1GamEyZHliM1Z1WkRwdVpYY2dNQ0F3SURFeU9EQWdNVEk0TURzaUlIaHRiRHB6Y0dGalpUMGljSEpsYzJWeWRtVWlQZ284YzNSNWJHVWdkSGx3WlQwaWRHVjRkQzlqYzNNaVBnb2dJQzV6Y1hWcGNtTnNaU0I3SUdacGJHdzZJQ00zUWpnM09UUTdJSFJ5WVc1elptOXliVG9nZEhKaGJuTnNZWFJsS0RWd2VDd2dNWEI0S1RzZ2ZRb2dJQzV1WVcxbElIc2dabTl1ZERvZ1ltOXNaQ0EwTURCd2VDQnpZVzV6SUhObGNtbG1PeUJtYVd4c09pQnlaV1E3SUhSeVlXNXpabTl5YlRvZ2RISmhibk5zWVhSbEtERXpNSEI0TENBMU1EQndlQ2tnY205MFlYUmxLREl3WkdWbktUc2dmUW84TDNOMGVXeGxQZ284Wno0S0lDQThjR0YwYUNCamJHRnpjejBpYzNGMWFYSmpiR1VpSUdROUlrMGdNQ3dnTlRBd0NpQWdJQ0FnSUNBZ0lDQWdJQ0FnSUNBZ0lDQWdJQ0FnSUNBZ0lDQkRJREFzSURVZ05Td2dNQ0ExTURBc0lEQUtJQ0FnSUNBZ0lDQWdJQ0FnSUNBZ0lDQWdJQ0FnSUNBZ0lDQWdJRk1nTVRBd01Dd2dOU0F4TURBd0xDQTFNREFLSUNBZ0lDQWdJQ0FnSUNBZ0lDQWdJQ0FnSUNBZ0lDQWdJQ0FnSUNBZ01UQXdNQ3dnTVRBd01DQTFNREFzSURFd01EQUtJQ0FnSUNBZ0lDQWdJQ0FnSUNBZ0lDQWdJQ0FnSUNBZ0lDQWdJQ0FnTUN3Z01UQXdNQ0F3TENBMU1EQWlMejRLSUNBOGRHVjRkQ0JqYkdGemN6MGlibUZ0WlNJK1ptOXZQQzkwWlhoMFBnbzhMMmMrQ2p3dmMzWm5QZ289IiwibWVkaWF0eXBlIjoiaW1hZ2Uvc3ZnK3htbCJ9XSwiaW5zdGFsbCI6eyJzcGVjIjp7ImRlcGxveW1lbnRzIjpbeyJuYW1lIjoiZm9vLW9wZXJhdG9yIiwic3BlYyI6eyJyZXBsaWNhcyI6MSwic2VsZWN0b3IiOnsibWF0Y2hMYWJlbHMiOnsiYXBwIjoiZm9vLW9wZXJhdG9yIn19LCJ0ZW1wbGF0ZSI6eyJtZXRhZGF0YSI6eyJsYWJlbHMiOnsiYXBwIjoiZm9vLW9wZXJhdG9yIiwidmVyc2lvbiI6InYwLjMuMCJ9LCJuYW1lIjoiZm9vLW9wZXJhdG9yIn0sInNwZWMiOnsiY29udGFpbmVycyI6W3siY29tbWFuZCI6WyIvcnVuLnNoIl0sImltYWdlIjoicXVheS5pby9vYy1taXJyb3Ivb2MtbWlycm9yLWRldkBzaGEyNTY6MWNlOGMwMTg3YzhmZTZiNGJlMzI3ZGM4NDhiOGJhZjA2MmNlMWJhYTUwOTZiNGY1ZDk1NTg5M2QxMjZkNWI1OCIsImltYWdlUHVsbFBvbGljeSI6IkFsd2F5cyIsIm5hbWUiOiJmb28ifV19fX19XX0sInN0cmF0ZWd5IjoiZGVwbG95bWVudCJ9LCJpbnN0YWxsTW9kZXMiOlt7InN1cHBvcnRlZCI6dHJ1ZSwidHlwZSI6Ik93bk5hbWVzcGFjZSJ9LHsic3VwcG9ydGVkIjp0cnVlLCJ0eXBlIjoiU2luZ2xlTmFtZXNwYWNlIn0seyJzdXBwb3J0ZWQiOmZhbHNlLCJ0eXBlIjoiTXVsdGlOYW1lc3BhY2UifSx7InN1cHBvcnRlZCI6dHJ1ZSwidHlwZSI6IkFsbE5hbWVzcGFjZXMifV0sImtleXdvcmRzIjpbImZvbyJdLCJsYWJlbHMiOnsibmFtZSI6ImZvby1vcGVyYXRvciJ9LCJtYWludGFpbmVycyI6W3siZW1haWwiOiJvYy1taXJyb3JAb3BlbnNoaWZ0Lm9yZyIsIm5hbWUiOiJvYy1taXJyb3IgZGV2ZWxvcGVycyJ9XSwibWF0dXJpdHkiOiJiZXRhIiwicHJvdmlkZXIiOnsibmFtZSI6IkZvbyJ9LCJyZWxhdGVkSW1hZ2VzIjpbeyJpbWFnZSI6InF1YXkuaW8vb2MtbWlycm9yL29jLW1pcnJvci1kZXZAc2hhMjU2OjFjZThjMDE4N2M4ZmU2YjRiZTMyN2RjODQ4YjhiYWYwNjJjZTFiYWE1MDk2YjRmNWQ5NTU4OTNkMTI2ZDViNTgiLCJuYW1lIjoib3BlcmF0b3IifV0sInJlcGxhY2VzIjoiZm9vLnYwLjIuMCIsInZlcnNpb24iOiIwLjMuMCJ9fQ==
++relatedImages:
++- image: quay.io/oc-mirror/oc-mirror-dev:foo-bundle-v0.3.0
++  name: ""
++- image: quay.io/oc-mirror/oc-mirror-dev@sha256:1ce8c0187c8fe6b4be327dc848b8baf062ce1baa5096b4f5d955893d126d5b58
++  name: operator
++schema: olm.bundle
++---
++image: quay.io/oc-mirror/oc-mirror-dev:foo-bundle-v0.3.1
++name: foo.v0.3.1
++package: foo
++properties:
++- type: olm.gvk
++  value:
++    group: test.foo
++    kind: Foo
++    version: v1
++- type: olm.gvk
++  value:
++    group: test.foo
++    kind: Foo
++    version: v2
++- type: olm.gvk.required
++  value:
++    group: test.bar
++    kind: Bar
++    version: v1alpha1
++- type: olm.package
++  value:
++    packageName: foo
++    version: 0.3.1
++- type: olm.package.required
++  value:
++    packageName: bar
++    versionRange: <0.2.0
++- type: olm.bundle.object
++  value:
++    data: eyJhcGlWZXJzaW9uIjoiYXBpZXh0ZW5zaW9ucy5rOHMuaW8vdjEiLCJraW5kIjoiQ3VzdG9tUmVzb3VyY2VEZWZpbml0aW9uIiwibWV0YWRhdGEiOnsibmFtZSI6ImZvb3MudGVzdC5mb28ifSwic3BlYyI6eyJncm91cCI6InRlc3QuZm9vIiwibmFtZXMiOnsia2luZCI6IkZvbyIsInBsdXJhbCI6ImZvb3MifSwic2NvcGUiOiJOYW1lc3BhY2VkIiwidmVyc2lvbnMiOlt7Im5hbWUiOiJ2MSIsInNjaGVtYSI6eyJvcGVuQVBJVjNTY2hlbWEiOnsidHlwZSI6Im9iamVjdCIsIngta3ViZXJuZXRlcy1wcmVzZXJ2ZS11bmtub3duLWZpZWxkcyI6dHJ1ZX19LCJzZXJ2ZWQiOnRydWUsInN0b3JhZ2UiOmZhbHNlfSx7Im5hbWUiOiJ2MiIsInNjaGVtYSI6eyJvcGVuQVBJVjNTY2hlbWEiOnsidHlwZSI6Im9iamVjdCIsIngta3ViZXJuZXRlcy1wcmVzZXJ2ZS11bmtub3duLWZpZWxkcyI6dHJ1ZX19LCJzZXJ2ZWQiOnRydWUsInN0b3JhZ2UiOnRydWV9XX19
++- type: olm.bundle.object
++  value:
++    data: eyJhcGlWZXJzaW9uIjoib3BlcmF0b3JzLmNvcmVvcy5jb20vdjFhbHBoYTEiLCJraW5kIjoiQ2x1c3RlclNlcnZpY2VWZXJzaW9uIiwibWV0YWRhdGEiOnsiYW5ub3RhdGlvbnMiOnsiY2FwYWJpbGl0aWVzIjoiQmFzaWNJbnN0YWxsIiwiY2VydGlmaWVkIjoiZmFsc2UiLCJjb250YWluZXJJbWFnZSI6InF1YXkuaW8vb2MtbWlycm9yL29jLW1pcnJvci1kZXZAc2hhMjU2OjFjZThjMDE4N2M4ZmU2YjRiZTMyN2RjODQ4YjhiYWYwNjJjZTFiYWE1MDk2YjRmNWQ5NTU4OTNkMTI2ZDViNTgiLCJkZXNjcmlwdGlvbiI6IlRoZSBGb28gT3BlcmF0b3IgZG9lcyBGb28gdGhpbmdzLiIsIm9sbS5za2lwUmFuZ2UiOiJcdTAwM2MwLjMuMSIsInJlcG9zaXRvcnkiOiJodHRwczovL2dpdGh1Yi5jb20vb3BlbnNoaWZ0L29jLW1pcnJvciJ9LCJuYW1lIjoiZm9vLnYwLjMuMSJ9LCJzcGVjIjp7ImN1c3RvbXJlc291cmNlZGVmaW5pdGlvbnMiOnsib3duZWQiOlt7Imdyb3VwIjoidGVzdC5mb28iLCJraW5kIjoiRm9vIiwibmFtZSI6ImZvb3MudGVzdC5mb28iLCJ2ZXJzaW9uIjoidjEifSx7Imdyb3VwIjoidGVzdC5mb28iLCJraW5kIjoiRm9vIiwibmFtZSI6ImZvb3MudGVzdC5mb28iLCJ2ZXJzaW9uIjoidjIifV19LCJkZXNjcmlwdGlvbiI6IlRoZSBGb28gT3BlcmF0b3IgZG9lcyBGb28gdGhpbmdzLiIsImRpc3BsYXlOYW1lIjoiRm9vIE9wZXJhdG9yIiwiaWNvbiI6W3siYmFzZTY0ZGF0YSI6IlBEOTRiV3dnZG1WeWMybHZiajBpTVM0d0lpQmxibU52WkdsdVp6MGlkWFJtTFRnaVB6NEtQSE4yWnlCMlpYSnphVzl1UFNJeExqRWlJR2xrUFNKcFkyOXVJaUI0Yld4dWN6MGlhSFIwY0RvdkwzZDNkeTUzTXk1dmNtY3ZNakF3TUM5emRtY2lJSGh0Ykc1ek9uaHNhVzVyUFNKb2RIUndPaTh2ZDNkM0xuY3pMbTl5Wnk4eE9UazVMM2hzYVc1cklpQjRQU0l3Y0hnaUlIazlJakJ3ZUNJS0lDQWdJSFpwWlhkQ2IzZzlJakFnTUNBeE1qZ3dJREV5T0RBaUlITjBlV3hsUFNKbGJtRmliR1V0WW1GamEyZHliM1Z1WkRwdVpYY2dNQ0F3SURFeU9EQWdNVEk0TURzaUlIaHRiRHB6Y0dGalpUMGljSEpsYzJWeWRtVWlQZ284YzNSNWJHVWdkSGx3WlQwaWRHVjRkQzlqYzNNaVBnb2dJQzV6Y1hWcGNtTnNaU0I3SUdacGJHdzZJQ00zUWpnM09UUTdJSFJ5WVc1elptOXliVG9nZEhKaGJuTnNZWFJsS0RWd2VDd2dNWEI0S1RzZ2ZRb2dJQzV1WVcxbElIc2dabTl1ZERvZ1ltOXNaQ0EwTURCd2VDQnpZVzV6SUhObGNtbG1PeUJtYVd4c09pQnlaV1E3SUhSeVlXNXpabTl5YlRvZ2RISmhibk5zWVhSbEtERXpNSEI0TENBMU1EQndlQ2tnY205MFlYUmxLREl3WkdWbktUc2dmUW84TDNOMGVXeGxQZ284Wno0S0lDQThjR0YwYUNCamJHRnpjejBpYzNGMWFYSmpiR1VpSUdROUlrMGdNQ3dnTlRBd0NpQWdJQ0FnSUNBZ0lDQWdJQ0FnSUNBZ0lDQWdJQ0FnSUNBZ0lDQkRJREFzSURVZ05Td2dNQ0ExTURBc0lEQUtJQ0FnSUNBZ0lDQWdJQ0FnSUNBZ0lDQWdJQ0FnSUNBZ0lDQWdJRk1nTVRBd01Dd2dOU0F4TURBd0xDQTFNREFLSUNBZ0lDQWdJQ0FnSUNBZ0lDQWdJQ0FnSUNBZ0lDQWdJQ0FnSUNBZ01UQXdNQ3dnTVRBd01DQTFNREFzSURFd01EQUtJQ0FnSUNBZ0lDQWdJQ0FnSUNBZ0lDQWdJQ0FnSUNBZ0lDQWdJQ0FnTUN3Z01UQXdNQ0F3TENBMU1EQWlMejRLSUNBOGRHVjRkQ0JqYkdGemN6MGlibUZ0WlNJK1ptOXZQQzkwWlhoMFBnbzhMMmMrQ2p3dmMzWm5QZ289IiwibWVkaWF0eXBlIjoiaW1hZ2Uvc3ZnK3htbCJ9XSwiaW5zdGFsbCI6eyJzcGVjIjp7ImRlcGxveW1lbnRzIjpbeyJuYW1lIjoiZm9vLW9wZXJhdG9yIiwic3BlYyI6eyJyZXBsaWNhcyI6MSwic2VsZWN0b3IiOnsibWF0Y2hMYWJlbHMiOnsiYXBwIjoiZm9vLW9wZXJhdG9yIn19LCJ0ZW1wbGF0ZSI6eyJtZXRhZGF0YSI6eyJsYWJlbHMiOnsiYXBwIjoiZm9vLW9wZXJhdG9yIiwidmVyc2lvbiI6InYwLjMuMSJ9LCJuYW1lIjoiZm9vLW9wZXJhdG9yIn0sInNwZWMiOnsiY29udGFpbmVycyI6W3siY29tbWFuZCI6WyIvcnVuLnNoIl0sImltYWdlIjoicXVheS5pby9vYy1taXJyb3Ivb2MtbWlycm9yLWRldkBzaGEyNTY6MWNlOGMwMTg3YzhmZTZiNGJlMzI3ZGM4NDhiOGJhZjA2MmNlMWJhYTUwOTZiNGY1ZDk1NTg5M2QxMjZkNWI1OCIsImltYWdlUHVsbFBvbGljeSI6IkFsd2F5cyIsIm5hbWUiOiJmb28ifV19fX19XX0sInN0cmF0ZWd5IjoiZGVwbG95bWVudCJ9LCJpbnN0YWxsTW9kZXMiOlt7InN1cHBvcnRlZCI6dHJ1ZSwidHlwZSI6Ik93bk5hbWVzcGFjZSJ9LHsic3VwcG9ydGVkIjp0cnVlLCJ0eXBlIjoiU2luZ2xlTmFtZXNwYWNlIn0seyJzdXBwb3J0ZWQiOmZhbHNlLCJ0eXBlIjoiTXVsdGlOYW1lc3BhY2UifSx7InN1cHBvcnRlZCI6dHJ1ZSwidHlwZSI6IkFsbE5hbWVzcGFjZXMifV0sImtleXdvcmRzIjpbImZvbyJdLCJsYWJlbHMiOnsibmFtZSI6ImZvby1vcGVyYXRvciJ9LCJtYWludGFpbmVycyI6W3siZW1haWwiOiJvYy1taXJyb3JAb3BlbnNoaWZ0Lm9yZyIsIm5hbWUiOiJvYy1taXJyb3IgZGV2ZWxvcGVycyJ9XSwibWF0dXJpdHkiOiJiZXRhIiwicHJvdmlkZXIiOnsibmFtZSI6IkZvbyJ9LCJyZWxhdGVkSW1hZ2VzIjpbeyJpbWFnZSI6InF1YXkuaW8vb2MtbWlycm9yL29jLW1pcnJvci1kZXZAc2hhMjU2OjFjZThjMDE4N2M4ZmU2YjRiZTMyN2RjODQ4YjhiYWYwNjJjZTFiYWE1MDk2YjRmNWQ5NTU4OTNkMTI2ZDViNTgiLCJuYW1lIjoib3BlcmF0b3IifV0sInJlcGxhY2VzIjoiZm9vLnYwLjIuMCIsInNraXBzIjpbImZvby52MC4zLjAiXSwidmVyc2lvbiI6IjAuMy4xIn19
++relatedImages:
++- image: quay.io/oc-mirror/oc-mirror-dev:foo-bundle-v0.3.1
++  name: ""
++- image: quay.io/oc-mirror/oc-mirror-dev@sha256:1ce8c0187c8fe6b4be327dc848b8baf062ce1baa5096b4f5d955893d126d5b58
++  name: operator
++schema: olm.bundle
+diff --git a/tests/integration/image-builders/operator/catalogs/test-catalog-latest/foo/channels.yaml b/tests/integration/image-builders/operator/catalogs/test-catalog-latest/foo/channels.yaml
+new file mode 100644
+index 000000000..019eae401
+--- /dev/null
++++ b/tests/integration/image-builders/operator/catalogs/test-catalog-latest/foo/channels.yaml
+@@ -0,0 +1,20 @@
++schema: olm.channel
++package: foo
++name: beta
++entries:
++  - name: foo.v0.1.0
++    skipRange: <0.1.0
++  - name: foo.v0.2.0
++    skipRange: <0.2.0
++    skips:
++      - foo.v0.1.1
++      - foo.v0.1.2
++    replaces: foo.v0.1.0
++  - name: foo.v0.3.0
++    skipRange: <0.3.0
++    replaces: foo.v0.2.0
++  - name: foo.v0.3.1
++    skipRange: <0.3.1
++    skips:
++      - foo.v0.3.0
++    replaces: foo.v0.2.0
+diff --git a/tests/integration/image-builders/operator/catalogs/test-catalog-latest/foo/operator.yaml b/tests/integration/image-builders/operator/catalogs/test-catalog-latest/foo/operator.yaml
+new file mode 100644
+index 000000000..960d2aa79
+--- /dev/null
++++ b/tests/integration/image-builders/operator/catalogs/test-catalog-latest/foo/operator.yaml
+@@ -0,0 +1,4 @@
++---
++defaultChannel: beta
++name: foo
++schema: olm.package
+diff --git a/tests/integration/image-builders/operator/catalogs/test-catalog-prune-diff/bar/bundles.yaml b/tests/integration/image-builders/operator/catalogs/test-catalog-prune-diff/bar/bundles.yaml
+new file mode 100644
+index 000000000..d3d9655d5
+--- /dev/null
++++ b/tests/integration/image-builders/operator/catalogs/test-catalog-prune-diff/bar/bundles.yaml
+@@ -0,0 +1,20 @@
++---
++image: quay.io/oc-mirror/oc-mirror-dev:bar-bundle-v0.1.0
++name: bar.v0.1.0
++package: bar
++properties:
++- type: olm.gvk
++  value:
++    group: test.bar
++    kind: Bar
++    version: v1alpha1
++- type: olm.package
++  value:
++    packageName: bar
++    version: 0.1.0
++relatedImages:
++- image: quay.io/oc-mirror/oc-mirror-dev:bar-bundle-v0.1.0
++  name: ""
++- image: quay.io/oc-mirror/oc-mirror-dev@sha256:1ce8c0187c8fe6b4be327dc848b8baf062ce1baa5096b4f5d955893d126d5b58
++  name: operator
++schema: olm.bundle
+diff --git a/tests/integration/image-builders/operator/catalogs/test-catalog-prune-diff/bar/channels.yaml b/tests/integration/image-builders/operator/catalogs/test-catalog-prune-diff/bar/channels.yaml
+new file mode 100644
+index 000000000..a2669f173
+--- /dev/null
++++ b/tests/integration/image-builders/operator/catalogs/test-catalog-prune-diff/bar/channels.yaml
+@@ -0,0 +1,6 @@
++schema: olm.channel
++package: bar
++name: alpha
++entries:
++  - name: bar.v0.1.0
++    skipRange: <0.1.0
+diff --git a/tests/integration/image-builders/operator/catalogs/test-catalog-prune-diff/bar/operator.yaml b/tests/integration/image-builders/operator/catalogs/test-catalog-prune-diff/bar/operator.yaml
+new file mode 100644
+index 000000000..c47964512
+--- /dev/null
++++ b/tests/integration/image-builders/operator/catalogs/test-catalog-prune-diff/bar/operator.yaml
+@@ -0,0 +1,4 @@
++---
++defaultChannel: alpha
++name: bar
++schema: olm.package
+diff --git a/tests/integration/image-builders/operator/catalogs/test-catalog-prune-diff/foo/bundles.yaml b/tests/integration/image-builders/operator/catalogs/test-catalog-prune-diff/foo/bundles.yaml
+new file mode 100644
+index 000000000..cf313d11d
+--- /dev/null
++++ b/tests/integration/image-builders/operator/catalogs/test-catalog-prune-diff/foo/bundles.yaml
+@@ -0,0 +1,35 @@
++---
++image: quay.io/oc-mirror/oc-mirror-dev:foo-bundle-v0.2.0
++name: foo.v0.2.0
++package: foo
++properties:
++- type: olm.gvk
++  value:
++    group: test.foo
++    kind: Foo
++    version: v1
++- type: olm.gvk.required
++  value:
++    group: test.bar
++    kind: Bar
++    version: v1alpha1
++- type: olm.package
++  value:
++    packageName: foo
++    version: 0.2.0
++- type: olm.package.required
++  value:
++    packageName: bar
++    versionRange: <0.2.0
++- type: olm.bundle.object
++  value:
++    data: eyJhcGlWZXJzaW9uIjoiYXBpZXh0ZW5zaW9ucy5rOHMuaW8vdjEiLCJraW5kIjoiQ3VzdG9tUmVzb3VyY2VEZWZpbml0aW9uIiwibWV0YWRhdGEiOnsibmFtZSI6ImZvb3MudGVzdC5mb28ifSwic3BlYyI6eyJncm91cCI6InRlc3QuZm9vIiwibmFtZXMiOnsia2luZCI6IkZvbyIsInBsdXJhbCI6ImZvb3MifSwic2NvcGUiOiJOYW1lc3BhY2VkIiwidmVyc2lvbnMiOlt7Im5hbWUiOiJ2MSIsInNjaGVtYSI6eyJvcGVuQVBJVjNTY2hlbWEiOnsidHlwZSI6Im9iamVjdCIsIngta3ViZXJuZXRlcy1wcmVzZXJ2ZS11bmtub3duLWZpZWxkcyI6dHJ1ZX19LCJzZXJ2ZWQiOnRydWUsInN0b3JhZ2UiOnRydWV9XX19
++- type: olm.bundle.object
++  value:
++    data: eyJhcGlWZXJzaW9uIjoib3BlcmF0b3JzLmNvcmVvcy5jb20vdjFhbHBoYTEiLCJraW5kIjoiQ2x1c3RlclNlcnZpY2VWZXJzaW9uIiwibWV0YWRhdGEiOnsiYW5ub3RhdGlvbnMiOnsiY2FwYWJpbGl0aWVzIjoiQmFzaWNJbnN0YWxsIiwiY2VydGlmaWVkIjoiZmFsc2UiLCJjb250YWluZXJJbWFnZSI6InF1YXkuaW8vb2MtbWlycm9yL29jLW1pcnJvci1kZXZAc2hhMjU2OjFjZThjMDE4N2M4ZmU2YjRiZTMyN2RjODQ4YjhiYWYwNjJjZTFiYWE1MDk2YjRmNWQ5NTU4OTNkMTI2ZDViNTgiLCJkZXNjcmlwdGlvbiI6IlRoZSBGb28gT3BlcmF0b3IgZG9lcyBGb28gdGhpbmdzLiIsIm9sbS5za2lwUmFuZ2UiOiJcdTAwM2MwLjIuMCIsInJlcG9zaXRvcnkiOiJodHRwczovL2dpdGh1Yi5jb20vb3BlbnNoaWZ0L29jLW1pcnJvciJ9LCJuYW1lIjoiZm9vLnYwLjIuMCJ9LCJzcGVjIjp7ImN1c3RvbXJlc291cmNlZGVmaW5pdGlvbnMiOnsib3duZWQiOlt7Imdyb3VwIjoidGVzdC5mb28iLCJraW5kIjoiRm9vIiwibmFtZSI6ImZvb3MudGVzdC5mb28iLCJ2ZXJzaW9uIjoidjEifV19LCJkZXNjcmlwdGlvbiI6IlRoZSBGb28gT3BlcmF0b3IgZG9lcyBGb28gdGhpbmdzLiIsImRpc3BsYXlOYW1lIjoiRm9vIE9wZXJhdG9yIiwiaWNvbiI6W3siYmFzZTY0ZGF0YSI6IlBEOTRiV3dnZG1WeWMybHZiajBpTVM0d0lpQmxibU52WkdsdVp6MGlkWFJtTFRnaVB6NEtQSE4yWnlCMlpYSnphVzl1UFNJeExqRWlJR2xrUFNKcFkyOXVJaUI0Yld4dWN6MGlhSFIwY0RvdkwzZDNkeTUzTXk1dmNtY3ZNakF3TUM5emRtY2lJSGh0Ykc1ek9uaHNhVzVyUFNKb2RIUndPaTh2ZDNkM0xuY3pMbTl5Wnk4eE9UazVMM2hzYVc1cklpQjRQU0l3Y0hnaUlIazlJakJ3ZUNJS0lDQWdJSFpwWlhkQ2IzZzlJakFnTUNBeE1qZ3dJREV5T0RBaUlITjBlV3hsUFNKbGJtRmliR1V0WW1GamEyZHliM1Z1WkRwdVpYY2dNQ0F3SURFeU9EQWdNVEk0TURzaUlIaHRiRHB6Y0dGalpUMGljSEpsYzJWeWRtVWlQZ284YzNSNWJHVWdkSGx3WlQwaWRHVjRkQzlqYzNNaVBnb2dJQzV6Y1hWcGNtTnNaU0I3SUdacGJHdzZJQ00zUWpnM09UUTdJSFJ5WVc1elptOXliVG9nZEhKaGJuTnNZWFJsS0RWd2VDd2dNWEI0S1RzZ2ZRb2dJQzV1WVcxbElIc2dabTl1ZERvZ1ltOXNaQ0EwTURCd2VDQnpZVzV6SUhObGNtbG1PeUJtYVd4c09pQnlaV1E3SUhSeVlXNXpabTl5YlRvZ2RISmhibk5zWVhSbEtERXpNSEI0TENBMU1EQndlQ2tnY205MFlYUmxLREl3WkdWbktUc2dmUW84TDNOMGVXeGxQZ284Wno0S0lDQThjR0YwYUNCamJHRnpjejBpYzNGMWFYSmpiR1VpSUdROUlrMGdNQ3dnTlRBd0NpQWdJQ0FnSUNBZ0lDQWdJQ0FnSUNBZ0lDQWdJQ0FnSUNBZ0lDQkRJREFzSURVZ05Td2dNQ0ExTURBc0lEQUtJQ0FnSUNBZ0lDQWdJQ0FnSUNBZ0lDQWdJQ0FnSUNBZ0lDQWdJRk1nTVRBd01Dd2dOU0F4TURBd0xDQTFNREFLSUNBZ0lDQWdJQ0FnSUNBZ0lDQWdJQ0FnSUNBZ0lDQWdJQ0FnSUNBZ01UQXdNQ3dnTVRBd01DQTFNREFzSURFd01EQUtJQ0FnSUNBZ0lDQWdJQ0FnSUNBZ0lDQWdJQ0FnSUNBZ0lDQWdJQ0FnTUN3Z01UQXdNQ0F3TENBMU1EQWlMejRLSUNBOGRHVjRkQ0JqYkdGemN6MGlibUZ0WlNJK1ptOXZQQzkwWlhoMFBnbzhMMmMrQ2p3dmMzWm5QZ289IiwibWVkaWF0eXBlIjoiaW1hZ2Uvc3ZnK3htbCJ9XSwiaW5zdGFsbCI6eyJzcGVjIjp7ImRlcGxveW1lbnRzIjpbeyJuYW1lIjoiZm9vLW9wZXJhdG9yIiwic3BlYyI6eyJyZXBsaWNhcyI6MSwic2VsZWN0b3IiOnsibWF0Y2hMYWJlbHMiOnsiYXBwIjoiZm9vLW9wZXJhdG9yIn19LCJ0ZW1wbGF0ZSI6eyJtZXRhZGF0YSI6eyJsYWJlbHMiOnsiYXBwIjoiZm9vLW9wZXJhdG9yIiwidmVyc2lvbiI6InYwLjIuMCJ9LCJuYW1lIjoiZm9vLW9wZXJhdG9yIn0sInNwZWMiOnsiY29udGFpbmVycyI6W3siY29tbWFuZCI6WyIvcnVuLnNoIl0sImltYWdlIjoicXVheS5pby9vYy1taXJyb3Ivb2MtbWlycm9yLWRldkBzaGEyNTY6MWNlOGMwMTg3YzhmZTZiNGJlMzI3ZGM4NDhiOGJhZjA2MmNlMWJhYTUwOTZiNGY1ZDk1NTg5M2QxMjZkNWI1OCIsImltYWdlUHVsbFBvbGljeSI6IkFsd2F5cyIsIm5hbWUiOiJmb28ifV19fX19XX0sInN0cmF0ZWd5IjoiZGVwbG95bWVudCJ9LCJpbnN0YWxsTW9kZXMiOlt7InN1cHBvcnRlZCI6dHJ1ZSwidHlwZSI6Ik93bk5hbWVzcGFjZSJ9LHsic3VwcG9ydGVkIjp0cnVlLCJ0eXBlIjoiU2luZ2xlTmFtZXNwYWNlIn0seyJzdXBwb3J0ZWQiOmZhbHNlLCJ0eXBlIjoiTXVsdGlOYW1lc3BhY2UifSx7InN1cHBvcnRlZCI6dHJ1ZSwidHlwZSI6IkFsbE5hbWVzcGFjZXMifV0sImtleXdvcmRzIjpbImZvbyJdLCJsYWJlbHMiOnsibmFtZSI6ImZvby1vcGVyYXRvciJ9LCJtYWludGFpbmVycyI6W3siZW1haWwiOiJvYy1taXJyb3JAb3BlbnNoaWZ0Lm9yZyIsIm5hbWUiOiJvYy1taXJyb3IgZGV2ZWxvcGVycyJ9XSwibWF0dXJpdHkiOiJiZXRhIiwicHJvdmlkZXIiOnsibmFtZSI6IkZvbyJ9LCJyZWxhdGVkSW1hZ2VzIjpbeyJpbWFnZSI6InF1YXkuaW8vb2MtbWlycm9yL29jLW1pcnJvci1kZXZAc2hhMjU2OjFjZThjMDE4N2M4ZmU2YjRiZTMyN2RjODQ4YjhiYWYwNjJjZTFiYWE1MDk2YjRmNWQ5NTU4OTNkMTI2ZDViNTgiLCJuYW1lIjoib3BlcmF0b3IifV0sInJlcGxhY2VzIjoiZm9vLnYwLjEuMCIsInNraXBzIjpbImZvby52MC4xLjEiLCJmb28udjAuMS4yIl0sInZlcnNpb24iOiIwLjIuMCJ9fQ==
++relatedImages:
++- image: quay.io/oc-mirror/oc-mirror-dev:foo-bundle-v0.2.0
++  name: ""
++- image: quay.io/oc-mirror/oc-mirror-dev@sha256:1ce8c0187c8fe6b4be327dc848b8baf062ce1baa5096b4f5d955893d126d5b58
++  name: operator
++schema: olm.bundle
+diff --git a/tests/integration/image-builders/operator/catalogs/test-catalog-prune-diff/foo/channels.yaml b/tests/integration/image-builders/operator/catalogs/test-catalog-prune-diff/foo/channels.yaml
+new file mode 100644
+index 000000000..bd7a8371b
+--- /dev/null
++++ b/tests/integration/image-builders/operator/catalogs/test-catalog-prune-diff/foo/channels.yaml
+@@ -0,0 +1,9 @@
++schema: olm.channel
++package: foo
++name: beta
++entries:
++  - name: foo.v0.2.0
++    skipRange: <0.2.0
++    skips:
++      - foo.v0.1.1
++      - foo.v0.1.2
+diff --git a/tests/integration/image-builders/operator/catalogs/test-catalog-prune-diff/foo/operator.yaml b/tests/integration/image-builders/operator/catalogs/test-catalog-prune-diff/foo/operator.yaml
+new file mode 100644
+index 000000000..960d2aa79
+--- /dev/null
++++ b/tests/integration/image-builders/operator/catalogs/test-catalog-prune-diff/foo/operator.yaml
+@@ -0,0 +1,4 @@
++---
++defaultChannel: beta
++name: foo
++schema: olm.package
+diff --git a/tests/integration/image-builders/operator/catalogs/test-catalog-prune/bar/bundles.yaml b/tests/integration/image-builders/operator/catalogs/test-catalog-prune/bar/bundles.yaml
+new file mode 100644
+index 000000000..d3d9655d5
+--- /dev/null
++++ b/tests/integration/image-builders/operator/catalogs/test-catalog-prune/bar/bundles.yaml
+@@ -0,0 +1,20 @@
++---
++image: quay.io/oc-mirror/oc-mirror-dev:bar-bundle-v0.1.0
++name: bar.v0.1.0
++package: bar
++properties:
++- type: olm.gvk
++  value:
++    group: test.bar
++    kind: Bar
++    version: v1alpha1
++- type: olm.package
++  value:
++    packageName: bar
++    version: 0.1.0
++relatedImages:
++- image: quay.io/oc-mirror/oc-mirror-dev:bar-bundle-v0.1.0
++  name: ""
++- image: quay.io/oc-mirror/oc-mirror-dev@sha256:1ce8c0187c8fe6b4be327dc848b8baf062ce1baa5096b4f5d955893d126d5b58
++  name: operator
++schema: olm.bundle
+diff --git a/tests/integration/image-builders/operator/catalogs/test-catalog-prune/bar/channels.yaml b/tests/integration/image-builders/operator/catalogs/test-catalog-prune/bar/channels.yaml
+new file mode 100644
+index 000000000..a2669f173
+--- /dev/null
++++ b/tests/integration/image-builders/operator/catalogs/test-catalog-prune/bar/channels.yaml
+@@ -0,0 +1,6 @@
++schema: olm.channel
++package: bar
++name: alpha
++entries:
++  - name: bar.v0.1.0
++    skipRange: <0.1.0
+diff --git a/tests/integration/image-builders/operator/catalogs/test-catalog-prune/bar/operator.yaml b/tests/integration/image-builders/operator/catalogs/test-catalog-prune/bar/operator.yaml
+new file mode 100644
+index 000000000..c47964512
+--- /dev/null
++++ b/tests/integration/image-builders/operator/catalogs/test-catalog-prune/bar/operator.yaml
+@@ -0,0 +1,4 @@
++---
++defaultChannel: alpha
++name: bar
++schema: olm.package
+diff --git a/tests/integration/image-builders/operator/catalogs/test-catalog-prune/foo/bundles.yaml b/tests/integration/image-builders/operator/catalogs/test-catalog-prune/foo/bundles.yaml
+new file mode 100644
+index 000000000..64480cfdc
+--- /dev/null
++++ b/tests/integration/image-builders/operator/catalogs/test-catalog-prune/foo/bundles.yaml
+@@ -0,0 +1,70 @@
++---
++image: quay.io/oc-mirror/oc-mirror-dev:foo-bundle-v0.1.0
++name: foo.v0.1.0
++package: foo
++properties:
++- type: olm.gvk
++  value:
++    group: test.foo
++    kind: Foo
++    version: v1
++- type: olm.gvk.required
++  value:
++    group: test.bar
++    kind: Bar
++    version: v1alpha1
++- type: olm.package
++  value:
++    packageName: foo
++    version: 0.1.0
++- type: olm.package.required
++  value:
++    packageName: bar
++    versionRange: <0.2.0
++- type: olm.bundle.object
++  value:
++    data: eyJhcGlWZXJzaW9uIjoiYXBpZXh0ZW5zaW9ucy5rOHMuaW8vdjEiLCJraW5kIjoiQ3VzdG9tUmVzb3VyY2VEZWZpbml0aW9uIiwibWV0YWRhdGEiOnsibmFtZSI6ImZvb3MudGVzdC5mb28ifSwic3BlYyI6eyJncm91cCI6InRlc3QuZm9vIiwibmFtZXMiOnsia2luZCI6IkZvbyIsInBsdXJhbCI6ImZvb3MifSwic2NvcGUiOiJOYW1lc3BhY2VkIiwidmVyc2lvbnMiOlt7Im5hbWUiOiJ2MSIsInNjaGVtYSI6eyJvcGVuQVBJVjNTY2hlbWEiOnsidHlwZSI6Im9iamVjdCIsIngta3ViZXJuZXRlcy1wcmVzZXJ2ZS11bmtub3duLWZpZWxkcyI6dHJ1ZX19LCJzZXJ2ZWQiOnRydWUsInN0b3JhZ2UiOnRydWV9XX19
++- type: olm.bundle.object
++  value:
++    data: eyJhcGlWZXJzaW9uIjoib3BlcmF0b3JzLmNvcmVvcy5jb20vdjFhbHBoYTEiLCJraW5kIjoiQ2x1c3RlclNlcnZpY2VWZXJzaW9uIiwibWV0YWRhdGEiOnsiYW5ub3RhdGlvbnMiOnsiY2FwYWJpbGl0aWVzIjoiQmFzaWNJbnN0YWxsIiwiY2VydGlmaWVkIjoiZmFsc2UiLCJjb250YWluZXJJbWFnZSI6InF1YXkuaW8vb2MtbWlycm9yL29jLW1pcnJvci1kZXZAc2hhMjU2OjFjZThjMDE4N2M4ZmU2YjRiZTMyN2RjODQ4YjhiYWYwNjJjZTFiYWE1MDk2YjRmNWQ5NTU4OTNkMTI2ZDViNTgiLCJkZXNjcmlwdGlvbiI6IlRoZSBGb28gT3BlcmF0b3IgZG9lcyBGb28gdGhpbmdzLiIsIm9sbS5za2lwUmFuZ2UiOiJcdTAwM2MwLjEuMCIsInJlcG9zaXRvcnkiOiJodHRwczovL2dpdGh1Yi5jb20vb3BlbnNoaWZ0L29jLW1pcnJvciJ9LCJuYW1lIjoiZm9vLnYwLjEuMCJ9LCJzcGVjIjp7ImN1c3RvbXJlc291cmNlZGVmaW5pdGlvbnMiOnsib3duZWQiOlt7Imdyb3VwIjoidGVzdC5mb28iLCJraW5kIjoiRm9vIiwibmFtZSI6ImZvb3MudGVzdC5mb28iLCJ2ZXJzaW9uIjoidjEifV19LCJkZXNjcmlwdGlvbiI6IlRoZSBGb28gT3BlcmF0b3IgZG9lcyBGb28gdGhpbmdzLiIsImRpc3BsYXlOYW1lIjoiRm9vIE9wZXJhdG9yIiwiaWNvbiI6W3siYmFzZTY0ZGF0YSI6IlBEOTRiV3dnZG1WeWMybHZiajBpTVM0d0lpQmxibU52WkdsdVp6MGlkWFJtTFRnaVB6NEtQSE4yWnlCMlpYSnphVzl1UFNJeExqRWlJR2xrUFNKcFkyOXVJaUI0Yld4dWN6MGlhSFIwY0RvdkwzZDNkeTUzTXk1dmNtY3ZNakF3TUM5emRtY2lJSGh0Ykc1ek9uaHNhVzVyUFNKb2RIUndPaTh2ZDNkM0xuY3pMbTl5Wnk4eE9UazVMM2hzYVc1cklpQjRQU0l3Y0hnaUlIazlJakJ3ZUNJS0lDQWdJSFpwWlhkQ2IzZzlJakFnTUNBeE1qZ3dJREV5T0RBaUlITjBlV3hsUFNKbGJtRmliR1V0WW1GamEyZHliM1Z1WkRwdVpYY2dNQ0F3SURFeU9EQWdNVEk0TURzaUlIaHRiRHB6Y0dGalpUMGljSEpsYzJWeWRtVWlQZ284YzNSNWJHVWdkSGx3WlQwaWRHVjRkQzlqYzNNaVBnb2dJQzV6Y1hWcGNtTnNaU0I3SUdacGJHdzZJQ00zUWpnM09UUTdJSFJ5WVc1elptOXliVG9nZEhKaGJuTnNZWFJsS0RWd2VDd2dNWEI0S1RzZ2ZRb2dJQzV1WVcxbElIc2dabTl1ZERvZ1ltOXNaQ0EwTURCd2VDQnpZVzV6SUhObGNtbG1PeUJtYVd4c09pQnlaV1E3SUhSeVlXNXpabTl5YlRvZ2RISmhibk5zWVhSbEtERXpNSEI0TENBMU1EQndlQ2tnY205MFlYUmxLREl3WkdWbktUc2dmUW84TDNOMGVXeGxQZ284Wno0S0lDQThjR0YwYUNCamJHRnpjejBpYzNGMWFYSmpiR1VpSUdROUlrMGdNQ3dnTlRBd0NpQWdJQ0FnSUNBZ0lDQWdJQ0FnSUNBZ0lDQWdJQ0FnSUNBZ0lDQkRJREFzSURVZ05Td2dNQ0ExTURBc0lEQUtJQ0FnSUNBZ0lDQWdJQ0FnSUNBZ0lDQWdJQ0FnSUNBZ0lDQWdJRk1nTVRBd01Dd2dOU0F4TURBd0xDQTFNREFLSUNBZ0lDQWdJQ0FnSUNBZ0lDQWdJQ0FnSUNBZ0lDQWdJQ0FnSUNBZ01UQXdNQ3dnTVRBd01DQTFNREFzSURFd01EQUtJQ0FnSUNBZ0lDQWdJQ0FnSUNBZ0lDQWdJQ0FnSUNBZ0lDQWdJQ0FnTUN3Z01UQXdNQ0F3TENBMU1EQWlMejRLSUNBOGRHVjRkQ0JqYkdGemN6MGlibUZ0WlNJK1ptOXZQQzkwWlhoMFBnbzhMMmMrQ2p3dmMzWm5QZ289IiwibWVkaWF0eXBlIjoiaW1hZ2Uvc3ZnK3htbCJ9XSwiaW5zdGFsbCI6eyJzcGVjIjp7ImRlcGxveW1lbnRzIjpbeyJuYW1lIjoiZm9vLW9wZXJhdG9yIiwic3BlYyI6eyJyZXBsaWNhcyI6MSwic2VsZWN0b3IiOnsibWF0Y2hMYWJlbHMiOnsiYXBwIjoiZm9vLW9wZXJhdG9yIn19LCJ0ZW1wbGF0ZSI6eyJtZXRhZGF0YSI6eyJsYWJlbHMiOnsiYXBwIjoiZm9vLW9wZXJhdG9yIiwidmVyc2lvbiI6InYwLjEuMCJ9LCJuYW1lIjoiZm9vLW9wZXJhdG9yIn0sInNwZWMiOnsiY29udGFpbmVycyI6W3siY29tbWFuZCI6WyIvcnVuLnNoIl0sImltYWdlIjoicXVheS5pby9vYy1taXJyb3Ivb2MtbWlycm9yLWRldkBzaGEyNTY6MWNlOGMwMTg3YzhmZTZiNGJlMzI3ZGM4NDhiOGJhZjA2MmNlMWJhYTUwOTZiNGY1ZDk1NTg5M2QxMjZkNWI1OCIsImltYWdlUHVsbFBvbGljeSI6IkFsd2F5cyIsIm5hbWUiOiJmb28ifV19fX19XX0sInN0cmF0ZWd5IjoiZGVwbG95bWVudCJ9LCJpbnN0YWxsTW9kZXMiOlt7InN1cHBvcnRlZCI6dHJ1ZSwidHlwZSI6Ik93bk5hbWVzcGFjZSJ9LHsic3VwcG9ydGVkIjp0cnVlLCJ0eXBlIjoiU2luZ2xlTmFtZXNwYWNlIn0seyJzdXBwb3J0ZWQiOmZhbHNlLCJ0eXBlIjoiTXVsdGlOYW1lc3BhY2UifSx7InN1cHBvcnRlZCI6dHJ1ZSwidHlwZSI6IkFsbE5hbWVzcGFjZXMifV0sImtleXdvcmRzIjpbImZvbyJdLCJsYWJlbHMiOnsibmFtZSI6ImZvby1vcGVyYXRvciJ9LCJtYWludGFpbmVycyI6W3siZW1haWwiOiJvYy1taXJyb3JAb3BlbnNoaWZ0Lm9yZyIsIm5hbWUiOiJvYy1taXJyb3IgZGV2ZWxvcGVycyJ9XSwibWF0dXJpdHkiOiJiZXRhIiwicHJvdmlkZXIiOnsibmFtZSI6IkZvbyJ9LCJyZWxhdGVkSW1hZ2VzIjpbeyJpbWFnZSI6InF1YXkuaW8vb2MtbWlycm9yL29jLW1pcnJvci1kZXZAc2hhMjU2OjFjZThjMDE4N2M4ZmU2YjRiZTMyN2RjODQ4YjhiYWYwNjJjZTFiYWE1MDk2YjRmNWQ5NTU4OTNkMTI2ZDViNTgiLCJuYW1lIjoib3BlcmF0b3IifV0sInZlcnNpb24iOiIwLjEuMCJ9fQ==
++relatedImages:
++- image: quay.io/oc-mirror/oc-mirror-dev:foo-bundle-v0.1.0
++  name: ""
++- image: quay.io/oc-mirror/oc-mirror-dev@sha256:1ce8c0187c8fe6b4be327dc848b8baf062ce1baa5096b4f5d955893d126d5b58
++  name: operator
++schema: olm.bundle
++---
++image: quay.io/oc-mirror/oc-mirror-dev:foo-bundle-v0.1.1
++name: foo.v0.1.1
++package: foo
++properties:
++- type: olm.gvk
++  value:
++    group: test.foo
++    kind: Foo
++    version: v1
++- type: olm.gvk.required
++  value:
++    group: test.bar
++    kind: Bar
++    version: v1alpha1
++- type: olm.package
++  value:
++    packageName: foo
++    version: 0.1.1
++- type: olm.package.required
++  value:
++    packageName: bar
++    versionRange: <0.2.0
++- type: olm.bundle.object
++  value:
++    data: eyJhcGlWZXJzaW9uIjoiYXBpZXh0ZW5zaW9ucy5rOHMuaW8vdjEiLCJraW5kIjoiQ3VzdG9tUmVzb3VyY2VEZWZpbml0aW9uIiwibWV0YWRhdGEiOnsibmFtZSI6ImZvb3MudGVzdC5mb28ifSwic3BlYyI6eyJncm91cCI6InRlc3QuZm9vIiwibmFtZXMiOnsia2luZCI6IkZvbyIsInBsdXJhbCI6ImZvb3MifSwic2NvcGUiOiJOYW1lc3BhY2VkIiwidmVyc2lvbnMiOlt7Im5hbWUiOiJ2MSIsInNjaGVtYSI6eyJvcGVuQVBJVjNTY2hlbWEiOnsidHlwZSI6Im9iamVjdCIsIngta3ViZXJuZXRlcy1wcmVzZXJ2ZS11bmtub3duLWZpZWxkcyI6dHJ1ZX19LCJzZXJ2ZWQiOnRydWUsInN0b3JhZ2UiOnRydWV9XX19
++- type: olm.bundle.object
++  value:
++    data: eyJhcGlWZXJzaW9uIjoib3BlcmF0b3JzLmNvcmVvcy5jb20vdjFhbHBoYTEiLCJraW5kIjoiQ2x1c3RlclNlcnZpY2VWZXJzaW9uIiwibWV0YWRhdGEiOnsiYW5ub3RhdGlvbnMiOnsiY2FwYWJpbGl0aWVzIjoiQmFzaWNJbnN0YWxsIiwiY2VydGlmaWVkIjoiZmFsc2UiLCJjb250YWluZXJJbWFnZSI6InF1YXkuaW8vb2MtbWlycm9yL29jLW1pcnJvci1kZXZAc2hhMjU2OjFjZThjMDE4N2M4ZmU2YjRiZTMyN2RjODQ4YjhiYWYwNjJjZTFiYWE1MDk2YjRmNWQ5NTU4OTNkMTI2ZDViNTgiLCJkZXNjcmlwdGlvbiI6IlRoZSBGb28gT3BlcmF0b3IgZG9lcyBGb28gdGhpbmdzLiIsIm9sbS5za2lwUmFuZ2UiOiJcdTAwM2MwLjEuMSIsInJlcG9zaXRvcnkiOiJodHRwczovL2dpdGh1Yi5jb20vb3BlbnNoaWZ0L29jLW1pcnJvciJ9LCJuYW1lIjoiZm9vLnYwLjEuMSJ9LCJzcGVjIjp7ImN1c3RvbXJlc291cmNlZGVmaW5pdGlvbnMiOnsib3duZWQiOlt7Imdyb3VwIjoidGVzdC5mb28iLCJraW5kIjoiRm9vIiwibmFtZSI6ImZvb3MudGVzdC5mb28iLCJ2ZXJzaW9uIjoidjEifV19LCJkZXNjcmlwdGlvbiI6IlRoZSBGb28gT3BlcmF0b3IgZG9lcyBGb28gdGhpbmdzLiIsImRpc3BsYXlOYW1lIjoiRm9vIE9wZXJhdG9yIiwiaWNvbiI6W3siYmFzZTY0ZGF0YSI6IlBEOTRiV3dnZG1WeWMybHZiajBpTVM0d0lpQmxibU52WkdsdVp6MGlkWFJtTFRnaVB6NEtQSE4yWnlCMlpYSnphVzl1UFNJeExqRWlJR2xrUFNKcFkyOXVJaUI0Yld4dWN6MGlhSFIwY0RvdkwzZDNkeTUzTXk1dmNtY3ZNakF3TUM5emRtY2lJSGh0Ykc1ek9uaHNhVzVyUFNKb2RIUndPaTh2ZDNkM0xuY3pMbTl5Wnk4eE9UazVMM2hzYVc1cklpQjRQU0l3Y0hnaUlIazlJakJ3ZUNJS0lDQWdJSFpwWlhkQ2IzZzlJakFnTUNBeE1qZ3dJREV5T0RBaUlITjBlV3hsUFNKbGJtRmliR1V0WW1GamEyZHliM1Z1WkRwdVpYY2dNQ0F3SURFeU9EQWdNVEk0TURzaUlIaHRiRHB6Y0dGalpUMGljSEpsYzJWeWRtVWlQZ284YzNSNWJHVWdkSGx3WlQwaWRHVjRkQzlqYzNNaVBnb2dJQzV6Y1hWcGNtTnNaU0I3SUdacGJHdzZJQ00zUWpnM09UUTdJSFJ5WVc1elptOXliVG9nZEhKaGJuTnNZWFJsS0RWd2VDd2dNWEI0S1RzZ2ZRb2dJQzV1WVcxbElIc2dabTl1ZERvZ1ltOXNaQ0EwTURCd2VDQnpZVzV6SUhObGNtbG1PeUJtYVd4c09pQnlaV1E3SUhSeVlXNXpabTl5YlRvZ2RISmhibk5zWVhSbEtERXpNSEI0TENBMU1EQndlQ2tnY205MFlYUmxLREl3WkdWbktUc2dmUW84TDNOMGVXeGxQZ284Wno0S0lDQThjR0YwYUNCamJHRnpjejBpYzNGMWFYSmpiR1VpSUdROUlrMGdNQ3dnTlRBd0NpQWdJQ0FnSUNBZ0lDQWdJQ0FnSUNBZ0lDQWdJQ0FnSUNBZ0lDQkRJREFzSURVZ05Td2dNQ0ExTURBc0lEQUtJQ0FnSUNBZ0lDQWdJQ0FnSUNBZ0lDQWdJQ0FnSUNBZ0lDQWdJRk1nTVRBd01Dd2dOU0F4TURBd0xDQTFNREFLSUNBZ0lDQWdJQ0FnSUNBZ0lDQWdJQ0FnSUNBZ0lDQWdJQ0FnSUNBZ01UQXdNQ3dnTVRBd01DQTFNREFzSURFd01EQUtJQ0FnSUNBZ0lDQWdJQ0FnSUNBZ0lDQWdJQ0FnSUNBZ0lDQWdJQ0FnTUN3Z01UQXdNQ0F3TENBMU1EQWlMejRLSUNBOGRHVjRkQ0JqYkdGemN6MGlibUZ0WlNJK1ptOXZQQzkwWlhoMFBnbzhMMmMrQ2p3dmMzWm5QZ289IiwibWVkaWF0eXBlIjoiaW1hZ2Uvc3ZnK3htbCJ9XSwiaW5zdGFsbCI6eyJzcGVjIjp7ImRlcGxveW1lbnRzIjpbeyJuYW1lIjoiZm9vLW9wZXJhdG9yIiwic3BlYyI6eyJyZXBsaWNhcyI6MSwic2VsZWN0b3IiOnsibWF0Y2hMYWJlbHMiOnsiYXBwIjoiZm9vLW9wZXJhdG9yIn19LCJ0ZW1wbGF0ZSI6eyJtZXRhZGF0YSI6eyJsYWJlbHMiOnsiYXBwIjoiZm9vLW9wZXJhdG9yIiwidmVyc2lvbiI6InYwLjEuMSJ9LCJuYW1lIjoiZm9vLW9wZXJhdG9yIn0sInNwZWMiOnsiY29udGFpbmVycyI6W3siY29tbWFuZCI6WyIvcnVuLnNoIl0sImltYWdlIjoicXVheS5pby9vYy1taXJyb3Ivb2MtbWlycm9yLWRldkBzaGEyNTY6MWNlOGMwMTg3YzhmZTZiNGJlMzI3ZGM4NDhiOGJhZjA2MmNlMWJhYTUwOTZiNGY1ZDk1NTg5M2QxMjZkNWI1OCIsImltYWdlUHVsbFBvbGljeSI6IkFsd2F5cyIsIm5hbWUiOiJmb28ifV19fX19XX0sInN0cmF0ZWd5IjoiZGVwbG95bWVudCJ9LCJpbnN0YWxsTW9kZXMiOlt7InN1cHBvcnRlZCI6dHJ1ZSwidHlwZSI6Ik93bk5hbWVzcGFjZSJ9LHsic3VwcG9ydGVkIjp0cnVlLCJ0eXBlIjoiU2luZ2xlTmFtZXNwYWNlIn0seyJzdXBwb3J0ZWQiOmZhbHNlLCJ0eXBlIjoiTXVsdGlOYW1lc3BhY2UifSx7InN1cHBvcnRlZCI6dHJ1ZSwidHlwZSI6IkFsbE5hbWVzcGFjZXMifV0sImtleXdvcmRzIjpbImZvbyJdLCJsYWJlbHMiOnsibmFtZSI6ImZvby1vcGVyYXRvciJ9LCJtYWludGFpbmVycyI6W3siZW1haWwiOiJvYy1taXJyb3JAb3BlbnNoaWZ0Lm9yZyIsIm5hbWUiOiJvYy1taXJyb3IgZGV2ZWxvcGVycyJ9XSwibWF0dXJpdHkiOiJiZXRhIiwicHJvdmlkZXIiOnsibmFtZSI6IkZvbyJ9LCJyZWxhdGVkSW1hZ2VzIjpbeyJpbWFnZSI6InF1YXkuaW8vb2MtbWlycm9yL29jLW1pcnJvci1kZXZAc2hhMjU2OjFjZThjMDE4N2M4ZmU2YjRiZTMyN2RjODQ4YjhiYWYwNjJjZTFiYWE1MDk2YjRmNWQ5NTU4OTNkMTI2ZDViNTgiLCJuYW1lIjoib3BlcmF0b3IifV0sInJlcGxhY2VzIjoiZm9vLnYwLjEuMCIsInZlcnNpb24iOiIwLjEuMSJ9fQ==
++relatedImages:
++- image: quay.io/oc-mirror/oc-mirror-dev:foo-bundle-v0.1.1
++  name: ""
++- image: quay.io/oc-mirror/oc-mirror-dev@sha256:1ce8c0187c8fe6b4be327dc848b8baf062ce1baa5096b4f5d955893d126d5b58
++  name: operator
++schema: olm.bundle
+diff --git a/tests/integration/image-builders/operator/catalogs/test-catalog-prune/foo/channels.yaml b/tests/integration/image-builders/operator/catalogs/test-catalog-prune/foo/channels.yaml
+new file mode 100644
+index 000000000..83e87de5e
+--- /dev/null
++++ b/tests/integration/image-builders/operator/catalogs/test-catalog-prune/foo/channels.yaml
+@@ -0,0 +1,9 @@
++schema: olm.channel
++package: foo
++name: beta
++entries:
++  - name: foo.v0.1.0
++    skipRange: <0.1.0
++  - name: foo.v0.1.1
++    skipRange: <0.1.1
++    replaces: foo.v0.1.0
+diff --git a/tests/integration/image-builders/operator/catalogs/test-catalog-prune/foo/operator.yaml b/tests/integration/image-builders/operator/catalogs/test-catalog-prune/foo/operator.yaml
+new file mode 100644
+index 000000000..960d2aa79
+--- /dev/null
++++ b/tests/integration/image-builders/operator/catalogs/test-catalog-prune/foo/operator.yaml
+@@ -0,0 +1,4 @@
++---
++defaultChannel: beta
++name: foo
++schema: olm.package
+diff --git a/tests/integration/image-builders/operator/cmd/build-catalogs/main.go b/tests/integration/image-builders/operator/cmd/build-catalogs/main.go
+deleted file mode 100644
+index 1fdc08ffd..000000000
+--- a/tests/integration/image-builders/operator/cmd/build-catalogs/main.go
++++ /dev/null
+@@ -1,233 +0,0 @@
+-package main
+-
+-import (
+-	"context"
+-	"fmt"
+-	"log"
+-	"os"
+-	"path/filepath"
+-	"runtime"
+-	"sort"
+-	"text/template"
+-
+-	"github.com/operator-framework/operator-registry/alpha/action"
+-	"github.com/operator-framework/operator-registry/alpha/declcfg"
+-	"github.com/operator-framework/operator-registry/pkg/image"
+-	"github.com/operator-framework/operator-registry/pkg/registry"
+-)
+-
+-const registryNS = "quay.io/oc-mirror/oc-mirror-dev"
+-
+-var (
+-	baseDir    string
+-	bundlesDir string
+-	outputDir  string
+-)
+-
+-func init() {
+-	_, src, _, _ := runtime.Caller(0)
+-	baseDir = filepath.Dir(filepath.Dir(filepath.Dir(src)))
+-	bundlesDir = filepath.Join(baseDir, "bundles")
+-	outputDir = filepath.Join(baseDir, "_output")
+-}
+-
+-var catalogs = map[string]map[string][]string{
+-	"prune": {
+-		"foo": {"0.1.0", "0.1.1"},
+-		"bar": {"0.1.0"},
+-	},
+-	"prune-diff": {
+-		"foo": {"0.2.0"},
+-		"bar": {"0.1.0"},
+-	},
+-	"latest": {
+-		"foo": {"0.1.0", "0.2.0", "0.3.0", "0.3.1"},
+-		"bar": {"0.1.0", "0.2.0", "1.0.0"},
+-		"baz": {"1.0.0", "1.0.1", "1.1.0"},
+-	},
+-	"diff": {
+-		"foo": {"0.1.0", "0.2.0", "0.3.0", "0.3.1", "0.3.2"},
+-		"bar": {"0.1.0", "0.2.0", "1.0.0"},
+-		"baz": {"1.0.0", "1.0.1", "1.1.0"},
+-	},
+-}
+-
+-func main() {
+-	for _, name := range sortedKeys(catalogs) {
+-		if err := generateCatalog(name, catalogs[name]); err != nil {
+-			log.Fatalf("catalog %s: %v", name, err)
+-		}
+-		fmt.Printf("Generated and validated: %s\n", name)
+-	}
+-}
+-
+-func generateCatalog(name string, pkgs map[string][]string) error {
+-	ctx := context.Background()
+-	imgTmpl := template.Must(template.New("img").Parse(
+-		registryNS + ":{{.Package}}-bundle-v{{.Version}}"))
+-
+-	var cfg declcfg.DeclarativeConfig
+-
+-	for _, pkg := range sortedKeys(pkgs) {
+-		versions := pkgs[pkg]
+-
+-		var bundles []*registry.Bundle
+-		for _, ver := range versions {
+-			dir := bundlePath(pkg, ver)
+-			b, err := readBundle(dir)
+-			if err != nil {
+-				return fmt.Errorf("bundle %s/%s: %w", pkg, ver, err)
+-			}
+-			bundles = append(bundles, b)
+-		}
+-
+-		lastBundle := bundles[len(bundles)-1]
+-		p, err := makePackage(pkg, lastBundle.Annotations.DefaultChannelName)
+-		if err != nil {
+-			return fmt.Errorf("package %s: %w", pkg, err)
+-		}
+-		cfg.Packages = append(cfg.Packages, p)
+-
+-		for _, ver := range versions {
+-			dir := bundlePath(pkg, ver)
+-			render := action.Render{
+-				Refs:             []string{dir},
+-				ImageRefTemplate: imgTmpl,
+-			}
+-			result, err := render.Run(ctx)
+-			if err != nil {
+-				return fmt.Errorf("render %s/%s: %w", pkg, ver, err)
+-			}
+-			cfg.Bundles = append(cfg.Bundles, result.Bundles...)
+-		}
+-
+-		cfg.Channels = append(cfg.Channels, buildChannels(pkg, bundles)...)
+-	}
+-
+-	// Validate
+-	if _, err := declcfg.ConvertToModel(cfg); err != nil {
+-		return fmt.Errorf("validate: %w", err)
+-	}
+-
+-	// Write index.yaml
+-	catalogDir := filepath.Join(outputDir, "test-catalog-"+name)
+-	if err := os.MkdirAll(catalogDir, 0o755); err != nil {
+-		return err
+-	}
+-	f, err := os.Create(filepath.Join(catalogDir, "index.yaml"))
+-	if err != nil {
+-		return err
+-	}
+-	defer f.Close()
+-	if err := declcfg.WriteYAML(cfg, f); err != nil {
+-		return fmt.Errorf("write: %w", err)
+-	}
+-
+-	// Generate Dockerfile
+-	dockerfilePath := filepath.Join(outputDir, "test-catalog-"+name+".Dockerfile")
+-	df, err := os.Create(dockerfilePath)
+-	if err != nil {
+-		return err
+-	}
+-	defer df.Close()
+-
+-	gen := action.GenerateDockerfile{
+-		BaseImage:    "quay.io/operator-framework/opm:latest",
+-		BuilderImage: "quay.io/operator-framework/opm:latest",
+-		IndexDir:     "test-catalog-" + name,
+-		Writer:       df,
+-	}
+-	return gen.Run()
+-}
+-
+-func readBundle(bundleDir string) (*registry.Bundle, error) {
+-	input, err := registry.NewImageInput(image.SimpleReference(""), bundleDir)
+-	if err != nil {
+-		return nil, err
+-	}
+-	return input.Bundle, nil
+-}
+-
+-func makePackage(pkg, defaultChannel string) (declcfg.Package, error) {
+-	iconData, err := os.ReadFile(filepath.Join(bundlesDir, pkg, pkg+".svg"))
+-	if err != nil {
+-		return declcfg.Package{}, fmt.Errorf("read icon: %w", err)
+-	}
+-	descData, err := os.ReadFile(filepath.Join(bundlesDir, pkg, "README.md"))
+-	if err != nil {
+-		return declcfg.Package{}, fmt.Errorf("read description: %w", err)
+-	}
+-	return declcfg.Package{
+-		Schema:         "olm.package",
+-		Name:           pkg,
+-		DefaultChannel: defaultChannel,
+-		Description:    string(descData),
+-		Icon: &declcfg.Icon{
+-			Data:      iconData,
+-			MediaType: "image/svg+xml",
+-		},
+-	}, nil
+-}
+-
+-func buildChannels(pkg string, bundles []*registry.Bundle) []declcfg.Channel {
+-	type channelData struct {
+-		bundles []*registry.Bundle
+-	}
+-	channels := map[string]*channelData{}
+-	for _, b := range bundles {
+-		for _, ch := range b.Channels {
+-			if channels[ch] == nil {
+-				channels[ch] = &channelData{}
+-			}
+-			channels[ch].bundles = append(channels[ch].bundles, b)
+-		}
+-	}
+-
+-	var result []declcfg.Channel
+-	for _, chName := range sortedKeys(channels) {
+-		chData := channels[chName]
+-
+-		inChannel := map[string]bool{}
+-		for _, b := range chData.bundles {
+-			inChannel[b.Name] = true
+-		}
+-
+-		var entries []declcfg.ChannelEntry
+-		for _, b := range chData.bundles {
+-			replaces, _ := b.Replaces()
+-			skips, _ := b.Skips()
+-			skipRange, _ := b.SkipRange()
+-
+-			entry := declcfg.ChannelEntry{
+-				Name:      b.Name,
+-				SkipRange: skipRange,
+-				Skips:     skips,
+-			}
+-			if replaces != "" && inChannel[replaces] {
+-				entry.Replaces = replaces
+-			}
+-			entries = append(entries, entry)
+-		}
+-
+-		result = append(result, declcfg.Channel{
+-			Schema:  "olm.channel",
+-			Package: pkg,
+-			Name:    chName,
+-			Entries: entries,
+-		})
+-	}
+-	return result
+-}
+-
+-func bundlePath(pkg, ver string) string {
+-	return filepath.Join(bundlesDir, pkg, fmt.Sprintf("%s-bundle-v%s", pkg, ver))
+-}
+-
+-func sortedKeys[M ~map[string]V, V any](m M) []string {
+-	keys := make([]string, 0, len(m))
+-	for k := range m {
+-		keys = append(keys, k)
+-	}
+-	sort.Strings(keys)
+-	return keys
+-}

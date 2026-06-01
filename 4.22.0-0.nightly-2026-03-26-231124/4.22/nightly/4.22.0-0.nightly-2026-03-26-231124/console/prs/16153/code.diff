@@ -1,0 +1,349 @@
+diff --git a/frontend/packages/console-app/src/components/data-view/ConsoleDataView.scss b/frontend/packages/console-app/src/components/data-view/ConsoleDataView.scss
+new file mode 100644
+index 00000000000..96af174138e
+--- /dev/null
++++ b/frontend/packages/console-app/src/components/data-view/ConsoleDataView.scss
+@@ -0,0 +1,7 @@
++// Hide the filter category selector when there's only one filter.
++// We use CSS instead of TypeScript prop changes because PatternFly's
++// DataViewFilters component doesn't expose a prop to hide the category selector.
++// This CSS-only solution avoids forking or patching the upstream component.
++.co-console-data-view-single-filter .pf-v6-c-toolbar__group.pf-m-filter-group > *:first-child {
++  display: none !important;
++}
+diff --git a/frontend/packages/console-app/src/components/data-view/ConsoleDataView.tsx b/frontend/packages/console-app/src/components/data-view/ConsoleDataView.tsx
+index 620fb2f89b3..979390be811 100644
+--- a/frontend/packages/console-app/src/components/data-view/ConsoleDataView.tsx
++++ b/frontend/packages/console-app/src/components/data-view/ConsoleDataView.tsx
+@@ -1,5 +1,6 @@
+ import type { FC, ReactNode } from 'react';
+ import { useCallback, useMemo, useState } from 'react';
++import './ConsoleDataView.scss';
+ import {
+   ResponsiveAction,
+   ResponsiveActions,
+@@ -10,11 +11,11 @@ import {
+   DataView,
+   DataViewState,
+   DataViewTable,
+-  DataViewTextFilter,
+   DataViewToolbar,
+ } from '@patternfly/react-data-view';
+ import DataViewFilters from '@patternfly/react-data-view/dist/cjs/DataViewFilters';
+ import { ColumnsIcon, UndoIcon } from '@patternfly/react-icons';
++import { css } from '@patternfly/react-styles';
+ import { InnerScrollContainer, Tbody, Td, Tr } from '@patternfly/react-table';
+ import { useTranslation } from 'react-i18next';
+ import type {
+@@ -26,6 +27,7 @@ import { LazyColumnManagementModalOverlay } from '@console/internal/components/m
+ import { EmptyBox } from '@console/shared/src/components/empty-state/EmptyBox';
+ import { StatusBox } from '@console/shared/src/components/status/StatusBox';
+ import { DataViewLabelFilter } from './DataViewLabelFilter';
++import { DataViewTextFilter } from './DataViewTextFilter';
+ import { useConsoleDataViewData } from './useConsoleDataViewData';
+ import { useConsoleDataViewFilters } from './useConsoleDataViewFilters';
+ 
+@@ -170,7 +172,10 @@ export const ConsoleDataView = <
+       loadError={loadError}
+       skeleton={<div className="loading-skeleton--table" />}
+     >
+-      <DataView activeState={activeState}>
++      <DataView
++        activeState={activeState}
++        className={css(dataViewFilterNodes.length === 1 && 'co-console-data-view-single-filter')}
++      >
+         <DataViewToolbar
+           filters={
+             dataViewFilterNodes.length > 0 && (
+diff --git a/frontend/packages/console-app/src/components/data-view/DataViewLabelFilter.tsx b/frontend/packages/console-app/src/components/data-view/DataViewLabelFilter.tsx
+index a522dfb8d15..304a011dc57 100644
+--- a/frontend/packages/console-app/src/components/data-view/DataViewLabelFilter.tsx
++++ b/frontend/packages/console-app/src/components/data-view/DataViewLabelFilter.tsx
+@@ -45,7 +45,7 @@ export const DataViewLabelFilter = <TData,>({
+         applyLabelFilters([]);
+       }}
+     >
+-      <div className="pf-v6-c-input-group co-filter-group">
++      <div className="pf-v6-c-input-group">
+         <AutocompleteInput
+           color="purple"
+           onSuggestionSelect={(selected) => {
+diff --git a/frontend/packages/console-app/src/components/data-view/DataViewTextFilter.tsx b/frontend/packages/console-app/src/components/data-view/DataViewTextFilter.tsx
+new file mode 100644
+index 00000000000..43e59a3d9f2
+--- /dev/null
++++ b/frontend/packages/console-app/src/components/data-view/DataViewTextFilter.tsx
+@@ -0,0 +1,55 @@
++import type { FormEvent } from 'react';
++import { useEffect, useState } from 'react';
++import { ToolbarFilter } from '@patternfly/react-core';
++import { useSearchParams } from 'react-router';
++import { TextFilter } from '@console/internal/components/factory/text-filter';
++
++type DataViewTextFilterProps = {
++  title: string;
++  filterId: string;
++  placeholder: string;
++  onChange?: (key: string, selectedValue: string) => void;
++  showToolbarItem?: boolean;
++};
++
++export const DataViewTextFilter = ({
++  title,
++  filterId,
++  placeholder,
++  onChange,
++  showToolbarItem,
++}: DataViewTextFilterProps) => {
++  const [searchParams] = useSearchParams();
++  const [inputText, setInputText] = useState(searchParams.get(filterId) ?? '');
++
++  // Sync local state with URL changes
++  useEffect(() => {
++    setInputText(searchParams.get(filterId) ?? '');
++  }, [searchParams, filterId]);
++
++  const handleChange = (_event: FormEvent<HTMLInputElement>, value: string) => {
++    setInputText(value);
++    onChange?.(filterId, value);
++  };
++
++  const handleDeleteChip = () => {
++    setInputText('');
++    onChange?.(filterId, '');
++  };
++
++  return (
++    <ToolbarFilter
++      categoryName={title}
++      showToolbarItem={showToolbarItem}
++      labels={inputText ? [inputText] : []}
++      deleteLabel={handleDeleteChip}
++    >
++      <TextFilter
++        label={filterId}
++        placeholder={placeholder}
++        value={inputText}
++        onChange={handleChange}
++      />
++    </ToolbarFilter>
++  );
++};
+diff --git a/frontend/packages/helm-plugin/integration-tests/support/pages/helm/helm-page.ts b/frontend/packages/helm-plugin/integration-tests/support/pages/helm/helm-page.ts
+index e1c4a243603..7d940ef8066 100644
+--- a/frontend/packages/helm-plugin/integration-tests/support/pages/helm/helm-page.ts
++++ b/frontend/packages/helm-plugin/integration-tests/support/pages/helm/helm-page.ts
+@@ -12,7 +12,7 @@ export const helmPage = {
+   search: (name: string) => {
+     cy.get(helmPO.filters).within(() => cy.get('.pf-v6-c-menu-toggle').first().click());
+     cy.get('.pf-v6-c-menu__list-item').contains('Name').click();
+-    cy.get('[aria-label="Name filter"]').clear().type(name);
++    cy.get('[aria-label="Filter by name"]').clear().type(name);
+   },
+   verifyHelmReleasesDisplayed: () => cy.get(helmPO.table).should('be.visible'),
+   clickHelmReleaseName: (name: string) => cy.get(`a[title="${name}"]`).click(),
+diff --git a/frontend/packages/integration-tests-cypress/tests/app/filtering-and-searching.cy.ts b/frontend/packages/integration-tests-cypress/tests/app/filtering-and-searching.cy.ts
+index 56597cd74f1..c745fc1c325 100644
+--- a/frontend/packages/integration-tests-cypress/tests/app/filtering-and-searching.cy.ts
++++ b/frontend/packages/integration-tests-cypress/tests/app/filtering-and-searching.cy.ts
+@@ -8,6 +8,24 @@ import * as yamlEditor from '../../views/yaml-editor';
+ 
+ const SEARCH_NAMESPACE = 'openshift-authentication-operator';
+ const SEARCH_DEPLOYMENT_NAME = 'authentication-operator';
++const SINGLE_FILTER_GROUP_SELECTOR =
++  '.co-console-data-view-single-filter .pf-v6-c-toolbar__group.pf-m-filter-group';
++
++const verifySingleFilterCategoryHidden = (expectedToggles: number) => {
++  cy.get('[data-test="data-view-table"]').should('exist');
++  cy.get(SINGLE_FILTER_GROUP_SELECTOR)
++    .find('.pf-v6-c-menu-toggle')
++    .should('have.length', expectedToggles);
++
++  if (expectedToggles === 1) {
++    cy.get(SINGLE_FILTER_GROUP_SELECTOR).find('.pf-v6-c-menu-toggle').should('not.be.visible');
++  } else {
++    cy.get(SINGLE_FILTER_GROUP_SELECTOR)
++      .find('.pf-v6-c-menu-toggle')
++      .first()
++      .should('not.be.visible');
++  }
++};
+ 
+ describe('Filtering and Searching', () => {
+   let WORKLOAD_NAME;
+@@ -105,4 +123,15 @@ describe('Filtering and Searching', () => {
+     });
+     listPage.dvRows.countShouldBe(3);
+   });
++
++  it('ConsoleDataView filter toolbar should not display a filter select', () => {
++    cy.log('when a text filter is the only filter');
++    cy.visit('/settings/cluster/alertmanagerconfig?page=1&perPage=50');
++    verifySingleFilterCategoryHidden(1);
++
++    cy.log('when a select filter is the only filter');
++    cy.visit('/search/all-namespaces?page=1&perPage=50&kind=core~v1~Pod');
++    listPage.dvRows.shouldBeLoaded();
++    verifySingleFilterCategoryHidden(2);
++  });
+ });
+diff --git a/frontend/packages/integration-tests-cypress/tests/cluster-settings/alertmanager/receivers/email.cy.ts b/frontend/packages/integration-tests-cypress/tests/cluster-settings/alertmanager/receivers/email.cy.ts
+index 09ac5cc724a..e691b7b0f01 100644
+--- a/frontend/packages/integration-tests-cypress/tests/cluster-settings/alertmanager/receivers/email.cy.ts
++++ b/frontend/packages/integration-tests-cypress/tests/cluster-settings/alertmanager/receivers/email.cy.ts
+@@ -49,7 +49,7 @@ describe('Alertmanager: Email Receiver Form', () => {
+     alertmanager.save();
+ 
+     cy.log('verify Email Receiver was created correctly');
+-    alertmanager.validateCreation(receiverName);
++    alertmanager.validateCreation(receiverName, 'integration-types', 'routing-labels');
+     alertmanager.visitYAMLPage();
+     yamlEditor.getEditorContent().then((content) => {
+       const configs = getGlobalsAndReceiverConfig(receiverName, configName, content);
+diff --git a/frontend/packages/integration-tests-cypress/tests/cluster-settings/alertmanager/receivers/pagerduty.cy.ts b/frontend/packages/integration-tests-cypress/tests/cluster-settings/alertmanager/receivers/pagerduty.cy.ts
+index ba3e1f856de..608c885cebe 100644
+--- a/frontend/packages/integration-tests-cypress/tests/cluster-settings/alertmanager/receivers/pagerduty.cy.ts
++++ b/frontend/packages/integration-tests-cypress/tests/cluster-settings/alertmanager/receivers/pagerduty.cy.ts
+@@ -50,7 +50,7 @@ describe('Alertmanager: PagerDuty Receiver Form', () => {
+     alertmanager.save();
+ 
+     cy.log('verify PagerDuty Receiver was created correctly');
+-    alertmanager.validateCreation(receiverName);
++    alertmanager.validateCreation(receiverName, 'integration-types', 'routing-labels');
+ 
+     cy.log('update pagerduty_url');
+     listPage.dvRows.clickKebabAction(receiverName, 'Edit Receiver');
+diff --git a/frontend/packages/integration-tests-cypress/tests/cluster-settings/alertmanager/receivers/slack.cy.ts b/frontend/packages/integration-tests-cypress/tests/cluster-settings/alertmanager/receivers/slack.cy.ts
+index e7c8c7f3eaf..3e8d679d814 100644
+--- a/frontend/packages/integration-tests-cypress/tests/cluster-settings/alertmanager/receivers/slack.cy.ts
++++ b/frontend/packages/integration-tests-cypress/tests/cluster-settings/alertmanager/receivers/slack.cy.ts
+@@ -52,7 +52,7 @@ describe('Alertmanager: Slack Receiver Form', () => {
+     alertmanager.save();
+ 
+     cy.log('verify Slack Receiver was created correctly');
+-    alertmanager.validateCreation(receiverName);
++    alertmanager.validateCreation(receiverName, 'integration-types', 'routing-labels');
+     alertmanager.visitYAMLPage();
+     yamlEditor.getEditorContent().then((content) => {
+       const configs = getGlobalsAndReceiverConfig(receiverName, configName, content);
+diff --git a/frontend/packages/integration-tests-cypress/tests/cluster-settings/alertmanager/receivers/webhook.cy.ts b/frontend/packages/integration-tests-cypress/tests/cluster-settings/alertmanager/receivers/webhook.cy.ts
+index 7edaa453844..0ec694a7b91 100644
+--- a/frontend/packages/integration-tests-cypress/tests/cluster-settings/alertmanager/receivers/webhook.cy.ts
++++ b/frontend/packages/integration-tests-cypress/tests/cluster-settings/alertmanager/receivers/webhook.cy.ts
+@@ -34,7 +34,7 @@ describe('Alertmanager: Webhook Receiver Form', () => {
+     alertmanager.save();
+ 
+     cy.log('verify Webhook Receiver was created correctly');
+-    alertmanager.validateCreation(receiverName);
++    alertmanager.validateCreation(receiverName, 'integration-types', 'routing-labels');
+     alertmanager.visitYAMLPage();
+     yamlEditor.getEditorContent().then((content) => {
+       const configs = getGlobalsAndReceiverConfig(receiverName, configName, content);
+diff --git a/frontend/packages/integration-tests-cypress/views/alertmanager.ts b/frontend/packages/integration-tests-cypress/views/alertmanager.ts
+index 66f7716af9c..cba660b292b 100644
+--- a/frontend/packages/integration-tests-cypress/views/alertmanager.ts
++++ b/frontend/packages/integration-tests-cypress/views/alertmanager.ts
+@@ -68,10 +68,14 @@ export const alertmanager = {
+     cy.exec(
+       `kubectl patch secret 'alertmanager-main' -n 'openshift-monitoring' --type='json' -p='[{ op: 'replace', path: '/data/alertmanager.yaml', value: ${defaultAlertmanagerYaml}}]'`,
+     ),
+-  save: () => cy.byTestID('save-changes').should('be.enabled').click(),
++  save: () => {
++    cy.byTestID('save-changes').should('be.enabled').click();
++    // wait for the changes to rollout
++    // eslint-disable-next-line cypress/no-unnecessary-waiting
++    cy.wait(10000);
++  },
+   showAdvancedConfiguration: () => cy.byTestID('advanced-configuration').find('button').click(),
+   validateCreation: (receiverName: string, typeCellName: string, labelCellName: string) => {
+-    listPage.dvFilter.byName(receiverName);
+     listPage.dvRows.shouldExist(receiverName);
+     listPage.dvRows.shouldExist(receiverName, typeCellName);
+     listPage.dvRows.shouldExist(receiverName, labelCellName);
+diff --git a/frontend/packages/integration-tests-cypress/views/list-page.ts b/frontend/packages/integration-tests-cypress/views/list-page.ts
+index 121db421453..7cf97dcb4aa 100644
+--- a/frontend/packages/integration-tests-cypress/views/list-page.ts
++++ b/frontend/packages/integration-tests-cypress/views/list-page.ts
+@@ -62,7 +62,7 @@ export const listPage = {
+         cy.get('.pf-v6-c-menu-toggle').first().click(),
+       );
+       cy.get('.pf-v6-c-menu__list-item').contains('Name').click();
+-      cy.get('[aria-label="Name filter"]').clear().type(name);
++      cy.get('[aria-label="Filter by name"]').clear().type(name);
+     },
+     by: (checkboxLabel: string) => {
+       cy.get('[data-ouia-component-id="DataViewCheckboxFilter"]').click();
+diff --git a/frontend/public/components/_autocomplete.scss b/frontend/public/components/_autocomplete.scss
+index b5f47209a5c..0cfb06685c7 100644
+--- a/frontend/public/components/_autocomplete.scss
++++ b/frontend/public/components/_autocomplete.scss
+@@ -2,12 +2,6 @@
+   position: relative;
+   width: 100%;
+   z-index: var(--pf-t--global--z-index--sm);
+-  @media (max-width: $screen-xs-min) {
+-    max-width: calc(100% - 95px);
+-  }
+-  @media (min-width: $screen-xs-min) and (max-width: $screen-sm-min) {
+-    max-width: 200px;
+-  }
+ }
+ 
+ .co-suggestion-box__suggestions {
+@@ -17,9 +11,6 @@
+   gap: var(--pf-t--global--spacer--gap--group--vertical);
+   position: absolute;
+   width: 100%;
+-  @media (min-width: $screen-xs-min) and (max-width: $screen-sm-min) {
+-    max-width: 200px;
+-  }
+ }
+ 
+ .co-suggestion-box__suggestions--shadowed {
+diff --git a/frontend/public/components/_filter-toolbar.scss b/frontend/public/components/_filter-toolbar.scss
+index 30fb246ffaa..644725d4ff3 100644
+--- a/frontend/public/components/_filter-toolbar.scss
++++ b/frontend/public/components/_filter-toolbar.scss
+@@ -1,29 +1,3 @@
+-.co-filter-dropdown__item {
+-  display: inline-flex;
+-  pointer-events: none;
+-}
+-
+-.co-filter-dropdown__list-item {
+-  list-style: none;
+-}
+-
+-/* No way to reach this ul */
+-.co-filter-dropdown-group > ul {
+-  margin-left: 0;
+-  padding-left: 0;
+-}
+-
+-.co-filter-dropdown-item {
+-  display: inline-flex;
+-  margin: var(--pf-t--global--spacer--xs) 0;
+-}
+-
+ .co-filter-dropdown-item__name {
+   padding: 0 var(--pf-t--global--spacer--xs);
+ }
+-
+-@media (min-width: $pf-v6-global--breakpoint--md) {
+-  .co-filter-group {
+-    width: 350px !important; // enable full placeholder text to display
+-  }
+-}
+diff --git a/frontend/public/components/filter-toolbar.tsx b/frontend/public/components/filter-toolbar.tsx
+index 831a78a2e8b..3a45d126fa4 100644
+--- a/frontend/public/components/filter-toolbar.tsx
++++ b/frontend/public/components/filter-toolbar.tsx
+@@ -444,7 +444,7 @@ export const FilterToolbar: FC<FilterToolbarProps> = ({
+                     }}
+                     categoryName={translatedNameFilterTitle}
+                   >
+-                    <div className="pf-v6-c-input-group co-filter-group">
++                    <div className="pf-v6-c-input-group">
+                       {showSearchFiltersDropdown && (
+                         <ConsoleSelect
+                           alwaysShowTitle

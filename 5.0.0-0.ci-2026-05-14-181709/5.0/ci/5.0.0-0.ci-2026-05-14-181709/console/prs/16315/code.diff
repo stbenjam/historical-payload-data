@@ -1,0 +1,761 @@
+diff --git a/.claude/migration-context.md b/.claude/migration-context.md
+new file mode 100644
+index 00000000000..73e20b943e3
+--- /dev/null
++++ b/.claude/migration-context.md
+@@ -0,0 +1,441 @@
++# Cypress → Playwright Migration Context
++
++Shared reference for migrating Console's Cypress e2e tests to Playwright. Used by `/migrate-cypress` and `/debug-test` skills. Adapted from [openshift-ui-tests-template cypress-migrator.mdc](https://github.com/bmaio-redhat/openshift-ui-tests-template/blob/main/.cursor/rules/cypress-migrator.mdc).
++
++## High-Level Principles
++
++1. **Understand, then rewrite.** Read the Cypress test to extract the _intent_ (what user workflow is being verified), then implement that intent using idiomatic Playwright patterns.
++2. **Self-contained tests.** Each `test()` block must create its own resources, assert independently, and clean up after itself. Never rely on test execution order or shared mutable state across `it` blocks.
++3. **Use the most specific API.** Prefer Playwright's built-in locator methods (`getByRole`, `getByTestId`, `getByText`, `getByLabel`) over generic `page.locator()` when they improve readability. Use `page.locator('[data-test="..."]')` for custom test attributes.
++4. **Leverage the framework.** Use existing page objects, and clients. Create new ones only when needed — always search first.
++5. **Live verification.** Use Playwright MCP browser tools to verify selectors, navigation flows, and element presence against the live UI before finalizing code.
++
++## Console Custom Selector Commands
++
++All 10 custom commands from `packages/integration-tests/support/selectors.ts`. Config: `testIdAttribute: 'data-test'` in `playwright.config.ts` — `page.getByTestId('x')` queries `[data-test="x"]`.
++
++| Cypress Command                | CSS Selector                             | Playwright Equivalent                                          |
++| :----------------------------- | :--------------------------------------- | :------------------------------------------------------------- |
++| `cy.byTestID('x')`             | `[data-test="x"]`                        | `page.getByTestId('x')`                                        |
++| `cy.byLegacyTestID('x')`       | `[data-test-id="x"]`                     | Change source to `data-test="x"`, then `page.getByTestId('x')` |
++| `cy.byTestActionID('x')`       | `[data-test-action="x"]:not([disabled])` | `page.locator('[data-test-action="x"]:not([disabled])')`       |
++| `cy.byButtonText('x')`         | `button` containing text                 | `page.getByRole('button', { name: 'x' })`                      |
++| `cy.byDataID('x')`             | `[data-id="x"]`                          | `page.locator('[data-id="x"]')`                                |
++| `cy.byTestSelector('x')`       | `[data-test-selector="x"]`               | `page.locator('[data-test-selector="x"]')`                     |
++| `cy.byTestDropDownMenu('x')`   | `[data-test-dropdown-menu="x"]`          | `page.locator('[data-test-dropdown-menu="x"]')`                |
++| `cy.byTestOperatorRow('x')`    | `[data-test-operator-row="x"]`           | `page.locator('[data-test-operator-row="x"]')`                 |
++| `cy.byTestSectionHeading('x')` | `[data-test-section-heading="x"]`        | `page.locator('[data-test-section-heading="x"]')`              |
++| `cy.byTestOperandLink('x')`    | `[data-test-operand-link="x"]`           | `page.locator('[data-test-operand-link="x"]')`                 |
++
++---
++
++## API Translation Reference
++
++### Selectors
++
++| Cypress                               | Playwright                                                                                                |
++| ------------------------------------- | --------------------------------------------------------------------------------------------------------- |
++| `cy.get('[data-test="x"]')`           | `page.getByTestId('x')` (page object: `this.page.getByTestId('x')`)                                       |
++| `cy.get('[data-test-id="x"]')`        | `page.locator('[data-test-id="x"]')`                                                                      |
++| `cy.byTestID('x')`                    | `page.getByTestId('x')`                                                                                   |
++| `cy.byLegacyTestID('x')`              | `page.locator('[data-test-id="x"]')`                                                                      |
++| `cy.byTestRows('resource-row')`       | `page.locator('[data-test-rows="resource-row"]')`                                                         |
++| `cy.byButtonText('Save')`             | `page.getByRole('button', { name: 'Save' })`                                                              |
++| `cy.contains('text')`                 | `page.getByText('text')` or `page.locator('selector', { hasText: 'text' })`                               |
++| `cy.contains('selector', 'text')`     | `page.locator('selector', { hasText: 'text' })` or `page.locator('selector').filter({ hasText: 'text' })` |
++| `cy.get('.pf-v6-c-table').find('tr')` | `page.locator('.pf-v6-c-table tr')` or compose with `.locator('tr')`                                      |
++| `cy.get('body').then($body => if...)` | `const count = await locator.count();` then branch                                                        |
++
++### Actions
++
++| Cypress                            | Playwright                                                                                          |
++| ---------------------------------- | --------------------------------------------------------------------------------------------------- |
++| `cy.get(s).click()`                | `await this.robustClick(this.page.locator(s))` (page object)                                        |
++| `cy.get(s).click({ force: true })` | `await this.robustClick(this.page.locator(s), { force: true })`                                     |
++| `cy.get(s).type('text')`           | `await this.page.locator(s).fill('text')`                                                           |
++| `cy.get(s).clear().type('text')`   | `await this.page.locator(s).fill('text')` (fill clears first)                                       |
++| `cy.get(s).select('option')`       | `await this.page.locator(s).selectOption('option')`                                                 |
++| `cy.get(s).check()`                | `await this.page.locator(s).check()`                                                                |
++| `cy.get(s).uncheck()`              | `await this.page.locator(s).uncheck()`                                                              |
++| `cy.get(s).scrollIntoView()`       | `await this.page.locator(s).scrollIntoViewIfNeeded()`                                               |
++| `cy.get(s).within(() => { ... })`  | `const container = this.page.locator(s); container.locator(child)` — scope via chained `.locator()` |
++| `cy.get('input').attachFile(f)`    | `await this.page.locator('input[type="file"]').setInputFiles(f)`                                    |
++| `cy.dropFile(selector, file)`      | `await this.page.locator(selector).setInputFiles(filePath)`                                         |
++
++### Navigation
++
++| Cypress                                | Playwright                                                  |
++| -------------------------------------- | ----------------------------------------------------------- |
++| `cy.visit('/path')`                    | `await this.goTo('/path')` (page object `navigate*` method) |
++| `cy.visitAndWait('/path')`             | `await this.goTo('/path')` (navigates + waits for loading)  |
++| `cy.clickNavLink(['Storage', 'PVCs'])` | Page object sidebar navigation method                       |
++| `cy.url().should('include', '/path')`  | `await expect(this.page).toHaveURL(/\/path/)`               |
++
++### Assertions
++
++| Cypress                                    | Playwright                                                         |
++| ------------------------------------------ | ------------------------------------------------------------------ |
++| `cy.get(s).should('exist')`                | `await expect(this.page.locator(s)).toBeAttached()`                |
++| `cy.get(s).should('not.exist')`            | `await expect(this.page.locator(s)).not.toBeAttached()`            |
++| `cy.get(s).should('be.visible')`           | `await expect(this.page.locator(s)).toBeVisible()`                 |
++| `cy.get(s).should('not.be.visible')`       | `await expect(this.page.locator(s)).not.toBeVisible()`             |
++| `cy.get(s).should('contain', 'text')`      | `await expect(this.page.locator(s)).toContainText('text')`         |
++| `cy.get(s).should('contain.text', 'text')` | `await expect(this.page.locator(s)).toContainText('text')`         |
++| `cy.get(s).should('have.text', 'text')`    | `await expect(this.page.locator(s)).toHaveText('text')`            |
++| `cy.get(s).should('have.value', 'v')`      | `await expect(this.page.locator(s)).toHaveValue('v')`              |
++| `cy.get(s).should('be.disabled')`          | `await expect(this.page.locator(s)).toBeDisabled()`                |
++| `cy.get(s).should('have.length', n)`       | `await expect(this.page.locator(s)).toHaveCount(n)`                |
++| `.and('contain', 'x')`                     | chain: `await expect(loc).toContainText('x')` (separate assertion) |
++| `cy.title().should('include', 't')`        | `await expect(this.page).toHaveTitle(/t/)`                         |
++
++### Waits and Retries
++
++| Cypress                                                  | Playwright                                                                                                                                                |
++| -------------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------- |
++| `cy.wait(3000)`                                          | **AVOID.** Use `await expect(locator).toBeVisible()` or condition-based waits. Only use `page.waitForTimeout()` as absolute last resort during debugging. |
++| `cy.get(s, { timeout: 60000 })`                          | `await this.page.locator(s).waitFor({ state: 'visible', timeout: 60000 })`                                                                                |
++| `cy.contains(text, { timeout })`                         | `await this.page.getByText(text).waitFor({ state: 'visible', timeout })`                                                                                  |
++| `cy.intercept('GET', url).as('req')` + `cy.wait('@req')` | `await this.page.waitForResponse(url)` or `page.waitForResponse(resp => resp.url().includes(url))`                                                        |
++
++### Resource Lifecycle
++
++| Cypress                                      | Playwright                                                          |
++| -------------------------------------------- | ------------------------------------------------------------------- |
++| `cy.exec('oc create ...')`                   | `KubernetesClient.createCustomResource(...)`                        |
++| `cy.exec('oc delete ...')`                   | `KubernetesClient.deleteCustomResource(...)`                        |
++| `cy.exec('oc get ... -o jsonpath')`          | `KubernetesClient.getCustomResource(...)`                           |
++| `cy.exec('oc patch ...')`                    | `KubernetesClient.patchConfigMap(...)` or equivalent K8s API method |
++| `cy.create(resourceJSON)`                    | `KubernetesClient.createCustomResource(...)`                        |
++| `cy.deleteProject(name)`                     | `cleanup.trackNamespace(name)` — auto-deleted after test            |
++| `cy.resourceShouldBeDeleted(ns, kind, name)` | `KubernetesClient.getCustomResource(...)` should throw 404          |
++
++### Conditional Logic
++
++| Cypress                                                               | Playwright                                              |
++| --------------------------------------------------------------------- | ------------------------------------------------------- |
++| `cy.get('body').then($body => { if ($body.find(s).length) { ... } })` | `if (await this.page.locator(s).count() > 0) { ... }`   |
++| `cy.get(s).then($el => { ... })`                                      | `const text = await this.page.locator(s).textContent()` |
++| Multiple `.then()` chains                                             | Sequential `await` statements                           |
++
++---
++
++## Structural Transformation Rules
++
++### Rule 1: Flatten Sequential `it` Blocks into Self-Contained Tests
++
++Cypress `testIsolation: false` means `it` blocks share browser state. In Playwright, each `test()` is isolated.
++
++**Cypress pattern (anti-pattern for Playwright):**
++
++```typescript
++describe("Resource lifecycle", () => {
++  before(() => {
++    cy.login();
++    cy.createProjectWithCLI(testName);
++  });
++  it("create resource", () => {
++    /* ... */
++  });
++  it("verify details", () => {
++    /* assumes resource exists from prior it */
++  });
++  it("delete resource", () => {
++    /* ... */
++  });
++  after(() => {
++    cy.deleteProjectWithCLI(testName);
++  });
++});
++```
++
++**Playwright equivalent:**
++
++```typescript
++import { test, expect } from "../../fixtures";
++
++test.describe("Resource lifecycle", { tag: ["@admin"] }, () => {
++  test("verify resource details after creation", async ({ page, cleanup }) => {
++    const ns = `test-${Date.now()}`;
++
++    await test.step("Create resource", async () => {
++      await KubernetesClient.createNamespace(ns);
++      cleanup.trackNamespace(ns);
++      // create resource via API or UI
++    });
++
++    await test.step("Verify details", async () => {
++      const details = new DetailsPage(page);
++      await details.navigateTo(`/k8s/ns/${ns}/deployments/my-app`);
++      await expect(details.title).toContainText("my-app");
++    });
++    // cleanup runs automatically after test
++  });
++});
++```
++
++### Rule 2: Replace `before`/`after` Hooks with `test.step` Blocks and `cleanup`
++
++Cypress hooks that create resources become explicit `test.step` blocks within each test. Resource cleanup is handled by the `cleanup` fixture — track resources with `cleanup.track*()` and they are deleted automatically after the test.
++
++**Exception:** `test.beforeEach` for login is acceptable when ALL tests in a describe need the same login. Prefer the `storageState` mechanism from global setup.
++
++### Rule 3: Replace Custom Commands with Page Object Methods
++
++Every `cy.customCommand()` maps to a page object method. Tests call page objects directly.
++
++| Cypress custom command                                     | Playwright equivalent                                                     |
++| ---------------------------------------------------------- | ------------------------------------------------------------------------- |
++| `cy.login()`                                               | `storageState` — zero code in tests                                       |
++| `cy.initAdmin()`                                           | Admin project `storageState`                                              |
++| `cy.visitAndWait(url)`                                     | `pageObject.goTo(url)`                                                    |
++| `cy.clickNavLink([...])`                                   | `navPage.clickNavLink(...)`                                               |
++| `cy.createProject(name)` / `cy.createProjectWithCLI(name)` | `KubernetesClient.createNamespace(name)` + `cleanup.trackNamespace(name)` |
++| `cy.deleteProject(name)` / `cy.deleteProjectWithCLI(name)` | `cleanup` fixture handles it                                              |
++| `cy.resourceShouldBeDeleted(ns, kind, name)`               | `await KubernetesClient.getCustomResource(...)` should throw              |
++| `checkErrors()`                                            | Not needed — Playwright catches uncaught exceptions                       |
++
++### Rule 4: Replace Fixed Waits with Condition-Based Waits
++
++```typescript
++// NEVER: cy.wait(5000) → page.waitForTimeout(5000)
++
++// ALWAYS: condition-based assertion
++await expect(statusLocator).toContainText("Running", { timeout: 120_000 });
++
++// or: polling-based condition
++await expect(async () => {
++  const text = await statusLocator.textContent();
++  expect(text).toContain("Running");
++}).toPass({ timeout: 120_000 });
++```
++
++### Rule 5: Replace `cy.exec('oc ...')` with KubernetesClient
++
++All cluster interactions go through `KubernetesClient` — never shell commands in tests.
++
++```typescript
++// NEVER
++cy.exec("oc delete deployment test-app -n test-ns");
++
++// ALWAYS
++await KubernetesClient.deleteCustomResource(
++  "apps",
++  "v1",
++  "test-ns",
++  "deployments",
++  "test-app",
++);
++```
++
++### Rule 6: Replace `cy.get(...).within(...)` with Scoped Locators
++
++```typescript
++// Cypress
++cy.get('[data-test="modal"]').within(() => {
++  cy.get('[data-test="name"]').type('my-resource');
++  cy.byButtonText('Submit').click();
++});
++
++// Playwright (page object method)
++async fillModalForm(name: string): Promise<void> {
++  const modal = this.page.getByTestId('modal');
++  await modal.getByTestId('name').fill(name);
++  await this.robustClick(modal.locator('button', { hasText: 'Submit' }));
++}
++```
++
++### Rule 7: Handle Conditional Presence without `.then()`
++
++```typescript
++// Cypress
++cy.get('body').then($body => {
++  if ($body.find('[data-test="welcome"]').length > 0) {
++    cy.get('[data-test="welcome"] button').click();
++  }
++});
++
++// Playwright (page object)
++async dismissWelcomeIfPresent(): Promise<void> {
++  const welcome = this.page.getByTestId('welcome');
++  if (await welcome.count() > 0) {
++    await this.robustClick(welcome.locator('button'));
++  }
++}
++```
++
++### Rule 8: Map Cypress Retries to Playwright Retries
++
++Cypress per-test `retries: { runMode: N }` becomes Playwright `test.describe.configure({ retries: N })` or is left to the global config. Never use per-test retries to mask flaky selectors — fix the root cause.
++
++---
++
++## Test Isolation Strategies
++
++### Strategy A: Fully Self-Contained (preferred)
++
++Each test creates its resources, runs assertions, and cleans up — even if the Cypress source had a shared `before` hook creating resources for multiple `it` blocks.
++
++Use when: tests are short enough that resource creation doesn't dominate runtime.
++
++### Strategy B: Shared Resources via `test.describe` Setup
++
++When multiple tests need the same expensive resource (e.g., an installed operator):
++
++```typescript
++import { test, expect } from "../../fixtures";
++
++test.describe("Operator tests", { tag: ["@admin"] }, () => {
++  let namespace: string;
++
++  test.beforeAll(async ({ browser }) => {
++    namespace = `aut-operator-${Date.now()}`;
++    const page = await browser.newPage();
++    await KubernetesClient.createNamespace(namespace);
++    // install operator or create expensive resource
++    await page.close();
++  });
++
++  test.afterAll(async ({ browser }) => {
++    const page = await browser.newPage();
++    await KubernetesClient.deleteNamespace(namespace);
++    await page.close();
++  });
++
++  test("verify operator installed", async ({ page }) => {
++    /* ... */
++  });
++  test("create operand", async ({ page }) => {
++    /* ... */
++  });
++});
++```
++
++Use when: multiple read-only tests share the same resource and creating it per-test would be too slow.
++
++### Strategy C: API-Created Resources
++
++Use `KubernetesClient` in `test.beforeAll` to create resources via API (faster than UI creation), then run UI-only assertions in tests.
++
++---
++
++## Page Object Pattern
++
++- Extend `BasePage` (provides `robustClick()`, `waitForLoadingComplete()`, `goTo()`)
++- Locators as `private readonly` properties
++- Actions as `async` methods
++- Use `robustClick()` for clicks intercepted by PatternFly overlays
++- Locator priority: `getByTestId` > `getByRole` > `getByText` > `locator`
++
++```typescript
++// e2e/pages/cluster-settings.ts
++import { BasePage } from "./base-page";
++
++export class ClusterSettingsPage extends BasePage {
++  private readonly detailsTab = this.page.locator(
++    '[data-test-id="horizontal-link-Details"]',
++  );
++  private readonly upstreamServerUrl = this.page.locator(
++    '[data-test-id="cv-upstream-server-url"]',
++  );
++
++  async navigateToDetails() {
++    await this.goTo("/settings/cluster");
++    await this.detailsTab.waitFor();
++  }
++
++  async clickUpstreamServerUrl() {
++    await this.robustClick(this.upstreamServerUrl);
++  }
++}
++```
++
++---
++
++## Gherkin Collapse
++
++Gherkin's 4-file indirection collapses to 2 files:
++
++| Gherkin source                             | Playwright target                                   |
++| ------------------------------------------ | --------------------------------------------------- |
++| `.feature` file                            | `test.describe` + `test()` blocks in `.spec.ts`     |
++| Step definition file                       | Inline in test or page object method                |
++| Page action file (`pages/*.ts`)            | Merged into page object class                       |
++| Page object selectors (`pageObjects/*.ts`) | Merged into page object class as locator properties |
++
++| Gherkin construct                 | Playwright equivalent                                           |
++| --------------------------------- | --------------------------------------------------------------- |
++| `Feature:`                        | `test.describe('...', () => { ... })`                           |
++| `Scenario:`                       | `test('...', async ({ page }) => { ... })`                      |
++| `Scenario Outline:` + `Examples:` | `for...of` loop or `[...].forEach()`                            |
++| `Background:`                     | `test.beforeEach(async ({ page }) => { ... })`                  |
++| `@smoke @regression`              | `test.describe('...', { tag: ['@smoke', '@regression'] }, ...)` |
++| `@manual` / `@broken-test`        | `test.skip('reason')` or `test.fixme('reason')` with Jira link  |
++
++---
++
++## File Mapping Convention
++
++| Cypress source                                                      | Playwright target                                                  |
++| ------------------------------------------------------------------- | ------------------------------------------------------------------ |
++| `packages/integration-tests/support/selectors.ts`                   | `BasePage` utilities and page object locators                      |
++| `packages/integration-tests/support/login.ts`                       | Global setup `storageState` — no test-level code                   |
++| `packages/integration-tests/support/nav.ts`                         | `navigate*` methods on page objects                                |
++| `packages/integration-tests/support/project.ts`                     | `KubernetesClient` namespace methods + `cleanup` fixture           |
++| `packages/integration-tests/views/list-page.ts`                     | `e2e/pages/list-page.ts` (page object class)                       |
++| `packages/integration-tests/views/details-page.ts`                  | `e2e/pages/details-page.ts` (page object class)                    |
++| `packages/integration-tests/views/modal.ts`                         | `e2e/pages/modal-page.ts` (page object class)                      |
++| `packages/integration-tests/views/nav.ts`                           | `e2e/pages/nav-page.ts` (page object class)                        |
++| `packages/integration-tests/views/<feature>.ts`                     | Methods within relevant page objects (e.g., `cluster-settings.ts`) |
++| `packages/integration-tests/tests/<area>/<name>.cy.ts`              | `e2e/tests/<area>/<name>.spec.ts`                                  |
++| `packages/<plugin>/integration-tests/features/<name>.feature`       | `e2e/tests/<area>/<name>.spec.ts`                                  |
++| `packages/<plugin>/integration-tests/support/step-definitions/*.ts` | Inline in test or page object method                               |
++| `packages/<plugin>/integration-tests/support/pages/*.ts`            | `e2e/pages/<name>.ts` (merged into page object)                    |
++| `packages/<plugin>/integration-tests/support/pageObjects/*.ts`      | `e2e/pages/<name>.ts` (merged as locator properties)               |
++
++---
++
++## Migration Checklist
++
++For each Cypress file being migrated:
++
++- [ ] Read the entire Cypress test file and all imported views/constants/support
++- [ ] Document each `it` block's intent in plain language
++- [ ] Search existing page objects in `e2e/pages/` for reusable methods
++- [ ] Identify test isolation strategy (A, B, or C)
++- [ ] Create/extend page objects with needed locators and methods
++- [ ] Write the spec file using project template
++- [ ] Replace all `cy.wait()` with condition-based waits
++- [ ] Replace all `cy.exec('oc ...')` with KubernetesClient calls
++- [ ] Run `npx tsc --noEmit` — zero errors
++- [ ] Run tests with `PLAYWRIGHT_RETRIES=0` — passing
++- [ ] Verify no orphaned resources after test run
++
++## Playwright MCP and Self-Signed Certificates
++
++OpenShift clusters use self-signed certificates. Both `browser_navigate` (Playwright MCP) and `navigate_page` (Chrome DevTools MCP) will fail with `ERR_CERT_AUTHORITY_INVALID`.
++
++**Workaround:** Use `browser_run_code_unsafe` to create a new browser context with `ignoreHTTPSErrors: true`:
++
++```javascript
++async (page) => {
++  const browser = page.context().browser();
++  const ctx = await browser.newContext({ ignoreHTTPSErrors: true });
++  const p = await ctx.newPage();
++  await p.goto('https://console-openshift-console.apps.<cluster>/');
++  // ... interact with p for selector verification
++}
++```
++
++The MCP's tracked page stays on `about:blank` — use the `p` reference from the new context for all interactions. Login via the OAuth form if needed (fill `#inputUsername`, `#inputPassword`, submit).
++
++---
++
++## Things to NEVER Do
++
++- **Never import `test` or `expect` from `@playwright/test`** — import from `e2e/fixtures`
++- **Never transliterate** — `cy.get(x).click()` → `page.locator(x).click()` is not a migration. Understand intent, use idiomatic Playwright APIs
++- **Never use `page.waitForTimeout()`** as a replacement for `cy.wait()`. Find the condition to wait for
++- **Never put locators in spec files** when a page object exists or should exist
++- **Never rely on test order** — each `test()` must work independently.
++- **Never skip cleanup** — every created resource must be tracked with `cleanup.track*()`
++- **Never use shell commands** (`execSync`, `child_process`) when `KubernetesClient` has a method
+diff --git a/.claude/skills/debug-test/SKILL.md b/.claude/skills/debug-test/SKILL.md
+new file mode 100644
+index 00000000000..88288325e38
+--- /dev/null
++++ b/.claude/skills/debug-test/SKILL.md
+@@ -0,0 +1,110 @@
++---
++name: debug-test
++description: Debug and fix failing Playwright e2e tests with MCP-assisted diagnosis. Use when user says "playwright test failing", "fix e2e test", "debug spec", or provides a failing .spec.ts file, e2e directory, or Playwright tag.
++argument-hint: "<path/to/file.spec.ts | directory/ | @tag>"
++allowed-tools: Read, Write, Edit, Bash(find *), Bash(grep *), Bash(ls *), Bash(npx tsc *), Bash(npx playwright *), Bash(git diff *), Bash(git status), mcp__plugin_playwright_playwright__browser_navigate, mcp__plugin_playwright_playwright__browser_snapshot, mcp__plugin_playwright_playwright__browser_click, mcp__plugin_playwright_playwright__browser_console_messages, mcp__plugin_playwright_playwright__browser_take_screenshot, mcp__plugin_playwright_playwright__browser_resize, mcp__plugin_playwright_playwright__browser_run_code_unsafe, mcp__plugin_playwright_playwright__browser_evaluate, mcp__plugin_playwright_playwright__browser_close, mcp__plugin_playwright_playwright__browser_type, mcp__plugin_playwright_playwright__browser_wait_for, mcp__plugin_playwright_playwright__browser_network_requests, AskUserQuestion
++---
++
++# Debug Test
++
++Debug and fix failing Playwright tests using MCP as the primary diagnostic tool. Works for a single spec, a directory, or a tag. Merged from [openshift-ui-tests-template/debug-test.md](https://github.com/bmaio-redhat/openshift-ui-tests-template/blob/main/.cursor/commands/debug-test.md) and [test-fix-cycle.md](https://github.com/bmaio-redhat/openshift-ui-tests-template/blob/main/.cursor/commands/test-fix-cycle.md).
++
++## Before Starting
++
++1. Check that `frontend/e2e/.env` exists. If missing, copy `frontend/e2e/.env.example` to `frontend/e2e/.env` and tell the user to fill in their cluster values before continuing.
++2. Read `.claude/migration-context.md` for the Console architecture, selector mappings, and migration rules. That file is the single source of truth for how Playwright tests should be structured.
++
++## Input
++
++- **Spec file**: `/debug-test e2e/tests/console/cluster-settings/upstream-modal.spec.ts`
++- **Test name**: `/debug-test "Verify console login"`
++- **Directory**: `/debug-test e2e/tests/helm/`
++- **Project**: `/debug-test --project=helm`
++- **Optional workers**: append `--workers=N` (default: 4)
++
++Examples:
++```text
++/debug-test e2e/tests/console/cluster-settings/upstream-modal.spec.ts
++/debug-test e2e/tests/helm/ --workers=2
++/debug-test --project=topology
++```
++
++## Workflow
++
++### Phase 1: Run
++
++1. Build command from input:
++   - File: `npx playwright test <file> --retries=0 --workers=1 --reporter=list`
++   - Directory: `npx playwright test <directory> --retries=0 --workers=<N> --reporter=list`
++   - Project: `npx playwright test --project=<name> --retries=0 --workers=<N> --reporter=list`
++   - For developer tests: `npx playwright test --project=<name>-developer --retries=0 --workers=1 --reporter=list`
++2. Run and capture output
++3. If all pass: report success. If single file, run 2 more times to confirm stability. Done.
++4. Parse failures: test name, file path, error message
++
++### Phase 2: Diagnose
++
++For each failure, use MCP to identify root cause:
++
++1. Resize viewport to 1920×1080
++2. Navigate to the failing page
++3. Snapshot accessibility tree — compare with test selectors
++4. Interact — reproduce the failing action
++5. Check console errors and network failures
++6. Classify: Selector Changed, Timing Issue, API/Auth Failure, Functional Regression, Test Code Bug
++
++### Phase 3: Fix
++
++For each fixable failure, in priority order:
++
++1. **Import/type errors** first — may cause cascading failures
++2. **Stale selectors** — use MCP snapshot to find correct selector
++3. **Timing issues** — add `robustClick()` or `waitForLoadingComplete()`
++4. **Missing awaits** — add `await`
++5. **Functional regressions** — `test.skip(true, 'reason')` after confirming with MCP
++
++Fix in the correct layer: selectors and waits in page objects, assertions in test files. Never put locators directly in test files when a page object exists.
++
++Run individual test after each fix to verify. If unfixable after 2 attempts: `test.skip(true, 'Descriptive reason')`.
++
++### Phase 4: Validate and Report
++
++1. Re-run the full target (file, directory, or tag). If new failures, repeat phases 2-3.
++2. For single files: run 3 consecutive times to confirm stability.
++3. Output summary:
++
++```text
++Debug Summary: <target>
++  Total tests: N
++  Passing: X
++  Fixed: Y
++  Skipped: Z
++
++  Fixes applied:
++    - <file>: <fix description>
++
++  Tests skipped:
++    - <file>: <reason>
++```
++
++## Troubleshooting
++
++### Playwright MCP not connected
++If MCP tools fail with "tool not found" or "connection refused": diagnose from error messages alone. Warn: "MCP not available — selector fixes may be inaccurate without live verification." Focus on fixes that don't require live inspection (missing awaits, type errors, obvious selector typos).
++
++### No cluster reachable
++If `npx playwright test` fails with login/connection errors on every test: this is an infrastructure issue, not a test bug. Report it to the user and suggest checking cluster access, `BRIDGE_BASE_ADDRESS`, and `storageState` files.
++
++### Playwright not installed
++If `npx playwright test` fails with "Cannot find module": the Playwright foundation hasn't been set up yet. Tell the user to complete the infrastructure setup first.
++
++### Flaky test (passes sometimes, fails sometimes)
++If a test passes on re-run without any fix: it's flaky. Use MCP to identify the timing-sensitive interaction, then fix with `robustClick()`, `waitForLoadingComplete()`, or a more specific `waitFor()` condition. Never mask flakiness with retries.
++
++## Rules
++
++- MCP first — always try browser tools before guessing at selectors
++- Fix in the right layer
++- Always use `--retries=0` during the cycle
++- Run `cd frontend && yarn eslint <fixed-files>` after fixes
++- **DO NOT commit** — the user handles git operations
+diff --git a/.claude/skills/migrate-cypress/SKILL.md b/.claude/skills/migrate-cypress/SKILL.md
+new file mode 100644
+index 00000000000..559ac50e003
+--- /dev/null
++++ b/.claude/skills/migrate-cypress/SKILL.md
+@@ -0,0 +1,154 @@
++---
++name: migrate-cypress
++description: Migrate a Cypress test file to Playwright following Console's architecture. Use when user says "migrate", "convert cypress", "port to playwright", or provides a .cy.ts or .feature file path.
++argument-hint: "<path/to/file.cy.ts or .feature> [--analyze] [--dry-run]"
++allowed-tools: Read, Write, Edit, Bash(find *), Bash(grep *), Bash(ls *), Bash(npx tsc *), Bash(npx playwright *), Bash(git diff *), Bash(git status), mcp__plugin_playwright_playwright__browser_navigate, mcp__plugin_playwright_playwright__browser_snapshot, mcp__plugin_playwright_playwright__browser_click, mcp__plugin_playwright_playwright__browser_console_messages, mcp__plugin_playwright_playwright__browser_take_screenshot, mcp__plugin_playwright_playwright__browser_resize, mcp__plugin_playwright_playwright__browser_run_code_unsafe, mcp__plugin_playwright_playwright__browser_evaluate, mcp__plugin_playwright_playwright__browser_close, mcp__plugin_playwright_playwright__browser_type, mcp__plugin_playwright_playwright__browser_wait_for, mcp__plugin_playwright_playwright__browser_network_requests, AskUserQuestion
++---
++
++# Migrate: Cypress to Playwright
++
++Translate Cypress E2E tests into idiomatic Playwright code following Console's layered architecture. Adapted from [openshift-ui-tests-template/migrate.md](https://github.com/bmaio-redhat/openshift-ui-tests-template/blob/main/.cursor/commands/migrate.md).
++
++## Before Starting
++
++1. Check that `frontend/e2e/.env` exists. If missing, copy `frontend/e2e/.env.example` to `frontend/e2e/.env` and tell the user to fill in their cluster values before continuing.
++2. Read `.claude/migration-context.md` for the complete API translation tables, structural transformation rules, Console selector mappings, and migration checklist. That file is the single source of truth for all translation context.
++
++## Input
++
++- `/migrate-cypress <cypress-file-or-feature>` — full migration (analyze → implement → validate)
++- `/migrate-cypress <cypress-file-or-feature> --analyze` — analysis only, produce migration plan
++- `/migrate-cypress <cypress-file-or-feature> --dry-run` — generate code without writing files
++
++### Examples
++
++```
++/migrate-cypress frontend/packages/integration-tests/tests/cluster-settings/upstream-modal.cy.ts
++/migrate-cypress upstream-modal --analyze
++/migrate-cypress frontend/packages/dev-console/integration-tests/features/addFlow/ --dry-run
++```
++
++### Output File Mapping
++
++Migrated tests go under `e2e/tests/<package>/` based on their source package:
++
++| Source package                                           | Playwright project | Output directory            |
++| -------------------------------------------------------- | ------------------ | --------------------------- |
++| `packages/integration-tests/tests/<area>/`               | `console`          | `e2e/tests/console/<area>/` |
++| `packages/dev-console/integration-tests/`                | `dev-console`      | `e2e/tests/dev-console/`    |
++| `packages/helm-plugin/integration-tests/`                | `helm`             | `e2e/tests/helm/`           |
++| `packages/knative-plugin/integration-tests/`             | `knative`          | `e2e/tests/knative/`        |
++| `packages/operator-lifecycle-manager/integration-tests/` | `olm`              | `e2e/tests/olm/`            |
++| `packages/topology/integration-tests/`                   | `topology`         | `e2e/tests/topology/`       |
++| `packages/shipwright-plugin/integration-tests/`          | `shipwright`       | `e2e/tests/shipwright/`     |
++| `packages/webterminal-plugin/integration-tests/`         | `webterminal`      | `e2e/tests/webterminal/`    |
++| `packages/console-telemetry-plugin/integration-tests/`   | `telemetry`        | `e2e/tests/telemetry/`      |
++
++Tests requiring developer auth go in a `developer/` subdirectory (e.g. `e2e/tests/dev-console/developer/`).
++
++## Workflow
++
++### Phase 1: Analysis
++
++1. Read the Cypress file and all imported views, constants, types, and custom commands. For `.feature` files, also resolve step definitions (`support/step-definitions/`), page actions (`support/pages/`), and page object selectors (`support/pageObjects/`).
++2. Extract intent — document what each `it` block or `Scenario` tests in plain language
++3. Search existing page objects and clients for reusable methods: `find frontend/e2e/pages -name "*.ts" 2>/dev/null`
++4. Identify gaps — missing locators, page object methods
++5. Determine test isolation strategy (self-contained, shared resources, or API-created — see migration-context.md for details)
++6. Produce a migration plan mapping Cypress blocks to Playwright components
++
++Expected output: a structured plan listing each test's intent, the Playwright components to use/create, the isolation strategy, and the output file path.
++
++**Stop here if `--analyze` was specified.**
++
++### Phase 2: Selector Discovery (Playwright MCP)
++
++1. Resize viewport to 1920×1080
++2. Navigate to target pages in the live UI
++3. Snapshot accessibility tree to discover `data-test` attributes and element roles
++4. Verify interactive elements work (click, type)
++5. Update migration plan with verified selectors
++
++If MCP is unavailable or no cluster is reachable, log a warning: "Playwright MCP not available — selectors translated literally. They may be stale. Run `/debug-test` after deployment to verify." Proceed to Phase 3.
++
++### Phase 3: Implementation
++
++1. Create/extend page objects with locators and interaction methods. Example:
++   ```typescript
++   // e2e/pages/cluster-settings.ts
++   export class ClusterSettingsPage extends BasePage {
++     private readonly detailsTab = this.page.locator(
++       '[data-test-id="horizontal-link-Details"]',
++     );
++     async navigateToDetails() {
++       await this.goTo("/settings/cluster");
++       await this.detailsTab.waitFor();
++     }
++   }
++   ```
++2. Write the spec file following project template:
++   - `import { test, expect } from '../../fixtures'`
++   - `test.describe` with tags (e.g. `{ tag: ['@smoke'] }`)
++   - Admin tests go in `e2e/tests/<package>/`, developer tests in `e2e/tests/<package>/developer/`
++   - Self-contained: create → assert → cleanup in each `test()`
++   - Use `test.step()` for logical grouping when a test has 3+ distinct phases
++   - For Gherkin `Scenario Outline` + `Examples`: use `for...of` loop
++   - For `@manual` / `@broken-test`: use `test.skip(true, 'reason')` or `test.fixme('reason')` with Jira link
++3. Run `npx tsc --noEmit -p e2e/tsconfig.json` and `cd frontend && yarn eslint <generated-files>` — fix any type or lint errors
++
++**Print code without writing if `--dry-run` was specified.**
++
++### Phase 4: Validation
++
++1. Run with `npx playwright test --project=<package> <output-file> --retries=0 --ui`. The project name matches the package directory under `e2e/tests/` (e.g. `--project=helm`, `--project=console`). For developer tests, use `--project=<package>-developer`. Note: `e2e/.env` may override `WEB_CONSOLE_URL` with a remote cluster URL. If running against localhost, ensure the user has updated `e2e/.env` or override with `WEB_CONSOLE_URL=http://localhost:9000`.
++2. Debug failures using Playwright MCP (navigate → snapshot → console → network)
++3. Verify no orphaned resources after run
++4. Produce migration summary:
++   ```
++   Migration complete: <source-file> → <output-file>
++     Tests migrated: N
++     Page objects created: [list]
++     Page objects reused: [list]
++     Files written: [list]
++     Validation: passed
++
++     Test mapping:
++     | Cypress test                          | Playwright test                       | Assertions |
++     |---------------------------------------|---------------------------------------|------------|
++     | it('does something')                  | test('does something')                | 3 → 3      |
++     | it('handles edge case')               | test('handles edge case')             | 2 → 2      |
++     | ...                                   | ...                                   | ...        |
++     | Total                                 |                                       | 8 → 8      |
++   ```
++   The "Assertions" column shows `<cypress count> → <playwright count>`. If a Playwright test has fewer assertions than its Cypress counterpart, flag it with `⚠` and investigate — assertions may have been silently dropped.
++5. If validation passes, delete the original Cypress test file. Also check imported view and support files — if they are no longer imported by any other Cypress test, delete them too.
++
++## Key Translation Rules
++
++- **Never transliterate** — understand intent, use idiomatic Playwright APIs
++- **Self-contained tests** — merge sequential `it` blocks into one `test()` with `test.step()`
++- **No fixed waits** — replace `cy.wait(ms)` with condition-based waits or assertion timeouts
++- **No shell commands** — replace `cy.exec('oc ...')` with `KubernetesClient`
++- **Framework-first** — use existing page objects before creating new ones
++- **Correct layer** — locators in page objects, test scenarios in specs
++
++## Troubleshooting
++
++### Playwright MCP not connected
++
++If MCP tools fail with "tool not found" or "connection refused": skip Phase 2, translate selectors literally, and warn the user. Selectors can be verified later with `/debug-test`.
++
++### TypeScript errors in generated files
++
++If `npx tsc --noEmit` reports errors in the generated spec or page object: read the errors, fix missing imports or type mismatches, and re-run. Common causes: missing page object import, wrong fixture type, incorrect `KubernetesClient` method signature.
++
++### Test passes but assertions are missing
++
++Compare assertion count with the original Cypress test. If the migrated test has fewer assertions, the agent may have silently dropped failing ones. Restore them using the intent documented in Phase 1.
++
++## Rules
++
++- Always read the Cypress source before writing any code
++- Use Playwright MCP to verify selectors against the live UI
++- Follow `.claude/migration-context.md` for API translation tables
++- **DO NOT commit** — the user handles git operations
+diff --git a/AGENTS.md b/AGENTS.md
+index 0a6091f1612..1f10761186e 100644
+--- a/AGENTS.md
++++ b/AGENTS.md
+@@ -21,21 +21,22 @@ Static plugins are built into the console bundle and are core parts of the appli
+ - **Type safety:** When writing code for static plugins, ensure that all `$codeRef` ALWAYS **reference the corresponding extension type from the dynamic plugin SDK package**. This ensures type safety and consistency across both static and dynamic plugins.
+ 
+ Example:
++
+ ```jsonc
+ // In console-extensions.json of a static plugin
+ {
+   "type": "console.flag",
+-  "$codeRef": "exampleFlag.handler"
++  "$codeRef": "exampleFlag.handler",
+ }
+ ```
+ 
+ ```typescript
+ // In the exampleFlag exposed module of the static plugin:
+-import type { FeatureFlagHandler } from '@console/dynamic-plugin-sdk/src/extensions/feature-flags';
++import type { FeatureFlagHandler } from "@console/dynamic-plugin-sdk/src/extensions/feature-flags";
+ 
+ // Exposed type from dynamic plugin SDK is used for type safety
+ export const handler: FeatureFlagHandler = (setFeatureFlag) => {
+-  setFeatureFlag('EXAMPLE', true);
++  setFeatureFlag("EXAMPLE", true);
+ };
+ ```
+ 
+@@ -121,3 +122,7 @@ These files are the single source of truth for architecture, coding standards, a
+ - [Dynamic Plugin SDK documentation](frontend/packages/console-dynamic-plugin-sdk/README.md) - architecture, design principles, and development guidelines. Consult before modifying SDK code.
+ - [Extension Types Reference](frontend/packages/console-dynamic-plugin-sdk/docs/console-extensions.md) - complete extension type definitions, naming conventions (`console.*`), and deprecation notices.
+ - [Console API Documentation](frontend/packages/console-dynamic-plugin-sdk/docs/api.md) - React components, hooks, utilities, and TypeScript types exported by the SDK.
++
++## Playwright migration
++
++We are migrating Cypress e2e tests to Playwright. Use `/migrate-cypress` to convert test files and `/debug-test` to fix failing tests. Shared migration context (translation tables, structural rules, checklist) is in `.claude/migration-context.md`.

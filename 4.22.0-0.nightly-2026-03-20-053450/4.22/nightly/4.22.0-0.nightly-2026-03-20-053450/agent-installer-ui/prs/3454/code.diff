@@ -1,0 +1,65 @@
+diff --git a/apps/assisted-disconnected-ui/proxy/bridge/handler.go b/apps/assisted-disconnected-ui/proxy/bridge/handler.go
+index 7b7f6da97e..2b4ecdc2a7 100644
+--- a/apps/assisted-disconnected-ui/proxy/bridge/handler.go
++++ b/apps/assisted-disconnected-ui/proxy/bridge/handler.go
+@@ -16,8 +16,9 @@ import (
+ const AssistedPingEndpoint = "/api/assisted-install/v2/clusters"
+ 
+ type handler struct {
+-	target *url.URL
+-	proxy  *httputil.ReverseProxy
++	target    *url.URL
++	proxy     *httputil.ReverseProxy
++	authToken string
+ }
+ 
+ func (h handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+@@ -26,6 +27,9 @@ func (h handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+ 	r.Header.Set("X-Forwarded-Host", r.Header.Get("Host"))
+ 	r.Host = h.target.Host
+ 	r.URL.Path = mux.Vars(r)["forward"]
++	if h.authToken != "" {
++		r.Header.Set("Authorization", h.authToken)
++	}
+ 	h.proxy.ServeHTTP(w, r)
+ }
+ 
+@@ -56,10 +60,18 @@ func NewAssistedAPIHandler(tlsConfig *tls.Config) (*handler, error) {
+ 			TLSClientConfig: tlsConfig,
+ 		},
+ 	}
+-	resp, err := client.Get(fmt.Sprintf("%s%s", config.AssistedApiUrl, AssistedPingEndpoint))
++	req, err := http.NewRequest("GET", fmt.Sprintf("%s%s", config.AssistedApiUrl, AssistedPingEndpoint), nil)
++	if err != nil {
++		return nil, fmt.Errorf("failed to create health check request: %w", err)
++	}
++	if config.UserAuthToken != "" {
++		req.Header.Set("Authorization", config.UserAuthToken)
++	}
++	resp, err := client.Do(req)
+ 	if err != nil {
+ 		return nil, fmt.Errorf("failed to connect to Assisted Installer: %w", err)
+ 	}
++	defer resp.Body.Close()
+ 	if resp.StatusCode != http.StatusOK {
+ 		return nil, fmt.Errorf("unexpected response code from Assisted Installer: %v", resp.StatusCode)
+ 	}
+@@ -70,5 +82,5 @@ func NewAssistedAPIHandler(tlsConfig *tls.Config) (*handler, error) {
+ 		TLSClientConfig: tlsConfig,
+ 	}
+ 
+-	return &handler{target: target, proxy: proxy}, nil
++	return &handler{target: target, proxy: proxy, authToken: config.UserAuthToken}, nil
+ }
+diff --git a/apps/assisted-disconnected-ui/proxy/config/config.go b/apps/assisted-disconnected-ui/proxy/config/config.go
+index cc98c3cbf6..c4be68205a 100644
+--- a/apps/assisted-disconnected-ui/proxy/config/config.go
++++ b/apps/assisted-disconnected-ui/proxy/config/config.go
+@@ -11,6 +11,7 @@ var (
+ 	ApiInsecure    = getEnvVar("API_INSECURE_SKIP_VERIFY", "false")
+ 	TlsKeyPath     = getEnvVar("TLS_KEY", "")
+ 	TlsCertPath    = getEnvVar("TLS_CERT", "")
++	UserAuthToken  = getEnvVar("USER_AUTH_TOKEN", "")
+ )
+ 
+ func getEnvUrlVar(key string, defaultValue string) string {

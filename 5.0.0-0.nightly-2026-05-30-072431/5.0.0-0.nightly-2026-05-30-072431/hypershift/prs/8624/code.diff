@@ -1,0 +1,174 @@
+diff --git a/.github/workflows/gocacheprog-test-reusable.yaml b/.github/workflows/gocacheprog-test-reusable.yaml
+new file mode 100644
+index 00000000000..f8a0d80091e
+--- /dev/null
++++ b/.github/workflows/gocacheprog-test-reusable.yaml
+@@ -0,0 +1,25 @@
++name: gocacheprog Tests (Reusable)
++
++on:
++  workflow_call:
++
++permissions:
++  contents: read
++
++jobs:
++  test:
++    name: gocacheprog Unit Tests
++    runs-on: arc-runner-set
++    timeout-minutes: 10
++    steps:
++      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
++        with:
++          persist-credentials: false
++      - uses: actions/setup-go@4a3601121dd01d1626a1e23e37211e3254c1c06c # v6.4.0
++        env:
++          HOME: /tmp
++        with:
++          go-version-file: contrib/ci/gocacheprog/go.mod
++          cache: false
++      - name: Run tests
++        run: cd contrib/ci/gocacheprog && go test -race -count=1 ./...
+diff --git a/.github/workflows/gocacheprog-test.yaml b/.github/workflows/gocacheprog-test.yaml
+new file mode 100644
+index 00000000000..53cfad779a0
+--- /dev/null
++++ b/.github/workflows/gocacheprog-test.yaml
+@@ -0,0 +1,15 @@
++name: gocacheprog Tests
++
++on:
++  pull_request:
++    branches:
++      - main
++      - release-4.22
++    paths:
++      - contrib/ci/gocacheprog/**
++
++jobs:
++  test:
++    uses: openshift/hypershift/.github/workflows/gocacheprog-test-reusable.yaml@main
++    permissions:
++      contents: read
+diff --git a/contrib/ci/gocacheprog/main.go b/contrib/ci/gocacheprog/main.go
+index d2ad024be99..74711d27149 100644
+--- a/contrib/ci/gocacheprog/main.go
++++ b/contrib/ci/gocacheprog/main.go
+@@ -173,7 +173,7 @@ func handlePut(req *request, rwDir string) response {
+ 	if err := os.MkdirAll(filepath.Dir(dPath), 0o777); err != nil {
+ 		return response{ID: req.ID, Err: err.Error()}
+ 	}
+-	if err := os.WriteFile(dPath, req.Body, 0o666); err != nil {
++	if err := writeFileAtomic(dPath, req.Body); err != nil {
+ 		return response{ID: req.ID, Err: err.Error()}
+ 	}
+ 
+@@ -187,10 +187,31 @@ func handlePut(req *request, rwDir string) response {
+ 		req.BodySize,
+ 		time.Now().UnixNano(),
+ 	)
+-	if err := os.WriteFile(aPath, []byte(entry), 0o666); err != nil {
++	if err := writeFileAtomic(aPath, []byte(entry)); err != nil {
+ 		return response{ID: req.ID, Err: err.Error()}
+ 	}
+ 
+ 	return response{ID: req.ID, DiskPath: dPath}
+ }
+ 
++// writeFileAtomic writes data to a temporary file in the same directory
++// then renames it to the target path. This prevents concurrent readers
++// from seeing a truncated file.
++func writeFileAtomic(path string, data []byte) error {
++	tmp, err := os.CreateTemp(filepath.Dir(path), ".tmp-*")
++	if err != nil {
++		return err
++	}
++	tmpName := tmp.Name()
++	if _, err := tmp.Write(data); err != nil {
++		tmp.Close()
++		os.Remove(tmpName)
++		return err
++	}
++	if err := tmp.Close(); err != nil {
++		os.Remove(tmpName)
++		return err
++	}
++	return os.Rename(tmpName, path)
++}
++
+diff --git a/contrib/ci/gocacheprog/main_test.go b/contrib/ci/gocacheprog/main_test.go
+index 0e005cc1761..a879b04b279 100644
+--- a/contrib/ci/gocacheprog/main_test.go
++++ b/contrib/ci/gocacheprog/main_test.go
+@@ -6,6 +6,7 @@ import (
+ 	"os"
+ 	"path/filepath"
+ 	"sync"
++	"sync/atomic"
+ 	"testing"
+ 	"time"
+ )
+@@ -419,3 +420,63 @@ func TestConcurrentPutAndGet(t *testing.T) {
+ 	}
+ 	wg.Wait()
+ }
++
++func TestConcurrentPutSameOutputID(t *testing.T) {
++	t.Parallel()
++	rwDir := t.TempDir()
++	outputID := mustDecodeHex(t, "7777777777777777")
++	body := []byte("shared output content that all writers agree on")
++
++	// Seed one entry so GETs can find it while PUTs overwrite the data file.
++	seedAction := mustDecodeHex(t, fmt.Sprintf("%016x", 2000))
++	seedReq := &request{
++		ID: 0, Command: "put",
++		ActionID: seedAction, OutputID: outputID,
++		Body: body, BodySize: int64(len(body)),
++	}
++	if resp := handlePut(seedReq, rwDir); resp.Err != "" {
++		t.Fatalf("seed put: %s", resp.Err)
++	}
++
++	// Interleave PUTs (different ActionIDs, same OutputID) with GETs that
++	// read the data file via DiskPath. Without atomic writes, a PUT's
++	// O_TRUNC would momentarily zero the file, causing a reader to see
++	// truncated/empty content.
++	var wg sync.WaitGroup
++	var badReads atomic.Int64
++	for i := range 100 {
++		wg.Add(2)
++		go func() {
++			defer wg.Done()
++			actionID := mustDecodeHex(t, fmt.Sprintf("%016x", i+2000))
++			putReq := &request{
++				ID: int64(i), Command: "put",
++				ActionID: actionID, OutputID: outputID,
++				Body: body, BodySize: int64(len(body)),
++			}
++			if resp := handlePut(putReq, rwDir); resp.Err != "" {
++				t.Errorf("put %d error: %s", i, resp.Err)
++			}
++		}()
++		go func() {
++			defer wg.Done()
++			getReq := &request{ID: int64(i + 5000), Command: "get", ActionID: seedAction}
++			resp := handleGet(getReq, "", rwDir)
++			if resp.Miss {
++				return
++			}
++			data, err := os.ReadFile(resp.DiskPath)
++			if err != nil {
++				return
++			}
++			if string(data) != string(body) {
++				badReads.Add(1)
++			}
++		}()
++	}
++	wg.Wait()
++
++	if n := badReads.Load(); n > 0 {
++		t.Errorf("got %d reads with corrupted data from concurrent PUT/GET on same OutputID", n)
++	}
++}

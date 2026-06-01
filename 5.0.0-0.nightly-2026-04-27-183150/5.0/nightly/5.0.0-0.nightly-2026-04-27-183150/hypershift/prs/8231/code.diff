@@ -1,0 +1,1131 @@
+diff --git a/test/e2e/nodepool_test.go b/test/e2e/nodepool_test.go
+index 7b18f7d9dd1..7d5f0046ad3 100644
+--- a/test/e2e/nodepool_test.go
++++ b/test/e2e/nodepool_test.go
+@@ -470,7 +470,7 @@ func validateCAPIConditionBubblingDuringProvisioning(t *testing.T, ctx context.C
+ 	machinesUnreadyObserved := pollForConditionFalseWithAggregatedMessage(t, ctx, client, nodePool,
+ 		hyperv1.NodePoolAllMachinesReadyConditionType, "ready")
+ 	if !machinesUnreadyObserved {
+-		t.Logf("AllMachinesReady was not observed as False with aggregated message during provisioning "+
++		t.Logf("AllMachinesReady was not observed as False with aggregated message during provisioning " +
+ 			"(CAPI provider may have set Ready condition before we could observe nil state)")
+ 	}
+ }
+diff --git a/test/e2e/v2/backuprestore/cli.go b/test/e2e/v2/backuprestore/cli.go
+index c19e9cb0074..78d6529680a 100644
+--- a/test/e2e/v2/backuprestore/cli.go
++++ b/test/e2e/v2/backuprestore/cli.go
+@@ -59,6 +59,7 @@ type OADPBackupOptions struct {
+ 	Render                   bool     // Render the backup object to STDOUT instead of creating it
+ 	IncludedResources        []string // Comma-separated list of resources to include
+ 	IncludeNamespaces        []string // Additional namespaces to include
++	UseEtcdSnapshot          bool     // Use etcd snapshot mode (--use-etcd-snapshot)
+ }
+ 
+ // OADPRestoreOptions contains options for creating an OADP restore
+@@ -79,6 +80,7 @@ type OADPRestoreOptions struct {
+ 	Render                 bool     // Render the restore object to STDOUT instead of creating it
+ 	RestorePVs             *bool    // Restore persistent volumes (default: true)
+ 	PreserveNodePorts      *bool    // Preserve NodePort assignments during restore (default: true)
++	UseEtcdSnapshot        bool     // Use etcd snapshot mode (--use-etcd-snapshot)
+ }
+ 
+ // OADPScheduleOptions contains options for creating an OADP backup schedule
+@@ -101,6 +103,7 @@ type OADPScheduleOptions struct {
+ 	Paused                   bool     // Create schedule in paused state
+ 	UseOwnerReferences       bool     // Use owner references in backup objects
+ 	SkipImmediately          bool     // Skip immediate backup after schedule creation
++	UseEtcdSnapshot          bool     // Use etcd snapshot mode (--use-etcd-snapshot)
+ }
+ 
+ // FixDrOidcIamOptions contains options for fixing OIDC identity provider during disaster recovery
+@@ -271,6 +274,9 @@ func buildBackupArgs(opts *OADPBackupOptions) []string {
+ 	if opts.Render {
+ 		args = append(args, "--render")
+ 	}
++	if opts.UseEtcdSnapshot {
++		args = append(args, "--use-etcd-snapshot")
++	}
+ 
+ 	// Slice flags
+ 	if len(opts.IncludedResources) > 0 {
+@@ -328,6 +334,9 @@ func buildRestoreArgs(opts *OADPRestoreOptions) []string {
+ 	if opts.Render {
+ 		args = append(args, "--render")
+ 	}
++	if opts.UseEtcdSnapshot {
++		args = append(args, "--use-etcd-snapshot")
++	}
+ 
+ 	// Slice flags
+ 	if len(opts.IncludeNamespaces) > 0 {
+@@ -383,6 +392,9 @@ func buildScheduleArgs(opts *OADPScheduleOptions) []string {
+ 	if opts.SkipImmediately {
+ 		args = append(args, "--skip-immediately")
+ 	}
++	if opts.UseEtcdSnapshot {
++		args = append(args, "--use-etcd-snapshot")
++	}
+ 
+ 	// Slice flags
+ 	if len(opts.IncludedResources) > 0 {
+diff --git a/test/e2e/v2/backuprestore/etcd_snapshot.go b/test/e2e/v2/backuprestore/etcd_snapshot.go
+new file mode 100644
+index 00000000000..79031d233c3
+--- /dev/null
++++ b/test/e2e/v2/backuprestore/etcd_snapshot.go
+@@ -0,0 +1,184 @@
++//go:build e2ev2 && backuprestore
++
++package backuprestore
++
++import (
++	"bufio"
++	"context"
++	"fmt"
++	"io"
++	"strings"
++
++	"github.com/go-logr/logr"
++	hyperv1 "github.com/openshift/hypershift/api/hypershift/v1beta1"
++	"github.com/openshift/hypershift/test/e2e/v2/internal"
++
++	corev1 "k8s.io/api/core/v1"
++	"k8s.io/apimachinery/pkg/api/meta"
++	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
++	"k8s.io/apimachinery/pkg/util/wait"
++	"k8s.io/client-go/kubernetes"
++	crclient "sigs.k8s.io/controller-runtime/pkg/client"
++)
++
++const (
++	// EtcdPodName is the name of the etcd pod whose init container logs are verified.
++	EtcdPodName = "etcd-0"
++	// EtcdInitContainerName is the name of the init container in the etcd pod.
++	EtcdInitContainerName = "etcd-init"
++
++	// HCPEtcdBackupNamePrefix is the prefix used by the OADP plugin when creating
++	// HCPEtcdBackup resources. The full name follows the pattern: oadp-<BackupName>-<random>.
++	HCPEtcdBackupNamePrefix = "oadp-"
++
++	// logRestoringSnapshot is emitted by etcdutl/etcdctl when starting a snapshot restore.
++	logRestoringSnapshot = "restoring snapshot"
++	// logRestoredSnapshot is emitted by etcdutl/etcdctl when snapshot restore completes.
++	logRestoredSnapshot = "restored snapshot"
++	// logNotRestoringSnapshot indicates the restore was skipped because data already existed.
++	logNotRestoringSnapshot = "not empty, not restoring snapshot"
++)
++
++// MatchesHCPEtcdBackupName checks whether an HCPEtcdBackup resource name matches the
++// expected naming pattern for a given OADP backup name. The OADP plugin creates
++// HCPEtcdBackup resources with the naming pattern: oadp-<BackupName>-<random>.
++func MatchesHCPEtcdBackupName(hcpEtcdBackupName, oadpBackupName string) bool {
++	return strings.HasPrefix(hcpEtcdBackupName, HCPEtcdBackupNamePrefix+oadpBackupName+"-")
++}
++
++// WaitForHCPEtcdBackupCondition waits for an HCPEtcdBackup resource matching the given
++// OADP backup name to have a BackupCompleted condition with the specified status.
++// HCPEtcdBackup names follow the pattern: oadp-<BackupName>-<random>.
++func WaitForHCPEtcdBackupCondition(testCtx *internal.TestContext, backupName string, expectedStatus metav1.ConditionStatus) error {
++	return wait.PollUntilContextTimeout(testCtx.Context, PollInterval, BackupTimeout, true, func(ctx context.Context) (bool, error) {
++		hcpEtcdBackupList := &hyperv1.HCPEtcdBackupList{}
++		if err := testCtx.MgmtClient.List(ctx, hcpEtcdBackupList, crclient.InNamespace(testCtx.ControlPlaneNamespace)); err != nil {
++			return false, fmt.Errorf("failed to list HCPEtcdBackup resources: %w", err)
++		}
++
++		for _, backup := range hcpEtcdBackupList.Items {
++			if !MatchesHCPEtcdBackupName(backup.Name, backupName) {
++				continue
++			}
++			condition := meta.FindStatusCondition(backup.Status.Conditions, string(hyperv1.BackupCompleted))
++			if condition == nil {
++				return false, nil
++			}
++			if condition.Status == expectedStatus {
++				return true, nil
++			}
++			// If the condition is explicitly False, the backup failed - stop polling.
++			if expectedStatus == metav1.ConditionTrue && condition.Status == metav1.ConditionFalse {
++				return false, fmt.Errorf("HCPEtcdBackup %s has BackupCompleted=False: reason=%s, message=%s",
++					backup.Name, condition.Reason, condition.Message)
++			}
++			return false, nil
++		}
++		return false, nil
++	})
++}
++
++// VerifyEtcdInitLogs retrieves the etcd-init container logs from the etcd-0 pod in the
++// control plane namespace and verifies that they contain expected snapshot restore traces.
++// The expected log lines from etcdutl/etcdctl indicate a successful snapshot restore:
++//   - "restoring snapshot" (restore started)
++//   - "restored snapshot" (restore completed)
++//
++// It also checks that the restore was not skipped due to existing data:
++//   - "not empty, not restoring snapshot" must NOT be present
++func VerifyEtcdInitLogs(ctx context.Context, logger logr.Logger, kubeClient kubernetes.Interface, controlPlaneNamespace string) error {
++	podLogOpts := &corev1.PodLogOptions{
++		Container: EtcdInitContainerName,
++	}
++
++	req := kubeClient.CoreV1().Pods(controlPlaneNamespace).GetLogs(EtcdPodName, podLogOpts)
++	logStream, err := req.Stream(ctx)
++	if err != nil {
++		return fmt.Errorf("failed to stream %s container logs from %s: %w", EtcdInitContainerName, EtcdPodName, err)
++	}
++	defer logStream.Close()
++
++	result, err := parseEtcdInitLogs(logStream)
++	if err != nil {
++		return err
++	}
++
++	logger.Info("etcd-init container logs scanned", "lines", result.lineCount)
++
++	if result.restoreSkipped {
++		for _, line := range result.tailLines {
++			logger.V(1).Info("etcd-init tail", "log", line)
++		}
++		return fmt.Errorf("etcd-init logs contain '%s'; restore was skipped because data directory was not empty", logNotRestoringSnapshot)
++	}
++	if !result.restoreStarted {
++		for _, line := range result.tailLines {
++			logger.V(1).Info("etcd-init tail", "log", line)
++		}
++		return fmt.Errorf("etcd-init logs do not contain '%s'; snapshot restore may not have started", logRestoringSnapshot)
++	}
++	if !result.restoreCompleted {
++		for _, line := range result.tailLines {
++			logger.V(1).Info("etcd-init tail", "log", line)
++		}
++		return fmt.Errorf("etcd-init logs do not contain '%s'; snapshot restore may have failed", logRestoredSnapshot)
++	}
++
++	return nil
++}
++
++// etcdInitLogResult holds the results of parsing etcd-init container logs.
++type etcdInitLogResult struct {
++	restoreStarted   bool
++	restoreCompleted bool
++	restoreSkipped   bool
++	lineCount        int
++	tailLines        []string
++}
++
++// parseEtcdInitLogs scans etcd-init container log output and checks for expected
++// snapshot restore trace messages from etcdutl/etcdctl.
++func parseEtcdInitLogs(reader io.Reader) (*etcdInitLogResult, error) {
++	const tailSize = 50
++
++	result := &etcdInitLogResult{}
++
++	// Use a ring buffer so old strings become eligible for GC immediately
++	// instead of being retained by the underlying slice array.
++	ring := make([]string, tailSize)
++	ringIdx := 0
++	ringLen := 0
++
++	scanner := bufio.NewScanner(reader)
++	buf := make([]byte, 256*1024)
++	scanner.Buffer(buf, 512*1024)
++	for scanner.Scan() {
++		line := scanner.Text()
++		result.lineCount++
++		ring[ringIdx] = line
++		ringIdx = (ringIdx + 1) % tailSize
++		if ringLen < tailSize {
++			ringLen++
++		}
++		lower := strings.ToLower(line)
++		if strings.Contains(lower, logNotRestoringSnapshot) {
++			result.restoreSkipped = true
++		} else if strings.Contains(lower, logRestoredSnapshot) {
++			result.restoreCompleted = true
++		} else if strings.Contains(lower, logRestoringSnapshot) {
++			result.restoreStarted = true
++		}
++	}
++	if err := scanner.Err(); err != nil {
++		return nil, fmt.Errorf("error reading etcd-init logs: %w", err)
++	}
++
++	// Flatten the ring buffer into chronological order.
++	result.tailLines = make([]string, ringLen)
++	start := (ringIdx - ringLen + tailSize) % tailSize
++	for i := range ringLen {
++		result.tailLines[i] = ring[(start+i)%tailSize]
++	}
++
++	return result, nil
++}
+diff --git a/test/e2e/v2/backuprestore/etcd_snapshot_test.go b/test/e2e/v2/backuprestore/etcd_snapshot_test.go
+new file mode 100644
+index 00000000000..04456286206
+--- /dev/null
++++ b/test/e2e/v2/backuprestore/etcd_snapshot_test.go
+@@ -0,0 +1,125 @@
++//go:build e2ev2 && backuprestore
++
++package backuprestore
++
++import (
++	"strings"
++	"testing"
++
++	. "github.com/onsi/gomega"
++)
++
++func TestParseEtcdInitLogs(t *testing.T) {
++	tests := []struct {
++		name             string
++		logs             string
++		restoreStarted   bool
++		restoreCompleted bool
++		restoreSkipped   bool
++		lineCount        int
++	}{
++		{
++			name: "When etcd-init logs show successful snapshot restore it should detect both restoring and restored",
++			logs: `INFO: using etcdutl (etcd 3.6+)
+++----------+----------+------------+------------+---------+
++|   HASH   | REVISION | TOTAL KEYS | TOTAL SIZE | VERSION |
+++----------+----------+------------+------------+---------+
++| 5643d825 |   578454 |       3209 |      49 MB |   3.6.0 |
+++----------+----------+------------+------------+---------+
++2026-04-13T07:33:20Z    info    snapshot/v3_snapshot.go:305     restoring snapshot      {"path": "/tmp/snapshot"}
++2026-04-13T07:33:20Z    info    membership/cluster.go:424       added member
++2026-04-13T07:33:20Z    info    snapshot/v3_snapshot.go:333     restored snapshot       {"path": "/tmp/snapshot"}`,
++			restoreStarted:   true,
++			restoreCompleted: true,
++			restoreSkipped:   false,
++			lineCount:        9,
++		},
++		{
++			name: "When data directory is not empty it should detect restore was skipped",
++			logs: `/var/lib/data not empty, not restoring snapshot`,
++			restoreStarted:   false,
++			restoreCompleted: false,
++			restoreSkipped:   true,
++			lineCount:        1,
++		},
++		{
++			name:             "When logs contain only curl progress it should detect neither restore started nor completed",
++			logs:             `  % Total    % Received % Xferd  Average Speed   Time    Time     Time  Current`,
++			restoreStarted:   false,
++			restoreCompleted: false,
++			restoreSkipped:   false,
++			lineCount:        1,
++		},
++		{
++			name: "When restore starts but does not complete it should detect only restoring",
++			logs: `INFO: using etcdutl (etcd 3.6+)
++2026-04-13T07:33:20Z    info    snapshot/v3_snapshot.go:305     restoring snapshot      {"path": "/tmp/snapshot"}`,
++			restoreStarted:   true,
++			restoreCompleted: false,
++			restoreSkipped:   false,
++			lineCount:        2,
++		},
++		{
++			name:             "When logs are empty it should detect nothing",
++			logs:             ``,
++			restoreStarted:   false,
++			restoreCompleted: false,
++			restoreSkipped:   false,
++			lineCount:        0,
++		},
++	}
++
++	for _, tt := range tests {
++		t.Run(tt.name, func(t *testing.T) {
++			g := NewWithT(t)
++			reader := strings.NewReader(tt.logs)
++			result, err := parseEtcdInitLogs(reader)
++			g.Expect(err).NotTo(HaveOccurred())
++			g.Expect(result.restoreStarted).To(Equal(tt.restoreStarted), "restoreStarted mismatch")
++			g.Expect(result.restoreCompleted).To(Equal(tt.restoreCompleted), "restoreCompleted mismatch")
++			g.Expect(result.restoreSkipped).To(Equal(tt.restoreSkipped), "restoreSkipped mismatch")
++			g.Expect(result.lineCount).To(Equal(tt.lineCount), "lineCount mismatch")
++		})
++	}
++}
++
++func TestMatchesHCPEtcdBackupName(t *testing.T) {
++	tests := []struct {
++		name               string
++		hcpEtcdBackupName  string
++		oadpBackupName     string
++		expectedMatch      bool
++	}{
++		{
++			name:              "When HCPEtcdBackup name matches the oadp pattern it should return true",
++			hcpEtcdBackupName: "oadp-mycluster-mynamespace-abc123-xyz78",
++			oadpBackupName:    "mycluster-mynamespace-abc123",
++			expectedMatch:     true,
++		},
++		{
++			name:              "When HCPEtcdBackup name does not match it should return false",
++			hcpEtcdBackupName: "some-other-backup",
++			oadpBackupName:    "mycluster-mynamespace-abc123",
++			expectedMatch:     false,
++		},
++		{
++			name:              "When HCPEtcdBackup name is the exact backup name without prefix it should return false",
++			hcpEtcdBackupName: "mycluster-mynamespace-abc123",
++			oadpBackupName:    "mycluster-mynamespace-abc123",
++			expectedMatch:     false,
++		},
++		{
++			name:              "When HCPEtcdBackup name only shares a backup name prefix it should return false",
++			hcpEtcdBackupName: "oadp-mycluster-mynamespace-abc1234-xyz78",
++			oadpBackupName:    "mycluster-mynamespace-abc123",
++			expectedMatch:     false,
++		},
++	}
++
++	for _, tt := range tests {
++		t.Run(tt.name, func(t *testing.T) {
++			g := NewWithT(t)
++			g.Expect(MatchesHCPEtcdBackupName(tt.hcpEtcdBackupName, tt.oadpBackupName)).To(Equal(tt.expectedMatch))
++		})
++	}
++}
+diff --git a/test/e2e/v2/backuprestore/velero.go b/test/e2e/v2/backuprestore/velero.go
+index c0a1db2afc2..6648a91d2fa 100644
+--- a/test/e2e/v2/backuprestore/velero.go
++++ b/test/e2e/v2/backuprestore/velero.go
+@@ -5,6 +5,8 @@ package backuprestore
+ import (
+ 	"context"
+ 	"fmt"
++	"log"
++	"slices"
+ 	"sort"
+ 	"strings"
+ 	"time"
+@@ -426,3 +428,245 @@ func DeleteOADPSchedule(testCtx *internal.TestContext, scheduleName string) erro
+ 
+ 	return nil
+ }
++
++// DPAPluginState captures the original DPA state so that cleanup can restore
++// the defaultPlugins list after a test run.
++type DPAPluginState struct {
++	// Name is the name of the DPA that was modified.
++	Name string
++	// OriginalPlugins is the defaultPlugins list before modification.
++	OriginalPlugins []string
++	// PluginsModified indicates whether the DPA was actually updated.
++	PluginsModified bool
++}
++
++var dpaGVK = schema.GroupVersionKind{
++	Group:   "oadp.openshift.io",
++	Version: "v1alpha1",
++	Kind:    "DataProtectionApplicationList",
++}
++
++// EnsureDPAHypershiftPlugin ensures the first DataProtectionApplication in
++// DefaultOADPNamespace has the hypershift plugin configured. The plugin can be
++// present either in spec.configuration.velero.defaultPlugins (as "hypershift")
++// or in spec.configuration.velero.customPlugins (as an entry named
++// "hypershift-oadp-plugin"). If the plugin is already present via either
++// mechanism this is a no-op. When the plugin is appended to defaultPlugins
++// the function waits for the Velero pod to restart and become ready.
++func EnsureDPAHypershiftPlugin(testCtx *internal.TestContext) (*DPAPluginState, error) {
++	client := testCtx.MgmtClient
++	ctx := testCtx.Context
++
++	dpaList := &unstructured.UnstructuredList{}
++	dpaList.SetGroupVersionKind(dpaGVK)
++	if err := client.List(ctx, dpaList, crclient.InNamespace(DefaultOADPNamespace)); err != nil {
++		return nil, fmt.Errorf("failed to list DataProtectionApplication resources: %w", err)
++	}
++	if len(dpaList.Items) == 0 {
++		return nil, fmt.Errorf("no DataProtectionApplication resources found in namespace %s", DefaultOADPNamespace)
++	}
++
++	dpa := dpaList.Items[0]
++	plugins, _, err := unstructured.NestedStringSlice(dpa.Object, "spec", "configuration", "velero", "defaultPlugins")
++	if err != nil {
++		return nil, fmt.Errorf("failed to read defaultPlugins from DPA %s: %w", dpa.GetName(), err)
++	}
++
++	state := &DPAPluginState{
++		Name:            dpa.GetName(),
++		OriginalPlugins: plugins,
++	}
++
++	if slices.Contains(plugins, "hypershift") {
++		return state, nil
++	}
++
++	// Check if the plugin is already configured via customPlugins.
++	// Adding "hypershift" to defaultPlugins when it already exists in
++	// customPlugins causes the OADP operator to generate duplicate
++	// init containers named "hypershift-oadp-plugin" in the velero
++	// Deployment, which fails Kubernetes validation.
++	if hasHypershiftCustomPlugin(&dpa) {
++		return state, nil
++	}
++
++	// Append the hypershift plugin and update.
++	updatedPlugins := append(plugins, "hypershift")
++	if err := unstructured.SetNestedStringSlice(dpa.Object, updatedPlugins, "spec", "configuration", "velero", "defaultPlugins"); err != nil {
++		return nil, fmt.Errorf("failed to set defaultPlugins on DPA %s: %w", dpa.GetName(), err)
++	}
++	if err := client.Update(ctx, &dpa); err != nil {
++		return nil, fmt.Errorf("failed to update DPA %s with hypershift plugin: %w", dpa.GetName(), err)
++	}
++	state.PluginsModified = true
++
++	// Wait for Velero to restart and DPA to reconcile with the new plugin.
++	// Use immediate=false so the first check happens after the poll interval,
++	// giving the OADP controller time to process the spec change. With
++	// immediate=true the stale Reconciled=True status from the previous
++	// reconciliation satisfies the check before the controller reacts.
++	const dpaReconcileTimeout = 10 * time.Minute
++	var lastVeleroErr, lastDPAErr error
++	if err := wait.PollUntilContextTimeout(ctx, 10*time.Second, dpaReconcileTimeout, false, func(ctx context.Context) (bool, error) {
++		lastVeleroErr = EnsureVeleroPodRunning(testCtx)
++		if lastVeleroErr != nil {
++			log.Printf("Velero pod not ready: %v", lastVeleroErr)
++			return false, nil
++		}
++		lastDPAErr = ensureDPAReconciled(ctx, client, DefaultOADPNamespace)
++		if lastDPAErr != nil {
++			log.Printf("DPA not reconciled: %v", lastDPAErr)
++			return false, nil
++		}
++		return true, nil
++	}); err != nil {
++		// Collect final diagnostic state to aid debugging.
++		diag := collectDPADiagnostics(ctx, testCtx, client)
++		return state, fmt.Errorf("velero pod or DPA did not become ready within %v after adding hypershift plugin to DPA %s: %w\nlast velero pod check: %v\nlast DPA reconciled check: %v\n%s",
++			dpaReconcileTimeout, dpa.GetName(), err, lastVeleroErr, lastDPAErr, diag)
++	}
++
++	return state, nil
++}
++
++// collectDPADiagnostics gathers Velero pod statuses and DPA conditions for
++// inclusion in timeout error messages.
++func collectDPADiagnostics(ctx context.Context, testCtx *internal.TestContext, client crclient.Client) string {
++	var b strings.Builder
++
++	// Velero pod status.
++	podList := &corev1.PodList{}
++	labels := map[string]string{
++		"deploy":    "velero",
++		"component": "velero",
++	}
++	if err := client.List(ctx, podList, crclient.InNamespace(DefaultOADPNamespace), crclient.MatchingLabels(labels)); err != nil {
++		fmt.Fprintf(&b, "diagnostics: failed to list Velero pods: %v\n", err)
++	} else if len(podList.Items) == 0 {
++		fmt.Fprintf(&b, "diagnostics: no Velero pods found in namespace %s\n", DefaultOADPNamespace)
++	} else {
++		for _, pod := range podList.Items {
++			fmt.Fprintf(&b, "diagnostics: velero pod %s: phase=%s", pod.Name, pod.Status.Phase)
++			for _, cs := range pod.Status.ContainerStatuses {
++				fmt.Fprintf(&b, " container=%s ready=%t restarts=%d", cs.Name, cs.Ready, cs.RestartCount)
++				if cs.State.Waiting != nil {
++					fmt.Fprintf(&b, " waiting=%s(%s)", cs.State.Waiting.Reason, cs.State.Waiting.Message)
++				}
++				if cs.State.Terminated != nil {
++					fmt.Fprintf(&b, " terminated=%s(exit=%d)", cs.State.Terminated.Reason, cs.State.Terminated.ExitCode)
++				}
++			}
++			fmt.Fprintln(&b)
++		}
++	}
++
++	// DPA conditions.
++	dpaList := &unstructured.UnstructuredList{}
++	dpaList.SetGroupVersionKind(dpaGVK)
++	if err := client.List(ctx, dpaList, crclient.InNamespace(DefaultOADPNamespace)); err != nil {
++		fmt.Fprintf(&b, "diagnostics: failed to list DPA resources: %v\n", err)
++	} else {
++		for _, dpa := range dpaList.Items {
++			conditions, found, err := unstructured.NestedSlice(dpa.Object, "status", "conditions")
++			if err != nil || !found {
++				fmt.Fprintf(&b, "diagnostics: DPA %s: no conditions found\n", dpa.GetName())
++				continue
++			}
++			fmt.Fprintf(&b, "diagnostics: DPA %s conditions:", dpa.GetName())
++			for _, condIface := range conditions {
++				cond, ok := condIface.(map[string]interface{})
++				if !ok {
++					continue
++				}
++				condType, _ := cond["type"].(string)
++				condStatus, _ := cond["status"].(string)
++				condMsg, _ := cond["message"].(string)
++				condReason, _ := cond["reason"].(string)
++				fmt.Fprintf(&b, " [%s=%s reason=%q message=%q]", condType, condStatus, condReason, condMsg)
++			}
++			fmt.Fprintln(&b)
++		}
++	}
++
++	return b.String()
++}
++
++// ensureDPAReconciled checks that at least one DPA in the namespace has
++// the Reconciled condition set to True.
++func ensureDPAReconciled(ctx context.Context, c crclient.Client, namespace string) error {
++	dpaList := &unstructured.UnstructuredList{}
++	dpaList.SetGroupVersionKind(dpaGVK)
++	if err := c.List(ctx, dpaList, crclient.InNamespace(namespace)); err != nil {
++		return fmt.Errorf("failed to list DPA resources: %w", err)
++	}
++	for _, dpa := range dpaList.Items {
++		conditions, found, err := unstructured.NestedSlice(dpa.Object, "status", "conditions")
++		if err != nil || !found {
++			continue
++		}
++		for _, condIface := range conditions {
++			cond, ok := condIface.(map[string]interface{})
++			if !ok {
++				continue
++			}
++			if condType, _ := cond["type"].(string); condType == "Reconciled" {
++				if condStatus, _ := cond["status"].(string); condStatus == "True" {
++					return nil
++				}
++			}
++		}
++	}
++	return fmt.Errorf("no reconciled DPA found in namespace %s", namespace)
++}
++
++// hasHypershiftCustomPlugin checks whether the DPA has an entry named
++// "hypershift-oadp-plugin" in spec.configuration.velero.customPlugins.
++func hasHypershiftCustomPlugin(dpa *unstructured.Unstructured) bool {
++	customPlugins, found, err := unstructured.NestedSlice(dpa.Object, "spec", "configuration", "velero", "customPlugins")
++	if err != nil || !found {
++		return false
++	}
++	for _, p := range customPlugins {
++		plugin, ok := p.(map[string]interface{})
++		if !ok {
++			continue
++		}
++		if name, _ := plugin["name"].(string); name == "hypershift-oadp-plugin" {
++			return true
++		}
++	}
++	return false
++}
++
++// RestoreDPAPlugins restores the original defaultPlugins list on the DPA.
++// If the DPA was not modified this is a no-op.
++func RestoreDPAPlugins(testCtx *internal.TestContext, state *DPAPluginState) error {
++	if !state.PluginsModified {
++		return nil
++	}
++
++	client := testCtx.MgmtClient
++	ctx := testCtx.Context
++
++	dpa := &unstructured.Unstructured{}
++	dpa.SetGroupVersionKind(schema.GroupVersionKind{
++		Group:   "oadp.openshift.io",
++		Version: "v1alpha1",
++		Kind:    "DataProtectionApplication",
++	})
++	if err := client.Get(ctx, crclient.ObjectKey{
++		Namespace: DefaultOADPNamespace,
++		Name:      state.Name,
++	}, dpa); err != nil {
++		return fmt.Errorf("failed to get DPA %s for plugin restore: %w", state.Name, err)
++	}
++
++	if err := unstructured.SetNestedStringSlice(dpa.Object, state.OriginalPlugins, "spec", "configuration", "velero", "defaultPlugins"); err != nil {
++		return fmt.Errorf("failed to set original defaultPlugins on DPA %s: %w", state.Name, err)
++	}
++	if err := client.Update(ctx, dpa); err != nil {
++		return fmt.Errorf("failed to restore DPA %s plugins: %w", state.Name, err)
++	}
++
++	return nil
++}
+diff --git a/test/e2e/v2/tests/backup_restore_test.go b/test/e2e/v2/tests/backup_restore_test.go
+index 8dab430736e..3015bedfa2f 100644
+--- a/test/e2e/v2/tests/backup_restore_test.go
++++ b/test/e2e/v2/tests/backup_restore_test.go
+@@ -18,6 +18,7 @@ package tests
+ 
+ import (
+ 	"fmt"
++	"maps"
+ 	"time"
+ 
+ 	. "github.com/onsi/ginkgo/v2"
+@@ -30,8 +31,12 @@ import (
+ 	"github.com/openshift/hypershift/test/e2e/util"
+ 	"github.com/openshift/hypershift/test/e2e/v2/backuprestore"
+ 	"github.com/openshift/hypershift/test/e2e/v2/internal"
++	corev1 "k8s.io/api/core/v1"
++	apierrors "k8s.io/apimachinery/pkg/api/errors"
+ 	"k8s.io/apimachinery/pkg/api/meta"
+ 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
++	"k8s.io/apimachinery/pkg/types"
++	"k8s.io/client-go/kubernetes"
+ 	crclient "sigs.k8s.io/controller-runtime/pkg/client"
+ )
+ 
+@@ -48,6 +53,15 @@ const (
+ 	ContextBreakControlPlane       = "BreakControlPlane"
+ )
+ 
++const (
++	// oadpPluginConfigMapName is the name of the ConfigMap used to configure the hypershift OADP plugin.
++	oadpPluginConfigMapName = "hypershift-oadp-plugin-config"
++	// etcdBackupMethodKey is the ConfigMap key that controls the etcd backup method.
++	etcdBackupMethodKey = "etcdBackupMethod"
++	// etcdBackupMethodSnapshot is the value for etcdBackupMethodKey to use etcd snapshots.
++	etcdBackupMethodSnapshot = "etcdSnapshot"
++)
++
+ type backupRestorePlatformConfig struct {
+ 	excludeWorkloads     []string
+ 	postRestoreHook      func(testCtx *internal.TestContext) error
+@@ -89,7 +103,6 @@ var _ = Describe("BackupRestore", Label("backup-restore"), Ordered, Serial, func
+ 		prober             backuprestore.ProberManager
+ 		testCtx            *internal.TestContext
+ 		backupName         string
+-		restoreName        string
+ 		scheduleName       string
+ 		expectedConditions []util.Condition
+ 	)
+@@ -124,41 +137,12 @@ var _ = Describe("BackupRestore", Label("backup-restore"), Ordered, Serial, func
+ 	BeforeEach(func() {
+ 		testCtx = internal.GetTestContext()
+ 		Expect(testCtx).NotTo(BeNil())
+-		if err := testCtx.ValidateControlPlaneNamespace(); err != nil {
+-			AbortSuite(err.Error())
+-		}
+-
+-		// Ensure Velero pod is running before proceeding with backup/restore tests
+-		err := backuprestore.EnsureVeleroPodRunning(testCtx)
+-		if err != nil {
+-			Fail(fmt.Sprintf("Velero is not running: %v", err))
+-		}
++		validateBeforeEach(testCtx)
+ 	})
+ 
+ 	Context(ContextPreBackupControlPlane, func() {
+ 		It("should have control plane healthy before backup", func() {
+-			err := internal.ValidateControlPlaneDeploymentsReadiness(testCtx, platformCfg.excludeWorkloads)
+-			Expect(err).NotTo(HaveOccurred())
+-			err = internal.ValidateControlPlaneStatefulSetsReadiness(testCtx, platformCfg.excludeWorkloads)
+-			Expect(err).NotTo(HaveOccurred())
+-			nodePool, err := getNodePool(testCtx)
+-			Expect(err).NotTo(HaveOccurred())
+-			Expect(nodePool).NotTo(BeNil())
+-			npConditions := conditions.ExpectedNodePoolConditions(nodePool)
+-
+-			latestVersion, err := supportedversion.GetLatestSupportedOCPVersion(testCtx.Context, testCtx.MgmtClient)
+-			Expect(err).NotTo(HaveOccurred())
+-			if latestVersion.LT(util.Version421) {
+-				delete(npConditions, hyperv1.NodePoolSupportedVersionSkewConditionType)
+-			}
+-
+-			for conditionType, conditionStatus := range npConditions {
+-				expectedConditions = append(expectedConditions, util.Condition{
+-					Type:   conditionType,
+-					Status: metav1.ConditionStatus(conditionStatus),
+-				})
+-			}
+-			internal.ValidateConditions(NewWithT(GinkgoT()), nodePool, expectedConditions)
++			expectedConditions = validatePreBackupControlPlane(testCtx, platformCfg.excludeWorkloads)
+ 		})
+ 	})
+ 
+@@ -251,9 +235,9 @@ var _ = Describe("BackupRestore", Label("backup-restore"), Ordered, Serial, func
+ 
+ 	Context(ContextPostBackupControlPlane, func() {
+ 		It("should have control plane healthy after backup", func() {
+-			err := internal.ValidateControlPlaneDeploymentsReadiness(testCtx, platformCfg.excludeWorkloads)
++			err := internal.WaitForControlPlaneDeploymentsReadiness(testCtx, 5*time.Minute, platformCfg.excludeWorkloads)
+ 			Expect(err).NotTo(HaveOccurred())
+-			err = internal.ValidateControlPlaneStatefulSetsReadiness(testCtx, platformCfg.excludeWorkloads)
++			err = internal.WaitForControlPlaneStatefulSetsReadiness(testCtx, 5*time.Minute, platformCfg.excludeWorkloads)
+ 			Expect(err).NotTo(HaveOccurred())
+ 		})
+ 	})
+@@ -268,7 +252,7 @@ var _ = Describe("BackupRestore", Label("backup-restore"), Ordered, Serial, func
+ 	Context(ContextRestore, func() {
+ 		It("should restore from backup successfully", func() {
+ 			By("Creating Restore")
+-			restoreName = oadp.GenerateRestoreName(testCtx.ClusterName, testCtx.ClusterNamespace)
++			restoreName := oadp.GenerateRestoreName(testCtx.ClusterName, testCtx.ClusterNamespace)
+ 			restoreOpts := &backuprestore.OADPRestoreOptions{
+ 				Name:              restoreName,
+ 				FromBackup:        backupName,
+@@ -276,38 +260,15 @@ var _ = Describe("BackupRestore", Label("backup-restore"), Ordered, Serial, func
+ 				HCNamespace:       testCtx.ClusterNamespace,
+ 				IncludeNamespaces: platformCfg.additionalNamespaces,
+ 			}
+-			err := backuprestore.RunOADPRestore(testCtx.Context, GinkgoLogr.WithName("backup-restore"), testCtx.ArtifactDir, restoreOpts)
+-			Expect(err).NotTo(HaveOccurred())
+-			By("Waiting for restore to complete")
+-			err = backuprestore.WaitForRestoreCompletion(testCtx, restoreName)
+-			Expect(err).NotTo(HaveOccurred())
+-
+-			if platformCfg.postRestoreHook != nil {
+-				By("Running platform-specific post-restore operations")
+-				err = platformCfg.postRestoreHook(testCtx)
+-				Expect(err).NotTo(HaveOccurred())
+-			}
++			executeRestore(testCtx, restoreOpts, platformCfg.postRestoreHook)
+ 		})
+ 	})
+ 
+ 	Context(ContextPostRestoreControlPlane, func() {
+ 		It("should have control plane healthy after restore", func() {
+-			By("Waiting for control plane statefulsets to be ready")
+-			err := internal.WaitForControlPlaneStatefulSetsReadiness(testCtx, backuprestore.RestoreTimeout, platformCfg.excludeWorkloads)
+-			Expect(err).NotTo(HaveOccurred())
+-			By("Waiting for control plane deployments to be ready")
+-			err = internal.WaitForControlPlaneDeploymentsReadiness(testCtx, backuprestore.RestoreTimeout, platformCfg.excludeWorkloads)
+-			Expect(err).NotTo(HaveOccurred())
+ 			// TODO(mgencur): Remove this condition once https://redhat.atlassian.net/browse/MGMT-23509 is fixed
+-			if testCtx.GetHostedCluster().Spec.Platform.Type != hyperv1.AgentPlatform {
+-				By("Validating NodePool conditions")
+-				Eventually(func(g Gomega) {
+-					nodePool, err := getNodePool(testCtx)
+-					g.Expect(err).NotTo(HaveOccurred())
+-					g.Expect(nodePool).NotTo(BeNil())
+-					internal.ValidateConditions(g, nodePool, expectedConditions)
+-				}).WithPolling(backuprestore.PollInterval).WithTimeout(backuprestore.OIDCTimeout).Should(Succeed())
+-			}
++			skipNodePoolValidation := testCtx.GetHostedCluster().Spec.Platform.Type == hyperv1.AgentPlatform
++			validatePostRestoreControlPlane(testCtx, platformCfg.excludeWorkloads, expectedConditions, skipNodePoolValidation)
+ 		})
+ 	})
+ })
+@@ -329,3 +290,323 @@ func getNodePool(testCtx *internal.TestContext) (*hyperv1.NodePool, error) {
+ 	}
+ 	return nil, fmt.Errorf("no NodePool found for cluster %s", testCtx.ClusterName)
+ }
++
++// validateBeforeEach validates the control plane namespace and ensures Velero is running.
++// It is called from BeforeEach in both BackupRestore and BackupRestoreEtcdSnapshot suites.
++func validateBeforeEach(testCtx *internal.TestContext) {
++	if err := testCtx.ValidateControlPlaneNamespace(); err != nil {
++		AbortSuite(err.Error())
++	}
++
++	err := backuprestore.EnsureVeleroPodRunning(testCtx)
++	if err != nil {
++		Fail(fmt.Sprintf("Velero is not running: %v", err))
++	}
++}
++
++// validatePreBackupControlPlane validates that deployments, statefulsets, and NodePool conditions
++// are healthy before a backup. It returns the expected conditions for later post-restore validation.
++func validatePreBackupControlPlane(testCtx *internal.TestContext, excludeWorkloads []string) []util.Condition {
++	err := internal.WaitForControlPlaneDeploymentsReadiness(testCtx, 5*time.Minute, excludeWorkloads)
++	Expect(err).NotTo(HaveOccurred())
++	err = internal.WaitForControlPlaneStatefulSetsReadiness(testCtx, 5*time.Minute, excludeWorkloads)
++	Expect(err).NotTo(HaveOccurred())
++	nodePool, err := getNodePool(testCtx)
++	Expect(err).NotTo(HaveOccurred())
++	Expect(nodePool).NotTo(BeNil())
++	npConditions := conditions.ExpectedNodePoolConditions(nodePool)
++
++	latestVersion, err := supportedversion.GetLatestSupportedOCPVersion(testCtx.Context, testCtx.MgmtClient)
++	Expect(err).NotTo(HaveOccurred())
++	if latestVersion.LT(util.Version421) {
++		delete(npConditions, hyperv1.NodePoolSupportedVersionSkewConditionType)
++	}
++
++	var expectedConditions []util.Condition
++	for conditionType, conditionStatus := range npConditions {
++		expectedConditions = append(expectedConditions, util.Condition{
++			Type:   conditionType,
++			Status: metav1.ConditionStatus(conditionStatus),
++		})
++	}
++	internal.ValidateConditions(NewWithT(GinkgoT()), nodePool, expectedConditions)
++	return expectedConditions
++}
++
++// executeRestore runs an OADP restore, waits for completion, and optionally runs a post-restore hook.
++func executeRestore(testCtx *internal.TestContext, restoreOpts *backuprestore.OADPRestoreOptions, postRestoreHook func(*internal.TestContext) error) {
++	err := backuprestore.RunOADPRestore(testCtx.Context, GinkgoLogr.WithName("backup-restore"), testCtx.ArtifactDir, restoreOpts)
++	Expect(err).NotTo(HaveOccurred())
++	By("Waiting for restore to complete")
++	err = backuprestore.WaitForRestoreCompletion(testCtx, restoreOpts.Name)
++	Expect(err).NotTo(HaveOccurred())
++
++	if postRestoreHook != nil {
++		By("Running platform-specific post-restore operations")
++		err = postRestoreHook(testCtx)
++		Expect(err).NotTo(HaveOccurred())
++	}
++}
++
++// validatePostRestoreControlPlane waits for statefulsets and deployments to become ready after a
++// restore, and optionally validates NodePool conditions. Set skipNodePoolValidation to true when
++// NodePool validation is not applicable (e.g. Agent platform workaround).
++func validatePostRestoreControlPlane(testCtx *internal.TestContext, excludeWorkloads []string, expectedConditions []util.Condition, skipNodePoolValidation bool) {
++	By("Waiting for control plane statefulsets to be ready")
++	err := internal.WaitForControlPlaneStatefulSetsReadiness(testCtx, backuprestore.RestoreTimeout, excludeWorkloads)
++	Expect(err).NotTo(HaveOccurred())
++	By("Waiting for control plane deployments to be ready")
++	err = internal.WaitForControlPlaneDeploymentsReadiness(testCtx, backuprestore.RestoreTimeout, excludeWorkloads)
++	Expect(err).NotTo(HaveOccurred())
++	if !skipNodePoolValidation {
++		By("Validating NodePool conditions")
++		Eventually(func(g Gomega) {
++			nodePool, err := getNodePool(testCtx)
++			g.Expect(err).NotTo(HaveOccurred())
++			g.Expect(nodePool).NotTo(BeNil())
++			internal.ValidateConditions(g, nodePool, expectedConditions)
++		}).WithPolling(backuprestore.PollInterval).WithTimeout(backuprestore.OIDCTimeout).Should(Succeed())
++	}
++}
++
++var _ = Describe("BackupRestoreEtcdSnapshot", Label("backup-restore", "etcd-snapshot"), Ordered, Serial, func() {
++
++	var (
++		platformCfg        backupRestorePlatformConfig
++		testCtx            *internal.TestContext
++		backupName         string
++		snapshotURL        string
++		expectedConditions []util.Condition
++	)
++
++	BeforeAll(func() {
++		testCtx = internal.GetTestContext()
++		Expect(testCtx).NotTo(BeNil())
++		hostedCluster := testCtx.GetHostedCluster()
++		Expect(hostedCluster).NotTo(BeNil(), "HostedCluster should be set up")
++		if hostedCluster.Spec.Platform.Type != hyperv1.AWSPlatform {
++			Skip("etcd snapshot backup test only supported on AWS")
++		}
++		platformCfg = backupRestorePlatforms[hyperv1.AWSPlatform]
++
++		By("Checking if HCPEtcdBackup feature gate is enabled")
++		hcpEtcdBackupList := &hyperv1.HCPEtcdBackupList{}
++		err := testCtx.MgmtClient.List(testCtx.Context, hcpEtcdBackupList, crclient.InNamespace(testCtx.ControlPlaneNamespace))
++		if err != nil {
++			if meta.IsNoMatchError(err) || apierrors.IsNotFound(err) {
++				Skip("HCPEtcdBackup feature gate is not enabled (CRD not installed). " +
++					"Set HYPERSHIFT_FEATURESET=TechPreviewNoUpgrade on the HyperShift operator to enable it.")
++			}
++			// Other errors are unexpected - fail loudly
++			Expect(err).NotTo(HaveOccurred(), "unexpected error listing HCPEtcdBackup resources")
++		}
++
++		By("Configuring the hypershift-oadp-plugin-config ConfigMap")
++		cm := &corev1.ConfigMap{}
++		cmKey := types.NamespacedName{
++			Name:      oadpPluginConfigMapName,
++			Namespace: backuprestore.DefaultOADPNamespace,
++		}
++		var originalData map[string]string
++		cmExisted := true
++		err = testCtx.MgmtClient.Get(testCtx.Context, cmKey, cm)
++		if apierrors.IsNotFound(err) {
++			cmExisted = false
++			cm = &corev1.ConfigMap{
++				ObjectMeta: metav1.ObjectMeta{
++					Name:      cmKey.Name,
++					Namespace: cmKey.Namespace,
++				},
++				Data: map[string]string{
++					etcdBackupMethodKey: etcdBackupMethodSnapshot,
++				},
++			}
++			err = testCtx.MgmtClient.Create(testCtx.Context, cm)
++			Expect(err).NotTo(HaveOccurred())
++		} else {
++			Expect(err).NotTo(HaveOccurred())
++			originalData = maps.Clone(cm.Data)
++			if cm.Data == nil {
++				cm.Data = map[string]string{}
++			}
++			cm.Data[etcdBackupMethodKey] = etcdBackupMethodSnapshot
++			err = testCtx.MgmtClient.Update(testCtx.Context, cm)
++			Expect(err).NotTo(HaveOccurred())
++		}
++
++		DeferCleanup(func() {
++			By("Cleaning up hypershift-oadp-plugin-config ConfigMap")
++			configMap := &corev1.ConfigMap{}
++			if err := testCtx.MgmtClient.Get(testCtx.Context, cmKey, configMap); err != nil {
++				if !apierrors.IsNotFound(err) {
++					GinkgoWriter.Printf("Failed to get ConfigMap during cleanup: %v\n", err)
++				}
++				return
++			}
++			if !cmExisted {
++				if err := testCtx.MgmtClient.Delete(testCtx.Context, configMap); err != nil && !apierrors.IsNotFound(err) {
++					GinkgoWriter.Printf("Failed to delete ConfigMap during cleanup: %v\n", err)
++				}
++				return
++			}
++			configMap.Data = originalData
++			if err := testCtx.MgmtClient.Update(testCtx.Context, configMap); err != nil {
++				GinkgoWriter.Printf("Failed to restore ConfigMap during cleanup: %v\n", err)
++			}
++		})
++
++		By("Ensuring DPA has the hypershift plugin")
++		dpaState, err := backuprestore.EnsureDPAHypershiftPlugin(testCtx)
++		Expect(err).NotTo(HaveOccurred(), "failed to ensure DPA has hypershift plugin")
++
++		if dpaState.PluginsModified {
++			DeferCleanup(func() {
++				By("Restoring original DPA plugins")
++				if err := backuprestore.RestoreDPAPlugins(testCtx, dpaState); err != nil {
++					GinkgoWriter.Printf("Failed to restore DPA plugins during cleanup: %v\n", err)
++				}
++			})
++		}
++	})
++
++	BeforeEach(func() {
++		testCtx = internal.GetTestContext()
++		Expect(testCtx).NotTo(BeNil())
++		validateBeforeEach(testCtx)
++	})
++
++	Context(ContextPreBackupControlPlane, func() {
++		It("should have control plane healthy before backup", func() {
++			expectedConditions = validatePreBackupControlPlane(testCtx, platformCfg.excludeWorkloads)
++		})
++	})
++
++	Context(ContextBackup, func() {
++		It("should create backup with etcd snapshot method", func() {
++			By("Creating backup with etcd snapshot options")
++			backupName = oadp.GenerateBackupName(
++				testCtx.ClusterName,
++				testCtx.ClusterNamespace,
++			)
++			backupOpts := &backuprestore.OADPBackupOptions{
++				Name:            backupName,
++				HCName:          testCtx.ClusterName,
++				HCNamespace:     testCtx.ClusterNamespace,
++				StorageLocation: testCtx.ClusterName,
++				UseEtcdSnapshot: true,
++			}
++			err := backuprestore.RunOADPBackup(testCtx.Context, GinkgoLogr.WithName("backup-restore"), testCtx.ArtifactDir, backupOpts)
++			Expect(err).NotTo(HaveOccurred())
++
++			By("Waiting for backup to complete")
++			err = backuprestore.WaitForBackupCompletion(testCtx, backupName)
++			Expect(err).NotTo(HaveOccurred())
++		})
++	})
++
++	Context("VerifyEtcdSnapshotBackup", func() {
++		It("should have HCPEtcdBackup with BackupCompleted=True", func() {
++			By("Waiting for HCPEtcdBackup BackupCompleted condition to be True")
++			err := backuprestore.WaitForHCPEtcdBackupCondition(testCtx, backupName, metav1.ConditionTrue)
++			Expect(err).NotTo(HaveOccurred(), "HCPEtcdBackup %s should have BackupCompleted=True", backupName)
++		})
++
++		It("should have HCPEtcdBackup with snapshotURL matching the backup created in this run", func() {
++			By("Waiting for HCPEtcdBackup to have a snapshotURL")
++			Eventually(func(g Gomega) {
++				hcpEtcdBackupList := &hyperv1.HCPEtcdBackupList{}
++				err := testCtx.MgmtClient.List(testCtx.Context, hcpEtcdBackupList, crclient.InNamespace(testCtx.ControlPlaneNamespace))
++				g.Expect(err).NotTo(HaveOccurred())
++				g.Expect(hcpEtcdBackupList.Items).NotTo(BeEmpty(), "expected at least one HCPEtcdBackup resource")
++
++				found := false
++				for _, backup := range hcpEtcdBackupList.Items {
++					if backuprestore.MatchesHCPEtcdBackupName(backup.Name, backupName) && backup.Status.SnapshotURL != "" {
++						snapshotURL = backup.Status.SnapshotURL
++						found = true
++						GinkgoWriter.Printf("Found HCPEtcdBackup %s with non-empty snapshotURL\n", backup.Name)
++						break
++					}
++				}
++				g.Expect(found).To(BeTrue(), fmt.Sprintf("expected HCPEtcdBackup matching OADP backup %s to have a non-empty snapshotURL", backupName))
++			}).WithPolling(backuprestore.PollInterval).WithTimeout(backuprestore.BackupTimeout).Should(Succeed())
++		})
++
++		It("should have lastSuccessfulEtcdBackupURL on HostedCluster status matching the snapshot", func() {
++			if snapshotURL == "" {
++				Skip("snapshotURL was not captured; the snapshotURL verification spec may have failed")
++			}
++			By("Waiting for HostedCluster lastSuccessfulEtcdBackupURL to match the snapshot")
++			Eventually(func(g Gomega) {
++				hostedCluster := &hyperv1.HostedCluster{}
++				err := testCtx.MgmtClient.Get(testCtx.Context, crclient.ObjectKey{
++					Name:      testCtx.ClusterName,
++					Namespace: testCtx.ClusterNamespace,
++				}, hostedCluster)
++				g.Expect(err).NotTo(HaveOccurred())
++				g.Expect(hostedCluster.Status.LastSuccessfulEtcdBackupURL).To(Equal(snapshotURL),
++					"expected HostedCluster lastSuccessfulEtcdBackupURL to match the snapshot created in this run")
++			}).WithPolling(backuprestore.PollInterval).WithTimeout(backuprestore.BackupTimeout).Should(Succeed())
++			GinkgoWriter.Printf("HostedCluster lastSuccessfulEtcdBackupURL matches expected snapshotURL\n")
++		})
++	})
++
++	Context(ContextBreakControlPlane, func() {
++		It("should break hosted cluster", func() {
++			err := backuprestore.BreakHostedClusterPreservingMachines(testCtx, GinkgoLogr.WithName("cleanup"))
++			Expect(err).NotTo(HaveOccurred())
++		})
++	})
++
++	Context(ContextRestore, func() {
++		It("should restore from backup successfully", func() {
++			By("Creating Restore with etcd snapshot options")
++			restoreName := oadp.GenerateRestoreName(testCtx.ClusterName, testCtx.ClusterNamespace)
++			restoreOpts := &backuprestore.OADPRestoreOptions{
++				Name:            restoreName,
++				FromBackup:      backupName,
++				HCName:          testCtx.ClusterName,
++				HCNamespace:     testCtx.ClusterNamespace,
++				UseEtcdSnapshot: true,
++			}
++			executeRestore(testCtx, restoreOpts, platformCfg.postRestoreHook)
++		})
++	})
++
++	Context(ContextPostRestoreControlPlane, func() {
++		It("should have control plane healthy after restore", func() {
++			validatePostRestoreControlPlane(testCtx, platformCfg.excludeWorkloads, expectedConditions, false)
++		})
++
++		It("should have restoreSnapshotURL set on HostedCluster after restore", func() {
++			// RestoreSnapshotURL contains a presigned URL, which differs from the
++			// original S3 URL stored in HCPEtcdBackup.Status.SnapshotURL. We verify
++			// the field is populated rather than comparing exact values.
++			Eventually(func(g Gomega) {
++				hostedCluster := &hyperv1.HostedCluster{}
++				err := testCtx.MgmtClient.Get(testCtx.Context, crclient.ObjectKey{
++					Name:      testCtx.ClusterName,
++					Namespace: testCtx.ClusterNamespace,
++				}, hostedCluster)
++				g.Expect(err).NotTo(HaveOccurred())
++				g.Expect(hostedCluster.Spec.Etcd.Managed).NotTo(BeNil(), "expected managed etcd spec to be set")
++				g.Expect(hostedCluster.Spec.Etcd.Managed.Storage.RestoreSnapshotURL).To(HaveLen(1),
++					"expected restoreSnapshotURL to contain exactly one entry")
++				g.Expect(hostedCluster.Spec.Etcd.Managed.Storage.RestoreSnapshotURL[0]).NotTo(BeEmpty(),
++					"expected restoreSnapshotURL to be a non-empty presigned URL")
++			}).WithPolling(backuprestore.PollInterval).WithTimeout(backuprestore.RestoreTimeout).Should(Succeed())
++			GinkgoWriter.Printf("RestoreSnapshotURL is set on HostedCluster\n")
++		})
++
++		It("should have etcd-init container logs showing successful snapshot restore", func() {
++			By("Verifying etcd-0 init container logs for snapshot restore traces")
++			restConfig, err := util.GetConfig()
++			Expect(err).NotTo(HaveOccurred(), "failed to get REST config for pod log access")
++			kubeClient, err := kubernetes.NewForConfig(restConfig)
++			Expect(err).NotTo(HaveOccurred(), "failed to create kubernetes clientset")
++
++			err = backuprestore.VerifyEtcdInitLogs(testCtx.Context, GinkgoLogr.WithName("etcd-init"), kubeClient, testCtx.ControlPlaneNamespace)
++			Expect(err).NotTo(HaveOccurred(), "etcd-init container logs should confirm snapshot restore")
++		})
++	})
++})
