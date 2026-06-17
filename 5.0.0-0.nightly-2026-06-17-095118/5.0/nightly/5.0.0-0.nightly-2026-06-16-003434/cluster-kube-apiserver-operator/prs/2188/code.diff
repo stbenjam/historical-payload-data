@@ -1,0 +1,94 @@
+diff --git a/go.mod b/go.mod
+index 323aca40ad..3877c621cd 100644
+--- a/go.mod
++++ b/go.mod
+@@ -17,7 +17,7 @@ require (
+ 	github.com/openshift/api v0.0.0-20260521125114-09730f85d883
+ 	github.com/openshift/build-machinery-go v0.0.0-20250530140348-dc5b2804eeee
+ 	github.com/openshift/client-go v0.0.0-20260512113608-deb4dc54551a
+-	github.com/openshift/library-go v0.0.0-20260612140105-3fa3bb604fd6
++	github.com/openshift/library-go v0.0.0-20260612181855-acbfa3c5590f
+ 	github.com/pkg/profile v1.7.0 // indirect
+ 	github.com/prometheus/client_golang v1.23.2
+ 	github.com/spf13/cobra v1.10.0
+diff --git a/go.sum b/go.sum
+index 48a932b781..ebacbcb854 100644
+--- a/go.sum
++++ b/go.sum
+@@ -165,8 +165,8 @@ github.com/openshift/build-machinery-go v0.0.0-20250530140348-dc5b2804eeee h1:+S
+ github.com/openshift/build-machinery-go v0.0.0-20250530140348-dc5b2804eeee/go.mod h1:8jcm8UPtg2mCAsxfqKil1xrmRMI3a+XU2TZ9fF8A7TE=
+ github.com/openshift/client-go v0.0.0-20260512113608-deb4dc54551a h1:EKx2XhOKehd1C5ptY7IrLl4WV35E8kP0pRPnG5BUZXk=
+ github.com/openshift/client-go v0.0.0-20260512113608-deb4dc54551a/go.mod h1:V933kvY/cb/Un7UCEOhXHUySNX327u7Epe8g9KNqg2Q=
+-github.com/openshift/library-go v0.0.0-20260612140105-3fa3bb604fd6 h1:4XQkleE6UqSF9D9QeNWnubGkst5OOs+KHCh2cPcdKXU=
+-github.com/openshift/library-go v0.0.0-20260612140105-3fa3bb604fd6/go.mod h1:/HBhy6jm/igWI3Y1vYFwFG3ZCcXmnNsKUT6VBpPyM9A=
++github.com/openshift/library-go v0.0.0-20260612181855-acbfa3c5590f h1:1wVATH1wpPdtryIhjtngrHKi4d0ucrN2o0IIZAoHPTw=
++github.com/openshift/library-go v0.0.0-20260612181855-acbfa3c5590f/go.mod h1:/HBhy6jm/igWI3Y1vYFwFG3ZCcXmnNsKUT6VBpPyM9A=
+ github.com/openshift/onsi-ginkgo/v2 v2.6.1-0.20251001123353-fd5b1fb35db1 h1:PMTgifBcBRLJJiM+LgSzPDTk9/Rx4qS09OUrfpY6GBQ=
+ github.com/openshift/onsi-ginkgo/v2 v2.6.1-0.20251001123353-fd5b1fb35db1/go.mod h1:7Du3c42kxCUegi0IImZ1wUQzMBVecgIHjR1C+NkhLQo=
+ github.com/orisano/pixelmatch v0.0.0-20220722002657-fb0b55479cde/go.mod h1:nZgzbfBr3hhjoZnS66nKrHmduYNpc34ny7RK4z5/HM0=
+diff --git a/vendor/github.com/openshift/library-go/pkg/operator/encryption/kms/pluginlifecycle/credentials.go b/vendor/github.com/openshift/library-go/pkg/operator/encryption/kms/pluginlifecycle/reference_data_resolver.go
+similarity index 100%
+rename from vendor/github.com/openshift/library-go/pkg/operator/encryption/kms/pluginlifecycle/credentials.go
+rename to vendor/github.com/openshift/library-go/pkg/operator/encryption/kms/pluginlifecycle/reference_data_resolver.go
+diff --git a/vendor/github.com/openshift/library-go/pkg/operator/encryption/kms/pluginlifecycle/sidecar.go b/vendor/github.com/openshift/library-go/pkg/operator/encryption/kms/pluginlifecycle/sidecar.go
+index 1a432a4952..543811e20c 100644
+--- a/vendor/github.com/openshift/library-go/pkg/operator/encryption/kms/pluginlifecycle/sidecar.go
++++ b/vendor/github.com/openshift/library-go/pkg/operator/encryption/kms/pluginlifecycle/sidecar.go
+@@ -76,8 +76,7 @@ func AddKMSPluginSidecarToStaticPodSpec(ctx context.Context, podSpec *corev1.Pod
+ 		if err := ensureVolumeMountInContainer(podSpec.InitContainers, name, volumeMount); err != nil {
+ 			return err
+ 		}
+-		// The resource-dir files are owned by root, so the sidecar needs root to read files in that directory.
+-		if err := setRunAsUser(podSpec.InitContainers, name, 0); err != nil {
++		if err := setRunAsRoot(podSpec.InitContainers, name); err != nil {
+ 			return err
+ 		}
+ 	}
+@@ -290,13 +289,16 @@ func ensureReferenceDataVolume(podSpec *corev1.PodSpec, secretName string) error
+ 	return ensureVolume(podSpec, volume)
+ }
+ 
+-func setRunAsUser(containers []corev1.Container, containerName string, uid int64) error {
++// setRunAsRoot sets RunAsUser=0 on the named container.
++// The resource-dir files are owned by root and protected by SELinux, so the sidecar needs
++// uid 0 and the proper SELinux label (indirectly obtained via host network) to read them.
++func setRunAsRoot(containers []corev1.Container, containerName string) error {
+ 	for i, c := range containers {
+ 		if c.Name == containerName {
+ 			if c.SecurityContext == nil {
+ 				containers[i].SecurityContext = &corev1.SecurityContext{}
+ 			}
+-			containers[i].SecurityContext.RunAsUser = ptr.To(uid)
++			containers[i].SecurityContext.RunAsUser = ptr.To(int64(0))
+ 			return nil
+ 		}
+ 	}
+diff --git a/vendor/github.com/openshift/library-go/pkg/operator/encryption/kms/pluginlifecycle/vault.go b/vendor/github.com/openshift/library-go/pkg/operator/encryption/kms/pluginlifecycle/vault.go
+index b40e29aa51..5f48c92409 100644
+--- a/vendor/github.com/openshift/library-go/pkg/operator/encryption/kms/pluginlifecycle/vault.go
++++ b/vendor/github.com/openshift/library-go/pkg/operator/encryption/kms/pluginlifecycle/vault.go
+@@ -120,5 +120,11 @@ func (v *vault) BuildSidecarContainer() (corev1.Container, error) {
+ 				corev1.ResourceCPU:    resource.MustParse("10m"),
+ 			},
+ 		},
++		SecurityContext: &corev1.SecurityContext{
++			ReadOnlyRootFilesystem:   ptr.To(true),
++			AllowPrivilegeEscalation: ptr.To(false),
++			Capabilities:             &corev1.Capabilities{Drop: []corev1.Capability{"ALL"}},
++			SeccompProfile:           &corev1.SeccompProfile{Type: corev1.SeccompProfileTypeRuntimeDefault},
++		},
+ 	}, nil
+ }
+diff --git a/vendor/modules.txt b/vendor/modules.txt
+index c43d6c3b56..9188e79de7 100644
+--- a/vendor/modules.txt
++++ b/vendor/modules.txt
+@@ -407,7 +407,7 @@ github.com/openshift/client-go/security/informers/externalversions/internalinter
+ github.com/openshift/client-go/security/informers/externalversions/security
+ github.com/openshift/client-go/security/informers/externalversions/security/v1
+ github.com/openshift/client-go/security/listers/security/v1
+-# github.com/openshift/library-go v0.0.0-20260612140105-3fa3bb604fd6
++# github.com/openshift/library-go v0.0.0-20260612181855-acbfa3c5590f
+ ## explicit; go 1.25.0
+ github.com/openshift/library-go/pkg/apiserver/jsonpatch
+ github.com/openshift/library-go/pkg/assets
