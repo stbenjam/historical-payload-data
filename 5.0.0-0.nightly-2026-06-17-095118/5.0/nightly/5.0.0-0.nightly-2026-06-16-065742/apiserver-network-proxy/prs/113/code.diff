@@ -1,0 +1,55 @@
+diff --git a/.ci-operator.yaml b/.ci-operator.yaml
+index 572c13b2b..1d88a59fd 100644
+--- a/.ci-operator.yaml
++++ b/.ci-operator.yaml
+@@ -1,4 +1,4 @@
+ build_root_image:
+   name: release
+   namespace: openshift
+-  tag: rhel-9-release-golang-1.25-openshift-4.23
++  tag: rhel-9-release-golang-1.26-openshift-5.0
+diff --git a/Dockerfile.openshift b/Dockerfile.openshift
+index ab2e8cafa..bbb4336fc 100644
+--- a/Dockerfile.openshift
++++ b/Dockerfile.openshift
+@@ -1,4 +1,4 @@
+-FROM registry.ci.openshift.org/ocp/builder:rhel-9-golang-1.25-openshift-4.23 AS builder
++FROM registry.ci.openshift.org/ocp/builder:rhel-9-golang-1.26-openshift-5.0 AS builder
+ 
+ WORKDIR /go/src/sigs.k8s.io/apiserver-network-proxy
+ 
+@@ -7,7 +7,7 @@ COPY . .
+ RUN CGO_ENABLED=0 go build -v -a -ldflags '-extldflags "-static"' -o proxy-server sigs.k8s.io/apiserver-network-proxy/cmd/server
+ RUN CGO_ENABLED=0 go build -v -a -ldflags '-extldflags "-static"' -o proxy-agent sigs.k8s.io/apiserver-network-proxy/cmd/agent
+ 
+-FROM registry.ci.openshift.org/ocp/4.23:base-rhel9
++FROM registry.ci.openshift.org/ocp/5.0:base-rhel9
+ 
+ COPY --from=builder /go/src/sigs.k8s.io/apiserver-network-proxy/proxy-server /usr/bin/proxy-server
+ COPY --from=builder /go/src/sigs.k8s.io/apiserver-network-proxy/proxy-agent /usr/bin/proxy-agent
+diff --git a/pkg/server/desthost_backend_manager.go b/pkg/server/desthost_backend_manager.go
+index a54024947..f231baf19 100644
+--- a/pkg/server/desthost_backend_manager.go
++++ b/pkg/server/desthost_backend_manager.go
+@@ -80,9 +80,18 @@ func (dibm *DestHostBackendManager) Backend(ctx context.Context) (*Backend, erro
+ 		bes, exist := dibm.backends[destHost]
+ 		if exist && len(bes) > 0 {
+ 			klog.V(5).InfoS("Get the backend through the DestHostBackendManager", "destHost", destHost)
+-			//TODO: change dibm.random.Intn(len(bes)) to be in sync with community when they fix
+-			// https://github.com/kubernetes-sigs/apiserver-network-proxy/issues/261
+-			return dibm.backends[destHost][dibm.random.Intn(len(bes))], nil
++
++			var nonDraining []*Backend
++			for _, be := range bes {
++				if !be.IsDraining() {
++					nonDraining = append(nonDraining, be)
++				}
++			}
++			if len(nonDraining) > 0 {
++				return nonDraining[dibm.random.Intn(len(nonDraining))], nil
++			}
++			klog.V(3).InfoS("All backends for destination host are draining, using one as fallback", "destHost", destHost)
++			return bes[dibm.random.Intn(len(bes))], nil
+ 		}
+ 	}
+ 	return nil, &ErrNotFound{}

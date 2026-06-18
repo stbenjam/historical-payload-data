@@ -1,0 +1,65 @@
+diff --git a/bindata/etcd/cluster-restore-tnf.sh b/bindata/etcd/cluster-restore-tnf.sh
+index 82991d72f..d6b28af0f 100644
+--- a/bindata/etcd/cluster-restore-tnf.sh
++++ b/bindata/etcd/cluster-restore-tnf.sh
+@@ -196,6 +196,9 @@ if [ -d "${ETCD_DATA_DIR}/member" ]; then
+   mv "${ETCD_DATA_DIR}"/member "${ETCD_DATA_DIR_BACKUP}"/
+ fi
+ 
++# Move any remaining files out of the data dir before wiping it.
++backup_remaining_etcd_data_dir_contents
++
+ echo "removing etcd data dir..."
+ rm -rf "${ETCD_DATA_DIR}"
+ mkdir -p "${ETCD_DATA_DIR}"
+diff --git a/bindata/etcd/cluster-restore.sh b/bindata/etcd/cluster-restore.sh
+index 8e36dd7ba..962a5610b 100644
+--- a/bindata/etcd/cluster-restore.sh
++++ b/bindata/etcd/cluster-restore.sh
+@@ -110,14 +110,9 @@ if [ -z "${ETCD_ETCDCTL_RESTORE}" ]; then
+   cp -p "${SNAPSHOT_FILE}" "${ETCD_DATA_DIR_BACKUP}"/snapshot.db
+   # Move the revision.json when it exists
+   [ ! -f "${ETCD_REV_JSON}" ] ||  mv -f "${ETCD_REV_JSON}" "${ETCD_DATA_DIR_BACKUP}"/revision.json
+-  # removing any fio perf files left behind that could be deleted without problems
+-  rm -f "${ETCD_DATA_DIR}"/etcd_perf*
+-
+-  # ensure the folder is really empty, otherwise the restore pod will crash loop
+-  if [ -n "$(ls -A "${ETCD_DATA_DIR}")" ]; then
+-      echo "folder ${ETCD_DATA_DIR} is not empty, please review and remove all files in it"
+-      exit 1
+-  fi
++  # Move any remaining files (fio perf artifacts, stray snapshots, etc.) out of the data dir.
++  # The restore pod requires /var/lib/etcd to be empty before it runs.
++  backup_remaining_etcd_data_dir_contents
+ 
+   echo "starting restore-etcd static pod"
+   cp -p "${RESTORE_ETCD_POD_YAML}" "${MANIFEST_DIR}/etcd-pod.yaml"
+diff --git a/bindata/etcd/etcd-common-tools b/bindata/etcd/etcd-common-tools
+index 99bf470f1..f3c36da64 100644
+--- a/bindata/etcd/etcd-common-tools
++++ b/bindata/etcd/etcd-common-tools
+@@ -78,6 +78,24 @@ function wait_for_containers_to_stop() {
+   done
+ }
+ 
++function backup_remaining_etcd_data_dir_contents() {
++  local entry base extras_dir="${ETCD_DATA_DIR_BACKUP}/extra-data-dir-contents"
++
++  mkdir -p "${extras_dir}"
++
++  shopt -s nullglob dotglob
++  for entry in "${ETCD_DATA_DIR}"/*; do
++    base=$(basename "${entry}")
++    if [ -e "${extras_dir}/${base}" ]; then
++      echo "removing previous backup ${extras_dir}/${base}"
++      rm -rf "${extras_dir:?}/${base}"
++    fi
++    echo "Moving ${entry} to ${extras_dir}/"
++    mv "${entry}" "${extras_dir}/"
++  done
++  shopt -u nullglob dotglob
++}
++
+ function mv_static_pods() {
+   local containers=("$@")
+ 

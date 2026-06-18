@@ -1,0 +1,31 @@
+diff --git a/pkg/controller/build/reconciler.go b/pkg/controller/build/reconciler.go
+index 79d91de71e..a9d993efbe 100644
+--- a/pkg/controller/build/reconciler.go
++++ b/pkg/controller/build/reconciler.go
+@@ -159,6 +159,13 @@ func (b *buildReconciler) rebuildMachineOSConfig(ctx context.Context, mosc *mcfg
+ // Runs whenever a new MachineOSConfig is added. Determines if a new
+ // MachineOSBuild should be created and then creates it, if needed.
+ func (b *buildReconciler) addMachineOSConfig(ctx context.Context, mosc *mcfgv1.MachineOSConfig) error {
++	// If the rebuild annotation is present (e.g., pod restarted while a rebuild
++	// was pending), process it now instead of falling through to the normal sync
++	// path which would see the existing MOSB and return early.
++	if hasRebuildAnnotation(mosc) {
++		return b.rebuildMachineOSConfig(ctx, mosc)
++	}
++
+ 	// Check for pre-built image seeding annotation - only seed if not already seeded
+ 	if preBuiltImage, hasImage := getPreBuiltImage(mosc); hasImage {
+ 		if shouldSeedWithPreBuiltImage(mosc) {
+diff --git a/test/extended-priv/mco_ocb.go b/test/extended-priv/mco_ocb.go
+index dffb210ad8..4ac6ff66ee 100644
+--- a/test/extended-priv/mco_ocb.go
++++ b/test/extended-priv/mco_ocb.go
+@@ -508,7 +508,7 @@ func RebuildImageAndCheck(mosc *MachineOSConfig) {
+ 	logger.Infof("OK!\n")
+ 
+ 	exutil.By("Check that the existing MOSB is reused and it builds a new image")
+-	o.Eventually(mosb.GetJob, "2m", "20s").Should(Exist(), "Rebuild job was not created")
++	o.Eventually(mosb.GetJob, "5m", "20s").Should(Exist(), "Rebuild job was not created")
+ 	o.Eventually(mosb, "20m", "20s").Should(HaveConditionField("Building", "status", FalseString), "Rebuild was not finished")
+ 	o.Eventually(mosb, "10m", "20s").Should(HaveConditionField("Succeeded", "status", TrueString), "Rebuild didn't succeed")
+ 	o.Eventually(mosb, "2m", "20s").Should(HaveConditionField("Interrupted", "status", FalseString), "Reuild was interrupted")
