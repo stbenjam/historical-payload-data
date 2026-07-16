@@ -1,0 +1,469 @@
+diff --git a/cmd/cluster/core/create.go b/cmd/cluster/core/create.go
+index 1ab5236f8637..b741cfac3dcc 100644
+--- a/cmd/cluster/core/create.go
++++ b/cmd/cluster/core/create.go
+@@ -33,6 +33,7 @@ import (
+ 	"k8s.io/apimachinery/pkg/util/validation"
+ 	"k8s.io/apimachinery/pkg/util/wait"
+ 	kubeclient "k8s.io/client-go/kubernetes"
++	"k8s.io/client-go/util/retry"
+ 	"k8s.io/utils/ptr"
+ 
+ 	crclient "sigs.k8s.io/controller-runtime/pkg/client"
+@@ -786,11 +787,9 @@ func (opts *RawCreateOptions) validateClusterExistence(ctx context.Context) erro
+ 	if err != nil {
+ 		return err
+ 	}
+-	cluster := &hyperv1.HostedCluster{ObjectMeta: metav1.ObjectMeta{Namespace: opts.Namespace, Name: opts.Name}}
+-	if err := client.Get(ctx, crclient.ObjectKeyFromObject(cluster), cluster); err == nil {
+-		return fmt.Errorf("hostedcluster %s already exists", crclient.ObjectKeyFromObject(cluster))
+-	} else if !apierrors.IsNotFound(err) {
+-		return fmt.Errorf("hostedcluster doesn't exist validation failed with error: %w", err)
++
++	if err := opts.validateClusterExistenceWithClient(ctx, client); err != nil {
++		return err
+ 	}
+ 
+ 	kc, err := hyperutil.GetKubeClientSetWithKubeconfig(opts.Kubeconfig)
+@@ -807,6 +806,38 @@ func (opts *RawCreateOptions) validateClusterExistence(ctx context.Context) erro
+ 	return nil
+ }
+ 
++func isTransientAPIError(err error) bool {
++	return apierrors.IsTimeout(err) || apierrors.IsServerTimeout(err) || apierrors.IsInternalError(err) || apierrors.IsTooManyRequests(err) || apierrors.IsServiceUnavailable(err)
++}
++
++func (opts *RawCreateOptions) validateClusterExistenceWithClient(ctx context.Context, c crclient.Client) error {
++	// Max total retry wait ~31s (1+2+4+8+16), acceptable for a CLI pre-flight check.
++	backoff := wait.Backoff{
++		Steps:    5,
++		Duration: 1 * time.Second,
++		Factor:   2.0,
++		Jitter:   0.1,
++	}
++
++	err := retry.OnError(backoff, isTransientAPIError, func() error {
++		cluster := &hyperv1.HostedCluster{ObjectMeta: metav1.ObjectMeta{Namespace: opts.Namespace, Name: opts.Name}}
++		if err := c.Get(ctx, crclient.ObjectKeyFromObject(cluster), cluster); err == nil {
++			return fmt.Errorf("hostedcluster %s already exists", crclient.ObjectKeyFromObject(cluster))
++		} else if !apierrors.IsNotFound(err) {
++			opts.Log.Error(err, "error checking hostedcluster existence", "namespace", opts.Namespace, "name", opts.Name)
++			return err
++		}
++		return nil
++	})
++	if err != nil {
++		if isTransientAPIError(err) {
++			return fmt.Errorf("hostedcluster doesn't exist validation failed with error: %w", err)
++		}
++		return err
++	}
++	return nil
++}
++
+ func (opts *RawCreateOptions) validateArchAndFeatureSet() error {
+ 	arch := strings.ToLower(opts.Arch)
+ 	switch arch {
+diff --git a/cmd/cluster/core/create_test.go b/cmd/cluster/core/create_test.go
+index 802fb0c14303..c5750b5956d6 100644
+--- a/cmd/cluster/core/create_test.go
++++ b/cmd/cluster/core/create_test.go
+@@ -2,6 +2,7 @@ package core
+ 
+ import (
+ 	"context"
++	"fmt"
+ 	"os"
+ 	"path/filepath"
+ 	"testing"
+@@ -18,7 +19,9 @@ import (
+ 
+ 	appsv1 "k8s.io/api/apps/v1"
+ 	corev1 "k8s.io/api/core/v1"
++	apierrors "k8s.io/apimachinery/pkg/api/errors"
+ 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
++	"k8s.io/apimachinery/pkg/runtime"
+ 	apiversion "k8s.io/apimachinery/pkg/version"
+ 	fakediscovery "k8s.io/client-go/discovery/fake"
+ 	fakekubeclient "k8s.io/client-go/kubernetes/fake"
+@@ -1763,3 +1766,161 @@ func TestEnsureClusterNetworkOperatorSpec(t *testing.T) {
+ 		g.Expect(cluster.Spec.OperatorConfiguration.ClusterNetworkOperator).NotTo(BeNil())
+ 	})
+ }
++
++func TestValidateClusterExistence(t *testing.T) {
++	scheme := fake.NewClientBuilder().Build().Scheme()
++	if err := hyperv1.AddToScheme(scheme); err != nil {
++		t.Fatalf("failed to add hyperv1 to scheme: %v", err)
++	}
++
++	tests := map[string]struct {
++		opts        *RawCreateOptions
++		client      crclient.Client
++		expectError bool
++		errorMsg    string
++	}{
++		"When the cluster does not exist it should succeed": {
++			opts: &RawCreateOptions{
++				Namespace: "test-ns",
++				Name:      "test-cluster",
++			},
++			client:      fake.NewClientBuilder().WithScheme(scheme).Build(),
++			expectError: false,
++		},
++		"When the cluster already exists it should return an error": {
++			opts: &RawCreateOptions{
++				Namespace: "test-ns",
++				Name:      "test-cluster",
++			},
++			client: fake.NewClientBuilder().WithScheme(scheme).WithObjects(
++				&hyperv1.HostedCluster{
++					ObjectMeta: metav1.ObjectMeta{
++						Namespace: "test-ns",
++						Name:      "test-cluster",
++					},
++				},
++			).Build(),
++			expectError: true,
++			errorMsg:    "already exists",
++		},
++		"When the API server returns a transient timeout it should retry and succeed": {
++			opts: &RawCreateOptions{
++				Namespace: "test-ns",
++				Name:      "test-cluster",
++			},
++			client:      &transientErrorClient{callsBeforeSuccess: 2, scheme: scheme},
++			expectError: false,
++		},
++		"When the API server returns persistent timeouts it should eventually fail": {
++			opts: &RawCreateOptions{
++				Namespace: "test-ns",
++				Name:      "test-cluster",
++			},
++			client:      &transientErrorClient{callsBeforeSuccess: 100, scheme: scheme},
++			expectError: true,
++			errorMsg:    "hostedcluster doesn't exist validation failed",
++		},
++		"When the API server returns a forbidden error it should fail immediately without retry": {
++			opts: &RawCreateOptions{
++				Namespace: "test-ns",
++				Name:      "test-cluster",
++			},
++			client:      &nonTransientErrorClient{err: apierrors.NewForbidden(hyperv1.Resource("hostedclusters"), "test-cluster", fmt.Errorf("forbidden")), scheme: scheme},
++			expectError: true,
++			errorMsg:    "forbidden",
++		},
++		"When the API server returns a service unavailable error it should retry and succeed": {
++			opts: &RawCreateOptions{
++				Namespace: "test-ns",
++				Name:      "test-cluster",
++			},
++			client:      &transientErrorClient{callsBeforeSuccess: 2, scheme: scheme, errFunc: func() error { return apierrors.NewServiceUnavailable("service unavailable") }},
++			expectError: false,
++		},
++		"When the API server times out then finds the cluster exists it should return already exists": {
++			opts: &RawCreateOptions{
++				Namespace: "test-ns",
++				Name:      "test-cluster",
++			},
++			client: &timeoutThenExistsClient{
++				callsBeforeTerminal: 2,
++				scheme:              scheme,
++			},
++			expectError: true,
++			errorMsg:    "already exists",
++		},
++	}
++
++	for name, test := range tests {
++		t.Run(name, func(t *testing.T) {
++			g := NewWithT(t)
++			ctx := t.Context()
++
++			err := test.opts.validateClusterExistenceWithClient(ctx, test.client)
++			if test.expectError {
++				g.Expect(err).To(HaveOccurred())
++				if test.errorMsg != "" {
++					g.Expect(err.Error()).To(ContainSubstring(test.errorMsg))
++				}
++			} else {
++				g.Expect(err).NotTo(HaveOccurred())
++			}
++		})
++	}
++}
++
++type transientErrorClient struct {
++	crclient.Client
++	callsBeforeSuccess int
++	calls              int
++	scheme             *runtime.Scheme
++	errFunc            func() error
++}
++
++func (c *transientErrorClient) Get(ctx context.Context, key crclient.ObjectKey, obj crclient.Object, opts ...crclient.GetOption) error {
++	c.calls++
++	if c.calls <= c.callsBeforeSuccess {
++		if c.errFunc != nil {
++			return c.errFunc()
++		}
++		return apierrors.NewTimeoutError("the server was unable to return a response in the time allotted", 0)
++	}
++	return apierrors.NewNotFound(hyperv1.Resource("hostedclusters"), key.Name)
++}
++
++func (c *transientErrorClient) Scheme() *runtime.Scheme {
++	return c.scheme
++}
++
++type nonTransientErrorClient struct {
++	crclient.Client
++	err    error
++	scheme *runtime.Scheme
++}
++
++func (c *nonTransientErrorClient) Get(ctx context.Context, key crclient.ObjectKey, obj crclient.Object, opts ...crclient.GetOption) error {
++	return c.err
++}
++
++func (c *nonTransientErrorClient) Scheme() *runtime.Scheme {
++	return c.scheme
++}
++
++type timeoutThenExistsClient struct {
++	crclient.Client
++	callsBeforeTerminal int
++	calls               int
++	scheme              *runtime.Scheme
++}
++
++func (c *timeoutThenExistsClient) Get(ctx context.Context, key crclient.ObjectKey, obj crclient.Object, opts ...crclient.GetOption) error {
++	c.calls++
++	if c.calls <= c.callsBeforeTerminal {
++		return apierrors.NewTimeoutError("the server was unable to return a response in the time allotted", 0)
++	}
++	return nil
++}
++
++func (c *timeoutThenExistsClient) Scheme() *runtime.Scheme {
++	return c.scheme
++}
+diff --git a/cmd/infra/azure/networking.go b/cmd/infra/azure/networking.go
+index 79626254f16f..294721d70e9f 100644
+--- a/cmd/infra/azure/networking.go
++++ b/cmd/infra/azure/networking.go
+@@ -4,7 +4,9 @@ import (
+ 	"context"
+ 	"errors"
+ 	"fmt"
++	"net/http"
+ 	"strings"
++	"time"
+ 
+ 	"github.com/openshift/hypershift/support/azureutil"
+ 
+@@ -14,6 +16,8 @@ import (
+ 	"github.com/Azure/azure-sdk-for-go/sdk/resourcemanager/network/armnetwork/v5"
+ 	"github.com/Azure/azure-sdk-for-go/sdk/resourcemanager/privatedns/armprivatedns"
+ 
++	"k8s.io/apimachinery/pkg/util/wait"
++	"k8s.io/client-go/util/retry"
+ 	"k8s.io/utils/ptr"
+ 
+ 	ctrl "sigs.k8s.io/controller-runtime"
+@@ -281,8 +285,22 @@ func NewPublicIPAddress(name string, location string) armnetwork.PublicIPAddress
+ 	}
+ }
+ 
++// isAzureConflictError returns true for Azure 409 Conflict errors that the SDK's
++// default retry policy does not cover (the SDK already retries 408/429/500/502/503/504).
++func isAzureConflictError(err error) bool {
++	if err == nil {
++		return false
++	}
++	var respErr *azcore.ResponseError
++	if !errors.As(err, &respErr) {
++		return false
++	}
++	return respErr.StatusCode == http.StatusConflict
++}
++
+ // CreatePublicIPAddressForLB creates a public IP address to use for the outbound rule in the load balancer
+ func (n *NetworkManager) CreatePublicIPAddressForLB(ctx context.Context, resourceGroupName string, infraID string, location string) (*armnetwork.PublicIPAddress, error) {
++	log := ctrl.LoggerFrom(ctx)
+ 	cloudConfig, err := azureutil.GetAzureCloudConfiguration(n.cloud)
+ 	if err != nil {
+ 		return nil, fmt.Errorf("failed to get Azure cloud configuration: %w", err)
+@@ -293,22 +311,47 @@ func (n *NetworkManager) CreatePublicIPAddressForLB(ctx context.Context, resourc
+ 	}
+ 
+ 	publicIPAddress := NewPublicIPAddress(infraID, location)
+-	pollerResp, err := publicIPAddressClient.BeginCreateOrUpdate(
+-		ctx,
+-		resourceGroupName,
+-		infraID,
+-		publicIPAddress,
+-		nil,
+-	)
+-	if err != nil {
+-		return nil, fmt.Errorf("failed to create public IP address, %w", err)
+-	}
+ 
+-	resp, err := pollerResp.PollUntilDone(ctx, nil)
++	// Max total retry wait ~155s (5+10+20+40+80), suitable for infra provisioning.
++	backoff := wait.Backoff{
++		Steps:    5,
++		Duration: 5 * time.Second,
++		Factor:   2.0,
++		Jitter:   0.1,
++	}
++
++	var result *armnetwork.PublicIPAddress
++	// BeginCreateOrUpdate is idempotent (CreateOrUpdate), so retries that re-submit
++	// the creation request after a transient failure on PollUntilDone are safe.
++	err = retry.OnError(backoff, isAzureConflictError, func() error {
++		pollerResp, err := publicIPAddressClient.BeginCreateOrUpdate(
++			ctx,
++			resourceGroupName,
++			infraID,
++			publicIPAddress,
++			nil,
++		)
++		if err != nil {
++			if isAzureConflictError(err) {
++				log.Info("Transient error creating public IP address, will retry", "error", err)
++			}
++			return err
++		}
++
++		resp, err := pollerResp.PollUntilDone(ctx, nil)
++		if err != nil {
++			if isAzureConflictError(err) {
++				log.Info("Transient error waiting for public IP address creation, will retry", "error", err)
++			}
++			return err
++		}
++		result = &resp.PublicIPAddress
++		return nil
++	})
+ 	if err != nil {
+-		return nil, fmt.Errorf("failed while waiting create public IP address, %w", err)
++		return nil, fmt.Errorf("failed to create public IP address: %w", err)
+ 	}
+-	return &resp.PublicIPAddress, nil
++	return result, nil
+ }
+ 
+ // newFrontendIPConfiguration creates a frontend IP configuration for a load balancer.
+diff --git a/cmd/infra/azure/networking_test.go b/cmd/infra/azure/networking_test.go
+index 33082b4c51ba..c8037bba4885 100644
+--- a/cmd/infra/azure/networking_test.go
++++ b/cmd/infra/azure/networking_test.go
+@@ -1,10 +1,14 @@
+ package azure
+ 
+ import (
++	"errors"
++	"fmt"
++	"net/http"
+ 	"testing"
+ 
+ 	. "github.com/onsi/gomega"
+ 
++	"github.com/Azure/azure-sdk-for-go/sdk/azcore"
+ 	"github.com/Azure/azure-sdk-for-go/sdk/resourcemanager/network/armnetwork/v5"
+ )
+ 
+@@ -166,3 +170,78 @@ func TestNewLoadBalancer(t *testing.T) {
+ func stringPtr(s string) *string {
+ 	return &s
+ }
++
++func TestIsAzureConflictError(t *testing.T) {
++	tests := map[string]struct {
++		err      error
++		expected bool
++	}{
++		"When the error is a 409 ConflictingConcurrentWriteNotAllowed it should be retryable": {
++			err: &azcore.ResponseError{
++				StatusCode: http.StatusConflict,
++				ErrorCode:  "ConflictingConcurrentWriteNotAllowed",
++			},
++			expected: true,
++		},
++		"When the error is a 409 with different error code it should be retryable": {
++			err: &azcore.ResponseError{
++				StatusCode: http.StatusConflict,
++				ErrorCode:  "AnotherConflict",
++			},
++			expected: true,
++		},
++		"When the error is a 429 too many requests it should not be retryable": {
++			err: &azcore.ResponseError{
++				StatusCode: http.StatusTooManyRequests,
++			},
++			expected: false,
++		},
++		"When the error is a 500 internal server error it should not be retryable": {
++			err: &azcore.ResponseError{
++				StatusCode: http.StatusInternalServerError,
++			},
++			expected: false,
++		},
++		"When the error is a 400 bad request it should not be retryable": {
++			err: &azcore.ResponseError{
++				StatusCode: http.StatusBadRequest,
++			},
++			expected: false,
++		},
++		"When the error is not an Azure ResponseError it should not be retryable": {
++			err:      fmt.Errorf("some random error"),
++			expected: false,
++		},
++		"When the error wraps a 409 Azure ResponseError it should be retryable": {
++			err: fmt.Errorf("wrapped: %w", &azcore.ResponseError{
++				StatusCode: http.StatusConflict,
++				ErrorCode:  "ConflictingConcurrentWriteNotAllowed",
++			}),
++			expected: true,
++		},
++		"When the error is nil it should not be retryable": {
++			err:      nil,
++			expected: false,
++		},
++	}
++
++	for name, test := range tests {
++		t.Run(name, func(t *testing.T) {
++			g := NewGomegaWithT(t)
++			g.Expect(isAzureConflictError(test.err)).To(Equal(test.expected))
++		})
++	}
++}
++
++// Verify that errors.As works with our test helper errors
++func TestErrorsAsAzureResponseError(t *testing.T) {
++	g := NewGomegaWithT(t)
++	wrappedErr := fmt.Errorf("operation failed: %w", &azcore.ResponseError{
++		StatusCode: http.StatusConflict,
++		ErrorCode:  "ConflictingConcurrentWriteNotAllowed",
++	})
++
++	var respErr *azcore.ResponseError
++	g.Expect(errors.As(wrappedErr, &respErr)).To(BeTrue())
++	g.Expect(respErr.StatusCode).To(Equal(http.StatusConflict))
++}
+diff --git a/test/e2e/v2/cmd/create-guests/main.go b/test/e2e/v2/cmd/create-guests/main.go
+index 1646af705baf..c3be0061dea6 100644
+--- a/test/e2e/v2/cmd/create-guests/main.go
++++ b/test/e2e/v2/cmd/create-guests/main.go
+@@ -179,7 +179,8 @@ func run(ctx context.Context, cfg envConfig) error {
+ 
+ 	// Phase 3: Watch for Available condition on all clusters.
+ 	log.Println("Phase 3: Waiting for all clusters to become Available")
+-	availableErrors := waitForClustersAvailable(ctx, mgmtClient, cfg.namespace, named, 30*time.Minute)
++	// Use cfg.waitTimeout (45m) to match the version rollout timeout at line 352.
++	availableErrors := waitForClustersAvailable(ctx, mgmtClient, cfg.namespace, named, cfg.waitTimeout)
+ 	for _, ns := range named {
+ 		if err := availableErrors[ns.Variant]; err != nil {
+ 			log.Printf("ERROR: cluster %s (%s) did not become Available: %v", ns.name, ns.Variant, err)

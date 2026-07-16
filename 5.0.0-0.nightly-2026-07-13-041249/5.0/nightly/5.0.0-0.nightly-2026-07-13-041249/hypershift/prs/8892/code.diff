@@ -1,0 +1,102 @@
+diff --git a/control-plane-operator/hostedclusterconfigoperator/controllers/machine/machine.go b/control-plane-operator/hostedclusterconfigoperator/controllers/machine/machine.go
+index 281d87dee56a..8930d75d8078 100644
+--- a/control-plane-operator/hostedclusterconfigoperator/controllers/machine/machine.go
++++ b/control-plane-operator/hostedclusterconfigoperator/controllers/machine/machine.go
+@@ -129,10 +129,20 @@ func (r *reconciler) reconcileKubevirtPassthroughService(ctx context.Context, _
+ 				log.Info("Skipping link-local address for EndpointSlice", "address", machineAddress.Address, "machine", machine.Name)
+ 				continue
+ 			}
++			// Use only the first address per family. CAPK PR #366 exposes all VMI
++			// interface IPs (for dual-stack CSR approval), including ovn-k8s-mp0
++			// management port IPs that are not routable from the management cluster.
++			// This assumes CAPK reports the pod-network IP first; if CAPK changes
++			// address ordering, this logic must be revisited.
++			// See: OCPBUGS-95615, kubernetes-sigs/cluster-api-provider-kubevirt#366
+ 			if parsedAddr.Is4() {
+-				ipv4MachineAddresses = append(ipv4MachineAddresses, machineAddress.Address)
++				if len(ipv4MachineAddresses) == 0 {
++					ipv4MachineAddresses = append(ipv4MachineAddresses, machineAddress.Address)
++				}
+ 			} else {
+-				ipv6MachineAddresses = append(ipv6MachineAddresses, machineAddress.Address)
++				if len(ipv6MachineAddresses) == 0 {
++					ipv6MachineAddresses = append(ipv6MachineAddresses, machineAddress.Address)
++				}
+ 			}
+ 		}
+ 	}
+diff --git a/control-plane-operator/hostedclusterconfigoperator/controllers/machine/machine_test.go b/control-plane-operator/hostedclusterconfigoperator/controllers/machine/machine_test.go
+index f9518457229b..027e8b5cd53a 100644
+--- a/control-plane-operator/hostedclusterconfigoperator/controllers/machine/machine_test.go
++++ b/control-plane-operator/hostedclusterconfigoperator/controllers/machine/machine_test.go
+@@ -422,6 +422,45 @@ func TestReconcileDefaultIngressEndpoints(t *testing.T) {
+ 		},
+ 	}
+ 
++	machinesWithExtraInternalIPs := []capiv1.Machine{
++		{
++			TypeMeta:   machineTypeMeta,
++			ObjectMeta: worker1Meta,
++			Spec: capiv1.MachineSpec{
++				InfrastructureRef: corev1.ObjectReference{
++					Name: vmWorker1Meta.Name,
++				},
++			},
++			Status: capiv1.MachineStatus{
++				Phase: string(capiv1.MachinePhaseRunning),
++				Addresses: []capiv1.MachineAddress{
++					{Type: capiv1.MachineInternalIP, Address: "192.168.1.3"},
++					{Type: capiv1.MachineInternalIP, Address: "10.8.20.2"},
++					{Type: capiv1.MachineInternalIP, Address: "2001:db8:a0b:12f0::3"},
++					{Type: capiv1.MachineInternalIP, Address: "fd00:10:8::3"},
++				},
++			},
++		},
++		{
++			TypeMeta:   machineTypeMeta,
++			ObjectMeta: worker2Meta,
++			Spec: capiv1.MachineSpec{
++				InfrastructureRef: corev1.ObjectReference{
++					Name: vmWorker2Meta.Name,
++				},
++			},
++			Status: capiv1.MachineStatus{
++				Phase: string(capiv1.MachinePhaseRunning),
++				Addresses: []capiv1.MachineAddress{
++					{Type: capiv1.MachineInternalIP, Address: "192.168.1.4"},
++					{Type: capiv1.MachineInternalIP, Address: "10.8.0.2"},
++					{Type: capiv1.MachineInternalIP, Address: "2001:db8:a0b:12f0::4"},
++					{Type: capiv1.MachineInternalIP, Address: "fd00:10:8::4"},
++				},
++			},
++		},
++	}
++
+ 	testCases := []struct {
+ 		name                          string
+ 		machines                      []capiv1.Machine
+@@ -495,6 +534,24 @@ func TestReconcileDefaultIngressEndpoints(t *testing.T) {
+ 			},
+ 			hcp: kubevirtHCP,
+ 		},
++		{
++			name:             "When machines have multiple same-family InternalIPs it should use only the first per family",
++			machines:         machinesWithExtraInternalIPs,
++			virtualMachines:  pairOfVirtualMachines,
++			services:         []corev1.Service{defaultIngressService, kccmService},
++			expectedServices: []corev1.Service{defaultIngressService, kccmService},
++			expectedIngressEndpointSlices: []discoveryv1.EndpointSlice{
++				defaultIngressEndpointSliceIPv4(machinesWithExtraInternalIPs[0], pairOfVirtualMachines[0]),
++				defaultIngressEndpointSliceIPv4(machinesWithExtraInternalIPs[1], pairOfVirtualMachines[1]),
++				defaultIngressEndpointSliceIPv6(machinesWithExtraInternalIPs[0], pairOfVirtualMachines[0]),
++				defaultIngressEndpointSliceIPv6(machinesWithExtraInternalIPs[1], pairOfVirtualMachines[1]),
++				kccmEndpointSliceIPv4(machinesWithExtraInternalIPs[0], pairOfVirtualMachines[0]),
++				kccmEndpointSliceIPv4(machinesWithExtraInternalIPs[1], pairOfVirtualMachines[1]),
++				kccmEndpointSliceIPv6(machinesWithExtraInternalIPs[0], pairOfVirtualMachines[0]),
++				kccmEndpointSliceIPv6(machinesWithExtraInternalIPs[1], pairOfVirtualMachines[1]),
++			},
++			hcp: kubevirtHCP,
++		},
+ 		{
+ 			name:            "Should remove orphan endpoint slices",
+ 			machines:        pairOfDualStackRunningMachines,
