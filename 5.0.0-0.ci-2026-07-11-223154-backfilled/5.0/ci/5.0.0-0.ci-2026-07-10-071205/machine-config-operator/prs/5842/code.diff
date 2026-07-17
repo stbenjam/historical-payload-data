@@ -1,0 +1,1587 @@
+diff --git a/cmd/machine-config-controller/start.go b/cmd/machine-config-controller/start.go
+index 4f0ad29019..579df9ec3b 100644
+--- a/cmd/machine-config-controller/start.go
++++ b/cmd/machine-config-controller/start.go
+@@ -109,6 +109,7 @@ func runStartCmd(_ *cobra.Command, _ []string) {
+ 			ctrlctx.KubeNamespacedInformerFactory.Core().V1().Secrets(),
+ 			ctrlctx.KubeNamespacedInformerFactory.Core().V1().ConfigMaps(),
+ 			ctrlctx.ConfigInformerFactory.Config().V1().Infrastructures(),
++			ctrlctx.ConfigInformerFactory,
+ 			ctrlctx.FeatureGatesHandler,
+ 			ctrlctx.ClientBuilder.MachineConfigClientOrDie("cert-rotation-controller"),
+ 		)
+diff --git a/go.mod b/go.mod
+index 1a98e574c0..6767152ab3 100644
+--- a/go.mod
++++ b/go.mod
+@@ -39,7 +39,7 @@ require (
+ 	github.com/openshift-eng/openshift-tests-extension v0.0.0-20260127124016-0fed2b824818
+ 	github.com/openshift/api v0.0.0-20260603130340-1ad2ac3eb53d
+ 	github.com/openshift/client-go v0.0.0-20260603140539-6892dc3e1ffc
+-	github.com/openshift/library-go v0.0.0-20260303171201-5d9eb6295ff6
++	github.com/openshift/library-go v0.0.0-20260611115129-21dd5809a4b2
+ 	github.com/openshift/runtime-utils v0.0.0-20230921210328-7bdb5b9c177b
+ 	github.com/prometheus/client_golang v1.23.2
+ 	github.com/rs/zerolog v1.34.0
+diff --git a/go.sum b/go.sum
+index 3ad86611c5..a719e8252b 100644
+--- a/go.sum
++++ b/go.sum
+@@ -675,8 +675,8 @@ github.com/openshift/kubernetes/staging/src/k8s.io/pod-security-admission v0.0.0
+ github.com/openshift/kubernetes/staging/src/k8s.io/pod-security-admission v0.0.0-20260305123649-d18f3f005eaa/go.mod h1:6wqqkK0+5hV+CLJ3uz9A1lkjxXRvkbq+5RnZdUZx/H8=
+ github.com/openshift/kubernetes/staging/src/k8s.io/sample-apiserver v0.0.0-20260305123649-d18f3f005eaa h1:JY4k94JmDGQp2Pj94Cw2xtIjs7MpPkU9n8zNPDTbiKo=
+ github.com/openshift/kubernetes/staging/src/k8s.io/sample-apiserver v0.0.0-20260305123649-d18f3f005eaa/go.mod h1:CnFDBq5NGnfOSMeOP8l4SNYJrxK6Z1kUaKdu3Qq9Uik=
+-github.com/openshift/library-go v0.0.0-20260303171201-5d9eb6295ff6 h1:xjqy0OolrFdJ+ofI/aD0+2k9+MSk5anP5dXifFt539Q=
+-github.com/openshift/library-go v0.0.0-20260303171201-5d9eb6295ff6/go.mod h1:D797O/ssKTNglbrGchjIguFq+DbyRYdeds5w4/VTrKM=
++github.com/openshift/library-go v0.0.0-20260611115129-21dd5809a4b2 h1:kH+vbMI//DZciIQXa6VhTX6BOH3ZJuZSN5IS8wQI76g=
++github.com/openshift/library-go v0.0.0-20260611115129-21dd5809a4b2/go.mod h1:/HBhy6jm/igWI3Y1vYFwFG3ZCcXmnNsKUT6VBpPyM9A=
+ github.com/openshift/onsi-ginkgo/v2 v2.6.1-0.20251120221002-696928a6a0d7 h1:02E4Ttpu+7yCQLQxtY42JfcfHU7TBGnje6uB2ytBSdU=
+ github.com/openshift/onsi-ginkgo/v2 v2.6.1-0.20251120221002-696928a6a0d7/go.mod h1:ArE1D/XhNXBXCBkKOLkbsb2c81dQHCRcF5zwn/ykDRo=
+ github.com/openshift/runtime-utils v0.0.0-20230921210328-7bdb5b9c177b h1:oXzC1N6E9gw76/WH2gEA8GEHvuq09wuVQ9GoCuR8GF4=
+diff --git a/pkg/controller/certrotation/certrotation_controller.go b/pkg/controller/certrotation/certrotation_controller.go
+index a8137849de..20644323ac 100644
+--- a/pkg/controller/certrotation/certrotation_controller.go
++++ b/pkg/controller/certrotation/certrotation_controller.go
+@@ -33,6 +33,7 @@ import (
+ 	configv1 "github.com/openshift/api/config/v1"
+ 	"github.com/openshift/api/features"
+ 	configclientset "github.com/openshift/client-go/config/clientset/versioned"
++	configinformersexternal "github.com/openshift/client-go/config/informers/externalversions"
+ 	machineclientset "github.com/openshift/client-go/machine/clientset/versioned"
+ 	mcfgclientset "github.com/openshift/client-go/machineconfiguration/clientset/versioned"
+ 
+@@ -40,6 +41,7 @@ import (
+ 	"github.com/openshift/library-go/pkg/crypto"
+ 	"github.com/openshift/library-go/pkg/operator/certrotation"
+ 	"github.com/openshift/library-go/pkg/operator/events"
++	"github.com/openshift/library-go/pkg/pki"
+ 
+ 	aroclientset "github.com/Azure/ARO-RP/pkg/operator/clientset/versioned"
+ 
+@@ -96,12 +98,26 @@ func New(
+ 	mcoSecretInformer coreinformersv1.SecretInformer,
+ 	mcoConfigMapInfomer coreinformersv1.ConfigMapInformer,
+ 	infraInformer configinformers.InfrastructureInformer,
++	configInformerFactory configinformersexternal.SharedInformerFactory,
+ 	featureGatesHandler ctrlcommon.FeatureGatesHandler,
+ 	mcfgClient mcfgclientset.Interface,
+ ) (*CertRotationController, error) {
+ 
+ 	recorder := events.NewLoggingEventRecorder(componentName, clock.RealClock{})
+ 
++	cachesToSync := []cache.InformerSynced{
++		maoSecretInformer.Informer().HasSynced,
++		mcoSecretInformer.Informer().HasSynced,
++		mcoConfigMapInfomer.Informer().HasSynced,
++		infraInformer.Informer().HasSynced,
++	}
++
++	var pkiProfileProvider pki.PKIProfileProvider
++	if configInformerFactory != nil && featureGatesHandler != nil && featureGatesHandler.Enabled(features.FeatureGateConfigurablePKI) {
++		pkiProfileProvider = pki.NewClusterPKIProfileProvider(configInformerFactory.Config().V1alpha1().PKIs().Lister())
++		cachesToSync = append(cachesToSync, configInformerFactory.Config().V1alpha1().PKIs().Informer().HasSynced)
++	}
++
+ 	c := &CertRotationController{
+ 		kubeClient:          kubeClient,
+ 		configClient:        configClient,
+@@ -112,12 +128,7 @@ func New(
+ 		mcoConfigMapInfomer: mcoConfigMapInfomer,
+ 		mcoSecretLister:     mcoSecretInformer.Lister(),
+ 		maoSecretLister:     maoSecretInformer.Lister(),
+-		cachesToSync: []cache.InformerSynced{
+-			maoSecretInformer.Informer().HasSynced,
+-			mcoSecretInformer.Informer().HasSynced,
+-			mcoConfigMapInfomer.Informer().HasSynced,
+-			infraInformer.Informer().HasSynced,
+-		},
++		cachesToSync:        cachesToSync,
+ 
+ 		hostnamesRotation: &DynamicServingRotation{hostnamesChanged: make(chan struct{}, 10)},
+ 		hostnamesQueue: workqueue.NewTypedRateLimitingQueueWithConfig(
+@@ -142,12 +153,14 @@ func New(
+ 				JiraComponent: "Machine Config Operator",
+ 				Description:   "CA used to sign the MachineConfigServer TLS certificate",
+ 			},
+-			Validity:      mcsCAExpiry,
+-			Refresh:       mcsCARefresh,
+-			Informer:      mcoSecretInformer,
+-			Lister:        c.mcoSecretLister,
+-			Client:        kubeClient.CoreV1(),
+-			EventRecorder: recorder,
++			Validity:           mcsCAExpiry,
++			Refresh:            mcsCARefresh,
++			CertificateName:    "machine-config.machine-config-server-signer",
++			PKIProfileProvider: pkiProfileProvider,
++			Informer:           mcoSecretInformer,
++			Lister:             c.mcoSecretLister,
++			Client:             kubeClient.CoreV1(),
++			EventRecorder:      recorder,
+ 		},
+ 		certrotation.CABundleConfigMap{
+ 			Namespace: ctrlcommon.MCONamespace,
+@@ -174,10 +187,12 @@ func New(
+ 				Hostnames:        c.hostnamesRotation.GetHostnames,
+ 				HostnamesChanged: c.hostnamesRotation.hostnamesChanged,
+ 			},
+-			Informer:      mcoSecretInformer,
+-			Lister:        c.mcoSecretLister,
+-			Client:        kubeClient.CoreV1(),
+-			EventRecorder: recorder,
++			CertificateName:    "machine-config.machine-config-server-serving",
++			PKIProfileProvider: pkiProfileProvider,
++			Informer:           mcoSecretInformer,
++			Lister:             c.mcoSecretLister,
++			Client:             kubeClient.CoreV1(),
++			EventRecorder:      recorder,
+ 		},
+ 		recorder,
+ 		NewCertRotationStatusReporter(),
+diff --git a/pkg/controller/certrotation/certrotation_controller_test.go b/pkg/controller/certrotation/certrotation_controller_test.go
+index 2ffa874008..9965212670 100644
+--- a/pkg/controller/certrotation/certrotation_controller_test.go
++++ b/pkg/controller/certrotation/certrotation_controller_test.go
+@@ -124,7 +124,7 @@ func (f *fixture) newController() *CertRotationController {
+ 		[]configv1.FeatureGateName{features.FeatureGateNoRegistryClusterInstall},
+ 		nil,
+ 	)
+-	c, err := New(f.kubeClient, f.configClient, f.machineClient, f.aroClient, f.k8sI.Core().V1().Secrets(), f.k8sI.Core().V1().Secrets(), f.k8sI.Core().V1().ConfigMaps(), f.infraInformer.Config().V1().Infrastructures(), fgHandler, f.mcfgClient)
++	c, err := New(f.kubeClient, f.configClient, f.machineClient, f.aroClient, f.k8sI.Core().V1().Secrets(), f.k8sI.Core().V1().Secrets(), f.k8sI.Core().V1().ConfigMaps(), f.infraInformer.Config().V1().Infrastructures(), nil, fgHandler, f.mcfgClient)
+ 	require.NoError(f.t, err)
+ 
+ 	c.StartInformers()
+@@ -464,7 +464,7 @@ func TestIRICertificateReconcileSkippedWhenFeatureGateDisabled(t *testing.T) {
+ 	c, err := New(f.kubeClient, f.configClient, f.machineClient, f.aroClient,
+ 		f.k8sI.Core().V1().Secrets(), f.k8sI.Core().V1().Secrets(),
+ 		f.k8sI.Core().V1().ConfigMaps(), f.infraInformer.Config().V1().Infrastructures(),
+-		fgHandler, f.mcfgClient)
++		nil, fgHandler, f.mcfgClient)
+ 	require.NoError(t, err)
+ 
+ 	// reconcileIRICertificate must be a no-op when the feature gate is disabled.
+@@ -476,6 +476,99 @@ func TestIRICertificateReconcileSkippedWhenFeatureGateDisabled(t *testing.T) {
+ 	require.True(t, k8serrors.IsNotFound(err))
+ }
+ 
++func TestNewWithConfigurablePKI(t *testing.T) {
++	testCases := []struct {
++		name           string
++		enablePKI      bool
++		maoSecrets     []runtime.Object
++		machineObjects []runtime.Object
++	}{
++		{
++			name:           "ConfigurablePKI enabled wires PKI informer and syncs certs",
++			enablePKI:      true,
++			maoSecrets:     []runtime.Object{getGoodMAOSecret("test-user-data")},
++			machineObjects: []runtime.Object{getMachineSet("test-machine")},
++		},
++		{
++			name:           "ConfigurablePKI disabled with configInformerFactory does not wire PKI informer",
++			enablePKI:      false,
++			maoSecrets:     []runtime.Object{getGoodMAOSecret("test-user-data")},
++			machineObjects: []runtime.Object{getMachineSet("test-machine")},
++		},
++	}
++
++	for _, tc := range testCases {
++		t.Run(tc.name, func(t *testing.T) {
++			t.Parallel()
++
++			objects := []runtime.Object{}
++			objects = append(objects, tc.maoSecrets...)
++
++			infraObj := &configv1.Infrastructure{
++				ObjectMeta: metav1.ObjectMeta{
++					Name: "cluster",
++				},
++				Status: configv1.InfrastructureStatus{
++					ControlPlaneTopology: configv1.HighlyAvailableTopologyMode,
++					APIServerInternalURL: "https://10.0.0.1:6443",
++				},
++			}
++
++			kubeClient := fake.NewSimpleClientset(objects...)
++			configClient := fakeconfigv1client.NewSimpleClientset(infraObj)
++			machineClient := fakemachineclientset.NewSimpleClientset(tc.machineObjects...)
++			mcfgClient := fakemcfgclientset.NewSimpleClientset()
++			aroClient := fakearoclientset.NewSimpleClientset()
++			k8sI := kubeinformers.NewSharedInformerFactory(kubeClient, noResyncPeriodFunc())
++			infraInformer := configinformers.NewSharedInformerFactory(configClient, noResyncPeriodFunc())
++
++			for _, obj := range tc.maoSecrets {
++				k8sI.Core().V1().Secrets().Informer().GetIndexer().Add(obj)
++			}
++			infraInformer.Config().V1().Infrastructures().Informer().GetIndexer().Add(infraObj)
++
++			enabledGates := []configv1.FeatureGateName{features.FeatureGateNoRegistryClusterInstall}
++			if tc.enablePKI {
++				enabledGates = append(enabledGates, features.FeatureGateConfigurablePKI)
++			}
++			fgHandler := ctrlcommon.NewFeatureGatesHardcodedHandler(enabledGates, nil)
++
++			configInformerFactory := configinformers.NewSharedInformerFactory(configClient, noResyncPeriodFunc())
++
++			c, err := New(kubeClient, configClient, machineClient, aroClient,
++				k8sI.Core().V1().Secrets(), k8sI.Core().V1().Secrets(),
++				k8sI.Core().V1().ConfigMaps(), infraInformer.Config().V1().Infrastructures(),
++				configInformerFactory, fgHandler, mcfgClient)
++			require.NoError(t, err)
++
++			if tc.enablePKI {
++				// 5 caches: maoSecret, mcoSecret, mcoConfigMap, infra, pki
++				require.Len(t, c.cachesToSync, 5, "PKI informer HasSynced should be registered in cachesToSync")
++			} else {
++				// 4 caches: maoSecret, mcoSecret, mcoConfigMap, infra
++				require.Len(t, c.cachesToSync, 4, "PKI informer should not be registered when feature gate is disabled")
++			}
++
++			err = c.StartInformers()
++			require.NoError(t, err)
++
++			// Verify the controller can perform a cert sync
++			syncCtx := factory.NewSyncContext("test-sync", c.recorder)
++			require.NoError(t, c.syncHostnames())
++			for _, certRotator := range c.certRotators {
++				require.NoError(t, certRotator.Sync(context.TODO(), syncCtx))
++			}
++
++			// Verify the CA and TLS secrets were created
++			_, err = kubeClient.CoreV1().Secrets(ctrlcommon.MCONamespace).Get(context.TODO(), ctrlcommon.MachineConfigServerCAName, metav1.GetOptions{})
++			require.NoError(t, err, "MCS CA secret should be created")
++
++			_, err = kubeClient.CoreV1().Secrets(ctrlcommon.MCONamespace).Get(context.TODO(), ctrlcommon.MachineConfigServerTLSSecretName, metav1.GetOptions{})
++			require.NoError(t, err, "MCS TLS secret should be created")
++		})
++	}
++}
++
+ func TestIsIRICertValid(t *testing.T) {
+ 	caConfig, err := crypto.MakeSelfSignedCAConfig("test-ca", 24*time.Hour)
+ 	require.NoError(t, err)
+diff --git a/vendor/github.com/openshift/library-go/pkg/crypto/cert_config.go b/vendor/github.com/openshift/library-go/pkg/crypto/cert_config.go
+new file mode 100644
+index 0000000000..76d71da2ab
+--- /dev/null
++++ b/vendor/github.com/openshift/library-go/pkg/crypto/cert_config.go
+@@ -0,0 +1,225 @@
++package crypto
++
++import (
++	"crypto"
++	"crypto/x509"
++	"crypto/x509/pkix"
++	"fmt"
++	"time"
++
++	"k8s.io/apimachinery/pkg/util/sets"
++	"k8s.io/apiserver/pkg/authentication/user"
++)
++
++// KeyPairGenerator generates a cryptographic key pair.
++type KeyPairGenerator interface {
++	GenerateKeyPair() (crypto.PublicKey, crypto.PrivateKey, error)
++}
++
++// NewSigningCertificate creates a CA certificate.
++// By default it creates a self-signed root CA. Use WithSigner to create an
++// intermediate CA signed by a parent CA.
++// The name parameter is used as the CommonName unless overridden with WithSubject.
++// Optional: WithSigner, WithSubject, WithLifetime (defaults to DefaultCACertificateLifetimeDuration).
++func NewSigningCertificate(name string, keyGen KeyPairGenerator, opts ...CertificateOption) (*TLSCertificateConfig, error) {
++	o := &CertificateOptions{
++		lifetime: DefaultCACertificateLifetimeDuration,
++	}
++	for _, opt := range opts {
++		opt(o)
++	}
++
++	subject := pkix.Name{CommonName: name}
++	if o.subject != nil {
++		subject = *o.subject
++	}
++
++	publicKey, privateKey, err := keyGen.GenerateKeyPair()
++	if err != nil {
++		return nil, fmt.Errorf("failed to generate key pair: %w", err)
++	}
++	subjectKeyId, err := SubjectKeyIDFromPublicKey(publicKey)
++	if err != nil {
++		return nil, fmt.Errorf("failed to compute subject key ID: %w", err)
++	}
++
++	if o.signer != nil {
++		// Intermediate CA signed by the provided signer.
++		authorityKeyId := o.signer.Config.Certs[0].SubjectKeyId
++		template := newSigningCertificateTemplateForDuration(subject, o.lifetime, time.Now, authorityKeyId, subjectKeyId)
++		template.SignatureAlgorithm = 0
++		template.KeyUsage = KeyUsageForPublicKey(publicKey) | x509.KeyUsageCertSign
++
++		cert, err := o.signer.SignCertificate(template, publicKey)
++		if err != nil {
++			return nil, fmt.Errorf("failed to sign certificate: %w", err)
++		}
++
++		return &TLSCertificateConfig{
++			Certs: append([]*x509.Certificate{cert}, o.signer.Config.Certs...),
++			Key:   privateKey,
++		}, nil
++	}
++
++	// Self-signed root CA. AuthorityKeyId and SubjectKeyId match.
++	template := newSigningCertificateTemplateForDuration(subject, o.lifetime, time.Now, subjectKeyId, subjectKeyId)
++	template.SignatureAlgorithm = 0
++	template.KeyUsage = KeyUsageForPublicKey(publicKey) | x509.KeyUsageCertSign
++
++	cert, err := signCertificate(template, publicKey, template, privateKey)
++	if err != nil {
++		return nil, fmt.Errorf("failed to sign certificate: %w", err)
++	}
++
++	return &TLSCertificateConfig{
++		Certs: []*x509.Certificate{cert},
++		Key:   privateKey,
++	}, nil
++}
++
++// NewServerCertificate creates a server/serving certificate signed by this CA.
++// Optional: WithLifetime (defaults to DefaultCertificateLifetimeDuration), WithExtensions.
++func (ca *CA) NewServerCertificate(hostnames sets.Set[string], keyGen KeyPairGenerator, opts ...CertificateOption) (*TLSCertificateConfig, error) {
++	o := &CertificateOptions{
++		lifetime: DefaultCertificateLifetimeDuration,
++	}
++	for _, opt := range opts {
++		opt(o)
++	}
++
++	publicKey, privateKey, err := keyGen.GenerateKeyPair()
++	if err != nil {
++		return nil, fmt.Errorf("failed to generate key pair: %w", err)
++	}
++	subjectKeyId, err := SubjectKeyIDFromPublicKey(publicKey)
++	if err != nil {
++		return nil, fmt.Errorf("failed to compute subject key ID: %w", err)
++	}
++
++	sortedHostnames := sets.List(hostnames)
++	authorityKeyId := ca.Config.Certs[0].SubjectKeyId
++	template := newServerCertificateTemplateForDuration(
++		pkix.Name{CommonName: sortedHostnames[0]},
++		sortedHostnames,
++		o.lifetime,
++		time.Now,
++		authorityKeyId,
++		subjectKeyId,
++	)
++	// Let x509.CreateCertificate auto-detect the signature algorithm from the CA's key.
++	template.SignatureAlgorithm = 0
++	template.KeyUsage = KeyUsageForPublicKey(publicKey)
++
++	for _, fn := range o.extensionFns {
++		if err := fn(template); err != nil {
++			return nil, fmt.Errorf("failed to apply certificate extension: %w", err)
++		}
++	}
++
++	cert, err := ca.SignCertificate(template, publicKey)
++	if err != nil {
++		return nil, fmt.Errorf("failed to sign certificate: %w", err)
++	}
++
++	return &TLSCertificateConfig{
++		Certs: append([]*x509.Certificate{cert}, ca.Config.Certs...),
++		Key:   privateKey,
++	}, nil
++}
++
++// NewClientCertificate creates a client certificate signed by this CA.
++// Optional: WithLifetime (defaults to DefaultCertificateLifetimeDuration).
++func (ca *CA) NewClientCertificate(u user.Info, keyGen KeyPairGenerator, opts ...CertificateOption) (*TLSCertificateConfig, error) {
++	o := &CertificateOptions{
++		lifetime: DefaultCertificateLifetimeDuration,
++	}
++	for _, opt := range opts {
++		opt(o)
++	}
++
++	publicKey, privateKey, err := keyGen.GenerateKeyPair()
++	if err != nil {
++		return nil, fmt.Errorf("failed to generate key pair: %w", err)
++	}
++	subjectKeyId, err := SubjectKeyIDFromPublicKey(publicKey)
++	if err != nil {
++		return nil, fmt.Errorf("failed to compute subject key ID: %w", err)
++	}
++
++	authorityKeyId := ca.Config.Certs[0].SubjectKeyId
++	template := NewClientCertificateTemplateForDuration(UserToSubject(u), o.lifetime, time.Now)
++	template.AuthorityKeyId = authorityKeyId
++	template.SubjectKeyId = subjectKeyId
++	// Let x509.CreateCertificate auto-detect the signature algorithm from the CA's key.
++	template.SignatureAlgorithm = 0
++	template.KeyUsage = KeyUsageForPublicKey(publicKey)
++
++	cert, err := ca.SignCertificate(template, publicKey)
++	if err != nil {
++		return nil, fmt.Errorf("failed to sign certificate: %w", err)
++	}
++
++	return &TLSCertificateConfig{
++		Certs: append([]*x509.Certificate{cert}, ca.Config.Certs...),
++		Key:   privateKey,
++	}, nil
++}
++
++// NewPeerCertificate creates a peer certificate (both server and client auth)
++// signed by this CA.
++// Optional: WithLifetime (defaults to DefaultCertificateLifetimeDuration), WithExtensions.
++func (ca *CA) NewPeerCertificate(hostnames sets.Set[string], u user.Info, keyGen KeyPairGenerator, opts ...CertificateOption) (*TLSCertificateConfig, error) {
++	o := &CertificateOptions{
++		lifetime: DefaultCertificateLifetimeDuration,
++	}
++	for _, opt := range opts {
++		opt(o)
++	}
++
++	publicKey, privateKey, err := keyGen.GenerateKeyPair()
++	if err != nil {
++		return nil, fmt.Errorf("failed to generate key pair: %w", err)
++	}
++	subjectKeyId, err := SubjectKeyIDFromPublicKey(publicKey)
++	if err != nil {
++		return nil, fmt.Errorf("failed to compute subject key ID: %w", err)
++	}
++
++	sortedHostnames := sets.List(hostnames)
++	authorityKeyId := ca.Config.Certs[0].SubjectKeyId
++
++	// Start from a server certificate template for the hostnames.
++	template := newServerCertificateTemplateForDuration(
++		pkix.Name{CommonName: sortedHostnames[0]},
++		sortedHostnames,
++		o.lifetime,
++		time.Now,
++		authorityKeyId,
++		subjectKeyId,
++	)
++	// Let x509.CreateCertificate auto-detect the signature algorithm from the CA's key.
++	template.SignatureAlgorithm = 0
++	template.KeyUsage = KeyUsageForPublicKey(publicKey)
++
++	// Set subject from user info for client authentication.
++	template.Subject = UserToSubject(u)
++
++	// Enable both server and client authentication.
++	template.ExtKeyUsage = []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth, x509.ExtKeyUsageClientAuth}
++
++	for _, fn := range o.extensionFns {
++		if err := fn(template); err != nil {
++			return nil, fmt.Errorf("failed to apply certificate extension: %w", err)
++		}
++	}
++
++	cert, err := ca.SignCertificate(template, publicKey)
++	if err != nil {
++		return nil, fmt.Errorf("failed to sign certificate: %w", err)
++	}
++
++	return &TLSCertificateConfig{
++		Certs: append([]*x509.Certificate{cert}, ca.Config.Certs...),
++		Key:   privateKey,
++	}, nil
++}
+diff --git a/vendor/github.com/openshift/library-go/pkg/crypto/keygen.go b/vendor/github.com/openshift/library-go/pkg/crypto/keygen.go
+new file mode 100644
+index 0000000000..96b7559468
+--- /dev/null
++++ b/vendor/github.com/openshift/library-go/pkg/crypto/keygen.go
+@@ -0,0 +1,118 @@
++package crypto
++
++import (
++	"crypto"
++	"crypto/ecdsa"
++	"crypto/elliptic"
++	"crypto/rand"
++	"crypto/rsa"
++	"crypto/sha256"
++	"crypto/x509"
++	"fmt"
++)
++
++// KeyAlgorithm identifies the key generation algorithm.
++type KeyAlgorithm string
++
++const (
++	// RSAKeyAlgorithm specifies RSA key generation.
++	RSAKeyAlgorithm KeyAlgorithm = "RSA"
++	// ECDSAKeyAlgorithm specifies ECDSA key generation.
++	ECDSAKeyAlgorithm KeyAlgorithm = "ECDSA"
++)
++
++// ECDSACurve identifies a named ECDSA curve.
++type ECDSACurve string
++
++const (
++	// P256 specifies the NIST P-256 curve (secp256r1), providing 128-bit security.
++	P256 ECDSACurve = "P256"
++	// P384 specifies the NIST P-384 curve (secp384r1), providing 192-bit security.
++	P384 ECDSACurve = "P384"
++	// P521 specifies the NIST P-521 curve (secp521r1), providing 256-bit security.
++	P521 ECDSACurve = "P521"
++)
++
++// RSAKeyPairGenerator generates RSA key pairs.
++type RSAKeyPairGenerator struct {
++	// Bits is the RSA key size in bits. Must be >= 2048.
++	Bits int
++}
++
++func (g RSAKeyPairGenerator) GenerateKeyPair() (crypto.PublicKey, crypto.PrivateKey, error) {
++	bits := g.Bits
++	if bits == 0 {
++		bits = keyBits
++	}
++	privateKey, err := rsa.GenerateKey(rand.Reader, bits)
++	if err != nil {
++		return nil, nil, err
++	}
++	return &privateKey.PublicKey, privateKey, nil
++}
++
++// ECDSAKeyPairGenerator generates ECDSA key pairs.
++type ECDSAKeyPairGenerator struct {
++	// Curve is the named ECDSA curve.
++	Curve ECDSACurve
++}
++
++func (g ECDSAKeyPairGenerator) GenerateKeyPair() (crypto.PublicKey, crypto.PrivateKey, error) {
++	curve, err := g.ellipticCurve()
++	if err != nil {
++		return nil, nil, err
++	}
++	privateKey, err := ecdsa.GenerateKey(curve, rand.Reader)
++	if err != nil {
++		return nil, nil, err
++	}
++	return &privateKey.PublicKey, privateKey, nil
++}
++
++func (g ECDSAKeyPairGenerator) ellipticCurve() (elliptic.Curve, error) {
++	switch g.Curve {
++	case P256:
++		return elliptic.P256(), nil
++	case P384:
++		return elliptic.P384(), nil
++	case P521:
++		return elliptic.P521(), nil
++	default:
++		return nil, fmt.Errorf("unsupported ECDSA curve: %q", g.Curve)
++	}
++}
++
++// KeyUsageForPublicKey returns the x509.KeyUsage flags appropriate for the
++// given public key type. ECDSA keys use DigitalSignature only; RSA keys also
++// include KeyEncipherment.
++func KeyUsageForPublicKey(pub crypto.PublicKey) x509.KeyUsage {
++	switch pub.(type) {
++	case *ecdsa.PublicKey:
++		return x509.KeyUsageDigitalSignature
++	default:
++		return x509.KeyUsageKeyEncipherment | x509.KeyUsageDigitalSignature
++	}
++}
++
++// SubjectKeyIDFromPublicKey computes a truncated SHA-256 hash suitable for
++// use as a certificate SubjectKeyId from any supported public key type.
++// This uses the first 160 bits of the SHA-256 hash per RFC 7093, consistent
++// with the Go standard library since Go 1.25 (go.dev/issue/71746) and
++// Let's Encrypt. Prior Go versions used SHA-1 which is not FIPS-compatible.
++func SubjectKeyIDFromPublicKey(pub crypto.PublicKey) ([]byte, error) {
++	var rawBytes []byte
++	switch pub := pub.(type) {
++	case *rsa.PublicKey:
++		rawBytes = pub.N.Bytes()
++	case *ecdsa.PublicKey:
++		ecdhKey, err := pub.ECDH()
++		if err != nil {
++			return nil, fmt.Errorf("failed to convert ECDSA public key: %w", err)
++		}
++		rawBytes = ecdhKey.Bytes()
++	default:
++		return nil, fmt.Errorf("unsupported public key type: %T", pub)
++	}
++	hash := sha256.Sum256(rawBytes)
++	return hash[:20], nil
++}
+diff --git a/vendor/github.com/openshift/library-go/pkg/crypto/options.go b/vendor/github.com/openshift/library-go/pkg/crypto/options.go
+new file mode 100644
+index 0000000000..983b115d22
+--- /dev/null
++++ b/vendor/github.com/openshift/library-go/pkg/crypto/options.go
+@@ -0,0 +1,49 @@
++package crypto
++
++import (
++	"crypto/x509/pkix"
++	"time"
++)
++
++// CertificateOptions holds optional configuration collected from functional options.
++type CertificateOptions struct {
++	lifetime     time.Duration
++	subject      *pkix.Name
++	extensionFns []CertificateExtensionFunc
++	signer       *CA
++}
++
++// CertificateOption is a functional option for certificate creation.
++type CertificateOption func(*CertificateOptions)
++
++// WithLifetime sets the certificate lifetime duration.
++func WithLifetime(d time.Duration) CertificateOption {
++	return func(o *CertificateOptions) {
++		o.lifetime = d
++	}
++}
++
++// WithSubject overrides the certificate subject. For signing certificates,
++// this overrides the default subject derived from the name parameter.
++func WithSubject(s pkix.Name) CertificateOption {
++	return func(o *CertificateOptions) {
++		o.subject = &s
++	}
++}
++
++// WithSigner specifies a CA to sign the certificate. When used with
++// NewSigningCertificate, this creates an intermediate CA signed by the
++// given CA instead of a self-signed root CA.
++func WithSigner(ca *CA) CertificateOption {
++	return func(o *CertificateOptions) {
++		o.signer = ca
++	}
++}
++
++// WithExtensions adds certificate extension functions that are called
++// to modify the certificate template before signing.
++func WithExtensions(fns ...CertificateExtensionFunc) CertificateOption {
++	return func(o *CertificateOptions) {
++		o.extensionFns = append(o.extensionFns, fns...)
++	}
++}
+diff --git a/vendor/github.com/openshift/library-go/pkg/crypto/tls_adherence.go b/vendor/github.com/openshift/library-go/pkg/crypto/tls_adherence.go
+new file mode 100644
+index 0000000000..ef0e1af51a
+--- /dev/null
++++ b/vendor/github.com/openshift/library-go/pkg/crypto/tls_adherence.go
+@@ -0,0 +1,23 @@
++package crypto
++
++import (
++	configv1 "github.com/openshift/api/config/v1"
++)
++
++// ShouldHonorClusterTLSProfile returns true if the component should honor the
++// cluster-wide TLS security profile settings from apiserver.config.openshift.io/cluster.
++//
++// When this returns true (StrictAllComponents mode), components must honor the
++// cluster-wide TLS profile unless they have a component-specific TLS configuration
++// that overrides it.
++//
++// Unknown enum values are treated as StrictAllComponents for forward compatibility
++// and to default to the more secure behavior.
++func ShouldHonorClusterTLSProfile(tlsAdherence configv1.TLSAdherencePolicy) bool {
++	switch tlsAdherence {
++	case configv1.TLSAdherencePolicyNoOpinion, configv1.TLSAdherencePolicyLegacyAdheringComponentsOnly:
++		return false
++	default:
++		return true
++	}
++}
+diff --git a/vendor/github.com/openshift/library-go/pkg/operator/certrotation/client_cert_rotation_controller.go b/vendor/github.com/openshift/library-go/pkg/operator/certrotation/client_cert_rotation_controller.go
+index f9ad1fc14b..dbacb066e9 100644
+--- a/vendor/github.com/openshift/library-go/pkg/operator/certrotation/client_cert_rotation_controller.go
++++ b/vendor/github.com/openshift/library-go/pkg/operator/certrotation/client_cert_rotation_controller.go
+@@ -6,13 +6,12 @@ import (
+ 	"time"
+ 
+ 	operatorv1 "github.com/openshift/api/operator/v1"
+-	corev1 "k8s.io/api/core/v1"
+-	"k8s.io/apimachinery/pkg/util/wait"
+-
+ 	"github.com/openshift/library-go/pkg/controller/factory"
+ 	"github.com/openshift/library-go/pkg/operator/condition"
+ 	"github.com/openshift/library-go/pkg/operator/events"
+ 	"github.com/openshift/library-go/pkg/operator/v1helpers"
++	corev1 "k8s.io/api/core/v1"
++	"k8s.io/apimachinery/pkg/util/wait"
+ )
+ 
+ const (
+@@ -80,6 +79,7 @@ func NewCertRotationController(
+ 		RotatedSelfSignedCertKeySecret: rotatedSelfSignedCertKeySecret,
+ 		StatusReporter:                 reporter,
+ 	}
++
+ 	return factory.New().
+ 		ResyncEvery(time.Minute).
+ 		WithSync(c.Sync).
+diff --git a/vendor/github.com/openshift/library-go/pkg/operator/certrotation/signer.go b/vendor/github.com/openshift/library-go/pkg/operator/certrotation/signer.go
+index c2c8b8368f..019cce7d5a 100644
+--- a/vendor/github.com/openshift/library-go/pkg/operator/certrotation/signer.go
++++ b/vendor/github.com/openshift/library-go/pkg/operator/certrotation/signer.go
+@@ -9,6 +9,7 @@ import (
+ 	"github.com/openshift/library-go/pkg/crypto"
+ 	"github.com/openshift/library-go/pkg/operator/events"
+ 	"github.com/openshift/library-go/pkg/operator/resource/resourcehelper"
++	"github.com/openshift/library-go/pkg/pki"
+ 	corev1 "k8s.io/api/core/v1"
+ 	apierrors "k8s.io/apimachinery/pkg/api/errors"
+ 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+@@ -48,6 +49,13 @@ type RotatedSigningCASecret struct {
+ 	// AdditionalAnnotations is a collection of annotations set for the secret
+ 	AdditionalAnnotations AdditionalAnnotations
+ 
++	// CertificateName is the logical name of this certificate for PKI profile resolution.
++	CertificateName string
++
++	// PKIProfileProvider, when non-nil, enables ConfigurablePKI certificate
++	// key algorithm resolution. When nil, legacy certificate generation is used.
++	PKIProfileProvider pki.PKIProfileProvider
++
+ 	// Plumbing:
+ 	Informer      corev1informers.SecretInformer
+ 	Lister        corev1listers.SecretLister
+@@ -87,12 +95,12 @@ func (c RotatedSigningCASecret) EnsureSigningCertKeyPair(ctx context.Context) (*
+ 
+ 	// run Update if signer content needs changing
+ 	signerUpdated := false
+-	if needed, reason := needNewSigningCertKeyPair(signingCertKeyPairSecret, c.Refresh, c.RefreshOnlyWhenExpired); needed || creationRequired {
++	if needed, reason := c.needNewSigningCertKeyPair(signingCertKeyPairSecret); needed || creationRequired {
+ 		if creationRequired {
+ 			reason = "secret doesn't exist"
+ 		}
+ 		c.EventRecorder.Eventf("SignerUpdateRequired", "%q in %q requires a new signing cert/key pair: %v", c.Name, c.Namespace, reason)
+-		if err = setSigningCertKeyPairSecretAndTLSAnnotations(signingCertKeyPairSecret, c.Validity, c.Refresh, c.AdditionalAnnotations); err != nil {
++		if err = c.setSigningCertKeyPairSecretAndTLSAnnotations(signingCertKeyPairSecret); err != nil {
+ 			return nil, false, err
+ 		}
+ 
+@@ -149,7 +157,7 @@ func ensureOwnerReference(meta *metav1.ObjectMeta, owner *metav1.OwnerReference)
+ 	return false
+ }
+ 
+-func needNewSigningCertKeyPair(secret *corev1.Secret, refresh time.Duration, refreshOnlyWhenExpired bool) (bool, string) {
++func (c RotatedSigningCASecret) needNewSigningCertKeyPair(secret *corev1.Secret) (bool, string) {
+ 	annotations := secret.Annotations
+ 	notBefore, notAfter, reason := getValidityFromAnnotations(annotations)
+ 	if len(reason) > 0 {
+@@ -160,7 +168,7 @@ func needNewSigningCertKeyPair(secret *corev1.Secret, refresh time.Duration, ref
+ 		return true, "already expired"
+ 	}
+ 
+-	if refreshOnlyWhenExpired {
++	if c.RefreshOnlyWhenExpired {
+ 		return false, ""
+ 	}
+ 
+@@ -170,7 +178,7 @@ func needNewSigningCertKeyPair(secret *corev1.Secret, refresh time.Duration, ref
+ 		return true, fmt.Sprintf("past refresh time (80%% of validity): %v", at80Percent)
+ 	}
+ 
+-	developerSpecifiedRefresh := notBefore.Add(refresh)
++	developerSpecifiedRefresh := notBefore.Add(c.Refresh)
+ 	if time.Now().After(developerSpecifiedRefresh) {
+ 		return true, fmt.Sprintf("past its refresh time %v", developerSpecifiedRefresh)
+ 	}
+@@ -199,22 +207,67 @@ func getValidityFromAnnotations(annotations map[string]string) (notBefore time.T
+ 	return notBefore, notAfter, ""
+ }
+ 
++func (c RotatedSigningCASecret) resolveKeyPairGenerator() (crypto.KeyPairGenerator, error) {
++	return resolveKeyPairGeneratorWithFallback(c.PKIProfileProvider, pki.CertificateTypeSigner, c.CertificateName)
++}
++
++// resolveKeyPairGeneratorWithFallback resolves the key pair generator from the
++// PKI profile provider. Returns nil for Unmanaged mode (no key override).
++//
++// TODO(sanchezl): Remove the fallback to DefaultPKIProfile() once installer
++// support for the PKI resource is in place. Until then, the PKI resource may
++// not exist in TechPreview clusters. Once removed, callers can use
++// pki.ResolveCertificateConfig directly.
++func resolveKeyPairGeneratorWithFallback(provider pki.PKIProfileProvider, certType pki.CertificateType, name string) (crypto.KeyPairGenerator, error) {
++	cfg, err := pki.ResolveCertificateConfig(provider, certType, name)
++	if err != nil {
++		klog.Warningf("Failed to resolve PKI config for %s %q, falling back to default profile: %v", certType, name, err)
++		defaultProfile := pki.DefaultPKIProfile()
++		cfg, err = pki.ResolveCertificateConfig(pki.NewStaticPKIProfileProvider(&defaultProfile), certType, name)
++		if err != nil {
++			return nil, err
++		}
++	}
++	if cfg == nil {
++		return nil, nil
++	}
++	return cfg.Key, nil
++}
++
+ // setSigningCertKeyPairSecretAndTLSAnnotations generates a new signing certificate and key pair,
+ // stores them in the specified secret, and adds predefined TLS annotations to that secret.
+-func setSigningCertKeyPairSecretAndTLSAnnotations(signingCertKeyPairSecret *corev1.Secret, validity, refresh time.Duration, tlsAnnotations AdditionalAnnotations) error {
+-	ca, err := setSigningCertKeyPairSecret(signingCertKeyPairSecret, validity)
++func (c RotatedSigningCASecret) setSigningCertKeyPairSecretAndTLSAnnotations(signingCertKeyPairSecret *corev1.Secret) error {
++	ca, err := c.setSigningCertKeyPairSecret(signingCertKeyPairSecret)
+ 	if err != nil {
+ 		return err
+ 	}
+ 
+-	setTLSAnnotationsOnSigningCertKeyPairSecret(signingCertKeyPairSecret, ca, refresh, tlsAnnotations)
++	c.setTLSAnnotationsOnSigningCertKeyPairSecret(signingCertKeyPairSecret, ca)
+ 	return nil
+ }
+ 
+-// setSigningCertKeyPairSecret creates a new signing cert/key pair and sets them in the secret
+-func setSigningCertKeyPairSecret(signingCertKeyPairSecret *corev1.Secret, validity time.Duration) (*crypto.TLSCertificateConfig, error) {
++// setSigningCertKeyPairSecret creates a new signing cert/key pair and sets them in the secret.
++func (c RotatedSigningCASecret) setSigningCertKeyPairSecret(signingCertKeyPairSecret *corev1.Secret) (*crypto.TLSCertificateConfig, error) {
+ 	signerName := fmt.Sprintf("%s_%s@%d", signingCertKeyPairSecret.Namespace, signingCertKeyPairSecret.Name, time.Now().Unix())
+-	ca, err := crypto.MakeSelfSignedCAConfigForDuration(signerName, validity)
++
++	var ca *crypto.TLSCertificateConfig
++	var err error
++	if c.PKIProfileProvider != nil {
++		keyGen, err := c.resolveKeyPairGenerator()
++		if err != nil {
++			return nil, err
++		}
++		if keyGen != nil {
++			ca, err = crypto.NewSigningCertificate(signerName, keyGen, crypto.WithLifetime(c.Validity))
++			if err != nil {
++				return nil, err
++			}
++		}
++		// nil keyGen means Unmanaged: fall through to legacy cert generation
++	}
++	if ca == nil {
++		ca, err = crypto.MakeSelfSignedCAConfigForDuration(signerName, c.Validity)
++	}
+ 	if err != nil {
+ 		return nil, err
+ 	}
+@@ -243,11 +296,12 @@ func setSigningCertKeyPairSecret(signingCertKeyPairSecret *corev1.Secret, validi
+ //
+ // These assumptions are safe because this function is only called after the secret
+ // has been initialized in setSigningCertKeyPairSecret.
+-func setTLSAnnotationsOnSigningCertKeyPairSecret(signingCertKeyPairSecret *corev1.Secret, ca *crypto.TLSCertificateConfig, refresh time.Duration, tlsAnnotations AdditionalAnnotations) {
++func (c RotatedSigningCASecret) setTLSAnnotationsOnSigningCertKeyPairSecret(signingCertKeyPairSecret *corev1.Secret, ca *crypto.TLSCertificateConfig) {
+ 	signingCertKeyPairSecret.Annotations[CertificateIssuer] = ca.Certs[0].Issuer.CommonName
+ 
++	tlsAnnotations := c.AdditionalAnnotations
+ 	tlsAnnotations.NotBefore = ca.Certs[0].NotBefore.Format(time.RFC3339)
+ 	tlsAnnotations.NotAfter = ca.Certs[0].NotAfter.Format(time.RFC3339)
+-	tlsAnnotations.RefreshPeriod = refresh.String()
++	tlsAnnotations.RefreshPeriod = c.Refresh.String()
+ 	_ = tlsAnnotations.EnsureTLSMetadataUpdate(&signingCertKeyPairSecret.ObjectMeta)
+ }
+diff --git a/vendor/github.com/openshift/library-go/pkg/operator/certrotation/target.go b/vendor/github.com/openshift/library-go/pkg/operator/certrotation/target.go
+index 88cd41189e..d1c0a59ee8 100644
+--- a/vendor/github.com/openshift/library-go/pkg/operator/certrotation/target.go
++++ b/vendor/github.com/openshift/library-go/pkg/operator/certrotation/target.go
+@@ -18,6 +18,7 @@ import (
+ 	"github.com/openshift/library-go/pkg/crypto"
+ 	"github.com/openshift/library-go/pkg/operator/events"
+ 	"github.com/openshift/library-go/pkg/operator/resource/resourcehelper"
++	"github.com/openshift/library-go/pkg/pki"
+ 	corev1informers "k8s.io/client-go/informers/core/v1"
+ 	corev1client "k8s.io/client-go/kubernetes/typed/core/v1"
+ 	corev1listers "k8s.io/client-go/listers/core/v1"
+@@ -64,6 +65,13 @@ type RotatedSelfSignedCertKeySecret struct {
+ 	// CertCreator does the actual cert generation.
+ 	CertCreator TargetCertCreator
+ 
++	// CertificateName is the logical name of this certificate for PKI profile resolution.
++	CertificateName string
++
++	// PKIProfileProvider, when non-nil, enables ConfigurablePKI certificate
++	// key algorithm resolution. When nil, legacy certificate generation is used.
++	PKIProfileProvider pki.PKIProfileProvider
++
+ 	// Plumbing:
+ 	Informer      corev1informers.SecretInformer
+ 	Lister        corev1listers.SecretLister
+@@ -72,12 +80,15 @@ type RotatedSelfSignedCertKeySecret struct {
+ }
+ 
+ type TargetCertCreator interface {
+-	// NewCertificate creates a new key-cert pair with the given signer.
+-	NewCertificate(signer *crypto.CA, validity time.Duration) (*crypto.TLSCertificateConfig, error)
++	// NewCertificate creates a new key-cert pair with the given signer. If keyGen
++	// is non-nil, it is used to generate the key pair; otherwise legacy defaults are used.
++	NewCertificate(signer *crypto.CA, validity time.Duration, keyGen crypto.KeyPairGenerator) (*crypto.TLSCertificateConfig, error)
+ 	// NeedNewTargetCertKeyPair decides whether a new cert-key pair is needed. It returns a non-empty reason if it is the case.
+ 	NeedNewTargetCertKeyPair(currentCertSecret *corev1.Secret, signer *crypto.CA, caBundleCerts []*x509.Certificate, refresh time.Duration, refreshOnlyWhenExpired, creationRequired bool) string
+ 	// SetAnnotations gives an option to override or set additional annotations
+ 	SetAnnotations(cert *crypto.TLSCertificateConfig, annotations map[string]string) map[string]string
++	// CertificateType returns the category of certificate this creator produces.
++	CertificateType() pki.CertificateType
+ }
+ 
+ // TargetCertRechecker is an optional interface to be implemented by the TargetCertCreator to enforce
+@@ -121,7 +132,7 @@ func (c RotatedSelfSignedCertKeySecret) EnsureTargetCertKeyPair(ctx context.Cont
+ 
+ 	if reason := c.CertCreator.NeedNewTargetCertKeyPair(targetCertKeyPairSecret, signingCertKeyPair, caBundleCerts, c.Refresh, c.RefreshOnlyWhenExpired, creationRequired); len(reason) > 0 {
+ 		c.EventRecorder.Eventf("TargetUpdateRequired", "%q in %q requires a new target cert/key pair: %v", c.Name, c.Namespace, reason)
+-		if err = setTargetCertKeyPairSecretAndTLSAnnotations(targetCertKeyPairSecret, c.Validity, c.Refresh, signingCertKeyPair, c.CertCreator, c.AdditionalAnnotations); err != nil {
++		if err = c.setTargetCertKeyPairSecretAndTLSAnnotations(targetCertKeyPairSecret, signingCertKeyPair); err != nil {
+ 			return nil, err
+ 		}
+ 
+@@ -239,19 +250,19 @@ func needNewTargetCertKeyPairForTime(annotations map[string]string, signer *cryp
+ 
+ // setTargetCertKeyPairSecretAndTLSAnnotations generates a new cert/key pair,
+ // stores them in the specified secret, and adds predefined TLS annotations to that secret.
+-func setTargetCertKeyPairSecretAndTLSAnnotations(targetCertKeyPairSecret *corev1.Secret, validity, refresh time.Duration, signer *crypto.CA, certCreator TargetCertCreator, tlsAnnotations AdditionalAnnotations) error {
+-	certKeyPair, err := setTargetCertKeyPairSecret(targetCertKeyPairSecret, validity, signer, certCreator)
++func (c RotatedSelfSignedCertKeySecret) setTargetCertKeyPairSecretAndTLSAnnotations(targetCertKeyPairSecret *corev1.Secret, signer *crypto.CA) error {
++	certKeyPair, err := c.setTargetCertKeyPairSecret(targetCertKeyPairSecret, signer)
+ 	if err != nil {
+ 		return err
+ 	}
+ 
+-	setTLSAnnotationsOnTargetCertKeyPairSecret(targetCertKeyPairSecret, certKeyPair, certCreator, refresh, tlsAnnotations)
++	c.setTLSAnnotationsOnTargetCertKeyPairSecret(targetCertKeyPairSecret, certKeyPair)
+ 	return nil
+ }
+ 
+ // setTargetCertKeyPairSecret creates a new cert/key pair and sets them in the secret.  Only one of client, serving, or signer rotation may be specified.
+ // TODO refactor with an interface for actually signing and move the one-of check higher in the stack.
+-func setTargetCertKeyPairSecret(targetCertKeyPairSecret *corev1.Secret, validity time.Duration, signer *crypto.CA, certCreator TargetCertCreator) (*crypto.TLSCertificateConfig, error) {
++func (c RotatedSelfSignedCertKeySecret) setTargetCertKeyPairSecret(targetCertKeyPairSecret *corev1.Secret, signer *crypto.CA) (*crypto.TLSCertificateConfig, error) {
+ 	if targetCertKeyPairSecret.Annotations == nil {
+ 		targetCertKeyPairSecret.Annotations = map[string]string{}
+ 	}
+@@ -260,13 +271,22 @@ func setTargetCertKeyPairSecret(targetCertKeyPairSecret *corev1.Secret, validity
+ 	}
+ 
+ 	// our annotation is based on our cert validity, so we want to make sure that we don't specify something past our signer
+-	targetValidity := validity
++	targetValidity := c.Validity
+ 	remainingSignerValidity := signer.Config.Certs[0].NotAfter.Sub(time.Now())
+-	if remainingSignerValidity < validity {
++	if remainingSignerValidity < targetValidity {
+ 		targetValidity = remainingSignerValidity
+ 	}
+ 
+-	certKeyPair, err := certCreator.NewCertificate(signer, targetValidity)
++	var keyGen crypto.KeyPairGenerator
++	if c.PKIProfileProvider != nil {
++		var err error
++		keyGen, err = c.resolveKeyPairGenerator()
++		if err != nil {
++			return nil, err
++		}
++	}
++
++	certKeyPair, err := c.CertCreator.NewCertificate(signer, targetValidity, keyGen)
+ 	if err != nil {
+ 		return nil, err
+ 	}
+@@ -282,23 +302,35 @@ func setTargetCertKeyPairSecret(targetCertKeyPairSecret *corev1.Secret, validity
+ //
+ // These assumptions are safe because this function is only called after the secret
+ // has been initialized in setTargetCertKeyPairSecret.
+-func setTLSAnnotationsOnTargetCertKeyPairSecret(targetCertKeyPairSecret *corev1.Secret, certKeyPair *crypto.TLSCertificateConfig, certCreator TargetCertCreator, refresh time.Duration, tlsAnnotations AdditionalAnnotations) {
++func (c RotatedSelfSignedCertKeySecret) setTLSAnnotationsOnTargetCertKeyPairSecret(targetCertKeyPairSecret *corev1.Secret, certKeyPair *crypto.TLSCertificateConfig) {
+ 	targetCertKeyPairSecret.Annotations[CertificateIssuer] = certKeyPair.Certs[0].Issuer.CommonName
+ 
++	tlsAnnotations := c.AdditionalAnnotations
+ 	tlsAnnotations.NotBefore = certKeyPair.Certs[0].NotBefore.Format(time.RFC3339)
+ 	tlsAnnotations.NotAfter = certKeyPair.Certs[0].NotAfter.Format(time.RFC3339)
+-	tlsAnnotations.RefreshPeriod = refresh.String()
++	tlsAnnotations.RefreshPeriod = c.Refresh.String()
+ 	_ = tlsAnnotations.EnsureTLSMetadataUpdate(&targetCertKeyPairSecret.ObjectMeta)
+ 
+-	certCreator.SetAnnotations(certKeyPair, targetCertKeyPairSecret.Annotations)
++	c.CertCreator.SetAnnotations(certKeyPair, targetCertKeyPairSecret.Annotations)
++}
++
++func (c RotatedSelfSignedCertKeySecret) resolveKeyPairGenerator() (crypto.KeyPairGenerator, error) {
++	return resolveKeyPairGeneratorWithFallback(c.PKIProfileProvider, c.CertCreator.CertificateType(), c.CertificateName)
+ }
+ 
+ type ClientRotation struct {
+ 	UserInfo user.Info
+ }
+ 
+-func (r *ClientRotation) NewCertificate(signer *crypto.CA, validity time.Duration) (*crypto.TLSCertificateConfig, error) {
+-	return signer.MakeClientCertificateForDuration(r.UserInfo, validity)
++func (r *ClientRotation) CertificateType() pki.CertificateType {
++	return pki.CertificateTypeClient
++}
++
++func (r *ClientRotation) NewCertificate(signer *crypto.CA, validity time.Duration, keyGen crypto.KeyPairGenerator) (*crypto.TLSCertificateConfig, error) {
++	if keyGen == nil {
++		return signer.MakeClientCertificateForDuration(r.UserInfo, validity)
++	}
++	return signer.NewClientCertificate(r.UserInfo, keyGen, crypto.WithLifetime(validity))
+ }
+ 
+ func (r *ClientRotation) NeedNewTargetCertKeyPair(currentCertSecret *corev1.Secret, signer *crypto.CA, caBundleCerts []*x509.Certificate, refresh time.Duration, refreshOnlyWhenExpired, exists bool) string {
+@@ -315,11 +347,22 @@ type ServingRotation struct {
+ 	HostnamesChanged       <-chan struct{}
+ }
+ 
+-func (r *ServingRotation) NewCertificate(signer *crypto.CA, validity time.Duration) (*crypto.TLSCertificateConfig, error) {
+-	if len(r.Hostnames()) == 0 {
++func (r *ServingRotation) CertificateType() pki.CertificateType {
++	return pki.CertificateTypeServing
++}
++
++func (r *ServingRotation) NewCertificate(signer *crypto.CA, validity time.Duration, keyGen crypto.KeyPairGenerator) (*crypto.TLSCertificateConfig, error) {
++	hostnames := r.Hostnames()
++	if len(hostnames) == 0 {
+ 		return nil, fmt.Errorf("no hostnames set")
+ 	}
+-	return signer.MakeServerCertForDuration(sets.New(r.Hostnames()...), validity, r.CertificateExtensionFn...)
++	if keyGen == nil {
++		return signer.MakeServerCertForDuration(sets.New(hostnames...), validity, r.CertificateExtensionFn...)
++	}
++	return signer.NewServerCertificate(sets.New(hostnames...), keyGen,
++		crypto.WithLifetime(validity),
++		crypto.WithExtensions(r.CertificateExtensionFn...),
++	)
+ }
+ 
+ func (r *ServingRotation) RecheckChannel() <-chan struct{} {
+@@ -336,18 +379,25 @@ func (r *ServingRotation) NeedNewTargetCertKeyPair(currentCertSecret *corev1.Sec
+ }
+ 
+ func (r *ServingRotation) missingHostnames(annotations map[string]string) string {
++	return missingHostnames(annotations, r.Hostnames())
++}
++
++func (r *ServingRotation) SetAnnotations(cert *crypto.TLSCertificateConfig, annotations map[string]string) map[string]string {
++	return setHostnameAnnotations(cert, annotations)
++}
++
++func missingHostnames(annotations map[string]string, hostnames []string) string {
+ 	existingHostnames := sets.New(strings.Split(annotations[CertificateHostnames], ",")...)
+-	requiredHostnames := sets.New(r.Hostnames()...)
++	requiredHostnames := sets.New(hostnames...)
+ 	if !existingHostnames.Equal(requiredHostnames) {
+ 		existingNotRequired := existingHostnames.Difference(requiredHostnames)
+ 		requiredNotExisting := requiredHostnames.Difference(existingHostnames)
+ 		return fmt.Sprintf("%q are existing and not required, %q are required and not existing", strings.Join(sets.List(existingNotRequired), ","), strings.Join(sets.List(requiredNotExisting), ","))
+ 	}
+-
+ 	return ""
+ }
+ 
+-func (r *ServingRotation) SetAnnotations(cert *crypto.TLSCertificateConfig, annotations map[string]string) map[string]string {
++func setHostnameAnnotations(cert *crypto.TLSCertificateConfig, annotations map[string]string) map[string]string {
+ 	hostnames := sets.Set[string]{}
+ 	for _, ip := range cert.Certs[0].IPAddresses {
+ 		hostnames.Insert(ip.String())
+@@ -355,7 +405,6 @@ func (r *ServingRotation) SetAnnotations(cert *crypto.TLSCertificateConfig, anno
+ 	for _, dnsName := range cert.Certs[0].DNSNames {
+ 		hostnames.Insert(dnsName)
+ 	}
+-
+ 	// List does a sort so that we have a consistent representation
+ 	annotations[CertificateHostnames] = strings.Join(sets.List(hostnames), ",")
+ 	return annotations
+@@ -367,9 +416,85 @@ type SignerRotation struct {
+ 	SignerName string
+ }
+ 
+-func (r *SignerRotation) NewCertificate(signer *crypto.CA, validity time.Duration) (*crypto.TLSCertificateConfig, error) {
++func (r *SignerRotation) CertificateType() pki.CertificateType {
++	return pki.CertificateTypeSigner
++}
++
++func (r *SignerRotation) NewCertificate(signer *crypto.CA, validity time.Duration, keyGen crypto.KeyPairGenerator) (*crypto.TLSCertificateConfig, error) {
+ 	signerName := fmt.Sprintf("%s_@%d", r.SignerName, time.Now().Unix())
+-	return crypto.MakeCAConfigForDuration(signerName, validity, signer)
++	if keyGen == nil {
++		return crypto.MakeCAConfigForDuration(signerName, validity, signer)
++	}
++	return crypto.NewSigningCertificate(signerName, keyGen,
++		crypto.WithSigner(signer),
++		crypto.WithLifetime(validity),
++	)
++}
++
++// PeerRotation creates certificates used for both server and client authentication
++// (e.g., etcd peer certificates). It uses CertificateTypePeer for PKI profile
++// resolution, which selects the stronger of the serving and client key configurations.
++//
++// UserInfo is always required. When keyGen is non-nil (ConfigurablePKI enabled),
++// NewPeerCertificate encodes UserInfo as the client identity in the certificate
++// subject. When keyGen is nil (legacy), UserInfo.Name must match the sorted first
++// hostname (used as CN by MakeServerCertForDuration), and the certificate falls
++// back to MakeServerCertForDuration with an extension function that sets both
++// ClientAuth and ServerAuth ExtKeyUsages.
++type PeerRotation struct {
++	Hostnames              ServingHostnameFunc
++	UserInfo               user.Info
++	CertificateExtensionFn []crypto.CertificateExtensionFunc
++	HostnamesChanged       <-chan struct{}
++}
++
++func (r *PeerRotation) CertificateType() pki.CertificateType {
++	return pki.CertificateTypePeer
++}
++
++func (r *PeerRotation) NewCertificate(signer *crypto.CA, validity time.Duration, keyGen crypto.KeyPairGenerator) (*crypto.TLSCertificateConfig, error) {
++	hostnames := r.Hostnames()
++	if len(hostnames) == 0 {
++		return nil, fmt.Errorf("no hostnames set")
++	}
++	if r.UserInfo == nil {
++		return nil, fmt.Errorf("PeerRotation requires UserInfo")
++	}
++	if keyGen == nil {
++		// Legacy path: use server cert template with extension fn to add both ExtKeyUsages.
++		// MakeServerCertForDuration sorts hostnames and uses the first sorted value as CN.
++		sortedHostnames := sets.List(sets.New(hostnames...))
++		if cn := sortedHostnames[0]; r.UserInfo.GetName() != cn {
++			return nil, fmt.Errorf("PeerRotation legacy path uses sorted first hostname %q as CN; UserInfo.Name %q conflicts — set UserInfo.Name to match or enable ConfigurablePKI", cn, r.UserInfo.GetName())
++		}
++		peerExtFn := func(cert *x509.Certificate) error {
++			cert.ExtKeyUsage = []x509.ExtKeyUsage{x509.ExtKeyUsageClientAuth, x509.ExtKeyUsageServerAuth}
++			return nil
++		}
++		extensions := append(append([]crypto.CertificateExtensionFunc{}, r.CertificateExtensionFn...), peerExtFn)
++		return signer.MakeServerCertForDuration(sets.New(hostnames...), validity, extensions...)
++	}
++	return signer.NewPeerCertificate(
++		sets.New(hostnames...), r.UserInfo, keyGen,
++		crypto.WithLifetime(validity),
++		crypto.WithExtensions(r.CertificateExtensionFn...),
++	)
++}
++
++func (r *PeerRotation) RecheckChannel() <-chan struct{} {
++	return r.HostnamesChanged
++}
++
++func (r *PeerRotation) NeedNewTargetCertKeyPair(currentCertSecret *corev1.Secret, signer *crypto.CA, caBundleCerts []*x509.Certificate, refresh time.Duration, refreshOnlyWhenExpired, creationRequired bool) string {
++	reason := needNewTargetCertKeyPair(currentCertSecret, signer, caBundleCerts, refresh, refreshOnlyWhenExpired, creationRequired)
++	if len(reason) > 0 {
++		return reason
++	}
++	return missingHostnames(currentCertSecret.Annotations, r.Hostnames())
++}
++
++func (r *PeerRotation) SetAnnotations(cert *crypto.TLSCertificateConfig, annotations map[string]string) map[string]string {
++	return setHostnameAnnotations(cert, annotations)
+ }
+ 
+ func (r *SignerRotation) NeedNewTargetCertKeyPair(currentCertSecret *corev1.Secret, signer *crypto.CA, caBundleCerts []*x509.Certificate, refresh time.Duration, refreshOnlyWhenExpired, exists bool) string {
+diff --git a/vendor/github.com/openshift/library-go/pkg/operator/events/recorder_in_memory.go b/vendor/github.com/openshift/library-go/pkg/operator/events/recorder_in_memory.go
+index d97be0de6c..bbddd98299 100644
+--- a/vendor/github.com/openshift/library-go/pkg/operator/events/recorder_in_memory.go
++++ b/vendor/github.com/openshift/library-go/pkg/operator/events/recorder_in_memory.go
+@@ -42,6 +42,8 @@ func NewInMemoryRecorder(sourceComponent string, clock clock.PassiveClock) InMem
+ }
+ 
+ func (r *inMemoryEventRecorder) ComponentName() string {
++	r.Lock()
++	defer r.Unlock()
+ 	return r.source
+ }
+ 
+@@ -55,6 +57,8 @@ func (r *inMemoryEventRecorder) ForComponent(component string) Recorder {
+ }
+ 
+ func (r *inMemoryEventRecorder) WithContext(ctx context.Context) Recorder {
++	r.Lock()
++	defer r.Unlock()
+ 	r.ctx = ctx
+ 	return r
+ }
+@@ -65,7 +69,9 @@ func (r *inMemoryEventRecorder) WithComponentSuffix(suffix string) Recorder {
+ 
+ // Events returns list of recorded events
+ func (r *inMemoryEventRecorder) Events() []*corev1.Event {
+-	return r.events
++	r.Lock()
++	defer r.Unlock()
++	return append([]*corev1.Event(nil), r.events...)
+ }
+ 
+ func (r *inMemoryEventRecorder) Event(reason, message string) {
+diff --git a/vendor/github.com/openshift/library-go/pkg/operator/management/management_state.go b/vendor/github.com/openshift/library-go/pkg/operator/management/management_state.go
+index 294770f3e0..4837a6c16f 100644
+--- a/vendor/github.com/openshift/library-go/pkg/operator/management/management_state.go
++++ b/vendor/github.com/openshift/library-go/pkg/operator/management/management_state.go
+@@ -62,7 +62,7 @@ func IsOperatorUnknownState(state v1.ManagementState) bool {
+ 
+ // IsOperatorManaged indicates whether the operator management state allows the control loop to proceed and manage the operand.
+ func IsOperatorManaged(state v1.ManagementState) bool {
+-	if IsOperatorAlwaysManaged() || IsOperatorNotRemovable() {
++	if IsOperatorAlwaysManaged() {
+ 		return true
+ 	}
+ 	switch state {
+diff --git a/vendor/github.com/openshift/library-go/pkg/operator/v1helpers/helpers.go b/vendor/github.com/openshift/library-go/pkg/operator/v1helpers/helpers.go
+index fd34ec6201..f4a0943e51 100644
+--- a/vendor/github.com/openshift/library-go/pkg/operator/v1helpers/helpers.go
++++ b/vendor/github.com/openshift/library-go/pkg/operator/v1helpers/helpers.go
+@@ -123,11 +123,22 @@ type UpdateOperatorSpecFunc func(spec *operatorv1.OperatorSpec) error
+ func UpdateSpec(ctx context.Context, client OperatorClient, updateFuncs ...UpdateOperatorSpecFunc) (*operatorv1.OperatorSpec, bool, error) {
+ 	updated := false
+ 	var operatorSpec *operatorv1.OperatorSpec
++	previousResourceVersion := ""
+ 	err := retry.RetryOnConflict(retry.DefaultBackoff, func() error {
+ 		oldSpec, _, resourceVersion, err := client.GetOperatorState()
+ 		if err != nil {
+ 			return err
+ 		}
++		if resourceVersion == previousResourceVersion {
++			// Lister is stale (e.g. after a conflict or restart); do a live GET to get the current resourceVersion.
++			listerResourceVersion := resourceVersion
++			oldSpec, _, resourceVersion, err = client.GetOperatorStateWithQuorum(ctx)
++			if err != nil {
++				return err
++			}
++			klog.V(2).Infof("lister was stale at resourceVersion=%v, live get showed resourceVersion=%v", listerResourceVersion, resourceVersion)
++		}
++		previousResourceVersion = resourceVersion
+ 
+ 		newSpec := oldSpec.DeepCopy()
+ 		for _, update := range updateFuncs {
+diff --git a/vendor/github.com/openshift/library-go/pkg/pki/profile.go b/vendor/github.com/openshift/library-go/pkg/pki/profile.go
+new file mode 100644
+index 0000000000..6f534c94f0
+--- /dev/null
++++ b/vendor/github.com/openshift/library-go/pkg/pki/profile.go
+@@ -0,0 +1,114 @@
++package pki
++
++import (
++	"fmt"
++
++	configv1alpha1 "github.com/openshift/api/config/v1alpha1"
++	"github.com/openshift/library-go/pkg/crypto"
++)
++
++// DefaultPKIProfile returns the default PKIProfile for OpenShift.
++func DefaultPKIProfile() configv1alpha1.PKIProfile {
++	return configv1alpha1.PKIProfile{
++		Defaults: configv1alpha1.DefaultCertificateConfig{
++			Key: configv1alpha1.KeyConfig{
++				Algorithm: configv1alpha1.KeyAlgorithmECDSA,
++				ECDSA:     configv1alpha1.ECDSAKeyConfig{Curve: configv1alpha1.ECDSACurveP256},
++			},
++		},
++		SignerCertificates: configv1alpha1.CertificateConfig{
++			Key: configv1alpha1.KeyConfig{
++				Algorithm: configv1alpha1.KeyAlgorithmECDSA,
++				ECDSA:     configv1alpha1.ECDSAKeyConfig{Curve: configv1alpha1.ECDSACurveP384},
++			},
++		},
++	}
++}
++
++// KeyPairGeneratorFromAPI converts a configv1alpha1.KeyConfig to a
++// crypto.KeyPairGenerator.
++func KeyPairGeneratorFromAPI(apiKey configv1alpha1.KeyConfig) (crypto.KeyPairGenerator, error) {
++	switch apiKey.Algorithm {
++	case configv1alpha1.KeyAlgorithmRSA:
++		return crypto.RSAKeyPairGenerator{
++			Bits: int(apiKey.RSA.KeySize),
++		}, nil
++	case configv1alpha1.KeyAlgorithmECDSA:
++		curve, err := ecdsaCurveFromAPI(apiKey.ECDSA.Curve)
++		if err != nil {
++			return nil, err
++		}
++		return crypto.ECDSAKeyPairGenerator{
++			Curve: curve,
++		}, nil
++	default:
++		return nil, fmt.Errorf("unknown key algorithm: %q", apiKey.Algorithm)
++	}
++}
++
++// ecdsaCurveFromAPI converts an API ECDSA curve name to the crypto package's ECDSACurve.
++func ecdsaCurveFromAPI(c configv1alpha1.ECDSACurve) (crypto.ECDSACurve, error) {
++	switch c {
++	case configv1alpha1.ECDSACurveP256:
++		return crypto.P256, nil
++	case configv1alpha1.ECDSACurveP384:
++		return crypto.P384, nil
++	case configv1alpha1.ECDSACurveP521:
++		return crypto.P521, nil
++	default:
++		return "", fmt.Errorf("unknown ECDSA curve: %q", c)
++	}
++}
++
++// securityBits returns the NIST security strength in bits for a given
++// KeyPairGenerator. For RSA, values come from the rsaSecurityStrength table.
++// For ECDSA, security strength is half the key size (fixed per curve).
++func securityBits(g crypto.KeyPairGenerator) int {
++	switch g := g.(type) {
++	case crypto.RSAKeyPairGenerator:
++		return rsaSecurityStrength[g.Bits]
++	case crypto.ECDSAKeyPairGenerator:
++		switch g.Curve {
++		case crypto.P256:
++			return 128
++		case crypto.P384:
++			return 192
++		case crypto.P521:
++			return 256
++		}
++	}
++	return 0
++}
++
++// rsaSecurityStrength maps RSA key sizes (2048-8192 in 1024-bit increments)
++// to their security strengths from NIST SP 800-56B Rev 2 Table 2 or
++// pre-calculated from the GNFS complexity estimate.
++var rsaSecurityStrength = map[int]int{
++	2048: 112,
++	3072: 128,
++	4096: 152,
++	5120: 168,
++	6144: 176,
++	7168: 192,
++	8192: 200,
++}
++
++// strongerKeyPairGenerator returns whichever of a or b provides higher NIST
++// security strength. In case of a tie, ECDSA is preferred over RSA.
++func strongerKeyPairGenerator(a, b crypto.KeyPairGenerator) crypto.KeyPairGenerator {
++	sa, sb := securityBits(a), securityBits(b)
++	if sb > sa {
++		return b
++	}
++	if sa > sb {
++		return a
++	}
++	// Equal strength: prefer ECDSA over RSA.
++	if _, ok := a.(crypto.ECDSAKeyPairGenerator); ok {
++		return a
++	}
++	if _, ok := b.(crypto.ECDSAKeyPairGenerator); ok {
++		return b
++	}
++	return a
++}
+diff --git a/vendor/github.com/openshift/library-go/pkg/pki/provider.go b/vendor/github.com/openshift/library-go/pkg/pki/provider.go
+new file mode 100644
+index 0000000000..2007aa890e
+--- /dev/null
++++ b/vendor/github.com/openshift/library-go/pkg/pki/provider.go
+@@ -0,0 +1,75 @@
++package pki
++
++import (
++	"fmt"
++
++	configv1alpha1 "github.com/openshift/api/config/v1alpha1"
++	configv1alpha1listers "github.com/openshift/client-go/config/listers/config/v1alpha1"
++)
++
++// PKIProfileProvider provides the PKIProfile that determines certificate key
++// configuration. A nil profile indicates Unmanaged mode where the caller
++// should use its own defaults.
++type PKIProfileProvider interface {
++	PKIProfile() (*configv1alpha1.PKIProfile, error)
++}
++
++// StaticPKIProfileProvider is a PKIProfileProvider backed by a fixed PKIProfile.
++type StaticPKIProfileProvider struct {
++	profile *configv1alpha1.PKIProfile
++}
++
++// NewStaticPKIProfileProvider returns a PKIProfileProvider backed by the given
++// profile. A nil profile signals Unmanaged mode.
++func NewStaticPKIProfileProvider(profile *configv1alpha1.PKIProfile) *StaticPKIProfileProvider {
++	return &StaticPKIProfileProvider{profile: profile}
++}
++
++// PKIProfile returns the static PKIProfile.
++func (s *StaticPKIProfileProvider) PKIProfile() (*configv1alpha1.PKIProfile, error) {
++	return s.profile, nil
++}
++
++// ListerPKIProfileProvider is a PKIProfileProvider that reads a named
++// cluster-scoped PKI resource via a lister.
++type ListerPKIProfileProvider struct {
++	lister       configv1alpha1listers.PKILister
++	resourceName string
++}
++
++// NewClusterPKIProfileProvider creates a PKIProfileProvider that resolves the
++// PKIProfile from the OpenShift cluster configuration PKI resource.
++func NewClusterPKIProfileProvider(lister configv1alpha1listers.PKILister) *ListerPKIProfileProvider {
++	return NewListerPKIProfileProvider(lister, "cluster")
++}
++
++// NewListerPKIProfileProvider returns a PKIProfileProvider that reads the
++// named cluster-scoped PKI resource via a lister.
++func NewListerPKIProfileProvider(lister configv1alpha1listers.PKILister, resourceName string) *ListerPKIProfileProvider {
++	return &ListerPKIProfileProvider{
++		lister:       lister,
++		resourceName: resourceName,
++	}
++}
++
++// PKIProfile reads the PKI resource and returns the profile based on its
++// certificate management mode. Returns nil for Unmanaged mode.
++func (l *ListerPKIProfileProvider) PKIProfile() (*configv1alpha1.PKIProfile, error) {
++	pki, err := l.lister.Get(l.resourceName)
++	if err != nil {
++		return nil, fmt.Errorf("failed to get PKI resource %q: %w", l.resourceName, err)
++	}
++
++	switch pki.Spec.CertificateManagement.Mode {
++	case configv1alpha1.PKICertificateManagementModeUnmanaged:
++		return nil, nil
++	case configv1alpha1.PKICertificateManagementModeDefault:
++		profile := DefaultPKIProfile()
++		return &profile, nil
++	case configv1alpha1.PKICertificateManagementModeCustom:
++		profile := pki.Spec.CertificateManagement.Custom.PKIProfile
++		return &profile, nil
++	default:
++		return nil, fmt.Errorf("unknown PKI certificate management mode: %q", pki.Spec.CertificateManagement.Mode)
++	}
++}
+diff --git a/vendor/github.com/openshift/library-go/pkg/pki/resolve.go b/vendor/github.com/openshift/library-go/pkg/pki/resolve.go
+new file mode 100644
+index 0000000000..1154fd48ea
+--- /dev/null
++++ b/vendor/github.com/openshift/library-go/pkg/pki/resolve.go
+@@ -0,0 +1,77 @@
++package pki
++
++import (
++	"fmt"
++
++	configv1alpha1 "github.com/openshift/api/config/v1alpha1"
++	"github.com/openshift/library-go/pkg/crypto"
++)
++
++// CertificateConfig holds the resolved configuration for a specific certificate.
++// Currently contains key configuration; will grow as the PKI API expands to
++// include additional certificate properties.
++type CertificateConfig struct {
++	// Key is the resolved key pair generator.
++	Key crypto.KeyPairGenerator
++}
++
++// ResolveCertificateConfig resolves the effective certificate configuration
++// for a given certificate type and name from the PKI profile.
++//
++// Returns nil if the provider returns a nil profile (Unmanaged mode),
++// indicating that the caller should use its own default behavior.
++//
++// The name parameter is reserved for future per-certificate overrides and
++// can be used for metrics and logging.
++func ResolveCertificateConfig(provider PKIProfileProvider, certType CertificateType, name string) (*CertificateConfig, error) {
++	profile, err := provider.PKIProfile()
++	if err != nil {
++		return nil, fmt.Errorf("resolving PKI profile for %s certificate %q: %w", certType, name, err)
++	}
++	if profile == nil {
++		return nil, nil
++	}
++
++	switch certType {
++	case CertificateTypeSigner:
++		return resolveKeyConfig(profile.Defaults, profile.SignerCertificates)
++	case CertificateTypeServing:
++		return resolveKeyConfig(profile.Defaults, profile.ServingCertificates)
++	case CertificateTypeClient:
++		return resolveKeyConfig(profile.Defaults, profile.ClientCertificates)
++	case CertificateTypePeer:
++		return resolvePeerKeyConfig(profile)
++	default:
++		return nil, fmt.Errorf("unknown certificate type: %q", certType)
++	}
++}
++
++// resolveKeyConfig returns the override KeyConfig if its Algorithm is set,
++// otherwise falls back to the default.
++func resolveKeyConfig(defaults configv1alpha1.DefaultCertificateConfig, override configv1alpha1.CertificateConfig) (*CertificateConfig, error) {
++	apiKey := defaults.Key
++	if override.Key.Algorithm != "" {
++		apiKey = override.Key
++	}
++	g, err := KeyPairGeneratorFromAPI(apiKey)
++	if err != nil {
++		return nil, err
++	}
++	return &CertificateConfig{Key: g}, nil
++}
++
++// resolvePeerKeyConfig resolves both the serving and client configs and
++// returns whichever has higher NIST security strength.
++func resolvePeerKeyConfig(profile *configv1alpha1.PKIProfile) (*CertificateConfig, error) {
++	servingCfg, err := resolveKeyConfig(profile.Defaults, profile.ServingCertificates)
++	if err != nil {
++		return nil, fmt.Errorf("resolving serving config for peer: %w", err)
++	}
++	clientCfg, err := resolveKeyConfig(profile.Defaults, profile.ClientCertificates)
++	if err != nil {
++		return nil, fmt.Errorf("resolving client config for peer: %w", err)
++	}
++	return &CertificateConfig{
++		Key: strongerKeyPairGenerator(servingCfg.Key, clientCfg.Key),
++	}, nil
++}
+diff --git a/vendor/github.com/openshift/library-go/pkg/pki/types.go b/vendor/github.com/openshift/library-go/pkg/pki/types.go
+new file mode 100644
+index 0000000000..2cf8282255
+--- /dev/null
++++ b/vendor/github.com/openshift/library-go/pkg/pki/types.go
+@@ -0,0 +1,23 @@
++package pki
++
++// CertificateType identifies the category of a certificate for profile resolution.
++type CertificateType string
++
++const (
++	// CertificateTypeSigner identifies certificate authority (CA) certificates
++	// that sign other certificates.
++	CertificateTypeSigner CertificateType = "signer"
++
++	// CertificateTypeServing identifies TLS server certificates used to serve
++	// HTTPS endpoints.
++	CertificateTypeServing CertificateType = "serving"
++
++	// CertificateTypeClient identifies client authentication certificates used
++	// to authenticate to servers.
++	CertificateTypeClient CertificateType = "client"
++
++	// CertificateTypePeer identifies certificates used for both server and client
++	// authentication. The resolved key configuration is the stronger of the
++	// serving and client configurations.
++	CertificateTypePeer CertificateType = "peer"
++)
+diff --git a/vendor/modules.txt b/vendor/modules.txt
+index 405f554b2b..667f29d81e 100644
+--- a/vendor/modules.txt
++++ b/vendor/modules.txt
+@@ -1507,7 +1507,7 @@ github.com/openshift/client-go/user/applyconfigurations/user/v1
+ github.com/openshift/client-go/user/clientset/versioned
+ github.com/openshift/client-go/user/clientset/versioned/scheme
+ github.com/openshift/client-go/user/clientset/versioned/typed/user/v1
+-# github.com/openshift/library-go v0.0.0-20260303171201-5d9eb6295ff6
++# github.com/openshift/library-go v0.0.0-20260611115129-21dd5809a4b2
+ ## explicit; go 1.25.0
+ github.com/openshift/library-go/pkg/apiserver/jsonpatch
+ github.com/openshift/library-go/pkg/authorization/hardcodedauthorizer
+@@ -1532,6 +1532,7 @@ github.com/openshift/library-go/pkg/operator/resource/resourcemerge
+ github.com/openshift/library-go/pkg/operator/resource/resourceread
+ github.com/openshift/library-go/pkg/operator/resourcesynccontroller
+ github.com/openshift/library-go/pkg/operator/v1helpers
++github.com/openshift/library-go/pkg/pki
+ # github.com/openshift/runtime-utils v0.0.0-20230921210328-7bdb5b9c177b
+ ## explicit; go 1.18
+ github.com/openshift/runtime-utils/pkg/registries

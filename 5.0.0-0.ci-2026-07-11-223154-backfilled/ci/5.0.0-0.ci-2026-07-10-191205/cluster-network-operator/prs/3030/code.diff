@@ -1,0 +1,249 @@
+diff --git a/pkg/controller/operconfig/operconfig_controller.go b/pkg/controller/operconfig/operconfig_controller.go
+index 099fe82c6b..a04e0faf38 100644
+--- a/pkg/controller/operconfig/operconfig_controller.go
++++ b/pkg/controller/operconfig/operconfig_controller.go
+@@ -365,6 +365,15 @@ func (r *ReconcileOperConfig) Reconcile(ctx context.Context, request reconcile.R
+ 		r.status.UnsetProgressing(statusmanager.OperatorRender)
+ 	}
+ 
++	if hcp := bootstrapResult.Infra.HostedControlPlane; hcp != nil && hcp.RestartDate != "" {
++		if err := hypershift.SetRestartDateAnnotation(objs, hcp.Namespace, hcp.RestartDate); err != nil {
++			log.Printf("Failed to set restart-date annotation: %v", err)
++			r.status.MaybeSetDegraded(statusmanager.OperatorConfig, "RenderError",
++				fmt.Sprintf("Internal error while setting restart-date annotation: %v", err))
++			return reconcile.Result{}, err
++		}
++	}
++
+ 	// The first object we create should be the record of our applied configuration. The last object we create is config.openshift.io/v1/Network.Status
+ 	app, err := AppliedConfiguration(operConfig)
+ 	if err != nil {
+diff --git a/pkg/hypershift/hypershift.go b/pkg/hypershift/hypershift.go
+index 905cba015b..fd43765d4d 100644
+--- a/pkg/hypershift/hypershift.go
++++ b/pkg/hypershift/hypershift.go
+@@ -36,6 +36,8 @@ const (
+ 	ClusterIDLabel = "_id"
+ 	// HyperShiftConditionTypePrefix is a cluster network operator condition type prefix in hostedControlPlane status
+ 	HyperShiftConditionTypePrefix = "network.operator.openshift.io/"
++	// RestartDateAnnotation is used to trigger rolling restarts of control plane operands
++	RestartDateAnnotation = "hypershift.openshift.io/restart-date"
+ )
+ 
+ type RelatedObject struct {
+@@ -49,6 +51,7 @@ type RelatedObject struct {
+ 
+ // HostedControlPlane represents a subset of HyperShift API definition for HostedControlPlane
+ type HostedControlPlane struct {
++	Namespace                    string
+ 	ClusterID                    string
+ 	ControllerAvailabilityPolicy AvailabilityPolicy
+ 	NodeSelector                 map[string]string
+@@ -58,6 +61,7 @@ type HostedControlPlane struct {
+ 	AdvertisePort                int
+ 	PriorityClass                string
+ 	APIServerSpec                *configv1.APIServerSpec
++	RestartDate                  string
+ }
+ 
+ // AvailabilityPolicy specifies a high level availability policy for components.
+@@ -144,6 +148,11 @@ func ParseHostedControlPlane(hcp *unstructured.Unstructured) (*HostedControlPlan
+ 		return nil, fmt.Errorf("failed to extract control plane priority class annotation: %v", err)
+ 	}
+ 
++	restartDate, _, err := unstructured.NestedString(hcp.UnstructuredContent(), "metadata", "annotations", RestartDateAnnotation)
++	if err != nil {
++		return nil, fmt.Errorf("failed to extract restart date annotation: %v", err)
++	}
++
+ 	nodeSelector, _, err := unstructured.NestedStringMap(hcp.UnstructuredContent(), "spec", "nodeSelector")
+ 	if err != nil {
+ 		return nil, fmt.Errorf("failed extract nodeSelector: %v", err)
+@@ -266,6 +275,7 @@ func ParseHostedControlPlane(hcp *unstructured.Unstructured) (*HostedControlPlan
+ 	}
+ 
+ 	return &HostedControlPlane{
++		Namespace:                    hcp.GetNamespace(),
+ 		ControllerAvailabilityPolicy: AvailabilityPolicy(controllerAvailabilityPolicy),
+ 		ClusterID:                    clusterID,
+ 		NodeSelector:                 nodeSelector,
+@@ -275,6 +285,7 @@ func ParseHostedControlPlane(hcp *unstructured.Unstructured) (*HostedControlPlan
+ 		AdvertisePort:                int(advertisePort),
+ 		PriorityClass:                controlPlanePriorityClassAnnotation,
+ 		APIServerSpec:                apiServerSpec,
++		RestartDate:                  restartDate,
+ 	}, nil
+ }
+ 
+@@ -302,6 +313,38 @@ func GetHostedControlPlane(client cnoclient.Client) (*HostedControlPlane, error)
+ 	return parsed, nil
+ }
+ 
++// SetRestartDateAnnotation sets the restart-date annotation on pod templates of
++// Deployment, DaemonSet, and StatefulSet objects in the HCP namespace to trigger
++// a rolling restart. Objects outside the HCP namespace (e.g. guest-cluster
++// DaemonSets) are not modified.
++func SetRestartDateAnnotation(objs []*unstructured.Unstructured, hcpNamespace, restartDate string) error {
++	for _, obj := range objs {
++		if obj.GetNamespace() != hcpNamespace {
++			continue
++		}
++		if obj.GetAPIVersion() != "apps/v1" {
++			continue
++		}
++		kind := obj.GetKind()
++		if kind != "Deployment" && kind != "DaemonSet" && kind != "StatefulSet" {
++			continue
++		}
++
++		anno, _, err := unstructured.NestedStringMap(obj.Object, "spec", "template", "metadata", "annotations")
++		if err != nil {
++			return fmt.Errorf("failed to get pod template annotations from %s/%s: %v", kind, obj.GetName(), err)
++		}
++		if anno == nil {
++			anno = map[string]string{}
++		}
++		anno[RestartDateAnnotation] = restartDate
++		if err := unstructured.SetNestedStringMap(obj.Object, anno, "spec", "template", "metadata", "annotations"); err != nil {
++			return fmt.Errorf("failed to set restart-date annotation on %s/%s: %v", kind, obj.GetName(), err)
++		}
++	}
++	return nil
++}
++
+ // SetHostedControlPlaneConditions updates the hcp status.conditions based on the provided operStatus
+ // Returns an updated list of conditions and an error. If there are no changes, the returned list is empty.
+ func SetHostedControlPlaneConditions(hcp *unstructured.Unstructured, operStatus *operv1.NetworkStatus) ([]metav1.Condition, error) {
+diff --git a/pkg/hypershift/hypershift_test.go b/pkg/hypershift/hypershift_test.go
+index 0d9ac49482..23ba761290 100644
+--- a/pkg/hypershift/hypershift_test.go
++++ b/pkg/hypershift/hypershift_test.go
+@@ -103,3 +103,128 @@ spec:
+ 		g.Expect(actualOutput).To(Equal(tc.expectedOutput))
+ 	}
+ }
++
++func TestParseHostedControlPlaneRestartDate(t *testing.T) {
++	g := NewGomegaWithT(t)
++	input := `
++apiVersion: hypershift.openshift.io/v1beta1
++kind: HostedControlPlane
++metadata:
++  annotations:
++    hypershift.openshift.io/restart-date: "2024-01-15T10:30:00Z"
++spec:
++  clusterID: test-cluster-id
++  controllerAvailabilityPolicy: SingleReplica
++`
++	rawHCP, err := yaml.ToJSON([]byte(input))
++	g.Expect(err).NotTo(HaveOccurred())
++	object, err := runtime.Decode(unstructured.UnstructuredJSONScheme, rawHCP)
++	g.Expect(err).NotTo(HaveOccurred())
++	hcpUnstructured, ok := object.(*unstructured.Unstructured)
++	g.Expect(ok).To(BeTrue())
++	result, err := ParseHostedControlPlane(hcpUnstructured)
++	g.Expect(err).NotTo(HaveOccurred())
++	g.Expect(result.RestartDate).To(Equal("2024-01-15T10:30:00Z"))
++}
++
++func TestSetRestartDateAnnotation(t *testing.T) {
++	g := NewGomegaWithT(t)
++
++	hcpNS := "clusters-test-hc"
++
++	makeObj := func(apiVersion, kind, name, ns string) *unstructured.Unstructured {
++		return &unstructured.Unstructured{
++			Object: map[string]interface{}{
++				"apiVersion": apiVersion,
++				"kind":       kind,
++				"metadata": map[string]interface{}{
++					"name":      name,
++					"namespace": ns,
++				},
++				"spec": map[string]interface{}{
++					"template": map[string]interface{}{
++						"metadata": map[string]interface{}{},
++					},
++				},
++			},
++		}
++	}
++
++	t.Run("sets annotation on Deployment pod template", func(t *testing.T) {
++		obj := makeObj("apps/v1", "Deployment", "cloud-network-config-controller", hcpNS)
++		err := SetRestartDateAnnotation([]*unstructured.Unstructured{obj}, hcpNS, "2024-01-15T10:30:00Z")
++		g.Expect(err).NotTo(HaveOccurred())
++		anno, _, err := unstructured.NestedStringMap(obj.Object, "spec", "template", "metadata", "annotations")
++		g.Expect(err).NotTo(HaveOccurred())
++		g.Expect(anno).To(HaveKeyWithValue(RestartDateAnnotation, "2024-01-15T10:30:00Z"))
++	})
++
++	t.Run("sets annotation on DaemonSet pod template", func(t *testing.T) {
++		obj := makeObj("apps/v1", "DaemonSet", "ovnkube-node", hcpNS)
++		err := SetRestartDateAnnotation([]*unstructured.Unstructured{obj}, hcpNS, "2024-01-15T10:30:00Z")
++		g.Expect(err).NotTo(HaveOccurred())
++		anno, _, err := unstructured.NestedStringMap(obj.Object, "spec", "template", "metadata", "annotations")
++		g.Expect(err).NotTo(HaveOccurred())
++		g.Expect(anno).To(HaveKeyWithValue(RestartDateAnnotation, "2024-01-15T10:30:00Z"))
++	})
++
++	t.Run("sets annotation on StatefulSet pod template", func(t *testing.T) {
++		obj := makeObj("apps/v1", "StatefulSet", "test-statefulset", hcpNS)
++		err := SetRestartDateAnnotation([]*unstructured.Unstructured{obj}, hcpNS, "2024-01-15T10:30:00Z")
++		g.Expect(err).NotTo(HaveOccurred())
++		anno, _, err := unstructured.NestedStringMap(obj.Object, "spec", "template", "metadata", "annotations")
++		g.Expect(err).NotTo(HaveOccurred())
++		g.Expect(anno).To(HaveKeyWithValue(RestartDateAnnotation, "2024-01-15T10:30:00Z"))
++	})
++
++	t.Run("skips non-apps/v1 objects", func(t *testing.T) {
++		obj := makeObj("v1", "ConfigMap", "test-cm", hcpNS)
++		err := SetRestartDateAnnotation([]*unstructured.Unstructured{obj}, hcpNS, "2024-01-15T10:30:00Z")
++		g.Expect(err).NotTo(HaveOccurred())
++		_, found, err := unstructured.NestedStringMap(obj.Object, "spec", "template", "metadata", "annotations")
++		g.Expect(err).NotTo(HaveOccurred())
++		g.Expect(found).To(BeFalse())
++	})
++
++	t.Run("skips objects outside HCP namespace", func(t *testing.T) {
++		obj := makeObj("apps/v1", "DaemonSet", "ovnkube-node", "openshift-ovn-kubernetes")
++		err := SetRestartDateAnnotation([]*unstructured.Unstructured{obj}, hcpNS, "2024-01-15T10:30:00Z")
++		g.Expect(err).NotTo(HaveOccurred())
++		_, found, err := unstructured.NestedStringMap(obj.Object, "spec", "template", "metadata", "annotations")
++		g.Expect(err).NotTo(HaveOccurred())
++		g.Expect(found).To(BeFalse())
++	})
++
++	t.Run("preserves existing pod template annotations", func(t *testing.T) {
++		obj := makeObj("apps/v1", "Deployment", "test-deploy", hcpNS)
++		err := unstructured.SetNestedStringMap(obj.Object, map[string]string{"existing": "value"}, "spec", "template", "metadata", "annotations")
++		g.Expect(err).NotTo(HaveOccurred())
++		err = SetRestartDateAnnotation([]*unstructured.Unstructured{obj}, hcpNS, "2024-01-15T10:30:00Z")
++		g.Expect(err).NotTo(HaveOccurred())
++		anno, _, err := unstructured.NestedStringMap(obj.Object, "spec", "template", "metadata", "annotations")
++		g.Expect(err).NotTo(HaveOccurred())
++		g.Expect(anno).To(HaveKeyWithValue("existing", "value"))
++		g.Expect(anno).To(HaveKeyWithValue(RestartDateAnnotation, "2024-01-15T10:30:00Z"))
++	})
++
++	t.Run("handles multiple objects", func(t *testing.T) {
++		deploy := makeObj("apps/v1", "Deployment", "cncc", hcpNS)
++		ds := makeObj("apps/v1", "DaemonSet", "multus", hcpNS)
++		cm := makeObj("v1", "ConfigMap", "config", hcpNS)
++		objs := []*unstructured.Unstructured{deploy, ds, cm}
++		err := SetRestartDateAnnotation(objs, hcpNS, "2024-01-15T10:30:00Z")
++		g.Expect(err).NotTo(HaveOccurred())
++
++		anno, _, err := unstructured.NestedStringMap(deploy.Object, "spec", "template", "metadata", "annotations")
++		g.Expect(err).NotTo(HaveOccurred())
++		g.Expect(anno).To(HaveKeyWithValue(RestartDateAnnotation, "2024-01-15T10:30:00Z"))
++
++		anno, _, err = unstructured.NestedStringMap(ds.Object, "spec", "template", "metadata", "annotations")
++		g.Expect(err).NotTo(HaveOccurred())
++		g.Expect(anno).To(HaveKeyWithValue(RestartDateAnnotation, "2024-01-15T10:30:00Z"))
++
++		_, found, err := unstructured.NestedStringMap(cm.Object, "spec", "template", "metadata", "annotations")
++		g.Expect(err).NotTo(HaveOccurred())
++		g.Expect(found).To(BeFalse())
++	})
++}

@@ -1,0 +1,202 @@
+diff --git a/cmd/cluster-authentication-operator-tests-ext/main.go b/cmd/cluster-authentication-operator-tests-ext/main.go
+index be7d997772..268a3d2637 100644
+--- a/cmd/cluster-authentication-operator-tests-ext/main.go
++++ b/cmd/cluster-authentication-operator-tests-ext/main.go
+@@ -15,6 +15,7 @@ import (
+ 	_ "github.com/openshift/cluster-authentication-operator/test/e2e"
+ 	_ "github.com/openshift/cluster-authentication-operator/test/e2e-encryption-kms"
+ 	_ "github.com/openshift/cluster-authentication-operator/test/e2e-encryption-perf"
++	_ "github.com/openshift/cluster-authentication-operator/test/e2e-encryption-rotation"
+ 
+ 	"k8s.io/klog/v2"
+ )
+@@ -112,6 +113,16 @@ func prepareOperatorTestsRegistry() (*oteextension.Registry, error) {
+ 		},
+ 	})
+ 
++	// ClusterStability set to Disruptive: encryption rotation triggers API server rollouts.
++	extension.AddSuite(oteextension.Suite{
++		Name:             "openshift/cluster-authentication-operator/operator-encryption-rotation/serial",
++		Parallelism:      1,
++		ClusterStability: oteextension.ClusterStabilityDisruptive,
++		Qualifiers: []string{
++			`name.contains("[Encryption]") && name.contains("[Serial]") && name.contains("Rotation")`,
++		},
++	})
++
+ 	specs, err := oteginkgo.BuildExtensionTestSpecsFromOpenShiftGinkgoSuite()
+ 	if err != nil {
+ 		return nil, fmt.Errorf("couldn't build extension test specs from ginkgo: %w", err)
+diff --git a/test/e2e-encryption-rotation/e2e-encryption-rotation_test.go b/test/e2e-encryption-rotation/e2e-encryption-rotation_test.go
+index 5817f68e9f..1b0e4b590f 100644
+--- a/test/e2e-encryption-rotation/e2e-encryption-rotation_test.go
++++ b/test/e2e-encryption-rotation/e2e-encryption-rotation_test.go
+@@ -1,73 +1,14 @@
+ package e2e_encryption_rotation
+ 
+ import (
+-	"context"
+-	"encoding/json"
+-	"fmt"
+ 	"testing"
+-
+-	configv1 "github.com/openshift/api/config/v1"
+-	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+-	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
+-	"k8s.io/apimachinery/pkg/runtime"
+-
+-	oauthapiconfigobservercontroller "github.com/openshift/cluster-authentication-operator/pkg/operator/configobservation/configobservercontroller"
+-	operatorencryption "github.com/openshift/cluster-authentication-operator/test/library/encryption"
+-	library "github.com/openshift/library-go/test/library/encryption"
+ )
+ 
+-// TestEncryptionRotation first encrypts data with aescbc key
+-// then it forces a key rotation by setting the "encyrption.Reason" in the operator's configuration file
+-func TestEncryptionRotation(t *testing.T) {
+-	ctx := context.TODO()
+-	library.TestEncryptionRotation(ctx, t, library.RotationScenario{
+-		BasicScenario: library.BasicScenario{
+-			Namespace:                       "openshift-config-managed",
+-			LabelSelector:                   "encryption.apiserver.operator.openshift.io/component" + "=" + "openshift-oauth-apiserver",
+-			EncryptionConfigSecretName:      fmt.Sprintf("encryption-config-openshift-oauth-apiserver"),
+-			EncryptionConfigSecretNamespace: "openshift-config-managed",
+-			OperatorNamespace:               "openshift-authentication-operator",
+-			TargetGRs:                       library.AuthTargetGRs,
+-			AssertFunc:                      library.AssertTokens,
+-		},
+-		CreateResourceFunc: func(t testing.TB, _ library.ClientSet, _ string) runtime.Object {
+-			return library.CreateAndStoreTokenOfLife(ctx, t, library.GetClients(t))
+-		},
+-		GetRawResourceFunc: func(t testing.TB, clientSet library.ClientSet, _ string) string {
+-			return library.GetRawTokenOfLife(t, clientSet)
+-		},
+-		EncryptionProvider: library.EncryptionProvider{
+-			APIServerEncryption: configv1.APIServerEncryption{Type: configv1.EncryptionType("aescbc")},
+-		},
+-		ForceRotationFunc: library.StaticEncryptionForceRotation(func(rawUnsupportedEncryptionCfg []byte) error {
+-			cs := operatorencryption.GetClients(t)
+-			authOperator, err := cs.OperatorClient.Get(ctx, "cluster", metav1.GetOptions{})
+-			if err != nil {
+-				return err
+-			}
+-
+-			unsupportedConfigAsMap := map[string]interface{}{}
+-			if len(authOperator.Spec.UnsupportedConfigOverrides.Raw) > 0 {
+-				if err := json.Unmarshal(authOperator.Spec.UnsupportedConfigOverrides.Raw, &unsupportedConfigAsMap); err != nil {
+-					return err
+-				}
+-			}
+-			unsupportedEncryptionConfigAsMap := map[string]interface{}{}
+-			if err := json.Unmarshal(rawUnsupportedEncryptionCfg, &unsupportedEncryptionConfigAsMap); err != nil {
+-				return err
+-			}
+-			if err := unstructured.SetNestedMap(unsupportedConfigAsMap, unsupportedEncryptionConfigAsMap, oauthapiconfigobservercontroller.OAuthAPIServerConfigPrefix); err != nil {
+-				return err
+-			}
+-			rawUnsupportedCfg, err := json.Marshal(unsupportedConfigAsMap)
+-			if err != nil {
+-				return err
+-			}
+-			authOperator.Spec.UnsupportedConfigOverrides.Raw = rawUnsupportedCfg
+-
+-			_, err = cs.OperatorClient.Update(ctx, authOperator, metav1.UpdateOptions{})
+-			return err
+-		}),
+-		WaitForRotationCompleteFunc: library.WaitForNextEncryptionKeyRotation(),
+-	})
++// This test calls the shared test function which
++// can be called from both standard Go tests and Ginkgo tests.
++//
++// This situation is temporary until we verify the new OTE job.
++// Eventually all tests will be run only as part of the OTE framework.
++func TestEncryptionRotation(tt *testing.T) {
++	testEncryptionRotation(tt.Context(), tt)
+ }
+diff --git a/test/e2e-encryption-rotation/encryption_rotation.go b/test/e2e-encryption-rotation/encryption_rotation.go
+new file mode 100644
+index 0000000000..9945c51dbf
+--- /dev/null
++++ b/test/e2e-encryption-rotation/encryption_rotation.go
+@@ -0,0 +1,82 @@
++package e2e_encryption_rotation
++
++import (
++	"context"
++	"encoding/json"
++	"testing"
++	"time"
++
++	g "github.com/onsi/ginkgo/v2"
++
++	configv1 "github.com/openshift/api/config/v1"
++	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
++	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
++	"k8s.io/apimachinery/pkg/runtime"
++
++	oauthapiconfigobservercontroller "github.com/openshift/cluster-authentication-operator/pkg/operator/configobservation/configobservercontroller"
++	operatorencryption "github.com/openshift/cluster-authentication-operator/test/library/encryption"
++	library "github.com/openshift/library-go/test/library/encryption"
++)
++
++var _ = g.Describe("[sig-auth] authentication operator", func() {
++	g.It("[Encryption][Serial] TestEncryptionRotation [Timeout:30m]", func(ctx context.Context) {
++		testEncryptionRotation(ctx, g.GinkgoTB())
++	})
++})
++
++// testEncryptionRotation first encrypts data with aescbc key
++// then it forces a key rotation by setting the "encryption.Reason" in the operator's configuration file
++func testEncryptionRotation(ctx context.Context, tt testing.TB) {
++	ctx, cancel := context.WithTimeout(ctx, 30*time.Minute)
++	tt.Cleanup(cancel)
++	library.TestEncryptionRotation(ctx, tt, library.RotationScenario{
++		BasicScenario: library.BasicScenario{
++			Namespace:                       "openshift-config-managed",
++			LabelSelector:                   "encryption.apiserver.operator.openshift.io/component=openshift-oauth-apiserver",
++			EncryptionConfigSecretName:      "encryption-config-openshift-oauth-apiserver",
++			EncryptionConfigSecretNamespace: "openshift-config-managed",
++			OperatorNamespace:               "openshift-authentication-operator",
++			TargetGRs:                       library.AuthTargetGRs,
++			AssertFunc:                      library.AssertTokens,
++		},
++		CreateResourceFunc: func(tt testing.TB, _ library.ClientSet, _ string) runtime.Object {
++			return library.CreateAndStoreTokenOfLife(ctx, tt, library.GetClients(tt))
++		},
++		GetRawResourceFunc: func(tt testing.TB, clientSet library.ClientSet, _ string) string {
++			return library.GetRawTokenOfLife(tt, clientSet)
++		},
++		EncryptionProvider: library.EncryptionProvider{
++			APIServerEncryption: configv1.APIServerEncryption{Type: configv1.EncryptionType("aescbc")},
++		},
++		ForceRotationFunc: library.StaticEncryptionForceRotation(func(rawUnsupportedEncryptionCfg []byte) error {
++			cs := operatorencryption.GetClients(tt)
++			authOperator, err := cs.OperatorClient.Get(ctx, "cluster", metav1.GetOptions{})
++			if err != nil {
++				return err
++			}
++
++			unsupportedConfigAsMap := map[string]interface{}{}
++			if len(authOperator.Spec.UnsupportedConfigOverrides.Raw) > 0 {
++				if err := json.Unmarshal(authOperator.Spec.UnsupportedConfigOverrides.Raw, &unsupportedConfigAsMap); err != nil {
++					return err
++				}
++			}
++			unsupportedEncryptionConfigAsMap := map[string]interface{}{}
++			if err := json.Unmarshal(rawUnsupportedEncryptionCfg, &unsupportedEncryptionConfigAsMap); err != nil {
++				return err
++			}
++			if err := unstructured.SetNestedMap(unsupportedConfigAsMap, unsupportedEncryptionConfigAsMap, oauthapiconfigobservercontroller.OAuthAPIServerConfigPrefix); err != nil {
++				return err
++			}
++			rawUnsupportedCfg, err := json.Marshal(unsupportedConfigAsMap)
++			if err != nil {
++				return err
++			}
++			authOperator.Spec.UnsupportedConfigOverrides.Raw = rawUnsupportedCfg
++
++			_, err = cs.OperatorClient.Update(ctx, authOperator, metav1.UpdateOptions{})
++			return err
++		}),
++		WaitForRotationCompleteFunc: library.WaitForNextEncryptionKeyRotation(),
++	})
++}

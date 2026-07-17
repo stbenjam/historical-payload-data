@@ -1,0 +1,648 @@
+diff --git a/pkg/osimagestream/discoverer.go b/pkg/osimagestream/discoverer.go
+new file mode 100644
+index 0000000000..55a51613a0
+--- /dev/null
++++ b/pkg/osimagestream/discoverer.go
+@@ -0,0 +1,58 @@
++package osimagestream
++
++import (
++	"context"
++
++	mcfgv1 "github.com/openshift/api/machineconfiguration/v1"
++	"k8s.io/klog/v2"
++)
++
++// StreamDiscoverer inspects a list of container images and discovers
++// which ones are OS or extensions images by reading their OCI labels,
++// grouping matching pairs into OS image stream sets.
++type StreamDiscoverer struct {
++	imageInspector       ImagesInspector
++	imageStreamExtractor ImageDataExtractor
++}
++
++// NewStreamDiscoverer creates a new StreamDiscoverer with the given dependencies.
++func NewStreamDiscoverer(imageInspector ImagesInspector, imageStreamExtractor ImageDataExtractor) *StreamDiscoverer {
++	return &StreamDiscoverer{
++		imageInspector:       imageInspector,
++		imageStreamExtractor: imageStreamExtractor,
++	}
++}
++
++// Discover inspects the given container images and returns the OS image stream
++// sets extracted from their labels. Images that fail inspection or lack stream
++// labels are logged and skipped.
++func (d *StreamDiscoverer) Discover(ctx context.Context, images []string) ([]*mcfgv1.OSImageStreamSet, error) {
++	if len(images) == 0 {
++		return []*mcfgv1.OSImageStreamSet{}, nil
++	}
++
++	inspectionResults, err := d.imageInspector.Inspect(ctx, images...)
++	if err != nil {
++		return nil, err
++	}
++
++	var imagesData []*ImageData
++	for _, result := range inspectionResults {
++		if result.Error != nil {
++			klog.Errorf(
++				"error inspecting image for OSImageStream discovery. %s image is ignored. %v",
++				result.Image,
++				result.Error,
++			)
++			continue
++		}
++		imageData := d.imageStreamExtractor.GetImageData(result.Image, result.InspectInfo.Labels)
++		if imageData == nil {
++			klog.V(4).Infof("image %s does not contain stream labels. Image discarded.", result.Image)
++			continue
++		}
++		imagesData = append(imagesData, imageData)
++	}
++
++	return GroupOSContainerImageMetadataToStream(imagesData), nil
++}
+diff --git a/pkg/osimagestream/discoverer_test.go b/pkg/osimagestream/discoverer_test.go
+new file mode 100644
+index 0000000000..0f02a39468
+--- /dev/null
++++ b/pkg/osimagestream/discoverer_test.go
+@@ -0,0 +1,99 @@
++package osimagestream
++
++import (
++	"context"
++	"errors"
++	"testing"
++
++	"github.com/containers/image/v5/types"
++	"github.com/stretchr/testify/assert"
++	"github.com/stretchr/testify/require"
++)
++
++func TestStreamDiscoverer_Discover(t *testing.T) {
++	tests := []struct {
++		name                string
++		images              []string
++		inspectData         map[string]*types.ImageInspectInfo
++		inspectorErr        error
++		expectedStreamNames []string
++		expectError         bool
++	}{
++		{
++			name:   "discovers OS and extensions pair",
++			images: []string{testStreamDefRHEL9.osImage, testStreamDefRHEL9.extImage},
++			inspectData: newTestInspectData(testStreamDefRHEL9),
++			expectedStreamNames: []string{"rhel-9"},
++		},
++		{
++			name:                "empty images list returns empty",
++			images:              []string{},
++			expectedStreamNames: []string{},
++		},
++		{
++			name:         "propagates inspector global error",
++			images:       []string{"quay.io/some/image@sha256:aaa"},
++			inspectorErr: errors.New("connection refused"),
++			expectError:  true,
++		},
++		{
++			name:   "skips images with per-image inspection errors",
++			images: []string{"bad-image", testStreamDefRHEL9.osImage, testStreamDefRHEL9.extImage},
++			inspectData: newTestInspectData(testStreamDefRHEL9),
++			expectedStreamNames: []string{"rhel-9"},
++		},
++		{
++			name:   "skips images without stream labels",
++			images: []string{"quay.io/some/app@sha256:aaa", testStreamDefRHEL9.osImage, testStreamDefRHEL9.extImage},
++			inspectData: func() map[string]*types.ImageInspectInfo {
++				data := newTestInspectData(testStreamDefRHEL9)
++				data["quay.io/some/app@sha256:aaa"] = &types.ImageInspectInfo{
++					Labels: map[string]string{"unrelated": "label"},
++				}
++				return data
++			}(),
++			expectedStreamNames: []string{"rhel-9"},
++		},
++		{
++			name: "discovers multiple streams",
++			images: []string{
++				testStreamDefRHEL9.osImage, testStreamDefRHEL9.extImage,
++				testStreamDefRHEL10.osImage, testStreamDefRHEL10.extImage,
++			},
++			inspectData:         newTestInspectData(testStreamDefRHEL9, testStreamDefRHEL10),
++			expectedStreamNames: []string{"rhel-9", "rhel-10"},
++		},
++		{
++			name:                "incomplete stream pair is discarded",
++			images:              []string{testStreamDefRHEL9.osImage},
++			inspectData:         newTestInspectData(testStreamDefRHEL9),
++			expectedStreamNames: []string{},
++		},
++	}
++
++	for _, tt := range tests {
++		t.Run(tt.name, func(t *testing.T) {
++			discoverer := NewStreamDiscoverer(
++				&mockImagesInspector{inspectData: tt.inspectData, err: tt.inspectorErr},
++				NewImageStreamExtractor(),
++			)
++
++			streams, err := discoverer.Discover(context.Background(), tt.images)
++
++			if tt.expectError {
++				require.Error(t, err)
++				assert.Nil(t, streams)
++				return
++			}
++
++			require.NoError(t, err)
++			require.Len(t, streams, len(tt.expectedStreamNames))
++
++			actualNames := make([]string, 0, len(streams))
++			for _, s := range streams {
++				actualNames = append(actualNames, s.Name)
++			}
++			assert.ElementsMatch(t, tt.expectedStreamNames, actualNames)
++		})
++	}
++}
+diff --git a/pkg/osimagestream/imagestream_source.go b/pkg/osimagestream/imagestream_source.go
+index 1a6c617316..f775722cba 100644
+--- a/pkg/osimagestream/imagestream_source.go
++++ b/pkg/osimagestream/imagestream_source.go
+@@ -2,13 +2,11 @@ package osimagestream
+ 
+ import (
+ 	"context"
+-	"fmt"
+ 	"regexp"
+ 	"strings"
+ 
+ 	imagev1 "github.com/openshift/api/image/v1"
+ 	mcfgv1 "github.com/openshift/api/machineconfiguration/v1"
+-	"k8s.io/klog/v2"
+ )
+ 
+ var (
+@@ -19,62 +17,24 @@ var (
+ 
+ // ImageStreamStreamSource fetches OS image stream metadata from an OpenShift ImageStream resource.
+ type ImageStreamStreamSource struct {
+-	imageStreamExtractor ImageDataExtractor
+-	imageInspector       ImagesInspector
+-	imageStreamProvider  ImageStreamProvider
++	discoverer          *StreamDiscoverer
++	imageStreamProvider ImageStreamProvider
+ }
+ 
+ // NewImageStreamStreamSource creates a new ImageStreamStreamSource with the provided dependencies.
+-func NewImageStreamStreamSource(imageInspector ImagesInspector, imageStreamProvider ImageStreamProvider, imageStreamExtractor ImageDataExtractor) *ImageStreamStreamSource {
+-	return &ImageStreamStreamSource{imageInspector: imageInspector, imageStreamProvider: imageStreamProvider, imageStreamExtractor: imageStreamExtractor}
++func NewImageStreamStreamSource(discoverer *StreamDiscoverer, imageStreamProvider ImageStreamProvider) *ImageStreamStreamSource {
++	return &ImageStreamStreamSource{discoverer: discoverer, imageStreamProvider: imageStreamProvider}
+ }
+ 
+-// FetchStreams retrieves an ImageStream, filters and inspects relevant OS images,
+-// and returns the extracted OS image stream metadata.
++// FetchStreams retrieves an ImageStream, filters relevant OS image tags,
++// and delegates discovery to the StreamDiscoverer.
+ func (r *ImageStreamStreamSource) FetchStreams(ctx context.Context) ([]*mcfgv1.OSImageStreamSet, error) {
+ 	imageStream, err := r.imageStreamProvider.ReadImageStream(ctx)
+ 	if err != nil {
+ 		return nil, err
+ 	}
+-
+-	// Filter out the tags to get only the one we consider
+-	// related to OS/Extensions
+ 	osImagesDigests := r.filterImageTag(imageStream)
+-
+-	// Get the labels of each OS image
+-	imagesData, err := r.fetchImagesData(ctx, osImagesDigests)
+-	if err != nil {
+-		return nil, fmt.Errorf("failed to fetch ImageStream images data: %w", err)
+-	}
+-	return GroupOSContainerImageMetadataToStream(imagesData), nil
+-}
+-
+-// fetchImagesData inspects the provided container images and extracts their metadata.
+-// Images that fail inspection are logged and skipped rather than causing the entire operation to fail.
+-func (r *ImageStreamStreamSource) fetchImagesData(ctx context.Context, images []string) ([]*ImageData, error) {
+-	inspectionResults, err := r.imageInspector.Inspect(ctx, images...)
+-	if err != nil {
+-		return nil, err
+-	}
+-	results := make([]*ImageData, 0)
+-	for _, inspectionResult := range inspectionResults {
+-		if inspectionResult.Error != nil {
+-			klog.Errorf(
+-				"error inspecting ImageStream Image for OSImageStream generation. %s image will is ignored. %v",
+-				inspectionResult.Image,
+-				inspectionResult.Error,
+-			)
+-			continue
+-		}
+-		imageData := r.imageStreamExtractor.GetImageData(inspectionResult.Image, inspectionResult.InspectInfo.Labels)
+-		// If imageData is nil: Not a CoreOS versions with the streams labels in place
+-		if imageData == nil {
+-			klog.V(4).Infof("image %s does not contain stream labels. Image discarded.", inspectionResult.Image)
+-			continue
+-		}
+-		results = append(results, imageData)
+-	}
+-	return results, nil
++	return r.discoverer.Discover(ctx, osImagesDigests)
+ }
+ 
+ // filterImageTag returns container image references from ImageStream tags that are
+diff --git a/pkg/osimagestream/imagestream_source_test.go b/pkg/osimagestream/imagestream_source_test.go
+index fe7e8dc663..52f0489088 100644
+--- a/pkg/osimagestream/imagestream_source_test.go
++++ b/pkg/osimagestream/imagestream_source_test.go
+@@ -70,7 +70,6 @@ func TestImageStreamStreamSource_FetchStreams(t *testing.T) {
+ 		providerImageStream *imagev1.ImageStream
+ 		providerErr         error
+ 		inspectorResults    []imageutils.BulkInspectResult
+-		inspectorErr        error
+ 		expectedStreamNames []string
+ 		errorContains       string
+ 	}{
+@@ -104,12 +103,6 @@ func TestImageStreamStreamSource_FetchStreams(t *testing.T) {
+ 			providerErr:   errors.New("failed to read imagestream"),
+ 			errorContains: "failed to read imagestream",
+ 		},
+-		{
+-			name:                "images inspector error",
+-			providerImageStream: createTestImageStream(),
+-			inspectorErr:        errors.New("inspection failed"),
+-			errorContains:       "inspection failed",
+-		},
+ 		{
+ 			name: "annotation-based filtering",
+ 			providerImageStream: &imagev1.ImageStream{
+@@ -190,35 +183,6 @@ func TestImageStreamStreamSource_FetchStreams(t *testing.T) {
+ 			inspectorResults:    []imageutils.BulkInspectResult{},
+ 			expectedStreamNames: []string{},
+ 		},
+-		{
+-			name:                "skips individual image inspection errors",
+-			providerImageStream: createTestImageStream(),
+-			inspectorResults: []imageutils.BulkInspectResult{
+-				{
+-					Image: "invalid-image",
+-					Error: errors.New("failed to inspect"),
+-				},
+-				{
+-					Image: testRHELCoreosImage,
+-					InspectInfo: &types.ImageInspectInfo{
+-						Labels: map[string]string{
+-							testCoreOSLabelStreamClass: streamNameRHELCoreos,
+-							testCoreOSLabelBootc:       testCoreOSLabelBootcValue1,
+-						},
+-					},
+-				},
+-				{
+-					Image: testRHELCoreosExtensionsImage,
+-					InspectInfo: &types.ImageInspectInfo{
+-						Labels: map[string]string{
+-							testCoreOSLabelStreamClass: streamNameRHELCoreos,
+-							testCoreOSLabelExtension:   testCoreOSLabelExtensionValue,
+-						},
+-					},
+-				},
+-			},
+-			expectedStreamNames: []string{streamNameRHELCoreos},
+-		},
+ 		{
+ 			name: "empty imagestream",
+ 			providerImageStream: &imagev1.ImageStream{
+@@ -306,13 +270,14 @@ func TestImageStreamStreamSource_FetchStreams(t *testing.T) {
+ 			ctx := context.Background()
+ 
+ 			streams, err := NewImageStreamStreamSource(
+-				&mockImagesInspector{
+-					results: tt.inspectorResults,
+-					err:     tt.inspectorErr,
+-				}, &mockImageStreamProvider{
++				NewStreamDiscoverer(
++					&mockImagesInspector{
++						results: tt.inspectorResults,
++					}, NewImageStreamExtractor()),
++				&mockImageStreamProvider{
+ 					imageStream: tt.providerImageStream,
+ 					err:         tt.providerErr,
+-				}, NewImageStreamExtractor()).
++				}).
+ 				FetchStreams(ctx)
+ 
+ 			if tt.errorContains != "" {
+diff --git a/pkg/osimagestream/osimagestream.go b/pkg/osimagestream/osimagestream.go
+index 280e7a6a83..33ec834d53 100644
+--- a/pkg/osimagestream/osimagestream.go
++++ b/pkg/osimagestream/osimagestream.go
+@@ -68,11 +68,12 @@ func NewDefaultStreamSourceFactory(inspectorFactory ImagesInspectorFactory) *Def
+ func (f *DefaultStreamSourceFactory) Create(ctx context.Context, sysCtx *types.SystemContext, createOptions CreateOptions) (*mcfgv1.OSImageStream, error) {
+ 	var sources []StreamSource
+ 	imagesInspector := f.inspectorFactory.ForContext(sysCtx)
++	discoverer := NewStreamDiscoverer(imagesInspector, f.imagesExtractor)
+ 	if createOptions.CliImages != nil {
+-		sources = append(sources, NewOSImagesURLStreamSource(NewStaticURLProvider(*createOptions.CliImages), f.imagesExtractor, imagesInspector))
++		sources = append(sources, NewOSImagesURLStreamSource(NewStaticURLProvider(*createOptions.CliImages), discoverer))
+ 	}
+ 	if createOptions.ConfigMapLister != nil {
+-		sources = append(sources, NewOSImagesURLStreamSource(NewConfigMapURLProviders(createOptions.ConfigMapLister), f.imagesExtractor, imagesInspector))
++		sources = append(sources, NewOSImagesURLStreamSource(NewConfigMapURLProviders(createOptions.ConfigMapLister), discoverer))
+ 	}
+ 	var imageStreamProvider ImageStreamProvider
+ 	//nolint:gocritic // I disagree that this would be more readable with a switch case @pablintino
+@@ -83,7 +84,7 @@ func (f *DefaultStreamSourceFactory) Create(ctx context.Context, sysCtx *types.S
+ 	} else {
+ 		return nil, errors.New("one of ReleaseImageStream or ReleaseImage must be specified")
+ 	}
+-	sources = append(sources, NewImageStreamStreamSource(imagesInspector, imageStreamProvider, f.imagesExtractor))
++	sources = append(sources, NewImageStreamStreamSource(discoverer, imageStreamProvider))
+ 
+ 	streams := collect(ctx, sources)
+ 	if len(streams) == 0 {
+diff --git a/pkg/osimagestream/urls_source.go b/pkg/osimagestream/urls_source.go
+index fc8e694f02..ba4c1c06b7 100644
+--- a/pkg/osimagestream/urls_source.go
++++ b/pkg/osimagestream/urls_source.go
+@@ -6,9 +6,7 @@ import (
+ 
+ 	mcfgv1 "github.com/openshift/api/machineconfiguration/v1"
+ 	"github.com/openshift/machine-config-operator/pkg/controller/common"
+-	"github.com/openshift/machine-config-operator/pkg/imageutils"
+ 	corelisterv1 "k8s.io/client-go/listers/core/v1"
+-	"k8s.io/klog/v2"
+ )
+ 
+ // OSImageTuple represents a pair of container images for OS and extensions.
+@@ -19,68 +17,26 @@ type OSImageTuple struct {
+ 
+ // OSImagesURLStreamSource fetches OS image stream metadata from specific container image URLs.
+ type OSImagesURLStreamSource struct {
+-	urlsProvider         URLsProvider
+-	imageStreamExtractor ImageDataExtractor
+-	imageInspector       ImagesInspector
++	urlsProvider URLsProvider
++	discoverer   *StreamDiscoverer
+ }
+ 
+ // NewOSImagesURLStreamSource creates a new OSImagesURLStreamSource with the provided dependencies.
+-func NewOSImagesURLStreamSource(urlsProvider URLsProvider, imageStreamExtractor ImageDataExtractor, imageInspector ImagesInspector) *OSImagesURLStreamSource {
++func NewOSImagesURLStreamSource(urlsProvider URLsProvider, discoverer *StreamDiscoverer) *OSImagesURLStreamSource {
+ 	return &OSImagesURLStreamSource{
+-		urlsProvider:         urlsProvider,
+-		imageStreamExtractor: imageStreamExtractor,
+-		imageInspector:       imageInspector,
++		urlsProvider: urlsProvider,
++		discoverer:   discoverer,
+ 	}
+ }
+ 
+-// FetchStreams retrieves and inspects OS and extensions images from the configured URLs,
+-// returning the extracted OS image stream metadata.
++// FetchStreams retrieves OS and extensions image URLs from the configured provider
++// and delegates discovery to the StreamDiscoverer.
+ func (s *OSImagesURLStreamSource) FetchStreams(ctx context.Context) ([]*mcfgv1.OSImageStreamSet, error) {
+ 	urls, err := s.urlsProvider.GetUrls()
+ 	if err != nil {
+ 		return nil, err
+ 	}
+-	inspectionResults, err := s.imageInspector.Inspect(ctx, urls.OSImage, urls.OSExtensionsImage)
+-	if err != nil {
+-		return nil, err
+-	}
+-
+-	// Validate we got results for both required images
+-	osInspectResult, err := getInspectResultByImageName(inspectionResults, urls.OSImage)
+-	if err != nil {
+-		return nil, fmt.Errorf("error inspecting OS image %w", err)
+-	}
+-	osExtensionsInspectResult, err := getInspectResultByImageName(inspectionResults, urls.OSExtensionsImage)
+-	if err != nil {
+-		return nil, fmt.Errorf("error inspecting OS extensions image %w", err)
+-	}
+-
+-	var imagesData []*ImageData
+-	for _, inspectionResult := range []*imageutils.BulkInspectResult{osInspectResult, osExtensionsInspectResult} {
+-		imageData := s.imageStreamExtractor.GetImageData(inspectionResult.Image, inspectionResult.InspectInfo.Labels)
+-		if imageData == nil {
+-			klog.V(4).Infof("image %s does not contain stream labels. Image discarded.", inspectionResult.Image)
+-
+-			// Both imageData should be fine to consider the source URLs valid
+-			return []*mcfgv1.OSImageStreamSet{}, nil
+-		}
+-		imagesData = append(imagesData, imageData)
+-	}
+-	return GroupOSContainerImageMetadataToStream(imagesData), nil
+-}
+-
+-// getInspectResultByImageName finds the inspection result for a specific image name
+-// and returns an error if the inspection failed or no result was found.
+-func getInspectResultByImageName(inspectResults []imageutils.BulkInspectResult, imageName string) (*imageutils.BulkInspectResult, error) {
+-	for _, result := range inspectResults {
+-		if imageName == result.Image {
+-			if result.Error != nil {
+-				return nil, result.Error
+-			}
+-			return &result, nil
+-		}
+-	}
+-	return nil, fmt.Errorf("no inspection result for image %s", imageName)
++	return s.discoverer.Discover(ctx, []string{urls.OSImage, urls.OSExtensionsImage})
+ }
+ 
+ // URLsProvider provides OS and extensions container image URLs.
+diff --git a/pkg/osimagestream/urls_source_test.go b/pkg/osimagestream/urls_source_test.go
+index 2da73143cf..e49b928edc 100644
+--- a/pkg/osimagestream/urls_source_test.go
++++ b/pkg/osimagestream/urls_source_test.go
+@@ -4,7 +4,6 @@ package osimagestream
+ import (
+ 	"context"
+ 	"errors"
+-	"fmt"
+ 	"testing"
+ 
+ 	"github.com/containers/image/v5/types"
+@@ -105,7 +104,7 @@ func TestOSImagesURLStreamSource_FetchStreams_Success(t *testing.T) {
+ 		},
+ 	}
+ 
+-	streams, err := NewOSImagesURLStreamSource(urlsProvider, NewImageStreamExtractor(), imagesInspector).
++	streams, err := NewOSImagesURLStreamSource(urlsProvider, NewStreamDiscoverer(imagesInspector, NewImageStreamExtractor())).
+ 		FetchStreams(ctx)
+ 
+ 	require.NoError(t, err)
+@@ -123,9 +122,7 @@ func TestOSImagesURLStreamSource_FetchStreams_URLProviderError(t *testing.T) {
+ 		err: errors.New("failed to get URLs"),
+ 	}
+ 
+-	imagesInspector := &mockImagesInspector{}
+-	extractor := &mockImageDataExtractor{}
+-	source := NewOSImagesURLStreamSource(urlsProvider, extractor, imagesInspector)
++	source := NewOSImagesURLStreamSource(urlsProvider, NewStreamDiscoverer(&mockImagesInspector{}, &mockImageDataExtractor{}))
+ 
+ 	streams, err := source.FetchStreams(ctx)
+ 
+@@ -134,158 +131,6 @@ func TestOSImagesURLStreamSource_FetchStreams_URLProviderError(t *testing.T) {
+ 	assert.Contains(t, err.Error(), "failed to get URLs")
+ }
+ 
+-func TestOSImagesURLStreamSource_FetchStreams_InspectorError(t *testing.T) {
+-	ctx := context.Background()
+-
+-	streams, err := NewOSImagesURLStreamSource(
+-		&mockURLsProvider{urls: createDummyTuple()},
+-		&mockImageDataExtractor{},
+-		&mockImagesInspector{
+-			err: errors.New("inspection failed"),
+-		},
+-	).FetchStreams(ctx)
+-	require.Error(t, err)
+-	assert.ErrorContains(t, err, "inspection failed")
+-
+-	assert.Nil(t, streams)
+-}
+-
+-func TestOSImagesURLStreamSource_FetchStreams_MissingImages(t *testing.T) {
+-	ctx := context.Background()
+-
+-	urlsProvider := &mockURLsProvider{urls: createDummyTuple()}
+-	tests := []struct {
+-		name    string
+-		results []imageutils.BulkInspectResult
+-		errMsg  string
+-	}{
+-		{
+-			name:    "no results",
+-			results: []imageutils.BulkInspectResult{},
+-			errMsg:  fmt.Sprintf("no inspection result for image %s", dummyOSImageName),
+-		},
+-		{
+-			name: "only OS image",
+-			results: []imageutils.BulkInspectResult{
+-				{
+-					Image: dummyOSImageName,
+-					InspectInfo: &types.ImageInspectInfo{
+-						Labels: map[string]string{},
+-					},
+-				},
+-			},
+-			errMsg: fmt.Sprintf("no inspection result for image %s", dummyOSExtensionsImageName),
+-		},
+-		{
+-			name: "only extensions image",
+-			results: []imageutils.BulkInspectResult{
+-				{
+-					Image: dummyOSExtensionsImageName,
+-					InspectInfo: &types.ImageInspectInfo{
+-						Labels: map[string]string{},
+-					},
+-				},
+-			},
+-			errMsg: fmt.Sprintf("no inspection result for image %s", dummyOSImageName),
+-		},
+-		{
+-			name: "wrong images",
+-			results: []imageutils.BulkInspectResult{
+-				{
+-					Image: "quay.io/wrong/image1:latest",
+-					InspectInfo: &types.ImageInspectInfo{
+-						Labels: map[string]string{},
+-					},
+-				},
+-				{
+-					Image: "quay.io/wrong/image2:latest",
+-					InspectInfo: &types.ImageInspectInfo{
+-						Labels: map[string]string{},
+-					},
+-				},
+-			},
+-			errMsg: fmt.Sprintf("no inspection result for image %s", dummyOSImageName),
+-		},
+-	}
+-
+-	for _, tt := range tests {
+-		t.Run(tt.name, func(t *testing.T) {
+-			streams, err := NewOSImagesURLStreamSource(
+-				urlsProvider,
+-				&mockImageDataExtractor{},
+-				&mockImagesInspector{
+-					results: tt.results,
+-				},
+-			).FetchStreams(ctx)
+-
+-			require.Error(t, err)
+-			assert.Contains(t, err.Error(), tt.errMsg)
+-			assert.Nil(t, streams)
+-		})
+-	}
+-}
+-
+-func TestOSImagesURLStreamSource_FetchStreams_InspectionResultError(t *testing.T) {
+-	ctx := context.Background()
+-
+-	urlsProvider := &mockURLsProvider{urls: createDummyTuple()}
+-	tests := []struct {
+-		name    string
+-		results []imageutils.BulkInspectResult
+-		errMsg  string
+-	}{
+-		{
+-			name: "OS image has error",
+-			results: []imageutils.BulkInspectResult{
+-				{
+-					Image: dummyOSImageName,
+-					Error: errors.New("failed to inspect OS image"),
+-				},
+-				{
+-					Image: dummyOSExtensionsImageName,
+-					InspectInfo: &types.ImageInspectInfo{
+-						Labels: map[string]string{},
+-					},
+-				},
+-			},
+-			errMsg: "error inspecting OS image",
+-		},
+-		{
+-			name: "extensions image has error",
+-			results: []imageutils.BulkInspectResult{
+-				{
+-					Image: dummyOSImageName,
+-					InspectInfo: &types.ImageInspectInfo{
+-						Labels: map[string]string{},
+-					},
+-				},
+-				{
+-					Image: dummyOSExtensionsImageName,
+-					Error: errors.New("failed to inspect extensions image"),
+-				},
+-			},
+-			errMsg: "error inspecting OS extensions image",
+-		},
+-	}
+-
+-	for _, tt := range tests {
+-		t.Run(tt.name, func(t *testing.T) {
+-			source := NewOSImagesURLStreamSource(
+-				urlsProvider,
+-				&mockImageDataExtractor{},
+-				&mockImagesInspector{
+-					results: tt.results,
+-				},
+-			)
+-			streams, err := source.FetchStreams(ctx)
+-
+-			require.Error(t, err)
+-			assert.Contains(t, err.Error(), tt.errMsg)
+-			assert.Nil(t, streams)
+-		})
+-	}
+-}
+-
+ // Tests for ConfigMapURLProvider
+ 
+ func TestConfigMapURLProvider_GetUrls_Success(t *testing.T) {

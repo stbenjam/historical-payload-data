@@ -1,0 +1,142 @@
+diff --git a/pkg/console/operator/sync_v400.go b/pkg/console/operator/sync_v400.go
+index e0759bcf8..082b383aa 100644
+--- a/pkg/console/operator/sync_v400.go
++++ b/pkg/console/operator/sync_v400.go
+@@ -192,7 +192,7 @@ func (co *consoleOperator) sync_v400(ctx context.Context, controllerContext fact
+ 		return statusHandler.FlushAndReturn(servingCertErr)
+ 	}
+ 
+-	actualDeployment, depChanged, depErrReason, depErr := co.SyncDeployment(
++	actualDeployment, depErrReason, depErr := co.SyncDeployment(
+ 		ctx,
+ 		set.Operator,
+ 		cm,
+@@ -218,17 +218,8 @@ func (co *consoleOperator) sync_v400(ctx context.Context, controllerContext fact
+ 
+ 	statusHandler.AddCondition(status.HandleProgressing("SyncLoopRefresh", "InProgress", func() error {
+ 		version := os.Getenv("OPERATOR_IMAGE_VERSION")
+-		// Skip the generation check when SyncDeployment just applied changes.
+-		// The generation gap is guaranteed immediately after an update (the API
+-		// server bumps Generation but ObservedGeneration lags until the deployment
+-		// controller processes it). Reporting Progressing=True for this sub-second
+-		// gap provides no signal and causes OTA invariant test failures during
+-		// upgrades. The next sync loop will check with depChanged=false and catch
+-		// any persistent gap. See https://issues.redhat.com/browse/OCPBUGS-93982
+-		if !depChanged {
+-			if err := checkDeploymentGenerationProgress(actualDeployment); err != nil {
+-				return err
+-			}
++		if err := checkDeploymentGenerationProgress(actualDeployment); err != nil {
++			return err
+ 		}
+ 
+ 		if co.versionGetter.GetVersions()["operator"] != version {
+@@ -313,7 +304,7 @@ func (co *consoleOperator) SyncDeployment(
+ 	proxyConfig *configv1.Proxy,
+ 	infrastructureConfig *configv1.Infrastructure,
+ 	recorder events.Recorder,
+-) (consoleDeployment *appsv1.Deployment, changed bool, reason string, err error) {
++) (consoleDeployment *appsv1.Deployment, reason string, err error) {
+ 	updatedOperatorConfig := operatorConfig.DeepCopy()
+ 	requiredDeployment := deploymentsub.DefaultDeployment(
+ 		operatorConfig,
+@@ -336,10 +327,9 @@ func (co *consoleOperator) SyncDeployment(
+ 	deploymentsub.LogDeploymentAnnotationChanges(co.deploymentClient, requiredDeployment, ctx)
+ 
+ 	var deployment *appsv1.Deployment
+-	var deploymentChanged bool
+ 	applyDepErr := controllersutil.RetryOnTransientError(func() error {
+ 		var e error
+-		deployment, deploymentChanged, e = resourceapply.ApplyDeployment(
++		deployment, _, e = resourceapply.ApplyDeployment(
+ 			ctx,
+ 			co.deploymentClient,
+ 			recorder,
+@@ -350,9 +340,9 @@ func (co *consoleOperator) SyncDeployment(
+ 	})
+ 
+ 	if applyDepErr != nil {
+-		return nil, false, "FailedApply", applyDepErr
++		return nil, "FailedApply", applyDepErr
+ 	}
+-	return deployment, deploymentChanged, "", nil
++	return deployment, "", nil
+ }
+ 
+ // apply configmap (needs route)
+diff --git a/pkg/console/operator/sync_v400_test.go b/pkg/console/operator/sync_v400_test.go
+index 5a4c2b9fc..985945f30 100644
+--- a/pkg/console/operator/sync_v400_test.go
++++ b/pkg/console/operator/sync_v400_test.go
+@@ -229,71 +229,6 @@ func TestGetNodeComputeEnvironments(t *testing.T) {
+ // report Progressing=True when the deployment controller has not yet processed
+ // a spec change (ObservedGeneration < Generation), NOT when replica counts
+ // fluctuate due to external disruptions like node reboots.
+-// TestDeploymentProgressingSkippedWhenChanged verifies the guard logic from
+-// OCPBUGS-93982: when SyncDeployment reports changed=true, the generation check
+-// is skipped because the operator itself caused the generation gap.
+-func TestDeploymentProgressingSkippedWhenChanged(t *testing.T) {
+-	tests := []struct {
+-		name               string
+-		depChanged         bool
+-		generation         int64
+-		observedGeneration int64
+-		wantProgressing    bool
+-	}{
+-		{
+-			name:               "changed=true with generation gap: skip check, not progressing",
+-			depChanged:         true,
+-			generation:         7,
+-			observedGeneration: 6,
+-			wantProgressing:    false,
+-		},
+-		{
+-			name:               "changed=false with generation gap: run check, progressing",
+-			depChanged:         false,
+-			generation:         7,
+-			observedGeneration: 6,
+-			wantProgressing:    true,
+-		},
+-		{
+-			name:               "changed=false with no generation gap: run check, not progressing",
+-			depChanged:         false,
+-			generation:         7,
+-			observedGeneration: 7,
+-			wantProgressing:    false,
+-		},
+-		{
+-			name:               "changed=true with no generation gap: skip check, not progressing",
+-			depChanged:         true,
+-			generation:         7,
+-			observedGeneration: 7,
+-			wantProgressing:    false,
+-		},
+-	}
+-
+-	for _, tt := range tests {
+-		t.Run(tt.name, func(t *testing.T) {
+-			deployment := &appsv1.Deployment{
+-				ObjectMeta: metav1.ObjectMeta{
+-					Generation: tt.generation,
+-				},
+-				Status: appsv1.DeploymentStatus{
+-					ObservedGeneration: tt.observedGeneration,
+-				},
+-			}
+-
+-			var progressingErr error
+-			if !tt.depChanged {
+-				progressingErr = checkDeploymentGenerationProgress(deployment)
+-			}
+-
+-			gotProgressing := progressingErr != nil
+-			if gotProgressing != tt.wantProgressing {
+-				t.Errorf("progressing = %v, want %v (err: %v)", gotProgressing, tt.wantProgressing, progressingErr)
+-			}
+-		})
+-	}
+-}
+-
+ func TestDeploymentProgressingByGeneration(t *testing.T) {
+ 	tests := []struct {
+ 		name               string

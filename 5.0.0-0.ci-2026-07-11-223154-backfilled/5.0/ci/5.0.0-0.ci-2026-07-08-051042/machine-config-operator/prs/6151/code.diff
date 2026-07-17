@@ -1,0 +1,868 @@
+diff --git a/cmd/machine-config-operator/start.go b/cmd/machine-config-operator/start.go
+index bdf9a5adb5..b9ea06f953 100644
+--- a/cmd/machine-config-operator/start.go
++++ b/cmd/machine-config-operator/start.go
+@@ -120,6 +120,7 @@ func runStartCmd(_ *cobra.Command, _ []string) {
+ 			ctrlctx.ConfigInformerFactory.Config().V1().ClusterVersions(),
+ 			ctrlctx.InformerFactory.Machineconfiguration().V1().OSImageStreams(),
+ 			iriInformer,
++			ctrlctx.KubeNamespacedInformerFactory.Networking().V1().NetworkPolicies(),
+ 			ctrlctx,
+ 		)
+ 
+diff --git a/manifests/machineconfigcontroller/networkpolicy-deletion-guard-validatingadmissionpolicy.yaml b/manifests/machineconfigcontroller/networkpolicy-deletion-guard-validatingadmissionpolicy.yaml
+new file mode 100644
+index 0000000000..40ce695284
+--- /dev/null
++++ b/manifests/machineconfigcontroller/networkpolicy-deletion-guard-validatingadmissionpolicy.yaml
+@@ -0,0 +1,21 @@
++apiVersion: admissionregistration.k8s.io/v1
++kind: ValidatingAdmissionPolicy
++metadata:
++  name: "networkpolicy-prevent-deletion"
++spec:
++  failurePolicy: Fail
++  matchConstraints:
++    matchPolicy: Equivalent
++    namespaceSelector:
++      matchLabels:
++        kubernetes.io/metadata.name: openshift-machine-config-operator
++    objectSelector: {}
++    resourceRules:
++    - apiGroups:   ["networking.k8s.io"]
++      apiVersions: ["v1"]
++      operations:  ["DELETE"]
++      resources:   ["networkpolicies"]
++      scope: "Namespaced"
++  validations:
++    - expression: "!(oldObject.metadata.name in ['default-deny', 'allow-all-egress', 'allow-machine-config-operator', 'allow-machine-config-controller', 'allow-machine-os-builder'])"
++      message: "Deletion of MCO-managed NetworkPolicy resources in the openshift-machine-config-operator namespace is not allowed"
+diff --git a/manifests/machineconfigcontroller/networkpolicy-deletion-guard-validatingadmissionpolicybinding.yaml b/manifests/machineconfigcontroller/networkpolicy-deletion-guard-validatingadmissionpolicybinding.yaml
+new file mode 100644
+index 0000000000..81975ebe45
+--- /dev/null
++++ b/manifests/machineconfigcontroller/networkpolicy-deletion-guard-validatingadmissionpolicybinding.yaml
+@@ -0,0 +1,7 @@
++apiVersion: admissionregistration.k8s.io/v1
++kind: ValidatingAdmissionPolicyBinding
++metadata:
++  name: "networkpolicy-prevent-deletion-binding"
++spec:
++  policyName: "networkpolicy-prevent-deletion"
++  validationActions: [Deny]
+diff --git a/manifests/machineconfigcontroller/networkpolicy-update-guard-validatingadmissionpolicy.yaml b/manifests/machineconfigcontroller/networkpolicy-update-guard-validatingadmissionpolicy.yaml
+new file mode 100644
+index 0000000000..5aa6549ba2
+--- /dev/null
++++ b/manifests/machineconfigcontroller/networkpolicy-update-guard-validatingadmissionpolicy.yaml
+@@ -0,0 +1,24 @@
++apiVersion: admissionregistration.k8s.io/v1
++kind: ValidatingAdmissionPolicy
++metadata:
++  name: "networkpolicy-prevent-update"
++spec:
++  failurePolicy: Fail
++  matchConstraints:
++    matchPolicy: Equivalent
++    namespaceSelector:
++      matchLabels:
++        kubernetes.io/metadata.name: openshift-machine-config-operator
++    objectSelector: {}
++    resourceRules:
++    - apiGroups:   ["networking.k8s.io"]
++      apiVersions: ["v1"]
++      operations:  ["UPDATE"]
++      resources:   ["networkpolicies"]
++      scope: "Namespaced"
++  matchConditions:
++    - name: "exclude-mco-service-account"
++      expression: "request.userInfo.username != 'system:serviceaccount:openshift-machine-config-operator:machine-config-operator'"
++  validations:
++    - expression: "!(object.metadata.name in ['default-deny', 'allow-all-egress', 'allow-machine-config-operator', 'allow-machine-config-controller', 'allow-machine-os-builder'])"
++      message: "Modification of MCO-managed NetworkPolicy resources in the openshift-machine-config-operator namespace is not allowed"
+diff --git a/manifests/machineconfigcontroller/networkpolicy-update-guard-validatingadmissionpolicybinding.yaml b/manifests/machineconfigcontroller/networkpolicy-update-guard-validatingadmissionpolicybinding.yaml
+new file mode 100644
+index 0000000000..e682cc0a83
+--- /dev/null
++++ b/manifests/machineconfigcontroller/networkpolicy-update-guard-validatingadmissionpolicybinding.yaml
+@@ -0,0 +1,7 @@
++apiVersion: admissionregistration.k8s.io/v1
++kind: ValidatingAdmissionPolicyBinding
++metadata:
++  name: "networkpolicy-prevent-update-binding"
++spec:
++  policyName: "networkpolicy-prevent-update"
++  validationActions: [Deny]
+diff --git a/pkg/operator/network_policy.go b/pkg/operator/network_policy.go
+new file mode 100644
+index 0000000000..b9e8d60e9e
+--- /dev/null
++++ b/pkg/operator/network_policy.go
+@@ -0,0 +1,176 @@
++package operator
++
++import (
++	"context"
++
++	configv1 "github.com/openshift/api/config/v1"
++	ctrlcommon "github.com/openshift/machine-config-operator/pkg/controller/common"
++	corev1 "k8s.io/api/core/v1"
++	networkingv1 "k8s.io/api/networking/v1"
++	"k8s.io/apimachinery/pkg/api/equality"
++	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
++	"k8s.io/apimachinery/pkg/types"
++	"k8s.io/apimachinery/pkg/util/intstr"
++	metav1ac "k8s.io/client-go/applyconfigurations/meta/v1"
++	networkingv1ac "k8s.io/client-go/applyconfigurations/networking/v1"
++	"k8s.io/utils/ptr"
++)
++
++const networkPolicyFieldManager = "machine-config-operator"
++
++// defaultDenyPatchBody returns a raw JSON SSA patch for the default-deny policy.
++// We use a raw patch instead of the typed Apply because the apply-config types
++// tag Ingress/Egress with omitempty, and Go's json.Marshal drops empty slices
++// with omitempty. Without explicit "ingress": [] and "egress": [] in the payload,
++// SSA never claims ownership of those fields and cannot revert externally-added rules.
++func defaultDenyPatchBody() []byte {
++	return []byte(`{
++		"apiVersion": "networking.k8s.io/v1",
++		"kind": "NetworkPolicy",
++		"metadata": {"name": "default-deny"},
++		"spec": {
++			"podSelector": {},
++			"ingress": [],
++			"egress": [],
++			"policyTypes": ["Ingress", "Egress"]
++		}
++	}`)
++}
++
++// allowAllEgressNetworkPolicy allows all egress for every pod in the namespace.
++// This covers the operator, controller, machine-os-builder, and ephemeral
++// builder pods (which lack a k8s-app label) that need DNS and registry access.
++func allowAllEgressNetworkPolicy(namespace string) *networkingv1ac.NetworkPolicyApplyConfiguration {
++	return networkingv1ac.NetworkPolicy("allow-all-egress", namespace).
++		WithSpec(networkingv1ac.NetworkPolicySpec().
++			WithPodSelector(metav1ac.LabelSelector()).
++			WithEgress(networkingv1ac.NetworkPolicyEgressRule()).
++			WithPolicyTypes(networkingv1.PolicyTypeEgress))
++}
++
++func allowMCONetworkPolicy(namespace string) *networkingv1ac.NetworkPolicyApplyConfiguration {
++	return networkingv1ac.NetworkPolicy("allow-machine-config-operator", namespace).
++		WithSpec(networkingv1ac.NetworkPolicySpec().
++			WithPodSelector(metav1ac.LabelSelector().
++				WithMatchLabels(map[string]string{"k8s-app": "machine-config-operator"})).
++			WithIngress(networkingv1ac.NetworkPolicyIngressRule().
++				WithPorts(networkingv1ac.NetworkPolicyPort().
++					WithProtocol(corev1.ProtocolTCP).
++					WithPort(intstr.FromInt32(9001)))).
++			WithPolicyTypes(networkingv1.PolicyTypeIngress))
++}
++
++func allowMCCNetworkPolicy(namespace string) *networkingv1ac.NetworkPolicyApplyConfiguration {
++	return networkingv1ac.NetworkPolicy("allow-machine-config-controller", namespace).
++		WithSpec(networkingv1ac.NetworkPolicySpec().
++			WithPodSelector(metav1ac.LabelSelector().
++				WithMatchLabels(map[string]string{"k8s-app": "machine-config-controller"})).
++			WithIngress(networkingv1ac.NetworkPolicyIngressRule().
++				WithPorts(networkingv1ac.NetworkPolicyPort().
++					WithProtocol(corev1.ProtocolTCP).
++					WithPort(intstr.FromInt32(9001)))).
++			WithPolicyTypes(networkingv1.PolicyTypeIngress))
++}
++
++func allowMOBNetworkPolicy(namespace string) *networkingv1ac.NetworkPolicyApplyConfiguration {
++	return networkingv1ac.NetworkPolicy("allow-machine-os-builder", namespace).
++		WithSpec(networkingv1ac.NetworkPolicySpec().
++			WithPodSelector(metav1ac.LabelSelector().
++				WithMatchLabels(map[string]string{"k8s-app": "machine-os-builder"})).
++			WithIngress(networkingv1ac.NetworkPolicyIngressRule().
++				WithPorts(networkingv1ac.NetworkPolicyPort().
++					WithProtocol(corev1.ProtocolTCP).
++					WithPort(intstr.FromInt32(9001)))).
++			WithPolicyTypes(networkingv1.PolicyTypeIngress))
++}
++
++// desiredNetworkPolicySpec returns the expected spec for each managed policy
++// so we can compare against the lister's cached copy before making API calls.
++func desiredNetworkPolicySpec(name string) networkingv1.NetworkPolicySpec {
++	switch name {
++	case "default-deny":
++		return networkingv1.NetworkPolicySpec{
++			PodSelector: metav1.LabelSelector{},
++			PolicyTypes: []networkingv1.PolicyType{networkingv1.PolicyTypeIngress, networkingv1.PolicyTypeEgress},
++		}
++	case "allow-all-egress":
++		return networkingv1.NetworkPolicySpec{
++			PodSelector: metav1.LabelSelector{},
++			Egress:      []networkingv1.NetworkPolicyEgressRule{{}},
++			PolicyTypes: []networkingv1.PolicyType{networkingv1.PolicyTypeEgress},
++		}
++	case "allow-machine-config-operator":
++		return allowPolicySpec("machine-config-operator")
++	case "allow-machine-config-controller":
++		return allowPolicySpec("machine-config-controller")
++	case "allow-machine-os-builder":
++		return allowPolicySpec("machine-os-builder")
++	default:
++		return networkingv1.NetworkPolicySpec{}
++	}
++}
++
++func allowPolicySpec(app string) networkingv1.NetworkPolicySpec {
++	return networkingv1.NetworkPolicySpec{
++		PodSelector: metav1.LabelSelector{MatchLabels: map[string]string{"k8s-app": app}},
++		Ingress: []networkingv1.NetworkPolicyIngressRule{{
++			Ports: []networkingv1.NetworkPolicyPort{{
++				Protocol: ptr.To(corev1.ProtocolTCP),
++				Port:     ptr.To(intstr.FromInt32(9001)),
++			}},
++		}},
++		PolicyTypes: []networkingv1.PolicyType{networkingv1.PolicyTypeIngress},
++	}
++}
++
++// networkPolicyMatchesDesired checks the informer cache for an existing policy
++// and returns true if its spec already matches the desired state. This avoids
++// unnecessary API round-trips when nothing has changed.
++func (optr *Operator) networkPolicyMatchesDesired(name, namespace string) bool {
++	if optr.networkPolicyLister == nil {
++		return false
++	}
++	existing, err := optr.networkPolicyLister.NetworkPolicies(namespace).Get(name)
++	if err != nil {
++		return false
++	}
++	return equality.Semantic.DeepEqual(existing.Spec, desiredNetworkPolicySpec(name))
++}
++
++func (optr *Operator) syncNetworkPolicies(_ *renderConfig, _ *configv1.ClusterOperator) error {
++	ctx := context.TODO()
++	ns := ctrlcommon.MCONamespace
++
++	// Apply allow rules before default-deny so that traffic is never blocked
++	// during the window between sequential resource applies.
++	applyOpts := metav1.ApplyOptions{FieldManager: networkPolicyFieldManager, Force: true}
++	policies := []*networkingv1ac.NetworkPolicyApplyConfiguration{
++		allowAllEgressNetworkPolicy(ns),
++		allowMCONetworkPolicy(ns),
++		allowMCCNetworkPolicy(ns),
++		allowMOBNetworkPolicy(ns),
++	}
++
++	for _, policy := range policies {
++		name := *policy.Name
++		if optr.networkPolicyMatchesDesired(name, ns) {
++			continue
++		}
++		if _, err := optr.kubeClient.NetworkingV1().NetworkPolicies(ns).Apply(ctx, policy, applyOpts); err != nil {
++			return err
++		}
++	}
++
++	// Apply default-deny last via raw patch so empty ingress/egress slices are
++	// preserved in the payload and SSA claims ownership of those fields.
++	if !optr.networkPolicyMatchesDesired("default-deny", ns) {
++		patchOpts := metav1.PatchOptions{FieldManager: networkPolicyFieldManager, Force: ptr.To(true)}
++		if _, err := optr.kubeClient.NetworkingV1().NetworkPolicies(ns).Patch(
++			ctx, "default-deny", types.ApplyPatchType, defaultDenyPatchBody(), patchOpts,
++		); err != nil {
++			return err
++		}
++	}
++
++	return nil
++}
+diff --git a/pkg/operator/network_policy_test.go b/pkg/operator/network_policy_test.go
+new file mode 100644
+index 0000000000..58536d1c5d
+--- /dev/null
++++ b/pkg/operator/network_policy_test.go
+@@ -0,0 +1,177 @@
++package operator
++
++import (
++	"context"
++	"testing"
++
++	"github.com/openshift/library-go/pkg/operator/events"
++	ctrlcommon "github.com/openshift/machine-config-operator/pkg/controller/common"
++	"github.com/stretchr/testify/assert"
++	"github.com/stretchr/testify/require"
++	networkingv1 "k8s.io/api/networking/v1"
++	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
++	"k8s.io/client-go/kubernetes/fake"
++	"k8s.io/utils/clock"
++)
++
++func testRenderConfig() *renderConfig {
++	return &renderConfig{
++		TargetNamespace: ctrlcommon.MCONamespace,
++	}
++}
++
++func testOperatorForNetworkPolicies(t *testing.T) *Operator {
++	t.Helper()
++
++	kubeClient := fake.NewClientset()
++
++	return &Operator{
++		kubeClient:    kubeClient,
++		libgoRecorder: events.NewInMemoryRecorder("test-operator", clock.RealClock{}),
++	}
++}
++
++func listNetworkPolicies(t *testing.T, optr *Operator) []networkingv1.NetworkPolicy {
++	t.Helper()
++	npList, err := optr.kubeClient.NetworkingV1().NetworkPolicies(ctrlcommon.MCONamespace).List(context.TODO(), metav1.ListOptions{})
++	require.NoError(t, err)
++	return npList.Items
++}
++
++func findPolicy(policies []networkingv1.NetworkPolicy, name string) *networkingv1.NetworkPolicy {
++	for i := range policies {
++		if policies[i].Name == name {
++			return &policies[i]
++		}
++	}
++	return nil
++}
++
++func TestSyncNetworkPolicies_StaticPoliciesCreated(t *testing.T) {
++	optr := testOperatorForNetworkPolicies(t)
++	config := testRenderConfig()
++
++	err := optr.syncNetworkPolicies(config, nil)
++	require.NoError(t, err)
++
++	policies := listNetworkPolicies(t, optr)
++	names := make([]string, len(policies))
++	for i, p := range policies {
++		names[i] = p.Name
++	}
++
++	assert.Contains(t, names, "default-deny", "expected default-deny policy")
++	assert.Contains(t, names, "allow-all-egress", "expected allow-all-egress policy")
++	assert.Contains(t, names, "allow-machine-config-operator", "expected allow-machine-config-operator policy")
++	assert.Contains(t, names, "allow-machine-config-controller", "expected allow-machine-config-controller policy")
++	assert.Contains(t, names, "allow-machine-os-builder", "expected allow-machine-os-builder policy")
++}
++
++func TestSyncNetworkPolicies_DefaultDenySpec(t *testing.T) {
++	optr := testOperatorForNetworkPolicies(t)
++	config := testRenderConfig()
++
++	err := optr.syncNetworkPolicies(config, nil)
++	require.NoError(t, err)
++
++	policies := listNetworkPolicies(t, optr)
++	denyPolicy := findPolicy(policies, "default-deny")
++	require.NotNil(t, denyPolicy, "default-deny policy must exist")
++
++	assert.Empty(t, denyPolicy.Spec.PodSelector.MatchLabels, "default-deny should select all pods with empty selector")
++	assert.Contains(t, denyPolicy.Spec.PolicyTypes, networkingv1.PolicyTypeIngress, "default-deny must include Ingress policy type")
++	assert.Contains(t, denyPolicy.Spec.PolicyTypes, networkingv1.PolicyTypeEgress, "default-deny must include Egress policy type")
++	assert.Empty(t, denyPolicy.Spec.Ingress, "default-deny should have no ingress rules")
++	assert.Empty(t, denyPolicy.Spec.Egress, "default-deny should have no egress rules")
++}
++
++func TestSyncNetworkPolicies_AllowAllEgressSpec(t *testing.T) {
++	optr := testOperatorForNetworkPolicies(t)
++	config := testRenderConfig()
++
++	err := optr.syncNetworkPolicies(config, nil)
++	require.NoError(t, err)
++
++	policies := listNetworkPolicies(t, optr)
++	egressPolicy := findPolicy(policies, "allow-all-egress")
++	require.NotNil(t, egressPolicy, "allow-all-egress policy must exist")
++
++	assert.Empty(t, egressPolicy.Spec.PodSelector.MatchLabels, "allow-all-egress should select all pods with empty selector")
++	assert.Contains(t, egressPolicy.Spec.PolicyTypes, networkingv1.PolicyTypeEgress)
++	assert.NotContains(t, egressPolicy.Spec.PolicyTypes, networkingv1.PolicyTypeIngress, "allow-all-egress should not set Ingress policy type")
++	require.Len(t, egressPolicy.Spec.Egress, 1, "should have one egress rule (allow all)")
++	assert.Empty(t, egressPolicy.Spec.Egress[0].Ports, "egress rule should allow all ports")
++	assert.Empty(t, egressPolicy.Spec.Egress[0].To, "egress rule should allow all destinations")
++}
++
++func TestSyncNetworkPolicies_AllowPolicySpecs(t *testing.T) {
++	optr := testOperatorForNetworkPolicies(t)
++	config := testRenderConfig()
++
++	err := optr.syncNetworkPolicies(config, nil)
++	require.NoError(t, err)
++
++	policies := listNetworkPolicies(t, optr)
++
++	cases := []struct {
++		name        string
++		labelKey    string
++		labelVal    string
++		metricsPort int32
++	}{
++		{"allow-machine-config-operator", "k8s-app", "machine-config-operator", 9001},
++		{"allow-machine-config-controller", "k8s-app", "machine-config-controller", 9001},
++		{"allow-machine-os-builder", "k8s-app", "machine-os-builder", 9001},
++	}
++	for _, tc := range cases {
++		t.Run(tc.name, func(t *testing.T) {
++			policy := findPolicy(policies, tc.name)
++			require.NotNil(t, policy, "policy %s must exist", tc.name)
++
++			assert.Equal(t, tc.labelVal, policy.Spec.PodSelector.MatchLabels[tc.labelKey],
++				"podSelector should match %s=%s", tc.labelKey, tc.labelVal)
++			assert.Contains(t, policy.Spec.PolicyTypes, networkingv1.PolicyTypeIngress)
++			assert.NotContains(t, policy.Spec.PolicyTypes, networkingv1.PolicyTypeEgress, "ingress-only allow policies should not set Egress policy type")
++
++			assert.Empty(t, policy.Spec.Egress, "ingress-only allow policies should have no egress rules")
++
++			require.Len(t, policy.Spec.Ingress, 1, "should have one ingress rule")
++			require.Len(t, policy.Spec.Ingress[0].Ports, 1, "ingress rule should have one port")
++			assert.Equal(t, tc.metricsPort, policy.Spec.Ingress[0].Ports[0].Port.IntVal, "ingress port should be metrics port")
++			assert.Empty(t, policy.Spec.Ingress[0].From, "ingress should not restrict source (kube-rbac-proxy handles auth)")
++		})
++	}
++}
++
++func TestSyncNetworkPolicies_MOBPolicyAlwaysCreated(t *testing.T) {
++	optr := testOperatorForNetworkPolicies(t)
++	config := testRenderConfig()
++
++	err := optr.syncNetworkPolicies(config, nil)
++	require.NoError(t, err)
++
++	policies := listNetworkPolicies(t, optr)
++	mobPolicy := findPolicy(policies, "allow-machine-os-builder")
++	require.NotNil(t, mobPolicy, "MOB policy should always be created even without layered pools")
++
++	assert.Equal(t, "machine-os-builder", mobPolicy.Spec.PodSelector.MatchLabels["k8s-app"])
++	assert.Empty(t, mobPolicy.Spec.Egress, "MOB ingress-only policy should have no egress rules")
++	require.Len(t, mobPolicy.Spec.Ingress, 1, "MOB should have one ingress rule")
++}
++
++func TestSyncNetworkPolicies_Idempotent(t *testing.T) {
++	optr := testOperatorForNetworkPolicies(t)
++	config := testRenderConfig()
++
++	err := optr.syncNetworkPolicies(config, nil)
++	require.NoError(t, err)
++
++	policiesBefore := listNetworkPolicies(t, optr)
++
++	err = optr.syncNetworkPolicies(config, nil)
++	require.NoError(t, err)
++
++	policiesAfter := listNetworkPolicies(t, optr)
++	assert.Len(t, policiesAfter, len(policiesBefore), "re-sync should produce the same number of policies")
++}
++
+diff --git a/pkg/operator/operator.go b/pkg/operator/operator.go
+index d512cbd8d3..4ae1a7c682 100644
+--- a/pkg/operator/operator.go
++++ b/pkg/operator/operator.go
+@@ -26,11 +26,13 @@ import (
+ 	"k8s.io/apimachinery/pkg/util/wait"
+ 	appsinformersv1 "k8s.io/client-go/informers/apps/v1"
+ 	coreinformersv1 "k8s.io/client-go/informers/core/v1"
++	networkinginformersv1 "k8s.io/client-go/informers/networking/v1"
+ 	rbacinformersv1 "k8s.io/client-go/informers/rbac/v1"
+ 	"k8s.io/client-go/kubernetes"
+ 	coreclientsetv1 "k8s.io/client-go/kubernetes/typed/core/v1"
+ 	appslisterv1 "k8s.io/client-go/listers/apps/v1"
+ 	corelisterv1 "k8s.io/client-go/listers/core/v1"
++	networkinglistersv1 "k8s.io/client-go/listers/networking/v1"
+ 
+ 	"k8s.io/apimachinery/pkg/runtime/schema"
+ 	"k8s.io/client-go/dynamic"
+@@ -128,6 +130,7 @@ type Operator struct {
+ 	clusterVersionLister     configlistersv1.ClusterVersionLister
+ 	osImageStreamLister      mcfglistersv1.OSImageStreamLister
+ 	iriLister                mcfglistersv1alpha1.InternalReleaseImageLister
++	networkPolicyLister      networkinglistersv1.NetworkPolicyLister
+ 	provisioningLister       dynamiclister.Lister
+ 	provisioningListerSynced cache.InformerSynced
+ 
+@@ -168,6 +171,7 @@ type Operator struct {
+ 	apiserverListerSynced            cache.InformerSynced
+ 	osImageStreamListerSynced        cache.InformerSynced
+ 	iriListerSynced                  cache.InformerSynced
++	networkPolicyInformerSynced      cache.InformerSynced
+ 
+ 	// queue only ever has one item, but it has nice error handling backoff/retry semantics
+ 	queue workqueue.TypedRateLimitingInterface[string]
+@@ -229,6 +233,7 @@ func New(
+ 	clusterVersionInformer configinformersv1.ClusterVersionInformer,
+ 	osImageStreamInformer mcfginformersv1.OSImageStreamInformer,
+ 	iriInformer mcfginformersv1alpha1.InternalReleaseImageInformer,
++	networkPolicyInformer networkinginformersv1.NetworkPolicyInformer,
+ 	ctrlctx *ctrlcommon.ControllerContext,
+ ) *Operator {
+ 	eventBroadcaster := record.NewBroadcaster()
+@@ -301,6 +306,7 @@ func New(
+ 		clusterOperatorInformer.Informer(),
+ 		apiserverInformer.Informer(),
+ 		moscInformer.Informer(),
++		networkPolicyInformer.Informer(),
+ 	}
+ 	for _, i := range informers {
+ 		i.AddEventHandler(optr.eventHandler())
+@@ -377,6 +383,8 @@ func New(
+ 	optr.apiserverListerSynced = apiserverInformer.Informer().HasSynced
+ 	optr.moscLister = moscInformer.Lister()
+ 	optr.moscListerSynced = moscInformer.Informer().HasSynced
++	optr.networkPolicyLister = networkPolicyInformer.Lister()
++	optr.networkPolicyInformerSynced = networkPolicyInformer.Informer().HasSynced
+ 	optr.clusterVersionLister = clusterVersionInformer.Lister()
+ 	if osImageStreamInformer != nil && osimagestream.IsFeatureEnabled(optr.fgHandler) {
+ 		optr.osImageStreamLister = osImageStreamInformer.Lister()
+@@ -464,6 +472,7 @@ func (optr *Operator) Run(workers int, stopCh <-chan struct{}) {
+ 		optr.crcListerSynced,
+ 		optr.nodeClusterListerSynced,
+ 		optr.moscListerSynced,
++		optr.networkPolicyInformerSynced,
+ 	}
+ 	if optr.osImageStreamListerSynced != nil && osimagestream.IsFeatureEnabled(optr.fgHandler) {
+ 		cacheSynced = append(cacheSynced, optr.osImageStreamListerSynced)
+@@ -618,6 +627,7 @@ func (optr *Operator) sync(key string) error {
+ 		{"MachineConfiguration", optr.syncMachineConfiguration},
+ 		{"MachineConfigNode", optr.syncMachineConfigNodes},
+ 		{"MachineConfigPools", optr.syncMachineConfigPools},
++		{"NetworkPolicies", optr.syncNetworkPolicies},
+ 		{"MachineConfigDaemon", optr.syncMachineConfigDaemon},
+ 		{"MachineConfigController", optr.syncMachineConfigController},
+ 		{"MachineConfigServer", optr.syncMachineConfigServer},
+diff --git a/pkg/operator/sync.go b/pkg/operator/sync.go
+index 5eeda92e0c..19b4017163 100644
+--- a/pkg/operator/sync.go
++++ b/pkg/operator/sync.go
+@@ -113,6 +113,10 @@ const (
+ 	mccOSImageStreamDeletionGuardValidatingAdmissionPolicyBindingPath     = "manifests/machineconfigcontroller/osimagestream-deletion-guard-validatingadmissionpolicybinding.yaml"
+ 	mccIRIDeletionGuardValidatingAdmissionPolicyPath                      = "manifests/machineconfigcontroller/internalreleaseimage-deletion-guard-validatingadmissionpolicy.yaml"
+ 	mccIRIDeletionGuardValidatingAdmissionPolicyBindingPath               = "manifests/machineconfigcontroller/internalreleaseimage-deletion-guard-validatingadmissionpolicybinding.yaml"
++	mccNetworkPolicyDeletionGuardValidatingAdmissionPolicyPath            = "manifests/machineconfigcontroller/networkpolicy-deletion-guard-validatingadmissionpolicy.yaml"
++	mccNetworkPolicyDeletionGuardValidatingAdmissionPolicyBindingPath     = "manifests/machineconfigcontroller/networkpolicy-deletion-guard-validatingadmissionpolicybinding.yaml"
++	mccNetworkPolicyUpdateGuardValidatingAdmissionPolicyPath              = "manifests/machineconfigcontroller/networkpolicy-update-guard-validatingadmissionpolicy.yaml"
++	mccNetworkPolicyUpdateGuardValidatingAdmissionPolicyBindingPath       = "manifests/machineconfigcontroller/networkpolicy-update-guard-validatingadmissionpolicybinding.yaml"
+ 	mccUpdateBootImagesCPMSValidatingAdmissionPolicyPath                  = "manifests/machineconfigcontroller/update-bootimages-cpms-validatingadmissionpolicy.yaml"
+ 	mccUpdateBootImagesCPMSValidatingAdmissionPolicyBindingPath           = "manifests/machineconfigcontroller/update-bootimages-cpms-validatingadmissionpolicybinding.yaml"
+ 
+@@ -1210,11 +1214,15 @@ func (optr *Operator) syncMachineConfigController(config *renderConfig, _ *confi
+ 			mccMachineConfigurationGuardsValidatingAdmissionPolicyPath,
+ 			mccUpdateBootImagesValidatingAdmissionPolicyPath,
+ 			mccMachineConfigPoolSelectorValidatingAdmissionPolicyPath,
++			mccNetworkPolicyDeletionGuardValidatingAdmissionPolicyPath,
++			mccNetworkPolicyUpdateGuardValidatingAdmissionPolicyPath,
+ 		},
+ 		validatingAdmissionPolicyBindings: []string{
+ 			mccMachineConfigurationGuardsValidatingAdmissionPolicyBindingPath,
+ 			mccUpdateBootImagesValidatingAdmissionPolicyBindingPath,
+ 			mccMachineConfigPoolSelectorValidatingAdmissionPolicyBindingPath,
++			mccNetworkPolicyDeletionGuardValidatingAdmissionPolicyBindingPath,
++			mccNetworkPolicyUpdateGuardValidatingAdmissionPolicyBindingPath,
+ 		},
+ 	}
+ 
+diff --git a/test/e2e-2of2/network_policy_test.go b/test/e2e-2of2/network_policy_test.go
+new file mode 100644
+index 0000000000..7f38039415
+--- /dev/null
++++ b/test/e2e-2of2/network_policy_test.go
+@@ -0,0 +1,296 @@
++package e2e_2of2_test
++
++import (
++	"context"
++	"testing"
++	"time"
++
++	"github.com/stretchr/testify/assert"
++	"github.com/stretchr/testify/require"
++	configv1 "github.com/openshift/api/config/v1"
++	corev1 "k8s.io/api/core/v1"
++	networkingv1 "k8s.io/api/networking/v1"
++	k8serrors "k8s.io/apimachinery/pkg/api/errors"
++	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
++	"k8s.io/apimachinery/pkg/util/intstr"
++	"k8s.io/apimachinery/pkg/util/wait"
++
++	ctrlcommon "github.com/openshift/machine-config-operator/pkg/controller/common"
++	"github.com/openshift/machine-config-operator/test/framework"
++)
++
++const (
++	networkPolicySyncPollInterval = 5 * time.Second
++	networkPolicySyncPollTimeout  = 2 * time.Minute
++)
++
++var staticPolicyNames = []string{
++	"default-deny",
++	"allow-all-egress",
++	"allow-machine-config-operator",
++	"allow-machine-config-controller",
++	"allow-machine-os-builder",
++}
++
++func skipIfNoNetworkPolicies(t *testing.T) {
++	t.Helper()
++	cs := framework.NewClientSet("")
++	policies, err := cs.GetKubeclient().NetworkingV1().NetworkPolicies(ctrlcommon.MCONamespace).List(
++		context.Background(), metav1.ListOptions{})
++	require.NoError(t, err)
++	require.NotEmpty(t, policies.Items, "expected at least one NetworkPolicy in MCO namespace")
++}
++
++func TestNetworkPolicies_DefaultPoliciesExist(t *testing.T) {
++	skipIfNoNetworkPolicies(t)
++
++	cs := framework.NewClientSet("")
++	ctx := context.Background()
++	ns := ctrlcommon.MCONamespace
++
++	policies, err := cs.GetKubeclient().NetworkingV1().NetworkPolicies(ns).List(ctx, metav1.ListOptions{})
++	require.NoError(t, err)
++
++	policyMap := make(map[string]*networkingv1.NetworkPolicy)
++	for i := range policies.Items {
++		policyMap[policies.Items[i].Name] = &policies.Items[i]
++	}
++
++	for _, name := range staticPolicyNames {
++		assert.Contains(t, policyMap, name, "expected policy %s to exist", name)
++	}
++
++	deny := policyMap["default-deny"]
++	if deny != nil {
++		assert.Empty(t, deny.Spec.PodSelector.MatchLabels, "default-deny should select all pods")
++		assert.Contains(t, deny.Spec.PolicyTypes, networkingv1.PolicyTypeIngress)
++		assert.Contains(t, deny.Spec.PolicyTypes, networkingv1.PolicyTypeEgress)
++		assert.Empty(t, deny.Spec.Ingress, "default-deny should have no ingress rules")
++		assert.Empty(t, deny.Spec.Egress, "default-deny should have no egress rules")
++	}
++
++	// Verify allow-all-egress policy covers all pods
++	egressPolicy := policyMap["allow-all-egress"]
++	if egressPolicy != nil {
++		assert.Empty(t, egressPolicy.Spec.PodSelector.MatchLabels, "allow-all-egress should select all pods")
++		assert.Contains(t, egressPolicy.Spec.PolicyTypes, networkingv1.PolicyTypeEgress)
++		require.NotEmpty(t, egressPolicy.Spec.Egress, "allow-all-egress should have egress rules")
++	}
++
++	// Verify per-component ingress-only allow policies
++	for _, tc := range []struct {
++		name     string
++		labelVal string
++	}{
++		{"allow-machine-config-operator", "machine-config-operator"},
++		{"allow-machine-config-controller", "machine-config-controller"},
++		{"allow-machine-os-builder", "machine-os-builder"},
++	} {
++		policy := policyMap[tc.name]
++		if policy == nil {
++			continue
++		}
++
++		assert.Equal(t, tc.labelVal, policy.Spec.PodSelector.MatchLabels["k8s-app"],
++			"%s: podSelector should match k8s-app=%s", tc.name, tc.labelVal)
++		assert.Contains(t, policy.Spec.PolicyTypes, networkingv1.PolicyTypeIngress)
++
++		require.NotEmpty(t, policy.Spec.Ingress, "%s: should have ingress rules", tc.name)
++		require.NotEmpty(t, policy.Spec.Ingress[0].Ports, "%s: ingress should have ports", tc.name)
++		assert.Equal(t, int32(9001), policy.Spec.Ingress[0].Ports[0].Port.IntVal,
++			"%s: ingress port should be 9001", tc.name)
++		assert.Equal(t, corev1.ProtocolTCP, *policy.Spec.Ingress[0].Ports[0].Protocol,
++			"%s: ingress protocol should be TCP", tc.name)
++	}
++}
++
++func TestNetworkPolicies_DeletionBlocked(t *testing.T) {
++	skipIfNoNetworkPolicies(t)
++
++	cs := framework.NewClientSet("")
++	ctx := context.Background()
++	ns := ctrlcommon.MCONamespace
++	npClient := cs.GetKubeclient().NetworkingV1().NetworkPolicies(ns)
++
++	for _, name := range staticPolicyNames {
++		err := npClient.Delete(ctx, name, metav1.DeleteOptions{})
++		require.Error(t, err, "deleting managed policy %s should be blocked", name)
++		require.True(t, k8serrors.IsInvalid(err),
++			"error should be Invalid (422) from ValidatingAdmissionPolicy, got: %v", err)
++		require.Contains(t, err.Error(), "MCO-managed NetworkPolicy",
++			"error message should indicate the policy is MCO-managed")
++	}
++
++	// Verify all policies still exist after blocked deletion attempts
++	policies, err := npClient.List(ctx, metav1.ListOptions{})
++	require.NoError(t, err)
++
++	policyNames := make(map[string]bool)
++	for _, p := range policies.Items {
++		policyNames[p.Name] = true
++	}
++	for _, expected := range staticPolicyNames {
++		assert.True(t, policyNames[expected], "policy %s should still exist after blocked deletion", expected)
++	}
++}
++
++func TestNetworkPolicies_UpdateBlocked(t *testing.T) {
++	skipIfNoNetworkPolicies(t)
++
++	cs := framework.NewClientSet("")
++	ctx := context.Background()
++	ns := ctrlcommon.MCONamespace
++	npClient := cs.GetKubeclient().NetworkingV1().NetworkPolicies(ns)
++
++	for _, name := range staticPolicyNames {
++		policy, err := npClient.Get(ctx, name, metav1.GetOptions{})
++		require.NoError(t, err, "should be able to get policy %s", name)
++
++		if policy.Labels == nil {
++			policy.Labels = make(map[string]string)
++		}
++		policy.Labels["test-modification"] = "should-be-blocked"
++		_, err = npClient.Update(ctx, policy, metav1.UpdateOptions{})
++		require.Error(t, err, "updating managed policy %s should be blocked", name)
++		require.True(t, k8serrors.IsInvalid(err),
++			"error should be Invalid (422) from ValidatingAdmissionPolicy, got: %v", err)
++		require.Contains(t, err.Error(), "MCO-managed NetworkPolicy",
++			"error message should indicate the policy is MCO-managed")
++	}
++}
++
++func TestNetworkPolicies_MCOProcessesContinueWorking(t *testing.T) {
++	skipIfNoNetworkPolicies(t)
++
++	cs := framework.NewClientSet("")
++	ctx := context.Background()
++	ns := ctrlcommon.MCONamespace
++
++	co, err := cs.ClusterOperators().Get(ctx, "machine-config", metav1.GetOptions{})
++	require.NoError(t, err, "should be able to get machine-config ClusterOperator")
++
++	foundAvailable, foundDegraded := false, false
++	for _, cond := range co.Status.Conditions {
++		switch cond.Type {
++		case configv1.OperatorAvailable:
++			foundAvailable = true
++			assert.Equal(t, configv1.ConditionTrue, cond.Status,
++				"machine-config operator should be Available")
++		case configv1.OperatorDegraded:
++			foundDegraded = true
++			assert.Equal(t, configv1.ConditionFalse, cond.Status,
++				"machine-config operator should not be Degraded")
++		}
++	}
++	assert.True(t, foundAvailable, "OperatorAvailable condition must be present on machine-config ClusterOperator")
++	assert.True(t, foundDegraded, "OperatorDegraded condition must be present on machine-config ClusterOperator")
++
++	pods, err := cs.Pods(ns).List(ctx, metav1.ListOptions{})
++	require.NoError(t, err)
++
++	componentRunning := map[string]bool{
++		"machine-config-operator":   false,
++		"machine-config-controller": false,
++	}
++	for _, pod := range pods.Items {
++		app := pod.Labels["k8s-app"]
++		if _, tracked := componentRunning[app]; tracked && pod.Status.Phase == corev1.PodRunning {
++			componentRunning[app] = true
++		}
++	}
++	for component, running := range componentRunning {
++		assert.True(t, running, "%s pod should be Running", component)
++	}
++
++	policies, err := cs.GetKubeclient().NetworkingV1().NetworkPolicies(ns).List(ctx, metav1.ListOptions{})
++	require.NoError(t, err)
++
++	policyNames := make([]string, len(policies.Items))
++	for i, p := range policies.Items {
++		policyNames[i] = p.Name
++	}
++	for _, expected := range staticPolicyNames {
++		assert.Contains(t, policyNames, expected,
++			"policy %s should exist while MCO processes are running", expected)
++	}
++}
++
++func TestNetworkPolicies_AdminNetworkPolicyOverride(t *testing.T) {
++	skipIfNoNetworkPolicies(t)
++
++	cs := framework.NewClientSet("")
++	ctx := context.Background()
++	ns := ctrlcommon.MCONamespace
++
++	deny, err := cs.GetKubeclient().NetworkingV1().NetworkPolicies(ns).Get(ctx, "default-deny", metav1.GetOptions{})
++	require.NoError(t, err)
++	assert.Empty(t, deny.Spec.Ingress, "default-deny should block all ingress")
++
++	overridePolicy := &networkingv1.NetworkPolicy{
++		ObjectMeta: metav1.ObjectMeta{
++			Name:      "test-additional-allow",
++			Namespace: ns,
++		},
++		Spec: networkingv1.NetworkPolicySpec{
++			PodSelector: metav1.LabelSelector{
++				MatchLabels: map[string]string{"k8s-app": "machine-config-operator"},
++			},
++			Ingress: []networkingv1.NetworkPolicyIngressRule{
++				{
++					Ports: []networkingv1.NetworkPolicyPort{
++						{
++							Protocol: npProtocolPtr(corev1.ProtocolTCP),
++							Port:     npPortPtr(8080),
++						},
++					},
++				},
++			},
++			PolicyTypes: []networkingv1.PolicyType{networkingv1.PolicyTypeIngress},
++		},
++	}
++
++	_, err = cs.GetKubeclient().NetworkingV1().NetworkPolicies(ns).Create(ctx, overridePolicy, metav1.CreateOptions{})
++	require.NoError(t, err)
++	defer func() {
++		_ = cs.GetKubeclient().NetworkingV1().NetworkPolicies(ns).Delete(ctx, "test-additional-allow", metav1.DeleteOptions{})
++	}()
++
++	created, err := cs.GetKubeclient().NetworkingV1().NetworkPolicies(ns).Get(ctx, "test-additional-allow", metav1.GetOptions{})
++	require.NoError(t, err)
++	assert.Equal(t, "test-additional-allow", created.Name)
++
++	err = wait.PollUntilContextTimeout(ctx, networkPolicySyncPollInterval, networkPolicySyncPollTimeout, true,
++		func(ctx context.Context) (bool, error) {
++			policies, err := cs.GetKubeclient().NetworkingV1().NetworkPolicies(ns).List(ctx, metav1.ListOptions{})
++			if err != nil {
++				return false, err
++			}
++			names := make(map[string]bool)
++			for _, p := range policies.Items {
++				names[p.Name] = true
++			}
++			for _, expected := range staticPolicyNames {
++				if !names[expected] {
++					return false, nil
++				}
++			}
++			return names["test-additional-allow"], nil
++		})
++	require.NoError(t, err, "operator-managed policies should coexist with user-created policies")
++
++	final, err := cs.GetKubeclient().NetworkingV1().NetworkPolicies(ns).Get(ctx, "test-additional-allow", metav1.GetOptions{})
++	require.NoError(t, err)
++	require.Len(t, final.Spec.Ingress, 1)
++	require.Len(t, final.Spec.Ingress[0].Ports, 1)
++	assert.Equal(t, int32(8080), final.Spec.Ingress[0].Ports[0].Port.IntVal,
++		"user-created policy should retain its original port")
++}
++
++func npProtocolPtr(p corev1.Protocol) *corev1.Protocol {
++	return &p
++}
++
++func npPortPtr(port int32) *intstr.IntOrString {
++	p := intstr.FromInt32(port)
++	return &p
++}

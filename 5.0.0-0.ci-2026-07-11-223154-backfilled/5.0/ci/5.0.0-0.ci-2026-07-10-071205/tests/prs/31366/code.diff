@@ -1,0 +1,119 @@
+diff --git a/test/extended/internalreleaseimage/helper.go b/test/extended/internalreleaseimage/helper.go
+index caa3baa6e8d7..b38b6deaddcb 100644
+--- a/test/extended/internalreleaseimage/helper.go
++++ b/test/extended/internalreleaseimage/helper.go
+@@ -3,17 +3,14 @@ package internalreleaseimage
+ import (
+ 	"context"
+ 	"fmt"
+-	"strings"
+-	"time"
+-
+ 	g "github.com/onsi/ginkgo/v2"
+ 	o "github.com/onsi/gomega"
++	"strings"
+ 
+ 	corev1 "k8s.io/api/core/v1"
+ 	apierrors "k8s.io/apimachinery/pkg/api/errors"
+ 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+ 	"k8s.io/apimachinery/pkg/util/uuid"
+-	"k8s.io/apimachinery/pkg/util/wait"
+ 	e2e "k8s.io/kubernetes/test/e2e/framework"
+ 	e2epod "k8s.io/kubernetes/test/e2e/framework/pod"
+ 
+@@ -165,43 +162,6 @@ func (h *IRITestHelper) DeleteTestPod(namespace, name string) {
+ 	}
+ }
+ 
+-// CreateSimpleNamespace creates a basic namespace and waits for SCC annotations
+-func (h *IRITestHelper) CreateSimpleNamespace() string {
+-	ns := &corev1.Namespace{
+-		ObjectMeta: metav1.ObjectMeta{
+-			Name: "e2e-test-" + string(uuid.NewUUID()),
+-		},
+-	}
+-
+-	createdNs, err := h.oc.AdminKubeClient().CoreV1().Namespaces().Create(context.Background(), ns, metav1.CreateOptions{})
+-	o.Expect(err).NotTo(o.HaveOccurred(), "Failed to create namespace")
+-	e2e.Logf("Created namespace: %s", createdNs.Name)
+-
+-	// Wait for the namespace controller to set the SCC uid-range annotation,
+-	// which is required by the admission controller before pods can be created.
+-	err = wait.PollUntilContextTimeout(context.Background(), 500*time.Millisecond, 60*time.Second, true, func(ctx context.Context) (bool, error) {
+-		updatedNs, err := h.oc.AdminKubeClient().CoreV1().Namespaces().Get(ctx, createdNs.Name, metav1.GetOptions{})
+-		if err != nil {
+-			return false, err
+-		}
+-		_, exists := updatedNs.Annotations["openshift.io/sa.scc.uid-range"]
+-		return exists, nil
+-	})
+-	o.Expect(err).NotTo(o.HaveOccurred(), "Timed out waiting for namespace %s to get SCC uid-range annotation", createdNs.Name)
+-
+-	return createdNs.Name
+-}
+-
+-// DeleteNamespace deletes a namespace
+-func (h *IRITestHelper) DeleteNamespace(name string) {
+-	err := h.oc.AdminKubeClient().CoreV1().Namespaces().Delete(context.Background(), name, metav1.DeleteOptions{})
+-	if err != nil && !apierrors.IsNotFound(err) {
+-		e2e.Logf("Warning: failed to delete namespace %s: %v", name, err)
+-	} else {
+-		e2e.Logf("Deleted namespace: %s", name)
+-	}
+-}
+-
+ // skipIfNoRegistryFeatureUnsupported skips the test if NoRegistryClusterInstall is not supported
+ // This checks: platform type (BareMetal/None) and feature gate enablement
+ func skipIfNoRegistryFeatureUnsupported(oc *exutil.CLI) {
+diff --git a/test/extended/internalreleaseimage/internalreleaseimage.go b/test/extended/internalreleaseimage/internalreleaseimage.go
+index ff0feb6f7936..60d6fc3730ba 100644
+--- a/test/extended/internalreleaseimage/internalreleaseimage.go
++++ b/test/extended/internalreleaseimage/internalreleaseimage.go
+@@ -151,7 +151,7 @@ var _ = g.Describe("[sig-installer][Feature:NoRegistryClusterInstall] InternalRe
+ var _ = g.Describe("[sig-installer][Feature:NoRegistryClusterInstall] Cluster operates without external registry using managed OCP release bundle images", func() {
+ 	defer g.GinkgoRecover()
+ 
+-	var oc = exutil.NewCLIWithoutNamespace("no-registry")
++	var oc = exutil.NewCLI("no-registry")
+ 	var helper *IRITestHelper
+ 
+ 	g.BeforeEach(func() {
+@@ -168,9 +168,8 @@ var _ = g.Describe("[sig-installer][Feature:NoRegistryClusterInstall] Cluster op
+ 			// Verify the image repo is present in IDMS (proves it will be pulled from mirror)
+ 			g.By("Verifying image repo is present in ImageDigestMirrorSet")
+ 			helper.VerifyIDMSConfigured(releaseImage)
+-			g.By("Creating test namespace and pod")
+-			ns := helper.CreateSimpleNamespace()
+-			defer helper.DeleteNamespace(ns)
++			g.By("Creating test pod in framework-managed namespace")
++			ns := oc.Namespace()
+ 
+ 			pod := helper.CreateTestPod(ns, releaseImage)
+ 			defer helper.DeleteTestPod(ns, pod.Name)
+diff --git a/test/extended/util/client.go b/test/extended/util/client.go
+index f268eee0158c..49053abaccad 100644
+--- a/test/extended/util/client.go
++++ b/test/extended/util/client.go
+@@ -409,10 +409,20 @@ func (c *CLI) setupProject() string {
+ 		defaultRoleBindings = append(defaultRoleBindings, "system:deployers")
+ 	}
+ 
+-	// If image registry is not enabled set default service account and default role bindings to empty slice,
+-	// the SA will not contain the docker secret and the role binding is not expected to be present.
++	// If image registry is not enabled or its management state is Removed, set default service
++	// account and default role bindings to empty slice, the SA will not contain the docker secret
++	// and the role binding is not expected to be present.
+ 	imageRegistryEnabled, err := IsCapabilityEnabled(c, configv1.ClusterVersionCapabilityImageRegistry)
+ 	o.Expect(err).NotTo(o.HaveOccurred())
++	if imageRegistryEnabled {
++		out, _, err := c.AsAdmin().Run("get").Args("configs.imageregistry.operator.openshift.io", "cluster", "-o", "jsonpath={.spec.managementState}").Outputs()
++		if err != nil {
++			framework.Logf("Error checking image registry management state: %v", err)
++		} else if out == "Removed" {
++			framework.Logf("Image registry management state is Removed, skipping dockercfg secret and role binding checks")
++			imageRegistryEnabled = false
++		}
++	}
+ 	if !imageRegistryEnabled {
+ 		DefaultServiceAccounts = []string{}
+ 		defaultRoleBindings = []string{}
