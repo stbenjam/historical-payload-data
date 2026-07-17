@@ -1,0 +1,671 @@
+diff --git a/.github/workflows/build.yaml b/.github/workflows/build.yaml
+index 55f54b6de..63095f2d9 100644
+--- a/.github/workflows/build.yaml
++++ b/.github/workflows/build.yaml
+@@ -2,6 +2,9 @@ name: build
+ 
+ on: ["push", "pull_request"]
+ 
++permissions:
++  contents: read
++
+ jobs:
+   lint:
+     name: Lint
+@@ -30,37 +33,22 @@ jobs:
+       - name: Build
+         run: make build-bin
+ 
+-  test:
+-    name: test
+-    runs-on: ubuntu-latest
+-    steps:
+-      - uses: actions/checkout@v6
+-      - name: setup go
+-        uses: actions/setup-go@v6
+-        with:
+-          go-version-file: go.mod
+-
+-      - name: Test
+-        env:
+-          GOTOOLCHAIN: auto
+-        run: make test
+-
+-  coverage:
++  unit-test:
+     runs-on: ubuntu-latest
+     needs: build
+-    name: coverage
++    name: unit-test
++    container:
++      image: golang:1.25
++      options: --privileged
+     steps:
+       - uses: actions/checkout@v6
+-      - name: Set up Go
+-        uses: actions/setup-go@v6
+-        with:
+-          go-version-file: go.mod
+ 
+       - name: Go test with coverage
+-        run: sudo make test-coverage # sudo needed for network interfaces creation
++        run: go test -race -covermode=atomic -coverprofile=profile.out ./... -v --ginkgo.v
+ 
+       - name: Coveralls
+         uses: coverallsapp/github-action@v2
+         with:
+           github-token: ${{ secrets.GITHUB_TOKEN }}
+-          path-to-lcov: test/coverage/lcov.info
++          file: profile.out
++          format: golang
+diff --git a/.github/workflows/clab-e2e.yml b/.github/workflows/clab-e2e.yml
+new file mode 100644
+index 000000000..72ff938f5
+--- /dev/null
++++ b/.github/workflows/clab-e2e.yml
+@@ -0,0 +1,57 @@
++name: e2e-clab
++on: [push, pull_request]
++
++permissions:
++  contents: read
++
++jobs:
++  e2e-clab:
++    runs-on: ubuntu-latest
++
++    steps:
++      - uses: actions/checkout@v4
++
++      - uses: actions/setup-go@v5
++        with:
++          go-version-file: go.mod
++
++      - name: Deploy topology
++        run: |
++          curl -sL https://get.containerlab.dev | sudo bash
++          sudo containerlab deploy -t clab/topo.yaml
++          kind export kubeconfig --name k01
++
++      - name: Build bond-cni image
++        run: |
++          docker build -t bond-cni:e2e -f images/Dockerfile .
++          kind load docker-image bond-cni:e2e --name k01
++
++      - name: Deploy stack
++        run: |
++          kubectl -n kube-system wait --for=condition=available deploy/coredns --timeout=300s
++          kubectl apply -f https://raw.githubusercontent.com/k8snetworkplumbingwg/multus-cni/v4.3.0/deployments/multus-daemonset-thick.yml
++          kubectl -n kube-system wait --for=condition=ready -l name=multus pod --timeout=300s
++          kubectl create -f clab/bond-cni-install.yml
++          kubectl -n kube-system wait --for=condition=complete job/bond-cni-install --timeout=300s
++
++      - name: Test
++        run: go test -tags e2e ./e2e/ -v -ginkgo.v -timeout 600s --ginkgo.junit-report=e2e-report.xml
++
++      - name: Export kind logs
++        if: always()
++        run: |
++          mkdir -p /tmp/kind-logs
++          kind export logs --name k01 /tmp/kind-logs
++
++      - name: Upload artifacts
++        if: always()
++        uses: actions/upload-artifact@v4
++        with:
++          name: e2e-artifacts-${{ github.run_id }}
++          path: |
++            e2e-report.xml
++            /tmp/kind-logs
++
++      - name: Teardown
++        if: always()
++        run: sudo containerlab destroy -t clab/topo.yaml
+diff --git a/.gitignore b/.gitignore
+index 3f1bb3d8b..6008ce5a7 100644
+--- a/.gitignore
++++ b/.gitignore
+@@ -17,3 +17,6 @@ bin/
+ /test/coverage*
+ /.gopath/*
+ .idea/
++clab-bond-cni-e2e/
++profile.out
++.gomodcache/
+diff --git a/Dockerfile.openshift b/Dockerfile.openshift
+index e75b09070..22fda88a0 100644
+--- a/Dockerfile.openshift
++++ b/Dockerfile.openshift
+@@ -1,12 +1,12 @@
+ FROM registry.ci.openshift.org/ocp/builder:rhel-9-golang-1.26-openshift-5.0 AS rhel9
+ WORKDIR /go/src/github.com/openshift/bond-cni
+ COPY . .
+-RUN ./build.sh
++RUN go build --mod=vendor -ldflags '-s -w' -o ./bin/bond ./bond/
+ 
+ FROM registry.ci.openshift.org/ocp/builder:rhel-8-golang-1.26-openshift-5.0 AS rhel8
+ WORKDIR /go/src/github.com/openshift/bond-cni
+ COPY . .
+-RUN ./build.sh
++RUN go build --mod=vendor -ldflags '-s -w' -o ./bin/bond ./bond/
+ 
+ FROM registry.ci.openshift.org/ocp/5.0:base-rhel9
+ LABEL io.k8s.display-name="bond-cni" \
+diff --git a/Makefile b/Makefile
+index eb0640b6a..6777ec04d 100644
+--- a/Makefile
++++ b/Makefile
+@@ -1,86 +1,20 @@
+ 
+-# Go environment:
+-GOPATH=$(CURDIR)/.gopath
+-GOBIN=$(CURDIR)/bin
+-
+-export GOPATH
+-export GOBIN
+-
+-# Go tools:
+-GOCOVXML = $(GOBIN)/gocov-xml
+-GOCOVMERGE = $(GOBIN)/gocovmerge
+-GOCOV = $(GOBIN)/gocov
+-GCOV2LCOV = $(GOBIN)/gcov2lcov
+-
+-# Package info
+-PACKAGE=bond-cni
+-ORG_PATH=github.com/k8snetworkplumbingwg
+-
+-# Build info
+-REPO_PATH=$(ORG_PATH)/$(PACKAGE)
+-BASE=$(GOPATH)/src/$(REPO_PATH)
+-PKGS = $(or $(PKG),$(shell cd $(BASE) && env GOPATH=$(GOPATH) go list ./... | grep -v "^$(PACKAGE)/vendor/"))
+-
+-# Test artifacts and settings:
+-TESTPKGS = $(shell env GOPATH=$(GOPATH) go list -f '{{ if or .TestGoFiles .XTestGoFiles }}{{ .ImportPath }}{{ end }}' $(PKGS))
+-COVERAGE_MODE = atomic
+-COVERAGE_DIR = $(CURDIR)/test/coverage
+-COVERAGE_PROFILE = $(COVERAGE_DIR)/profile.out
+-COVERAGE_XML = $(COVERAGE_DIR)/coverage.xml
+-COVERAGE_HTML = $(COVERAGE_DIR)/index.html
+-
+-.PHONY: $(BASE)
+-$(BASE): ; $(info  Setting GOPATH...)
+-	@mkdir -p $(dir $@)
+-	@ln -sf $(CURDIR) $@
++.PHONY: deps-update build-bin unittest
+ 
++ARG ?=
+ 
+ deps-update:
+ 	go mod tidy && \
+ 	go mod vendor
+ 
+-gofmt:
+-	@echo "Running gofmt"
+-	gofmt -s -l `find . -path ./vendor -prune -o -type f -name '*.go' -print`
+-
+ build-bin:
+-	./build.sh
+-
+-test: build-bin # Tests need sudo due to network interfaces creation
+-	sudo -E bash -c "umask 0; PATH=${GOPATH}/bin:$(pwd)/bin:${PATH} go test -race ./bond/"
+-
+-
+-# tool that takes the results from multiple go test -coverprofile runs and merges them into one profile
+-$(GOCOVMERGE): | $(BASE) ; $(info  building gocovmerge...)
+-	go install github.com/wadey/gocovmerge@latest
+-
+-# Convert golang test coverage to lcov format (which can be uploaded to coveralls).
+-$(GCOV2LCOV): | $(BASE) ; $(info  building gcov2lcov...)
+-	go install github.com/jandelgado/gcov2lcov@latest
+-
+-# A tool to generate Go coverage in XML report
+-$(GOCOVXML): | $(BASE) ; $(info  building gocov-xml...)
+-	go install github.com/AlekSi/gocov-xml@latest
+-
+-#Coverage reporting tool
+-$(GOCOV): | $(BASE) ; $(info  building gocov...)
+-	go install github.com/axw/gocov/gocov@v1.1.0
+-
+-
+-.PHONY: test-coverage test-coverage-tools
+-test-coverage-tools: | $(GOCOVMERGE) $(GOCOV) $(GOCOVXML) $(GCOV2LCOV)
+-test-coverage: COVERAGE_DIR := $(CURDIR)/test/coverage
+-test-coverage: test-coverage-tools | $(BASE) ; $(info  Running coverage tests...) @ ## Run coverage tests
+-	mkdir -p $(COVERAGE_DIR)/coverage
+-	cd $(BASE) && for pkg in $(TESTPKGS); do \
+-		go test \
+-			-coverpkg=$$(go list -f '{{ join .Deps "\n" }}' $$pkg | \
+-					grep '^$(PACKAGE)/' | grep -v '^$(PACKAGE)/vendor/' | \
+-					tr '\n' ',')$$pkg \
+-			-covermode=$(COVERAGE_MODE) \
+-			-coverprofile="$(COVERAGE_DIR)/coverage/`echo $$pkg | tr "/" "-"`.cover" $$pkg ;\
+-	done
+-	$(GOCOVMERGE) $(COVERAGE_DIR)/coverage/*.cover > $(COVERAGE_PROFILE)
+-	go tool cover -html=$(COVERAGE_PROFILE) -o $(COVERAGE_HTML)
+-	$(GOCOV) convert $(COVERAGE_PROFILE) | $(GOCOVXML) > $(COVERAGE_XML)
+-	$(GCOV2LCOV) -infile $(COVERAGE_PROFILE) -outfile $(COVERAGE_DIR)/lcov.info
++	mkdir -p ./bin
++	go build -o ./bin/bond ./bond/
++
++unittest:
++	docker run --rm --privileged \
++		-v $(CURDIR):/workspace \
++		-v $(CURDIR)/.gomodcache:/go/pkg/mod \
++		-w /workspace \
++		golang:1.25 \
++		go test -race -covermode=atomic -coverprofile=profile.out ./... $(ARG)
+diff --git a/build.sh b/build.sh
+deleted file mode 100755
+index 13ee3440b..000000000
+--- a/build.sh
++++ /dev/null
+@@ -1,23 +0,0 @@
+-#!/usr/bin/env bash
+-
+-# Copyright (c) 2017 Intel Corp
+-#
+-# Licensed under the Apache License, Version 2.0 (the "License");
+-# you may not use this file except in compliance with the License.
+-# You may obtain a copy of the License at
+-#
+-#    http://www.apache.org/licenses/LICENSE-2.0
+-#
+-# Unless required by applicable law or agreed to in writing, software
+-# distributed under the License is distributed on an "AS IS" BASIS,
+-# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
+-# implied.
+-# See the License for the specific language governing permissions and
+-# limitations under the License.
+-
+-set -e
+-
+-echo "Building bond-cni plugins"
+-
+-export GO111MODULE=on
+-go build --mod=vendor -o ./bin/bond ./bond/
+diff --git a/clab/bond-cni-install.yml b/clab/bond-cni-install.yml
+new file mode 100644
+index 000000000..f6f65fc33
+--- /dev/null
++++ b/clab/bond-cni-install.yml
+@@ -0,0 +1,27 @@
++---
++apiVersion: batch/v1
++kind: Job
++metadata:
++  name: bond-cni-install
++  namespace: kube-system
++spec:
++  template:
++    spec:
++      restartPolicy: OnFailure
++      tolerations:
++      - operator: Exists
++        effect: NoSchedule
++      containers:
++      - name: bond-cni-plugin
++        image: bond-cni:e2e
++        imagePullPolicy: Never
++        env:
++        - name: SLEEP
++          value: "false"
++        volumeMounts:
++        - name: cnibin
++          mountPath: /host/opt/cni/bin/
++      volumes:
++      - name: cnibin
++        hostPath:
++          path: /opt/cni/bin/
+diff --git a/clab/kind-cluster.yaml b/clab/kind-cluster.yaml
+new file mode 100644
+index 000000000..cebee6d5b
+--- /dev/null
++++ b/clab/kind-cluster.yaml
+@@ -0,0 +1,5 @@
++kind: Cluster
++apiVersion: kind.x-k8s.io/v1alpha4
++nodes:
++  - role: control-plane
++  - role: worker
+diff --git a/clab/topo.yaml b/clab/topo.yaml
+new file mode 100644
+index 000000000..4e0cfa1da
+--- /dev/null
++++ b/clab/topo.yaml
+@@ -0,0 +1,28 @@
++name: bond-cni-e2e
++
++topology:
++  nodes:
++    k01:
++      kind: k8s-kind
++      startup-config: kind-cluster.yaml
++
++    k01-worker:
++      kind: ext-container
++      exec:
++        - curl -Lo /tmp/cni.tgz https://github.com/containernetworking/plugins/releases/download/v1.9.1/cni-plugins-linux-amd64-v1.9.1.tgz
++        - tar -xzf /tmp/cni.tgz -C /opt/cni/bin
++
++    sw:
++      kind: linux
++      image: ghcr.io/srl-labs/network-multitool:v0.6.0
++      entrypoint: sleep
++      cmd: infinity
++      exec:
++        - ip link add br0 type bridge
++        - ip link set br0 up
++        - ip link set eth1 master br0
++        - ip link set eth2 master br0
++
++  links:
++    - endpoints: ["k01-worker:eth1", "sw:eth1"]
++    - endpoints: ["k01-worker:eth2", "sw:eth2"]
+diff --git a/e2e/bond_test.go b/e2e/bond_test.go
+new file mode 100644
+index 000000000..8c7731cb5
+--- /dev/null
++++ b/e2e/bond_test.go
+@@ -0,0 +1,83 @@
++//go:build e2e
++
++package e2e_test
++
++import (
++	"context"
++	"os/exec"
++	"path"
++	"strings"
++
++	. "github.com/onsi/ginkgo/v2"
++	. "github.com/onsi/gomega"
++)
++
++var _ = Describe("bond", func() {
++	When("mode1 (active-backup)", func() {
++		const yamlFile = "yamls/bond-mode1.yml"
++
++		BeforeEach(func(ctx context.Context) {
++			out, err := exec.CommandContext(ctx, "kubectl", "create", "-n", namespace, "-f", yamlFile).CombinedOutput()
++			Expect(err).NotTo(HaveOccurred(), string(out))
++
++			DeferCleanup(func() {
++				exec.Command("kubectl", "delete", "-n", namespace, "--ignore-not-found", "-f", yamlFile).Run()
++			})
++
++			out, err = exec.CommandContext(ctx, "kubectl", "wait", "-n", namespace, "--for=condition=ready", "-l", "app=bond-test", "pod", "--timeout=300s").CombinedOutput()
++			Expect(err).NotTo(HaveOccurred(), string(out))
++		})
++
++		It("works", func(ctx context.Context) {
++			out, err := exec.CommandContext(ctx, "kubectl", "exec", "-n", namespace, "bond-test", "--",
++				"cat", "/proc/net/bonding/bond0").CombinedOutput()
++			Expect(err).NotTo(HaveOccurred(), string(out))
++			bondInfo := string(out)
++			Expect(bondInfo).To(ContainSubstring("Bonding Mode: fault-tolerance (active-backup)"))
++			Expect(bondInfo).To(ContainSubstring("MII Polling Interval (ms): 100"))
++
++			out, err = exec.CommandContext(ctx, "kubectl", "exec", "-n", namespace, "bond-test", "--",
++				"cat", "/sys/class/net/bond0/mtu").CombinedOutput()
++			Expect(err).NotTo(HaveOccurred(), string(out))
++			Expect(strings.TrimSpace(string(out))).To(Equal("1300"))
++		})
++	})
++
++	When("mode2 (balance-xor)", func() {
++		DescribeTable("with hash",
++			func(ctx context.Context, hash string) {
++				yamlFile := "yamls/bond-mode2-" + strings.ReplaceAll(hash, "+", "plus") + ".yml"
++				podName := strings.TrimSuffix(path.Base(yamlFile), ".yml")
++
++				By("scheduling a pod on a node with two macvlan interfaces bonded in balance-xor mode")
++				out, err := exec.CommandContext(ctx, "kubectl", "create", "-n", namespace, "-f", yamlFile).CombinedOutput()
++				Expect(err).NotTo(HaveOccurred(), string(out))
++
++				DeferCleanup(func() {
++					exec.Command("kubectl", "delete", "-n", namespace, "--ignore-not-found", "-f", yamlFile).Run()
++				})
++
++				By("waiting for the pod to become ready")
++				out, err = exec.CommandContext(ctx, "kubectl", "wait", "-n", namespace, "--for=condition=ready",
++					"-l", "app="+podName, "pod", "--timeout=300s").CombinedOutput()
++				Expect(err).NotTo(HaveOccurred(), string(out))
++
++				By("verifying bond mode and xmit hash policy in /proc/net/bonding/bond0")
++				out, err = exec.CommandContext(ctx, "kubectl", "exec", "-n", namespace, podName, "--",
++					"cat", "/proc/net/bonding/bond0").CombinedOutput()
++				Expect(err).NotTo(HaveOccurred(), string(out))
++				bondInfo := string(out)
++				Expect(bondInfo).To(ContainSubstring("Bonding Mode: load balancing (xor)"))
++				Expect(bondInfo).To(ContainSubstring("Transmit Hash Policy: " + hash))
++				Expect(bondInfo).To(ContainSubstring("MII Polling Interval (ms): 100"))
++
++				out, err = exec.CommandContext(ctx, "kubectl", "exec", "-n", namespace, podName, "--",
++					"cat", "/sys/class/net/bond0/mtu").CombinedOutput()
++				Expect(err).NotTo(HaveOccurred(), string(out))
++				Expect(strings.TrimSpace(string(out))).To(Equal("1300"))
++			},
++			Entry("layer2", "layer2"),
++			Entry("layer2+3", "layer2+3"),
++		)
++	})
++})
+diff --git a/e2e/suite_test.go b/e2e/suite_test.go
+new file mode 100644
+index 000000000..abe0a165a
+--- /dev/null
++++ b/e2e/suite_test.go
+@@ -0,0 +1,44 @@
++//go:build e2e
++
++package e2e_test
++
++import (
++	"context"
++	"flag"
++	"fmt"
++	"os/exec"
++	"testing"
++
++	. "github.com/onsi/ginkgo/v2"
++	. "github.com/onsi/gomega"
++)
++
++var (
++	nadsFile  string
++	namespace string
++)
++
++func init() {
++	flag.StringVar(&nadsFile, "nads", "yamls/kind-nads.yaml", "path to NADs YAML file")
++}
++
++func TestE2E(t *testing.T) {
++	RegisterFailHandler(Fail)
++	RunSpecs(t, "bond-cni e2e")
++}
++
++var _ = BeforeSuite(func(ctx context.Context) {
++	Expect(nadsFile).To(BeAnExistingFile())
++
++	namespace = fmt.Sprintf("bond-cni-test-%d", GinkgoRandomSeed())
++
++	out, err := exec.CommandContext(ctx, "kubectl", "create", "namespace", namespace).CombinedOutput()
++	Expect(err).NotTo(HaveOccurred(), string(out))
++
++	out, err = exec.CommandContext(ctx, "kubectl", "apply", "-n", namespace, "-f", nadsFile).CombinedOutput()
++	Expect(err).NotTo(HaveOccurred(), string(out))
++})
++
++var _ = AfterSuite(func() {
++	exec.Command("kubectl", "delete", "namespace", "--ignore-not-found", namespace).Run()
++})
+diff --git a/e2e/yamls/bond-mode1.yml b/e2e/yamls/bond-mode1.yml
+new file mode 100644
+index 000000000..6214e6eea
+--- /dev/null
++++ b/e2e/yamls/bond-mode1.yml
+@@ -0,0 +1,39 @@
++---
++apiVersion: k8s.cni.cncf.io/v1
++kind: NetworkAttachmentDefinition
++metadata:
++  name: bond-net
++spec:
++  config: |
++    {
++      "cniVersion": "1.1.0",
++      "type": "bond",
++      "ifname": "bond0",
++      "mode": "active-backup",
++      "miimon": "100",
++      "mtu": 1300,
++      "linksInContainer": true,
++      "links": [
++        {"name": "net1"},
++        {"name": "net2"}
++      ]
++    }
++---
++apiVersion: v1
++kind: Pod
++metadata:
++  name: bond-test
++  labels:
++    app: bond-test
++  annotations:
++    k8s.v1.cni.cncf.io/networks: |
++      [
++        {"name": "slave-one", "interface": "net1"},
++        {"name": "slave-two", "interface": "net2"},
++        {"name": "bond-net",  "interface": "bond0"}
++      ]
++spec:
++  containers:
++  - name: bond-test
++    image: docker.io/library/alpine:3.19
++    command: ["sleep", "infinity"]
+diff --git a/e2e/yamls/bond-mode2-layer2.yml b/e2e/yamls/bond-mode2-layer2.yml
+new file mode 100644
+index 000000000..a85b957a4
+--- /dev/null
++++ b/e2e/yamls/bond-mode2-layer2.yml
+@@ -0,0 +1,40 @@
++---
++apiVersion: k8s.cni.cncf.io/v1
++kind: NetworkAttachmentDefinition
++metadata:
++  name: bond-mode2-layer2
++spec:
++  config: |
++    {
++      "cniVersion": "1.1.0",
++      "type": "bond",
++      "ifname": "bond0",
++      "mode": "balance-xor",
++      "xmitHashPolicy": "layer2",
++      "miimon": "100",
++      "mtu": 1300,
++      "linksInContainer": true,
++      "links": [
++        {"name": "net1"},
++        {"name": "net2"}
++      ]
++    }
++---
++apiVersion: v1
++kind: Pod
++metadata:
++  name: bond-mode2-layer2
++  labels:
++    app: bond-mode2-layer2
++  annotations:
++    k8s.v1.cni.cncf.io/networks: |
++      [
++        {"name": "slave-one",        "interface": "net1"},
++        {"name": "slave-two",        "interface": "net2"},
++        {"name": "bond-mode2-layer2", "interface": "bond0"}
++      ]
++spec:
++  containers:
++  - name: bond-mode2-layer2
++    image: alpine:3.19
++    command: ["sleep", "infinity"]
+diff --git a/e2e/yamls/bond-mode2-layer2plus3.yml b/e2e/yamls/bond-mode2-layer2plus3.yml
+new file mode 100644
+index 000000000..a8159b210
+--- /dev/null
++++ b/e2e/yamls/bond-mode2-layer2plus3.yml
+@@ -0,0 +1,40 @@
++---
++apiVersion: k8s.cni.cncf.io/v1
++kind: NetworkAttachmentDefinition
++metadata:
++  name: bond-mode2-layer2plus3
++spec:
++  config: |
++    {
++      "cniVersion": "1.1.0",
++      "type": "bond",
++      "ifname": "bond0",
++      "mode": "balance-xor",
++      "xmitHashPolicy": "layer2+3",
++      "miimon": "100",
++      "mtu": 1300,
++      "linksInContainer": true,
++      "links": [
++        {"name": "net1"},
++        {"name": "net2"}
++      ]
++    }
++---
++apiVersion: v1
++kind: Pod
++metadata:
++  name: bond-mode2-layer2plus3
++  labels:
++    app: bond-mode2-layer2plus3
++  annotations:
++    k8s.v1.cni.cncf.io/networks: |
++      [
++        {"name": "slave-one",          "interface": "net1"},
++        {"name": "slave-two",          "interface": "net2"},
++        {"name": "bond-mode2-layer2plus3", "interface": "bond0"}
++      ]
++spec:
++  containers:
++  - name: bond-mode2-layer2plus3
++    image: alpine:3.19
++    command: ["sleep", "infinity"]
+diff --git a/e2e/yamls/kind-nads.yaml b/e2e/yamls/kind-nads.yaml
+new file mode 100644
+index 000000000..dab5ee550
+--- /dev/null
++++ b/e2e/yamls/kind-nads.yaml
+@@ -0,0 +1,26 @@
++---
++apiVersion: k8s.cni.cncf.io/v1
++kind: NetworkAttachmentDefinition
++metadata:
++  name: slave-one
++spec:
++  config: |
++    {
++      "cniVersion": "1.1.0",
++      "type": "macvlan",
++      "master": "eth1",
++      "mode": "bridge"
++    }
++---
++apiVersion: k8s.cni.cncf.io/v1
++kind: NetworkAttachmentDefinition
++metadata:
++  name: slave-two
++spec:
++  config: |
++    {
++      "cniVersion": "1.1.0",
++      "type": "macvlan",
++      "master": "eth2",
++      "mode": "bridge"
++    }

@@ -1,0 +1,168 @@
+diff --git a/ipfailover/keepalived/Dockerfile b/ipfailover/keepalived/Dockerfile
+index 97fc174ce..b6fa09d9d 100644
+--- a/ipfailover/keepalived/Dockerfile
++++ b/ipfailover/keepalived/Dockerfile
+@@ -5,19 +5,12 @@
+ #
+ FROM registry.ci.openshift.org/ocp/4.18:base-rhel9
+ 
+-RUN INSTALL_PKGS="kmod keepalived iproute psmisc nmap-ncat net-tools ipset ipset-libs procps-ng" && \
++RUN INSTALL_PKGS="kmod keepalived iproute psmisc nmap-ncat net-tools ipset ipset-libs procps-ng nftables" && \
+     yum install -y $INSTALL_PKGS && \
+     rpm -V $INSTALL_PKGS && \
+     yum clean all
+ COPY . /var/lib/ipfailover/keepalived/
+ 
+-COPY iptables-scripts/iptables /usr/sbin/
+-COPY iptables-scripts/iptables-save /usr/sbin/
+-COPY iptables-scripts/iptables-restore /usr/sbin/
+-COPY iptables-scripts/ip6tables /usr/sbin/
+-COPY iptables-scripts/ip6tables-save /usr/sbin/
+-COPY iptables-scripts/ip6tables-restore /usr/sbin/
+-
+ LABEL io.k8s.display-name="OpenShift IP Failover" \
+       io.k8s.description="This is a component of OpenShift and runs a clustered keepalived instance across multiple hosts to allow highly available IP addresses." \
+       io.openshift.tags="openshift,ha,ip,failover"
+diff --git a/ipfailover/keepalived/conf/settings.sh b/ipfailover/keepalived/conf/settings.sh
+index f5d3b04e9..b7424f4fd 100755
+--- a/ipfailover/keepalived/conf/settings.sh
++++ b/ipfailover/keepalived/conf/settings.sh
+@@ -43,10 +43,14 @@ HA_REPLICA_COUNT="${OPENSHIFT_HA_REPLICA_COUNT:-"1"}"
+ #
+ HA_VRRP_ID_OFFSET="${OPENSHIFT_HA_VRRP_ID_OFFSET:-"0"}"
+ 
+-# When the DC supplies an (non null) iptables chain
+-# (OPENSHIFT_HA_IPTABLES_CHAIN) make sure the rule to pass keepalived
+-# multicast (224.0.0.18) traffic is in the table.
+-HA_IPTABLES_CHAIN="${OPENSHIFT_HA_IPTABLES_CHAIN:-""}"
++# When set (non-empty), nftables rules are created to allow keepalived
++# multicast (224.0.0.18) traffic. Only the non-emptiness of the value
++# matters; nft manages its own isolated table and chain.
++#
++# OPENSHIFT_HA_NFTABLES_RULE is the preferred env var name.
++# OPENSHIFT_HA_IPTABLES_CHAIN is accepted for backward compatibility
++# with existing deployments but is deprecated.
++HA_MULTICAST_ACCEPT="${OPENSHIFT_HA_NFTABLES_RULE:-${OPENSHIFT_HA_IPTABLES_CHAIN:-""}}"
+ 
+ # Optional external check script that is run every HA_CHECK_INTERVAL seconds
+ # The script can test whatever is needed to verify the application is running.
+diff --git a/ipfailover/keepalived/iptables-scripts/ip6tables b/ipfailover/keepalived/iptables-scripts/ip6tables
+deleted file mode 100755
+index b9a8c3b14..000000000
+--- a/ipfailover/keepalived/iptables-scripts/ip6tables
++++ /dev/null
+@@ -1,3 +0,0 @@
+-#!/bin/sh
+-
+-exec chroot /host /usr/sbin/ip6tables "$@"
+diff --git a/ipfailover/keepalived/iptables-scripts/ip6tables-restore b/ipfailover/keepalived/iptables-scripts/ip6tables-restore
+deleted file mode 100755
+index e82a4d5b2..000000000
+--- a/ipfailover/keepalived/iptables-scripts/ip6tables-restore
++++ /dev/null
+@@ -1,3 +0,0 @@
+-#!/bin/sh
+-
+-exec chroot /host /usr/sbin/ip6tables-restore "$@"
+diff --git a/ipfailover/keepalived/iptables-scripts/ip6tables-save b/ipfailover/keepalived/iptables-scripts/ip6tables-save
+deleted file mode 100755
+index b59d4b1b9..000000000
+--- a/ipfailover/keepalived/iptables-scripts/ip6tables-save
++++ /dev/null
+@@ -1,3 +0,0 @@
+-#!/bin/sh
+-
+-exec chroot /host /usr/sbin/ip6tables-save "$@"
+diff --git a/ipfailover/keepalived/iptables-scripts/iptables b/ipfailover/keepalived/iptables-scripts/iptables
+deleted file mode 100755
+index aa4cb6bf7..000000000
+--- a/ipfailover/keepalived/iptables-scripts/iptables
++++ /dev/null
+@@ -1,3 +0,0 @@
+-#!/bin/sh
+-
+-exec chroot /host /usr/sbin/iptables "$@"
+diff --git a/ipfailover/keepalived/iptables-scripts/iptables-restore b/ipfailover/keepalived/iptables-scripts/iptables-restore
+deleted file mode 100755
+index 5ef394f02..000000000
+--- a/ipfailover/keepalived/iptables-scripts/iptables-restore
++++ /dev/null
+@@ -1,3 +0,0 @@
+-#!/bin/sh
+-
+-exec chroot /host /usr/sbin/iptables-restore "$@"
+diff --git a/ipfailover/keepalived/iptables-scripts/iptables-save b/ipfailover/keepalived/iptables-scripts/iptables-save
+deleted file mode 100755
+index 39134a72a..000000000
+--- a/ipfailover/keepalived/iptables-scripts/iptables-save
++++ /dev/null
+@@ -1,3 +0,0 @@
+-#!/bin/sh
+-
+-exec chroot /host /usr/sbin/iptables-save "$@"
+diff --git a/ipfailover/keepalived/lib/failover-functions.sh b/ipfailover/keepalived/lib/failover-functions.sh
+index dfb1a73a5..c16bd6ca4 100755
+--- a/ipfailover/keepalived/lib/failover-functions.sh
++++ b/ipfailover/keepalived/lib/failover-functions.sh
+@@ -38,11 +38,14 @@ function unconfigure_failover() {
+   echo "  - Removing ip_vs module ..."
+   modprobe -r ip_vs
+ 
+-  chain="${HA_IPTABLES_CHAIN:-""}"
+-  if [[ -n ${chain} ]]; then
+-    if iptables -C ${chain} 1 -d 224.0.0.18/32 -j ACCEPT ; then
+-      echo "  - Removing keepalived multicast iptables rule ..."
+-      iptables -D ${chain} 1 -d 224.0.0.18/32 -j ACCEPT
++  # Remove the nftables table we created for keepalived multicast.
++  # Unlike iptables where we removed a single rule from a shared chain,
++  # nft gives us an isolated table ("inet keepalived") that only we own,
++  # so deleting the entire table is the correct cleanup.
++  if [[ -n "${HA_MULTICAST_ACCEPT:-}" ]]; then
++    if nft list table inet keepalived > /dev/null 2>&1 ; then
++      echo "  - Removing keepalived multicast nftables rules ..."
++      nft delete table inet keepalived
+     fi
+   fi
+ 
+@@ -60,16 +63,31 @@ function setup_failover() {
+     echo "ERROR: Module ip_vs is NOT available."
+   fi
+ 
+-  # When the DC supplies an (non null) iptables chain
+-  # (OPENSHIFT_HA_IPTABLES_CHAIN) make sure the rule to pass keepalived
+-  # multicast (224.0.0.18) traffic is in the table.
+-  chain="${HA_IPTABLES_CHAIN:-""}"
+-  if [[ -n ${chain} ]]; then
+-    echo "  - check for iptables rule for keepalived multicast (224.0.0.18) ..."
+-    if ! iptables -S | grep 224.0.0.18 > /dev/null 2>&1 ; then
+-      # Add the rule to the beginning of the chain.
+-      echo "  - adding iptables rule to $chain to access 224.0.0.18."
+-      iptables -I ${chain} 1 -d 224.0.0.18/32 -j ACCEPT
++  # When HA_MULTICAST_ACCEPT is set, ensure an nftables rule exists to
++  # explicitly allow VRRP multicast traffic (224.0.0.18) used by keepalived.
++  # The chain policy is "accept" so this rule is defense-in-depth, not
++  # load-bearing — traffic would flow without it, but we keep it as an
++  # explicit signal that multicast is expected.
++  #
++  # nft creates an isolated table ("inet keepalived") with its own chain
++  # hooked into the input path. This is different from iptables where we
++  # inserted a rule into an existing shared chain. The table name is fixed
++  # and does not come from the env var value.
++  if [[ -n "${HA_MULTICAST_ACCEPT:-}" ]]; then
++    echo "  - Ensuring nftables rule for keepalived multicast (224.0.0.18) ..."
++    if ! nft list chain inet keepalived filter 2>/dev/null | grep -q 'ip daddr 224.0.0.18 accept' ; then
++      echo "  - Adding nftables rule to accept multicast 224.0.0.18."
++      # Atomic batch: create the table, chain, and rule in one nft -f call.
++      # "inet" family handles both IPv4 and IPv6.
++      # Hook "input" at priority 0 matches where the old iptables rule lived.
++      nft -f - <<-'NFT'
++	table inet keepalived {
++	  chain filter {
++	    type filter hook input priority 0; policy accept;
++	    ip daddr 224.0.0.18 accept
++	  }
++	}
++	NFT
+     fi
+   fi
+ 

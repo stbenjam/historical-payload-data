@@ -1,0 +1,4814 @@
+diff --git a/cmd/cluster-network-operator/main.go b/cmd/cluster-network-operator/main.go
+index c507ac28b1..24378481ed 100644
+--- a/cmd/cluster-network-operator/main.go
++++ b/cmd/cluster-network-operator/main.go
+@@ -6,19 +6,31 @@ import (
+ 	"fmt"
+ 	"os"
+ 
++	operatorv1alpha1 "github.com/openshift/api/operator/v1alpha1"
++	cnoclient "github.com/openshift/cluster-network-operator/pkg/client"
++	"github.com/openshift/cluster-network-operator/pkg/hypershift"
+ 	"github.com/openshift/cluster-network-operator/pkg/names"
++	"github.com/openshift/cluster-network-operator/pkg/network"
+ 	"github.com/openshift/cluster-network-operator/pkg/operator"
+ 	"github.com/openshift/cluster-network-operator/pkg/version"
++	libgoclient "github.com/openshift/library-go/pkg/config/client"
+ 	"github.com/openshift/library-go/pkg/controller/controllercmd"
++	"github.com/openshift/library-go/pkg/crypto"
++	"github.com/openshift/library-go/pkg/operator/events"
++	"github.com/openshift/library-go/pkg/serviceability"
+ 	"github.com/spf13/cobra"
+ 	"github.com/spf13/pflag"
++	"k8s.io/apiserver/pkg/server"
+ 	_ "k8s.io/client-go/plugin/pkg/client/auth/gcp"
+-
++	"k8s.io/client-go/rest"
+ 	utilflag "k8s.io/component-base/cli/flag"
+ 	"k8s.io/component-base/logs"
++	"k8s.io/klog/v2"
+ 	"k8s.io/utils/clock"
+ )
+ 
++const componentName = "network-operator"
++
+ func main() {
+ 	pflag.CommandLine.SetNormalizeFunc(utilflag.WordSepNormalizeFunc)
+ 	pflag.CommandLine.AddGoFlagSet(flag.CommandLine)
+@@ -44,20 +56,154 @@ func newNetworkOperatorCommand() *cobra.Command {
+ 			os.Exit(1)
+ 		},
+ 	}
+-	var extraClusters *map[string]string
+-	var inClusterClientName *string
+-	cmdcfg := controllercmd.NewControllerCommandConfig("network-operator", version.Get(), func(ctx context.Context, controllerConfig *controllercmd.ControllerContext) error {
+-		return operator.RunOperator(ctx, controllerConfig, *inClusterClientName, *extraClusters)
+-	}, clock.RealClock{})
+ 
+-	cmd2 := cmdcfg.NewCommand()
++	cmdcfg := controllercmd.NewControllerCommandConfig(componentName, version.Get(), nil, clock.RealClock{})
++
++	cmd2 := newCommandWithTLSCustomization(cmdcfg)
+ 	cmd2.Use = "start"
+ 	cmd2.Short = "Start the cluster network operator"
+-	extraClusters = cmd2.Flags().StringToString("extra-clusters", nil, "extra clusters, pairs of cluster name and kubeconfig path")
+-	inClusterClientName = cmd2.Flags().String("in-cluster-client-name", names.DefaultClusterName, "client name for in-cluster config(service account or kubeconfig)")
+ 	cmd.AddCommand(cmd2)
+ 
+ 	cmd.AddCommand(newMTUProberCommand())
+ 
+ 	return cmd
+ }
++
++// newCommandWithTLSCustomization creates a custom command that allows customizing TLS
++// settings based on the cluster's TLS security profile
++func newCommandWithTLSCustomization(cmdcfg *controllercmd.ControllerCommandConfig) *cobra.Command {
++	cmd := cmdcfg.NewCommandWithContext(context.Background())
++
++	// Add custom flags
++	var extraClusters map[string]string
++	var inClusterClientName string
++	cmd.Flags().StringToStringVar(&extraClusters, "extra-clusters", nil, "extra clusters, pairs of cluster name and kubeconfig path")
++	cmd.Flags().StringVar(&inClusterClientName, "in-cluster-client-name", names.DefaultClusterName, "client name for in-cluster config(service account or kubeconfig)")
++
++	// Replace with custom Run that intercepts to customize TLS
++	cmd.Run = func(cmd *cobra.Command, args []string) {
++		// Standard boilerplate from library-go
++		logs.InitLogs()
++
++		ctx := server.SetupSignalContext()
++
++		defer logs.FlushLogs()
++		defer serviceability.BehaviorOnPanic(os.Getenv("OPENSHIFT_ON_PANIC"), version.Get())()
++		defer serviceability.Profile(os.Getenv("OPENSHIFT_PROFILE")).Stop()
++
++		serviceability.StartProfiler()
++
++		// Get kubeconfig and namespace from the parsed flags. Unfortunately we can't access cmdcfg.basicFlags directly.
++		kubeConfigFile, _ := cmd.Flags().GetString("kubeconfig")
++		namespace, _ := cmd.Flags().GetString("namespace")
++		bindAddress, _ := cmd.Flags().GetString("listen")
++
++		if err := startControllerWithTLSCustomization(ctx, cmdcfg, extraClusters, inClusterClientName, kubeConfigFile,
++			namespace, bindAddress); err != nil {
++			klog.Fatal(err)
++		}
++	}
++
++	return cmd
++}
++
++// startControllerWithTLSCustomization starts the controller with customized TLS settings
++func startControllerWithTLSCustomization(ctx context.Context, cmdcfg *controllercmd.ControllerCommandConfig,
++	extraClusters map[string]string, inClusterClientName string, kubeConfigFile string, namespace string, bindAddress string) error {
++	// Get the base config
++	unstructuredConfig, config, configContent, err := cmdcfg.Config()
++	if err != nil {
++		return err
++	}
++
++	// Let library-go set up certificate rotation (handles service-serving-cert)
++	startingFileContent, observedFiles, err := cmdcfg.AddDefaultRotationToConfig(config, configContent)
++	if err != nil {
++		return err
++	}
++
++	// Apply the --listen flag to override the default bind address (mimics library-go's StartController behavior)
++	if len(bindAddress) != 0 {
++		config.ServingInfo.BindAddress = bindAddress
++	}
++
++	// Customize TLS settings based on cluster profile
++	if err := applyClusterTLSProfile(ctx, config, kubeConfigFile, inClusterClientName, extraClusters); err != nil {
++		return fmt.Errorf("failed to apply cluster TLS profile: %w", err)
++	}
++
++	controllerCtx, cancel := context.WithCancel(ctx)
++	defer cancel()
++
++	// exitOnChangeReactorCh is used by the file watcher to trigger restart on cert file changes
++	exitOnChangeReactorCh := make(chan struct{})
++	go func() {
++		<-exitOnChangeReactorCh
++		klog.Infof("Certificate file change detected, triggering graceful restart")
++		cancel()
++	}()
++
++	// Create startFunc that passes the cancel function to RunOperator
++	// The TLS controller will call cancel() when TLS profile changes are detected
++	startFunc := func(ctx context.Context, controllerConfig *controllercmd.ControllerContext) error {
++		return operator.RunOperator(ctx, controllerConfig, inClusterClientName, extraClusters, cancel)
++	}
++
++	// Build the controller with our customized ServingInfo
++	builder := controllercmd.NewController(componentName, startFunc, clock.RealClock{}).
++		WithKubeConfigFile(kubeConfigFile, nil).
++		WithComponentNamespace(namespace).
++		WithLeaderElection(config.LeaderElection, namespace, componentName+"-lock").
++		WithVersion(version.Get()).
++		WithEventRecorderOptions(events.RecommendedClusterSingletonCorrelatorOptions()).
++		WithRestartOnChange(exitOnChangeReactorCh, startingFileContent, observedFiles...).
++		WithComponentOwnerReference(cmdcfg.ComponentOwnerReference).
++		WithServer(config.ServingInfo, config.Authentication, config.Authorization)
++
++	return builder.Run(controllerCtx, unstructuredConfig)
++}
++
++// applyClusterTLSProfile fetches the cluster's TLS security profile and applies it to the config
++func applyClusterTLSProfile(ctx context.Context, config *operatorv1alpha1.GenericOperatorConfig, kubeConfigFile string, inClusterClientName string, extraClusters map[string]string) error {
++	restConfig, err := libgoclient.GetKubeConfigOrInClusterConfig(kubeConfigFile, nil)
++	if err != nil {
++		return fmt.Errorf("failed to build kubeconfig: %w", err)
++	}
++
++	// Create protoConfig for performance (used by kubernetes.Interface)
++	protoConfig := rest.CopyConfig(restConfig)
++	protoConfig.AcceptContentTypes = "application/vnd.kubernetes.protobuf,application/json"
++	protoConfig.ContentType = "application/vnd.kubernetes.protobuf"
++
++	client, err := cnoclient.NewClient(restConfig, protoConfig, inClusterClientName, extraClusters)
++	if err != nil {
++		return fmt.Errorf("failed to create CNO client: %w", err)
++	}
++
++	// Fetch HostedControlPlane for HyperShift (if applicable)
++	hcp, err := hypershift.GetHostedControlPlane(client)
++	if err != nil {
++		return fmt.Errorf("failed to get HostedControlPlane: %w", err)
++	}
++
++	// Fetch TLS profile using network.GetTLSProfile (handles both standalone and HyperShift)
++	tlsProfile, err := network.GetTLSProfile(client, hcp)
++	if err != nil {
++		return fmt.Errorf("failed to get TLS profile: %w", err)
++	}
++
++	// Check if we should honor the cluster TLS profile
++	if !crypto.ShouldHonorClusterTLSProfile(tlsProfile.Adherence) {
++		klog.Infof("TLS adherence policy is %q, using default TLS settings", tlsProfile.Adherence)
++		return nil
++	}
++
++	// Apply the TLS settings to the serving config
++	config.ServingInfo.MinTLSVersion = string(tlsProfile.Spec.MinTLSVersion)
++	config.ServingInfo.CipherSuites = crypto.OpenSSLToIANACipherSuites(tlsProfile.Spec.Ciphers)
++
++	klog.Infof("Applied cluster TLS profile: minTLSVersion=%s, ciphers=%v",
++		tlsProfile.Spec.MinTLSVersion, tlsProfile.Spec.Ciphers)
++
++	return nil
++}
+diff --git a/go.mod b/go.mod
+index e2affcb690..bb3b2d9238 100644
+--- a/go.mod
++++ b/go.mod
+@@ -26,7 +26,7 @@ require (
+ 	k8s.io/klog/v2 v2.130.1
+ 	k8s.io/kube-proxy v0.35.2
+ 	k8s.io/utils v0.0.0-20260210185600-b8788abfbbc2
+-	sigs.k8s.io/controller-runtime v0.23.1
++	sigs.k8s.io/controller-runtime v0.23.3
+ )
+ 
+ require (
+@@ -102,9 +102,11 @@ require (
+ require (
+ 	github.com/openshift/api v0.0.0-20260609121705-d3390bd1109f
+ 	github.com/openshift/client-go v0.0.0-20260603140539-6892dc3e1ffc
+-	github.com/openshift/library-go v0.0.0-20260303171201-5d9eb6295ff6
++	github.com/openshift/controller-runtime-common v0.0.0-20260428152732-64ee174f5e2e
++	github.com/openshift/library-go v0.0.0-20260318140748-04979c746b4d
+ 	github.com/openshift/machine-config-operator v0.0.1-0.20250724162154-ab14c8e2843b
+ 	k8s.io/apiextensions-apiserver v0.35.2
++	k8s.io/apiserver v0.35.2
+ 	k8s.io/client-go v0.35.2
+ 	sigs.k8s.io/controller-tools v0.20.1
+ )
+@@ -140,7 +142,6 @@ require (
+ 	github.com/kylelemons/godebug v1.1.0 // indirect
+ 	github.com/mattn/go-colorable v0.1.14 // indirect
+ 	github.com/mattn/go-isatty v0.0.20 // indirect
+-	github.com/onsi/ginkgo/v2 v2.28.1 // indirect
+ 	github.com/shopspring/decimal v1.3.1 // indirect
+ 	github.com/spf13/cast v1.10.0 // indirect
+ 	github.com/stretchr/objx v0.5.3 // indirect
+@@ -154,7 +155,6 @@ require (
+ 	google.golang.org/genproto/googleapis/api v0.0.0-20260226221140-a57be14db171 // indirect
+ 	google.golang.org/genproto/googleapis/rpc v0.0.0-20260226221140-a57be14db171 // indirect
+ 	gopkg.in/evanphx/json-patch.v4 v4.13.0 // indirect
+-	k8s.io/apiserver v0.35.2 // indirect
+ 	k8s.io/gengo/v2 v2.0.0-20251215205346-5ee0d033ba5b // indirect
+ 	k8s.io/kms v0.35.2 // indirect
+ 	k8s.io/kube-aggregator v0.35.1 // indirect
+diff --git a/go.sum b/go.sum
+index 911f6043a9..3066469731 100644
+--- a/go.sum
++++ b/go.sum
+@@ -215,8 +215,10 @@ github.com/openshift/build-machinery-go v0.0.0-20251023084048-5d77c1a5e5af h1:Ui
+ github.com/openshift/build-machinery-go v0.0.0-20251023084048-5d77c1a5e5af/go.mod h1:8jcm8UPtg2mCAsxfqKil1xrmRMI3a+XU2TZ9fF8A7TE=
+ github.com/openshift/client-go v0.0.0-20260603140539-6892dc3e1ffc h1:yCLc/pmoZ4YZbMWlAnvYZ2YWkLZoPCilO4Fk/oAu2/E=
+ github.com/openshift/client-go v0.0.0-20260603140539-6892dc3e1ffc/go.mod h1:eqfaEX/V7xHMZ8Mpf72J03RnnY/kEqoZVLpkpjy5p6s=
+-github.com/openshift/library-go v0.0.0-20260303171201-5d9eb6295ff6 h1:xjqy0OolrFdJ+ofI/aD0+2k9+MSk5anP5dXifFt539Q=
+-github.com/openshift/library-go v0.0.0-20260303171201-5d9eb6295ff6/go.mod h1:D797O/ssKTNglbrGchjIguFq+DbyRYdeds5w4/VTrKM=
++github.com/openshift/controller-runtime-common v0.0.0-20260428152732-64ee174f5e2e h1:k89oIo2EjX0PRSdi1kesktCyWp50SC9WwKurvupvRGs=
++github.com/openshift/controller-runtime-common v0.0.0-20260428152732-64ee174f5e2e/go.mod h1:XGabTMnNbz0M5Oa7IbscZp/jmcc7aHobvOCUWwkzKvM=
++github.com/openshift/library-go v0.0.0-20260318140748-04979c746b4d h1:i3STSVfFi+39gOAramKPySB6WrvuD0rAIssSNOnTwyg=
++github.com/openshift/library-go v0.0.0-20260318140748-04979c746b4d/go.mod h1:3bi4pLpYRdVd1aEhsHfRTJkwxwPLfRZ+ZePn3RmJd2k=
+ github.com/openshift/machine-config-operator v0.0.1-0.20250724162154-ab14c8e2843b h1:LvoFr/2IEj0BWy7mKBdR7ueAHpMJGju1EkEIZrXa+DM=
+ github.com/openshift/machine-config-operator v0.0.1-0.20250724162154-ab14c8e2843b/go.mod h1:UL1OVkRAUkB4aaFZrLlSvuY0jayfdF+o+ZxKiKaaArc=
+ github.com/orisano/pixelmatch v0.0.0-20220722002657-fb0b55479cde/go.mod h1:nZgzbfBr3hhjoZnS66nKrHmduYNpc34ny7RK4z5/HM0=
+@@ -482,8 +484,8 @@ k8s.io/utils v0.0.0-20260210185600-b8788abfbbc2 h1:AZYQSJemyQB5eRxqcPky+/7EdBj0x
+ k8s.io/utils v0.0.0-20260210185600-b8788abfbbc2/go.mod h1:xDxuJ0whA3d0I4mf/C4ppKHxXynQ+fxnkmQH0vTHnuk=
+ sigs.k8s.io/apiserver-network-proxy/konnectivity-client v0.34.0 h1:hSfpvjjTQXQY2Fol2CS0QHMNs/WI1MOSGzCm1KhM5ec=
+ sigs.k8s.io/apiserver-network-proxy/konnectivity-client v0.34.0/go.mod h1:Ve9uj1L+deCXFrPOk1LpFXqTg7LCFzFso6PA48q/XZw=
+-sigs.k8s.io/controller-runtime v0.23.1 h1:TjJSM80Nf43Mg21+RCy3J70aj/W6KyvDtOlpKf+PupE=
+-sigs.k8s.io/controller-runtime v0.23.1/go.mod h1:B6COOxKptp+YaUT5q4l6LqUJTRpizbgf9KSRNdQGns0=
++sigs.k8s.io/controller-runtime v0.23.3 h1:VjB/vhoPoA9l1kEKZHBMnQF33tdCLQKJtydy4iqwZ80=
++sigs.k8s.io/controller-runtime v0.23.3/go.mod h1:B6COOxKptp+YaUT5q4l6LqUJTRpizbgf9KSRNdQGns0=
+ sigs.k8s.io/controller-tools v0.20.1 h1:gkfMt9YodI0K85oT8rVi80NTXO/kDmabKR5Ajn5GYxs=
+ sigs.k8s.io/controller-tools v0.20.1/go.mod h1:b4qPmjGU3iZwqn34alUU5tILhNa9+VXK+J3QV0fT/uU=
+ sigs.k8s.io/json v0.0.0-20250730193827-2d320260d730 h1:IpInykpT6ceI+QxKBbEflcR5EXP7sU1kvOlxwZh5txg=
+diff --git a/pkg/bootstrap/types.go b/pkg/bootstrap/types.go
+index 2df2153acc..51e5f044fe 100644
+--- a/pkg/bootstrap/types.go
++++ b/pkg/bootstrap/types.go
+@@ -101,6 +101,7 @@ type BootstrapResult struct {
+ 
+ 	OVN             OVNBootstrapResult
+ 	IPTablesAlerter IPTablesAlerterBootstrapResult
++	TLSProfile      TLSProfile
+ }
+ 
+ type InfraStatus struct {
+@@ -176,3 +177,8 @@ type FlowsConfig struct {
+ 	// Sampling is the sampling rate on the reporter. 100 means one flow on 100 is sent. 0 means disabled.
+ 	Sampling *uint
+ }
++
++type TLSProfile struct {
++	Spec      configv1.TLSProfileSpec
++	Adherence configv1.TLSAdherencePolicy
++}
+diff --git a/pkg/client/fake/fake_client.go b/pkg/client/fake/fake_client.go
+index 876eba57ab..1203333a92 100644
+--- a/pkg/client/fake/fake_client.go
++++ b/pkg/client/fake/fake_client.go
+@@ -107,9 +107,20 @@ func NewFakeClient(objs ...crclient.Object) cnoclient.Client {
+ 		crclient:     crfake.NewClientBuilder().WithStatusSubresource(co, proxy).WithObjects(objs...).Build(),
+ 		osOperClient: osoperfakeclient.NewClientset(),
+ 	}
++
++	// Create a management cluster client for HyperShift scenarios
++	// This represents a separate cluster, so it starts empty
++	managementClient := FakeClusterClient{
++		kClient:      faketyped.NewClientset(),
++		dynclient:    fakedynamic.NewSimpleDynamicClient(scheme.Scheme),
++		crclient:     crfake.NewClientBuilder().WithStatusSubresource(co).Build(),
++		osOperClient: osoperfakeclient.NewClientset(),
++	}
++
+ 	return &FakeClient{
+ 		clusterClients: map[string]*FakeClusterClient{
+-			names.DefaultClusterName: &fc,
++			names.DefaultClusterName:    &fc,
++			names.ManagementClusterName: &managementClient,
+ 		},
+ 	}
+ }
+diff --git a/pkg/controller/tls/tls_controller.go b/pkg/controller/tls/tls_controller.go
+new file mode 100644
+index 0000000000..18242b4d70
+--- /dev/null
++++ b/pkg/controller/tls/tls_controller.go
+@@ -0,0 +1,148 @@
++package tls
++
++import (
++	"context"
++	"reflect"
++
++	configv1 "github.com/openshift/api/config/v1"
++	cnoclient "github.com/openshift/cluster-network-operator/pkg/client"
++	"github.com/openshift/cluster-network-operator/pkg/hypershift"
++	"github.com/openshift/cluster-network-operator/pkg/names"
++	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
++	uns "k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
++	"k8s.io/apimachinery/pkg/runtime"
++	"k8s.io/apimachinery/pkg/types"
++	"k8s.io/apimachinery/pkg/watch"
++	"k8s.io/client-go/tools/cache"
++	"k8s.io/klog/v2"
++	crclient "sigs.k8s.io/controller-runtime/pkg/client"
++	"sigs.k8s.io/controller-runtime/pkg/controller"
++	"sigs.k8s.io/controller-runtime/pkg/event"
++	"sigs.k8s.io/controller-runtime/pkg/handler"
++	"sigs.k8s.io/controller-runtime/pkg/manager"
++	"sigs.k8s.io/controller-runtime/pkg/predicate"
++	"sigs.k8s.io/controller-runtime/pkg/reconcile"
++	"sigs.k8s.io/controller-runtime/pkg/source"
++)
++
++// ReconcileTLS watches for TLS profile changes and triggers operator restart
++type ReconcileTLS struct {
++	client         cnoclient.Client
++	triggerRestart context.CancelFunc
++}
++
++// Add creates a new TLS restart controller and adds it to the Manager
++func Add(mgr manager.Manager, client cnoclient.Client, triggerRestart context.CancelFunc) error {
++	r := &ReconcileTLS{
++		client:         client,
++		triggerRestart: triggerRestart,
++	}
++
++	c, err := controller.New("tls-controller", mgr, controller.Options{Reconciler: r})
++	if err != nil {
++		return err
++	}
++
++	// Watch APIServer for TLS profile changes
++	err = c.Watch(source.Kind(mgr.GetCache(), &configv1.APIServer{}, &handler.TypedEnqueueRequestForObject[*configv1.APIServer]{},
++		predicate.TypedFuncs[*configv1.APIServer]{
++			CreateFunc: func(evt event.TypedCreateEvent[*configv1.APIServer]) bool {
++				// Don't reconcile on initial creation
++				return false
++			},
++			UpdateFunc: func(evt event.TypedUpdateEvent[*configv1.APIServer]) bool {
++				if evt.ObjectOld == nil || evt.ObjectNew == nil {
++					return false
++				}
++
++				oldAPI := evt.ObjectOld
++				newAPI := evt.ObjectNew
++
++				// Only trigger on TLS profile or adherence changes
++				tlsProfileChanged := !reflect.DeepEqual(oldAPI.Spec.TLSSecurityProfile, newAPI.Spec.TLSSecurityProfile)
++				adherenceChanged := oldAPI.Spec.TLSAdherence != newAPI.Spec.TLSAdherence
++
++				return tlsProfileChanged || adherenceChanged
++			},
++		},
++	))
++	if err != nil {
++		return err
++	}
++
++	// In HyperShift mode, also watch HostedControlPlane
++	hc := hypershift.NewHyperShiftConfig()
++	if hc.Enabled {
++		// Create a dynamic informer for HostedControlPlane in the management cluster
++		dynClient := client.ClientFor(names.ManagementClusterName).Dynamic()
++		hostedControlPlaneGVR := hypershift.HostedControlPlaneGVK.GroupVersion().WithResource("hostedcontrolplanes")
++		hostedControlPlaneInformer := cache.NewSharedIndexInformer(
++			cache.ToListWatcherWithWatchListSemantics(&cache.ListWatch{
++				ListWithContextFunc: func(ctx context.Context, options metav1.ListOptions) (runtime.Object, error) {
++					return dynClient.Resource(hostedControlPlaneGVR).Namespace(hc.Namespace).List(ctx, options)
++				},
++				WatchFuncWithContext: func(ctx context.Context, options metav1.ListOptions) (watch.Interface, error) {
++					return dynClient.Resource(hostedControlPlaneGVR).Namespace(hc.Namespace).Watch(ctx, options)
++				},
++			}, dynClient),
++			&uns.Unstructured{},
++			0, // don't resync
++			cache.Indexers{cache.NamespaceIndex: cache.MetaNamespaceIndexFunc},
++		)
++
++		client.ClientFor(names.ManagementClusterName).AddCustomInformer(hostedControlPlaneInformer)
++
++		err = c.Watch(&source.Informer{
++			Informer: hostedControlPlaneInformer,
++			Handler: handler.EnqueueRequestsFromMapFunc(func(ctx context.Context, obj crclient.Object) []reconcile.Request {
++				return []reconcile.Request{{NamespacedName: types.NamespacedName{Name: "cluster"}}}
++			}),
++			Predicates: []predicate.TypedPredicate[crclient.Object]{
++				predicate.NewPredicateFuncs(func(obj crclient.Object) bool {
++					// Only watch our specific HostedControlPlane
++					return obj.GetName() == hc.Name && obj.GetNamespace() == hc.Namespace
++				}),
++				predicate.Funcs{
++					CreateFunc: func(evt event.CreateEvent) bool {
++						// Don't reconcile on initial creation/add events
++						return false
++					},
++					UpdateFunc: func(evt event.UpdateEvent) bool {
++						newObj, ok := evt.ObjectNew.(*uns.Unstructured)
++						if !ok {
++							return false
++						}
++
++						oldObj, ok := evt.ObjectOld.(*uns.Unstructured)
++						if !ok {
++							return false
++						}
++
++						// Check if TLS profile or adherence changed
++						oldTLSProfile, _, _ := uns.NestedFieldCopy(oldObj.Object, "spec", "configuration", "apiServer", "tlsSecurityProfile")
++						newTLSProfile, _, _ := uns.NestedFieldCopy(newObj.Object, "spec", "configuration", "apiServer", "tlsSecurityProfile")
++
++						oldAdherence, _, _ := uns.NestedString(oldObj.Object, "spec", "configuration", "apiServer", "tlsAdherence")
++						newAdherence, _, _ := uns.NestedString(newObj.Object, "spec", "configuration", "apiServer", "tlsAdherence")
++
++						// Only reconcile if TLS profile or adherence changed
++						return !reflect.DeepEqual(oldTLSProfile, newTLSProfile) || oldAdherence != newAdherence
++					},
++				},
++			},
++		})
++		if err != nil {
++			return err
++		}
++	}
++
++	return nil
++}
++
++func (r *ReconcileTLS) Reconcile(ctx context.Context, request reconcile.Request) (reconcile.Result, error) {
++	klog.Infof("TLS profile or adherence changed, triggering graceful operator restart")
++
++	r.triggerRestart()
++
++	return reconcile.Result{}, nil
++}
+diff --git a/pkg/hypershift/hypershift.go b/pkg/hypershift/hypershift.go
+index 24cd9dbe12..905cba015b 100644
+--- a/pkg/hypershift/hypershift.go
++++ b/pkg/hypershift/hypershift.go
+@@ -1,6 +1,7 @@
+ package hypershift
+ 
+ import (
++	"context"
+ 	"encoding/json"
+ 	"fmt"
+ 	"os"
+@@ -10,12 +11,16 @@ import (
+ 
+ 	configv1 "github.com/openshift/api/config/v1"
+ 	operv1 "github.com/openshift/api/operator/v1"
++	cnoclient "github.com/openshift/cluster-network-operator/pkg/client"
++	"github.com/openshift/cluster-network-operator/pkg/names"
+ 	"gopkg.in/yaml.v2"
+ 	corev1 "k8s.io/api/core/v1"
+ 	"k8s.io/apimachinery/pkg/api/meta"
+ 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+ 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
++	"k8s.io/apimachinery/pkg/runtime"
+ 	"k8s.io/apimachinery/pkg/runtime/schema"
++	"k8s.io/apimachinery/pkg/types"
+ )
+ 
+ const HostedClusterLocalProxy = "socks5://127.0.0.1:8090"
+@@ -24,17 +29,6 @@ const HostedClusterDefaultAdvertiseAddressIPV6 = "fd00::1"
+ 
+ const HostedClusterDefaultAdvertisePort = int64(6443)
+ 
+-var (
+-	enabled           = os.Getenv("HYPERSHIFT")
+-	name              = os.Getenv("HOSTED_CLUSTER_NAME")
+-	namespace         = os.Getenv("HOSTED_CLUSTER_NAMESPACE")
+-	runAsUser         = os.Getenv("RUN_AS_USER")
+-	releaseImage      = os.Getenv("OPENSHIFT_RELEASE_IMAGE")
+-	controlPlaneImage = os.Getenv("OVN_CONTROL_PLANE_IMAGE")
+-	caConfigMap       = os.Getenv("CA_CONFIG_MAP")
+-	caConfigMapKey    = os.Getenv("CA_CONFIG_MAP_KEY")
+-)
+-
+ const (
+ 	// ClusterIDLabel (_id) is the common label used to identify clusters in telemeter.
+ 	// For hypershift, it will identify metrics produced by the both the control plane
+@@ -63,6 +57,7 @@ type HostedControlPlane struct {
+ 	AdvertiseAddress             string
+ 	AdvertisePort                int
+ 	PriorityClass                string
++	APIServerSpec                *configv1.APIServerSpec
+ }
+ 
+ // AvailabilityPolicy specifies a high level availability policy for components.
+@@ -82,13 +77,13 @@ const (
+ 	SingleReplica AvailabilityPolicy = "SingleReplica"
+ )
+ 
+-// HostedControlPlaneGVK GroupVersionKind for HostedControlPlane
+-// Based on https://github.com/openshift/hypershift/blob/27316d734d806a29d63f65ddf746cafd4409a1de/api/hypershift/v1beta1/hosted_controlplane.go#L19
+-var HostedControlPlaneGVK = schema.GroupVersionKind{
+-	Group:   "hypershift.openshift.io",
+-	Version: "v1beta1",
+-	Kind:    "HostedControlPlane",
+-}
++var (
++	HostedControlPlaneGVK = schema.GroupVersionKind{
++		Group:   "hypershift.openshift.io",
++		Version: "v1beta1",
++		Kind:    "HostedControlPlane",
++	}
++)
+ 
+ type HyperShiftConfig struct {
+ 	sync.Mutex
+@@ -104,30 +99,28 @@ type HyperShiftConfig struct {
+ }
+ 
+ func NewHyperShiftConfig() *HyperShiftConfig {
++	caConfigMap := os.Getenv("CA_CONFIG_MAP")
+ 	if caConfigMap == "" {
+ 		caConfigMap = "openshift-service-ca.crt"
+ 	}
+ 
++	caConfigMapKey := os.Getenv("CA_CONFIG_MAP_KEY")
+ 	if caConfigMapKey == "" {
+ 		caConfigMapKey = "service-ca.crt"
+ 	}
+ 
+ 	return &HyperShiftConfig{
+-		Enabled:           hyperShiftEnabled(),
+-		Name:              name,
+-		Namespace:         namespace,
+-		RunAsUser:         runAsUser,
+-		ReleaseImage:      releaseImage,
+-		ControlPlaneImage: controlPlaneImage,
++		Enabled:           os.Getenv("HYPERSHIFT") == "true",
++		Name:              os.Getenv("HOSTED_CLUSTER_NAME"),
++		Namespace:         os.Getenv("HOSTED_CLUSTER_NAMESPACE"),
++		RunAsUser:         os.Getenv("RUN_AS_USER"),
++		ReleaseImage:      os.Getenv("OPENSHIFT_RELEASE_IMAGE"),
++		ControlPlaneImage: os.Getenv("OVN_CONTROL_PLANE_IMAGE"),
+ 		CAConfigMap:       caConfigMap,
+ 		CAConfigMapKey:    caConfigMapKey,
+ 	}
+ }
+ 
+-func hyperShiftEnabled() bool {
+-	return enabled == "true"
+-}
+-
+ func (hc *HyperShiftConfig) SetRelatedObjects(relatedObjects []RelatedObject) {
+ 	hc.Lock()
+ 	defer hc.Unlock()
+@@ -255,6 +248,23 @@ func ParseHostedControlPlane(hcp *unstructured.Unstructured) (*HostedControlPlan
+ 		advertisePort = HostedClusterDefaultAdvertisePort
+ 	}
+ 
++	// Parse APIServer configuration (for TLS profile and other settings)
++	var apiServerSpec *configv1.APIServerSpec
++	apiServerConfig, found, err := unstructured.NestedFieldCopy(hcp.UnstructuredContent(), "spec", "configuration", "apiServer")
++	if err != nil {
++		return nil, fmt.Errorf("failed to extract apiServer config: %v", err)
++	}
++	if found && apiServerConfig != nil {
++		apiServerMap, ok := apiServerConfig.(map[string]interface{})
++		if ok {
++			var spec configv1.APIServerSpec
++			if err := runtime.DefaultUnstructuredConverter.FromUnstructured(apiServerMap, &spec); err != nil {
++				return nil, fmt.Errorf("failed to convert apiServer spec: %w", err)
++			}
++			apiServerSpec = &spec
++		}
++	}
++
+ 	return &HostedControlPlane{
+ 		ControllerAvailabilityPolicy: AvailabilityPolicy(controllerAvailabilityPolicy),
+ 		ClusterID:                    clusterID,
+@@ -264,9 +274,34 @@ func ParseHostedControlPlane(hcp *unstructured.Unstructured) (*HostedControlPlan
+ 		AdvertiseAddress:             advertiseAddress,
+ 		AdvertisePort:                int(advertisePort),
+ 		PriorityClass:                controlPlanePriorityClassAnnotation,
++		APIServerSpec:                apiServerSpec,
+ 	}, nil
+ }
+ 
++// GetHostedControlPlane retrieves and parses the HostedControlPlane CR for the current HyperShift cluster.
++// Returns nil if HyperShift is not enabled.
++func GetHostedControlPlane(client cnoclient.Client) (*HostedControlPlane, error) {
++	hc := NewHyperShiftConfig()
++	if !hc.Enabled {
++		return nil, nil
++	}
++
++	hcp := &unstructured.Unstructured{}
++	hcp.SetGroupVersionKind(HostedControlPlaneGVK)
++	err := client.ClientFor(names.ManagementClusterName).CRClient().Get(context.TODO(),
++		types.NamespacedName{Namespace: hc.Namespace, Name: hc.Name}, hcp)
++	if err != nil {
++		return nil, fmt.Errorf("failed to retrieve HostedControlPlane %s/%s: %w", hc.Namespace, hc.Name, err)
++	}
++
++	parsed, err := ParseHostedControlPlane(hcp)
++	if err != nil {
++		return nil, fmt.Errorf("failed to parse HostedControlPlane %s/%s: %w", hc.Namespace, hc.Name, err)
++	}
++
++	return parsed, nil
++}
++
+ // SetHostedControlPlaneConditions updates the hcp status.conditions based on the provided operStatus
+ // Returns an updated list of conditions and an error. If there are no changes, the returned list is empty.
+ func SetHostedControlPlaneConditions(hcp *unstructured.Unstructured, operStatus *operv1.NetworkStatus) ([]metav1.Condition, error) {
+diff --git a/pkg/network/bootstrap.go b/pkg/network/bootstrap.go
+index 3490688f5f..b4575b7315 100644
+--- a/pkg/network/bootstrap.go
++++ b/pkg/network/bootstrap.go
+@@ -3,12 +3,10 @@ package network
+ import (
+ 	"context"
+ 
++	operv1 "github.com/openshift/api/operator/v1"
+ 	"github.com/openshift/cluster-network-operator/pkg/bootstrap"
+ 	cnoclient "github.com/openshift/cluster-network-operator/pkg/client"
+ 	"github.com/openshift/cluster-network-operator/pkg/platform"
+-
+-	operv1 "github.com/openshift/api/operator/v1"
+-
+ 	corev1 "k8s.io/api/core/v1"
+ 	apierrors "k8s.io/apimachinery/pkg/api/errors"
+ 	"k8s.io/apimachinery/pkg/types"
+@@ -36,6 +34,11 @@ func Bootstrap(conf *operv1.Network, client cnoclient.Client) (*bootstrap.Bootst
+ 
+ 	out.IPTablesAlerter = iptablesAlerterBootstrap(client.ClientFor("").CRClient())
+ 
++	out.TLSProfile, err = GetTLSProfile(client, infraStatus.HostedControlPlane)
++	if err != nil {
++		return nil, err
++	}
++
+ 	return out, nil
+ }
+ 
+diff --git a/pkg/network/bootstrap_test.go b/pkg/network/bootstrap_test.go
+new file mode 100644
+index 0000000000..869d78b1cc
+--- /dev/null
++++ b/pkg/network/bootstrap_test.go
+@@ -0,0 +1,217 @@
++package network_test
++
++import (
++	"context"
++	"os"
++	"reflect"
++	"testing"
++
++	configv1 "github.com/openshift/api/config/v1"
++	operv1 "github.com/openshift/api/operator/v1"
++	fakeclient "github.com/openshift/cluster-network-operator/pkg/client/fake"
++	"github.com/openshift/cluster-network-operator/pkg/hypershift"
++	"github.com/openshift/cluster-network-operator/pkg/names"
++	"github.com/openshift/cluster-network-operator/pkg/network"
++	openshifttls "github.com/openshift/controller-runtime-common/pkg/tls"
++	corev1 "k8s.io/api/core/v1"
++	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
++	uns "k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
++	crclient "sigs.k8s.io/controller-runtime/pkg/client"
++)
++
++func TestBootstrap(t *testing.T) {
++	// Base setup - runs for all tests
++	baseOperConfig := &operv1.Network{
++		ObjectMeta: metav1.ObjectMeta{Name: names.OPERATOR_CONFIG},
++		Spec: operv1.NetworkSpec{
++			DefaultNetwork: operv1.DefaultNetworkDefinition{
++				Type: operv1.NetworkTypeOVNKubernetes,
++				OVNKubernetesConfig: &operv1.OVNKubernetesConfig{
++					MTU: nil,
++				},
++			},
++		},
++	}
++
++	baseClientObjs := []crclient.Object{
++		&configv1.Infrastructure{
++			ObjectMeta: metav1.ObjectMeta{Name: "cluster"},
++			Status: configv1.InfrastructureStatus{
++				PlatformStatus: &configv1.PlatformStatus{
++					Type: configv1.NonePlatformType,
++				},
++			},
++		},
++		&configv1.Proxy{
++			ObjectMeta: metav1.ObjectMeta{Name: "cluster"},
++		},
++		&corev1.ConfigMap{
++			ObjectMeta: metav1.ObjectMeta{
++				Name:      network.CLUSTER_CONFIG_NAME,
++				Namespace: network.CLUSTER_CONFIG_NAMESPACE,
++			},
++			Data: map[string]string{
++				"install-config": "controlPlane:\n  replicas: 3\n",
++			},
++		},
++	}
++
++	t.Run("in standalone (non-HyperShift) mode", func(t *testing.T) {
++		clientObjs := append(baseClientObjs, &configv1.APIServer{
++			ObjectMeta: metav1.ObjectMeta{Name: openshifttls.APIServerName},
++			Spec: configv1.APIServerSpec{
++				TLSSecurityProfile: &configv1.TLSSecurityProfile{
++					Type: configv1.TLSProfileCustomType,
++					Custom: &configv1.CustomTLSProfile{
++						TLSProfileSpec: configv1.TLSProfileSpec{
++							MinTLSVersion: configv1.VersionTLS13,
++							Ciphers:       []string{"TLS_AES_128_GCM_SHA256"},
++						},
++					},
++				},
++				TLSAdherence: configv1.TLSAdherencePolicyLegacyAdheringComponentsOnly,
++			},
++		})
++
++		t.Run("should set the TLS profile info from the APIServer CR", func(t *testing.T) {
++			client := fakeclient.NewFakeClient(clientObjs...)
++			result, err := network.Bootstrap(baseOperConfig, client)
++			if err != nil {
++				t.Fatalf("Bootstrap failed: %v", err)
++			}
++			if result == nil {
++				t.Fatal("Bootstrap result is nil")
++			}
++
++			if result.TLSProfile.Spec.MinTLSVersion != configv1.VersionTLS13 {
++				t.Errorf("Expected MinTLSVersion %v, got %v",
++					configv1.VersionTLS13, result.TLSProfile.Spec.MinTLSVersion)
++			}
++
++			expectedCiphers := []string{"TLS_AES_128_GCM_SHA256"}
++			if !reflect.DeepEqual(result.TLSProfile.Spec.Ciphers, expectedCiphers) {
++				t.Errorf("Expected ciphers %v, got %v",
++					expectedCiphers, result.TLSProfile.Spec.Ciphers)
++			}
++
++			if result.TLSProfile.Adherence != configv1.TLSAdherencePolicyLegacyAdheringComponentsOnly {
++				t.Errorf("Expected adherence %v, got %v",
++					configv1.TLSAdherencePolicyLegacyAdheringComponentsOnly,
++					result.TLSProfile.Adherence)
++			}
++		})
++	})
++
++	t.Run("in HyperShift mode", func(t *testing.T) {
++		const (
++			hostedClusterName      = "test-hosted-cluster"
++			hostedClusterNamespace = "test-namespace"
++		)
++
++		setupHyperShift := func(t *testing.T) {
++			t.Setenv("HYPERSHIFT", "true")
++			t.Setenv("HOSTED_CLUSTER_NAME", hostedClusterName)
++			t.Setenv("HOSTED_CLUSTER_NAMESPACE", hostedClusterNamespace)
++
++			t.Cleanup(func() {
++				os.Unsetenv("HYPERSHIFT")
++				os.Unsetenv("HOSTED_CLUSTER_NAME")
++				os.Unsetenv("HOSTED_CLUSTER_NAMESPACE")
++			})
++		}
++
++		t.Run("when the HostedControlPlane CR exists", func(t *testing.T) {
++			setupHyperShift(t)
++
++			t.Run("should set the TLS profile info from the APIServer spec", func(t *testing.T) {
++				ctx := context.Background()
++				client := fakeclient.NewFakeClient(baseClientObjs...)
++
++				// Create HostedControlPlane with TLS configuration
++				hcp := &uns.Unstructured{}
++				hcp.SetGroupVersionKind(hypershift.HostedControlPlaneGVK)
++				hcp.SetName(hostedClusterName)
++				hcp.SetNamespace(hostedClusterNamespace)
++				hcp.Object["spec"] = map[string]interface{}{
++					"clusterID":                    "test-cluster-id",
++					"controllerAvailabilityPolicy": "SingleReplica",
++					"configuration": map[string]interface{}{
++						"apiServer": map[string]interface{}{
++							"tlsSecurityProfile": map[string]interface{}{
++								"type": string(configv1.TLSProfileModernType),
++							},
++							"tlsAdherence": string(configv1.TLSAdherencePolicyStrictAllComponents),
++						},
++					},
++				}
++
++				if err := client.ClientFor(names.ManagementClusterName).CRClient().Create(ctx, hcp); err != nil {
++					t.Fatalf("Failed to create HostedControlPlane: %v", err)
++				}
++
++				result, err := network.Bootstrap(baseOperConfig, client)
++				if err != nil {
++					t.Fatalf("Bootstrap failed: %v", err)
++				}
++				if result == nil {
++					t.Fatal("Bootstrap result is nil")
++				}
++
++				if result.TLSProfile.Spec.MinTLSVersion != configv1.VersionTLS13 {
++					t.Errorf("Expected MinTLSVersion %v, got %v",
++						configv1.VersionTLS13, result.TLSProfile.Spec.MinTLSVersion)
++				}
++
++				if len(result.TLSProfile.Spec.Ciphers) == 0 {
++					t.Error("Expected ciphers to not be empty")
++				}
++
++				if result.TLSProfile.Adherence != configv1.TLSAdherencePolicyStrictAllComponents {
++					t.Errorf("Expected adherence %v, got %v",
++						configv1.TLSAdherencePolicyStrictAllComponents,
++						result.TLSProfile.Adherence)
++				}
++			})
++
++			t.Run("and the APIServer spec doesn't exist", func(t *testing.T) {
++				ctx := context.Background()
++				client := fakeclient.NewFakeClient(baseClientObjs...)
++
++				// Create HostedControlPlane without APIServer spec
++				hcp := &uns.Unstructured{}
++				hcp.SetGroupVersionKind(hypershift.HostedControlPlaneGVK)
++				hcp.SetName(hostedClusterName)
++				hcp.SetNamespace(hostedClusterNamespace)
++				hcp.Object["spec"] = map[string]interface{}{
++					"clusterID":                    "test-cluster-id",
++					"controllerAvailabilityPolicy": "SingleReplica",
++				}
++
++				if err := client.ClientFor(names.ManagementClusterName).CRClient().Create(ctx, hcp); err != nil {
++					t.Fatalf("Failed to create HostedControlPlane: %v", err)
++				}
++
++				result, err := network.Bootstrap(baseOperConfig, client)
++				if err != nil {
++					t.Fatalf("Bootstrap failed: %v", err)
++				}
++				if result == nil {
++					t.Fatal("Bootstrap result is nil")
++				}
++
++				if result.TLSProfile.Spec.MinTLSVersion != configv1.VersionTLS12 {
++					t.Errorf("Expected MinTLSVersion %v, got %v", configv1.VersionTLS12,
++						result.TLSProfile.Spec.MinTLSVersion)
++				}
++
++				if len(result.TLSProfile.Spec.Ciphers) == 0 {
++					t.Error("Expected ciphers to not be empty")
++				}
++
++				if result.TLSProfile.Adherence != "" {
++					t.Errorf("Expected adherence to be empty, got %v", result.TLSProfile.Adherence)
++				}
++			})
++		})
++	})
++}
+diff --git a/pkg/network/render_test.go b/pkg/network/render_test.go
+index d6bfde1441..c9ce1f099e 100644
+--- a/pkg/network/render_test.go
++++ b/pkg/network/render_test.go
+@@ -3,16 +3,16 @@ package network
+ import (
+ 	"fmt"
+ 	"reflect"
++	"testing"
+ 
+ 	. "github.com/onsi/gomega"
+ 	"github.com/openshift/cluster-network-operator/pkg/client/fake"
+ 	"github.com/openshift/cluster-network-operator/pkg/hypershift"
++	openshifttls "github.com/openshift/controller-runtime-common/pkg/tls"
+ 	"github.com/openshift/library-go/pkg/operator/configobserver/featuregates"
+ 	"github.com/stretchr/testify/assert"
+ 	"k8s.io/client-go/kubernetes/scheme"
+ 
+-	"testing"
+-
+ 	configv1 "github.com/openshift/api/config/v1"
+ 	apifeatures "github.com/openshift/api/features"
+ 	operv1 "github.com/openshift/api/operator/v1"
+@@ -332,7 +332,10 @@ func TestRenderUnknownNetwork(t *testing.T) {
+ 		},
+ 	}
+ 
+-	client := fake.NewFakeClient(infrastructure)
++	client := fake.NewFakeClient(infrastructure, &configv1.APIServer{
++		ObjectMeta: metav1.ObjectMeta{Name: openshifttls.APIServerName},
++	})
++
+ 	err := createProxy(client)
+ 	g.Expect(err).NotTo(HaveOccurred())
+ 
+diff --git a/pkg/network/tls.go b/pkg/network/tls.go
+new file mode 100644
+index 0000000000..1ba5ac1736
+--- /dev/null
++++ b/pkg/network/tls.go
+@@ -0,0 +1,68 @@
++package network
++
++import (
++	"context"
++	"fmt"
++	"strings"
++
++	configv1 "github.com/openshift/api/config/v1"
++	"github.com/openshift/cluster-network-operator/pkg/bootstrap"
++	cnoclient "github.com/openshift/cluster-network-operator/pkg/client"
++	"github.com/openshift/cluster-network-operator/pkg/hypershift"
++	openshifttls "github.com/openshift/controller-runtime-common/pkg/tls"
++	"github.com/openshift/library-go/pkg/crypto"
++	"k8s.io/apimachinery/pkg/types"
++)
++
++const (
++	// UseTLSProfileKey is the template data key indicating whether to use the cluster TLS profile
++	UseTLSProfileKey = "UseTLSProfile"
++	// TLSMinVersionKey is the template data key for the minimum TLS version
++	TLSMinVersionKey = "TLSMinVersion"
++	// TLSCipherSuitesKey is the template data key for the comma-separated cipher suites
++	TLSCipherSuitesKey = "TLSCipherSuites"
++)
++
++// addTLSInfoToRenderData adds TLS-related template data to the render data.
++func addTLSInfoToRenderData(data map[string]interface{}, bootstrapResult *bootstrap.BootstrapResult, respectAdherence bool) {
++	if respectAdherence && !crypto.ShouldHonorClusterTLSProfile(bootstrapResult.TLSProfile.Adherence) {
++		data[UseTLSProfileKey] = false
++		return
++	}
++
++	data[TLSMinVersionKey] = bootstrapResult.TLSProfile.Spec.MinTLSVersion
++	data[TLSCipherSuitesKey] = strings.Join(bootstrapResult.TLSProfile.Spec.Ciphers, ",")
++	data[UseTLSProfileKey] = true
++}
++
++// GetTLSProfile fetches the TLS profile from either the APIServer (standalone) or HostedControlPlane (HyperShift)
++func GetTLSProfile(client cnoclient.Client, hcp *hypershift.HostedControlPlane) (bootstrap.TLSProfile, error) {
++	// For HyperShift, read TLS profile from the already-parsed HostedControlPlane
++	if hcp != nil {
++		if hcp.APIServerSpec == nil {
++			// No APIServer spec, use defaults
++			return toTLSProfile(&configv1.APIServerSpec{})
++		}
++		return toTLSProfile(hcp.APIServerSpec)
++	}
++
++	// For non-HyperShift, read from APIServer CR in the default cluster
++	apiServer := &configv1.APIServer{}
++	if err := client.Default().CRClient().Get(context.TODO(), types.NamespacedName{Name: openshifttls.APIServerName}, apiServer); err != nil {
++		return bootstrap.TLSProfile{}, fmt.Errorf("failed to fetch apiserver.config.openshift.io/%s: %w", openshifttls.APIServerName, err)
++	}
++
++	return toTLSProfile(&apiServer.Spec)
++}
++
++func toTLSProfile(apiServerSpec *configv1.APIServerSpec) (bootstrap.TLSProfile, error) {
++	profileSpec, err := openshifttls.GetTLSProfileSpec(apiServerSpec.TLSSecurityProfile)
++	if err != nil {
++		return bootstrap.TLSProfile{}, fmt.Errorf("failed to get TLS profile spec: %w", err)
++	}
++
++	return bootstrap.TLSProfile{
++		Spec:      profileSpec,
++		Adherence: apiServerSpec.TLSAdherence,
++	}, nil
++}
+diff --git a/pkg/network/tls_test.go b/pkg/network/tls_test.go
+new file mode 100644
+index 0000000000..bab55cacc3
+--- /dev/null
++++ b/pkg/network/tls_test.go
+@@ -0,0 +1,140 @@
++package network
++
++import (
++	"testing"
++
++	configv1 "github.com/openshift/api/config/v1"
++	"github.com/openshift/cluster-network-operator/pkg/bootstrap"
++)
++
++func TestAddTLSInfoToRenderData(t *testing.T) {
++	t.Run("when adherence policy is StrictAllComponents", func(t *testing.T) {
++		testCases := []struct {
++			name             string
++			respectAdherence bool
++		}{
++			{"and respecting adherence", true},
++			{"and not respecting adherence", false},
++		}
++
++		for _, tc := range testCases {
++			t.Run(tc.name, func(t *testing.T) {
++				data := make(map[string]interface{})
++				bootstrapResult := &bootstrap.BootstrapResult{
++					TLSProfile: bootstrap.TLSProfile{
++						Spec: configv1.TLSProfileSpec{
++							MinTLSVersion: configv1.VersionTLS12,
++							Ciphers:       []string{"TLS_AES_128_GCM_SHA256", "TLS_AES_256_GCM_SHA384"},
++						},
++						Adherence: configv1.TLSAdherencePolicyStrictAllComponents,
++					},
++				}
++
++				addTLSInfoToRenderData(data, bootstrapResult, tc.respectAdherence)
++
++				// Should always use TLS profile when adherence is StrictAllComponents
++				if v, ok := data[UseTLSProfileKey]; !ok || v != true {
++					t.Errorf("Expected %s to be true, got %v", UseTLSProfileKey, v)
++				}
++				if v, ok := data[TLSMinVersionKey]; !ok || v != configv1.VersionTLS12 {
++					t.Errorf("Expected %s to be %v, got %v", TLSMinVersionKey, configv1.VersionTLS12, v)
++				}
++				expectedCiphers := "TLS_AES_128_GCM_SHA256,TLS_AES_256_GCM_SHA384"
++				if v, ok := data[TLSCipherSuitesKey]; !ok || v != expectedCiphers {
++					t.Errorf("Expected %s to be %v, got %v", TLSCipherSuitesKey, expectedCiphers, v)
++				}
++			})
++		}
++	})
++
++	t.Run("adherence policy is", func(t *testing.T) {
++		adherencePolicies := []struct {
++			name      string
++			adherence configv1.TLSAdherencePolicy
++		}{
++			{"LegacyAdheringComponentsOnly", configv1.TLSAdherencePolicyLegacyAdheringComponentsOnly},
++			{"NoOpinion (empty)", configv1.TLSAdherencePolicyNoOpinion},
++		}
++
++		for _, policy := range adherencePolicies {
++			t.Run(policy.name, func(t *testing.T) {
++				t.Run("and respecting adherence", func(t *testing.T) {
++					data := make(map[string]interface{})
++					bootstrapResult := &bootstrap.BootstrapResult{
++						TLSProfile: bootstrap.TLSProfile{
++							Spec: configv1.TLSProfileSpec{
++								MinTLSVersion: configv1.VersionTLS13,
++								Ciphers:       []string{"TLS_AES_128_GCM_SHA256"},
++							},
++							Adherence: policy.adherence,
++						},
++					}
++
++					addTLSInfoToRenderData(data, bootstrapResult, true)
++
++					// Should NOT use TLS profile when respecting adherence for these policies
++					if v, ok := data[UseTLSProfileKey]; !ok || v != false {
++						t.Errorf("Expected %s to be false, got %v", UseTLSProfileKey, v)
++					}
++					if _, ok := data[TLSMinVersionKey]; ok {
++						t.Errorf("Expected %s to not be present, but it was: %v", TLSMinVersionKey, data[TLSMinVersionKey])
++					}
++					if _, ok := data[TLSCipherSuitesKey]; ok {
++						t.Errorf("Expected %s to not be present, but it was: %v", TLSCipherSuitesKey, data[TLSCipherSuitesKey])
++					}
++				})
++
++				t.Run("and not respecting adherence", func(t *testing.T) {
++					data := make(map[string]interface{})
++					bootstrapResult := &bootstrap.BootstrapResult{
++						TLSProfile: bootstrap.TLSProfile{
++							Spec: configv1.TLSProfileSpec{
++								MinTLSVersion: configv1.VersionTLS13,
++								Ciphers:       []string{"TLS_AES_128_GCM_SHA256"},
++							},
++							Adherence: policy.adherence,
++						},
++					}
++
++					addTLSInfoToRenderData(data, bootstrapResult, false)
++
++					// Should use TLS profile when not respecting adherence
++					if v, ok := data[UseTLSProfileKey]; !ok || v != true {
++						t.Errorf("Expected %s to be true, got %v", UseTLSProfileKey, v)
++					}
++					if v, ok := data[TLSMinVersionKey]; !ok || v != configv1.VersionTLS13 {
++						t.Errorf("Expected %s to be %v, got %v", TLSMinVersionKey, configv1.VersionTLS13, v)
++					}
++					expectedCiphers := "TLS_AES_128_GCM_SHA256"
++					if v, ok := data[TLSCipherSuitesKey]; !ok || v != expectedCiphers {
++						t.Errorf("Expected %s to be %v, got %v", TLSCipherSuitesKey, expectedCiphers, v)
++					}
++				})
++			})
++		}
++	})
++
++	t.Run("with nil cipher list", func(t *testing.T) {
++		data := make(map[string]interface{})
++		bootstrapResult := &bootstrap.BootstrapResult{
++			TLSProfile: bootstrap.TLSProfile{
++				Spec: configv1.TLSProfileSpec{
++					MinTLSVersion: configv1.VersionTLS12,
++					// Ciphers is nil
++				},
++			},
++		}
++
++		addTLSInfoToRenderData(data, bootstrapResult, false)
++
++		if v, ok := data[UseTLSProfileKey]; !ok || v != true {
++			t.Errorf("Expected %s to be true, got %v", UseTLSProfileKey, v)
++		}
++		if v, ok := data[TLSMinVersionKey]; !ok || v != configv1.VersionTLS12 {
++			t.Errorf("Expected %s to be %v, got %v", TLSMinVersionKey, configv1.VersionTLS12, v)
++		}
++		if v, ok := data[TLSCipherSuitesKey]; !ok || v != "" {
++			t.Errorf("Expected %s to be empty string, got %v", TLSCipherSuitesKey, v)
++		}
++	})
++}
+diff --git a/pkg/operator/operator.go b/pkg/operator/operator.go
+index 7351a75d3b..cfe3c126d0 100644
+--- a/pkg/operator/operator.go
++++ b/pkg/operator/operator.go
+@@ -28,6 +28,7 @@ import (
+ 	"github.com/openshift/cluster-network-operator/pkg/controller"
+ 	"github.com/openshift/cluster-network-operator/pkg/controller/connectivitycheck"
+ 	"github.com/openshift/cluster-network-operator/pkg/controller/statusmanager"
++	tlscontroller "github.com/openshift/cluster-network-operator/pkg/controller/tls"
+ 	"github.com/openshift/cluster-network-operator/pkg/hypershift"
+ 	"github.com/openshift/cluster-network-operator/pkg/names"
+ 
+@@ -47,7 +48,8 @@ type Operator struct {
+ 
+ var logger = klog.NewKlogr()
+ 
+-func RunOperator(ctx context.Context, controllerConfig *controllercmd.ControllerContext, inClusterClientName string, extraClusters map[string]string) error {
++func RunOperator(ctx context.Context, controllerConfig *controllercmd.ControllerContext, inClusterClientName string,
++	extraClusters map[string]string, triggerRestart context.CancelFunc) error {
+ 	o := &Operator{}
+ 
+ 	var err error
+@@ -146,6 +148,12 @@ func RunOperator(ctx context.Context, controllerConfig *controllercmd.Controller
+ 		return fmt.Errorf("failed to add controllers to manager: %w", err)
+ 	}
+ 
++	// Add TLS restart controller
++	klog.Info("Adding TLS restart controller")
++	if err := tlscontroller.Add(o.manager, o.client, triggerRestart); err != nil {
++		return fmt.Errorf("failed to add TLS restart controller: %w", err)
++	}
++
+ 	// Initialize individual (non-controller-runtime) controllers
+ 
+ 	// logLevelController reacts to changes in the operator spec loglevel
+diff --git a/pkg/platform/platform.go b/pkg/platform/platform.go
+index 92008d16c3..a3d461725a 100644
+--- a/pkg/platform/platform.go
++++ b/pkg/platform/platform.go
+@@ -19,7 +19,6 @@ import (
+ 	apiextensionsv1 "k8s.io/apiextensions-apiserver/pkg/apis/apiextensions/v1"
+ 	apierrors "k8s.io/apimachinery/pkg/api/errors"
+ 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+-	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
+ 	"k8s.io/apimachinery/pkg/labels"
+ 	types "k8s.io/apimachinery/pkg/types"
+ 	"k8s.io/apimachinery/pkg/util/sets"
+@@ -119,18 +118,10 @@ func InfraStatus(client cnoclient.Client) (*bootstrap.InfraStatus, error) {
+ 		}
+ 	}
+ 
+-	if hc := hypershift.NewHyperShiftConfig(); hc.Enabled {
+-		hcp := &unstructured.Unstructured{}
+-		hcp.SetGroupVersionKind(hypershift.HostedControlPlaneGVK)
+-		err := client.ClientFor(names.ManagementClusterName).CRClient().Get(context.TODO(), types.NamespacedName{Namespace: hc.Namespace, Name: hc.Name}, hcp)
+-		if err != nil {
+-			return nil, fmt.Errorf("failed to retrieve HostedControlPlane %s: %v", types.NamespacedName{Namespace: hc.Namespace, Name: hc.Name}, err)
+-		}
+-
+-		res.HostedControlPlane, err = hypershift.ParseHostedControlPlane(hcp)
+-		if err != nil {
+-			return nil, fmt.Errorf("failed to parsing HostedControlPlane %s: %v", types.NamespacedName{Namespace: hc.Namespace, Name: hc.Name}, err)
+-		}
++	var err error
++	res.HostedControlPlane, err = hypershift.GetHostedControlPlane(client)
++	if err != nil {
++		return nil, err
+ 	}
+ 
+ 	netIDEnabled, err := isNetworkNodeIdentityEnabled(client)
+diff --git a/vendor/github.com/openshift/controller-runtime-common/LICENSE b/vendor/github.com/openshift/controller-runtime-common/LICENSE
+new file mode 100644
+index 0000000000..261eeb9e9f
+--- /dev/null
++++ b/vendor/github.com/openshift/controller-runtime-common/LICENSE
+@@ -0,0 +1,201 @@
++                                 Apache License
++                           Version 2.0, January 2004
++                        http://www.apache.org/licenses/
++
++   TERMS AND CONDITIONS FOR USE, REPRODUCTION, AND DISTRIBUTION
++
++   1. Definitions.
++
++      "License" shall mean the terms and conditions for use, reproduction,
++      and distribution as defined by Sections 1 through 9 of this document.
++
++      "Licensor" shall mean the copyright owner or entity authorized by
++      the copyright owner that is granting the License.
++
++      "Legal Entity" shall mean the union of the acting entity and all
++      other entities that control, are controlled by, or are under common
++      control with that entity. For the purposes of this definition,
++      "control" means (i) the power, direct or indirect, to cause the
++      direction or management of such entity, whether by contract or
++      otherwise, or (ii) ownership of fifty percent (50%) or more of the
++      outstanding shares, or (iii) beneficial ownership of such entity.
++
++      "You" (or "Your") shall mean an individual or Legal Entity
++      exercising permissions granted by this License.
++
++      "Source" form shall mean the preferred form for making modifications,
++      including but not limited to software source code, documentation
++      source, and configuration files.
++
++      "Object" form shall mean any form resulting from mechanical
++      transformation or translation of a Source form, including but
++      not limited to compiled object code, generated documentation,
++      and conversions to other media types.
++
++      "Work" shall mean the work of authorship, whether in Source or
++      Object form, made available under the License, as indicated by a
++      copyright notice that is included in or attached to the work
++      (an example is provided in the Appendix below).
++
++      "Derivative Works" shall mean any work, whether in Source or Object
++      form, that is based on (or derived from) the Work and for which the
++      editorial revisions, annotations, elaborations, or other modifications
++      represent, as a whole, an original work of authorship. For the purposes
++      of this License, Derivative Works shall not include works that remain
++      separable from, or merely link (or bind by name) to the interfaces of,
++      the Work and Derivative Works thereof.
++
++      "Contribution" shall mean any work of authorship, including
++      the original version of the Work and any modifications or additions
++      to that Work or Derivative Works thereof, that is intentionally
++      submitted to Licensor for inclusion in the Work by the copyright owner
++      or by an individual or Legal Entity authorized to submit on behalf of
++      the copyright owner. For the purposes of this definition, "submitted"
++      means any form of electronic, verbal, or written communication sent
++      to the Licensor or its representatives, including but not limited to
++      communication on electronic mailing lists, source code control systems,
++      and issue tracking systems that are managed by, or on behalf of, the
++      Licensor for the purpose of discussing and improving the Work, but
++      excluding communication that is conspicuously marked or otherwise
++      designated in writing by the copyright owner as "Not a Contribution."
++
++      "Contributor" shall mean Licensor and any individual or Legal Entity
++      on behalf of whom a Contribution has been received by Licensor and
++      subsequently incorporated within the Work.
++
++   2. Grant of Copyright License. Subject to the terms and conditions of
++      this License, each Contributor hereby grants to You a perpetual,
++      worldwide, non-exclusive, no-charge, royalty-free, irrevocable
++      copyright license to reproduce, prepare Derivative Works of,
++      publicly display, publicly perform, sublicense, and distribute the
++      Work and such Derivative Works in Source or Object form.
++
++   3. Grant of Patent License. Subject to the terms and conditions of
++      this License, each Contributor hereby grants to You a perpetual,
++      worldwide, non-exclusive, no-charge, royalty-free, irrevocable
++      (except as stated in this section) patent license to make, have made,
++      use, offer to sell, sell, import, and otherwise transfer the Work,
++      where such license applies only to those patent claims licensable
++      by such Contributor that are necessarily infringed by their
++      Contribution(s) alone or by combination of their Contribution(s)
++      with the Work to which such Contribution(s) was submitted. If You
++      institute patent litigation against any entity (including a
++      cross-claim or counterclaim in a lawsuit) alleging that the Work
++      or a Contribution incorporated within the Work constitutes direct
++      or contributory patent infringement, then any patent licenses
++      granted to You under this License for that Work shall terminate
++      as of the date such litigation is filed.
++
++   4. Redistribution. You may reproduce and distribute copies of the
++      Work or Derivative Works thereof in any medium, with or without
++      modifications, and in Source or Object form, provided that You
++      meet the following conditions:
++
++      (a) You must give any other recipients of the Work or
++          Derivative Works a copy of this License; and
++
++      (b) You must cause any modified files to carry prominent notices
++          stating that You changed the files; and
++
++      (c) You must retain, in the Source form of any Derivative Works
++          that You distribute, all copyright, patent, trademark, and
++          attribution notices from the Source form of the Work,
++          excluding those notices that do not pertain to any part of
++          the Derivative Works; and
++
++      (d) If the Work includes a "NOTICE" text file as part of its
++          distribution, then any Derivative Works that You distribute must
++          include a readable copy of the attribution notices contained
++          within such NOTICE file, excluding those notices that do not
++          pertain to any part of the Derivative Works, in at least one
++          of the following places: within a NOTICE text file distributed
++          as part of the Derivative Works; within the Source form or
++          documentation, if provided along with the Derivative Works; or,
++          within a display generated by the Derivative Works, if and
++          wherever such third-party notices normally appear. The contents
++          of the NOTICE file are for informational purposes only and
++          do not modify the License. You may add Your own attribution
++          notices within Derivative Works that You distribute, alongside
++          or as an addendum to the NOTICE text from the Work, provided
++          that such additional attribution notices cannot be construed
++          as modifying the License.
++
++      You may add Your own copyright statement to Your modifications and
++      may provide additional or different license terms and conditions
++      for use, reproduction, or distribution of Your modifications, or
++      for any such Derivative Works as a whole, provided Your use,
++      reproduction, and distribution of the Work otherwise complies with
++      the conditions stated in this License.
++
++   5. Submission of Contributions. Unless You explicitly state otherwise,
++      any Contribution intentionally submitted for inclusion in the Work
++      by You to the Licensor shall be under the terms and conditions of
++      this License, without any additional terms or conditions.
++      Notwithstanding the above, nothing herein shall supersede or modify
++      the terms of any separate license agreement you may have executed
++      with Licensor regarding such Contributions.
++
++   6. Trademarks. This License does not grant permission to use the trade
++      names, trademarks, service marks, or product names of the Licensor,
++      except as required for reasonable and customary use in describing the
++      origin of the Work and reproducing the content of the NOTICE file.
++
++   7. Disclaimer of Warranty. Unless required by applicable law or
++      agreed to in writing, Licensor provides the Work (and each
++      Contributor provides its Contributions) on an "AS IS" BASIS,
++      WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
++      implied, including, without limitation, any warranties or conditions
++      of TITLE, NON-INFRINGEMENT, MERCHANTABILITY, or FITNESS FOR A
++      PARTICULAR PURPOSE. You are solely responsible for determining the
++      appropriateness of using or redistributing the Work and assume any
++      risks associated with Your exercise of permissions under this License.
++
++   8. Limitation of Liability. In no event and under no legal theory,
++      whether in tort (including negligence), contract, or otherwise,
++      unless required by applicable law (such as deliberate and grossly
++      negligent acts) or agreed to in writing, shall any Contributor be
++      liable to You for damages, including any direct, indirect, special,
++      incidental, or consequential damages of any character arising as a
++      result of this License or out of the use or inability to use the
++      Work (including but not limited to damages for loss of goodwill,
++      work stoppage, computer failure or malfunction, or any and all
++      other commercial damages or losses), even if such Contributor
++      has been advised of the possibility of such damages.
++
++   9. Accepting Warranty or Additional Liability. While redistributing
++      the Work or Derivative Works thereof, You may choose to offer,
++      and charge a fee for, acceptance of support, warranty, indemnity,
++      or other liability obligations and/or rights consistent with this
++      License. However, in accepting such obligations, You may act only
++      on Your own behalf and on Your sole responsibility, not on behalf
++      of any other Contributor, and only if You agree to indemnify,
++      defend, and hold each Contributor harmless for any liability
++      incurred by, or claims asserted against, such Contributor by reason
++      of your accepting any such warranty or additional liability.
++
++   END OF TERMS AND CONDITIONS
++
++   APPENDIX: How to apply the Apache License to your work.
++
++      To apply the Apache License to your work, attach the following
++      boilerplate notice, with the fields enclosed by brackets "[]"
++      replaced with your own identifying information. (Don't include
++      the brackets!)  The text should be enclosed in the appropriate
++      comment syntax for the file format. We also recommend that a
++      file or class name and description of purpose be included on the
++      same "printed page" as the copyright notice for easier
++      identification within third-party archives.
++
++   Copyright [yyyy] [name of copyright owner]
++
++   Licensed under the Apache License, Version 2.0 (the "License");
++   you may not use this file except in compliance with the License.
++   You may obtain a copy of the License at
++
++       http://www.apache.org/licenses/LICENSE-2.0
++
++   Unless required by applicable law or agreed to in writing, software
++   distributed under the License is distributed on an "AS IS" BASIS,
++   WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++   See the License for the specific language governing permissions and
++   limitations under the License.
+diff --git a/vendor/github.com/openshift/controller-runtime-common/pkg/tls/controller.go b/vendor/github.com/openshift/controller-runtime-common/pkg/tls/controller.go
+new file mode 100644
+index 0000000000..41ef2f4540
+--- /dev/null
++++ b/vendor/github.com/openshift/controller-runtime-common/pkg/tls/controller.go
+@@ -0,0 +1,164 @@
++/*
++Copyright 2026 Red Hat, Inc.
++
++Licensed under the Apache License, Version 2.0 (the "License");
++you may not use this file except in compliance with the License.
++You may obtain a copy of the License at
++
++    http://www.apache.org/licenses/LICENSE-2.0
++
++Unless required by applicable law or agreed to in writing, software
++distributed under the License is distributed on an "AS IS" BASIS,
++WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++See the License for the specific language governing permissions and
++limitations under the License.
++*/
++
++package tls
++
++import (
++	"context"
++	"fmt"
++	"reflect"
++
++	"github.com/go-logr/logr"
++	configv1 "github.com/openshift/api/config/v1"
++	apierrors "k8s.io/apimachinery/pkg/api/errors"
++	"k8s.io/utils/ptr"
++	ctrl "sigs.k8s.io/controller-runtime"
++	"sigs.k8s.io/controller-runtime/pkg/builder"
++	"sigs.k8s.io/controller-runtime/pkg/client"
++	"sigs.k8s.io/controller-runtime/pkg/controller"
++	"sigs.k8s.io/controller-runtime/pkg/event"
++	"sigs.k8s.io/controller-runtime/pkg/log"
++	"sigs.k8s.io/controller-runtime/pkg/predicate"
++	"sigs.k8s.io/controller-runtime/pkg/reconcile"
++)
++
++// SecurityProfileWatcher watches the APIServer object for TLS profile changes
++// and triggers a graceful shutdown when the profile changes.
++type SecurityProfileWatcher struct {
++	client.Client
++
++	// InitialTLSProfileSpec is the TLS profile spec that was configured when the operator started.
++	InitialTLSProfileSpec configv1.TLSProfileSpec
++
++	// InitialTLSAdherencePolicy is the TLS adherence policy that was configured when the operator started.
++	InitialTLSAdherencePolicy configv1.TLSAdherencePolicy
++
++	// OnProfileChange is a function that will be called when the TLS profile changes.
++	// It receives the reconcile context, old and new TLS profile specs.
++	// This allows the caller to make decisions based on the actual profile changes.
++	//
++	// The most common use case for this callback is
++	// to trigger a graceful shutdown of the operator
++	// to make it pick up the new configuration.
++	//
++	// Example:
++	//
++	// 	// Create a context that can be cancelled when there is a need to shut down the manager.
++	//  ctx, cancel := context.WithCancel(ctrl.SetupSignalHandler())
++	//  defer cancel()
++	//
++	//  watcher := &SecurityProfileWatcher{
++	// 	  OnProfileChange: func(ctx context.Context, old, new configv1.TLSProfileSpec) {
++	//      logger.Infof("TLS profile has changed, initiating a shutdown to reload it. %q: %+v, %q: %+v",
++	//        "old profile", old,
++	//        "new profile", new,
++	//      )
++	//      // Cancel the outer context to trigger a graceful shutdown of the manager.
++	//      cancel()
++	//    },
++	//  }
++	OnProfileChange func(ctx context.Context, oldTLSProfileSpec, newTLSProfileSpec configv1.TLSProfileSpec)
++
++	// OnAdherencePolicyChange is a function that will be called when the TLS adherence policy changes.
++	OnAdherencePolicyChange func(ctx context.Context, oldTLSAdherencePolicy, newTLSAdherencePolicy configv1.TLSAdherencePolicy)
++}
++
++// SetupWithManager sets up the controller with the Manager.
++func (r *SecurityProfileWatcher) SetupWithManager(mgr ctrl.Manager) error {
++	if err := ctrl.NewControllerManagedBy(mgr).
++		Named("tlssecurityprofilewatcher").
++		WithOptions(controller.Options{NeedLeaderElection: ptr.To(false)}).
++		For(&configv1.APIServer{}, builder.WithPredicates(
++			predicate.Funcs{
++				// Only watch the "cluster" APIServer object.
++				CreateFunc: func(e event.CreateEvent) bool {
++					return e.Object.GetName() == APIServerName
++				},
++				UpdateFunc: func(e event.UpdateEvent) bool {
++					return e.ObjectNew.GetName() == APIServerName
++				},
++				DeleteFunc: func(e event.DeleteEvent) bool {
++					return e.Object.GetName() == APIServerName
++				},
++				GenericFunc: func(e event.GenericEvent) bool {
++					return e.Object.GetName() == APIServerName
++				},
++			},
++		)).
++		// Override the default log constructor as it makes the logs very chatty.
++		WithLogConstructor(func(_ *reconcile.Request) logr.Logger {
++			return mgr.GetLogger().WithValues(
++				"controller", "tlssecurityprofilewatcher",
++			)
++		}).
++		Complete(r); err != nil {
++		return fmt.Errorf("could not set up controller for TLS security profile watcher: %w", err)
++	}
++
++	return nil
++}
++
++// Reconcile watches for changes to the APIServer TLS profile and triggers a shutdown
++// when the profile changes from the initial configuration.
++func (r *SecurityProfileWatcher) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
++	logger := log.FromContext(ctx, "name", req.Name)
++
++	logger.V(1).Info("Reconciling APIServer TLS profile")
++	defer logger.V(1).Info("Finished reconciling APIServer TLS profile")
++
++	// Fetch the APIServer object.
++	apiServer := &configv1.APIServer{}
++	if err := r.Get(ctx, req.NamespacedName, apiServer); err != nil {
++		if apierrors.IsNotFound(err) {
++			// If the APIServer object is not found, we don't need to do anything.
++			// This could happen if the object was deleted.
++			return ctrl.Result{}, nil
++		}
++
++		return ctrl.Result{}, fmt.Errorf("failed to get APIServer %s: %w", req.NamespacedName.String(), err)
++	}
++
++	// Get the current TLS profile spec.
++	currentTLSProfileSpec, err := GetTLSProfileSpec(apiServer.Spec.TLSSecurityProfile)
++	if err != nil {
++		return ctrl.Result{}, fmt.Errorf("failed to get TLS profile from APIServer %s: %w", req.NamespacedName.String(), err)
++	}
++
++	// Compare the current TLS profile spec with the initial one.
++	if tlsProfileChanged := !reflect.DeepEqual(r.InitialTLSProfileSpec, currentTLSProfileSpec); tlsProfileChanged {
++		// TLS profile has changed, invoke the callback if it is set.
++		if r.OnProfileChange != nil {
++			r.OnProfileChange(ctx, r.InitialTLSProfileSpec, currentTLSProfileSpec)
++		}
++
++		// Persist the new profile for future change detection.
++		r.InitialTLSProfileSpec = currentTLSProfileSpec
++	}
++
++	// Compare the current TLS adherence policy with the initial one.
++	if tlsAdherencePolicyChanged := r.InitialTLSAdherencePolicy != apiServer.Spec.TLSAdherence; tlsAdherencePolicyChanged {
++		// TLS adherence policy has changed, invoke the callback if it is set.
++		if r.OnAdherencePolicyChange != nil {
++			r.OnAdherencePolicyChange(ctx, r.InitialTLSAdherencePolicy, apiServer.Spec.TLSAdherence)
++		}
++
++		// Persist the new adherence policy for future change detection.
++		r.InitialTLSAdherencePolicy = apiServer.Spec.TLSAdherence
++	}
++
++	// No need to requeue, as the callback will handle further actions.
++	return ctrl.Result{}, nil
++}
+diff --git a/vendor/github.com/openshift/controller-runtime-common/pkg/tls/tls.go b/vendor/github.com/openshift/controller-runtime-common/pkg/tls/tls.go
+new file mode 100644
+index 0000000000..ce1e8c7d9f
+--- /dev/null
++++ b/vendor/github.com/openshift/controller-runtime-common/pkg/tls/tls.go
+@@ -0,0 +1,168 @@
++/*
++Copyright 2026 Red Hat, Inc.
++
++Licensed under the Apache License, Version 2.0 (the "License");
++you may not use this file except in compliance with the License.
++You may obtain a copy of the License at
++
++    http://www.apache.org/licenses/LICENSE-2.0
++
++Unless required by applicable law or agreed to in writing, software
++distributed under the License is distributed on an "AS IS" BASIS,
++WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++See the License for the specific language governing permissions and
++limitations under the License.
++*/
++
++// Package tls provides utilities for working with OpenShift TLS profiles.
++package tls
++
++import (
++	"context"
++	"crypto/tls"
++	"errors"
++	"fmt"
++
++	configv1 "github.com/openshift/api/config/v1"
++	libgocrypto "github.com/openshift/library-go/pkg/crypto"
++	"sigs.k8s.io/controller-runtime/pkg/client"
++)
++
++const (
++	// APIServerName is the name of the APIServer resource in the cluster.
++	APIServerName = "cluster"
++)
++
++var (
++	// ErrCustomProfileNil is returned when a custom TLS profile is specified but the Custom field is nil.
++	ErrCustomProfileNil = errors.New("custom TLS profile specified but Custom field is nil")
++
++	// DefaultTLSCiphers are the default TLS ciphers for API servers.
++	DefaultTLSCiphers = configv1.TLSProfiles[configv1.TLSProfileIntermediateType].Ciphers //nolint:gochecknoglobals
++	// DefaultMinTLSVersion is the default minimum TLS version for API servers.
++	DefaultMinTLSVersion = configv1.TLSProfiles[configv1.TLSProfileIntermediateType].MinTLSVersion //nolint:gochecknoglobals
++)
++
++// FetchAPIServerTLSProfile fetches the TLS profile spec configured in APIServer.
++// If no profile is configured, the default profile is returned.
++func FetchAPIServerTLSProfile(ctx context.Context, k8sClient client.Client) (configv1.TLSProfileSpec, error) {
++	apiServer := &configv1.APIServer{}
++	key := client.ObjectKey{Name: APIServerName}
++
++	if err := k8sClient.Get(ctx, key, apiServer); err != nil {
++		return configv1.TLSProfileSpec{}, fmt.Errorf("failed to get APIServer %q: %w", key.String(), err)
++	}
++
++	profile, err := GetTLSProfileSpec(apiServer.Spec.TLSSecurityProfile)
++	if err != nil {
++		return configv1.TLSProfileSpec{}, fmt.Errorf("failed to get TLS profile from APIServer %q: %w", key.String(), err)
++	}
++
++	return profile, nil
++}
++
++// FetchAPIServerTLSAdherencePolicy fetches the TLS adherence policy configured in APIServer.
++// If no policy is configured, the default policy is returned.
++func FetchAPIServerTLSAdherencePolicy(ctx context.Context, k8sClient client.Client) (configv1.TLSAdherencePolicy, error) {
++	apiServer := &configv1.APIServer{}
++	key := client.ObjectKey{Name: APIServerName}
++
++	if err := k8sClient.Get(ctx, key, apiServer); err != nil {
++		return configv1.TLSAdherencePolicyNoOpinion, fmt.Errorf("failed to get APIServer %q: %w", key.String(), err)
++	}
++
++	return apiServer.Spec.TLSAdherence, nil
++}
++
++// GetTLSProfileSpec returns TLSProfileSpec for the given profile.
++// If no profile is configured, the default profile is returned.
++func GetTLSProfileSpec(profile *configv1.TLSSecurityProfile) (configv1.TLSProfileSpec, error) {
++	// Define the default profile (at the time of writing, this is the intermediate profile).
++	defaultProfile := *configv1.TLSProfiles[configv1.TLSProfileIntermediateType]
++	// If the profile is nil or the type is empty, return the default profile.
++	if profile == nil || profile.Type == "" {
++		return defaultProfile, nil
++	}
++
++	// Get the profile type.
++	profileType := profile.Type
++
++	// If the profile type is not custom, return the profile from the map.
++	if profileType != configv1.TLSProfileCustomType {
++		if tlsConfig, ok := configv1.TLSProfiles[profileType]; ok {
++			return *tlsConfig, nil
++		}
++
++		// If the profile type is not found, return the default profile.
++		return defaultProfile, nil
++	}
++
++	if profile.Custom == nil {
++		// If the custom profile is nil, return an error.
++		return configv1.TLSProfileSpec{}, ErrCustomProfileNil
++	}
++
++	// Return the custom profile spec.
++	return profile.Custom.TLSProfileSpec, nil
++}
++
++// NewTLSConfigFromProfile returns a function that configures a tls.Config based on the provided TLSProfileSpec,
++// along with any cipher names from the profile that are not supported by the library-go crypto package.
++// The returned function is intended to be used with controller-runtime's TLSOpts.
++//
++// Note: CipherSuites are only set when MinVersion is below TLS 1.3, as Go's TLS 1.3 implementation
++// does not allow configuring cipher suites - all TLS 1.3 ciphers are always enabled.
++// See: https://github.com/golang/go/issues/29349
++func NewTLSConfigFromProfile(profile configv1.TLSProfileSpec) (tlsConfig func(*tls.Config), unsupportedCiphers []string) {
++	minVersion := libgocrypto.TLSVersionOrDie(string(profile.MinTLSVersion))
++	cipherSuites, unsupportedCiphers := cipherCodes(profile.Ciphers)
++
++	return func(tlsConf *tls.Config) {
++		tlsConf.MinVersion = minVersion
++		// TODO: add curve preferences from profile once https://github.com/openshift/api/pull/2583 merges.
++		// tlsConf.CurvePreferences <<<<<< profile.Curves
++
++		// TLS 1.3 cipher suites are not configurable in Go (https://github.com/golang/go/issues/29349), so only set CipherSuites accordingly.
++		// TODO: revisit this once we get an answer on the best way to handle this here:
++		// https://docs.google.com/document/d/1cMc9E8psHfnoK06ntR8kHSWB8d3rMtmldhnmM4nImjs/edit?disco=AAABu_nPcYg
++		if minVersion != tls.VersionTLS13 {
++			tlsConf.CipherSuites = cipherSuites
++		}
++	}, unsupportedCiphers
++}
++
++// cipherCode returns the TLS cipher code for an OpenSSL or IANA cipher name.
++// Returns 0 if the cipher is not supported.
++func cipherCode(cipher string) uint16 {
++	// First try as IANA name directly.
++	if code, err := libgocrypto.CipherSuite(cipher); err == nil {
++		return code
++	}
++
++	// Try converting from OpenSSL name to IANA name.
++	ianaCiphers := libgocrypto.OpenSSLToIANACipherSuites([]string{cipher})
++	if len(ianaCiphers) == 1 {
++		if code, err := libgocrypto.CipherSuite(ianaCiphers[0]); err == nil {
++			return code
++		}
++	}
++
++	// Return 0 if the cipher is not supported.
++	return 0
++}
++
++// cipherCodes converts a list of cipher names (OpenSSL or IANA format) to their uint16 codes.
++// Returns the converted codes and a list of any unsupported cipher names.
++func cipherCodes(ciphers []string) (codes []uint16, unsupportedCiphers []string) {
++	for _, cipher := range ciphers {
++		code := cipherCode(cipher)
++		if code == 0 {
++			unsupportedCiphers = append(unsupportedCiphers, cipher)
++			continue
++		}
++
++		codes = append(codes, code)
++	}
++
++	return codes, unsupportedCiphers
++}
+diff --git a/vendor/github.com/openshift/library-go/pkg/crypto/tls_adherence.go b/vendor/github.com/openshift/library-go/pkg/crypto/tls_adherence.go
+new file mode 100644
+index 0000000000..ef0e1af51a
+--- /dev/null
++++ b/vendor/github.com/openshift/library-go/pkg/crypto/tls_adherence.go
+@@ -0,0 +1,23 @@
++package crypto
++
++import (
++	configv1 "github.com/openshift/api/config/v1"
++)
++
++// ShouldHonorClusterTLSProfile returns true if the component should honor the
++// cluster-wide TLS security profile settings from apiserver.config.openshift.io/cluster.
++//
++// When this returns true (StrictAllComponents mode), components must honor the
++// cluster-wide TLS profile unless they have a component-specific TLS configuration
++// that overrides it.
++//
++// Unknown enum values are treated as StrictAllComponents for forward compatibility
++// and to default to the more secure behavior.
++func ShouldHonorClusterTLSProfile(tlsAdherence configv1.TLSAdherencePolicy) bool {
++	switch tlsAdherence {
++	case configv1.TLSAdherencePolicyNoOpinion, configv1.TLSAdherencePolicyLegacyAdheringComponentsOnly:
++		return false
++	default:
++		return true
++	}
++}
+diff --git a/vendor/modules.txt b/vendor/modules.txt
+index 0de4e63347..b736c09c9c 100644
+--- a/vendor/modules.txt
++++ b/vendor/modules.txt
+@@ -233,8 +233,6 @@ github.com/modern-go/reflect2
+ # github.com/munnerz/goautoneg v0.0.0-20191010083416-a7dc8b61c822
+ ## explicit
+ github.com/munnerz/goautoneg
+-# github.com/onsi/ginkgo/v2 v2.28.1
+-## explicit; go 1.24.0
+ # github.com/onsi/gomega v1.39.1
+ ## explicit; go 1.24.0
+ github.com/onsi/gomega
+@@ -389,7 +387,10 @@ github.com/openshift/client-go/operatorcontrolplane/informers/externalversions/i
+ github.com/openshift/client-go/operatorcontrolplane/informers/externalversions/operatorcontrolplane
+ github.com/openshift/client-go/operatorcontrolplane/informers/externalversions/operatorcontrolplane/v1alpha1
+ github.com/openshift/client-go/operatorcontrolplane/listers/operatorcontrolplane/v1alpha1
+-# github.com/openshift/library-go v0.0.0-20260303171201-5d9eb6295ff6
++# github.com/openshift/controller-runtime-common v0.0.0-20260428152732-64ee174f5e2e
++## explicit; go 1.25.0
++github.com/openshift/controller-runtime-common/pkg/tls
++# github.com/openshift/library-go v0.0.0-20260318140748-04979c746b4d
+ ## explicit; go 1.25.0
+ github.com/openshift/library-go/pkg/apiserver/jsonpatch
+ github.com/openshift/library-go/pkg/authorization/hardcodedauthorizer
+@@ -1676,14 +1677,17 @@ sigs.k8s.io/apiserver-network-proxy/konnectivity-client/pkg/client
+ sigs.k8s.io/apiserver-network-proxy/konnectivity-client/pkg/client/metrics
+ sigs.k8s.io/apiserver-network-proxy/konnectivity-client/pkg/common/metrics
+ sigs.k8s.io/apiserver-network-proxy/konnectivity-client/proto/client
+-# sigs.k8s.io/controller-runtime v0.23.1
++# sigs.k8s.io/controller-runtime v0.23.3
+ ## explicit; go 1.25.0
++sigs.k8s.io/controller-runtime
++sigs.k8s.io/controller-runtime/pkg/builder
+ sigs.k8s.io/controller-runtime/pkg/cache
+ sigs.k8s.io/controller-runtime/pkg/cache/internal
+ sigs.k8s.io/controller-runtime/pkg/certwatcher
+ sigs.k8s.io/controller-runtime/pkg/certwatcher/metrics
+ sigs.k8s.io/controller-runtime/pkg/client
+ sigs.k8s.io/controller-runtime/pkg/client/apiutil
++sigs.k8s.io/controller-runtime/pkg/client/config
+ sigs.k8s.io/controller-runtime/pkg/client/fake
+ sigs.k8s.io/controller-runtime/pkg/client/interceptor
+ sigs.k8s.io/controller-runtime/pkg/cluster
+@@ -1708,11 +1712,13 @@ sigs.k8s.io/controller-runtime/pkg/internal/syncs
+ sigs.k8s.io/controller-runtime/pkg/leaderelection
+ sigs.k8s.io/controller-runtime/pkg/log
+ sigs.k8s.io/controller-runtime/pkg/manager
++sigs.k8s.io/controller-runtime/pkg/manager/signals
+ sigs.k8s.io/controller-runtime/pkg/metrics
+ sigs.k8s.io/controller-runtime/pkg/metrics/server
+ sigs.k8s.io/controller-runtime/pkg/predicate
+ sigs.k8s.io/controller-runtime/pkg/reconcile
+ sigs.k8s.io/controller-runtime/pkg/recorder
++sigs.k8s.io/controller-runtime/pkg/scheme
+ sigs.k8s.io/controller-runtime/pkg/source
+ sigs.k8s.io/controller-runtime/pkg/webhook
+ sigs.k8s.io/controller-runtime/pkg/webhook/admission
+diff --git a/vendor/sigs.k8s.io/controller-runtime/.gitignore b/vendor/sigs.k8s.io/controller-runtime/.gitignore
+new file mode 100644
+index 0000000000..2ddc5a8b87
+--- /dev/null
++++ b/vendor/sigs.k8s.io/controller-runtime/.gitignore
+@@ -0,0 +1,30 @@
++# Binaries for programs and plugins
++*.exe
++*.exe~
++*.dll
++*.so
++*.dylib
++
++# Test binary, build with `go test -c`
++*.test
++
++# Output of the go coverage tool, specifically when used with LiteIDE
++*.out
++
++# editor and IDE paraphernalia
++.idea
++*.swp
++*.swo
++*~
++
++# Vscode files
++.vscode
++
++# Tools binaries.
++hack/tools/bin
++
++# Release artifacts
++tools/setup-envtest/out
++
++junit-report.xml
++/artifacts
+diff --git a/vendor/sigs.k8s.io/controller-runtime/.golangci.yml b/vendor/sigs.k8s.io/controller-runtime/.golangci.yml
+new file mode 100644
+index 0000000000..5c86af65a3
+--- /dev/null
++++ b/vendor/sigs.k8s.io/controller-runtime/.golangci.yml
+@@ -0,0 +1,209 @@
++version: "2"
++run:
++  go: "1.25"
++  timeout: 10m
++  allow-parallel-runners: true
++linters:
++  default: none
++  enable:
++    - asasalint
++    - asciicheck
++    - bidichk
++    - bodyclose
++    - copyloopvar
++    - depguard
++    - dogsled
++    - dupl
++    - errcheck
++    - errchkjson
++    - errorlint
++    - exhaustive
++    - forbidigo
++    - ginkgolinter
++    - goconst
++    - gocritic
++    - gocyclo
++    - godoclint
++    - goprintffuncname
++    - govet
++    - importas
++    - ineffassign
++    - iotamixing
++    - makezero
++    - misspell
++    - modernize
++    - nakedret
++    - nilerr
++    - nolintlint
++    - prealloc
++    - revive
++    - staticcheck
++    - tagliatelle
++    - unconvert
++    - unparam
++    - unused
++    - whitespace
++  settings:
++    depguard:
++      rules:
++        forbid-pkg-errors:
++          deny:
++            - pkg: sort
++              desc: Should be replaced with slices package
++    forbidigo:
++        forbid:
++          - pattern: context.Background
++            msg: Use ginkgos SpecContext or go testings t.Context instead
++          - pattern: context.TODO
++            msg: Use ginkgos SpecContext or go testings t.Context instead
++    govet:
++      disable:
++        - fieldalignment
++        - shadow
++        - buildtag
++      enable-all: true
++    importas:
++      alias:
++        - pkg: k8s.io/api/core/v1
++          alias: corev1
++        - pkg: k8s.io/apiextensions-apiserver/pkg/apis/apiextensions/v1
++          alias: apiextensionsv1
++        - pkg: k8s.io/apimachinery/pkg/apis/meta/v1
++          alias: metav1
++        - pkg: k8s.io/apimachinery/pkg/api/errors
++          alias: apierrors
++        - pkg: k8s.io/apimachinery/pkg/util/errors
++          alias: kerrors
++        - pkg: sigs.k8s.io/controller-runtime
++          alias: ctrl
++      no-unaliased: true
++    modernize:
++      disable:
++        - omitzero
++        - fmtappendf
++    revive:
++      rules:
++        # The following rules are recommended https://github.com/mgechev/revive#recommended-configuration
++        - name: blank-imports
++        - name: context-as-argument
++        - name: context-keys-type
++        - name: dot-imports
++        - name: error-return
++        - name: error-strings
++        - name: error-naming
++        - name: exported
++        - name: if-return
++        - name: increment-decrement
++        - name: var-naming
++        - name: var-declaration
++        - name: range
++        - name: receiver-naming
++        - name: time-naming
++        - name: unexported-return
++        - name: indent-error-flow
++        - name: errorf
++        - name: superfluous-else
++        - name: unreachable-code
++        - name: redefines-builtin-id
++        #
++        # Rules in addition to the recommended configuration above.
++        #
++        - name: bool-literal-in-expr
++        - name: constant-logical-expr
++  exclusions:
++    generated: strict
++    paths:
++      - zz_generated.*\.go$
++      - .*conversion.*\.go$
++    rules:
++      - linters:
++          - forbidigo
++        path-except: _test\.go
++      - linters:
++          - gosec
++        text: 'G108: Profiling endpoint is automatically exposed on /debug/pprof'
++      - linters:
++          - revive
++        text: 'exported: exported method .*\.(Reconcile|SetupWithManager|SetupWebhookWithManager) should have comment or be unexported'
++      - linters:
++          - errcheck
++        text: Error return value of .((os\.)?std(out|err)\..*|.*Close|.*Flush|os\.Remove(All)?|.*print(f|ln)?|os\.(Un)?Setenv). is not checked
++      - linters:
++          - staticcheck
++        text: 'SA1019: .*The component config package has been deprecated and will be removed in a future release.'
++      # With Go 1.16, the new embed directive can be used with an un-named import,
++      # revive (previously, golint) only allows these to be imported in a main.go, which wouldn't work for us.
++      # This directive allows the embed package to be imported with an underscore everywhere.
++      - linters:
++          - revive
++        source: _ "embed"
++      # Exclude some packages or code to require comments, for example test code, or fake clients.
++      - linters:
++          - revive
++        text: exported (method|function|type|const) (.+) should have comment or be unexported
++        source: (func|type).*Fake.*
++      - linters:
++          - revive
++        path: fake_\.go
++        text: exported (method|function|type|const) (.+) should have comment or be unexported
++      # Disable unparam "always receives" which might not be really
++      # useful when building libraries.
++      - linters:
++          - unparam
++        text: always receives
++      # Dot imports for gomega and ginkgo are allowed
++      # within test files.
++      - path: _test\.go
++        text: should not use dot imports
++      - path: _test\.go
++        text: cyclomatic complexity
++      - path: _test\.go
++        text: 'G107: Potential HTTP request made with variable url'
++      # Append should be able to assign to a different var/slice.
++      - linters:
++          - gocritic
++        text: 'appendAssign: append result not assigned to the same slice'
++      - linters:
++          - gocritic
++        text: 'singleCaseSwitch: should rewrite switch statement to if statement'
++      # It considers all file access to a filename that comes from a variable problematic,
++      # which is naiv at best.
++      - linters:
++          - gosec
++        text: 'G304: Potential file inclusion via variable'
++      - linters:
++          - dupl
++        path: _test\.go
++      - linters:
++          - revive
++        path: .*/internal/.*
++      - linters:
++          - unused
++        # Seems to incorrectly trigger on the two implementations that are only
++        # used through an interface and not directly..?
++        # Likely same issue as https://github.com/dominikh/go-tools/issues/1616
++        path: pkg/controller/priorityqueue/metrics\.go
++      # The following are being worked on to remove their exclusion. This list should be reduced or go away all together over time.
++      # If it is decided they will not be addressed they should be moved above this comment.
++      - path: (.+)\.go$
++        text: Subprocess launch(ed with variable|ing should be audited)
++      - linters:
++          - gosec
++        path: (.+)\.go$
++        text: (G204|G104|G307)
++      - linters:
++          - staticcheck
++        path: (.+)\.go$
++        text: (ST1000|QF1008)
++issues:
++  max-issues-per-linter: 0
++  max-same-issues: 0
++formatters:
++  enable:
++    - gofmt
++    - goimports
++  exclusions:
++    generated: strict
++    paths:
++      - zz_generated.*\.go$
++      - .*conversion.*\.go$
+diff --git a/vendor/sigs.k8s.io/controller-runtime/.gomodcheck.yaml b/vendor/sigs.k8s.io/controller-runtime/.gomodcheck.yaml
+new file mode 100644
+index 0000000000..3eaff8dc47
+--- /dev/null
++++ b/vendor/sigs.k8s.io/controller-runtime/.gomodcheck.yaml
+@@ -0,0 +1,21 @@
++upstreamRefs:
++  - k8s.io/api
++  - k8s.io/apiextensions-apiserver
++  - k8s.io/apimachinery
++  - k8s.io/apiserver
++  - k8s.io/client-go
++  - k8s.io/component-base
++  # k8s.io/klog/v2 -> conflicts with k/k deps
++  # k8s.io/utils -> conflicts with k/k deps
++
++excludedModules:
++  # Needs a newer version to fix https://github.com/kubernetes-sigs/controller-runtime/issues/3418
++  # This should not be needed by the time we update to 1.36
++  - sigs.k8s.io/structured-merge-diff/v6
++
++  # --- test dependencies:
++  - github.com/onsi/ginkgo/v2
++  - github.com/onsi/gomega
++
++  # --- We want a newer version with generics support for this
++  - github.com/google/btree
+diff --git a/vendor/sigs.k8s.io/controller-runtime/CONTRIBUTING.md b/vendor/sigs.k8s.io/controller-runtime/CONTRIBUTING.md
+new file mode 100644
+index 0000000000..2c0ea1f667
+--- /dev/null
++++ b/vendor/sigs.k8s.io/controller-runtime/CONTRIBUTING.md
+@@ -0,0 +1,19 @@
++# Contributing guidelines
++
++## Sign the CLA
++
++Kubernetes projects require that you sign a Contributor License Agreement (CLA) before we can accept your pull requests.
++  
++Please see https://git.k8s.io/community/CLA.md for more info
++
++## Contributing steps
++
++1. Submit an issue describing your proposed change to the repo in question.
++1. The [repo owners](OWNERS) will respond to your issue promptly.
++1. If your proposed change is accepted, and you haven't already done so, sign a Contributor License Agreement (see details above).
++1. Fork the desired repo, develop and test your code changes.
++1. Submit a pull request.
++
++## Test locally
++
++Run the command `make test` to test the changes locally.
+diff --git a/vendor/sigs.k8s.io/controller-runtime/FAQ.md b/vendor/sigs.k8s.io/controller-runtime/FAQ.md
+new file mode 100644
+index 0000000000..9c36c8112e
+--- /dev/null
++++ b/vendor/sigs.k8s.io/controller-runtime/FAQ.md
+@@ -0,0 +1,81 @@
++# FAQ
++
++### Q: How do I know which type of object a controller references?
++
++**A**: Each controller should only reconcile one object type.  Other
++affected objects should be mapped to a single type of root object, using
++the `handler.EnqueueRequestForOwner` or `handler.EnqueueRequestsFromMapFunc` event
++handlers, and potentially indices. Then, your Reconcile method should
++attempt to reconcile *all* state for that given root objects.
++
++### Q: How do I have different logic in my reconciler for different types of events (e.g. create, update, delete)?
++
++**A**: You should not. Reconcile functions should be idempotent, and
++should always reconcile state by reading all the state it needs, then
++writing updates.  This allows your reconciler to correctly respond to
++generic events, adjust to skipped or coalesced events, and easily deal
++with application startup.  The controller will enqueue reconcile requests
++for both old and new objects if a mapping changes, but it's your
++responsibility to make sure you have enough information to be able clean
++up state that's no longer referenced.
++
++### Q: My cache might be stale if I read from a cache! How should I deal with that?
++
++**A**: There are several different approaches that can be taken, depending
++on your situation.
++
++- When you can, take advantage of optimistic locking: use deterministic
++  names for objects you create, so that the Kubernetes API server will
++  warn you if the object already exists.  Many controllers in Kubernetes
++  take this approach: the StatefulSet controller appends a specific number
++  to each pod that it creates, while the Deployment controller hashes the
++  pod template spec and appends that.
++
++- In the few cases when you cannot take advantage of deterministic names
++  (e.g. when using generateName), it may be useful in to track which
++  actions you took, and assume that they need to be repeated if they don't
++  occur after a given time (e.g. using a requeue result).  This is what
++  the ReplicaSet controller does.
++
++In general, write your controller with the assumption that information
++will eventually be correct, but may be slightly out of date. Make sure
++that your reconcile function enforces the entire state of the world each
++time it runs.  If none of this works for you, you can always construct
++a client that reads directly from the API server, but this is generally
++considered to be a last resort, and the two approaches above should
++generally cover most circumstances.
++
++### Q: Where's the fake client?  How do I use it?
++
++**A**: The fake client
++[exists](https://pkg.go.dev/sigs.k8s.io/controller-runtime/pkg/client/fake),
++but we generally recommend using
++[envtest.Environment](https://pkg.go.dev/sigs.k8s.io/controller-runtime/pkg/envtest#Environment)
++to test against a real API server.  In our experience, tests using fake
++clients gradually re-implement poorly-written impressions of a real API
++server, which leads to hard-to-maintain, complex test code.
++
++### Q: How should I write tests?  Any suggestions for getting started?
++
++- Use the aforementioned
++  [envtest.Environment](https://pkg.go.dev/sigs.k8s.io/controller-runtime/pkg/envtest#Environment)
++  to spin up a real API server instead of trying to mock one out.
++
++- Structure your tests to check that the state of the world is as you
++  expect it, *not* that a particular set of API calls were made, when
++  working with Kubernetes APIs.  This will allow you to more easily
++  refactor and improve the internals of your controllers without changing
++  your tests.
++
++- Remember that any time you're interacting with the API server, changes
++  may have some delay between write time and reconcile time.
++
++### Q: What are these errors about no Kind being registered for a type?
++
++**A**: You're probably missing a fully-set-up Scheme.  Schemes record the
++mapping between Go types and group-version-kinds in Kubernetes. In
++general, your application should have its own Scheme containing the types
++from the API groups that it needs (be they Kubernetes types or your own).
++See the [scheme builder
++docs](https://pkg.go.dev/sigs.k8s.io/controller-runtime/pkg/scheme) for
++more information.
+diff --git a/vendor/sigs.k8s.io/controller-runtime/Makefile b/vendor/sigs.k8s.io/controller-runtime/Makefile
+new file mode 100644
+index 0000000000..1c1fb7f429
+--- /dev/null
++++ b/vendor/sigs.k8s.io/controller-runtime/Makefile
+@@ -0,0 +1,214 @@
++#!/usr/bin/env bash
++
++#  Copyright 2020 The Kubernetes Authors.
++#
++#  Licensed under the Apache License, Version 2.0 (the "License");
++#  you may not use this file except in compliance with the License.
++#  You may obtain a copy of the License at
++#
++#      http://www.apache.org/licenses/LICENSE-2.0
++#
++#  Unless required by applicable law or agreed to in writing, software
++#  distributed under the License is distributed on an "AS IS" BASIS,
++#  WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++#  See the License for the specific language governing permissions and
++#  limitations under the License.
++
++# If you update this file, please follow
++# https://suva.sh/posts/well-documented-makefiles
++
++## --------------------------------------
++## General
++## --------------------------------------
++
++SHELL:=/usr/bin/env bash
++.DEFAULT_GOAL:=help
++
++#
++# Go.
++#
++GO_VERSION ?= 1.25.0
++
++# Use GOPROXY environment variable if set
++GOPROXY := $(shell go env GOPROXY)
++ifeq ($(GOPROXY),)
++GOPROXY := https://proxy.golang.org
++endif
++export GOPROXY
++
++# Active module mode, as we use go modules to manage dependencies
++export GO111MODULE=on
++
++# Hosts running SELinux need :z added to volume mounts
++SELINUX_ENABLED := $(shell cat /sys/fs/selinux/enforce 2> /dev/null || echo 0)
++
++ifeq ($(SELINUX_ENABLED),1)
++  DOCKER_VOL_OPTS?=:z
++endif
++
++# Tools.
++TOOLS_DIR := hack/tools
++TOOLS_BIN_DIR := $(abspath $(TOOLS_DIR)/bin)
++GOLANGCI_LINT := $(abspath $(TOOLS_BIN_DIR)/golangci-lint)
++GO_APIDIFF := $(TOOLS_BIN_DIR)/go-apidiff
++CONTROLLER_GEN := $(TOOLS_BIN_DIR)/controller-gen
++ENVTEST_DIR := $(abspath tools/setup-envtest)
++SCRATCH_ENV_DIR := $(abspath examples/scratch-env)
++GO_INSTALL := ./hack/go-install.sh
++
++# The help will print out all targets with their descriptions organized bellow their categories. The categories are represented by `##@` and the target descriptions by `##`.
++# The awk commands is responsible to read the entire set of makefiles included in this invocation, looking for lines of the file as xyz: ## something, and then pretty-format the target and help. Then, if there's a line with ##@ something, that gets pretty-printed as a category.
++# More info over the usage of ANSI control characters for terminal formatting: https://en.wikipedia.org/wiki/ANSI_escape_code#SGR_parameters
++# More info over awk command: http://linuxcommand.org/lc3_adv_awk.php
++.PHONY: help
++help:  ## Display this help
++	@awk 'BEGIN {FS = ":.*##"; printf "\nUsage:\n  make \033[36m<target>\033[0m\n"} /^[a-zA-Z_0-9-]+:.*?##/ { printf "  \033[36m%-15s\033[0m %s\n", $$1, $$2 } /^##@/ { printf "\n\033[1m%s\033[0m\n", substr($$0, 5) } ' $(MAKEFILE_LIST)
++
++## --------------------------------------
++## Testing
++## --------------------------------------
++
++.PHONY: test
++test: ## Run the script check-everything.sh which will check all.
++	TRACE=1 ./hack/check-everything.sh
++
++## --------------------------------------
++## Binaries
++## --------------------------------------
++
++GO_APIDIFF_VER := v0.8.3
++GO_APIDIFF_BIN := go-apidiff
++GO_APIDIFF := $(abspath $(TOOLS_BIN_DIR)/$(GO_APIDIFF_BIN)-$(GO_APIDIFF_VER))
++GO_APIDIFF_PKG := github.com/joelanford/go-apidiff
++
++$(GO_APIDIFF): # Build go-apidiff from tools folder.
++	GOBIN=$(TOOLS_BIN_DIR) $(GO_INSTALL) $(GO_APIDIFF_PKG) $(GO_APIDIFF_BIN) $(GO_APIDIFF_VER)
++
++CONTROLLER_GEN_VER := v0.20.0
++CONTROLLER_GEN_BIN := controller-gen
++CONTROLLER_GEN := $(abspath $(TOOLS_BIN_DIR)/$(CONTROLLER_GEN_BIN)-$(CONTROLLER_GEN_VER))
++CONTROLLER_GEN_PKG := sigs.k8s.io/controller-tools/cmd/controller-gen
++
++$(CONTROLLER_GEN): # Build controller-gen from tools folder.
++	GOBIN=$(TOOLS_BIN_DIR) $(GO_INSTALL) $(CONTROLLER_GEN_PKG) $(CONTROLLER_GEN_BIN) $(CONTROLLER_GEN_VER)
++
++GOLANGCI_LINT_BIN := golangci-lint
++GOLANGCI_LINT_VER := $(shell cat .github/workflows/golangci-lint.yml | grep [[:space:]]version: | sed 's/.*version: //')
++GOLANGCI_LINT := $(abspath $(TOOLS_BIN_DIR)/$(GOLANGCI_LINT_BIN)-$(GOLANGCI_LINT_VER))
++GOLANGCI_LINT_PKG := github.com/golangci/golangci-lint/v2/cmd/golangci-lint
++
++$(GOLANGCI_LINT): # Build golangci-lint from tools folder.
++	GOBIN=$(TOOLS_BIN_DIR) $(GO_INSTALL) $(GOLANGCI_LINT_PKG) $(GOLANGCI_LINT_BIN) $(GOLANGCI_LINT_VER)
++
++GO_MOD_CHECK_DIR := $(abspath ./hack/tools/cmd/gomodcheck)
++GO_MOD_CHECK := $(abspath $(TOOLS_BIN_DIR)/gomodcheck)
++GO_MOD_CHECK_IGNORE := $(abspath .gomodcheck.yaml)
++.PHONY: $(GO_MOD_CHECK)
++$(GO_MOD_CHECK): # Build gomodcheck
++	go build -C $(GO_MOD_CHECK_DIR) -o $(GO_MOD_CHECK)
++
++## --------------------------------------
++## Linting
++## --------------------------------------
++
++.PHONY: lint
++lint: $(GOLANGCI_LINT) ## Lint codebase
++	$(GOLANGCI_LINT) run -v $(GOLANGCI_LINT_EXTRA_ARGS)
++	cd tools/setup-envtest; $(GOLANGCI_LINT) run -v $(GOLANGCI_LINT_EXTRA_ARGS)
++
++.PHONY: lint-fix
++lint-fix: $(GOLANGCI_LINT) ## Lint the codebase and run auto-fixers if supported by the linter.
++	GOLANGCI_LINT_EXTRA_ARGS=--fix $(MAKE) lint
++
++## --------------------------------------
++## Generate
++## --------------------------------------
++
++.PHONY: modules
++modules: ## Runs go mod to ensure modules are up to date.
++	go mod tidy
++	cd $(TOOLS_DIR); go mod tidy
++	cd $(ENVTEST_DIR); go mod tidy
++	cd $(SCRATCH_ENV_DIR); go mod tidy
++
++## --------------------------------------
++## Release
++## --------------------------------------
++
++RELEASE_DIR := tools/setup-envtest/out
++
++.PHONY: $(RELEASE_DIR)
++$(RELEASE_DIR):
++	mkdir -p $(RELEASE_DIR)/
++
++.PHONY: release
++release: clean-release $(RELEASE_DIR) ## Build release.
++	@if ! [ -z "$$(git status --porcelain)" ]; then echo "Your local git repository contains uncommitted changes, use git clean before proceeding."; exit 1; fi
++
++	# Build binaries first.
++	$(MAKE) release-binaries
++
++.PHONY: release-binaries
++release-binaries: ## Build release binaries.
++	RELEASE_BINARY=setup-envtest-linux-amd64       GOOS=linux   GOARCH=amd64   $(MAKE) release-binary
++	RELEASE_BINARY=setup-envtest-linux-arm64       GOOS=linux   GOARCH=arm64   $(MAKE) release-binary
++	RELEASE_BINARY=setup-envtest-linux-ppc64le     GOOS=linux   GOARCH=ppc64le $(MAKE) release-binary
++	RELEASE_BINARY=setup-envtest-linux-s390x       GOOS=linux   GOARCH=s390x   $(MAKE) release-binary
++	RELEASE_BINARY=setup-envtest-darwin-amd64      GOOS=darwin  GOARCH=amd64   $(MAKE) release-binary
++	RELEASE_BINARY=setup-envtest-darwin-arm64      GOOS=darwin  GOARCH=arm64   $(MAKE) release-binary
++	RELEASE_BINARY=setup-envtest-windows-amd64.exe GOOS=windows GOARCH=amd64   $(MAKE) release-binary
++
++.PHONY: release-binary
++release-binary: $(RELEASE_DIR)
++	docker run \
++		--rm \
++		-e CGO_ENABLED=0 \
++		-e GOOS=$(GOOS) \
++		-e GOARCH=$(GOARCH) \
++		-e GOCACHE=/tmp/ \
++		--user $$(id -u):$$(id -g) \
++		-v "$$(pwd):/workspace$(DOCKER_VOL_OPTS)" \
++		-w /workspace/tools/setup-envtest \
++		golang:$(GO_VERSION) \
++		go build -a -trimpath -ldflags "-X 'sigs.k8s.io/controller-runtime/tools/setup-envtest/version.version=$(RELEASE_TAG)' -extldflags '-static'" \
++		-o ./out/$(RELEASE_BINARY) ./
++
++## --------------------------------------
++## Cleanup / Verification
++## --------------------------------------
++
++.PHONY: clean
++clean: ## Cleanup.
++	$(GOLANGCI_LINT) cache clean
++	$(MAKE) clean-bin
++
++.PHONY: clean-bin
++clean-bin: ## Remove all generated binaries.
++	rm -rf hack/tools/bin
++
++.PHONY: clean-release
++clean-release: ## Remove the release folder
++	rm -rf $(RELEASE_DIR)
++
++.PHONY: verify-modules
++verify-modules: modules $(GO_MOD_CHECK) ## Verify go modules are up to date
++	@if !(git diff --quiet HEAD -- go.sum go.mod $(TOOLS_DIR)/go.mod $(TOOLS_DIR)/go.sum $(ENVTEST_DIR)/go.mod $(ENVTEST_DIR)/go.sum $(SCRATCH_ENV_DIR)/go.sum); then \
++		git diff; \
++		echo "go module files are out of date, please run 'make modules'"; exit 1; \
++	fi
++	$(GO_MOD_CHECK) $(GO_MOD_CHECK_IGNORE)
++
++APIDIFF_OLD_COMMIT ?= $(shell git rev-parse origin/main)
++
++.PHONY: apidiff
++verify-apidiff: $(GO_APIDIFF) ## Check for API differences
++	$(GO_APIDIFF) $(APIDIFF_OLD_COMMIT) --print-compatible
++
++## --------------------------------------
++## Helpers
++## --------------------------------------
++
++##@ helpers:
++
++go-version: ## Print the go version we use to compile our binaries and images
++	@echo $(GO_VERSION)
+diff --git a/vendor/sigs.k8s.io/controller-runtime/OWNERS b/vendor/sigs.k8s.io/controller-runtime/OWNERS
+new file mode 100644
+index 0000000000..9f2d296e4c
+--- /dev/null
++++ b/vendor/sigs.k8s.io/controller-runtime/OWNERS
+@@ -0,0 +1,11 @@
++# See the OWNERS docs: https://git.k8s.io/community/contributors/guide/owners.md
++
++approvers:
++  - controller-runtime-admins
++  - controller-runtime-maintainers
++  - controller-runtime-approvers
++reviewers:
++  - controller-runtime-admins
++  - controller-runtime-maintainers
++  - controller-runtime-approvers
++  - controller-runtime-reviewers
+diff --git a/vendor/sigs.k8s.io/controller-runtime/OWNERS_ALIASES b/vendor/sigs.k8s.io/controller-runtime/OWNERS_ALIASES
+new file mode 100644
+index 0000000000..47bf6eedf3
+--- /dev/null
++++ b/vendor/sigs.k8s.io/controller-runtime/OWNERS_ALIASES
+@@ -0,0 +1,39 @@
++# See the OWNERS docs: https://git.k8s.io/community/contributors/guide/owners.md
++
++aliases:
++  # active folks who can be contacted to perform admin-related
++  # tasks on the repo, or otherwise approve any PRS.
++  controller-runtime-admins:
++  - alvaroaleman
++  - joelanford
++  - sbueringer
++  - vincepri
++
++  # non-admin folks who have write-access and can approve any PRs in the repo
++  controller-runtime-maintainers:
++  - alvaroaleman
++  - joelanford
++  - sbueringer
++  - vincepri
++
++  # non-admin folks who can approve any PRs in the repo
++  controller-runtime-approvers:
++  - fillzpp
++
++  # folks who can review and LGTM any PRs in the repo (doesn't
++  # include approvers & admins -- those count too via the OWNERS
++  # file)
++  controller-runtime-reviewers:
++  - varshaprasad96
++  - inteon
++  - JoelSpeed
++  - troy0820
++
++  # folks who may have context on ancient history,
++  # but are no longer directly involved
++  controller-runtime-emeritus-maintainers:
++  - directxman12
++  controller-runtime-emeritus-admins:
++  - droot
++  - mengqiy
++  - pwittrock
+diff --git a/vendor/sigs.k8s.io/controller-runtime/README.md b/vendor/sigs.k8s.io/controller-runtime/README.md
+new file mode 100644
+index 0000000000..8549f4e880
+--- /dev/null
++++ b/vendor/sigs.k8s.io/controller-runtime/README.md
+@@ -0,0 +1,86 @@
++[![Go Report Card](https://goreportcard.com/badge/sigs.k8s.io/controller-runtime)](https://goreportcard.com/report/sigs.k8s.io/controller-runtime)
++[![godoc](https://pkg.go.dev/badge/sigs.k8s.io/controller-runtime)](https://pkg.go.dev/sigs.k8s.io/controller-runtime)
++
++# Kubernetes controller-runtime Project
++
++The Kubernetes controller-runtime Project is a set of go libraries for building
++Controllers. It is leveraged by [Kubebuilder](https://book.kubebuilder.io/) and
++[Operator SDK](https://github.com/operator-framework/operator-sdk). Both are
++a great place to start for new projects. See
++[Kubebuilder's Quick Start](https://book.kubebuilder.io/quick-start.html) to
++see how it can be used.
++
++Documentation:
++
++- [Package overview](https://pkg.go.dev/sigs.k8s.io/controller-runtime/pkg)
++- [Basic controller using builder](https://pkg.go.dev/sigs.k8s.io/controller-runtime/pkg/builder#example-Builder)
++- [Creating a manager](https://pkg.go.dev/sigs.k8s.io/controller-runtime/pkg/manager#example-New)
++- [Creating a controller](https://pkg.go.dev/sigs.k8s.io/controller-runtime/pkg/controller#example-New)
++- [Examples](https://github.com/kubernetes-sigs/controller-runtime/blob/main/examples)
++- [Designs](https://github.com/kubernetes-sigs/controller-runtime/blob/main/designs)
++
++# Versioning, Maintenance, and Compatibility
++
++The full documentation can be found at [VERSIONING.md](VERSIONING.md), but TL;DR:
++
++Users:
++
++- We stick to a zero major version
++- We publish a minor version for each Kubernetes minor release and allow breaking changes between minor versions
++- We publish patch versions as needed and we don't allow breaking changes in them
++
++Contributors:
++
++- All code PR must be labeled with :bug: (patch fixes), :sparkles: (backwards-compatible features), or :warning: (breaking changes)
++- Breaking changes will find their way into the next major release, other changes will go into an semi-immediate patch or minor release
++- For a quick PR template suggesting the right information, use one of these PR templates:
++  * [Breaking Changes/Features](/.github/PULL_REQUEST_TEMPLATE/breaking_change.md)
++  * [Backwards-Compatible Features](/.github/PULL_REQUEST_TEMPLATE/compat_feature.md)
++  * [Bug fixes](/.github/PULL_REQUEST_TEMPLATE/bug_fix.md)
++  * [Documentation Changes](/.github/PULL_REQUEST_TEMPLATE/docs.md)
++  * [Test/Build/Other Changes](/.github/PULL_REQUEST_TEMPLATE/other.md)
++
++## Compatibility
++
++Every minor version of controller-runtime has been tested with a specific minor version of client-go. A controller-runtime minor version *may* be compatible with
++other client-go minor versions, but this is by chance and neither supported nor tested. In general, we create one minor version of controller-runtime
++for each minor version of client-go and other k8s.io/* dependencies.
++
++The minimum Go version of controller-runtime is the highest minimum Go version of our Go dependencies. Usually, this will
++be identical to the minimum Go version of the corresponding k8s.io/* dependencies.
++
++Compatible k8s.io/*, client-go and minimum Go versions can be looked up in our [go.mod](go.mod) file.
++
++|          | k8s.io/*, client-go | minimum Go version |
++|----------|:-------------------:|:------------------:|
++| CR v0.22 |        v0.34        |        1.24        |
++| CR v0.21 |        v0.33        |        1.24        |
++| CR v0.20 |        v0.32        |        1.23        |
++| CR v0.19 |        v0.31        |        1.22        |
++| CR v0.18 |        v0.30        |        1.22        |
++| CR v0.17 |        v0.29        |        1.21        |
++| CR v0.16 |        v0.28        |        1.20        |
++| CR v0.15 |        v0.27        |        1.20        |
++
++## FAQ
++
++See [FAQ.md](FAQ.md)
++
++## Community, discussion, contribution, and support
++
++Learn how to engage with the Kubernetes community on the [community page](http://kubernetes.io/community/).
++
++You can reach the maintainers of this project at:
++
++- Slack channel: [#controller-runtime](https://kubernetes.slack.com/archives/C02MRBMN00Z)
++- Google Group: [kubebuilder@googlegroups.com](https://groups.google.com/forum/#!forum/kubebuilder)
++
++## Contributing
++
++Contributions are greatly appreciated. The maintainers actively manage the issues list, and try to highlight issues suitable for newcomers.
++The project follows the typical GitHub pull request model. See [CONTRIBUTING.md](CONTRIBUTING.md) for more details.
++Before starting any work, please either comment on an existing issue, or file a new one.
++
++## Code of conduct
++
++Participation in the Kubernetes community is governed by the [Kubernetes Code of Conduct](code-of-conduct.md).
+diff --git a/vendor/sigs.k8s.io/controller-runtime/RELEASE.md b/vendor/sigs.k8s.io/controller-runtime/RELEASE.md
+new file mode 100644
+index 0000000000..2a857b976e
+--- /dev/null
++++ b/vendor/sigs.k8s.io/controller-runtime/RELEASE.md
+@@ -0,0 +1,51 @@
++# Release Process
++
++The Kubernetes controller-runtime Project is released on an as-needed basis. The process is as follows:
++
++**Note:** Releases are done from the `release-MAJOR.MINOR` branches. For PATCH releases is not required
++to create a new branch you will just need to ensure that all big fixes are cherry-picked into the respective
++`release-MAJOR.MINOR` branch. To know more about versioning check https://semver.org/.
++
++## How to do a release
++
++### Create the new branch and the release tag
++
++1. Create a new branch `git checkout -b release-<MAJOR.MINOR>` from main
++2. Push the new branch to the remote repository
++
++### Now, let's generate the changelog
++
++1. Create the changelog from the new branch `release-<MAJOR.MINOR>` (`git checkout release-<MAJOR.MINOR>`).
++You will need to use the [kubebuilder-release-tools][kubebuilder-release-tools] to generate the notes. See [here][release-notes-generation]
++
++> **Note**
++> - You will need to have checkout locally from the remote repository the previous branch
++> - Also, ensure that you fetch all tags from the remote `git fetch --all --tags`
++
++### Draft a new release from GitHub
++
++1. Create a new tag with the correct version from the new `release-<MAJOR.MINOR>` branch
++2. Add the changelog on it and publish. Now, the code source is released !
++
++### Add a new Prow test the for the new branch release
++
++1. Create a new prow test under [github.com/kubernetes/test-infra/tree/master/config/jobs/kubernetes-sigs/controller-runtime](https://github.com/kubernetes/test-infra/tree/master/config/jobs/kubernetes-sigs/controller-runtime)
++for the new `release-<MAJOR.MINOR>` branch. (i.e. for the `0.11.0` release see the PR: https://github.com/kubernetes/test-infra/pull/25205)
++2. Ping the infra PR in the controller-runtime slack channel for reviews.
++
++### Announce the new release:
++
++1. Publish on the Slack channel the new release, i.e:
++
++````
++:announce: Controller-Runtime v0.12.0 has been released!
++This release includes a Kubernetes dependency bump to v1.24.
++For more info, see the release page: https://github.com/kubernetes-sigs/controller-runtime/releases.
++ :tada:  Thanks to all our contributors!
++````
++
++2. An announcement email is sent to `kubebuilder@googlegroups.com` with the subject `[ANNOUNCE] Controller-Runtime $VERSION is released`
++
++[kubebuilder-release-tools]: https://github.com/kubernetes-sigs/kubebuilder-release-tools
++[release-notes-generation]: https://github.com/kubernetes-sigs/kubebuilder-release-tools/blob/master/README.md#release-notes-generation
++[release-process]: https://github.com/kubernetes-sigs/kubebuilder/blob/master/VERSIONING.md#releasing
+diff --git a/vendor/sigs.k8s.io/controller-runtime/SECURITY_CONTACTS b/vendor/sigs.k8s.io/controller-runtime/SECURITY_CONTACTS
+new file mode 100644
+index 0000000000..9c5241c6b4
+--- /dev/null
++++ b/vendor/sigs.k8s.io/controller-runtime/SECURITY_CONTACTS
+@@ -0,0 +1,15 @@
++# Defined below are the security contacts for this repo.
++#
++# They are the contact point for the Product Security Team to reach out
++# to for triaging and handling of incoming issues.
++#
++# The below names agree to abide by the
++# [Embargo Policy](https://github.com/kubernetes/sig-release/blob/master/security-release-process-documentation/security-release-process.md#embargo-policy)
++# and will be removed and replaced if they violate that agreement.
++#
++# DO NOT REPORT SECURITY VULNERABILITIES DIRECTLY TO THESE NAMES, FOLLOW THE
++# INSTRUCTIONS AT https://kubernetes.io/security/
++
++alvaroaleman
++sbueringer
++vincepri
+diff --git a/vendor/sigs.k8s.io/controller-runtime/TMP-LOGGING.md b/vendor/sigs.k8s.io/controller-runtime/TMP-LOGGING.md
+new file mode 100644
+index 0000000000..97e091fd48
+--- /dev/null
++++ b/vendor/sigs.k8s.io/controller-runtime/TMP-LOGGING.md
+@@ -0,0 +1,169 @@
++Logging Guidelines
++==================
++
++controller-runtime uses a kind of logging called *structured logging*. If
++you've used a library like Zap or logrus before, you'll be familiar with
++the concepts we use.  If you've only used a logging library like the "log"
++package (in the Go standard library) or "glog" (in Kubernetes), you'll
++need to adjust how you think about logging a bit.
++
++### Getting Started With Structured Logging
++
++With structured logging, we associate a *constant* log message with some
++variable key-value pairs.  For instance, suppose we wanted to log that we
++were starting reconciliation on a pod.  In the Go standard library logger,
++we might write:
++
++```go
++log.Printf("starting reconciliation for pod %s/%s", podNamespace, podName)
++```
++
++In controller-runtime, we'd instead write:
++
++```go
++logger.Info("starting reconciliation", "pod", req.NamespacedName)
++```
++
++or even write
++
++```go
++func (r *Reconciler) Reconcile(req reconcile.Request) (reconcile.Response, error) {
++    logger := logger.WithValues("pod", req.NamespacedName)
++    // do some stuff
++    logger.Info("starting reconciliation")
++}
++```
++
++Notice how we've broken out the information that we want to convey into
++a constant message (`"starting reconciliation"`) and some key-value pairs
++that convey variable information (`"pod", req.NamespacedName`).  We've
++there-by added "structure" to our logs, which makes them easier to save
++and search later, as well as correlate with metrics and events.
++
++All of controller-runtime's logging is done via
++[logr](https://github.com/go-logr/logr), a generic interface for
++structured logging.  You can use whichever logging library you want to
++implement the actual mechanics of the logging.  controller-runtime
++provides some helpers to make it easy to use
++[Zap](https://go.uber.org/zap) as the implementation.
++
++You can configure the logging implementation using
++`"sigs.k8s.io/controller-runtime/pkg/log".SetLogger`.  That
++package also contains the convenience functions for setting up Zap.
++
++You can get a handle to the "root" logger using
++`"sigs.k8s.io/controller-runtime/pkg/log".Log`, and can then call
++`WithName` to create individual named loggers.  You can call `WithName`
++repeatedly to chain names together:
++
++```go
++logger := log.Log.WithName("controller").WithName("replicaset")
++// in reconcile...
++logger = logger.WithValues("replicaset", req.NamespacedName)
++// later on in reconcile...
++logger.Info("doing things with pods", "pod", newPod)
++```
++
++As seen above, you can also call `WithValue` to create a new sub-logger
++that always attaches some key-value pairs to a logger.
++
++Finally, you can use `V(1)` to mark a particular log line as "debug" logs:
++
++```go
++logger.V(1).Info("this is particularly verbose!", "state of the world",
++allKubernetesObjectsEverywhere)
++```
++
++While it's possible to use higher log levels, it's recommended that you
++stick with `V(1)` or `V(0)` (which is equivalent to not specifying `V`),
++and then filter later based on key-value pairs or messages; different
++numbers tend to lose meaning easily over time, and you'll be left
++wondering why particular logs lines are at `V(5)` instead of `V(7)`.
++
++## Logging errors
++
++Errors should *always* be logged with `log.Error`, which allows logr
++implementations to provide special handling of errors (for instance,
++providing stack traces in debug mode).
++
++It's acceptable to log call `log.Error` with a nil error object.  This
++conveys that an error occurred in some capacity, but that no actual
++`error` object was involved.
++
++Errors returned by the `Reconcile` implementation of the `Reconciler` interface are commonly logged as a `Reconciler error`.
++It's a developer choice to create an additional error log in the `Reconcile` implementation so a more specific file name and line for the error are returned. 
++
++## Logging messages
++
++- Don't put variable content in your messages -- use key-value pairs for
++  that. Never use `fmt.Sprintf` in your message.
++
++- Try to match the terminology in your messages with your key-value pairs
++  -- for instance, if you have a key-value pairs `api version`, use the
++  term `APIVersion` instead of `GroupVersion` in your message.
++
++## Logging Kubernetes Objects
++
++Kubernetes objects should be logged directly, like `log.Info("this is
++a Kubernetes object", "pod", somePod)`.  controller-runtime provides
++a special encoder for Zap that will transform Kubernetes objects into
++`name, namespace, apiVersion, kind` objects, when available and not in
++development mode.  Other logr implementations should implement similar
++logic.
++
++## Logging Structured Values (Key-Value pairs)
++
++- Use lower-case, space separated keys.  For example `object` for objects,
++  `api version` for `APIVersion`
++
++- Be consistent across your application, and with controller-runtime when
++  possible.
++
++- Try to be brief but descriptive.
++
++- Match terminology in keys with terminology in the message.
++
++- Be careful logging non-Kubernetes objects verbatim if they're very
++  large.
++
++### Groups, Versions, and Kinds
++
++- Kinds should not be logged alone (they're meaningless alone).  Use
++  a `GroupKind` object to log them instead, or a `GroupVersionKind` when
++  version is relevant.
++
++- If you need to log an API version string, use `api version` as the key
++  (formatted as with a `GroupVersion`, or as received directly from API
++  discovery).
++
++### Objects and Types
++
++- If code works with a generic Kubernetes `runtime.Object`, use the
++  `object` key.  For specific objects, prefer the resource name as the key
++  (e.g. `pod` for `v1.Pod` objects).
++
++- For non-Kubernetes objects, the `object` key may also be used, if you
++  accept a generic interface.
++
++- When logging a raw type, log it using the `type` key, with a value of
++  `fmt.Sprintf("%T", typ)`
++
++- If there's specific context around a type, the key may be more specific,
++  but should end with `type` -- for instance, `OwnerType` should be logged
++  as `owner` in the context of `log.Error(err, "Could not get ObjectKinds
++  for OwnerType", `owner type`, fmt.Sprintf("%T"))`.  When possible, favor
++  communicating kind instead.
++
++### Multiple things
++
++- When logging multiple things, simply pluralize the key.
++
++### controller-runtime Specifics
++
++- Reconcile requests should be logged as `request`, although normal code
++  should favor logging the key.
++
++- Reconcile keys should be logged as with the same key as if you were
++  logging the object directly (e.g. `log.Info("reconciling pod", "pod",
++  req.NamespacedName)`).  This ends up having a similar effect to logging
++  the object directly.
+diff --git a/vendor/sigs.k8s.io/controller-runtime/VERSIONING.md b/vendor/sigs.k8s.io/controller-runtime/VERSIONING.md
+new file mode 100644
+index 0000000000..7ad6b142cc
+--- /dev/null
++++ b/vendor/sigs.k8s.io/controller-runtime/VERSIONING.md
+@@ -0,0 +1,40 @@
++# Versioning and Branching in controller-runtime
++
++We follow the [common KubeBuilder versioning guidelines][guidelines], and
++use the corresponding tooling.
++
++For the purposes of the aforementioned guidelines, controller-runtime
++counts as a "library project", but otherwise follows the guidelines
++exactly.
++
++We stick to a major version of zero and create a minor version for
++each Kubernetes minor version and we allow breaking changes in our
++minor versions. We create patch releases as needed and don't allow
++breaking changes in them.
++
++Publishing a non-zero major version is pointless for us, as the k8s.io/*
++libraries we heavily depend on do breaking changes but use the same
++versioning scheme as described above. Consequently, a project can only
++ever depend on one controller-runtime version.
++
++[guidelines]: https://sigs.k8s.io/kubebuilder-release-tools/VERSIONING.md
++
++## Compatibility and Release Support
++
++For release branches, we generally tend to support backporting one (1)
++major release (`release-{X-1}` or `release-0.{Y-1}`), but may go back
++further if the need arises and is very pressing (e.g. security updates).
++
++### Dependency Support
++
++Note the [guidelines on dependency versions][dep-versions].  Particularly:
++
++- We **DO** guarantee Kubernetes REST API compatibility -- if a given
++  version of controller-runtime stops working with what should be
++  a supported version of Kubernetes, this is almost certainly a bug.
++
++- We **DO NOT** guarantee any particular compatibility matrix between
++  kubernetes library dependencies (client-go, apimachinery, etc); Such
++  compatibility is infeasible due to the way those libraries are versioned.
++
++[dep-versions]: https://sigs.k8s.io/kubebuilder-release-tools/VERSIONING.md#kubernetes-version-compatibility
+diff --git a/vendor/sigs.k8s.io/controller-runtime/alias.go b/vendor/sigs.k8s.io/controller-runtime/alias.go
+new file mode 100644
+index 0000000000..e2ac45a5e0
+--- /dev/null
++++ b/vendor/sigs.k8s.io/controller-runtime/alias.go
+@@ -0,0 +1,168 @@
++/*
++Copyright 2018 The Kubernetes Authors.
++
++Licensed under the Apache License, Version 2.0 (the "License");
++you may not use this file except in compliance with the License.
++You may obtain a copy of the License at
++
++    http://www.apache.org/licenses/LICENSE-2.0
++
++Unless required by applicable law or agreed to in writing, software
++distributed under the License is distributed on an "AS IS" BASIS,
++WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++See the License for the specific language governing permissions and
++limitations under the License.
++*/
++
++package controllerruntime
++
++import (
++	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
++	"k8s.io/apimachinery/pkg/runtime"
++	"k8s.io/apimachinery/pkg/runtime/schema"
++	"sigs.k8s.io/controller-runtime/pkg/builder"
++	"sigs.k8s.io/controller-runtime/pkg/client/config"
++	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
++	"sigs.k8s.io/controller-runtime/pkg/log"
++	"sigs.k8s.io/controller-runtime/pkg/manager"
++	"sigs.k8s.io/controller-runtime/pkg/manager/signals"
++	"sigs.k8s.io/controller-runtime/pkg/reconcile"
++	"sigs.k8s.io/controller-runtime/pkg/scheme"
++)
++
++// Builder builds an Application ControllerManagedBy (e.g. Operator) and returns a manager.Manager to start it.
++type Builder = builder.Builder
++
++// Request contains the information necessary to reconcile a Kubernetes object.  This includes the
++// information to uniquely identify the object - its Name and Namespace.  It does NOT contain information about
++// any specific Event or the object contents itself.
++type Request = reconcile.Request
++
++// Result contains the result of a Reconciler invocation.
++type Result = reconcile.Result
++
++// Manager initializes shared dependencies such as Caches and Clients, and provides them to Runnables.
++// A Manager is required to create Controllers.
++type Manager = manager.Manager
++
++// Options are the arguments for creating a new Manager.
++type Options = manager.Options
++
++// SchemeBuilder builds a new Scheme for mapping go types to Kubernetes GroupVersionKinds.
++type SchemeBuilder = scheme.Builder
++
++// GroupVersion contains the "group" and the "version", which uniquely identifies the API.
++type GroupVersion = schema.GroupVersion
++
++// GroupResource specifies a Group and a Resource, but does not force a version.  This is useful for identifying
++// concepts during lookup stages without having partially valid types.
++type GroupResource = schema.GroupResource
++
++// TypeMeta describes an individual object in an API response or request
++// with strings representing the type of the object and its API schema version.
++// Structures that are versioned or persisted should inline TypeMeta.
++//
++// +k8s:deepcopy-gen=false
++type TypeMeta = metav1.TypeMeta
++
++// ObjectMeta is metadata that all persisted resources must have, which includes all objects
++// users must create.
++type ObjectMeta = metav1.ObjectMeta
++
++var (
++	// RegisterFlags registers flag variables to the given FlagSet if not already registered.
++	// It uses the default command line FlagSet, if none is provided. Currently, it only registers the kubeconfig flag.
++	RegisterFlags = config.RegisterFlags
++
++	// GetConfigOrDie creates a *rest.Config for talking to a Kubernetes apiserver.
++	// If --kubeconfig is set, will use the kubeconfig file at that location.  Otherwise will assume running
++	// in cluster and use the cluster provided kubeconfig.
++	//
++	// The returned `*rest.Config` has client-side ratelimting disabled as we can rely on API priority and
++	// fairness. Set its QPS to a value equal or bigger than 0 to re-enable it.
++	//
++	// Will log an error and exit if there is an error creating the rest.Config.
++	GetConfigOrDie = config.GetConfigOrDie
++
++	// GetConfig creates a *rest.Config for talking to a Kubernetes apiserver.
++	// If --kubeconfig is set, will use the kubeconfig file at that location.  Otherwise will assume running
++	// in cluster and use the cluster provided kubeconfig.
++	//
++	// The returned `*rest.Config` has client-side ratelimting disabled as we can rely on API priority and
++	// fairness. Set its QPS to a value equal or bigger than 0 to re-enable it.
++	//
++	// Config precedence
++	//
++	// * --kubeconfig flag pointing at a file
++	//
++	// * KUBECONFIG environment variable pointing at a file
++	//
++	// * In-cluster config if running in cluster
++	//
++	// * $HOME/.kube/config if exists.
++	GetConfig = config.GetConfig
++
++	// NewControllerManagedBy returns a new controller builder that will be started by the provided Manager.
++	NewControllerManagedBy = builder.ControllerManagedBy
++
++	// NewManager returns a new Manager for creating Controllers.
++	// Note that if ContentType in the given config is not set, "application/vnd.kubernetes.protobuf"
++	// will be used for all built-in resources of Kubernetes, and "application/json" is for other types
++	// including all CRD resources.
++	NewManager = manager.New
++
++	// CreateOrPatch creates or patches the given object obj in the Kubernetes
++	// cluster. The object's desired state should be reconciled with the existing
++	// state using the passed in ReconcileFn. obj must be a struct pointer so that
++	// obj can be patched with the content returned by the Server.
++	//
++	// It returns the executed operation and an error.
++	CreateOrPatch = controllerutil.CreateOrPatch
++
++	// CreateOrUpdate creates or updates the given object obj in the Kubernetes
++	// cluster. The object's desired state should be reconciled with the existing
++	// state using the passed in ReconcileFn. obj must be a struct pointer so that
++	// obj can be updated with the content returned by the Server.
++	//
++	// It returns the executed operation and an error.
++	CreateOrUpdate = controllerutil.CreateOrUpdate
++
++	// SetControllerReference sets owner as a Controller OwnerReference on owned.
++	// This is used for garbage collection of the owned object and for
++	// reconciling the owner object on changes to owned (with a Watch + EnqueueRequestForOwner).
++	// Since only one OwnerReference can be a controller, it returns an error if
++	// there is another OwnerReference with Controller flag set.
++	SetControllerReference = controllerutil.SetControllerReference
++
++	// SetupSignalHandler registers for SIGTERM and SIGINT. A context is returned
++	// which is canceled on one of these signals. If a second signal is caught, the program
++	// is terminated with exit code 1.
++	SetupSignalHandler = signals.SetupSignalHandler
++
++	// Log is the base logger used by controller-runtime.  It delegates
++	// to another logr.Logger.  You *must* call SetLogger to
++	// get any actual logging.
++	Log = log.Log
++
++	// LoggerFrom returns a logger with predefined values from a context.Context.
++	// The logger, when used with controllers, can be expected to contain basic information about the object
++	// that's being reconciled like:
++	// - `reconciler group` and `reconciler kind` coming from the For(...) object passed in when building a controller.
++	// - `name` and `namespace` from the reconciliation request.
++	//
++	// This is meant to be used with the context supplied in a struct that satisfies the Reconciler interface.
++	LoggerFrom = log.FromContext
++
++	// LoggerInto takes a context and sets the logger as one of its keys.
++	//
++	// This is meant to be used in reconcilers to enrich the logger within a context with additional values.
++	LoggerInto = log.IntoContext
++
++	// SetLogger sets a concrete logging implementation for all deferred Loggers.
++	SetLogger = log.SetLogger
++)
++
++// NewWebhookManagedBy returns a new webhook builder for the provided type T.
++func NewWebhookManagedBy[T runtime.Object](mgr manager.Manager, obj T) *builder.WebhookBuilder[T] {
++	return builder.WebhookManagedBy(mgr, obj)
++}
+diff --git a/vendor/sigs.k8s.io/controller-runtime/code-of-conduct.md b/vendor/sigs.k8s.io/controller-runtime/code-of-conduct.md
+new file mode 100644
+index 0000000000..0d15c00cf3
+--- /dev/null
++++ b/vendor/sigs.k8s.io/controller-runtime/code-of-conduct.md
+@@ -0,0 +1,3 @@
++# Kubernetes Community Code of Conduct
++
++Please refer to our [Kubernetes Community Code of Conduct](https://git.k8s.io/community/code-of-conduct.md)
+diff --git a/vendor/sigs.k8s.io/controller-runtime/doc.go b/vendor/sigs.k8s.io/controller-runtime/doc.go
+new file mode 100644
+index 0000000000..75d1d908c5
+--- /dev/null
++++ b/vendor/sigs.k8s.io/controller-runtime/doc.go
+@@ -0,0 +1,128 @@
++/*
++Copyright 2018 The Kubernetes Authors.
++
++Licensed under the Apache License, Version 2.0 (the "License");
++you may not use this file except in compliance with the License.
++You may obtain a copy of the License at
++
++    http://www.apache.org/licenses/LICENSE-2.0
++
++Unless required by applicable law or agreed to in writing, software
++distributed under the License is distributed on an "AS IS" BASIS,
++WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++See the License for the specific language governing permissions and
++limitations under the License.
++*/
++
++// Package controllerruntime provides tools to construct Kubernetes-style
++// controllers that manipulate both Kubernetes CRDs and aggregated/built-in
++// Kubernetes APIs.
++//
++// It defines easy helpers for the common use cases when building CRDs, built
++// on top of customizable layers of abstraction.  Common cases should be easy,
++// and uncommon cases should be possible.  In general, controller-runtime tries
++// to guide users towards Kubernetes controller best-practices.
++//
++// # Getting Started
++//
++// The main entrypoint for controller-runtime is this root package, which
++// contains all of the common types needed to get started building controllers:
++//
++//	import (
++//		ctrl "sigs.k8s.io/controller-runtime"
++//	)
++//
++// The examples in this package walk through a basic controller setup.  The
++// kubebuilder book (https://book.kubebuilder.io) has some more in-depth
++// walkthroughs.
++//
++// controller-runtime favors structs with sane defaults over constructors, so
++// it's fairly common to see structs being used directly in controller-runtime.
++//
++// # Organization
++//
++// A brief-ish walkthrough of the layout of this library can be found below. Each
++// package contains more information about how to use it.
++//
++// Frequently asked questions about using controller-runtime and designing
++// controllers can be found at
++// https://github.com/kubernetes-sigs/controller-runtime/blob/main/FAQ.md.
++//
++// # Managers
++//
++// Every controller and webhook is ultimately run by a Manager (pkg/manager). A
++// manager is responsible for running controllers and webhooks, and setting up
++// common dependencies, like shared caches and clients, as
++// well as managing leader election (pkg/leaderelection).  Managers are
++// generally configured to gracefully shut down controllers on pod termination
++// by wiring up a signal handler (pkg/manager/signals).
++//
++// # Controllers
++//
++// Controllers (pkg/controller) use events (pkg/event) to eventually trigger
++// reconcile requests.  They may be constructed manually, but are often
++// constructed with a Builder (pkg/builder), which eases the wiring of event
++// sources (pkg/source), like Kubernetes API object changes, to event handlers
++// (pkg/handler), like "enqueue a reconcile request for the object owner".
++// Predicates (pkg/predicate) can be used to filter which events actually
++// trigger reconciles.  There are pre-written utilities for the common cases, and
++// interfaces and helpers for advanced cases.
++//
++// # Reconcilers
++//
++// Controller logic is implemented in terms of Reconcilers (pkg/reconcile).  A
++// Reconciler implements a function which takes a reconcile Request containing
++// the name and namespace of the object to reconcile, reconciles the object,
++// and returns a Response or an error indicating whether to requeue for a
++// second round of processing.
++//
++// # Clients and Caches
++//
++// Reconcilers use Clients (pkg/client) to access API objects.  The default
++// client provided by the manager reads from a local shared cache (pkg/cache)
++// and writes directly to the API server, but clients can be constructed that
++// only talk to the API server, without a cache.  The Cache will auto-populate
++// with watched objects, as well as when other structured objects are
++// requested. The default split client does not promise to invalidate the cache
++// during writes (nor does it promise sequential create/get coherence), and code
++// should not assume a get immediately following a create/update will return
++// the updated resource. Caches may also have indexes, which can be created via
++// a FieldIndexer (pkg/client) obtained from the manager.  Indexes can be used to
++// quickly and easily look up all objects with certain fields set.  Reconcilers
++// may retrieve event recorders (pkg/recorder) to emit events using the
++// manager.
++//
++// # Schemes
++//
++// Clients, Caches, and many other things in Kubernetes use Schemes
++// (pkg/scheme) to associate Go types to Kubernetes API Kinds
++// (Group-Version-Kinds, to be specific).
++//
++// # Webhooks
++//
++// Similarly, webhooks (pkg/webhook/admission) may be implemented directly, but
++// are often constructed using a builder (pkg/webhook/admission/builder).  They
++// are run via a server (pkg/webhook) which is managed by a Manager.
++//
++// # Logging and Metrics
++//
++// Logging (pkg/log) in controller-runtime is done via structured logs, using a
++// log set of interfaces called logr
++// (https://pkg.go.dev/github.com/go-logr/logr).  While controller-runtime
++// provides easy setup for using Zap (https://go.uber.org/zap, pkg/log/zap),
++// you can provide any implementation of logr as the base logger for
++// controller-runtime.
++//
++// Metrics (pkg/metrics) provided by controller-runtime are registered into a
++// controller-runtime-specific Prometheus metrics registry.  The manager can
++// serve these by an HTTP endpoint, and additional metrics may be registered to
++// this Registry as normal.
++//
++// # Testing
++//
++// You can easily build integration and unit tests for your controllers and
++// webhooks using the test Environment (pkg/envtest).  This will automatically
++// stand up a copy of etcd and kube-apiserver, and provide the correct options
++// to connect to the API server.  It's designed to work well with the Ginkgo
++// testing framework, but should work with any testing setup.
++package controllerruntime
+diff --git a/vendor/sigs.k8s.io/controller-runtime/pkg/builder/controller.go b/vendor/sigs.k8s.io/controller-runtime/pkg/builder/controller.go
+new file mode 100644
+index 0000000000..840e27b679
+--- /dev/null
++++ b/vendor/sigs.k8s.io/controller-runtime/pkg/builder/controller.go
+@@ -0,0 +1,466 @@
++/*
++Copyright 2018 The Kubernetes Authors.
++
++Licensed under the Apache License, Version 2.0 (the "License");
++you may not use this file except in compliance with the License.
++You may obtain a copy of the License at
++
++    http://www.apache.org/licenses/LICENSE-2.0
++
++Unless required by applicable law or agreed to in writing, software
++distributed under the License is distributed on an "AS IS" BASIS,
++WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++See the License for the specific language governing permissions and
++limitations under the License.
++*/
++
++package builder
++
++import (
++	"errors"
++	"fmt"
++	"reflect"
++	"strings"
++
++	"github.com/go-logr/logr"
++	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
++	"k8s.io/apimachinery/pkg/runtime/schema"
++	"k8s.io/klog/v2"
++
++	"sigs.k8s.io/controller-runtime/pkg/client"
++	"sigs.k8s.io/controller-runtime/pkg/client/apiutil"
++	"sigs.k8s.io/controller-runtime/pkg/controller"
++	"sigs.k8s.io/controller-runtime/pkg/handler"
++	"sigs.k8s.io/controller-runtime/pkg/manager"
++	"sigs.k8s.io/controller-runtime/pkg/predicate"
++	"sigs.k8s.io/controller-runtime/pkg/reconcile"
++	"sigs.k8s.io/controller-runtime/pkg/source"
++)
++
++// project represents other forms that we can use to
++// send/receive a given resource (metadata-only, unstructured, etc).
++type objectProjection int
++
++const (
++	// projectAsNormal doesn't change the object from the form given.
++	projectAsNormal objectProjection = iota
++	// projectAsMetadata turns this into a metadata-only watch.
++	projectAsMetadata
++)
++
++// Builder builds a Controller.
++type Builder = TypedBuilder[reconcile.Request]
++
++// TypedBuilder builds a Controller. The request is the request type
++// that is passed to the workqueue and then to the Reconciler.
++// The workqueue de-duplicates identical requests.
++type TypedBuilder[request comparable] struct {
++	forInput         ForInput
++	ownsInput        []OwnsInput
++	rawSources       []source.TypedSource[request]
++	watchesInput     []WatchesInput[request]
++	mgr              manager.Manager
++	globalPredicates []predicate.Predicate
++	ctrl             controller.TypedController[request]
++	ctrlOptions      controller.TypedOptions[request]
++	name             string
++	newController    func(name string, mgr manager.Manager, options controller.TypedOptions[request]) (controller.TypedController[request], error)
++}
++
++// ControllerManagedBy returns a new controller builder that will be started by the provided Manager.
++func ControllerManagedBy(m manager.Manager) *Builder {
++	return TypedControllerManagedBy[reconcile.Request](m)
++}
++
++// TypedControllerManagedBy returns a new typed controller builder that will be started by the provided Manager.
++func TypedControllerManagedBy[request comparable](m manager.Manager) *TypedBuilder[request] {
++	return &TypedBuilder[request]{mgr: m}
++}
++
++// ForInput represents the information set by the For method.
++type ForInput struct {
++	object           client.Object
++	predicates       []predicate.Predicate
++	objectProjection objectProjection
++	err              error
++}
++
++// For defines the type of Object being *reconciled*, and configures the ControllerManagedBy to respond to create / delete /
++// update events by *reconciling the object*.
++//
++// This is the equivalent of calling
++// Watches(source.Kind(cache, &Type{}, &handler.EnqueueRequestForObject{})).
++func (blder *TypedBuilder[request]) For(object client.Object, opts ...ForOption) *TypedBuilder[request] {
++	if blder.forInput.object != nil {
++		blder.forInput.err = fmt.Errorf("For(...) should only be called once, could not assign multiple objects for reconciliation")
++		return blder
++	}
++	input := ForInput{object: object}
++	for _, opt := range opts {
++		opt.ApplyToFor(&input)
++	}
++
++	blder.forInput = input
++	return blder
++}
++
++// OwnsInput represents the information set by Owns method.
++type OwnsInput struct {
++	matchEveryOwner  bool
++	object           client.Object
++	predicates       []predicate.Predicate
++	objectProjection objectProjection
++}
++
++// Owns defines types of Objects being *generated* by the ControllerManagedBy, and configures the ControllerManagedBy to respond to
++// create / delete / update events by *reconciling the owner object*.
++//
++// The default behavior reconciles only the first controller-type OwnerReference of the given type.
++// Use Owns(object, builder.MatchEveryOwner) to reconcile all owners.
++//
++// By default, this is the equivalent of calling
++// Watches(source.Kind(cache, &Type{}, handler.EnqueueRequestForOwner([...], &OwnerType{}, OnlyControllerOwner()))).
++func (blder *TypedBuilder[request]) Owns(object client.Object, opts ...OwnsOption) *TypedBuilder[request] {
++	input := OwnsInput{object: object}
++	for _, opt := range opts {
++		opt.ApplyToOwns(&input)
++	}
++
++	blder.ownsInput = append(blder.ownsInput, input)
++	return blder
++}
++
++type untypedWatchesInput interface {
++	setPredicates([]predicate.Predicate)
++	setObjectProjection(objectProjection)
++}
++
++// WatchesInput represents the information set by Watches method.
++type WatchesInput[request comparable] struct {
++	obj              client.Object
++	handler          handler.TypedEventHandler[client.Object, request]
++	predicates       []predicate.Predicate
++	objectProjection objectProjection
++}
++
++func (w *WatchesInput[request]) setPredicates(predicates []predicate.Predicate) {
++	w.predicates = predicates
++}
++
++func (w *WatchesInput[request]) setObjectProjection(objectProjection objectProjection) {
++	w.objectProjection = objectProjection
++}
++
++// Watches defines the type of Object to watch, and configures the ControllerManagedBy to respond to create / delete /
++// update events by *reconciling the object* with the given EventHandler.
++//
++// This is the equivalent of calling
++// WatchesRawSource(source.Kind(cache, object, eventHandler, predicates...)).
++func (blder *TypedBuilder[request]) Watches(
++	object client.Object,
++	eventHandler handler.TypedEventHandler[client.Object, request],
++	opts ...WatchesOption,
++) *TypedBuilder[request] {
++	input := WatchesInput[request]{
++		obj:     object,
++		handler: eventHandler,
++	}
++	for _, opt := range opts {
++		opt.ApplyToWatches(&input)
++	}
++
++	blder.watchesInput = append(blder.watchesInput, input)
++
++	return blder
++}
++
++// WatchesMetadata is the same as Watches, but forces the internal cache to only watch PartialObjectMetadata.
++//
++// This is useful when watching lots of objects, really big objects, or objects for which you only know
++// the GVK, but not the structure. You'll need to pass metav1.PartialObjectMetadata to the client
++// when fetching objects in your reconciler, otherwise you'll end up with a duplicate structured or unstructured cache.
++//
++// When watching a resource with metadata only, for example the v1.Pod, you should not Get and List using the v1.Pod type.
++// Instead, you should use the special metav1.PartialObjectMetadata type.
++//
++// ❌ Incorrect:
++//
++//	pod := &v1.Pod{}
++//	mgr.GetClient().Get(ctx, nsAndName, pod)
++//
++// ✅ Correct:
++//
++//	pod := &metav1.PartialObjectMetadata{}
++//	pod.SetGroupVersionKind(schema.GroupVersionKind{
++//	    Group:   "",
++//	    Version: "v1",
++//	    Kind:    "Pod",
++//	})
++//	mgr.GetClient().Get(ctx, nsAndName, pod)
++//
++// In the first case, controller-runtime will create another cache for the
++// concrete type on top of the metadata cache; this increases memory
++// consumption and leads to race conditions as caches are not in sync.
++func (blder *TypedBuilder[request]) WatchesMetadata(
++	object client.Object,
++	eventHandler handler.TypedEventHandler[client.Object, request],
++	opts ...WatchesOption,
++) *TypedBuilder[request] {
++	opts = append(opts, OnlyMetadata)
++	return blder.Watches(object, eventHandler, opts...)
++}
++
++// WatchesRawSource exposes the lower-level ControllerManagedBy Watches functions through the builder.
++//
++// WatchesRawSource does not respect predicates configured through WithEventFilter.
++//
++// WatchesRawSource makes it possible to use typed handlers and predicates with `source.Kind` as well as custom source implementations.
++func (blder *TypedBuilder[request]) WatchesRawSource(src source.TypedSource[request]) *TypedBuilder[request] {
++	blder.rawSources = append(blder.rawSources, src)
++
++	return blder
++}
++
++// WithEventFilter sets the event filters, to filter which create/update/delete/generic events eventually
++// trigger reconciliations. For example, filtering on whether the resource version has changed.
++// Given predicate is added for all watched objects and thus must be able to deal with the type
++// of all watched objects.
++//
++// Defaults to the empty list.
++func (blder *TypedBuilder[request]) WithEventFilter(p predicate.Predicate) *TypedBuilder[request] {
++	blder.globalPredicates = append(blder.globalPredicates, p)
++	return blder
++}
++
++// WithOptions overrides the controller options used in doController. Defaults to empty.
++func (blder *TypedBuilder[request]) WithOptions(options controller.TypedOptions[request]) *TypedBuilder[request] {
++	blder.ctrlOptions = options
++	return blder
++}
++
++// WithLogConstructor overrides the controller options's LogConstructor.
++func (blder *TypedBuilder[request]) WithLogConstructor(logConstructor func(*request) logr.Logger) *TypedBuilder[request] {
++	blder.ctrlOptions.LogConstructor = logConstructor
++	return blder
++}
++
++// Named sets the name of the controller to the given name. The name shows up
++// in metrics, among other things, and thus should be a prometheus compatible name
++// (underscores and alphanumeric characters only).
++//
++// By default, controllers are named using the lowercase version of their kind.
++//
++// The name must be unique as it is used to identify the controller in metrics and logs.
++func (blder *TypedBuilder[request]) Named(name string) *TypedBuilder[request] {
++	blder.name = name
++	return blder
++}
++
++// Complete builds the Application Controller.
++func (blder *TypedBuilder[request]) Complete(r reconcile.TypedReconciler[request]) error {
++	_, err := blder.Build(r)
++	return err
++}
++
++// Build builds the Application Controller and returns the Controller it created.
++func (blder *TypedBuilder[request]) Build(r reconcile.TypedReconciler[request]) (controller.TypedController[request], error) {
++	if r == nil {
++		return nil, fmt.Errorf("must provide a non-nil Reconciler")
++	}
++	if blder.mgr == nil {
++		return nil, fmt.Errorf("must provide a non-nil Manager")
++	}
++	if blder.forInput.err != nil {
++		return nil, blder.forInput.err
++	}
++
++	// Set the ControllerManagedBy
++	if err := blder.doController(r); err != nil {
++		return nil, err
++	}
++
++	// Set the Watch
++	if err := blder.doWatch(); err != nil {
++		return nil, err
++	}
++
++	return blder.ctrl, nil
++}
++
++func (blder *TypedBuilder[request]) project(obj client.Object, proj objectProjection) (client.Object, error) {
++	switch proj {
++	case projectAsNormal:
++		return obj, nil
++	case projectAsMetadata:
++		metaObj := &metav1.PartialObjectMetadata{}
++		gvk, err := apiutil.GVKForObject(obj, blder.mgr.GetScheme())
++		if err != nil {
++			return nil, fmt.Errorf("unable to determine GVK of %T for a metadata-only watch: %w", obj, err)
++		}
++		metaObj.SetGroupVersionKind(gvk)
++		return metaObj, nil
++	default:
++		panic(fmt.Sprintf("unexpected projection type %v on type %T, should not be possible since this is an internal field", proj, obj))
++	}
++}
++
++func (blder *TypedBuilder[request]) doWatch() error {
++	// Reconcile type
++	if blder.forInput.object != nil {
++		obj, err := blder.project(blder.forInput.object, blder.forInput.objectProjection)
++		if err != nil {
++			return err
++		}
++
++		if reflect.TypeFor[request]() != reflect.TypeFor[reconcile.Request]() {
++			return fmt.Errorf("For() can only be used with reconcile.Request, got %T", *new(request))
++		}
++
++		var hdler handler.TypedEventHandler[client.Object, request]
++		reflect.ValueOf(&hdler).Elem().Set(reflect.ValueOf(&handler.EnqueueRequestForObject{}))
++		allPredicates := append([]predicate.Predicate(nil), blder.globalPredicates...)
++		allPredicates = append(allPredicates, blder.forInput.predicates...)
++		src := source.TypedKind(blder.mgr.GetCache(), obj, hdler, allPredicates...)
++		if err := blder.ctrl.Watch(src); err != nil {
++			return err
++		}
++	}
++
++	// Watches the managed types
++	if len(blder.ownsInput) > 0 && blder.forInput.object == nil {
++		return errors.New("Owns() can only be used together with For()")
++	}
++	for _, own := range blder.ownsInput {
++		obj, err := blder.project(own.object, own.objectProjection)
++		if err != nil {
++			return err
++		}
++		opts := []handler.OwnerOption{}
++		if !own.matchEveryOwner {
++			opts = append(opts, handler.OnlyControllerOwner())
++		}
++
++		var hdler handler.TypedEventHandler[client.Object, request]
++		reflect.ValueOf(&hdler).Elem().Set(reflect.ValueOf(handler.EnqueueRequestForOwner(
++			blder.mgr.GetScheme(), blder.mgr.GetRESTMapper(),
++			blder.forInput.object,
++			opts...,
++		)))
++		allPredicates := append([]predicate.Predicate(nil), blder.globalPredicates...)
++		allPredicates = append(allPredicates, own.predicates...)
++		src := source.TypedKind(blder.mgr.GetCache(), obj, hdler, allPredicates...)
++		if err := blder.ctrl.Watch(src); err != nil {
++			return err
++		}
++	}
++
++	// Do the watch requests
++	if len(blder.watchesInput) == 0 && blder.forInput.object == nil && len(blder.rawSources) == 0 {
++		return errors.New("there are no watches configured, controller will never get triggered. Use For(), Owns(), Watches() or WatchesRawSource() to set them up")
++	}
++	for _, w := range blder.watchesInput {
++		projected, err := blder.project(w.obj, w.objectProjection)
++		if err != nil {
++			return fmt.Errorf("failed to project for %T: %w", w.obj, err)
++		}
++		allPredicates := append([]predicate.Predicate(nil), blder.globalPredicates...)
++		allPredicates = append(allPredicates, w.predicates...)
++		if err := blder.ctrl.Watch(source.TypedKind(blder.mgr.GetCache(), projected, w.handler, allPredicates...)); err != nil {
++			return err
++		}
++	}
++	for _, src := range blder.rawSources {
++		if err := blder.ctrl.Watch(src); err != nil {
++			return err
++		}
++	}
++	return nil
++}
++
++func (blder *TypedBuilder[request]) getControllerName(gvk schema.GroupVersionKind, hasGVK bool) (string, error) {
++	if blder.name != "" {
++		return blder.name, nil
++	}
++	if !hasGVK {
++		return "", errors.New("one of For() or Named() must be called")
++	}
++	return strings.ToLower(gvk.Kind), nil
++}
++
++func (blder *TypedBuilder[request]) doController(r reconcile.TypedReconciler[request]) error {
++	globalOpts := blder.mgr.GetControllerOptions()
++
++	ctrlOptions := blder.ctrlOptions
++	if ctrlOptions.Reconciler != nil && r != nil {
++		return errors.New("reconciler was set via WithOptions() and via Build() or Complete()")
++	}
++	if ctrlOptions.Reconciler == nil {
++		ctrlOptions.Reconciler = r
++	}
++
++	// Retrieve the GVK from the object we're reconciling
++	// to pre-populate logger information, and to optionally generate a default name.
++	var gvk schema.GroupVersionKind
++	hasGVK := blder.forInput.object != nil
++	if hasGVK {
++		var err error
++		gvk, err = apiutil.GVKForObject(blder.forInput.object, blder.mgr.GetScheme())
++		if err != nil {
++			return err
++		}
++	}
++
++	// Setup concurrency.
++	if ctrlOptions.MaxConcurrentReconciles == 0 && hasGVK {
++		groupKind := gvk.GroupKind().String()
++
++		if concurrency, ok := globalOpts.GroupKindConcurrency[groupKind]; ok && concurrency > 0 {
++			ctrlOptions.MaxConcurrentReconciles = concurrency
++		}
++	}
++
++	// Setup cache sync timeout.
++	if ctrlOptions.CacheSyncTimeout == 0 && globalOpts.CacheSyncTimeout > 0 {
++		ctrlOptions.CacheSyncTimeout = globalOpts.CacheSyncTimeout
++	}
++
++	controllerName, err := blder.getControllerName(gvk, hasGVK)
++	if err != nil {
++		return err
++	}
++
++	// Setup the logger.
++	if ctrlOptions.LogConstructor == nil {
++		log := blder.mgr.GetLogger().WithValues(
++			"controller", controllerName,
++		)
++		if hasGVK {
++			log = log.WithValues(
++				"controllerGroup", gvk.Group,
++				"controllerKind", gvk.Kind,
++			)
++		}
++
++		ctrlOptions.LogConstructor = func(in *request) logr.Logger {
++			log := log
++
++			if req, ok := any(in).(*reconcile.Request); ok && req != nil {
++				if hasGVK {
++					log = log.WithValues(gvk.Kind, klog.KRef(req.Namespace, req.Name))
++				}
++				log = log.WithValues(
++					"namespace", req.Namespace, "name", req.Name,
++				)
++			}
++			return log
++		}
++	}
++
++	if blder.newController == nil {
++		blder.newController = controller.NewTyped[request]
++	}
++
++	// Build the controller and return.
++	blder.ctrl, err = blder.newController(controllerName, blder.mgr, ctrlOptions)
++	return err
++}
+diff --git a/vendor/sigs.k8s.io/controller-runtime/pkg/builder/doc.go b/vendor/sigs.k8s.io/controller-runtime/pkg/builder/doc.go
+new file mode 100644
+index 0000000000..e4df1b709f
+--- /dev/null
++++ b/vendor/sigs.k8s.io/controller-runtime/pkg/builder/doc.go
+@@ -0,0 +1,28 @@
++/*
++Copyright 2018 The Kubernetes Authors.
++
++Licensed under the Apache License, Version 2.0 (the "License");
++you may not use this file except in compliance with the License.
++You may obtain a copy of the License at
++
++    http://www.apache.org/licenses/LICENSE-2.0
++
++Unless required by applicable law or agreed to in writing, software
++distributed under the License is distributed on an "AS IS" BASIS,
++WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++See the License for the specific language governing permissions and
++limitations under the License.
++*/
++
++// Package builder wraps other controller-runtime libraries and exposes simple
++// patterns for building common Controllers.
++//
++// Projects built with the builder package can trivially be rebased on top of the underlying
++// packages if the project requires more customized behavior in the future.
++package builder
++
++import (
++	logf "sigs.k8s.io/controller-runtime/pkg/internal/log"
++)
++
++var log = logf.RuntimeLog.WithName("builder")
+diff --git a/vendor/sigs.k8s.io/controller-runtime/pkg/builder/options.go b/vendor/sigs.k8s.io/controller-runtime/pkg/builder/options.go
+new file mode 100644
+index 0000000000..b907b5d020
+--- /dev/null
++++ b/vendor/sigs.k8s.io/controller-runtime/pkg/builder/options.go
+@@ -0,0 +1,156 @@
++/*
++Copyright 2018 The Kubernetes Authors.
++
++Licensed under the Apache License, Version 2.0 (the "License");
++you may not use this file except in compliance with the License.
++You may obtain a copy of the License at
++
++    http://www.apache.org/licenses/LICENSE-2.0
++
++Unless required by applicable law or agreed to in writing, software
++distributed under the License is distributed on an "AS IS" BASIS,
++WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++See the License for the specific language governing permissions and
++limitations under the License.
++*/
++
++package builder
++
++import (
++	"sigs.k8s.io/controller-runtime/pkg/predicate"
++)
++
++// {{{ "Functional" Option Interfaces
++
++// ForOption is some configuration that modifies options for a For request.
++type ForOption interface {
++	// ApplyToFor applies this configuration to the given for input.
++	ApplyToFor(*ForInput)
++}
++
++// OwnsOption is some configuration that modifies options for an owns request.
++type OwnsOption interface {
++	// ApplyToOwns applies this configuration to the given owns input.
++	ApplyToOwns(*OwnsInput)
++}
++
++// WatchesOption is some configuration that modifies options for a watches request.
++type WatchesOption interface {
++	// ApplyToWatches applies this configuration to the given watches options.
++	ApplyToWatches(untypedWatchesInput)
++}
++
++// }}}
++
++// {{{ Multi-Type Options
++
++// WithPredicates sets the given predicates list.
++func WithPredicates(predicates ...predicate.Predicate) Predicates {
++	return Predicates{
++		predicates: predicates,
++	}
++}
++
++// Predicates filters events before enqueuing the keys.
++type Predicates struct {
++	predicates []predicate.Predicate
++}
++
++// ApplyToFor applies this configuration to the given ForInput options.
++func (w Predicates) ApplyToFor(opts *ForInput) {
++	opts.predicates = w.predicates
++}
++
++// ApplyToOwns applies this configuration to the given OwnsInput options.
++func (w Predicates) ApplyToOwns(opts *OwnsInput) {
++	opts.predicates = w.predicates
++}
++
++// ApplyToWatches applies this configuration to the given WatchesInput options.
++func (w Predicates) ApplyToWatches(opts untypedWatchesInput) {
++	opts.setPredicates(w.predicates)
++}
++
++var _ ForOption = &Predicates{}
++var _ OwnsOption = &Predicates{}
++var _ WatchesOption = &Predicates{}
++
++// }}}
++
++// {{{ For & Owns Dual-Type options
++
++// projectAs configures the projection on the input.
++// Currently only OnlyMetadata is supported.  We might want to expand
++// this to arbitrary non-special local projections in the future.
++type projectAs objectProjection
++
++// ApplyToFor applies this configuration to the given ForInput options.
++func (p projectAs) ApplyToFor(opts *ForInput) {
++	opts.objectProjection = objectProjection(p)
++}
++
++// ApplyToOwns applies this configuration to the given OwnsInput options.
++func (p projectAs) ApplyToOwns(opts *OwnsInput) {
++	opts.objectProjection = objectProjection(p)
++}
++
++// ApplyToWatches applies this configuration to the given WatchesInput options.
++func (p projectAs) ApplyToWatches(opts untypedWatchesInput) {
++	opts.setObjectProjection(objectProjection(p))
++}
++
++var (
++	// OnlyMetadata tells the controller to *only* cache metadata, and to watch
++	// the API server in metadata-only form. This is useful when watching
++	// lots of objects, really big objects, or objects for which you only know
++	// the GVK, but not the structure. You'll need to pass
++	// metav1.PartialObjectMetadata to the client when fetching objects in your
++	// reconciler, otherwise you'll end up with a duplicate structured or
++	// unstructured cache.
++	//
++	// When watching a resource with OnlyMetadata, for example the v1.Pod, you
++	// should not Get and List using the v1.Pod type. Instead, you should use
++	// the special metav1.PartialObjectMetadata type.
++	//
++	// ❌ Incorrect:
++	//
++	//   pod := &v1.Pod{}
++	//   mgr.GetClient().Get(ctx, nsAndName, pod)
++	//
++	// ✅ Correct:
++	//
++	//   pod := &metav1.PartialObjectMetadata{}
++	//   pod.SetGroupVersionKind(schema.GroupVersionKind{
++	//       Group:   "",
++	//       Version: "v1",
++	//       Kind:    "Pod",
++	//   })
++	//   mgr.GetClient().Get(ctx, nsAndName, pod)
++	//
++	// In the first case, controller-runtime will create another cache for the
++	// concrete type on top of the metadata cache; this increases memory
++	// consumption and leads to race conditions as caches are not in sync.
++	OnlyMetadata = projectAs(projectAsMetadata)
++
++	_ ForOption     = OnlyMetadata
++	_ OwnsOption    = OnlyMetadata
++	_ WatchesOption = OnlyMetadata
++)
++
++// }}}
++
++// MatchEveryOwner determines whether the watch should be filtered based on
++// controller ownership. As in, when the OwnerReference.Controller field is set.
++//
++// If passed as an option,
++// the handler receives notification for every owner of the object with the given type.
++// If unset (default), the handler receives notification only for the first
++// OwnerReference with `Controller: true`.
++var MatchEveryOwner = &matchEveryOwner{}
++
++type matchEveryOwner struct{}
++
++// ApplyToOwns applies this configuration to the given OwnsInput options.
++func (o matchEveryOwner) ApplyToOwns(opts *OwnsInput) {
++	opts.matchEveryOwner = true
++}
+diff --git a/vendor/sigs.k8s.io/controller-runtime/pkg/builder/webhook.go b/vendor/sigs.k8s.io/controller-runtime/pkg/builder/webhook.go
+new file mode 100644
+index 0000000000..d9c57c5e8b
+--- /dev/null
++++ b/vendor/sigs.k8s.io/controller-runtime/pkg/builder/webhook.go
+@@ -0,0 +1,386 @@
++/*
++Copyright 2019 The Kubernetes Authors.
++
++Licensed under the Apache License, Version 2.0 (the "License");
++you may not use this file except in compliance with the License.
++You may obtain a copy of the License at
++
++    http://www.apache.org/licenses/LICENSE-2.0
++
++Unless required by applicable law or agreed to in writing, software
++distributed under the License is distributed on an "AS IS" BASIS,
++WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++See the License for the specific language governing permissions and
++limitations under the License.
++*/
++
++package builder
++
++import (
++	"context"
++	"errors"
++	"net/http"
++	"net/url"
++	"regexp"
++	"strings"
++
++	"github.com/go-logr/logr"
++	"k8s.io/apimachinery/pkg/runtime"
++	"k8s.io/apimachinery/pkg/runtime/schema"
++	"k8s.io/client-go/rest"
++	"k8s.io/klog/v2"
++
++	"sigs.k8s.io/controller-runtime/pkg/client/apiutil"
++	"sigs.k8s.io/controller-runtime/pkg/manager"
++	"sigs.k8s.io/controller-runtime/pkg/webhook/admission"
++	"sigs.k8s.io/controller-runtime/pkg/webhook/conversion"
++)
++
++// WebhookBuilder builds a Webhook.
++type WebhookBuilder[T runtime.Object] struct {
++	apiType                   runtime.Object
++	customDefaulter           admission.CustomDefaulter //nolint:staticcheck
++	defaulter                 admission.Defaulter[T]
++	customDefaulterOpts       []admission.DefaulterOption
++	customValidator           admission.CustomValidator //nolint:staticcheck
++	validator                 admission.Validator[T]
++	customPath                string
++	customValidatorCustomPath string
++	customDefaulterCustomPath string
++	converterConstructor      func(*runtime.Scheme) (conversion.Converter, error)
++	gvk                       schema.GroupVersionKind
++	mgr                       manager.Manager
++	config                    *rest.Config
++	recoverPanic              *bool
++	logConstructor            func(base logr.Logger, req *admission.Request) logr.Logger
++	contextFunc               func(context.Context, *http.Request) context.Context
++	err                       error
++}
++
++// WebhookManagedBy returns a new webhook builder.
++func WebhookManagedBy[T runtime.Object](m manager.Manager, object T) *WebhookBuilder[T] {
++	return &WebhookBuilder[T]{mgr: m, apiType: object}
++}
++
++// WithCustomDefaulter takes an admission.CustomDefaulter interface, a MutatingWebhook with the provided opts (admission.DefaulterOption)
++// will be wired for this type.
++//
++// Deprecated: Use WithDefaulter instead.
++func (blder *WebhookBuilder[T]) WithCustomDefaulter(defaulter admission.CustomDefaulter, opts ...admission.DefaulterOption) *WebhookBuilder[T] {
++	blder.customDefaulter = defaulter
++	blder.customDefaulterOpts = opts
++	return blder
++}
++
++// WithDefaulter sets up the provided admission.Defaulter in a defaulting webhook.
++func (blder *WebhookBuilder[T]) WithDefaulter(defaulter admission.Defaulter[T], opts ...admission.DefaulterOption) *WebhookBuilder[T] {
++	blder.defaulter = defaulter
++	blder.customDefaulterOpts = opts
++	return blder
++}
++
++// WithCustomValidator takes a admission.CustomValidator interface, a ValidatingWebhook will be wired for this type.
++//
++// Deprecated: Use WithValidator instead.
++func (blder *WebhookBuilder[T]) WithCustomValidator(validator admission.CustomValidator) *WebhookBuilder[T] {
++	blder.customValidator = validator
++	return blder
++}
++
++// WithValidator sets up the provided admission.Validator in a validating webhook.
++func (blder *WebhookBuilder[T]) WithValidator(validator admission.Validator[T]) *WebhookBuilder[T] {
++	blder.validator = validator
++	return blder
++}
++
++// WithConverter takes a func that constructs a converter.Converter.
++// The Converter will then be used by the conversion endpoint for the type passed into NewWebhookManagedBy()
++func (blder *WebhookBuilder[T]) WithConverter(converterConstructor func(*runtime.Scheme) (conversion.Converter, error)) *WebhookBuilder[T] {
++	blder.converterConstructor = converterConstructor
++	return blder
++}
++
++// WithLogConstructor overrides the webhook's LogConstructor.
++func (blder *WebhookBuilder[T]) WithLogConstructor(logConstructor func(base logr.Logger, req *admission.Request) logr.Logger) *WebhookBuilder[T] {
++	blder.logConstructor = logConstructor
++	return blder
++}
++
++// WithContextFunc overrides the webhook's WithContextFunc.
++func (blder *WebhookBuilder[T]) WithContextFunc(contextFunc func(context.Context, *http.Request) context.Context) *WebhookBuilder[T] {
++	blder.contextFunc = contextFunc
++	return blder
++}
++
++// RecoverPanic indicates whether panics caused by the webhook should be recovered.
++// Defaults to true.
++func (blder *WebhookBuilder[T]) RecoverPanic(recoverPanic bool) *WebhookBuilder[T] {
++	blder.recoverPanic = &recoverPanic
++	return blder
++}
++
++// WithCustomPath overrides the webhook's default path by the customPath
++//
++// Deprecated: WithCustomPath should not be used anymore.
++// Please use WithValidatorCustomPath or WithDefaulterCustomPath instead.
++func (blder *WebhookBuilder[T]) WithCustomPath(customPath string) *WebhookBuilder[T] {
++	blder.customPath = customPath
++	return blder
++}
++
++// WithValidatorCustomPath overrides the path of the Validator.
++func (blder *WebhookBuilder[T]) WithValidatorCustomPath(customPath string) *WebhookBuilder[T] {
++	blder.customValidatorCustomPath = customPath
++	return blder
++}
++
++// WithDefaulterCustomPath overrides the path of the Defaulter.
++func (blder *WebhookBuilder[T]) WithDefaulterCustomPath(customPath string) *WebhookBuilder[T] {
++	blder.customDefaulterCustomPath = customPath
++	return blder
++}
++
++// Complete builds the webhook.
++func (blder *WebhookBuilder[T]) Complete() error {
++	// Set the Config
++	blder.loadRestConfig()
++
++	// Configure the default LogConstructor
++	blder.setLogConstructor()
++
++	// Set the Webhook if needed
++	return blder.registerWebhooks()
++}
++
++func (blder *WebhookBuilder[T]) loadRestConfig() {
++	if blder.config == nil {
++		blder.config = blder.mgr.GetConfig()
++	}
++}
++
++func (blder *WebhookBuilder[T]) setLogConstructor() {
++	if blder.logConstructor == nil {
++		blder.logConstructor = func(base logr.Logger, req *admission.Request) logr.Logger {
++			log := base.WithValues(
++				"webhookGroup", blder.gvk.Group,
++				"webhookKind", blder.gvk.Kind,
++			)
++			if req != nil {
++				return log.WithValues(
++					blder.gvk.Kind, klog.KRef(req.Namespace, req.Name),
++					"namespace", req.Namespace, "name", req.Name,
++					"resource", req.Resource, "user", req.UserInfo.Username,
++					"requestID", req.UID,
++				)
++			}
++			return log
++		}
++	}
++}
++
++func (blder *WebhookBuilder[T]) isThereCustomPathConflict() bool {
++	return (blder.customPath != "" && blder.customDefaulter != nil && blder.customValidator != nil) || (blder.customPath != "" && blder.customDefaulterCustomPath != "") || (blder.customPath != "" && blder.customValidatorCustomPath != "")
++}
++
++func (blder *WebhookBuilder[T]) registerWebhooks() error {
++	typ, err := blder.getType()
++	if err != nil {
++		return err
++	}
++
++	blder.gvk, err = apiutil.GVKForObject(typ, blder.mgr.GetScheme())
++	if err != nil {
++		return err
++	}
++
++	if blder.isThereCustomPathConflict() {
++		return errors.New("only one of CustomDefaulter or CustomValidator should be set when using WithCustomPath. Otherwise, WithDefaulterCustomPath() and WithValidatorCustomPath() should be used")
++	}
++	if blder.customPath != "" {
++		// isThereCustomPathConflict() already checks for potential conflicts.
++		// Since we are sure that only one of customDefaulter or customValidator will be used,
++		// we can set both customDefaulterCustomPath and validatingCustomPath.
++		blder.customDefaulterCustomPath = blder.customPath
++		blder.customValidatorCustomPath = blder.customPath
++	}
++
++	// Register webhook(s) for type
++	err = blder.registerDefaultingWebhook()
++	if err != nil {
++		return err
++	}
++
++	err = blder.registerValidatingWebhook()
++	if err != nil {
++		return err
++	}
++
++	err = blder.registerConversionWebhook()
++	if err != nil {
++		return err
++	}
++	return blder.err
++}
++
++// registerDefaultingWebhook registers a defaulting webhook if necessary.
++func (blder *WebhookBuilder[T]) registerDefaultingWebhook() error {
++	mwh, err := blder.getDefaultingWebhook()
++	if err != nil {
++		return err
++	}
++	if mwh != nil {
++		mwh.LogConstructor = blder.logConstructor
++		mwh.WithContextFunc = blder.contextFunc
++		path := generateMutatePath(blder.gvk)
++		if blder.customDefaulterCustomPath != "" {
++			generatedCustomPath, err := generateCustomPath(blder.customDefaulterCustomPath)
++			if err != nil {
++				return err
++			}
++			path = generatedCustomPath
++		}
++
++		// Checking if the path is already registered.
++		// If so, just skip it.
++		if !blder.isAlreadyHandled(path) {
++			log.Info("Registering a mutating webhook",
++				"GVK", blder.gvk,
++				"path", path)
++			blder.mgr.GetWebhookServer().Register(path, mwh)
++		}
++	}
++
++	return nil
++}
++
++func (blder *WebhookBuilder[T]) getDefaultingWebhook() (*admission.Webhook, error) {
++	var w *admission.Webhook
++	if blder.defaulter != nil {
++		if blder.customDefaulter != nil {
++			return nil, errors.New("only one of Defaulter or CustomDefaulter can be set")
++		}
++		w = admission.WithDefaulter(blder.mgr.GetScheme(), blder.defaulter, blder.customDefaulterOpts...)
++	} else if blder.customDefaulter != nil {
++		w = admission.WithCustomDefaulter(blder.mgr.GetScheme(), blder.apiType, blder.customDefaulter, blder.customDefaulterOpts...)
++	}
++	if w != nil && blder.recoverPanic != nil {
++		w = w.WithRecoverPanic(*blder.recoverPanic)
++	}
++	return w, nil
++}
++
++// registerValidatingWebhook registers a validating webhook if necessary.
++func (blder *WebhookBuilder[T]) registerValidatingWebhook() error {
++	vwh, err := blder.getValidatingWebhook()
++	if err != nil {
++		return err
++	}
++	if vwh != nil {
++		vwh.LogConstructor = blder.logConstructor
++		vwh.WithContextFunc = blder.contextFunc
++		path := generateValidatePath(blder.gvk)
++		if blder.customValidatorCustomPath != "" {
++			generatedCustomPath, err := generateCustomPath(blder.customValidatorCustomPath)
++			if err != nil {
++				return err
++			}
++			path = generatedCustomPath
++		}
++
++		// Checking if the path is already registered.
++		// If so, just skip it.
++		if !blder.isAlreadyHandled(path) {
++			log.Info("Registering a validating webhook",
++				"GVK", blder.gvk,
++				"path", path)
++			blder.mgr.GetWebhookServer().Register(path, vwh)
++		}
++	}
++
++	return nil
++}
++
++func (blder *WebhookBuilder[T]) getValidatingWebhook() (*admission.Webhook, error) {
++	var w *admission.Webhook
++	if blder.validator != nil {
++		if blder.customValidator != nil {
++			return nil, errors.New("only one of Validator or CustomValidator can be set")
++		}
++		w = admission.WithValidator(blder.mgr.GetScheme(), blder.validator)
++	} else if blder.customValidator != nil {
++		//nolint:staticcheck
++		w = admission.WithCustomValidator(blder.mgr.GetScheme(), blder.apiType, blder.customValidator)
++	}
++	if w != nil && blder.recoverPanic != nil {
++		w = w.WithRecoverPanic(*blder.recoverPanic)
++	}
++	return w, nil
++}
++
++func (blder *WebhookBuilder[T]) registerConversionWebhook() error {
++	if blder.converterConstructor != nil {
++		converter, err := blder.converterConstructor(blder.mgr.GetScheme())
++		if err != nil {
++			return err
++		}
++
++		if err := blder.mgr.GetConverterRegistry().RegisterConverter(blder.gvk.GroupKind(), converter); err != nil {
++			return err
++		}
++	} else {
++		ok, err := conversion.IsConvertible(blder.mgr.GetScheme(), blder.apiType)
++		if err != nil {
++			log.Error(err, "conversion check failed", "GVK", blder.gvk)
++			return err
++		}
++		if !ok {
++			return nil
++		}
++	}
++
++	if !blder.isAlreadyHandled("/convert") {
++		blder.mgr.GetWebhookServer().Register("/convert", conversion.NewWebhookHandler(blder.mgr.GetScheme(), blder.mgr.GetConverterRegistry()))
++	}
++	log.Info("Conversion webhook enabled", "GVK", blder.gvk)
++
++	return nil
++}
++
++func (blder *WebhookBuilder[T]) getType() (runtime.Object, error) {
++	if blder.apiType != nil {
++		return blder.apiType, nil
++	}
++	return nil, errors.New("NewWebhookManagedBy() must be called with a valid object")
++}
++
++func (blder *WebhookBuilder[T]) isAlreadyHandled(path string) bool {
++	if blder.mgr.GetWebhookServer().WebhookMux() == nil {
++		return false
++	}
++	h, p := blder.mgr.GetWebhookServer().WebhookMux().Handler(&http.Request{URL: &url.URL{Path: path}})
++	if p == path && h != nil {
++		return true
++	}
++	return false
++}
++
++func generateMutatePath(gvk schema.GroupVersionKind) string {
++	return "/mutate-" + strings.ReplaceAll(gvk.Group, ".", "-") + "-" +
++		gvk.Version + "-" + strings.ToLower(gvk.Kind)
++}
++
++func generateValidatePath(gvk schema.GroupVersionKind) string {
++	return "/validate-" + strings.ReplaceAll(gvk.Group, ".", "-") + "-" +
++		gvk.Version + "-" + strings.ToLower(gvk.Kind)
++}
++
++const webhookPathStringValidation = `^((/[a-zA-Z0-9-_]+)+|/)$`
++
++var validWebhookPathRegex = regexp.MustCompile(webhookPathStringValidation)
++
++func generateCustomPath(customPath string) (string, error) {
++	if !validWebhookPathRegex.MatchString(customPath) {
++		return "", errors.New("customPath \"" + customPath + "\" does not match this regex: " + webhookPathStringValidation)
++	}
++	return customPath, nil
++}
+diff --git a/vendor/sigs.k8s.io/controller-runtime/pkg/client/config/config.go b/vendor/sigs.k8s.io/controller-runtime/pkg/client/config/config.go
+new file mode 100644
+index 0000000000..1c39f4d854
+--- /dev/null
++++ b/vendor/sigs.k8s.io/controller-runtime/pkg/client/config/config.go
+@@ -0,0 +1,183 @@
++/*
++Copyright 2017 The Kubernetes Authors.
++
++Licensed under the Apache License, Version 2.0 (the "License");
++you may not use this file except in compliance with the License.
++You may obtain a copy of the License at
++
++    http://www.apache.org/licenses/LICENSE-2.0
++
++Unless required by applicable law or agreed to in writing, software
++distributed under the License is distributed on an "AS IS" BASIS,
++WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++See the License for the specific language governing permissions and
++limitations under the License.
++*/
++
++package config
++
++import (
++	"flag"
++	"fmt"
++	"os"
++	"os/user"
++	"path/filepath"
++
++	"k8s.io/client-go/rest"
++	"k8s.io/client-go/tools/clientcmd"
++	clientcmdapi "k8s.io/client-go/tools/clientcmd/api"
++	logf "sigs.k8s.io/controller-runtime/pkg/internal/log"
++)
++
++// KubeconfigFlagName is the name of the kubeconfig flag
++const KubeconfigFlagName = "kubeconfig"
++
++var (
++	kubeconfig string
++	log        = logf.RuntimeLog.WithName("client").WithName("config")
++)
++
++// init registers the "kubeconfig" flag to the default command line FlagSet.
++// TODO: This should be removed, as it potentially leads to redefined flag errors for users, if they already
++// have registered the "kubeconfig" flag to the command line FlagSet in other parts of their code.
++func init() {
++	RegisterFlags(flag.CommandLine)
++}
++
++// RegisterFlags registers flag variables to the given FlagSet if not already registered.
++// It uses the default command line FlagSet, if none is provided. Currently, it only registers the kubeconfig flag.
++func RegisterFlags(fs *flag.FlagSet) {
++	if fs == nil {
++		fs = flag.CommandLine
++	}
++	if f := fs.Lookup(KubeconfigFlagName); f != nil {
++		kubeconfig = f.Value.String()
++	} else {
++		fs.StringVar(&kubeconfig, KubeconfigFlagName, "", "Paths to a kubeconfig. Only required if out-of-cluster.")
++	}
++}
++
++// GetConfig creates a *rest.Config for talking to a Kubernetes API server.
++// If --kubeconfig is set, will use the kubeconfig file at that location.  Otherwise will assume running
++// in cluster and use the cluster provided kubeconfig.
++//
++// The returned `*rest.Config` has client-side ratelimting disabled as we can rely on API priority and
++// fairness. Set its QPS to a value equal or bigger than 0 to re-enable it.
++//
++// Config precedence:
++//
++// * --kubeconfig flag pointing at a file
++//
++// * KUBECONFIG environment variable pointing at a file
++//
++// * In-cluster config if running in cluster
++//
++// * $HOME/.kube/config if exists.
++func GetConfig() (*rest.Config, error) {
++	return GetConfigWithContext("")
++}
++
++// GetConfigWithContext creates a *rest.Config for talking to a Kubernetes API server with a specific context.
++// If --kubeconfig is set, will use the kubeconfig file at that location.  Otherwise will assume running
++// in cluster and use the cluster provided kubeconfig.
++//
++// The returned `*rest.Config` has client-side ratelimting disabled as we can rely on API priority and
++// fairness. Set its QPS to a value equal or bigger than 0 to re-enable it.
++//
++// Config precedence:
++//
++// * --kubeconfig flag pointing at a file
++//
++// * KUBECONFIG environment variable pointing at a file
++//
++// * In-cluster config if running in cluster
++//
++// * $HOME/.kube/config if exists.
++func GetConfigWithContext(context string) (*rest.Config, error) {
++	cfg, err := loadConfig(context)
++	if err != nil {
++		return nil, err
++	}
++	if cfg.QPS == 0.0 {
++		// Disable client-side ratelimer by default, we can rely on
++		// API priority and fairness
++		cfg.QPS = -1
++	}
++	return cfg, nil
++}
++
++// loadInClusterConfig is a function used to load the in-cluster
++// Kubernetes client config. This variable makes is possible to
++// test the precedence of loading the config.
++var loadInClusterConfig = rest.InClusterConfig
++
++// loadConfig loads a REST Config as per the rules specified in GetConfig.
++func loadConfig(context string) (config *rest.Config, configErr error) {
++	// If a flag is specified with the config location, use that
++	if len(kubeconfig) > 0 {
++		return loadConfigWithContext("", &clientcmd.ClientConfigLoadingRules{ExplicitPath: kubeconfig}, context)
++	}
++
++	// If the recommended kubeconfig env variable is not specified,
++	// try the in-cluster config.
++	kubeconfigPath := os.Getenv(clientcmd.RecommendedConfigPathEnvVar)
++	if len(kubeconfigPath) == 0 {
++		c, err := loadInClusterConfig()
++		if err == nil {
++			return c, nil
++		}
++
++		defer func() {
++			if configErr != nil {
++				log.Error(err, "unable to load in-cluster config")
++			}
++		}()
++	}
++
++	// If the recommended kubeconfig env variable is set, or there
++	// is no in-cluster config, try the default recommended locations.
++	//
++	// NOTE: For default config file locations, upstream only checks
++	// $HOME for the user's home directory, but we can also try
++	// os/user.HomeDir when $HOME is unset.
++	//
++	// TODO(jlanford): could this be done upstream?
++	loadingRules := clientcmd.NewDefaultClientConfigLoadingRules()
++	if _, ok := os.LookupEnv("HOME"); !ok {
++		u, err := user.Current()
++		if err != nil {
++			return nil, fmt.Errorf("could not get current user: %w", err)
++		}
++		loadingRules.Precedence = append(loadingRules.Precedence, filepath.Join(u.HomeDir, clientcmd.RecommendedHomeDir, clientcmd.RecommendedFileName))
++	}
++
++	return loadConfigWithContext("", loadingRules, context)
++}
++
++func loadConfigWithContext(apiServerURL string, loader clientcmd.ClientConfigLoader, context string) (*rest.Config, error) {
++	return clientcmd.NewNonInteractiveDeferredLoadingClientConfig(
++		loader,
++		&clientcmd.ConfigOverrides{
++			ClusterInfo: clientcmdapi.Cluster{
++				Server: apiServerURL,
++			},
++			CurrentContext: context,
++		}).ClientConfig()
++}
++
++// GetConfigOrDie creates a *rest.Config for talking to a Kubernetes apiserver.
++// If --kubeconfig is set, will use the kubeconfig file at that location.  Otherwise will assume running
++// in cluster and use the cluster provided kubeconfig.
++//
++// The returned `*rest.Config` has client-side ratelimting disabled as we can rely on API priority and
++// fairness. Set its QPS to a value equal or bigger than 0 to re-enable it.
++//
++// Will log an error and exit if there is an error creating the rest.Config.
++func GetConfigOrDie() *rest.Config {
++	config, err := GetConfig()
++	if err != nil {
++		log.Error(err, "unable to get kubeconfig")
++		os.Exit(1)
++	}
++	return config
++}
+diff --git a/vendor/sigs.k8s.io/controller-runtime/pkg/client/config/doc.go b/vendor/sigs.k8s.io/controller-runtime/pkg/client/config/doc.go
+new file mode 100644
+index 0000000000..796c9cf590
+--- /dev/null
++++ b/vendor/sigs.k8s.io/controller-runtime/pkg/client/config/doc.go
+@@ -0,0 +1,18 @@
++/*
++Copyright 2017 The Kubernetes Authors.
++
++Licensed under the Apache License, Version 2.0 (the "License");
++you may not use this file except in compliance with the License.
++You may obtain a copy of the License at
++
++    http://www.apache.org/licenses/LICENSE-2.0
++
++Unless required by applicable law or agreed to in writing, software
++distributed under the License is distributed on an "AS IS" BASIS,
++WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++See the License for the specific language governing permissions and
++limitations under the License.
++*/
++
++// Package config contains libraries for initializing REST configs for talking to the Kubernetes API
++package config
+diff --git a/vendor/sigs.k8s.io/controller-runtime/pkg/client/fake/versioned_tracker.go b/vendor/sigs.k8s.io/controller-runtime/pkg/client/fake/versioned_tracker.go
+index f22425278d..62ccac2bec 100644
+--- a/vendor/sigs.k8s.io/controller-runtime/pkg/client/fake/versioned_tracker.go
++++ b/vendor/sigs.k8s.io/controller-runtime/pkg/client/fake/versioned_tracker.go
+@@ -267,13 +267,15 @@ func (t versionedTracker) updateObject(
+ 			// apiserver accepts such a patch, but it does so we just copy that behavior.
+ 			// Kubernetes apiserver behavior can be checked like this:
+ 			// `kubectl patch configmap foo --patch '{"metadata":{"annotations":{"foo":"bar"},"resourceVersion":null}}' -v=9`
+-		case bytes.Contains(debug.Stack(), []byte("sigs.k8s.io/controller-runtime/pkg/client/fake.(*fakeClient).Patch")):
++		case bytes.Contains(debug.Stack(), []byte("sigs.k8s.io/controller-runtime/pkg/client/fake.(*fakeClient).Patch")),
++			bytes.Contains(debug.Stack(), []byte("sigs.k8s.io/controller-runtime/pkg/client/fake.(*fakeSubResourceClient).Patch")):
+ 			// We apply patches using a client-go reaction that ends up calling the trackers Update. As we can't change
+-			// that reaction, we use the callstack to figure out if this originated from the "fakeClient.Patch" func.
++			// that reaction, we use the callstack to figure out if this originated from the "fake[SubResource]Client.Patch" func.
+ 			accessor.SetResourceVersion(oldAccessor.GetResourceVersion())
+-		case bytes.Contains(debug.Stack(), []byte("sigs.k8s.io/controller-runtime/pkg/client/fake.(*fakeClient).Apply")):
++		case bytes.Contains(debug.Stack(), []byte("sigs.k8s.io/controller-runtime/pkg/client/fake.(*fakeClient).Apply")),
++			bytes.Contains(debug.Stack(), []byte("sigs.k8s.io/controller-runtime/pkg/client/fake.(*fakeSubResourceClient).Apply")):
+ 			// We apply patches using a client-go reaction that ends up calling the trackers Update. As we can't change
+-			// that reaction, we use the callstack to figure out if this originated from the "fakeClient.Apply" func.
++			// that reaction, we use the callstack to figure out if this originated from the "fake[SubResource]Client.Apply" func.
+ 			accessor.SetResourceVersion(oldAccessor.GetResourceVersion())
+ 		}
+ 	}
+diff --git a/vendor/sigs.k8s.io/controller-runtime/pkg/manager/signals/doc.go b/vendor/sigs.k8s.io/controller-runtime/pkg/manager/signals/doc.go
+new file mode 100644
+index 0000000000..737cc7eff2
+--- /dev/null
++++ b/vendor/sigs.k8s.io/controller-runtime/pkg/manager/signals/doc.go
+@@ -0,0 +1,20 @@
++/*
++Copyright 2017 The Kubernetes Authors.
++
++Licensed under the Apache License, Version 2.0 (the "License");
++you may not use this file except in compliance with the License.
++You may obtain a copy of the License at
++
++    http://www.apache.org/licenses/LICENSE-2.0
++
++Unless required by applicable law or agreed to in writing, software
++distributed under the License is distributed on an "AS IS" BASIS,
++WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++See the License for the specific language governing permissions and
++limitations under the License.
++*/
++
++// Package signals contains libraries for handling signals to gracefully
++// shutdown the manager in combination with Kubernetes pod graceful termination
++// policy.
++package signals
+diff --git a/vendor/sigs.k8s.io/controller-runtime/pkg/manager/signals/signal.go b/vendor/sigs.k8s.io/controller-runtime/pkg/manager/signals/signal.go
+new file mode 100644
+index 0000000000..a79cfb42df
+--- /dev/null
++++ b/vendor/sigs.k8s.io/controller-runtime/pkg/manager/signals/signal.go
+@@ -0,0 +1,45 @@
++/*
++Copyright 2017 The Kubernetes Authors.
++
++Licensed under the Apache License, Version 2.0 (the "License");
++you may not use this file except in compliance with the License.
++You may obtain a copy of the License at
++
++    http://www.apache.org/licenses/LICENSE-2.0
++
++Unless required by applicable law or agreed to in writing, software
++distributed under the License is distributed on an "AS IS" BASIS,
++WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++See the License for the specific language governing permissions and
++limitations under the License.
++*/
++
++package signals
++
++import (
++	"context"
++	"os"
++	"os/signal"
++)
++
++var onlyOneSignalHandler = make(chan struct{})
++
++// SetupSignalHandler registers for SIGTERM and SIGINT. A context is returned
++// which is canceled on one of these signals. If a second signal is caught, the program
++// is terminated with exit code 1.
++func SetupSignalHandler() context.Context {
++	close(onlyOneSignalHandler) // panics when called twice
++
++	ctx, cancel := context.WithCancel(context.Background())
++
++	c := make(chan os.Signal, 2)
++	signal.Notify(c, shutdownSignals...)
++	go func() {
++		<-c
++		cancel()
++		<-c
++		os.Exit(1) // second signal. Exit directly.
++	}()
++
++	return ctx
++}
+diff --git a/vendor/sigs.k8s.io/controller-runtime/pkg/manager/signals/signal_posix.go b/vendor/sigs.k8s.io/controller-runtime/pkg/manager/signals/signal_posix.go
+new file mode 100644
+index 0000000000..2b24faa428
+--- /dev/null
++++ b/vendor/sigs.k8s.io/controller-runtime/pkg/manager/signals/signal_posix.go
+@@ -0,0 +1,26 @@
++//go:build !windows
++
++/*
++Copyright 2017 The Kubernetes Authors.
++
++Licensed under the Apache License, Version 2.0 (the "License");
++you may not use this file except in compliance with the License.
++You may obtain a copy of the License at
++
++    http://www.apache.org/licenses/LICENSE-2.0
++
++Unless required by applicable law or agreed to in writing, software
++distributed under the License is distributed on an "AS IS" BASIS,
++WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++See the License for the specific language governing permissions and
++limitations under the License.
++*/
++
++package signals
++
++import (
++	"os"
++	"syscall"
++)
++
++var shutdownSignals = []os.Signal{os.Interrupt, syscall.SIGTERM}
+diff --git a/vendor/sigs.k8s.io/controller-runtime/pkg/manager/signals/signal_windows.go b/vendor/sigs.k8s.io/controller-runtime/pkg/manager/signals/signal_windows.go
+new file mode 100644
+index 0000000000..4907d573fe
+--- /dev/null
++++ b/vendor/sigs.k8s.io/controller-runtime/pkg/manager/signals/signal_windows.go
+@@ -0,0 +1,23 @@
++/*
++Copyright 2017 The Kubernetes Authors.
++
++Licensed under the Apache License, Version 2.0 (the "License");
++you may not use this file except in compliance with the License.
++You may obtain a copy of the License at
++
++    http://www.apache.org/licenses/LICENSE-2.0
++
++Unless required by applicable law or agreed to in writing, software
++distributed under the License is distributed on an "AS IS" BASIS,
++WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++See the License for the specific language governing permissions and
++limitations under the License.
++*/
++
++package signals
++
++import (
++	"os"
++)
++
++var shutdownSignals = []os.Signal{os.Interrupt}
+diff --git a/vendor/sigs.k8s.io/controller-runtime/pkg/scheme/scheme.go b/vendor/sigs.k8s.io/controller-runtime/pkg/scheme/scheme.go
+new file mode 100644
+index 0000000000..55ebe21773
+--- /dev/null
++++ b/vendor/sigs.k8s.io/controller-runtime/pkg/scheme/scheme.go
+@@ -0,0 +1,93 @@
++/*
++Copyright 2018 The Kubernetes Authors.
++
++Licensed under the Apache License, Version 2.0 (the "License");
++you may not use this file except in compliance with the License.
++You may obtain a copy of the License at
++
++    http://www.apache.org/licenses/LICENSE-2.0
++
++Unless required by applicable law or agreed to in writing, software
++distributed under the License is distributed on an "AS IS" BASIS,
++WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++See the License for the specific language governing permissions and
++limitations under the License.
++*/
++
++// Package scheme contains utilities for gradually building Schemes,
++// which contain information associating Go types with Kubernetes
++// groups, versions, and kinds.
++//
++// Each API group should define a utility function
++// called AddToScheme for adding its types to a Scheme:
++//
++//	 // in package myapigroupv1...
++//	var (
++//		SchemeGroupVersion = schema.GroupVersion{Group: "my.api.group", Version: "v1"}
++//		SchemeBuilder = &scheme.Builder{GroupVersion: SchemeGroupVersion}
++//		AddToScheme = SchemeBuilder.AddToScheme
++//	)
++//
++//	func init() {
++//		SchemeBuilder.Register(&MyType{}, &MyTypeList)
++//	}
++//	var (
++//		scheme *runtime.Scheme = runtime.NewScheme()
++//	)
++//
++// This also true of the built-in Kubernetes types.  Then, in the entrypoint for
++// your manager, assemble the scheme containing exactly the types you need,
++// panicing if scheme registration failed. For instance, if our controller needs
++// types from the core/v1 API group (e.g. Pod), plus types from my.api.group/v1:
++//
++//	func init() {
++//		utilruntime.Must(myapigroupv1.AddToScheme(scheme))
++//		utilruntime.Must(kubernetesscheme.AddToScheme(scheme))
++//	}
++//
++//	func main() {
++//		mgr := controllers.NewManager(context.Background(), controllers.GetConfigOrDie(), manager.Options{
++//			Scheme: scheme,
++//		})
++//		// ...
++//	}
++package scheme
++
++import (
++	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
++	"k8s.io/apimachinery/pkg/runtime"
++	"k8s.io/apimachinery/pkg/runtime/schema"
++)
++
++// Builder builds a new Scheme for mapping go types to Kubernetes GroupVersionKinds.
++type Builder struct {
++	GroupVersion schema.GroupVersion
++	runtime.SchemeBuilder
++}
++
++// Register adds one or more objects to the SchemeBuilder so they can be added to a Scheme.  Register mutates bld.
++func (bld *Builder) Register(object ...runtime.Object) *Builder {
++	bld.SchemeBuilder.Register(func(scheme *runtime.Scheme) error {
++		scheme.AddKnownTypes(bld.GroupVersion, object...)
++		metav1.AddToGroupVersion(scheme, bld.GroupVersion)
++		return nil
++	})
++	return bld
++}
++
++// RegisterAll registers all types from the Builder argument.  RegisterAll mutates bld.
++func (bld *Builder) RegisterAll(b *Builder) *Builder {
++	bld.SchemeBuilder = append(bld.SchemeBuilder, b.SchemeBuilder...)
++	return bld
++}
++
++// AddToScheme adds all registered types to s.
++func (bld *Builder) AddToScheme(s *runtime.Scheme) error {
++	return bld.SchemeBuilder.AddToScheme(s)
++}
++
++// Build returns a new Scheme containing the registered types.
++func (bld *Builder) Build() (*runtime.Scheme, error) {
++	s := runtime.NewScheme()
++	return s, bld.AddToScheme(s)
++}
+diff --git a/vendor/sigs.k8s.io/controller-runtime/pkg/webhook/admission/defaulter_custom.go b/vendor/sigs.k8s.io/controller-runtime/pkg/webhook/admission/defaulter_custom.go
+index d946966d4e..9fec8003f2 100644
+--- a/vendor/sigs.k8s.io/controller-runtime/pkg/webhook/admission/defaulter_custom.go
++++ b/vendor/sigs.k8s.io/controller-runtime/pkg/webhook/admission/defaulter_custom.go
+@@ -129,11 +129,7 @@ func (h *defaulterForType[T]) Handle(ctx context.Context, req Request) Response
+ 		return Errored(http.StatusBadRequest, err)
+ 	}
+ 
+-	// Keep a copy of the object if needed
+-	var originalObj T
+-	if !h.removeUnknownOrOmitableFields {
+-		originalObj = obj.DeepCopyObject().(T)
+-	}
++	originalObj := obj.DeepCopyObject().(T)
+ 
+ 	// Default the object
+ 	if err := h.defaulter.Default(ctx, obj); err != nil {
+@@ -144,6 +140,21 @@ func (h *defaulterForType[T]) Handle(ctx context.Context, req Request) Response
+ 		return Denied(err.Error())
+ 	}
+ 
++	// If the object is not changed, there's no reason to go through the expensive patch calculation below.
++	// Note: While jsonpatch.CreatePatch short-circuits if both byte arrays are equal this is likely never the case.
++	// * json.Marshal that we use below sorts fields alphabetically
++	// * for builtin types the apiserver also sorts alphabetically (but it seems like it adds an empty line at the end)
++	// * for CRDs the apiserver uses the field order in the OpenAPI schema which very likely is not alphabetically sorted
++	// Note: If removeUnknownOrOmitableFields is set we have to compute a patch to remove unknown or omitable fields even
++	// if the objects are equal
++	if !h.removeUnknownOrOmitableFields && reflect.DeepEqual(originalObj, obj) {
++		return Response{
++			AdmissionResponse: admissionv1.AdmissionResponse{
++				Allowed: true,
++			},
++		}
++	}
++
+ 	// Create the patch
+ 	marshalled, err := json.Marshal(obj)
+ 	if err != nil {

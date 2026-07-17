@@ -1,0 +1,91 @@
+diff --git a/legacy/gcp-pd-csi-driver-operator/assets/controller.yaml b/legacy/gcp-pd-csi-driver-operator/assets/controller.yaml
+index c95f6f985..90c5bc096 100644
+--- a/legacy/gcp-pd-csi-driver-operator/assets/controller.yaml
++++ b/legacy/gcp-pd-csi-driver-operator/assets/controller.yaml
+@@ -20,7 +20,7 @@ spec:
+       labels:
+         app: gcp-pd-csi-driver-controller
+       annotations:
+-        openshift.io/required-scc: privileged
++        openshift.io/required-scc: hostnetwork-v2
+         target.workload.openshift.io/management: '{"effect": "PreferredDuringScheduling"}'
+     spec:
+       hostNetwork: true
+diff --git a/legacy/gcp-pd-csi-driver-operator/assets/rbac/controller_hostnetwork_binding.yaml b/legacy/gcp-pd-csi-driver-operator/assets/rbac/controller_hostnetwork_binding.yaml
+new file mode 100644
+index 000000000..6e59c19bd
+--- /dev/null
++++ b/legacy/gcp-pd-csi-driver-operator/assets/rbac/controller_hostnetwork_binding.yaml
+@@ -0,0 +1,12 @@
++kind: ClusterRoleBinding
++apiVersion: rbac.authorization.k8s.io/v1
++metadata:
++  name: gcp-pd-controller-hostnetwork-binding
++subjects:
++  - kind: ServiceAccount
++    name: gcp-pd-csi-driver-controller-sa
++    namespace: openshift-cluster-csi-drivers
++roleRef:
++  kind: ClusterRole
++  name: gcp-pd-hostnetwork-role
++  apiGroup: rbac.authorization.k8s.io
+diff --git a/legacy/gcp-pd-csi-driver-operator/assets/rbac/hostnetwork_role.yaml b/legacy/gcp-pd-csi-driver-operator/assets/rbac/hostnetwork_role.yaml
+new file mode 100644
+index 000000000..133d40416
+--- /dev/null
++++ b/legacy/gcp-pd-csi-driver-operator/assets/rbac/hostnetwork_role.yaml
+@@ -0,0 +1,12 @@
++kind: ClusterRole
++apiVersion: rbac.authorization.k8s.io/v1
++metadata:
++  name: gcp-pd-hostnetwork-role
++rules:
++  - apiGroups: ["security.openshift.io"]
++    resourceNames: ["hostnetwork-v2"]
++    resources: ["securitycontextconstraints"]
++    verbs: ["use"]
++  - apiGroups: [""]
++    resources: ["nodes"]
++    verbs: ["get"]
+diff --git a/legacy/gcp-pd-csi-driver-operator/assets/rbac/controller_privileged_binding.yaml b/legacy/gcp-pd-csi-driver-operator/assets/rbac/old_controller_privileged_binding.yaml
+similarity index 100%
+rename from legacy/gcp-pd-csi-driver-operator/assets/rbac/controller_privileged_binding.yaml
+rename to legacy/gcp-pd-csi-driver-operator/assets/rbac/old_controller_privileged_binding.yaml
+diff --git a/legacy/gcp-pd-csi-driver-operator/pkg/operator/starter.go b/legacy/gcp-pd-csi-driver-operator/pkg/operator/starter.go
+index 01742570a..e52754cb2 100644
+--- a/legacy/gcp-pd-csi-driver-operator/pkg/operator/starter.go
++++ b/legacy/gcp-pd-csi-driver-operator/pkg/operator/starter.go
+@@ -154,7 +154,8 @@ func RunOperator(ctx context.Context, controllerConfig *controllercmd.Controller
+ 			"cabundle_cm.yaml",
+ 			"rbac/main_attacher_binding.yaml",
+ 			"rbac/privileged_role.yaml",
+-			"rbac/controller_privileged_binding.yaml",
++			"rbac/hostnetwork_role.yaml",
++			"rbac/controller_hostnetwork_binding.yaml",
+ 			"rbac/node_privileged_binding.yaml",
+ 			"rbac/main_provisioner_binding.yaml",
+ 			"rbac/volumesnapshot_reader_provisioner_binding.yaml",
+@@ -190,6 +191,23 @@ func RunOperator(ctx context.Context, controllerConfig *controllercmd.Controller
+ 		func() bool {
+ 			return false
+ 		},
++	).WithConditionalStaticResourcesController(
++		"GCPPDDriverOldControllerPrivilegedBindingRemoval",
++		kubeClient,
++		dynamicClient,
++		kubeInformersForNamespaces,
++		assets.ReadFile,
++		[]string{
++			"rbac/old_controller_privileged_binding.yaml",
++		},
++		// Never create.
++		func() bool {
++			return false
++		},
++		// Always delete.
++		func() bool {
++			return true
++		},
+ 	).WithCSIConfigObserverController(
+ 		"GCPPDDriverCSIConfigObserverController",
+ 		configInformers,

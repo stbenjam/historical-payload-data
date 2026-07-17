@@ -1,0 +1,503 @@
+diff --git a/Makefile b/Makefile
+index 8b85144eafa..e0e97ed1ac0 100644
+--- a/Makefile
++++ b/Makefile
+@@ -220,7 +220,7 @@ write-available-featuresets:
+ 
+ .PHONY: clean
+ clean:
+-	rm -f render write-available-featuresets models-schema
++	rm -f render write-available-featuresets
+ 	rm -rf tools/_output
+ 
+ VERSION     ?= $(shell git describe --always --abbrev=7)
+diff --git a/hack/update-openapi.sh b/hack/update-openapi.sh
+index fd35ece5e6f..c2ddebd73b1 100755
+--- a/hack/update-openapi.sh
++++ b/hack/update-openapi.sh
+@@ -6,8 +6,5 @@ source "$(dirname "${BASH_SOURCE}")/lib/init.sh"
+ output_path="${OUTPUT_PATH:-openapi}"
+ output_package="${SCRIPT_ROOT}/${output_path}"
+ 
+-GENERATOR=openapi EXTRA_ARGS=--openapi:output-package-path=${output_path}/generated_openapi ${SCRIPT_ROOT}/hack/update-codegen.sh
+-
+-go build github.com/openshift/api/openapi/cmd/models-schema
+-
+-./models-schema  | jq '.' > ${output_package}/openapi.json
++# Generate both Go and JSON OpenAPI schemas using the integrated codegen tool
++GENERATOR=openapi EXTRA_ARGS=--openapi:output-package-path=${output_path} ${SCRIPT_ROOT}/hack/update-codegen.sh
+diff --git a/openapi/cmd/models-schema/main.go b/openapi/cmd/models-schema/main.go
+deleted file mode 100644
+index 9c81c715476..00000000000
+--- a/openapi/cmd/models-schema/main.go
++++ /dev/null
+@@ -1,76 +0,0 @@
+-package main
+-
+-import (
+-	"encoding/json"
+-	"fmt"
+-	"os"
+-	"strings"
+-
+-	"github.com/openshift/api/openapi/generated_openapi"
+-	"k8s.io/kube-openapi/pkg/common"
+-	"k8s.io/kube-openapi/pkg/validation/spec"
+-)
+-
+-// Outputs openAPI schema JSON containing the schema definitions in zz_generated.openapi.go.
+-// pulled from model_schema command of k/k
+-func main() {
+-	err := output()
+-	if err != nil {
+-		os.Stderr.WriteString(fmt.Sprintf("Failed: %v", err))
+-		os.Exit(1)
+-	}
+-}
+-
+-func output() error {
+-	refFunc := func(name string) spec.Ref {
+-		return spec.MustCreateRef(fmt.Sprintf("#/definitions/%s", name))
+-	}
+-	defs := generated_openapi.GetOpenAPIDefinitions(refFunc)
+-	schemaDefs := make(map[string]spec.Schema, len(defs))
+-	for k, v := range defs {
+-		// Replace top-level schema with v2 if a v2 schema is embedded
+-		// so that the output of this program is always in OpenAPI v2.
+-		// This is done by looking up an extension that marks the embedded v2
+-		// schema, and, if the v2 schema is found, make it the resulting schema for
+-		// the type.
+-		if schema, ok := v.Schema.Extensions[common.ExtensionV2Schema]; ok {
+-			if v2Schema, isOpenAPISchema := schema.(spec.Schema); isOpenAPISchema {
+-				schemaDefs[k] = v2Schema
+-				continue
+-			}
+-		}
+-
+-		schemaDefs[k] = v.Schema
+-	}
+-	data, err := json.Marshal(&spec.Swagger{
+-		SwaggerProps: spec.SwaggerProps{
+-			Definitions: schemaDefs,
+-			Info: &spec.Info{
+-				InfoProps: spec.InfoProps{
+-					Title:   "Kubernetes",
+-					Version: "unversioned",
+-				},
+-			},
+-			Swagger: "2.0",
+-		},
+-	})
+-	if err != nil {
+-		return fmt.Errorf("error serializing api definitions: %w", err)
+-	}
+-	os.Stdout.Write(data)
+-	return nil
+-}
+-
+-// From vendor/k8s.io/apiserver/pkg/endpoints/openapi/openapi.go
+-func friendlyName(name string) string {
+-	nameParts := strings.Split(name, "/")
+-	// Reverse first part. e.g., io.k8s... instead of k8s.io...
+-	if len(nameParts) > 0 && strings.Contains(nameParts[0], ".") {
+-		parts := strings.Split(nameParts[0], ".")
+-		for i, j := 0, len(parts)-1; i < j; i, j = i+1, j-1 {
+-			parts[i], parts[j] = parts[j], parts[i]
+-		}
+-		nameParts[0] = strings.Join(parts, ".")
+-	}
+-	return strings.Join(nameParts, ".")
+-}
+diff --git a/openapi/openapi.json b/openapi/openapi.json
+index 9949e9600bf..e39019707c8 100644
+--- a/openapi/openapi.json
++++ b/openapi/openapi.json
+@@ -1,7 +1,7 @@
+ {
+   "swagger": "2.0",
+   "info": {
+-    "title": "Kubernetes",
++    "title": "OpenShift API",
+     "version": "unversioned"
+   },
+   "paths": null,
+@@ -9257,7 +9257,7 @@
+       ],
+       "properties": {
+         "installationPolicy": {
+-          "description": "installationPolicy controls whether network observability is installed during cluster deployment. Valid values are \"InstallAndEnable\" and \"NoAction\". When set to \"InstallAndEnable\", ensure that network observability will be installed and enabled on the cluster. If already installed, no action taken, but if it gets uninstalled, it will install it again. When set to \"NoAction\", nothing will be done regarding Network observability.",
++          "description": "installationPolicy controls whether network observability is installed during cluster deployment. Valid values are \"InstallAndEnable\" and \"NoAction\". When set to \"InstallAndEnable\", ensure that network observability will be installed and enabled on the cluster. If already installed, no action taken, but if it gets uninstalled, it will install it again. When set to \"NoAction\", nothing will be done regarding Network observability. During the installation of NetworkObservability, the platform checks for any existing manual installations. If a successful installation using the OLMv0 or OLMv1 API is detected, it will be used. If the platform cannot determine how the current version was installed, or if the existing installation is incomplete, the installation process will stop.",
+           "type": "string"
+         }
+       }
+@@ -32116,8 +32116,8 @@
+       "description": "CustomSecretRotation holds configuration for custom secret rotation behavior.",
+       "type": "object",
+       "properties": {
+-        "rotationPollIntervalSeconds": {
+-          "description": "rotationPollIntervalSeconds is the minimum time in seconds between secret rotation attempts. The driver skips provider calls if less than this interval has elapsed since the last successful rotation. Must be at least 1 second and no more than 31560000 seconds (~1 year). When omitted, this means no opinion and the platform is left to choose a reasonable default, which is subject to change over time.",
++        "minimumRefreshAge": {
++          "description": "minimumRefreshAge is the minimum time in seconds between secret rotation attempts. Each time kubelet calls NodePublishVolume, the driver checks whether this interval has elapsed since the last successful provider call. If it has, the driver contacts the secret provider to fetch the latest secret values and updates the mounted volume. Setting this value below the kubelet syncFrequency (default: 1 minute) has no additional effect on the actual rotation cadence. Must be at least 1 second and no more than 31560000 seconds (~1 year). When omitted, this means no opinion and the platform is left to choose a reasonable default, which is subject to change over time.",
+           "type": "integer",
+           "format": "int32"
+         }
+@@ -33572,6 +33572,10 @@
+           "description": "endpointPublishingStrategy is used to publish the ingress controller endpoints to other networks, enable load balancer integrations, etc.\n\nIf unset, the default is based on infrastructure.config.openshift.io/cluster .status.platform:\n\n  AWS:          LoadBalancerService (with External scope)\n  Azure:        LoadBalancerService (with External scope)\n  GCP:          LoadBalancerService (with External scope)\n  IBMCloud:     LoadBalancerService (with External scope)\n  AlibabaCloud: LoadBalancerService (with External scope)\n  Libvirt:      HostNetwork\n\nAny other platform types (including None) default to HostNetwork.\n\nendpointPublishingStrategy cannot be updated.",
+           "$ref": "#/definitions/com.github.openshift.api.operator.v1.EndpointPublishingStrategy"
+         },
++        "haproxyVersion": {
++          "description": "haproxyVersion specifies the HAProxy version to use for this IngressController.\n\nOpenShift 5.0 introduces HAProxy 3.2 as its default version and supports HAProxy 2.8 from OpenShift 4.22 for migration purposes. When an OpenShift release introduces a new default HAProxy version, that HAProxy version becomes available as a pinnable value in subsequent OpenShift releases, providing a smooth migration path for administrators who want to defer HAProxy upgrades.\n\nValid values for OpenShift 5.0: - Unset (default): Uses HAProxy 3.2 (the default for OpenShift 5.0) - \"3.2\": Explicitly pins HAProxy 3.2 for preservation during cluster\n  upgrades to future OpenShift releases\n- \"2.8\": Uses HAProxy 2.8 from OpenShift 4.22 (migration support, will\n  be dropped in the next OpenShift release)\n\nIf a specific HAProxy version is set and would become unsupported in a target cluster upgrade, a preflight check will block the cluster upgrade until this field is updated to unset or a supported version.",
++          "type": "string"
++        },
+         "httpCompression": {
+           "description": "httpCompression defines a policy for HTTP traffic compression. By default, there is no HTTP compression.",
+           "default": {},
+@@ -33662,6 +33666,10 @@
+           "type": "string",
+           "default": ""
+         },
++        "effectiveHAProxyVersion": {
++          "description": "effectiveHAProxyVersion reports the HAProxy version currently in use by this IngressController. This reflects the resolved value of the spec.haproxyVersion field. When omitted, the effective value has not yet been resolved by the operator or the feature is not enabled for this cluster.\n\nExamples for OpenShift 5.0: - \"3.2\": Using HAProxy 3.2 - \"2.8\": Using HAProxy 2.8",
++          "type": "string"
++        },
+         "endpointPublishingStrategy": {
+           "description": "endpointPublishingStrategy is the actual strategy in use.",
+           "$ref": "#/definitions/com.github.openshift.api.operator.v1.EndpointPublishingStrategy"
+diff --git a/tools/codegen/pkg/openapi/generator.go b/tools/codegen/pkg/openapi/generator.go
+index 3aa6b5b5bf7..cc0888e57c4 100644
+--- a/tools/codegen/pkg/openapi/generator.go
++++ b/tools/codegen/pkg/openapi/generator.go
+@@ -18,7 +18,7 @@ const (
+ 
+ var (
+ 	// DefaultOutputPackagePath is the default output package path for the generated openapi functions.
+-	DefaultOutputPackagePath = filepath.Join("openapi", "generated_openapi")
++	DefaultOutputPackagePath = filepath.Join("openapi")
+ 
+ 	// defaultInputPaths contains the default list of input paths for the OpenAPI generator.
+ 	defaultInputPaths = []string{
+diff --git a/tools/codegen/pkg/openapi/openapi.go b/tools/codegen/pkg/openapi/openapi.go
+index 5246f4e576c..97362b7f7f9 100644
+--- a/tools/codegen/pkg/openapi/openapi.go
++++ b/tools/codegen/pkg/openapi/openapi.go
+@@ -5,6 +5,7 @@ import (
+ 	"fmt"
+ 	"log"
+ 	"os"
++	"os/exec"
+ 	"path/filepath"
+ 
+ 	"github.com/openshift/api/tools/codegen/pkg/generation"
+@@ -18,11 +19,16 @@ import (
+ 	"k8s.io/kube-openapi/pkg/generators"
+ )
+ 
+-// generateDeepcopyFunctions generates the OpenAPI functions for the given API package paths.
++const generatedOpenAPI = "generated_openapi"
++
++// generateOpenAPIDefinitions generates the OpenAPI functions for the given API package paths.
++// It generates both the Go file and the JSON schema output.
+ func generateOpenAPIDefinitions(globalParser *parser.Parser, universe types.Universe, inputPaths []string, outputPackagePath, outputFileName, headerFilePath string, verify bool) error {
+ 	// This is the expected path to the output file.
+ 	// This is what we will compare against if verify is true.
+-	outputFile := filepath.Join(outputPackagePath, outputFileName)
++	originalOutputPackagePath := outputPackagePath
++	goOutputPackagePath := filepath.Join(outputPackagePath, generatedOpenAPI)
++	outputFile := filepath.Join(goOutputPackagePath, outputFileName)
+ 
+ 	if verify {
+ 		outputPackageBase := filepath.Base(outputPackagePath)
+@@ -36,8 +42,8 @@ func generateOpenAPIDefinitions(globalParser *parser.Parser, universe types.Univ
+ 		outputPackagePath = filepath.Join(tmpDir, outputPackageBase)
+ 	}
+ 	arguments := args.New()
+-	arguments.OutputDir = outputPackagePath
+-	arguments.OutputPkg = outputPackagePath
++	arguments.OutputDir = goOutputPackagePath
++	arguments.OutputPkg = goOutputPackagePath
+ 	arguments.OutputFile = outputFileName
+ 	arguments.GoHeaderFile = headerFilePath
+ 
+@@ -67,34 +73,182 @@ func generateOpenAPIDefinitions(globalParser *parser.Parser, universe types.Univ
+ 		return fmt.Errorf("error executing openapi generator: %w", err)
+ 	}
+ 
+-	if verify {
+-		return verifyDiff(outputFile, outputPackagePath, outputFileName)
++	if !verify {
++		// For normal generation, write JSON schema to disk
++		if err := generateJSONSchema(goOutputPackagePath, outputPackagePath); err != nil {
++			return fmt.Errorf("error generating JSON schema: %w", err)
++		}
++	} else {
++		// For verification, first verify Go files, then verify JSON schema separately
++		if err := verifyGoFile(outputFile, goOutputPackagePath, outputFileName); err != nil {
++			return fmt.Errorf("error verifying generated openapi Go file: %w", err)
++		}
++
++		// After Go verification passes, verify JSON schema, this is all handled in memory
++		return verifyJSONSchema(goOutputPackagePath, originalOutputPackagePath)
+ 	}
+ 
+ 	return nil
+ }
+ 
+-// verifyDiff compares the generated file we put in the temporary directory
+-// with the current file in the expected location.
++// verifyGoFile compares the generated Go file in the temporary directory
++// with the current Go file in the expected location.
+ // It returns a diff in the error if the files are different.
+-func verifyDiff(currentFile, outputPackagePath, outputFileName string) error {
+-	verifyFile := filepath.Join(outputPackagePath, outputFileName)
++func verifyGoFile(currentFile, tempOutputPackagePath, outputFileName string) error {
++	verifyGoFile := filepath.Join(tempOutputPackagePath, outputFileName)
++	verifyGoData, err := os.ReadFile(verifyGoFile)
++	if err != nil {
++		return fmt.Errorf("failed to read generated Go file: %w", err)
++	}
++
++	currentGoData, err := os.ReadFile(currentFile)
++	if err != nil {
++		return fmt.Errorf("failed to read current Go file: %w", err)
++	}
++
++	if !bytes.Equal(currentGoData, verifyGoData) {
++		diff := utils.Diff(currentGoData, verifyGoData, currentFile)
++		return fmt.Errorf("OpenAPI Go schema for %s is out of date, please regenerate the OpenAPI schema:\n%s", currentFile, diff)
++	}
++
++	return nil
++}
+ 
+-	verifyData, err := os.ReadFile(verifyFile)
++// verifyJSONSchema generates JSON schema in memory and compares it with the current JSON file.
++// This is run separately after Go file verification passes.
++func verifyJSONSchema(schemaSourcePackage, outputPackagePath string) error {
++	outputFileName := "openapi.json"
++	klog.V(2).Infof("Verifying JSON schema for %s", outputFileName)
++
++	// Generate JSON schema in memory for verification
++	jsonSchemaData, err := generateJSONSchemaInMemory(schemaSourcePackage)
++	if err != nil {
++		return fmt.Errorf("failed to generate JSON schema for verification: %w", err)
++	}
++
++	// Verify the JSON schema file
++	currentJsonFile := filepath.Join(outputPackagePath, outputFileName)
++	currentJsonData, err := os.ReadFile(currentJsonFile)
+ 	if err != nil {
+-		return fmt.Errorf("failed to read generated file: %w", err)
++		return fmt.Errorf("failed to read current JSON schema file: %w", err)
++	}
++
++	if !bytes.Equal(currentJsonData, jsonSchemaData) {
++		diff := utils.Diff(currentJsonData, jsonSchemaData, currentJsonFile)
++		return fmt.Errorf("OpenAPI JSON schema for %s is out of date, please regenerate the OpenAPI schema:\n%s", currentJsonFile, diff)
++	}
++
++	return nil
++}
++
++// generateJSONSchemaInMemory creates JSON schema data from the generated Go OpenAPI definitions
++// and returns it as a byte slice without writing to disk
++func generateJSONSchemaInMemory(schemaSourcePackage string) ([]byte, error) {
++	outputFileName := "openapi.json"
++	klog.V(2).Infof("Generating JSON schema in memory from %s", outputFileName)
++
++	// Create a temporary Go program that imports the generated package and outputs JSON
++	tempDir, err := os.MkdirTemp("", "openapi-json-gen-*")
++	if err != nil {
++		return nil, fmt.Errorf("failed to create temporary directory: %w", err)
++	}
++	defer os.RemoveAll(tempDir)
++
++	// Determine the package name from the output package path
++	packageName := filepath.Join("github.com/openshift/api", schemaSourcePackage)
++
++	// Create temporary main.go that calls the generated function
++	tempMainContent := fmt.Sprintf(`package main
++
++import (
++	"fmt"
++	"os"
++
++	openapi "%s"
++	"github.com/openshift/api/tools/codegen/pkg/openapi/util"
++)
++
++func main() {
++	if err := util.OutputSchemas(openapi.GetOpenAPIDefinitions); err != nil {
++		fmt.Fprintf(os.Stderr, "Failed: %%v\n", err)
++		os.Exit(1)
+ 	}
++}`, packageName)
+ 
+-	currentData, err := os.ReadFile(currentFile)
++	tempMainFile := filepath.Join(tempDir, "main.go")
++	if err := os.WriteFile(tempMainFile, []byte(tempMainContent), 0644); err != nil {
++		return nil, fmt.Errorf("failed to write temporary main.go: %w", err)
++	}
++
++	// Get the absolute path to the repository root
++	repoRoot, err := filepath.Abs(".")
+ 	if err != nil {
+-		return fmt.Errorf("failed to read current file: %w", err)
++		return nil, fmt.Errorf("failed to get absolute path: %w", err)
++	}
++
++	// Create go.mod for the temporary module
++	tempGoModContent := fmt.Sprintf(`module temp-json-gen
++
++go 1.21
++
++replace github.com/openshift/api => %s
++replace github.com/openshift/api/tools => %s/tools
++
++require github.com/openshift/api v0.0.0
++require github.com/openshift/api/tools v0.0.0
++`, repoRoot, repoRoot)
++	tempGoModFile := filepath.Join(tempDir, "go.mod")
++	if err := os.WriteFile(tempGoModFile, []byte(tempGoModContent), 0644); err != nil {
++		return nil, fmt.Errorf("failed to write temporary go.mod: %w", err)
+ 	}
+ 
+-	if !bytes.Equal(currentData, verifyData) {
+-		diff := utils.Diff(currentData, verifyData, currentFile)
++	// Run go mod tidy to fix dependencies
++	tidyCmd := exec.Command("go", "mod", "tidy")
++	tidyCmd.Dir = tempDir
++	if err := tidyCmd.Run(); err != nil {
++		return nil, fmt.Errorf("failed to run go mod tidy: %w", err)
++	}
++
++	vendorCmd := exec.Command("go", "mod", "vendor")
++	vendorCmd.Dir = tempDir
++	if err := vendorCmd.Run(); err != nil {
++		return nil, fmt.Errorf("failed to run go mod vendor: %w", err)
++	}
++
++	// Run the temporary program and capture its output
++	cmd := exec.Command("go", "run", ".")
++	cmd.Dir = tempDir
++
++	// Capture both stdout and stderr separately for better error handling
++	var stdout, stderr bytes.Buffer
++	cmd.Stdout = &stdout
++	cmd.Stderr = &stderr
++
++	if err := cmd.Run(); err != nil {
++		return nil, fmt.Errorf("failed to run temporary JSON generation program: %w\nstderr: %s", err, stderr.String())
++	}
++
++	output := stdout.Bytes()
++	if len(output) == 0 {
++		return nil, fmt.Errorf("temporary JSON generation program produced no output\nstderr: %s", stderr.String())
++	}
++
++	return output, nil
++}
++
++// generateJSONSchema creates a JSON schema file from the generated Go OpenAPI definitions
++func generateJSONSchema(schemaSourcePackage, outputPackagePath string) error {
++	jsonSchemaData, err := generateJSONSchemaInMemory(schemaSourcePackage)
++	if err != nil {
++		return err
++	}
+ 
+-		return fmt.Errorf("OpenAPI schema for %s is out of date, please regenerate the OpenAPI schema:\n%s", currentFile, diff)
++	// Write the JSON schema to the output directory
++	jsonSchemaFile := filepath.Join(outputPackagePath, "openapi.json")
++	if err := os.WriteFile(jsonSchemaFile, jsonSchemaData, 0644); err != nil {
++		return fmt.Errorf("failed to write OpenAPI JSON schema file: %w", err)
+ 	}
+ 
++	klog.V(1).Infof("Generated OpenAPI JSON schema: %s", jsonSchemaFile)
+ 	return nil
+ }
+diff --git a/tools/codegen/pkg/openapi/util/util.go b/tools/codegen/pkg/openapi/util/util.go
+new file mode 100644
+index 00000000000..5e28258d299
+--- /dev/null
++++ b/tools/codegen/pkg/openapi/util/util.go
+@@ -0,0 +1,81 @@
++/*
++Copyright The Kubernetes Authors.
++
++Licensed under the Apache License, Version 2.0 (the "License");
++you may not use this file except in compliance with the License.
++You may obtain a copy of the License at
++
++    http://www.apache.org/licenses/LICENSE-2.0
++
++Unless required by applicable law or agreed to in writing, software
++distributed under the License is distributed on an "AS IS" BASIS,
++WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++See the License for the specific language governing permissions and
++limitations under the License.
++*/
++
++package util
++
++import (
++	"bytes"
++	"encoding/json"
++	"fmt"
++	"os"
++
++	"k8s.io/kube-openapi/pkg/common"
++	"k8s.io/kube-openapi/pkg/validation/spec"
++)
++
++// OutputSchemas writes OpenAPI v2 schema JSON to stdout for the provided definitions.
++func OutputSchemas(getDefinitions common.GetOpenAPIDefinitions) error {
++	refFunc := func(name string) spec.Ref {
++		return spec.MustCreateRef(fmt.Sprintf("#/definitions/%s", name))
++	}
++
++	defs := getDefinitions(refFunc)
++	schemaDefs := make(map[string]spec.Schema, len(defs))
++
++	for k, v := range defs {
++		// Replace top-level schema with v2 if a v2 schema is embedded
++		// so that the output of this program is always in OpenAPI v2.
++		// This is done by looking up an extension that marks the embedded v2
++		// schema, and, if the v2 schema is found, make it the resulting schema for
++		// the type.
++		if schema, ok := v.Schema.Extensions[common.ExtensionV2Schema]; ok {
++			if v2Schema, isOpenAPISchema := schema.(spec.Schema); isOpenAPISchema {
++				schemaDefs[k] = v2Schema
++				continue
++			}
++		}
++		schemaDefs[k] = v.Schema
++	}
++
++	// Use a buffer and encoder to control JSON formatting
++	var buf bytes.Buffer
++	encoder := json.NewEncoder(&buf)
++	encoder.SetEscapeHTML(false) // Don't escape HTML characters like & < >
++	encoder.SetIndent("", "  ")  // Pretty print with 2-space indent
++
++	swagger := &spec.Swagger{
++		SwaggerProps: spec.SwaggerProps{
++			Definitions: schemaDefs,
++			Info: &spec.Info{
++				InfoProps: spec.InfoProps{
++					Title:   "OpenShift API",
++					Version: "unversioned",
++				},
++			},
++			Swagger: "2.0",
++		},
++	}
++
++	if err := encoder.Encode(swagger); err != nil {
++		return fmt.Errorf("error serializing api definitions: %v\n", err)
++	}
++
++	if _, err := os.Stdout.Write(buf.Bytes()); err != nil {
++		return fmt.Errorf("error writing api definitions: %v\n", err)
++	}
++
++	return nil
++}

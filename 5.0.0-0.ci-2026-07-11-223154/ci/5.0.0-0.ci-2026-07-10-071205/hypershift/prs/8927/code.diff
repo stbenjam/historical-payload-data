@@ -1,0 +1,736 @@
+diff --git a/hypershift-operator/controllers/platform/gcp/privateserviceconnect_controller.go b/hypershift-operator/controllers/platform/gcp/privateserviceconnect_controller.go
+index 127c6caf781e..6c32278d9eae 100644
+--- a/hypershift-operator/controllers/platform/gcp/privateserviceconnect_controller.go
++++ b/hypershift-operator/controllers/platform/gcp/privateserviceconnect_controller.go
+@@ -40,11 +40,63 @@ const (
+ // +kubebuilder:rbac:groups=hypershift.openshift.io,resources=gcpprivateserviceconnects/status,verbs=get;update;patch
+ // +kubebuilder:rbac:groups=hypershift.openshift.io,resources=hostedclusters,verbs=get;list;watch
+ 
++// ComputeClient abstracts the GCP Compute API calls used by the PSC controller.
++// Using an interface instead of *compute.Service enables unit testing with fakes.
++type ComputeClient interface {
++	ListForwardingRules(ctx context.Context, project, region, filter string) ([]*compute.ForwardingRule, error)
++	ListSubnetworks(ctx context.Context, project, region, filter string) ([]*compute.Subnetwork, error)
++	ListServiceAttachments(ctx context.Context, project, region string) ([]*compute.ServiceAttachment, error)
++	GetServiceAttachment(ctx context.Context, project, region, name string) (*compute.ServiceAttachment, error)
++	InsertServiceAttachment(ctx context.Context, project, region string, sa *compute.ServiceAttachment) (*compute.Operation, error)
++	DeleteServiceAttachment(ctx context.Context, project, region, name string) (*compute.Operation, error)
++}
++
++// computeServiceAdapter adapts *compute.Service to ComputeClient.
++type computeServiceAdapter struct {
++	svc *compute.Service
++}
++
++func (a *computeServiceAdapter) ListForwardingRules(ctx context.Context, project, region, filter string) ([]*compute.ForwardingRule, error) {
++	resp, err := a.svc.ForwardingRules.List(project, region).Filter(filter).Context(ctx).Do()
++	if err != nil {
++		return nil, err
++	}
++	return resp.Items, nil
++}
++
++func (a *computeServiceAdapter) ListSubnetworks(ctx context.Context, project, region, filter string) ([]*compute.Subnetwork, error) {
++	resp, err := a.svc.Subnetworks.List(project, region).Filter(filter).Context(ctx).Do()
++	if err != nil {
++		return nil, err
++	}
++	return resp.Items, nil
++}
++
++func (a *computeServiceAdapter) ListServiceAttachments(ctx context.Context, project, region string) ([]*compute.ServiceAttachment, error) {
++	resp, err := a.svc.ServiceAttachments.List(project, region).Context(ctx).Do()
++	if err != nil {
++		return nil, err
++	}
++	return resp.Items, nil
++}
++
++func (a *computeServiceAdapter) GetServiceAttachment(ctx context.Context, project, region, name string) (*compute.ServiceAttachment, error) {
++	return a.svc.ServiceAttachments.Get(project, region, name).Context(ctx).Do()
++}
++
++func (a *computeServiceAdapter) InsertServiceAttachment(ctx context.Context, project, region string, sa *compute.ServiceAttachment) (*compute.Operation, error) {
++	return a.svc.ServiceAttachments.Insert(project, region, sa).Context(ctx).Do()
++}
++
++func (a *computeServiceAdapter) DeleteServiceAttachment(ctx context.Context, project, region, name string) (*compute.Operation, error) {
++	return a.svc.ServiceAttachments.Delete(project, region, name).Context(ctx).Do()
++}
++
+ // GCPPrivateServiceConnectReconciler reconciles GCPPrivateServiceConnect resources
+ type GCPPrivateServiceConnectReconciler struct {
+ 	client.Client
+ 	upsert.CreateOrUpdateProvider
+-	GcpClient *compute.Service // GCP Compute API client for ForwardingRules, ServiceAttachments, and Subnets
++	GcpClient ComputeClient
+ 	ProjectID string
+ 	Region    string
+ 	Log       logr.Logger
+@@ -57,7 +109,7 @@ func (r *GCPPrivateServiceConnectReconciler) SetupWithManager(mgr ctrl.Manager)
+ 	if err != nil {
+ 		return fmt.Errorf("failed to initialize GCP Compute service: %w", err)
+ 	}
+-	r.GcpClient = gcpComputeService
++	r.GcpClient = &computeServiceAdapter{svc: gcpComputeService}
+ 
+ 	// Extract GCP project ID from GCP_PROJECT environment variable
+ 	projectID, err := r.extractGCPProjectFromEnv()
+@@ -152,18 +204,30 @@ func (r *GCPPrivateServiceConnectReconciler) Reconcile(ctx context.Context, req
+ 
+ // reconcileGCPPrivateServiceConnectSpec reconciles the GCPPrivateServiceConnect spec fields
+ func (r *GCPPrivateServiceConnectReconciler) reconcileGCPPrivateServiceConnectSpec(ctx context.Context, gcpPSC *hyperv1.GCPPrivateServiceConnect, _ *hyperv1.HostedCluster) error {
+-	// Set ForwardingRuleName if not already populated
++	if gcpPSC.Spec.ForwardingRuleName != "" && gcpPSC.Spec.NATSubnet != "" {
++		return nil
++	}
++
++	// NAT subnet discovery requires the forwarding rule's Network field to scope subnets to the
++	// management cluster's VPC. Look up the forwarding rule unconditionally so we always have the
++	// network URL, even when ForwardingRuleName is already set but NATSubnet is not.
++	rule, err := r.lookupForwardingRule(ctx, gcpPSC)
++	if err != nil {
++		return fmt.Errorf("failed to lookup ForwardingRule: %w", err)
++	}
++	if rule == nil {
++		// ILB not yet provisioned; requeue without writing to spec.
++		return nil
++	}
++	if rule.Network == "" {
++		return fmt.Errorf("ForwardingRule %q has no Network field; cannot scope NAT subnet discovery to the correct VPC", rule.Name)
++	}
+ 	if gcpPSC.Spec.ForwardingRuleName == "" {
+-		forwardingRuleName, err := r.lookupForwardingRuleName(ctx, gcpPSC)
+-		if err != nil {
+-			return fmt.Errorf("failed to lookup ForwardingRule: %w", err)
+-		}
+-		gcpPSC.Spec.ForwardingRuleName = hyperv1.GCPResourceName(forwardingRuleName)
++		gcpPSC.Spec.ForwardingRuleName = hyperv1.GCPResourceName(rule.Name)
+ 	}
+ 
+-	// Set NAT Subnet if not already populated
+ 	if gcpPSC.Spec.NATSubnet == "" {
+-		natSubnet, err := r.discoverNATSubnet(ctx, gcpPSC)
++		natSubnet, err := r.discoverNATSubnet(ctx, gcpPSC, rule.Network)
+ 		if err != nil {
+ 			return fmt.Errorf("failed to discover NAT subnet: %w", err)
+ 		}
+@@ -173,8 +237,9 @@ func (r *GCPPrivateServiceConnectReconciler) reconcileGCPPrivateServiceConnectSp
+ 	return nil
+ }
+ 
+-// lookupForwardingRuleName finds the ForwardingRule name by LoadBalancer IP
+-func (r *GCPPrivateServiceConnectReconciler) lookupForwardingRuleName(ctx context.Context, gcpPSC *hyperv1.GCPPrivateServiceConnect) (string, error) {
++// lookupForwardingRule finds the ForwardingRule for the LoadBalancer IP and returns the full object.
++// Returns nil (no error) when the ILB is not yet provisioned.
++func (r *GCPPrivateServiceConnectReconciler) lookupForwardingRule(ctx context.Context, gcpPSC *hyperv1.GCPPrivateServiceConnect) (*compute.ForwardingRule, error) {
+ 	log := r.Log.WithValues("gcpprivateserviceconnect", gcpPSC.Name, "loadBalancerIP", gcpPSC.Spec.LoadBalancerIP)
+ 
+ 	// Use AIP-160 filter syntax for exact string matching
+@@ -183,27 +248,23 @@ func (r *GCPPrivateServiceConnectReconciler) lookupForwardingRuleName(ctx contex
+ 	apiCtx, cancel := context.WithTimeout(ctx, gcpAPITimeout)
+ 	defer cancel()
+ 
+-	req := r.GcpClient.ForwardingRules.List(r.ProjectID, r.Region).Filter(filter)
+-	resp, err := req.Context(apiCtx).Do()
++	rules, err := r.GcpClient.ListForwardingRules(apiCtx, r.ProjectID, r.Region, filter)
+ 	if err != nil {
+-		return "", fmt.Errorf("failed to list forwarding rules: %w", err)
++		return nil, fmt.Errorf("failed to list forwarding rules: %w", err)
+ 	}
+ 
+-	if len(resp.Items) == 0 {
++	if len(rules) == 0 {
+ 		log.V(1).Info("ForwardingRule not found for LoadBalancer IP, will retry later")
+-		// LoadBalancer might not be fully provisioned yet
+-		return "", nil // Return empty string, not an error
++		return nil, nil
+ 	}
+ 
+-	if len(resp.Items) > 1 {
+-		// This shouldn't happen, but handle gracefully
+-		log.Info("Multiple ForwardingRules found for LoadBalancer IP, using first one", "count", len(resp.Items))
++	if len(rules) > 1 {
++		log.Info("Multiple ForwardingRules found for LoadBalancer IP, using first one", "count", len(rules))
+ 	}
+ 
+-	forwardingRule := resp.Items[0]
+-	log.Info("Found ForwardingRule for LoadBalancer IP", "forwardingRule", forwardingRule.Name)
+-
+-	return forwardingRule.Name, nil
++	rule := rules[0]
++	log.Info("Found ForwardingRule for LoadBalancer IP", "forwardingRule", rule.Name)
++	return rule, nil
+ }
+ 
+ // isSubnetInUse checks if a subnet is already being used by existing Service Attachments
+@@ -211,15 +272,13 @@ func (r *GCPPrivateServiceConnectReconciler) isSubnetInUse(ctx context.Context,
+ 	apiCtx, cancel := context.WithTimeout(ctx, gcpAPITimeout)
+ 	defer cancel()
+ 
+-	// List all Service Attachments in the region
+-	req := r.GcpClient.ServiceAttachments.List(r.ProjectID, r.Region)
+-	resp, err := req.Context(apiCtx).Do()
++	serviceAttachments, err := r.GcpClient.ListServiceAttachments(apiCtx, r.ProjectID, r.Region)
+ 	if err != nil {
+ 		return false, fmt.Errorf("failed to list service attachments: %w", err)
+ 	}
+ 
+ 	// Check if any Service Attachment is using this subnet
+-	for _, sa := range resp.Items {
++	for _, sa := range serviceAttachments {
+ 		for _, natSubnet := range sa.NatSubnets {
+ 			// NatSubnets contains full URLs like:
+ 			// "projects/PROJECT_ID/regions/REGION/subnetworks/SUBNET_NAME"
+@@ -233,46 +292,45 @@ func (r *GCPPrivateServiceConnectReconciler) isSubnetInUse(ctx context.Context,
+ 	return false, nil
+ }
+ 
+-// discoverNATSubnet discovers available PRIVATE_SERVICE_CONNECT subnets
+-func (r *GCPPrivateServiceConnectReconciler) discoverNATSubnet(ctx context.Context, gcpPSC *hyperv1.GCPPrivateServiceConnect) (string, error) {
++// discoverNATSubnet finds an available PRIVATE_SERVICE_CONNECT subnet scoped to the given VPC network.
++// networkURL is the full GCP network URL from the forwarding rule (e.g.
++// "https://www.googleapis.com/compute/v1/projects/…/global/networks/my-vpc").
++func (r *GCPPrivateServiceConnectReconciler) discoverNATSubnet(ctx context.Context, gcpPSC *hyperv1.GCPPrivateServiceConnect, networkURL string) (string, error) {
+ 	log := r.Log.WithValues("gcpprivateserviceconnect", gcpPSC.Name)
+ 
+-	// 1. Check if NATSubnet already specified in CR
+-	if gcpPSC.Spec.NATSubnet != "" {
+-		log.Info("Using specified NAT subnet", "subnet", gcpPSC.Spec.NATSubnet)
+-		return string(gcpPSC.Spec.NATSubnet), nil
+-	}
++	// Filter server-side to only subnets with PSC purpose in the management cluster's VPC,
++	// preventing cross-VPC selection when multiple management clusters share a GCP project.
++	filter := buildNATSubnetFilter(networkURL)
+ 
+-	// 2. List subnets with PRIVATE_SERVICE_CONNECT purpose
+ 	apiCtx, cancel := context.WithTimeout(ctx, gcpAPITimeout)
+ 	defer cancel()
+ 
+-	req := r.GcpClient.Subnetworks.List(r.ProjectID, r.Region)
+-	resp, err := req.Context(apiCtx).Do()
++	subnets, err := r.GcpClient.ListSubnetworks(apiCtx, r.ProjectID, r.Region, filter)
+ 	if err != nil {
+ 		return "", fmt.Errorf("failed to list subnets: %w", err)
+ 	}
+ 
+-	// Find first available PRIVATE_SERVICE_CONNECT subnet not already in use.
+-	// Race conditions are not a concern since we use a single management cluster per GCP project.
+-	for _, subnet := range resp.Items {
+-		if subnet.Purpose == "PRIVATE_SERVICE_CONNECT" {
+-			// Check if this subnet is already in use by another Service Attachment
+-			inUse, err := r.isSubnetInUse(ctx, subnet.Name)
+-			if err != nil {
+-				log.Error(err, "Failed to check subnet usage", "subnet", subnet.Name)
+-				continue // Skip this subnet and try the next one
+-			}
+-
+-			if !inUse {
+-				log.Info("Found available PSC subnet", "subnet", subnet.Name)
+-				return subnet.Name, nil
+-			}
++	// Find the first available PSC subnet in the MC's VPC not already in use by another Service Attachment.
++	var checkErrors int
++	for _, subnet := range subnets {
++		inUse, err := r.isSubnetInUse(ctx, subnet.Name)
++		if err != nil {
++			log.Error(err, "Failed to check subnet usage", "subnet", subnet.Name)
++			checkErrors++
++			continue
++		}
+ 
+-			log.V(1).Info("Subnet already in use, trying next", "subnet", subnet.Name)
++		if !inUse {
++			log.Info("Found available PSC subnet", "subnet", subnet.Name)
++			return subnet.Name, nil
+ 		}
++
++		log.V(1).Info("Subnet already in use, trying next", "subnet", subnet.Name)
+ 	}
+ 
++	if checkErrors > 0 {
++		return "", fmt.Errorf("no available PRIVATE_SERVICE_CONNECT subnet found in region %s (failed to check %d of %d candidates due to API errors)", r.Region, checkErrors, len(subnets))
++	}
+ 	return "", fmt.Errorf("no available PRIVATE_SERVICE_CONNECT subnet found in region %s", r.Region)
+ }
+ 
+@@ -287,7 +345,7 @@ func (r *GCPPrivateServiceConnectReconciler) reconcileServiceAttachment(ctx cont
+ 	getCtx, getCancel := context.WithTimeout(ctx, gcpAPITimeout)
+ 	defer getCancel()
+ 
+-	existingServiceAttachment, err := r.GcpClient.ServiceAttachments.Get(r.ProjectID, r.Region, serviceAttachmentName).Context(getCtx).Do()
++	existingServiceAttachment, err := r.GcpClient.GetServiceAttachment(getCtx, r.ProjectID, r.Region, serviceAttachmentName)
+ 	if err != nil && !isNotFoundError(err) {
+ 		return ctrl.Result{}, fmt.Errorf("failed to get Service Attachment: %w", err)
+ 	}
+@@ -320,7 +378,7 @@ func (r *GCPPrivateServiceConnectReconciler) reconcileServiceAttachment(ctx cont
+ 	insertCtx, insertCancel := context.WithTimeout(ctx, gcpAPITimeout)
+ 	defer insertCancel()
+ 
+-	op, err := r.GcpClient.ServiceAttachments.Insert(r.ProjectID, r.Region, serviceAttachment).Context(insertCtx).Do()
++	op, err := r.GcpClient.InsertServiceAttachment(insertCtx, r.ProjectID, r.Region, serviceAttachment)
+ 	if err != nil {
+ 		return r.handleGCPError(ctx, gcpPSC, "ServiceAttachmentCreationFailed", err)
+ 	}
+@@ -340,7 +398,7 @@ func (r *GCPPrivateServiceConnectReconciler) reconcileServiceAttachment(ctx cont
+ 	fetchCtx, fetchCancel := context.WithTimeout(ctx, gcpAPITimeout)
+ 	defer fetchCancel()
+ 
+-	createdServiceAttachment, err := r.GcpClient.ServiceAttachments.Get(r.ProjectID, r.Region, serviceAttachmentName).Context(fetchCtx).Do()
++	createdServiceAttachment, err := r.GcpClient.GetServiceAttachment(fetchCtx, r.ProjectID, r.Region, serviceAttachmentName)
+ 	if err != nil {
+ 		return ctrl.Result{}, fmt.Errorf("failed to get newly created Service Attachment: %w", err)
+ 	}
+@@ -439,7 +497,7 @@ func (r *GCPPrivateServiceConnectReconciler) delete(ctx context.Context, gcpPSC
+ 	deleteCtx, deleteCancel := context.WithTimeout(ctx, gcpAPITimeout)
+ 	defer deleteCancel()
+ 
+-	op, err := r.GcpClient.ServiceAttachments.Delete(r.ProjectID, r.Region, serviceAttachmentName).Context(deleteCtx).Do()
++	op, err := r.GcpClient.DeleteServiceAttachment(deleteCtx, r.ProjectID, r.Region, serviceAttachmentName)
+ 	if err != nil {
+ 		if isNotFoundError(err) {
+ 			// Service Attachment already deleted, consider it completed
+@@ -511,6 +569,12 @@ func (r *GCPPrivateServiceConnectReconciler) handleGCPError(ctx context.Context,
+ 	return ctrl.Result{RequeueAfter: requeueAfter}, nil
+ }
+ 
++// buildNATSubnetFilter returns an AIP-160 filter that restricts Subnetworks.List to
++// PSC-purpose subnets in the given VPC network, used by discoverNATSubnet.
++func buildNATSubnetFilter(networkURL string) string {
++	return fmt.Sprintf(`purpose = "PRIVATE_SERVICE_CONNECT" AND network = "%s"`, networkURL)
++}
++
+ // Helper functions
+ 
+ // isNotFoundError checks if an error is a GCP 404 Not Found error
+diff --git a/hypershift-operator/controllers/platform/gcp/privateserviceconnect_controller_test.go b/hypershift-operator/controllers/platform/gcp/privateserviceconnect_controller_test.go
+index 916374b11ebf..8aa7d4e012b3 100644
+--- a/hypershift-operator/controllers/platform/gcp/privateserviceconnect_controller_test.go
++++ b/hypershift-operator/controllers/platform/gcp/privateserviceconnect_controller_test.go
+@@ -20,9 +20,55 @@ import (
+ 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
+ 
+ 	"github.com/go-logr/logr/testr"
++	"google.golang.org/api/compute/v1"
+ 	"google.golang.org/api/googleapi"
+ )
+ 
++// fakeComputeClient implements ComputeClient for unit tests.
++// Each field holds the canned return values for the corresponding method.
++// capturedSubnetFilter records the filter string passed to ListSubnetworks so
++// tests can assert that the VPC-scoped filter reaches the API call site.
++type fakeComputeClient struct {
++	forwardingRules         []*compute.ForwardingRule
++	forwardingRulesErr      error
++	subnetworks             []*compute.Subnetwork
++	subnetworksErr          error
++	capturedSubnetFilter    string
++	serviceAttachments      []*compute.ServiceAttachment
++	serviceAttachmentsErr   error
++	getServiceAttachment    *compute.ServiceAttachment
++	getServiceAttachmentErr error
++	insertOperation         *compute.Operation
++	insertErr               error
++	deleteOperation         *compute.Operation
++	deleteErr               error
++}
++
++func (f *fakeComputeClient) ListForwardingRules(_ context.Context, _, _, _ string) ([]*compute.ForwardingRule, error) {
++	return f.forwardingRules, f.forwardingRulesErr
++}
++
++func (f *fakeComputeClient) ListSubnetworks(_ context.Context, _, _, filter string) ([]*compute.Subnetwork, error) {
++	f.capturedSubnetFilter = filter
++	return f.subnetworks, f.subnetworksErr
++}
++
++func (f *fakeComputeClient) ListServiceAttachments(_ context.Context, _, _ string) ([]*compute.ServiceAttachment, error) {
++	return f.serviceAttachments, f.serviceAttachmentsErr
++}
++
++func (f *fakeComputeClient) GetServiceAttachment(_ context.Context, _, _, _ string) (*compute.ServiceAttachment, error) {
++	return f.getServiceAttachment, f.getServiceAttachmentErr
++}
++
++func (f *fakeComputeClient) InsertServiceAttachment(_ context.Context, _, _ string, _ *compute.ServiceAttachment) (*compute.Operation, error) {
++	return f.insertOperation, f.insertErr
++}
++
++func (f *fakeComputeClient) DeleteServiceAttachment(_ context.Context, _, _, _ string) (*compute.Operation, error) {
++	return f.deleteOperation, f.deleteErr
++}
++
+ func TestIsNotFoundError(t *testing.T) {
+ 	tests := []struct {
+ 		name     string
+@@ -291,3 +337,264 @@ func TestConstructServiceAttachmentName(t *testing.T) {
+ 		})
+ 	}
+ }
++
++func TestNATSubnetFilterFormat(t *testing.T) {
++	tests := []struct {
++		name       string
++		networkURL string
++		expected   string
++	}{
++		{
++			name:       "When given a network URL it should include both purpose and network in the filter",
++			networkURL: "https://www.googleapis.com/compute/v1/projects/my-project/global/networks/my-vpc",
++			expected:   `purpose = "PRIVATE_SERVICE_CONNECT" AND network = "https://www.googleapis.com/compute/v1/projects/my-project/global/networks/my-vpc"`,
++		},
++	}
++
++	for _, tt := range tests {
++		t.Run(tt.name, func(t *testing.T) {
++			filter := buildNATSubnetFilter(tt.networkURL)
++			if filter != tt.expected {
++				t.Errorf("expected %s, got %s", tt.expected, filter)
++			}
++		})
++	}
++}
++
++func newReconciler(t *testing.T, gcpClient ComputeClient) *GCPPrivateServiceConnectReconciler {
++	t.Helper()
++	return &GCPPrivateServiceConnectReconciler{
++		GcpClient: gcpClient,
++		ProjectID: "test-project",
++		Region:    "us-central1",
++		Log:       testr.New(t),
++	}
++}
++
++func newGCPPSC(forwardingRuleName, natSubnet string) *hyperv1.GCPPrivateServiceConnect {
++	return &hyperv1.GCPPrivateServiceConnect{
++		ObjectMeta: metav1.ObjectMeta{Name: "test-psc", Namespace: "test-namespace"},
++		Spec: hyperv1.GCPPrivateServiceConnectSpec{
++			LoadBalancerIP:     "10.0.0.1",
++			ForwardingRuleName: hyperv1.GCPResourceName(forwardingRuleName),
++			NATSubnet:          hyperv1.GCPResourceName(natSubnet),
++		},
++	}
++}
++
++// --- lookupForwardingRule ---
++
++func TestLookupForwardingRule_APIError(t *testing.T) {
++	r := newReconciler(t, &fakeComputeClient{forwardingRulesErr: errors.New("GCP unavailable")})
++	rule, err := r.lookupForwardingRule(context.Background(), newGCPPSC("", ""))
++	if err == nil {
++		t.Error("expected error, got nil")
++	}
++	if rule != nil {
++		t.Errorf("expected nil rule, got %v", rule)
++	}
++}
++
++func TestLookupForwardingRule_NoResults(t *testing.T) {
++	r := newReconciler(t, &fakeComputeClient{forwardingRules: nil})
++	rule, err := r.lookupForwardingRule(context.Background(), newGCPPSC("", ""))
++	if err != nil {
++		t.Errorf("unexpected error: %v", err)
++	}
++	if rule != nil {
++		t.Errorf("expected nil rule, got %v", rule)
++	}
++}
++
++func TestLookupForwardingRule_SingleResult(t *testing.T) {
++	expected := &compute.ForwardingRule{Name: "fr-1", Network: "https://www.googleapis.com/compute/v1/projects/p/global/networks/my-vpc"}
++	r := newReconciler(t, &fakeComputeClient{forwardingRules: []*compute.ForwardingRule{expected}})
++	rule, err := r.lookupForwardingRule(context.Background(), newGCPPSC("", ""))
++	if err != nil {
++		t.Errorf("unexpected error: %v", err)
++	}
++	if rule == nil || rule.Name != expected.Name {
++		t.Errorf("expected rule %q, got %v", expected.Name, rule)
++	}
++}
++
++func TestLookupForwardingRule_MultipleResults_UsesFirst(t *testing.T) {
++	rules := []*compute.ForwardingRule{
++		{Name: "fr-first", Network: "https://www.googleapis.com/compute/v1/projects/p/global/networks/my-vpc"},
++		{Name: "fr-second", Network: "https://www.googleapis.com/compute/v1/projects/p/global/networks/my-vpc"},
++	}
++	r := newReconciler(t, &fakeComputeClient{forwardingRules: rules})
++	rule, err := r.lookupForwardingRule(context.Background(), newGCPPSC("", ""))
++	if err != nil {
++		t.Errorf("unexpected error: %v", err)
++	}
++	if rule == nil || rule.Name != "fr-first" {
++		t.Errorf("expected first rule, got %v", rule)
++	}
++}
++
++// --- reconcileGCPPrivateServiceConnectSpec ---
++
++func TestReconcileSpec_BothFieldsSet_EarlyReturn(t *testing.T) {
++	// GcpClient is nil — proves no GCP call is made when both fields are already set.
++	r := newReconciler(t, nil)
++	gcpPSC := newGCPPSC("existing-rule", "existing-subnet")
++	if err := r.reconcileGCPPrivateServiceConnectSpec(context.Background(), gcpPSC, nil); err != nil {
++		t.Errorf("unexpected error: %v", err)
++	}
++}
++
++func TestReconcileSpec_ForwardingRuleLookupError(t *testing.T) {
++	r := newReconciler(t, &fakeComputeClient{forwardingRulesErr: errors.New("api error")})
++	err := r.reconcileGCPPrivateServiceConnectSpec(context.Background(), newGCPPSC("", ""), nil)
++	if err == nil {
++		t.Error("expected error, got nil")
++	}
++}
++
++func TestReconcileSpec_ForwardingRuleNotYetProvisioned(t *testing.T) {
++	// nil result from lookupForwardingRule — ILB not yet ready, should return nil (requeue).
++	r := newReconciler(t, &fakeComputeClient{forwardingRules: nil})
++	err := r.reconcileGCPPrivateServiceConnectSpec(context.Background(), newGCPPSC("", ""), nil)
++	if err != nil {
++		t.Errorf("expected nil, got error: %v", err)
++	}
++}
++
++func TestReconcileSpec_ForwardingRuleEmptyNetwork(t *testing.T) {
++	// Forwarding rule exists but has no Network field — cannot scope subnet discovery.
++	r := newReconciler(t, &fakeComputeClient{
++		forwardingRules: []*compute.ForwardingRule{{Name: "fr-1", Network: ""}},
++	})
++	err := r.reconcileGCPPrivateServiceConnectSpec(context.Background(), newGCPPSC("", ""), nil)
++	if err == nil {
++		t.Error("expected error for empty Network, got nil")
++	}
++}
++
++func TestReconcileSpec_SetsForwardingRuleNameAndNATSubnet(t *testing.T) {
++	networkURL := "https://www.googleapis.com/compute/v1/projects/p/global/networks/my-vpc"
++	r := newReconciler(t, &fakeComputeClient{
++		forwardingRules: []*compute.ForwardingRule{{Name: "fr-1", Network: networkURL}},
++		subnetworks:     []*compute.Subnetwork{{Name: "psc-subnet-1"}},
++		// No existing service attachments — subnet is available.
++		serviceAttachments: nil,
++	})
++	gcpPSC := newGCPPSC("", "")
++	if err := r.reconcileGCPPrivateServiceConnectSpec(context.Background(), gcpPSC, nil); err != nil {
++		t.Errorf("unexpected error: %v", err)
++	}
++	if gcpPSC.Spec.ForwardingRuleName != "fr-1" {
++		t.Errorf("expected ForwardingRuleName %q, got %q", "fr-1", gcpPSC.Spec.ForwardingRuleName)
++	}
++	if gcpPSC.Spec.NATSubnet != "psc-subnet-1" {
++		t.Errorf("expected NATSubnet %q, got %q", "psc-subnet-1", gcpPSC.Spec.NATSubnet)
++	}
++}
++
++func TestReconcileSpec_PartialWrite_ForwardingRuleNamePreservedNATSubnetDiscovered(t *testing.T) {
++	// Partial-write edge case: ForwardingRuleName was already written in a previous reconcile
++	// but NATSubnet was not (e.g. discoverNATSubnet failed transiently). The controller must
++	// preserve the existing ForwardingRuleName rather than overwriting it, and still use the
++	// forwarding rule's Network field to scope NAT subnet discovery to the correct VPC.
++	networkURL := "https://www.googleapis.com/compute/v1/projects/p/global/networks/my-vpc"
++	fc := &fakeComputeClient{
++		// GCP returns a different rule name than the one already stored in the spec.
++		forwardingRules:    []*compute.ForwardingRule{{Name: "fr-new", Network: networkURL}},
++		subnetworks:        []*compute.Subnetwork{{Name: "psc-subnet-1"}},
++		serviceAttachments: nil,
++	}
++	r := newReconciler(t, fc)
++	gcpPSC := newGCPPSC("fr-original", "")
++	if err := r.reconcileGCPPrivateServiceConnectSpec(context.Background(), gcpPSC, nil); err != nil {
++		t.Errorf("unexpected error: %v", err)
++	}
++	// ForwardingRuleName must not be overwritten.
++	if gcpPSC.Spec.ForwardingRuleName != "fr-original" {
++		t.Errorf("ForwardingRuleName should be preserved; got %q", gcpPSC.Spec.ForwardingRuleName)
++	}
++	// NATSubnet must be discovered using the forwarding rule's network URL.
++	if gcpPSC.Spec.NATSubnet != "psc-subnet-1" {
++		t.Errorf("expected NATSubnet %q, got %q", "psc-subnet-1", gcpPSC.Spec.NATSubnet)
++	}
++	// The subnet filter must be scoped to the forwarding rule's VPC — the core invariant of this PR.
++	wantFilter := buildNATSubnetFilter(networkURL)
++	if fc.capturedSubnetFilter != wantFilter {
++		t.Errorf("ListSubnetworks filter = %q, want %q", fc.capturedSubnetFilter, wantFilter)
++	}
++}
++
++// --- discoverNATSubnet ---
++
++func TestDiscoverNATSubnet_APIError(t *testing.T) {
++	networkURL := "https://example.com/network"
++	fc := &fakeComputeClient{subnetworksErr: errors.New("api error")}
++	r := newReconciler(t, fc)
++	_, err := r.discoverNATSubnet(context.Background(), newGCPPSC("", ""), networkURL)
++	if err == nil {
++		t.Error("expected error, got nil")
++	}
++	wantFilter := buildNATSubnetFilter(networkURL)
++	if fc.capturedSubnetFilter != wantFilter {
++		t.Errorf("ListSubnetworks filter = %q, want %q", fc.capturedSubnetFilter, wantFilter)
++	}
++}
++
++func TestDiscoverNATSubnet_NoSubnets(t *testing.T) {
++	networkURL := "https://example.com/network"
++	fc := &fakeComputeClient{subnetworks: nil}
++	r := newReconciler(t, fc)
++	_, err := r.discoverNATSubnet(context.Background(), newGCPPSC("", ""), networkURL)
++	if err == nil {
++		t.Error("expected error for no available subnets, got nil")
++	}
++	wantFilter := buildNATSubnetFilter(networkURL)
++	if fc.capturedSubnetFilter != wantFilter {
++		t.Errorf("ListSubnetworks filter = %q, want %q", fc.capturedSubnetFilter, wantFilter)
++	}
++}
++
++func TestDiscoverNATSubnet_SubnetInUse_SkipsToNext(t *testing.T) {
++	networkURL := "https://example.com/network"
++	fc := &fakeComputeClient{
++		subnetworks: []*compute.Subnetwork{
++			{Name: "subnet-in-use"},
++			{Name: "subnet-available"},
++		},
++		// First subnet is in use by an existing service attachment.
++		serviceAttachments: []*compute.ServiceAttachment{
++			{NatSubnets: []string{"projects/p/regions/r/subnetworks/subnet-in-use"}},
++		},
++	}
++	r := newReconciler(t, fc)
++	name, err := r.discoverNATSubnet(context.Background(), newGCPPSC("", ""), networkURL)
++	if err != nil {
++		t.Errorf("unexpected error: %v", err)
++	}
++	if name != "subnet-available" {
++		t.Errorf("expected %q, got %q", "subnet-available", name)
++	}
++	wantFilter := buildNATSubnetFilter(networkURL)
++	if fc.capturedSubnetFilter != wantFilter {
++		t.Errorf("ListSubnetworks filter = %q, want %q", fc.capturedSubnetFilter, wantFilter)
++	}
++}
++
++func TestDiscoverNATSubnet_AllSubnetsInUse(t *testing.T) {
++	networkURL := "https://example.com/network"
++	fc := &fakeComputeClient{
++		subnetworks: []*compute.Subnetwork{{Name: "only-subnet"}},
++		serviceAttachments: []*compute.ServiceAttachment{
++			{NatSubnets: []string{"projects/p/regions/r/subnetworks/only-subnet"}},
++		},
++	}
++	r := newReconciler(t, fc)
++	_, err := r.discoverNATSubnet(context.Background(), newGCPPSC("", ""), networkURL)
++	if err == nil {
++		t.Error("expected error when all subnets are in use, got nil")
++	}
++	wantFilter := buildNATSubnetFilter(networkURL)
++	if fc.capturedSubnetFilter != wantFilter {
++		t.Errorf("ListSubnetworks filter = %q, want %q", fc.capturedSubnetFilter, wantFilter)
++	}
++}
+diff --git a/test/e2e/v2/tests/hosted_cluster_psc_test.go b/test/e2e/v2/tests/hosted_cluster_psc_test.go
+new file mode 100644
+index 000000000000..910168e531d7
+--- /dev/null
++++ b/test/e2e/v2/tests/hosted_cluster_psc_test.go
+@@ -0,0 +1,100 @@
++//go:build e2ev2
++
++/*
++Licensed under the Apache License, Version 2.0 (the "License");
++you may not use this file except in compliance with the License.
++You may obtain a copy of the License at
++
++    http://www.apache.org/licenses/LICENSE-2.0
++
++Unless required by applicable law or agreed to in writing, software
++distributed under the License is distributed on an "AS IS" BASIS,
++WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++See the License for the specific language governing permissions and
++limitations under the License.
++*/
++
++package tests
++
++import (
++	. "github.com/onsi/ginkgo/v2"
++	. "github.com/onsi/gomega"
++
++	hyperv1 "github.com/openshift/hypershift/api/hypershift/v1beta1"
++	"github.com/openshift/hypershift/test/e2e/v2/internal"
++
++	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
++	crclient "sigs.k8s.io/controller-runtime/pkg/client"
++)
++
++// GCPPrivateServiceConnectTest registers tests that validate PSC resource correctness on GCP.
++func GCPPrivateServiceConnectTest(getTestCtx internal.TestContextGetter) {
++	Context("GCP Private Service Connect", Label("GCP", "PSC"), func() {
++		BeforeEach(func() {
++			testCtx := getTestCtx()
++			hc := testCtx.GetHostedCluster()
++			if hc == nil || hc.Spec.Platform.Type != hyperv1.GCPPlatform {
++				Skip("GCP Private Service Connect test is only for GCP platform")
++			}
++		})
++
++		// GCP enforces that the NAT subnet and the forwarding rule must belong to the same VPC
++		// when creating a Service Attachment. A True GCPServiceAttachmentAvailable condition
++		// is therefore proof that the controller selected a subnet from the correct VPC.
++		It("should have GCPServiceAttachmentAvailable condition set to True", func() {
++			testCtx := getTestCtx()
++
++			// Find the GCPPrivateServiceConnect CR in the control plane namespace.
++			// There is exactly one GCPPrivateServiceConnect per hosted cluster.
++			pscList := &hyperv1.GCPPrivateServiceConnectList{}
++			Expect(testCtx.MgmtClient.List(testCtx.Context, pscList,
++				crclient.InNamespace(testCtx.ControlPlaneNamespace),
++			)).To(Succeed())
++			Expect(pscList.Items).NotTo(BeEmpty(),
++				"expected at least one GCPPrivateServiceConnect in namespace %s", testCtx.ControlPlaneNamespace)
++
++			psc := pscList.Items[0]
++
++			// Assert both spec fields are populated — the controller successfully resolved
++			// the forwarding rule and the VPC-scoped NAT subnet.
++			Expect(string(psc.Spec.ForwardingRuleName)).NotTo(BeEmpty(),
++				"GCPPrivateServiceConnect %s should have ForwardingRuleName set", psc.Name)
++			Expect(string(psc.Spec.NATSubnet)).NotTo(BeEmpty(),
++				"GCPPrivateServiceConnect %s should have NATSubnet set", psc.Name)
++
++			// Assert GCP accepted the Service Attachment. GCP rejects a Service Attachment
++			// whose NAT subnet is not in the same VPC as the forwarding rule, so a True
++			// condition here implicitly validates VPC correctness without requiring GCP
++			// credentials in the test binary.
++			found := false
++			for _, cond := range psc.Status.Conditions {
++				if cond.Type == string(hyperv1.GCPServiceAttachmentAvailable) {
++					found = true
++					Expect(cond.Status).To(Equal(metav1.ConditionTrue),
++						"GCPServiceAttachmentAvailable condition should be True on GCPPrivateServiceConnect %s: %s",
++						psc.Name, cond.Message)
++					break
++				}
++			}
++			Expect(found).To(BeTrue(),
++				"expected GCPServiceAttachmentAvailable condition on GCPPrivateServiceConnect %s", psc.Name)
++		})
++	})
++}
++
++// RegisterGCPPSCTests registers all GCP Private Service Connect tests.
++func RegisterGCPPSCTests(getTestCtx internal.TestContextGetter) {
++	GCPPrivateServiceConnectTest(getTestCtx)
++}
++
++var _ = Describe("[sig-hypershift][Jira:Hypershift][Feature:GCPPrivateServiceConnect] GCP Private Service Connect", Label("gcp-psc"), func() {
++	var testCtx *internal.TestContext
++
++	BeforeEach(func() {
++		testCtx = internal.GetTestContext()
++		Expect(testCtx).NotTo(BeNil(), "test context should be set up in BeforeSuite")
++		testCtx.ValidateHostedCluster()
++	})
++
++	RegisterGCPPSCTests(func() *internal.TestContext { return testCtx })
++})

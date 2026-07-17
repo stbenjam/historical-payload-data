@@ -1,0 +1,817 @@
+diff --git a/internal/pkg/archive/archive.go b/internal/pkg/archive/archive.go
+index 174ccd971..790e09ba4 100644
+--- a/internal/pkg/archive/archive.go
++++ b/internal/pkg/archive/archive.go
+@@ -10,6 +10,7 @@ import (
+ 	"time"
+ 
+ 	digest "github.com/opencontainers/go-digest"
++	"k8s.io/apimachinery/pkg/util/sets"
+ 
+ 	"github.com/openshift/oc-mirror/v2/internal/pkg/api/v2alpha1"
+ 	"github.com/openshift/oc-mirror/v2/internal/pkg/history"
+@@ -135,8 +136,8 @@ func (o *MirrorArchive) createTarball() error {
+ 	return nil
+ }
+ 
+-func (o *MirrorArchive) addImagesDiff(ctx context.Context, collectedImages []v2alpha1.CopyImageSchema, historyBlobs map[string]struct{}) (map[string]struct{}, error) {
+-	allAddedBlobs := make(map[string]struct{})
++func (o *MirrorArchive) addImagesDiff(ctx context.Context, collectedImages []v2alpha1.CopyImageSchema, historyBlobs sets.Set[string]) (sets.Set[string], error) {
++	allAddedBlobs := sets.New[string]()
+ 	for _, img := range collectedImages {
+ 		imgBlobs, err := o.blobGatherer.GatherBlobs(ctx, img.Destination)
+ 		var sigErr *SignatureBlobGathererError
+@@ -156,34 +157,29 @@ func (o *MirrorArchive) addImagesDiff(ctx context.Context, collectedImages []v2a
+ 			return nil, fmt.Errorf("unable to add blobs corresponding to %s: %w", img.Destination, err)
+ 		}
+ 
+-		for hash, value := range addedBlobs {
+-			allAddedBlobs[hash] = value
+-		}
+-
++		allAddedBlobs = allAddedBlobs.Union(addedBlobs)
+ 	}
+ 
+ 	return allAddedBlobs, nil
+ }
+ 
+-func (o *MirrorArchive) addBlobsDiff(collectedBlobs, historyBlobs map[string]struct{}, alreadyAddedBlobs map[string]struct{}) (map[string]struct{}, error) {
+-	blobsInDiff := make(map[string]struct{})
++func (o *MirrorArchive) addBlobsDiff(collectedBlobs, historyBlobs, alreadyAddedBlobs sets.Set[string]) (sets.Set[string], error) {
++	blobsInDiff := sets.New[string]()
+ 	for hash := range collectedBlobs {
+-		_, alreadyMirrored := historyBlobs[hash]
+-		_, previouslyAdded := alreadyAddedBlobs[hash]
+-		skip := alreadyMirrored || previouslyAdded
+-		if !skip {
+-			// Add to tar
+-			d, err := digest.Parse(hash)
+-			if err != nil {
+-				return nil, fmt.Errorf("error parsing digest %w", err)
+-			}
+-			blobPath := filepath.Join(o.cacheDir, cacheBlobsDir, d.Algorithm().String(), d.Encoded()[:2], d.Encoded())
+-			err = o.adder.addAllFolder(blobPath, o.cacheDir)
+-			if err != nil {
+-				return nil, err
+-			}
+-			blobsInDiff[hash] = struct{}{}
++		if historyBlobs.Has(hash) || alreadyAddedBlobs.Has(hash) {
++			continue
+ 		}
++		// Add to tar
++		d, err := digest.Parse(hash)
++		if err != nil {
++			return nil, fmt.Errorf("error parsing digest %w", err)
++		}
++		blobPath := filepath.Join(o.cacheDir, cacheBlobsDir, d.Algorithm().String(), d.Encoded()[:2], d.Encoded())
++		err = o.adder.addAllFolder(blobPath, o.cacheDir)
++		if err != nil {
++			return nil, err
++		}
++		blobsInDiff.Insert(hash)
+ 	}
+ 	return blobsInDiff, nil
+ }
+@@ -210,7 +206,6 @@ func RemovePastArchives(destination string) error {
+ }
+ 
+ func handleSignatureErrors(img v2alpha1.CopyImageSchema, err error) error {
+-
+ 	var sigErr *SignatureBlobGathererError
+ 	if err == nil || !errors.As(err, &sigErr) {
+ 		return nil
+diff --git a/internal/pkg/archive/archive_test.go b/internal/pkg/archive/archive_test.go
+index 8e56d9122..a7adef36b 100644
+--- a/internal/pkg/archive/archive_test.go
++++ b/internal/pkg/archive/archive_test.go
+@@ -12,6 +12,7 @@ import (
+ 	"testing"
+ 
+ 	"github.com/stretchr/testify/assert"
++	"k8s.io/apimachinery/pkg/util/sets"
+ 
+ 	"github.com/openshift/oc-mirror/v2/internal/pkg/api/v2alpha1"
+ 	"github.com/openshift/oc-mirror/v2/internal/pkg/consts"
+@@ -195,41 +196,41 @@ func TestArchive_AddBlobsDiff(t *testing.T) {
+ 		t.Fatal(err)
+ 	}
+ 
+-	collectedBlobs := map[string]struct{}{
+-		"sha256:2e39d55595ea56337b5b788e96e6afdec3db09d2759d903cbe120468187c4644": {},
+-		"sha256:94343313ec1512ab02267e4bc3ce09eecb01fda5bf26c56e2f028ecc72e80b18": {},
+-		"sha256:4c0f6aace7053de3b9c1476b33c9a763e45a099c8c7ae9117773c9a8e5b8506b": {},
+-		"sha256:cfaa7496ab546c36ab14859f93fbd2d8a3588b344b18d5fbe74dd834e4a6f7eb": {},
+-		"sha256:53c56977ccd20c0d87df0ad52036c55b27201e1a63874c2644383d0c532f5aee": {},
+-		"sha256:e1bb0572465a9e03d7af5024abb36d7227b5bf133c448b54656d908982127874": {},
+-		"sha256:6e1ac33d11e06db5e850fec4a1ec07f6c2ab15f130c2fdf0f9d0d0a5c83651e7": {},
+-		"sha256:f992cb38fce665360a4d07f6f78db864a1f6e20a7ad304219f7f81d7fe608d97": {},
+-		"sha256:6376a0276facf61d87fdf7c6f21d761ee25ba8ceba934d64752d43e84fe0cb98": {},
+-		"sha256:db870970ba330193164dacc88657df261d75bce1552ea474dbc7cf08b2fae2ed": {},
+-		"sha256:9b6fa335dba394d437930ad79e308e01da4f624328e49d00c0ff44775d2e4769": {},
+-		"sha256:e6c589cf5f402a60a83a01653304d7a8dcdd47b93a395a797b5622a18904bd66": {},
+-	}
+-
+-	historyBlobs := map[string]struct{}{
+-		"sha256:2e39d55595ea56337b5b788e96e6afdec3db09d2759d903cbe120468187c4644": {},
+-		"sha256:94343313ec1512ab02267e4bc3ce09eecb01fda5bf26c56e2f028ecc72e80b18": {},
+-		"sha256:4c0f6aace7053de3b9c1476b33c9a763e45a099c8c7ae9117773c9a8e5b8506b": {},
+-		"sha256:cfaa7496ab546c36ab14859f93fbd2d8a3588b344b18d5fbe74dd834e4a6f7eb": {},
+-		"sha256:53c56977ccd20c0d87df0ad52036c55b27201e1a63874c2644383d0c532f5aee": {},
+-	}
+-
+-	expectedAddedBlobs := map[string]struct{}{
+-		"sha256:e1bb0572465a9e03d7af5024abb36d7227b5bf133c448b54656d908982127874": {},
+-		"sha256:6e1ac33d11e06db5e850fec4a1ec07f6c2ab15f130c2fdf0f9d0d0a5c83651e7": {},
+-		"sha256:f992cb38fce665360a4d07f6f78db864a1f6e20a7ad304219f7f81d7fe608d97": {},
+-		"sha256:6376a0276facf61d87fdf7c6f21d761ee25ba8ceba934d64752d43e84fe0cb98": {},
+-		"sha256:db870970ba330193164dacc88657df261d75bce1552ea474dbc7cf08b2fae2ed": {},
+-		"sha256:9b6fa335dba394d437930ad79e308e01da4f624328e49d00c0ff44775d2e4769": {},
+-		"sha256:e6c589cf5f402a60a83a01653304d7a8dcdd47b93a395a797b5622a18904bd66": {},
+-	}
+-	actualAddedBlobs, err := ma.addBlobsDiff(collectedBlobs, historyBlobs, make(map[string]struct{}))
++	collectedBlobs := sets.New(
++		"sha256:2e39d55595ea56337b5b788e96e6afdec3db09d2759d903cbe120468187c4644",
++		"sha256:94343313ec1512ab02267e4bc3ce09eecb01fda5bf26c56e2f028ecc72e80b18",
++		"sha256:4c0f6aace7053de3b9c1476b33c9a763e45a099c8c7ae9117773c9a8e5b8506b",
++		"sha256:cfaa7496ab546c36ab14859f93fbd2d8a3588b344b18d5fbe74dd834e4a6f7eb",
++		"sha256:53c56977ccd20c0d87df0ad52036c55b27201e1a63874c2644383d0c532f5aee",
++		"sha256:e1bb0572465a9e03d7af5024abb36d7227b5bf133c448b54656d908982127874",
++		"sha256:6e1ac33d11e06db5e850fec4a1ec07f6c2ab15f130c2fdf0f9d0d0a5c83651e7",
++		"sha256:f992cb38fce665360a4d07f6f78db864a1f6e20a7ad304219f7f81d7fe608d97",
++		"sha256:6376a0276facf61d87fdf7c6f21d761ee25ba8ceba934d64752d43e84fe0cb98",
++		"sha256:db870970ba330193164dacc88657df261d75bce1552ea474dbc7cf08b2fae2ed",
++		"sha256:9b6fa335dba394d437930ad79e308e01da4f624328e49d00c0ff44775d2e4769",
++		"sha256:e6c589cf5f402a60a83a01653304d7a8dcdd47b93a395a797b5622a18904bd66",
++	)
++
++	historyBlobs := sets.New(
++		"sha256:2e39d55595ea56337b5b788e96e6afdec3db09d2759d903cbe120468187c4644",
++		"sha256:94343313ec1512ab02267e4bc3ce09eecb01fda5bf26c56e2f028ecc72e80b18",
++		"sha256:4c0f6aace7053de3b9c1476b33c9a763e45a099c8c7ae9117773c9a8e5b8506b",
++		"sha256:cfaa7496ab546c36ab14859f93fbd2d8a3588b344b18d5fbe74dd834e4a6f7eb",
++		"sha256:53c56977ccd20c0d87df0ad52036c55b27201e1a63874c2644383d0c532f5aee",
++	)
++
++	expectedAddedBlobs := sets.New(
++		"sha256:e1bb0572465a9e03d7af5024abb36d7227b5bf133c448b54656d908982127874",
++		"sha256:6e1ac33d11e06db5e850fec4a1ec07f6c2ab15f130c2fdf0f9d0d0a5c83651e7",
++		"sha256:f992cb38fce665360a4d07f6f78db864a1f6e20a7ad304219f7f81d7fe608d97",
++		"sha256:6376a0276facf61d87fdf7c6f21d761ee25ba8ceba934d64752d43e84fe0cb98",
++		"sha256:db870970ba330193164dacc88657df261d75bce1552ea474dbc7cf08b2fae2ed",
++		"sha256:9b6fa335dba394d437930ad79e308e01da4f624328e49d00c0ff44775d2e4769",
++		"sha256:e6c589cf5f402a60a83a01653304d7a8dcdd47b93a395a797b5622a18904bd66",
++	)
++	actualAddedBlobs, err := ma.addBlobsDiff(collectedBlobs, historyBlobs, sets.New[string]())
+ 	assert.NoError(t, err, "call addBlobsDiff should not return an error")
+-	assert.Equal(t, expectedAddedBlobs, actualAddedBlobs)
++	assert.Equal(t, sets.List(expectedAddedBlobs), sets.List(actualAddedBlobs))
+ }
+ 
+ func TestArchive_RemovePastMirrors(t *testing.T) {
+@@ -462,45 +463,43 @@ func (ma *MirrorArchive) WithFakes(maxArchiveSize int64) (*MirrorArchive, error)
+ 	return ma, nil
+ }
+ 
+-func (mbg mockBlobGatherer) GatherBlobs(ctx context.Context, imgRef string) (map[string]struct{}, error) {
+-	blobs := map[string]struct{}{
+-		"sha256:2e39d55595ea56337b5b788e96e6afdec3db09d2759d903cbe120468187c4644": {},
+-		"sha256:94343313ec1512ab02267e4bc3ce09eecb01fda5bf26c56e2f028ecc72e80b18": {},
+-		"sha256:4c0f6aace7053de3b9c1476b33c9a763e45a099c8c7ae9117773c9a8e5b8506b": {},
+-		"sha256:cfaa7496ab546c36ab14859f93fbd2d8a3588b344b18d5fbe74dd834e4a6f7eb": {},
+-		"sha256:53c56977ccd20c0d87df0ad52036c55b27201e1a63874c2644383d0c532f5aee": {},
+-		"sha256:e1bb0572465a9e03d7af5024abb36d7227b5bf133c448b54656d908982127874": {},
+-		"sha256:6e1ac33d11e06db5e850fec4a1ec07f6c2ab15f130c2fdf0f9d0d0a5c83651e7": {},
+-		"sha256:f992cb38fce665360a4d07f6f78db864a1f6e20a7ad304219f7f81d7fe608d97": {},
+-		"sha256:6376a0276facf61d87fdf7c6f21d761ee25ba8ceba934d64752d43e84fe0cb98": {},
+-		"sha256:db870970ba330193164dacc88657df261d75bce1552ea474dbc7cf08b2fae2ed": {},
+-		"sha256:9b6fa335dba394d437930ad79e308e01da4f624328e49d00c0ff44775d2e4769": {},
+-		"sha256:e6c589cf5f402a60a83a01653304d7a8dcdd47b93a395a797b5622a18904bd66": {},
+-	}
++func (mbg mockBlobGatherer) GatherBlobs(ctx context.Context, imgRef string) (sets.Set[string], error) {
++	blobs := sets.New(
++		"sha256:2e39d55595ea56337b5b788e96e6afdec3db09d2759d903cbe120468187c4644",
++		"sha256:94343313ec1512ab02267e4bc3ce09eecb01fda5bf26c56e2f028ecc72e80b18",
++		"sha256:4c0f6aace7053de3b9c1476b33c9a763e45a099c8c7ae9117773c9a8e5b8506b",
++		"sha256:cfaa7496ab546c36ab14859f93fbd2d8a3588b344b18d5fbe74dd834e4a6f7eb",
++		"sha256:53c56977ccd20c0d87df0ad52036c55b27201e1a63874c2644383d0c532f5aee",
++		"sha256:e1bb0572465a9e03d7af5024abb36d7227b5bf133c448b54656d908982127874",
++		"sha256:6e1ac33d11e06db5e850fec4a1ec07f6c2ab15f130c2fdf0f9d0d0a5c83651e7",
++		"sha256:f992cb38fce665360a4d07f6f78db864a1f6e20a7ad304219f7f81d7fe608d97",
++		"sha256:6376a0276facf61d87fdf7c6f21d761ee25ba8ceba934d64752d43e84fe0cb98",
++		"sha256:db870970ba330193164dacc88657df261d75bce1552ea474dbc7cf08b2fae2ed",
++		"sha256:9b6fa335dba394d437930ad79e308e01da4f624328e49d00c0ff44775d2e4769",
++		"sha256:e6c589cf5f402a60a83a01653304d7a8dcdd47b93a395a797b5622a18904bd66",
++	)
+ 	return blobs, nil
+ }
+ 
+-func (m mockHistory) Read() (map[string]struct{}, error) {
+-	historyMap := map[string]struct{}{
+-		"sha256:2e39d55595ea56337b5b788e96e6afdec3db09d2759d903cbe120468187c4644": {},
+-		"sha256:94343313ec1512ab02267e4bc3ce09eecb01fda5bf26c56e2f028ecc72e80b18": {},
+-		"sha256:4c0f6aace7053de3b9c1476b33c9a763e45a099c8c7ae9117773c9a8e5b8506b": {},
+-		"sha256:cfaa7496ab546c36ab14859f93fbd2d8a3588b344b18d5fbe74dd834e4a6f7eb": {},
+-		"sha256:53c56977ccd20c0d87df0ad52036c55b27201e1a63874c2644383d0c532f5aee": {},
+-	}
++func (m mockHistory) Read() (sets.Set[string], error) {
++	historyMap := sets.New(
++		"sha256:2e39d55595ea56337b5b788e96e6afdec3db09d2759d903cbe120468187c4644",
++		"sha256:94343313ec1512ab02267e4bc3ce09eecb01fda5bf26c56e2f028ecc72e80b18",
++		"sha256:4c0f6aace7053de3b9c1476b33c9a763e45a099c8c7ae9117773c9a8e5b8506b",
++		"sha256:cfaa7496ab546c36ab14859f93fbd2d8a3588b344b18d5fbe74dd834e4a6f7eb",
++		"sha256:53c56977ccd20c0d87df0ad52036c55b27201e1a63874c2644383d0c532f5aee",
++	)
+ 	return historyMap, nil
+ }
+ 
+-func (m mockHistory) Append(inputMap map[string]struct{}) (map[string]struct{}, error) {
+-	historyMap := map[string]struct{}{
+-		"sha256:2e39d55595ea56337b5b788e96e6afdec3db09d2759d903cbe120468187c4644": {},
+-		"sha256:94343313ec1512ab02267e4bc3ce09eecb01fda5bf26c56e2f028ecc72e80b18": {},
+-		"sha256:4c0f6aace7053de3b9c1476b33c9a763e45a099c8c7ae9117773c9a8e5b8506b": {},
+-		"sha256:cfaa7496ab546c36ab14859f93fbd2d8a3588b344b18d5fbe74dd834e4a6f7eb": {},
+-		"sha256:53c56977ccd20c0d87df0ad52036c55b27201e1a63874c2644383d0c532f5aee": {},
+-	}
+-	for k, v := range inputMap {
+-		historyMap[k] = v
+-	}
++func (m mockHistory) Append(inputMap sets.Set[string]) (sets.Set[string], error) {
++	historyMap := sets.New(
++		"sha256:2e39d55595ea56337b5b788e96e6afdec3db09d2759d903cbe120468187c4644",
++		"sha256:94343313ec1512ab02267e4bc3ce09eecb01fda5bf26c56e2f028ecc72e80b18",
++		"sha256:4c0f6aace7053de3b9c1476b33c9a763e45a099c8c7ae9117773c9a8e5b8506b",
++		"sha256:cfaa7496ab546c36ab14859f93fbd2d8a3588b344b18d5fbe74dd834e4a6f7eb",
++		"sha256:53c56977ccd20c0d87df0ad52036c55b27201e1a63874c2644383d0c532f5aee",
++	)
++	historyMap = historyMap.Union(inputMap)
+ 	return historyMap, nil
+ }
+diff --git a/internal/pkg/archive/image-blob-gatherer.go b/internal/pkg/archive/image-blob-gatherer.go
+index d5ff39b60..24bb6c85c 100644
+--- a/internal/pkg/archive/image-blob-gatherer.go
++++ b/internal/pkg/archive/image-blob-gatherer.go
+@@ -4,11 +4,11 @@ import (
+ 	"context"
+ 	"errors"
+ 	"fmt"
+-	"maps"
+ 
+ 	digest "github.com/opencontainers/go-digest"
+ 	"go.podman.io/image/v5/manifest"
+ 	"go.podman.io/image/v5/types"
++	"k8s.io/apimachinery/pkg/util/sets"
+ 
+ 	"github.com/openshift/oc-mirror/v2/internal/pkg/image"
+ 	clog "github.com/openshift/oc-mirror/v2/internal/pkg/log"
+@@ -41,7 +41,7 @@ func NewImageBlobGatherer(opts *mirror.CopyOptions, log clog.PluggableLoggerInte
+ }
+ 
+ // GatherBlobs returns all container image blobs (including signature blobs if they exists).
+-func (o *ImageBlobGatherer) GatherBlobs(ctx context.Context, imgRef string) (blobs map[string]struct{}, retErr error) {
++func (o *ImageBlobGatherer) GatherBlobs(ctx context.Context, imgRef string) (blobs sets.Set[string], retErr error) {
+ 	// we are always gathering blobs from the local cache registry - skipping tls verification
+ 	sourceCtx, err := o.opts.SrcImage.NewSystemContext()
+ 	if err != nil {
+@@ -69,12 +69,10 @@ func (o *ImageBlobGatherer) GatherBlobs(ctx context.Context, imgRef string) (blo
+ }
+ 
+ // multiArchBlobs returns the blobs of all architectures (including signature blobs if they exists).
+-func (o *ImageBlobGatherer) multiArchBlobs(ctx context.Context, in internalImageBlobGatherer) (map[string]struct{}, error) {
++func (o *ImageBlobGatherer) multiArchBlobs(ctx context.Context, in internalImageBlobGatherer) (sets.Set[string], error) {
+ 	var sigErrors []error
+ 
+-	blobs := make(map[string]struct{})
+-
+-	blobs[in.digest.String()] = struct{}{}
++	blobs := sets.New(in.digest.String())
+ 
+ 	manifestList, err := manifest.ListFromBlob(in.manifestBytes, in.mimeType)
+ 	if err != nil {
+@@ -82,20 +80,20 @@ func (o *ImageBlobGatherer) multiArchBlobs(ctx context.Context, in internalImage
+ 	}
+ 
+ 	if in.copySignatures {
+-		sigBlobs, err := o.imageSignatureBlobs(ctx, in)
+-		if err == nil {
+-			for _, digest := range sigBlobs {
+-				blobs[digest] = struct{}{}
+-			}
++		// OCPBUGS-87160:
++		// In the beginning, cosign did not support signing manifest lists.
++		// Also podman/clusterimagepolicy only verifies the single arch manifest signatures.
++		// Because of that, ART only signs the single arch manifests not the manifest list itself.
++		if sigBlobs, err := o.imageSignatureBlobs(ctx, in); err == nil {
++			blobs.Insert(sigBlobs...)
+ 		} else {
+-			sigErrors = append(sigErrors, err)
++			o.log.Debug("Skip signature gathering for manifest list %q: %s", in.digest.String(), err.Error())
+ 		}
+-
+ 	}
+ 
+ 	digests := manifestList.Instances()
+ 	for _, digest := range digests {
+-		blobs[digest.String()] = struct{}{}
++		blobs.Insert(digest.String())
+ 		singleIn := in
+ 
+ 		singleIn.manifestBytes, singleIn.mimeType, err = o.ocmirrormanifest.ImageManifest(ctx, in.sourceCtx, in.imgRef, &digest)
+@@ -114,19 +112,17 @@ func (o *ImageBlobGatherer) multiArchBlobs(ctx context.Context, in internalImage
+ 			}
+ 		}
+ 
+-		maps.Copy(blobs, singleArchBlobs)
++		blobs = blobs.Union(singleArchBlobs)
+ 	}
+ 
+ 	return blobs, errors.Join(sigErrors...)
+ }
+ 
+ // singleArchBlobs returns the blobs of single architecture (including signature blobs if they exists).
+-func (o *ImageBlobGatherer) singleArchBlobs(ctx context.Context, in internalImageBlobGatherer) (map[string]struct{}, error) {
++func (o *ImageBlobGatherer) singleArchBlobs(ctx context.Context, in internalImageBlobGatherer) (sets.Set[string], error) {
+ 	var err error
+ 
+-	blobs := make(map[string]struct{})
+-
+-	blobs[in.digest.String()] = struct{}{}
++	blobs := sets.New(in.digest.String())
+ 
+ 	manifestBlobs, err := imageBlobs(in.manifestBytes, in.mimeType)
+ 	if err != nil {
+@@ -141,9 +137,7 @@ func (o *ImageBlobGatherer) singleArchBlobs(ctx context.Context, in internalImag
+ 		}
+ 	}
+ 
+-	for _, digest := range manifestBlobs {
+-		blobs[digest] = struct{}{}
+-	}
++	blobs.Insert(manifestBlobs...)
+ 
+ 	return blobs, err
+ }
+diff --git a/internal/pkg/archive/image-blob-gatherer_test.go b/internal/pkg/archive/image-blob-gatherer_test.go
+index 1868964fe..469f3474a 100644
+--- a/internal/pkg/archive/image-blob-gatherer_test.go
++++ b/internal/pkg/archive/image-blob-gatherer_test.go
+@@ -10,6 +10,7 @@ import (
+ 
+ 	"github.com/google/go-containerregistry/pkg/registry"
+ 	"github.com/stretchr/testify/assert"
++	"k8s.io/apimachinery/pkg/util/sets"
+ 
+ 	"github.com/openshift/oc-mirror/v2/internal/pkg/consts"
+ 	clog "github.com/openshift/oc-mirror/v2/internal/pkg/log"
+@@ -30,7 +31,7 @@ func TestImageBlobGatherer_GatherBlobs(t *testing.T) {
+ 		caseName          string
+ 		images            []image
+ 		removeSignatures  bool
+-		expectedBlobs     map[string]struct{}
++		expectedBlobs     sets.Set[string]
+ 		expectedErrorType error
+ 	}
+ 
+@@ -47,11 +48,11 @@ func TestImageBlobGatherer_GatherBlobs(t *testing.T) {
+ 				},
+ 			},
+ 			removeSignatures: true,
+-			expectedBlobs: map[string]struct{}{
+-				"sha256:467829ca4ff134ef9762a8f69647fdf2515b974dfc94a8474c493a45ef922e51": {},
+-				"sha256:728191dbaae078c825ffb518e15d33956353823d4da6c2e81fe9b1ed60ddef7d": {},
+-				"sha256:50b9402635dd4b312a86bed05dcdbda8c00120d3789ec2e9b527045100b3bdb4": {},
+-			},
++			expectedBlobs: sets.New(
++				"sha256:467829ca4ff134ef9762a8f69647fdf2515b974dfc94a8474c493a45ef922e51",
++				"sha256:728191dbaae078c825ffb518e15d33956353823d4da6c2e81fe9b1ed60ddef7d",
++				"sha256:50b9402635dd4b312a86bed05dcdbda8c00120d3789ec2e9b527045100b3bdb4",
++			),
+ 		},
+ 		{
+ 			caseName: "image without signature and --remove-signature=false: image blobs should pass and signature blobs should fail",
+@@ -65,11 +66,11 @@ func TestImageBlobGatherer_GatherBlobs(t *testing.T) {
+ 				},
+ 			},
+ 			expectedErrorType: &SignatureBlobGathererError{},
+-			expectedBlobs: map[string]struct{}{
+-				"sha256:467829ca4ff134ef9762a8f69647fdf2515b974dfc94a8474c493a45ef922e51": {},
+-				"sha256:728191dbaae078c825ffb518e15d33956353823d4da6c2e81fe9b1ed60ddef7d": {},
+-				"sha256:50b9402635dd4b312a86bed05dcdbda8c00120d3789ec2e9b527045100b3bdb4": {},
+-			},
++			expectedBlobs: sets.New(
++				"sha256:467829ca4ff134ef9762a8f69647fdf2515b974dfc94a8474c493a45ef922e51",
++				"sha256:728191dbaae078c825ffb518e15d33956353823d4da6c2e81fe9b1ed60ddef7d",
++				"sha256:50b9402635dd4b312a86bed05dcdbda8c00120d3789ec2e9b527045100b3bdb4",
++			),
+ 		},
+ 		{
+ 			caseName: "single arch image with signatures: pass",
+@@ -88,14 +89,14 @@ func TestImageBlobGatherer_GatherBlobs(t *testing.T) {
+ 					dest:         "/empty-image:sha256-7d27ba1da0f64410102468d138f9ec8f61f2cc23bb58ff4cd63243a4434e3d99.sig",
+ 				},
+ 			},
+-			expectedBlobs: map[string]struct{}{
+-				"sha256:7d27ba1da0f64410102468d138f9ec8f61f2cc23bb58ff4cd63243a4434e3d99": {},
+-				"sha256:a890cd283a99877f5407c8f78fa4dae6af6e4a5def4a5383a343079bc89f309e": {},
+-				"sha256:f5160c724874c865c42578e560b8bd4c2172b0f8ec5b8192f4fc45b746d41962": {},
+-				"sha256:ed81f580f1cc03b20cb0600084a76b3da35a9e303ffc1b908e5b5e61e05d9f27": {},
+-				"sha256:1faf95412673f2c4345d6961ed543c92173589cfe364282f129d5de056003980": {},
+-				"sha256:5e7a034f575bb1b9188e4ea29470a2b86c640170125fa8c7ec9dc9c4bc17a373": {},
+-			},
++			expectedBlobs: sets.New(
++				"sha256:7d27ba1da0f64410102468d138f9ec8f61f2cc23bb58ff4cd63243a4434e3d99",
++				"sha256:a890cd283a99877f5407c8f78fa4dae6af6e4a5def4a5383a343079bc89f309e",
++				"sha256:f5160c724874c865c42578e560b8bd4c2172b0f8ec5b8192f4fc45b746d41962",
++				"sha256:ed81f580f1cc03b20cb0600084a76b3da35a9e303ffc1b908e5b5e61e05d9f27",
++				"sha256:1faf95412673f2c4345d6961ed543c92173589cfe364282f129d5de056003980",
++				"sha256:5e7a034f575bb1b9188e4ea29470a2b86c640170125fa8c7ec9dc9c4bc17a373",
++			),
+ 		},
+ 		{
+ 			caseName: "multi arch image with signatures: pass",
+@@ -139,36 +140,36 @@ func TestImageBlobGatherer_GatherBlobs(t *testing.T) {
+ 					dest:         "/multi-platform-container:sha256-e033aa62f84267cf44de611acac2e76bfa4d2f0b6b2b61f1c4fecbefefde7159.sig",
+ 				},
+ 			},
+-			expectedBlobs: map[string]struct{}{
+-				"sha256:0de0e983a4980f32b1aad2d7f7f387cea2d4e9517b47f336cef27f63735911fa": {},
+-				"sha256:94328d9ae45c60c4c791f0066042521d57654bfd8e497b1cfbea3003ff3abb29": {},
+-				"sha256:84c87436d1101432e5af3ea09e89324afff39b06496849c1165930374167078f": {},
+-				"sha256:a5888bc451c329a02074f29a7f9d0710f117930907ffcf80f19f3836aabc8527": {},
+-				"sha256:832f20ad3d7e687c581b0a7d483174901d8bf22bb96c981b3f9da452817a754e": {},
+-				"sha256:f859b423345efd29f20d220aa79d8aaacf5fd6d1f1518ab42ed3ce35eb46688e": {},
+-				"sha256:cca6216db43b3ffa04aebbe9c3eb91de78e31301c7e015a7392fa79dfc85ce61": {},
+-				"sha256:fa50f89548925bace553298581f24c5c7a1297f3f95d5a15f1ee1f03b95afe10": {},
+-				"sha256:874b6ca0d55c403f9d1a782e1a143c4801f6cb1ca0cadb520e9df4a877eb914a": {},
+-				"sha256:f2a85fb3e895978775ec31bc0375e295e1ef08d8e6e323c5a74a947da1ad71c1": {},
+-				"sha256:b15a2f174d803fd5fd7db0b3969c75cee0fe9131e0d8478f8c70ac01a4534869": {},
+-				"sha256:645e7ac88707b388674231b8e473a29c38bcb60e764ea69e8b4f5791b9efd848": {},
+-				"sha256:fbbb412beb1de15db239cdf6211b41510b7148e2ae8bb6b7fa8595a749c7dfc4": {},
+-				"sha256:9af5f463e252eb32b3db3993ae017a21f2096fc867a1a9c41e6a37746fede539": {},
+-				"sha256:681624245c5af9557670a5ac63535149d930be055156bf617d9f5cd225a5eb4d": {},
+-				"sha256:0a43bd4effe1b9095d9110575b52bf237205585431d4eeac4db03c57c08c4562": {},
+-				"sha256:02f29c270f30416a266571383098d7b98a49488723087fd917128045bcd1ca75": {},
+-				"sha256:b1a8f85a8bf03345f76c684778bb4e56bf2e540d103bb87bf82c81e7139e2f3f": {},
+-				"sha256:e92ae2b67386a079de2f99e6045637f2612d9aa9b0089736152c060b338ba5b3": {},
+-				"sha256:fd23bc8220beb3fd8b52434f65c146345f1a1f409577c19326a30b3d4ccebba6": {},
+-				"sha256:aaf8e64a632cddf51e5b6b02784d635be5c8f39d36ee2361ef0b0de5f9824426": {},
+-				"sha256:89a25c4b082b1f78379293c7443585b598f34257dbb8bb2c7c33d93a30a45c52": {},
+-				"sha256:e033aa62f84267cf44de611acac2e76bfa4d2f0b6b2b61f1c4fecbefefde7159": {},
+-				"sha256:6db70183199d1d7a1c7ae19c982988c82180aa10383e7ebbbc9071d7a6cae87d": {},
+-				"sha256:e8170da5e917b5a8fd29726001e996f567f248541fde0f7bf42a4c7a5cca9ed0": {},
+-				"sha256:4ec5da06666e387046c4190d3ff21cff504736725b10845edcd8d103ffc5fa4e": {},
+-				"sha256:d1b3a652c935f8bdc538553d49cfe52aba8193adac103e63a78aebde96bbb1fa": {},
+-				"sha256:b690db3637d45cca671a5121ec22adc21226354d2b22ea03541e71efbe41b083": {},
+-			},
++			expectedBlobs: sets.New(
++				"sha256:0de0e983a4980f32b1aad2d7f7f387cea2d4e9517b47f336cef27f63735911fa",
++				"sha256:94328d9ae45c60c4c791f0066042521d57654bfd8e497b1cfbea3003ff3abb29", // manifest list sig blob,
++				"sha256:84c87436d1101432e5af3ea09e89324afff39b06496849c1165930374167078f", // manifest list sig blob,
++				"sha256:a5888bc451c329a02074f29a7f9d0710f117930907ffcf80f19f3836aabc8527", // manifest list sig blob,
++				"sha256:832f20ad3d7e687c581b0a7d483174901d8bf22bb96c981b3f9da452817a754e",
++				"sha256:f859b423345efd29f20d220aa79d8aaacf5fd6d1f1518ab42ed3ce35eb46688e",
++				"sha256:cca6216db43b3ffa04aebbe9c3eb91de78e31301c7e015a7392fa79dfc85ce61",
++				"sha256:fa50f89548925bace553298581f24c5c7a1297f3f95d5a15f1ee1f03b95afe10",
++				"sha256:874b6ca0d55c403f9d1a782e1a143c4801f6cb1ca0cadb520e9df4a877eb914a",
++				"sha256:f2a85fb3e895978775ec31bc0375e295e1ef08d8e6e323c5a74a947da1ad71c1",
++				"sha256:b15a2f174d803fd5fd7db0b3969c75cee0fe9131e0d8478f8c70ac01a4534869",
++				"sha256:645e7ac88707b388674231b8e473a29c38bcb60e764ea69e8b4f5791b9efd848",
++				"sha256:fbbb412beb1de15db239cdf6211b41510b7148e2ae8bb6b7fa8595a749c7dfc4",
++				"sha256:9af5f463e252eb32b3db3993ae017a21f2096fc867a1a9c41e6a37746fede539",
++				"sha256:681624245c5af9557670a5ac63535149d930be055156bf617d9f5cd225a5eb4d",
++				"sha256:0a43bd4effe1b9095d9110575b52bf237205585431d4eeac4db03c57c08c4562",
++				"sha256:02f29c270f30416a266571383098d7b98a49488723087fd917128045bcd1ca75",
++				"sha256:b1a8f85a8bf03345f76c684778bb4e56bf2e540d103bb87bf82c81e7139e2f3f",
++				"sha256:e92ae2b67386a079de2f99e6045637f2612d9aa9b0089736152c060b338ba5b3",
++				"sha256:fd23bc8220beb3fd8b52434f65c146345f1a1f409577c19326a30b3d4ccebba6",
++				"sha256:aaf8e64a632cddf51e5b6b02784d635be5c8f39d36ee2361ef0b0de5f9824426",
++				"sha256:89a25c4b082b1f78379293c7443585b598f34257dbb8bb2c7c33d93a30a45c52",
++				"sha256:e033aa62f84267cf44de611acac2e76bfa4d2f0b6b2b61f1c4fecbefefde7159",
++				"sha256:6db70183199d1d7a1c7ae19c982988c82180aa10383e7ebbbc9071d7a6cae87d",
++				"sha256:e8170da5e917b5a8fd29726001e996f567f248541fde0f7bf42a4c7a5cca9ed0",
++				"sha256:4ec5da06666e387046c4190d3ff21cff504736725b10845edcd8d103ffc5fa4e",
++				"sha256:d1b3a652c935f8bdc538553d49cfe52aba8193adac103e63a78aebde96bbb1fa",
++				"sha256:b690db3637d45cca671a5121ec22adc21226354d2b22ea03541e71efbe41b083",
++			),
+ 		},
+ 	}
+ 
+@@ -227,7 +228,7 @@ func TestImageBlobGatherer_GatherBlobs(t *testing.T) {
+ 			assert.NoError(t, err, "GatherBlobs failed: %v", err)
+ 		}
+ 
+-		assert.Equal(t, tc.expectedBlobs, blobs)
++		assert.Equal(t, sets.List(tc.expectedBlobs), sets.List(blobs))
+ 	}
+ }
+ 
+diff --git a/internal/pkg/archive/interface.go b/internal/pkg/archive/interface.go
+index 3f0eac9e9..fcb818e48 100644
+--- a/internal/pkg/archive/interface.go
++++ b/internal/pkg/archive/interface.go
+@@ -3,11 +3,13 @@ package archive
+ import (
+ 	"context"
+ 
++	"k8s.io/apimachinery/pkg/util/sets"
++
+ 	"github.com/openshift/oc-mirror/v2/internal/pkg/api/v2alpha1"
+ )
+ 
+ type BlobsGatherer interface {
+-	GatherBlobs(ctx context.Context, imgRef string) (map[string]struct{}, error)
++	GatherBlobs(ctx context.Context, imgRef string) (sets.Set[string], error)
+ }
+ 
+ type Archiver interface {
+diff --git a/internal/pkg/delete/delete_images_test.go b/internal/pkg/delete/delete_images_test.go
+index cff249831..a328c2fe7 100644
+--- a/internal/pkg/delete/delete_images_test.go
++++ b/internal/pkg/delete/delete_images_test.go
+@@ -10,6 +10,7 @@ import (
+ 	specv1 "github.com/opencontainers/image-spec/specs-go/v1"
+ 	"github.com/stretchr/testify/assert"
+ 	"go.podman.io/image/v5/types"
++	"k8s.io/apimachinery/pkg/util/sets"
+ 
+ 	"github.com/openshift/oc-mirror/v2/internal/pkg/consts"
+ 
+@@ -521,8 +522,8 @@ func (o mockBatch) Worker(ctx context.Context, collectorSchema v2alpha1.Collecto
+ 	return collectorSchema, nil
+ }
+ 
+-func (o *mockBlobs) GatherBlobs(ctx context.Context, image string) (map[string]struct{}, error) {
+-	res := map[string]struct{}{"sha256:95ad8395795ee0460baf05458f669d3b865535f213f015519ef9a221a6a08280": {}}
++func (o *mockBlobs) GatherBlobs(ctx context.Context, image string) (sets.Set[string], error) {
++	res := sets.New("sha256:95ad8395795ee0460baf05458f669d3b865535f213f015519ef9a221a6a08280")
+ 	if o.Fail {
+ 		return nil, fmt.Errorf("forced error")
+ 	}
+diff --git a/internal/pkg/history/history.go b/internal/pkg/history/history.go
+index 29da41f4c..72160b2ce 100644
+--- a/internal/pkg/history/history.go
++++ b/internal/pkg/history/history.go
+@@ -11,17 +11,21 @@ import (
+ 	"strings"
+ 	"time"
+ 
++	"k8s.io/apimachinery/pkg/util/sets"
++
+ 	clog "github.com/openshift/oc-mirror/v2/internal/pkg/log"
+ )
+ 
+ var log clog.PluggableLoggerInterface
+ 
+-type OSFileCreator struct{}
+-type history struct {
+-	historyDir  string
+-	before      time.Time
+-	fileCreator FileCreator
+-}
++type (
++	OSFileCreator struct{}
++	history       struct {
++		historyDir  string
++		before      time.Time
++		fileCreator FileCreator
++	}
++)
+ 
+ func NewHistory(workingDir string, before time.Time, logg clog.PluggableLoggerInterface, fileCreator FileCreator) (history, error) {
+ 	if logg == nil {
+@@ -31,7 +35,7 @@ func NewHistory(workingDir string, before time.Time, logg clog.PluggableLoggerIn
+ 	}
+ 	historyDir := filepath.Join(workingDir, historyPath)
+ 
+-	err := os.MkdirAll(historyDir, 0755)
++	err := os.MkdirAll(historyDir, 0o755)
+ 	if err != nil {
+ 		return history{}, fmt.Errorf("error creating directories %w", err)
+ 	}
+@@ -42,8 +46,8 @@ func NewHistory(workingDir string, before time.Time, logg clog.PluggableLoggerIn
+ 	}, nil
+ }
+ 
+-func (o history) Read() (map[string]struct{}, error) {
+-	historyMap := make(map[string]struct{})
++func (o history) Read() (sets.Set[string], error) {
++	historyMap := sets.New[string]()
+ 	historyFile, err := o.getHistoryFile(o.before)
+ 	// if err is of type EmptyHistoryError
+ 	// then return the erorr and an empty historyMap
+@@ -63,7 +67,7 @@ func (o history) Read() (map[string]struct{}, error) {
+ 
+ 	for scanner.Scan() {
+ 		blob := scanner.Text()
+-		historyMap[blob] = struct{}{}
++		historyMap.Insert(blob)
+ 	}
+ 
+ 	if err := scanner.Err(); err != nil {
+@@ -129,8 +133,7 @@ func getFileDate(historyFile fs.DirEntry) (time.Time, error) {
+ 	return dateTime, nil
+ }
+ 
+-func (o history) Append(blobsToAppend map[string]struct{}) (map[string]struct{}, error) {
+-
++func (o history) Append(blobsToAppend sets.Set[string]) (sets.Set[string], error) {
+ 	filename := o.newFileName()
+ 
+ 	historyBlobs, err := o.Read()
+@@ -138,9 +141,7 @@ func (o history) Append(blobsToAppend map[string]struct{}) (map[string]struct{},
+ 		return nil, err
+ 	}
+ 
+-	for k := range blobsToAppend {
+-		historyBlobs[k] = struct{}{}
+-	}
++	historyBlobs = historyBlobs.Union(blobsToAppend)
+ 
+ 	file, err := o.fileCreator.Create(filename)
+ 	if err != nil {
+@@ -157,13 +158,11 @@ func (o history) Append(blobsToAppend map[string]struct{}) (map[string]struct{},
+ 		}
+ 	}
+ 
+-	err = writer.Flush()
+-	if err != nil {
++	if err := writer.Flush(); err != nil {
+ 		return historyBlobs, fmt.Errorf("unable to flush history file: %w", err)
+ 	}
+ 
+ 	return historyBlobs, nil
+-
+ }
+ 
+ func (o history) newFileName() string {
+diff --git a/internal/pkg/history/history_test.go b/internal/pkg/history/history_test.go
+index 5479ae791..181ebcfcc 100644
+--- a/internal/pkg/history/history_test.go
++++ b/internal/pkg/history/history_test.go
+@@ -8,6 +8,7 @@ import (
+ 	"time"
+ 
+ 	"github.com/stretchr/testify/assert"
++	"k8s.io/apimachinery/pkg/util/sets"
+ 
+ 	clog "github.com/openshift/oc-mirror/v2/internal/pkg/log"
+ )
+@@ -34,13 +35,12 @@ func TestNewHistory(t *testing.T) {
+ }
+ 
+ func TestRead(t *testing.T) {
+-
+ 	type testCase struct {
+ 		caseName      string
+ 		workingDir    string
+ 		before        time.Time
+ 		expectedError string
+-		expectedHist  map[string]struct{}
++		expectedHist  sets.Set[string]
+ 	}
+ 
+ 	testCases := []testCase{
+@@ -49,28 +49,21 @@ func TestRead(t *testing.T) {
+ 			workingDir:    historyFakePath,
+ 			before:        time.Time{},
+ 			expectedError: "",
+-			expectedHist: map[string]struct{}{
+-				"sha256:1dddb0988d16": {},
+-				"sha256:3658954f1990": {},
+-				"sha256:e3dad360d035": {},
+-				"sha256:422e4fbe1ed8": {},
+-			},
++			expectedHist:  sets.New("sha256:1dddb0988d16", "sha256:3658954f1990", "sha256:e3dad360d035", "sha256:422e4fbe1ed8"),
+ 		},
+ 		{
+ 			caseName:      "valid history file - with specified time",
+ 			workingDir:    historyFakePath,
+ 			before:        time.Date(2023, 11, 22, 0, 0, 0, 0, time.UTC),
+ 			expectedError: "",
+-			expectedHist: map[string]struct{}{
+-				"sha256:1dddb0988d16": {},
+-			},
++			expectedHist:  sets.New("sha256:1dddb0988d16"),
+ 		},
+ 		{
+ 			caseName:      "invalid working dir",
+ 			workingDir:    "./invalid-workindir",
+ 			before:        time.Time{},
+ 			expectedError: "no history metadata found under invalid-workindir",
+-			expectedHist:  map[string]struct{}{},
++			expectedHist:  sets.New[string](),
+ 		},
+ 	}
+ 
+@@ -83,63 +76,45 @@ func TestRead(t *testing.T) {
+ 			if test.expectedError != "" {
+ 				assert.EqualError(t, err, test.expectedError)
+ 			}
+-			assert.Equal(t, test.expectedHist, historyMap)
++			assert.Equal(t, sets.List(test.expectedHist), sets.List(historyMap))
+ 		})
+ 	}
+ }
+ 
+ func TestAppend(t *testing.T) {
+-
+ 	type testCase struct {
+ 		caseName      string
+ 		workingDir    string
+ 		before        time.Time
+-		blobsToAppend map[string]struct{}
++		blobsToAppend sets.Set[string]
+ 		expectedError string
+-		expectedHist  map[string]struct{}
++		expectedHist  sets.Set[string]
+ 	}
+ 
+ 	testCases := []testCase{
+ 		{
+-			caseName:   "valid history file - without specified time",
+-			workingDir: historyFakePath,
+-			before:     time.Time{},
+-			blobsToAppend: map[string]struct{}{
+-				"sha256:20f695d2a913": {},
+-			},
++			caseName:      "valid history file - without specified time",
++			workingDir:    historyFakePath,
++			before:        time.Time{},
++			blobsToAppend: sets.New("sha256:20f695d2a913"),
+ 			expectedError: "",
+-			expectedHist: map[string]struct{}{
+-				"sha256:422e4fbe1ed8": {},
+-				"sha256:1dddb0988d16": {},
+-				"sha256:3658954f1990": {},
+-				"sha256:e3dad360d035": {},
+-				"sha256:20f695d2a913": {},
+-			},
++			expectedHist:  sets.New("sha256:422e4fbe1ed8", "sha256:1dddb0988d16", "sha256:3658954f1990", "sha256:e3dad360d035", "sha256:20f695d2a913"),
+ 		},
+ 		{
+-			caseName:   "valid history file - with specified time",
+-			workingDir: historyFakePath,
+-			before:     time.Date(2023, 11, 22, 0, 0, 0, 0, time.UTC),
+-			blobsToAppend: map[string]struct{}{
+-				"sha256:20f695d2a913": {},
+-			},
++			caseName:      "valid history file - with specified time",
++			workingDir:    historyFakePath,
++			before:        time.Date(2023, 11, 22, 0, 0, 0, 0, time.UTC),
++			blobsToAppend: sets.New("sha256:20f695d2a913"),
+ 			expectedError: "",
+-			expectedHist: map[string]struct{}{
+-				"sha256:1dddb0988d16": {},
+-				"sha256:20f695d2a913": {},
+-			},
++			expectedHist:  sets.New("sha256:1dddb0988d16", "sha256:20f695d2a913"),
+ 		},
+ 		{
+-			caseName:   "empty working dir - error is ignored",
+-			workingDir: "./empty-workindir",
+-			before:     time.Time{},
+-			blobsToAppend: map[string]struct{}{
+-				"sha256:20f695d2a913": {},
+-			},
++			caseName:      "empty working dir - error is ignored",
++			workingDir:    "./empty-workindir",
++			before:        time.Time{},
++			blobsToAppend: sets.New("sha256:20f695d2a913"),
+ 			expectedError: "",
+-			expectedHist: map[string]struct{}{
+-				"sha256:20f695d2a913": {},
+-			},
++			expectedHist:  sets.New("sha256:20f695d2a913"),
+ 		},
+ 	}
+ 
+@@ -153,7 +128,7 @@ func TestAppend(t *testing.T) {
+ 				assert.EqualError(t, err, test.expectedError)
+ 			} else {
+ 				assert.NoError(t, err)
+-				assert.Equal(t, test.expectedHist, historyBlobs)
++				assert.Equal(t, sets.List(test.expectedHist), sets.List(historyBlobs))
+ 			}
+ 		})
+ 	}
+diff --git a/internal/pkg/history/interface.go b/internal/pkg/history/interface.go
+index c6bbf8cd8..0ce34b8b4 100644
+--- a/internal/pkg/history/interface.go
++++ b/internal/pkg/history/interface.go
+@@ -1,10 +1,14 @@
+ package history
+ 
+-import "io"
++import (
++	"io"
++
++	"k8s.io/apimachinery/pkg/util/sets"
++)
+ 
+ type History interface {
+-	Read() (map[string]struct{}, error)
+-	Append(map[string]struct{}) (map[string]struct{}, error)
++	Read() (sets.Set[string], error)
++	Append(sets.Set[string]) (sets.Set[string], error)
+ }
+ 
+ type FileCreator interface {

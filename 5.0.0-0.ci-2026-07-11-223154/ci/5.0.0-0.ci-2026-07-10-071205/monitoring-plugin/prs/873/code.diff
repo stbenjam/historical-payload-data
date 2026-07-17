@@ -1,0 +1,1482 @@
+diff --git a/docs/incident_detection/tests/performance/03.endurance_test_source.md b/docs/incident_detection/tests/performance/03.endurance_test_source.md
+new file mode 100644
+index 000000000..d8f69e29d
+--- /dev/null
++++ b/docs/incident_detection/tests/performance/03.endurance_test_source.md
+@@ -0,0 +1,152 @@
++# 03. Endurance Test — Shelved Source
++
++Shelved due to Cypress DOM snapshot accumulation causing ~10x degradation over 100 cycles regardless of application performance. See [overview.md](./overview.md) for details.
++
++**To re-enable:** save the code block below as `web/cypress/e2e/incidents/performance/03.performance_endurance.cy.ts`.
++
++```typescript
++import { incidentsPage } from '../../../views/incidents-page';
++
++const MCP = {
++  namespace: Cypress.env('COO_NAMESPACE'),
++  packageName: 'cluster-observability-operator',
++  operatorName: 'Cluster Observability Operator',
++  config: {
++    kind: 'UIPlugin',
++    name: 'monitoring',
++  },
++};
++
++const MP = {
++  namespace: 'openshift-monitoring',
++  operatorName: 'Cluster Monitoring Operator',
++};
++
++const INCIDENT_COUNT = 20;
++const CYCLES_PER_INCIDENT = 5;
++const TOTAL_CYCLES = INCIDENT_COUNT * CYCLES_PER_INCIDENT;
++const DEGRADATION_FACTOR = 5;
++
++const INCIDENT_IDS = Array.from({ length: INCIDENT_COUNT }, (_, i) =>
++  `bench-${String(i + 1).padStart(2, '0')}`,
++);
++
++const TRACKED_AVERAGE = 'bench-01';
++const TRACKED_HEAVIEST = 'bench-03';
++
++describe('Performance: Endurance - Select/Deselect Cycling', { tags: ['@incidents', '@performance', '@endurance'] }, () => {
++
++  before(() => {
++    cy.beforeBlockCOO(MCP, MP, { dashboards: false, troubleshootingPanel: false });
++  });
++
++  it('8.1 Endurance: Incident select/deselect cycling across 20 incidents', () => {
++    cy.mockIncidentFixture('incident-scenarios/22-benchmark-20-incidents.yaml');
++    incidentsPage.clearAllFilters();
++    incidentsPage.setDays('1 day');
++    incidentsPage.elements.incidentsChartBarsGroups()
++      .should('have.length', 20);
++
++    const cycleTimes: number[] = [];
++    const trackedTimes: Record<string, number[]> = {
++      [TRACKED_AVERAGE]: [],
++      [TRACKED_HEAVIEST]: [],
++    };
++
++    const sum = (arr: number[]) => arr.reduce((a, b) => a + b, 0);
++    const avg = (arr: number[]) => Math.round(sum(arr) / arr.length);
++
++    const logTrackedSnapshot = (label: string) => {
++      const lines: string[] = [label];
++      for (const [id, times] of Object.entries(trackedTimes)) {
++        if (times.length === 0) continue;
++        lines.push(
++          `  ${id} (${times.length} cycles): avg ${avg(times)}ms, last ${times[times.length - 1]}ms`,
++        );
++      }
++      lines.forEach((line) => {
++        cy.log(line);
++        cy.task('log', line);
++      });
++    };
++
++    cy.window({ log: false }).then((win) => {
++      win.performance.clearMarks('endurance-start');
++      win.performance.mark('endurance-start');
++    });
++
++    const runCycle = (cycleIndex: number) => {
++      if (cycleIndex >= TOTAL_CYCLES) return;
++
++      const incidentId = INCIDENT_IDS[cycleIndex % INCIDENT_IDS.length];
++      const cycleMark = `cycle-${cycleIndex}`;
++
++      cy.window({ log: false }).then((win) => {
++        win.performance.mark(cycleMark);
++      });
++
++      incidentsPage.selectIncidentById(incidentId);
++      incidentsPage.elements.alertsChartCard().should('be.visible');
++
++      incidentsPage.deselectIncidentById(incidentId);
++
++      cy.window({ log: false }).then((win) => {
++        const measure = win.performance.measure(`${cycleMark}-measure`, cycleMark);
++        const elapsed = Math.round(measure.duration);
++        cycleTimes.push(elapsed);
++
++        if (incidentId in trackedTimes) {
++          trackedTimes[incidentId].push(elapsed);
++        }
++
++        if ((cycleIndex + 1) % 20 === 0 || cycleIndex === 0) {
++          const totalMeasure = win.performance.measure('endurance-progress', 'endurance-start');
++          const totalElapsed = Math.round(totalMeasure.duration / 1000);
++          win.performance.clearMeasures('endurance-progress');
++          const msg = `Cycle ${cycleIndex + 1}/${TOTAL_CYCLES} [${incidentId}]: ${elapsed}ms (${totalElapsed}s elapsed)`;
++          cy.log(msg);
++          cy.task('log', msg);
++          logTrackedSnapshot('--- Tracked incidents snapshot ---');
++        }
++      });
++
++      cy.then(() => { runCycle(cycleIndex + 1); });
++    };
++
++    runCycle(0);
++
++    cy.window({ log: false }).then((win) => {
++      const totalMeasure = win.performance.measure('endurance-total', 'endurance-start');
++      const totalElapsed = totalMeasure.duration;
++
++      const min = Math.min(...cycleTimes);
++      const max = Math.max(...cycleTimes);
++      const mean = avg(cycleTimes);
++      const first10Avg = avg(cycleTimes.slice(0, 10));
++      const last10Avg = avg(cycleTimes.slice(-10));
++
++      const summary = [
++        `=== ENDURANCE TEST SUMMARY ===`,
++        `Total cycles: ${cycleTimes.length}`,
++        `Total time: ${Math.round(totalElapsed / 1000)}s`,
++        `Cycle times - min: ${min}ms, max: ${max}ms, avg: ${mean}ms`,
++        `First 10 avg: ${first10Avg}ms`,
++        `Last 10 avg: ${last10Avg}ms`,
++        `Degradation ratio: ${(last10Avg / first10Avg).toFixed(2)}x (threshold: ${DEGRADATION_FACTOR}x)`,
++      ];
++
++      summary.forEach((line) => {
++        cy.log(line);
++        cy.task('log', line);
++      });
++
++      logTrackedSnapshot('=== TRACKED INCIDENTS FINAL ===');
++
++      expect(
++        last10Avg,
++        `Last 10 cycles avg (${last10Avg}ms) should not exceed ${DEGRADATION_FACTOR}x first 10 avg (${first10Avg}ms)`,
++      ).to.be.lessThan(first10Avg * DEGRADATION_FACTOR);
++    });
++  });
++});
++```
+diff --git a/docs/incident_detection/tests/performance/overview.md b/docs/incident_detection/tests/performance/overview.md
+new file mode 100644
+index 000000000..f4d4b5913
+--- /dev/null
++++ b/docs/incident_detection/tests/performance/overview.md
+@@ -0,0 +1,93 @@
++# Performance Testing - Incidents Page
++
++Location: `web/cypress/e2e/incidents/performance/`
++Verifies: OBSINTA-1006
++
++## Test Suite
++
++### 01. Performance Benchmark (`01.performance_benchmark.cy.ts`)
++
++Measures wall-clock render time for chart operations under escalating data loads. Uses `performance.mark()`/`performance.measure()` for timing.
++
++**What it tests:**
++- Incidents chart render: 100, 200, 500 alerts (single incident)
++- Alerts detail chart render after incident selection: 100, 200, 500 alerts
++- Multi-incident chart: 20 uniform incidents, 12 mixed-size incidents (67 alerts)
++
++**Thresholds** are regression indicators, not absolute targets. They include Cypress overhead (~3-5s per navigation cycle). Calibrate by running 3-5 times on a clean build, then set at ~2x median.
++
++**Known limitation:** 1000-alert tests are disabled — mocking that volume triggers a maximum call stack error in the mock generator, though equivalent non-mocked simulated data renders without issue. To re-enable, apply:
++
++```diff
++--- a/web/cypress/e2e/incidents/performance/01.performance_benchmark.cy.ts
+++++ b/web/cypress/e2e/incidents/performance/01.performance_benchmark.cy.ts
++@@ end of it('6.1 ...')
+++    cy.log('6.1.4 Incidents chart with 1000 alerts (single incident)');
+++    benchmarkIncidentsChart(
+++      '18-stress-test-1000-alerts-single.yaml',
+++      1,
+++      THRESHOLDS.INCIDENTS_CHART_1000_ALERTS,
+++      'Incidents chart - 1000 alerts',
+++      '7 days',
+++    );
++
++@@ end of it('6.2 ...')
+++    cy.log('6.2.4 Alerts chart after selecting incident with 1000 alerts');
+++    benchmarkAlertsChart(
+++      '18-stress-test-1000-alerts-single.yaml',
+++      'cluster-wide-failure-1000-alerts',
+++      THRESHOLDS.ALERTS_CHART_1000_ALERTS,
+++      'Alerts chart - 1000 alerts',
+++      '7 days',
+++    );
++```
++
++### 02. Interactive Walkthrough (`02.performance_walkthrough.cy.ts`)
++
++Measures incremental re-render cost during a realistic user session (as opposed to 01 which measures initial render).
++
++**What it tests:**
++- Filter apply/clear cycle times with 20 incidents loaded
++- Time range switching (1d → 3d → 7d → 15d → 1d)
++- Table row expansion with 100 and 500 alerts
++
++### 03. Endurance Cycling — Shelved
++
++Rapidly cycles select/deselect across 20 incidents to detect progressive degradation or memory leaks. Compares first-10 vs last-10 cycle averages against a degradation threshold.
++
++**Status:** Shelved — results are unreliable due to Cypress overhead (see below). The full test source is preserved in [`03.endurance_test_source.md`](./03.endurance_test_source.md). To re-enable, copy it to `web/cypress/e2e/incidents/performance/`.
++
++## Cypress Overhead
++
++All timings include Cypress command processing time. This adds a constant baseline to each operation and, more importantly, a **progressive overhead** that grows with test length.
++
++### DOM snapshot accumulation
++
++Cypress captures a full DOM snapshot for every logged command (to enable time-travel debugging in the runner). The OpenShift Console DOM is large (thousands of nodes), so each snapshot is expensive. Over many cycles, these snapshots accumulate in memory, causing:
++
++- Increasing GC pressure → micro-jank on interactions
++- Cypress command queue growth → longer per-command scheduling
++- Linear slowdown: cycle times grow ~10x over 100 cycles regardless of application performance
++
++### Mitigation attempts and findings
++
++| Approach | Result |
++|----------|--------|
++| `{ log: false }` on commands | ~20% total time reduction, ~34% faster by cycle 100. Gap widens over time, confirming snapshot accumulation contributes. But `.should()` assertions have no `log` option and still snapshot. |
++| `numTestsKeptInMemory: 0` | Only purges between `it()` blocks, not within a single long-running test. |
++| Split into multiple `it()` blocks | `testIsolation: false` preserves page state, but fixture/mock setup between blocks adds complexity and the shared state management is fragile. |
++| Override `Cypress.log` with no-op | Cypress internally chains `.snapshot()`, `.end()`, `.set()` on the log return value. Stubbing all methods is brittle across Cypress versions. |
++
++### Implication for the endurance test
++
++The endurance test (03) cannot reliably distinguish between "the UI is getting slower" and "Cypress is getting slower." Both logged and unlogged runs show ~9-10x degradation over 100 cycles, dominated by Cypress overhead. The test would only catch catastrophic leaks that add degradation far above the Cypress baseline.
++
++## Potential: In-App Performance Measurement
++
++A more accurate approach would instrument the React components directly:
++
++1. Add `performance.mark()` calls inside the incidents component's render/effect lifecycle
++2. Trigger interactions from Cypress but measure only the React work via `cy.window()`
++3. The endurance loop would still run in Cypress, but measured duration would exclude Cypress command queue and snapshot overhead
++
++This is not implemented because it requires modifying production source code (or adding test-only hooks), and the benchmark tests (01, 02) already provide sufficient regression signal for practical purposes — their shorter duration keeps Cypress overhead in the flat range (~2-3x) where real application regressions are visible.
+diff --git a/web/cypress.config.ts b/web/cypress.config.ts
+index 58b6dcbc0..1c9a2b345 100644
+--- a/web/cypress.config.ts
++++ b/web/cypress.config.ts
+@@ -4,6 +4,7 @@ import * as console from 'console';
+ import * as path from 'path';
+ import registerCypressGrep from '@cypress/grep/src/plugin';
+ import { DefinePlugin, NormalModuleReplacementPlugin } from 'webpack';
++import { writeBenchmarkReport, injectBenchmarksIntoMochawesome } from './cypress/plugins/benchmark-reporter';
+ 
+ const getLoginCredentials = (index: number): { username: string; password: string } => {
+   const users = (process.env.CYPRESS_LOGIN_USERS || '').split(',').filter(Boolean);
+@@ -158,18 +159,25 @@ export default defineConfig({
+           console.log(`Files in "${folder}": ${files.join(', ')}`);
+           return files;
+         },
++
++        writeBenchmarkReport,
++
+       });
+       on('after:spec', (spec: Cypress.Spec, results: CypressCommandLine.RunResult) => {
+         if (results && results.video) {
+-          // Do we have failures for any retry attempts?
+           const failures = results.tests.some((test) =>
+             test.attempts.some((attempt) => attempt.state === 'failed'),
+           );
+           if (!failures && fs.existsSync(results.video)) {
+-            // Delete the video if the spec passed and no tests retried
+             fs.unlinkSync(results.video);
+           }
+         }
++
++        try {
++          injectBenchmarksIntoMochawesome(spec.relative);
++        } catch (e) {
++          console.log(`Benchmark injection skipped: ${(e as Error).message}`);
++        }
+       });
+       return config;
+     },
+diff --git a/web/cypress/e2e/incidents/performance/01.performance_benchmark.cy.ts b/web/cypress/e2e/incidents/performance/01.performance_benchmark.cy.ts
+new file mode 100644
+index 000000000..55e139d55
+--- /dev/null
++++ b/web/cypress/e2e/incidents/performance/01.performance_benchmark.cy.ts
+@@ -0,0 +1,199 @@
++/*
++Performance benchmark tests for the Incidents page UI rendering.
++
++Measures wall-clock time for key rendering operations under escalating data loads.
++Cypress command overhead adds a constant baseline (~3-5s per navigation cycle), so
++these thresholds are NOT absolute performance targets. They serve as regression
++indicators: if a code change causes timings to exceed thresholds that previously
++passed, it signals a potential performance degradation worth investigating.
++
++Tune THRESHOLDS based on your CI environment's baseline. Run the suite 3-5 times
++on a clean build to establish stable baselines, then set thresholds at ~2x the
++median observed time.
++
++Verifies: OBSINTA-1006
++*/
++
++import { incidentsPage } from '../../../views/incidents-page';
++import { BenchmarkCollector } from '../../../support/benchmark-utils';
++
++const MCP = {
++  namespace: Cypress.env('COO_NAMESPACE'),
++  packageName: 'cluster-observability-operator',
++  operatorName: 'Cluster Observability Operator',
++  config: {
++    kind: 'UIPlugin',
++    name: 'monitoring',
++  },
++};
++
++const MP = {
++  namespace: 'openshift-monitoring',
++  operatorName: 'Cluster Monitoring Operator',
++};
++
++// Wall-clock thresholds in ms. Includes Cypress overhead (navigation, intercept
++// wait, command scheduling). Set conservatively for initial calibration — tighten
++// after observing stable baselines in your environment.
++const THRESHOLDS = {
++  INCIDENTS_CHART_100_ALERTS: 4_000,
++  INCIDENTS_CHART_200_ALERTS: 3_000,
++  INCIDENTS_CHART_500_ALERTS: 6_000,
++  INCIDENTS_CHART_1000_ALERTS: 60_000,
++
++  ALERTS_CHART_100_ALERTS: 3_000,
++  ALERTS_CHART_200_ALERTS: 8_000,
++  ALERTS_CHART_500_ALERTS: 20_000,
++  ALERTS_CHART_1000_ALERTS: 60_000,
++
++  INCIDENTS_CHART_20_INCIDENTS: 7_000,
++  INCIDENTS_CHART_MIXED_12: 5_000,
++};
++
++const collector = new BenchmarkCollector('01.performance_benchmark.cy.ts');
++
++describe(
++  'Regression: Performance Benchmark',
++  { tags: ['@incidents', '@performance', '@regression'], numTestsKeptInMemory: 0 },
++  () => {
++    before(() => {
++      cy.beforeBlockCOO(MCP, MP, { dashboards: false, troubleshootingPanel: false });
++    });
++
++    afterEach(() => {
++      collector.reportAfterEach();
++    });
++
++    after(() => {
++      collector.writeReport();
++    });
++
++    it('6.1 Benchmark: Incidents chart render time with escalating alert counts', () => {
++      const benchmarkIncidentsChart = (
++        fixture: string,
++        expectedBars: number,
++        thresholdMs: number,
++        label: string,
++        days: '1 day' | '3 days' | '7 days' | '15 days' = '1 day',
++      ) => {
++        cy.mockIncidentFixture(`incident-scenarios/${fixture}`);
++
++        collector.markStart(label);
++
++        incidentsPage.clearAllFilters();
++        incidentsPage.setDays(days);
++        incidentsPage.elements.incidentsChartBarsGroups().should('have.length', expectedBars);
++
++        collector.recordBenchmark(label, thresholdMs);
++      };
++
++      cy.log('6.1.1 Incidents chart with 100 alerts (single incident)');
++      benchmarkIncidentsChart(
++        '15-stress-test-100-alerts.yaml',
++        1,
++        THRESHOLDS.INCIDENTS_CHART_100_ALERTS,
++        'Incidents chart - 100 alerts',
++      );
++
++      cy.log('6.1.2 Incidents chart with 200 alerts (single incident)');
++      benchmarkIncidentsChart(
++        '16-stress-test-200-alerts.yaml',
++        1,
++        THRESHOLDS.INCIDENTS_CHART_200_ALERTS,
++        'Incidents chart - 200 alerts',
++      );
++
++      cy.log('6.1.3 Incidents chart with 500 alerts (single incident)');
++      benchmarkIncidentsChart(
++        '17-stress-test-500-alerts.yaml',
++        1,
++        THRESHOLDS.INCIDENTS_CHART_500_ALERTS,
++        'Incidents chart - 500 alerts',
++      );
++    });
++
++    it('6.2 Benchmark: Alerts detail chart render time after incident selection', () => {
++      cy.wait(10000);
++
++      const benchmarkAlertsChart = (
++        fixture: string,
++        incidentId: string,
++        thresholdMs: number,
++        label: string,
++        days: '1 day' | '3 days' | '7 days' | '15 days' = '1 day',
++      ) => {
++        cy.mockIncidentFixture(`incident-scenarios/${fixture}`);
++        incidentsPage.clearAllFilters();
++        incidentsPage.setDays(days);
++        incidentsPage.elements.incidentsChartBarsGroups().should('have.length', 1);
++
++        incidentsPage.selectIncidentById(incidentId);
++
++        collector.markStart(label);
++
++        incidentsPage.elements.alertsChartCard().should('be.visible');
++        incidentsPage.elements.alertsChartBarsVisiblePaths().should('have.length.greaterThan', 0);
++
++        collector.recordBenchmark(label, thresholdMs);
++      };
++
++      cy.log('6.2.1 Alerts chart after selecting incident with 100 alerts');
++      benchmarkAlertsChart(
++        '15-stress-test-100-alerts.yaml',
++        'cluster-wide-failure-100-alerts',
++        THRESHOLDS.ALERTS_CHART_100_ALERTS,
++        'Alerts chart - 100 alerts',
++      );
++
++      cy.log('6.2.2 Alerts chart after selecting incident with 200 alerts');
++      benchmarkAlertsChart(
++        '16-stress-test-200-alerts.yaml',
++        'cluster-wide-failure-200-alerts',
++        THRESHOLDS.ALERTS_CHART_200_ALERTS,
++        'Alerts chart - 200 alerts',
++      );
++
++      cy.log('6.2.3 Alerts chart after selecting incident with 500 alerts');
++      benchmarkAlertsChart(
++        '17-stress-test-500-alerts.yaml',
++        'cluster-wide-failure-500-alerts',
++        THRESHOLDS.ALERTS_CHART_500_ALERTS,
++        'Alerts chart - 500 alerts',
++      );
++    });
++
++    it('6.3 Benchmark: Multi-incident chart render time (20 uniform incidents)', () => {
++      cy.wait(10000);
++
++      cy.mockIncidentFixture('incident-scenarios/22-benchmark-20-incidents.yaml');
++
++      collector.markStart('Incidents chart - 20 uniform incidents');
++
++      incidentsPage.clearAllFilters();
++      incidentsPage.setDays('1 day');
++      incidentsPage.elements.incidentsChartBarsGroups().should('have.length', 20);
++
++      collector.recordBenchmark(
++        'Incidents chart - 20 uniform incidents',
++        THRESHOLDS.INCIDENTS_CHART_20_INCIDENTS,
++      );
++    });
++
++    it('6.4 Benchmark: Mixed-size incidents chart render time (12 heterogeneous incidents)', () => {
++      cy.wait(10000);
++
++      cy.mockIncidentFixture('incident-scenarios/23-benchmark-mixed-size-incidents.yaml');
++
++      collector.markStart('Incidents chart - 12 mixed-size incidents (67 alerts)');
++
++      incidentsPage.clearAllFilters();
++      incidentsPage.setDays('1 day');
++      incidentsPage.elements.incidentsChartBarsGroups().should('have.length', 12);
++
++      collector.recordBenchmark(
++        'Incidents chart - 12 mixed-size incidents (67 alerts)',
++        THRESHOLDS.INCIDENTS_CHART_MIXED_12,
++      );
++    });
++  },
++);
+diff --git a/web/cypress/e2e/incidents/performance/02.performance_walkthrough.cy.ts b/web/cypress/e2e/incidents/performance/02.performance_walkthrough.cy.ts
+new file mode 100644
+index 000000000..75fcca188
+--- /dev/null
++++ b/web/cypress/e2e/incidents/performance/02.performance_walkthrough.cy.ts
+@@ -0,0 +1,174 @@
++/*
++Performance walkthrough: measures rendering cost of interactive operations
++(filter toggling, time range switching, table row expansion) under load.
++
++Unlike 01.performance_benchmark which measures initial chart render time,
++this test measures incremental re-render cost during a realistic user session.
++
++Verifies: OBSINTA-1006
++*/
++
++import { incidentsPage } from '../../../views/incidents-page';
++import { BenchmarkCollector } from '../../../support/benchmark-utils';
++
++const MCP = {
++  namespace: Cypress.env('COO_NAMESPACE'),
++  packageName: 'cluster-observability-operator',
++  operatorName: 'Cluster Observability Operator',
++  config: {
++    kind: 'UIPlugin',
++    name: 'monitoring',
++  },
++};
++
++const MP = {
++  namespace: 'openshift-monitoring',
++  operatorName: 'Cluster Monitoring Operator',
++};
++
++const THRESHOLDS = {
++  FILTER_APPLY: 3_000,
++  FILTER_CLEAR: 800,
++  TIME_RANGE_SWITCH: 4_000,
++  TABLE_EXPAND_100: 4_000,
++  TABLE_EXPAND_500: 20_000,
++};
++
++const collector = new BenchmarkCollector('02.performance_walkthrough.cy.ts');
++
++describe(
++  'Performance: Interactive Walkthrough',
++  { tags: ['@incidents', '@performance'], numTestsKeptInMemory: 0 },
++  () => {
++    before(() => {
++      cy.beforeBlockCOO(MCP, MP, { dashboards: false, troubleshootingPanel: false });
++    });
++
++    afterEach(() => {
++      collector.reportAfterEach();
++    });
++
++    after(() => {
++      collector.writeReport();
++    });
++
++    it('7.1 Walkthrough: Filter interaction and time range switching with 20 incidents', () => {
++      cy.mockIncidentFixture('incident-scenarios/22-benchmark-20-incidents.yaml');
++      incidentsPage.clearAllFilters();
++      incidentsPage.setDays('1 day');
++      incidentsPage.elements.incidentsChartBarsGroups().should('have.length', 20);
++
++      // --- Phase 1: Filter interaction ---
++
++      cy.log('7.1.1 Apply Critical severity filter');
++      collector.markStart('Filter apply - Critical');
++
++      incidentsPage.toggleFilter('Critical');
++      incidentsPage.elements.incidentsChartContainer().should('be.visible');
++      incidentsPage.elements.incidentsChartBarsGroups().should('exist');
++
++      collector.recordBenchmark('Filter apply - Critical', THRESHOLDS.FILTER_APPLY);
++
++      cy.log('7.1.2 Clear all filters (restore 20 incidents)');
++      collector.markStart('Filter clear - all');
++
++      incidentsPage.clearAllFilters();
++      incidentsPage.elements.incidentsChartBarsGroups().should('have.length', 20);
++
++      collector.recordBenchmark('Filter clear - all', THRESHOLDS.FILTER_CLEAR);
++
++      cy.log('7.1.3 Apply Warning severity filter');
++      collector.markStart('Filter apply - Warning');
++
++      incidentsPage.toggleFilter('Warning');
++      incidentsPage.elements.incidentsChartContainer().should('be.visible');
++      incidentsPage.elements.incidentsChartBarsGroups().should('exist');
++
++      collector.recordBenchmark('Filter apply - Warning', THRESHOLDS.FILTER_APPLY);
++
++      cy.log('7.1.4 Clear all filters again');
++      collector.markStart('Filter clear - all (2nd)');
++
++      incidentsPage.clearAllFilters();
++      incidentsPage.elements.incidentsChartBarsGroups().should('have.length', 20);
++
++      collector.recordBenchmark('Filter clear - all (2nd)', THRESHOLDS.FILTER_CLEAR);
++
++      // --- Phase 2: Time range switching ---
++
++      cy.log('7.1.5 Switch time range from 1 day to 3 days');
++      collector.markStart('Time range switch - 1d to 3d');
++
++      incidentsPage.setDays('3 days');
++      incidentsPage.elements.incidentsChartContainer().should('be.visible');
++      incidentsPage.elements.incidentsChartBarsGroups().should('exist');
++
++      collector.recordBenchmark('Time range switch - 1d to 3d', THRESHOLDS.TIME_RANGE_SWITCH);
++
++      cy.log('7.1.6 Switch time range from 3 days to 7 days');
++      collector.markStart('Time range switch - 3d to 7d');
++
++      incidentsPage.setDays('7 days');
++      incidentsPage.elements.incidentsChartContainer().should('be.visible');
++      incidentsPage.elements.incidentsChartBarsGroups().should('exist');
++
++      collector.recordBenchmark('Time range switch - 3d to 7d', THRESHOLDS.TIME_RANGE_SWITCH);
++
++      cy.log('7.1.7 Switch time range from 7 days to 15 days');
++      collector.markStart('Time range switch - 7d to 15d');
++
++      incidentsPage.setDays('15 days');
++      incidentsPage.elements.incidentsChartContainer().should('be.visible');
++      incidentsPage.elements.incidentsChartBarsGroups().should('exist');
++
++      collector.recordBenchmark('Time range switch - 7d to 15d', THRESHOLDS.TIME_RANGE_SWITCH);
++
++      cy.log('7.1.8 Switch time range back to 1 day');
++      collector.markStart('Time range switch - 15d to 1d');
++
++      incidentsPage.setDays('1 day');
++      incidentsPage.elements.incidentsChartContainer().should('be.visible');
++      incidentsPage.elements.incidentsChartBarsGroups().should('have.length', 20);
++
++      collector.recordBenchmark('Time range switch - 15d to 1d', THRESHOLDS.TIME_RANGE_SWITCH);
++    });
++
++    it('7.2 Walkthrough: Table row expansion with 100 and 500 alerts', () => {
++      cy.wait(10000);
++
++      // --- Phase 3a: Table expansion with 100 alerts ---
++
++      cy.log('7.2.1 Load 100-alert fixture and select incident');
++      cy.mockIncidentFixture('incident-scenarios/15-stress-test-100-alerts.yaml');
++      incidentsPage.clearAllFilters();
++      incidentsPage.setDays('1 day');
++      incidentsPage.selectIncidentById('cluster-wide-failure-100-alerts');
++      incidentsPage.elements.incidentsTable().should('be.visible');
++
++      cy.log('7.2.2 Expand first component row (100 alerts)');
++      collector.markStart('Table expand - 100 alerts');
++
++      incidentsPage.expandRow(0);
++      incidentsPage.elements.incidentsDetailsTableRows().should('have.length.greaterThan', 0);
++
++      collector.recordBenchmark('Table expand - 100 alerts', THRESHOLDS.TABLE_EXPAND_100);
++
++      // --- Phase 3b: Table expansion with 500 alerts ---
++
++      cy.log('7.2.3 Load 500-alert fixture and select incident');
++      cy.mockIncidentFixture('incident-scenarios/17-stress-test-500-alerts.yaml');
++      incidentsPage.clearAllFilters();
++      incidentsPage.setDays('1 day');
++      incidentsPage.selectIncidentById('cluster-wide-failure-500-alerts');
++      incidentsPage.elements.incidentsTable().should('be.visible');
++
++      cy.log('7.2.4 Expand first component row (500 alerts)');
++      collector.markStart('Table expand - 500 alerts');
++
++      incidentsPage.expandRow(0);
++      incidentsPage.elements.incidentsDetailsTableRows().should('have.length.greaterThan', 0);
++
++      collector.recordBenchmark('Table expand - 500 alerts', THRESHOLDS.TABLE_EXPAND_500);
++    });
++  },
++);
+diff --git a/web/cypress/fixtures/incident-scenarios/22-benchmark-20-incidents.yaml b/web/cypress/fixtures/incident-scenarios/22-benchmark-20-incidents.yaml
+new file mode 100644
+index 000000000..3506c2306
+--- /dev/null
++++ b/web/cypress/fixtures/incident-scenarios/22-benchmark-20-incidents.yaml
+@@ -0,0 +1,314 @@
++name: "22 - Performance Benchmark - 20 Incidents"
++description: >
++  20 incidents across various components for benchmarking incidents chart
++  rendering performance. Each incident has 2-3 alerts. Uses 1h timeline
++  consistent with other stress test fixtures.
++incidents:
++  - id: bench-01
++    component: monitoring
++    layer: core
++    timeline:
++      start: 1h
++    alerts:
++      - name: BenchMonAlert01a
++        namespace: openshift-monitoring
++        severity: critical
++        firing: true
++      - name: BenchMonAlert01b
++        namespace: openshift-monitoring
++        severity: warning
++        firing: true
++  - id: bench-02
++    component: monitoring
++    layer: core
++    timeline:
++      start: 55m
++    alerts:
++      - name: BenchMonAlert02a
++        namespace: openshift-monitoring
++        severity: warning
++        firing: true
++      - name: BenchMonAlert02b
++        namespace: openshift-monitoring
++        severity: info
++        firing: true
++  - id: bench-03
++    component: monitoring
++    layer: core
++    timeline:
++      start: 50m
++    alerts:
++      - name: BenchMonAlert03a
++        namespace: openshift-monitoring
++        severity: critical
++        firing: true
++      - name: BenchMonAlert03b
++        namespace: openshift-monitoring
++        severity: warning
++        firing: true
++      - name: BenchMonAlert03c
++        namespace: openshift-monitoring
++        severity: info
++        firing: true
++  - id: bench-04
++    component: network
++    layer: core
++    timeline:
++      start: 48m
++    alerts:
++      - name: BenchNetAlert01a
++        namespace: openshift-network
++        severity: critical
++        firing: true
++      - name: BenchNetAlert01b
++        namespace: openshift-network
++        severity: warning
++        firing: true
++  - id: bench-05
++    component: network
++    layer: core
++    timeline:
++      start: 45m
++    alerts:
++      - name: BenchNetAlert02a
++        namespace: openshift-network
++        severity: warning
++        firing: true
++      - name: BenchNetAlert02b
++        namespace: openshift-network
++        severity: info
++        firing: true
++      - name: BenchNetAlert02c
++        namespace: openshift-network
++        severity: critical
++        firing: true
++  - id: bench-06
++    component: network
++    layer: core
++    timeline:
++      start: 42m
++    alerts:
++      - name: BenchNetAlert03a
++        namespace: openshift-network
++        severity: critical
++        firing: true
++      - name: BenchNetAlert03b
++        namespace: openshift-network
++        severity: warning
++        firing: true
++  - id: bench-07
++    component: storage
++    layer: core
++    timeline:
++      start: 40m
++    alerts:
++      - name: BenchStorAlert01a
++        namespace: openshift-storage
++        severity: critical
++        firing: true
++      - name: BenchStorAlert01b
++        namespace: openshift-storage
++        severity: warning
++        firing: true
++  - id: bench-08
++    component: storage
++    layer: core
++    timeline:
++      start: 38m
++    alerts:
++      - name: BenchStorAlert02a
++        namespace: openshift-storage
++        severity: warning
++        firing: true
++      - name: BenchStorAlert02b
++        namespace: openshift-storage
++        severity: critical
++        firing: true
++      - name: BenchStorAlert02c
++        namespace: openshift-storage
++        severity: info
++        firing: true
++  - id: bench-09
++    component: storage
++    layer: core
++    timeline:
++      start: 35m
++    alerts:
++      - name: BenchStorAlert03a
++        namespace: openshift-storage
++        severity: critical
++        firing: true
++      - name: BenchStorAlert03b
++        namespace: openshift-storage
++        severity: warning
++        firing: true
++  - id: bench-10
++    component: compute
++    layer: core
++    timeline:
++      start: 32m
++    alerts:
++      - name: BenchCompAlert01a
++        namespace: openshift-compute
++        severity: critical
++        firing: true
++      - name: BenchCompAlert01b
++        namespace: openshift-compute
++        severity: warning
++        firing: true
++  - id: bench-11
++    component: compute
++    layer: core
++    timeline:
++      start: 30m
++    alerts:
++      - name: BenchCompAlert02a
++        namespace: openshift-compute
++        severity: warning
++        firing: true
++      - name: BenchCompAlert02b
++        namespace: openshift-compute
++        severity: info
++        firing: true
++      - name: BenchCompAlert02c
++        namespace: openshift-compute
++        severity: critical
++        firing: true
++  - id: bench-12
++    component: compute
++    layer: core
++    timeline:
++      start: 28m
++    alerts:
++      - name: BenchCompAlert03a
++        namespace: openshift-compute
++        severity: critical
++        firing: true
++      - name: BenchCompAlert03b
++        namespace: openshift-compute
++        severity: warning
++        firing: true
++  - id: bench-13
++    component: etcd
++    layer: core
++    timeline:
++      start: 25m
++    alerts:
++      - name: BenchEtcdAlert01a
++        namespace: openshift-etcd
++        severity: critical
++        firing: true
++      - name: BenchEtcdAlert01b
++        namespace: openshift-etcd
++        severity: warning
++        firing: true
++  - id: bench-14
++    component: etcd
++    layer: core
++    timeline:
++      start: 22m
++    alerts:
++      - name: BenchEtcdAlert02a
++        namespace: openshift-etcd
++        severity: warning
++        firing: true
++      - name: BenchEtcdAlert02b
++        namespace: openshift-etcd
++        severity: critical
++        firing: true
++      - name: BenchEtcdAlert02c
++        namespace: openshift-etcd
++        severity: info
++        firing: true
++  - id: bench-15
++    component: etcd
++    layer: core
++    timeline:
++      start: 20m
++    alerts:
++      - name: BenchEtcdAlert03a
++        namespace: openshift-etcd
++        severity: critical
++        firing: true
++      - name: BenchEtcdAlert03b
++        namespace: openshift-etcd
++        severity: warning
++        firing: true
++  - id: bench-16
++    component: api-server
++    layer: core
++    timeline:
++      start: 18m
++    alerts:
++      - name: BenchApiAlert01a
++        namespace: openshift-apiserver
++        severity: critical
++        firing: true
++      - name: BenchApiAlert01b
++        namespace: openshift-apiserver
++        severity: warning
++        firing: true
++  - id: bench-17
++    component: api-server
++    layer: core
++    timeline:
++      start: 15m
++    alerts:
++      - name: BenchApiAlert02a
++        namespace: openshift-apiserver
++        severity: warning
++        firing: true
++      - name: BenchApiAlert02b
++        namespace: openshift-apiserver
++        severity: info
++        firing: true
++      - name: BenchApiAlert02c
++        namespace: openshift-apiserver
++        severity: critical
++        firing: true
++  - id: bench-18
++    component: version
++    layer: core
++    timeline:
++      start: 12m
++    alerts:
++      - name: BenchVerAlert01a
++        namespace: openshift-cluster-version
++        severity: warning
++        firing: true
++      - name: BenchVerAlert01b
++        namespace: openshift-cluster-version
++        severity: critical
++        firing: true
++  - id: bench-19
++    component: monitoring
++    layer: core
++    timeline:
++      start: 10m
++    alerts:
++      - name: BenchMonAlert04a
++        namespace: openshift-monitoring
++        severity: critical
++        firing: true
++      - name: BenchMonAlert04b
++        namespace: openshift-monitoring
++        severity: warning
++        firing: true
++      - name: BenchMonAlert04c
++        namespace: openshift-monitoring
++        severity: info
++        firing: true
++  - id: bench-20
++    component: network
++    layer: core
++    timeline:
++      start: 5m
++    alerts:
++      - name: BenchNetAlert04a
++        namespace: openshift-network
++        severity: critical
++        firing: true
++      - name: BenchNetAlert04b
++        namespace: openshift-network
++        severity: warning
++        firing: true
+diff --git a/web/cypress/fixtures/incident-scenarios/23-benchmark-mixed-size-incidents.yaml b/web/cypress/fixtures/incident-scenarios/23-benchmark-mixed-size-incidents.yaml
+new file mode 100644
+index 000000000..2d81396f7
+--- /dev/null
++++ b/web/cypress/fixtures/incident-scenarios/23-benchmark-mixed-size-incidents.yaml
+@@ -0,0 +1,160 @@
++name: "23 - Performance Benchmark - Mixed Size Incidents"
++description: >
++  12 incidents with heterogeneous alert counts (1 large, 2 medium, 3 small-medium,
++  6 small) for benchmarking chart rendering with realistic data distribution.
++  Uses 1h timeline consistent with other stress test fixtures.
++incidents:
++  # --- LARGE: 1 incident with 20 alerts ---
++  - id: mixed-large-mon
++    component: monitoring
++    layer: core
++    timeline:
++      start: 58m
++    alerts:
++      - { name: LargeMonCrit01, namespace: openshift-monitoring, severity: critical, firing: true }
++      - { name: LargeMonCrit02, namespace: openshift-monitoring, severity: critical, firing: true }
++      - { name: LargeMonCrit03, namespace: openshift-monitoring, severity: critical, firing: true }
++      - { name: LargeMonCrit04, namespace: openshift-monitoring, severity: critical, firing: true }
++      - { name: LargeMonCrit05, namespace: openshift-monitoring, severity: critical, firing: true }
++      - { name: LargeMonCrit06, namespace: openshift-monitoring, severity: critical, firing: true }
++      - { name: LargeMonCrit07, namespace: openshift-monitoring, severity: critical, firing: true }
++      - { name: LargeMonCrit08, namespace: openshift-monitoring, severity: critical, firing: true }
++      - { name: LargeMonCrit09, namespace: openshift-monitoring, severity: critical, firing: true }
++      - { name: LargeMonCrit10, namespace: openshift-monitoring, severity: critical, firing: true }
++      - { name: LargeMonWarn01, namespace: openshift-monitoring, severity: warning, firing: true }
++      - { name: LargeMonWarn02, namespace: openshift-monitoring, severity: warning, firing: true }
++      - { name: LargeMonWarn03, namespace: openshift-monitoring, severity: warning, firing: true }
++      - { name: LargeMonWarn04, namespace: openshift-monitoring, severity: warning, firing: true }
++      - { name: LargeMonWarn05, namespace: openshift-monitoring, severity: warning, firing: true }
++      - { name: LargeMonInfo01, namespace: openshift-monitoring, severity: info, firing: true }
++      - { name: LargeMonInfo02, namespace: openshift-monitoring, severity: info, firing: true }
++      - { name: LargeMonInfo03, namespace: openshift-monitoring, severity: info, firing: true }
++      - { name: LargeMonInfo04, namespace: openshift-monitoring, severity: info, firing: true }
++      - { name: LargeMonInfo05, namespace: openshift-monitoring, severity: info, firing: true }
++
++  # --- MEDIUM: 2 incidents with 10 alerts each ---
++  - id: mixed-med-net
++    component: network
++    layer: core
++    timeline:
++      start: 52m
++    alerts:
++      - { name: MedNetCrit01, namespace: openshift-network, severity: critical, firing: true }
++      - { name: MedNetCrit02, namespace: openshift-network, severity: critical, firing: true }
++      - { name: MedNetCrit03, namespace: openshift-network, severity: critical, firing: true }
++      - { name: MedNetCrit04, namespace: openshift-network, severity: critical, firing: true }
++      - { name: MedNetCrit05, namespace: openshift-network, severity: critical, firing: true }
++      - { name: MedNetWarn01, namespace: openshift-network, severity: warning, firing: true }
++      - { name: MedNetWarn02, namespace: openshift-network, severity: warning, firing: true }
++      - { name: MedNetWarn03, namespace: openshift-network, severity: warning, firing: true }
++      - { name: MedNetWarn04, namespace: openshift-network, severity: warning, firing: true }
++      - { name: MedNetWarn05, namespace: openshift-network, severity: warning, firing: true }
++
++  - id: mixed-med-stor
++    component: storage
++    layer: core
++    timeline:
++      start: 48m
++    alerts:
++      - { name: MedStorCrit01, namespace: openshift-storage, severity: critical, firing: true }
++      - { name: MedStorCrit02, namespace: openshift-storage, severity: critical, firing: true }
++      - { name: MedStorCrit03, namespace: openshift-storage, severity: critical, firing: true }
++      - { name: MedStorCrit04, namespace: openshift-storage, severity: critical, firing: true }
++      - { name: MedStorCrit05, namespace: openshift-storage, severity: critical, firing: true }
++      - { name: MedStorWarn01, namespace: openshift-storage, severity: warning, firing: true }
++      - { name: MedStorWarn02, namespace: openshift-storage, severity: warning, firing: true }
++      - { name: MedStorWarn03, namespace: openshift-storage, severity: warning, firing: true }
++      - { name: MedStorWarn04, namespace: openshift-storage, severity: warning, firing: true }
++      - { name: MedStorWarn05, namespace: openshift-storage, severity: warning, firing: true }
++
++  # --- SMALL-MEDIUM: 3 incidents with 5 alerts each ---
++  - id: mixed-sm-comp
++    component: compute
++    layer: core
++    timeline:
++      start: 42m
++    alerts:
++      - { name: SmCompCrit01, namespace: openshift-compute, severity: critical, firing: true }
++      - { name: SmCompCrit02, namespace: openshift-compute, severity: critical, firing: true }
++      - { name: SmCompCrit03, namespace: openshift-compute, severity: critical, firing: true }
++      - { name: SmCompWarn01, namespace: openshift-compute, severity: warning, firing: true }
++      - { name: SmCompWarn02, namespace: openshift-compute, severity: warning, firing: true }
++
++  - id: mixed-sm-etcd
++    component: etcd
++    layer: core
++    timeline:
++      start: 38m
++    alerts:
++      - { name: SmEtcdCrit01, namespace: openshift-etcd, severity: critical, firing: true }
++      - { name: SmEtcdCrit02, namespace: openshift-etcd, severity: critical, firing: true }
++      - { name: SmEtcdCrit03, namespace: openshift-etcd, severity: critical, firing: true }
++      - { name: SmEtcdWarn01, namespace: openshift-etcd, severity: warning, firing: true }
++      - { name: SmEtcdWarn02, namespace: openshift-etcd, severity: warning, firing: true }
++
++  - id: mixed-sm-api
++    component: api-server
++    layer: core
++    timeline:
++      start: 34m
++    alerts:
++      - { name: SmApiCrit01, namespace: openshift-apiserver, severity: critical, firing: true }
++      - { name: SmApiCrit02, namespace: openshift-apiserver, severity: critical, firing: true }
++      - { name: SmApiCrit03, namespace: openshift-apiserver, severity: critical, firing: true }
++      - { name: SmApiWarn01, namespace: openshift-apiserver, severity: warning, firing: true }
++      - { name: SmApiWarn02, namespace: openshift-apiserver, severity: warning, firing: true }
++
++  # --- SMALL: 6 incidents with 2 alerts each ---
++  - id: mixed-tiny-mon
++    component: monitoring
++    layer: core
++    timeline:
++      start: 28m
++    alerts:
++      - { name: TinyMonCrit01, namespace: openshift-monitoring, severity: critical, firing: true }
++      - { name: TinyMonWarn01, namespace: openshift-monitoring, severity: warning, firing: true }
++
++  - id: mixed-tiny-net
++    component: network
++    layer: core
++    timeline:
++      start: 24m
++    alerts:
++      - { name: TinyNetCrit01, namespace: openshift-network, severity: critical, firing: true }
++      - { name: TinyNetWarn01, namespace: openshift-network, severity: warning, firing: true }
++
++  - id: mixed-tiny-stor
++    component: storage
++    layer: core
++    timeline:
++      start: 20m
++    alerts:
++      - { name: TinyStorCrit01, namespace: openshift-storage, severity: critical, firing: true }
++      - { name: TinyStorWarn01, namespace: openshift-storage, severity: warning, firing: true }
++
++  - id: mixed-tiny-comp
++    component: compute
++    layer: core
++    timeline:
++      start: 16m
++    alerts:
++      - { name: TinyCompCrit01, namespace: openshift-compute, severity: critical, firing: true }
++      - { name: TinyCompWarn01, namespace: openshift-compute, severity: warning, firing: true }
++
++  - id: mixed-tiny-etcd
++    component: etcd
++    layer: core
++    timeline:
++      start: 12m
++    alerts:
++      - { name: TinyEtcdCrit01, namespace: openshift-etcd, severity: critical, firing: true }
++      - { name: TinyEtcdWarn01, namespace: openshift-etcd, severity: warning, firing: true }
++
++  - id: mixed-tiny-ver
++    component: version
++    layer: core
++    timeline:
++      start: 8m
++    alerts:
++      - { name: TinyVerCrit01, namespace: openshift-cluster-version, severity: critical, firing: true }
++      - { name: TinyVerWarn01, namespace: openshift-cluster-version, severity: warning, firing: true }
+diff --git a/web/cypress/plugins/benchmark-reporter.ts b/web/cypress/plugins/benchmark-reporter.ts
+new file mode 100644
+index 000000000..e6e2a830e
+--- /dev/null
++++ b/web/cypress/plugins/benchmark-reporter.ts
+@@ -0,0 +1,89 @@
++/*
++Node-side benchmark utilities for cypress.config.ts.
++
++Handles writing benchmark JSON reports and injecting benchmark data into
++mochawesome reports (via after:spec, since spec code runs in the browser
++and cannot set mochawesome context directly).
++*/
++
++import * as fs from 'fs-extra';
++import * as path from 'path';
++import * as console from 'console';
++
++const REPORTS_DIR = path.join(__dirname, '..', '..', 'screenshots');
++
++export function writeBenchmarkReport(report: {
++  specFile: string;
++  timestamp: string;
++  [key: string]: unknown;
++}): null {
++  fs.ensureDirSync(REPORTS_DIR);
++
++  const safeName = (report.specFile || 'unknown')
++    .replace(/[^a-zA-Z0-9_-]/g, '_')
++    .replace(/_+/g, '_');
++  const ts = (report.timestamp || new Date().toISOString())
++    .replace(/[:.]/g, '-')
++    .replace('T', '_')
++    .slice(0, 19);
++
++  const filePath = path.join(REPORTS_DIR, `benchmark-${safeName}-${ts}.json`);
++  fs.writeFileSync(filePath, JSON.stringify(report, null, 2));
++  console.log(`Benchmark report written: ${filePath}`);
++  return null;
++}
++
++/**
++ * Reads the most recent benchmark JSON for the given spec and injects its
++ * data into the matching mochawesome report's test contexts.
++ */
++export function injectBenchmarksIntoMochawesome(specRelative: string): void {
++  if (!fs.existsSync(REPORTS_DIR)) return;
++
++  const safeName = path
++    .basename(specRelative)
++    .replace(/[^a-zA-Z0-9_-]/g, '_')
++    .replace(/_+/g, '_');
++
++  const benchFile = fs
++    .readdirSync(REPORTS_DIR)
++    .filter((f: string) => f.startsWith(`benchmark-${safeName}`) && f.endsWith('.json'))
++    .sort()
++    .pop();
++  if (!benchFile) return;
++
++  const benchmarks: Array<{ label: string; [k: string]: unknown }> =
++    fs.readJsonSync(path.join(REPORTS_DIR, benchFile)).benchmarks || [];
++  if (benchmarks.length === 0) return;
++
++  const reportFile = fs
++    .readdirSync(REPORTS_DIR)
++    .filter((f: string) => f.startsWith('cypress_report') && f.endsWith('.json'))
++    .sort()
++    .pop();
++  if (!reportFile) return;
++
++  const reportPath = path.join(REPORTS_DIR, reportFile);
++  const report = fs.readJsonSync(reportPath);
++
++  let injected = false;
++  const suites = (report.results || []).flatMap(
++    (r: Record<string, unknown>) => (r.suites as unknown[]) || [],
++  );
++  for (const suite of suites as Array<Record<string, unknown>>) {
++    for (const test of (suite.tests || []) as Array<Record<string, unknown>>) {
++      const matched = benchmarks.filter(
++        (b) => test.code && (test.code as string).includes(b.label),
++      );
++      if (matched.length > 0) {
++        test.context = JSON.stringify([{ title: 'Benchmark Results', value: matched }]);
++        injected = true;
++      }
++    }
++  }
++
++  if (injected) {
++    fs.writeFileSync(reportPath, JSON.stringify(report, null, 2));
++    console.log(`Benchmark data injected into mochawesome report: ${reportPath}`);
++  }
++}
+diff --git a/web/cypress/support/benchmark-utils.ts b/web/cypress/support/benchmark-utils.ts
+new file mode 100644
+index 000000000..4401e12c3
+--- /dev/null
++++ b/web/cypress/support/benchmark-utils.ts
+@@ -0,0 +1,197 @@
++/*
++Shared benchmark utilities for performance tests.
++
++Provides timing instrumentation (markStart / recordBenchmark), structured
++JSON report writing, and a formatted CI summary table.  Mochawesome context
++injection happens server-side in cypress.config.ts (after:spec hook).
++
++All performance specs should use these instead of rolling
++their own — keeps threshold semantics and output format consistent.
++*/
++
++// ---------------------------------------------------------------------------
++// Types
++// ---------------------------------------------------------------------------
++
++export interface BenchmarkResult {
++  label: string;
++  elapsedMs: number;
++  thresholdMs: number;
++}
++
++export interface BenchmarkReportEntry {
++  label: string;
++  elapsedMs: number;
++  thresholdMs: number;
++  status: 'pass' | 'fail';
++  headroom: number;
++}
++
++export interface BenchmarkReport {
++  specFile: string;
++  timestamp: string;
++  environment: {
++    browser: string;
++    cypressVersion: string;
++    viewport: string;
++  };
++  benchmarks: BenchmarkReportEntry[];
++  summary: {
++    total: number;
++    passed: number;
++    failed: number;
++    slowest: string | null;
++    fastest: string | null;
++  };
++}
++
++// ---------------------------------------------------------------------------
++// Collector — one instance per spec file
++// ---------------------------------------------------------------------------
++
++export class BenchmarkCollector {
++  private results: BenchmarkResult[] = [];
++  private allResults: BenchmarkResult[] = [];
++  private specFile: string;
++
++  constructor(specFile: string) {
++    this.specFile = specFile;
++  }
++
++  /** Place a Performance.mark at the current point in time. */
++  markStart(label: string): void {
++    cy.window({ log: false }).then((win) => {
++      win.performance.clearMarks(label);
++      win.performance.clearMeasures(`measure:${label}`);
++      win.performance.mark(label);
++    });
++  }
++
++  /**
++   * Measure elapsed time since the matching markStart call, assert against
++   * the threshold, and collect the result.
++   *
++   * Threshold semantics: elapsed <= thresholdMs  →  PASS.
++   */
++  recordBenchmark(label: string, thresholdMs: number): void {
++    cy.window({ log: false }).then((win) => {
++      const entry = win.performance.measure(`measure:${label}`, label);
++      const elapsedMs = Math.round(entry.duration);
++      const result = { label, elapsedMs, thresholdMs };
++      this.results.push(result);
++      this.allResults.push(result);
++
++      const status = elapsedMs <= thresholdMs ? 'PASS' : 'FAIL';
++      const msg = `BENCHMARK [${status}] ${label}: ${elapsedMs}ms (threshold: ${thresholdMs}ms)`;
++      cy.log(msg);
++      cy.task('log', msg);
++
++      expect(elapsedMs, `${label} should complete within ${thresholdMs}ms`).to.be.at.most(
++        thresholdMs,
++      );
++    });
++  }
++
++  // -------------------------------------------------------------------------
++  // afterEach — summary table
++  // -------------------------------------------------------------------------
++
++  /**
++   * Call from afterEach(() => { collector.reportAfterEach(); }).
++   * Logs the summary table and clears per-test results.
++   */
++  reportAfterEach(): void {
++    if (this.results.length === 0) return;
++
++    const enriched = this.enrichResults();
++    this.logSummaryTable(enriched);
++
++    this.results.length = 0;
++  }
++
++  // -------------------------------------------------------------------------
++  // after — write JSON report file
++  // -------------------------------------------------------------------------
++
++  /**
++   * Call from after(() => { collector.writeReport(); }).
++   * Writes a JSON file to cypress/reports/benchmarks/.
++   */
++  writeReport(): void {
++    if (this.allResults.length === 0) return;
++
++    const enriched = this.enrichResults(this.allResults);
++    const report = this.buildReport(enriched);
++
++    cy.task('writeBenchmarkReport', report);
++    this.allResults.length = 0;
++  }
++
++  // -------------------------------------------------------------------------
++  // Private helpers
++  // -------------------------------------------------------------------------
++
++  private enrichResults(source: BenchmarkResult[] = this.results): BenchmarkReportEntry[] {
++    return source.map((r) => ({
++      label: r.label,
++      elapsedMs: r.elapsedMs,
++      thresholdMs: r.thresholdMs,
++      status: (r.elapsedMs <= r.thresholdMs ? 'pass' : 'fail') as 'pass' | 'fail',
++      headroom: +((r.thresholdMs - r.elapsedMs) / r.thresholdMs).toFixed(3),
++    }));
++  }
++
++  private buildReport(entries: BenchmarkReportEntry[]): BenchmarkReport {
++    const passed = entries.filter((e) => e.status === 'pass').length;
++    const sorted = [...entries].sort((a, b) => b.elapsedMs - a.elapsedMs);
++
++    return {
++      specFile: this.specFile,
++      timestamp: new Date().toISOString(),
++      environment: {
++        browser: Cypress.browser?.displayName ?? 'unknown',
++        cypressVersion: Cypress.version,
++        viewport: `${Cypress.config('viewportWidth')}x${Cypress.config('viewportHeight')}`,
++      },
++      benchmarks: entries,
++      summary: {
++        total: entries.length,
++        passed,
++        failed: entries.length - passed,
++        slowest: sorted[0]?.label ?? null,
++        fastest: sorted[sorted.length - 1]?.label ?? null,
++      },
++    };
++  }
++
++  private logSummaryTable(entries: BenchmarkReportEntry[]): void {
++    const labelWidth = Math.max(20, ...entries.map((e) => e.label.length)) + 2;
++
++    const pad = (s: string, w: number) => s + ' '.repeat(Math.max(0, w - s.length));
++    const rpad = (s: string, w: number) => ' '.repeat(Math.max(0, w - s.length)) + s;
++    const fmtMs = (ms: number) => ms.toLocaleString('en-US') + 'ms';
++    const fmtHeadroom = (h: number) => (h >= 0 ? '+' : '') + Math.round(h * 100) + '%';
++
++    const hdr =
++      `| ${pad('Benchmark', labelWidth)}` +
++      `| ${rpad('Elapsed', 10)} ` +
++      `| ${rpad('Threshold', 10)} ` +
++      `| ${rpad('Headroom', 9)} ` +
++      `| ${pad('Status', 6)} |`;
++
++    const sep = hdr.replace(/[^|]/g, '-');
++
++    const rows = entries.map(
++      (e) =>
++        `| ${pad(e.label, labelWidth)}` +
++        `| ${rpad(fmtMs(e.elapsedMs), 10)} ` +
++        `| ${rpad(fmtMs(e.thresholdMs), 10)} ` +
++        `| ${rpad(fmtHeadroom(e.headroom), 9)} ` +
++        `| ${pad(e.status.toUpperCase(), 6)} |`,
++    );
++
++    const table = [sep, hdr, sep, ...rows, sep].join('\n');
++
++    cy.task('log', '\n' + table);
++  }
++}
+diff --git a/web/cypress/views/incidents-page.ts b/web/cypress/views/incidents-page.ts
+index b47fb639a..7e9ad50ec 100644
+--- a/web/cypress/views/incidents-page.ts
++++ b/web/cypress/views/incidents-page.ts
+@@ -203,7 +203,10 @@ export const incidentsPage = {
+ 
+   setDays: (value: '1 day' | '3 days' | '7 days' | '15 days') => {
+     cy.log('incidentsPage.setDays');
+-    incidentsPage.elements.daysSelectToggle().scrollIntoView().click();
++    cy.wait(250);
++    incidentsPage.elements.daysSelectToggle().scrollIntoView().click({ force: true });
++    incidentsPage.elements.daysSelectList().should('be.visible');
++    cy.wait(250);
+     const dayKey = value.replace(' ', '-');
+     cy.byTestID(`${DataTestIDs.IncidentsPage.DaysSelectOption}-${dayKey}`)
+       .should('be.visible')
