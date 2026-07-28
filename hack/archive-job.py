@@ -214,13 +214,14 @@ def extract_jobs_from_snapshot(snapshot_dir):
                 data = json.load(f)
         except (json.JSONDecodeError, UnicodeDecodeError):
             continue
-        if isinstance(data, dict) and "gcs_bucket_path" in data:
+        if isinstance(data, dict) and data.get("gcs_bucket_path"):
             raw = data["gcs_bucket_path"]
             for bucket in (SOURCE_BUCKET, DEST_BUCKET):
                 if raw.startswith(bucket + "/"):
                     raw = raw[len(bucket) + 1:]
                     break
-            job_paths.add(raw)
+            if raw:
+                job_paths.add(raw)
     return sorted(job_paths)
 
 
