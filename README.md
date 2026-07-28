@@ -20,6 +20,8 @@ gcloud storage cp -r \
 
 ### 2. Archive referenced jobs to GCS
 
+> **Note:** Write access to the `prow-artifact-archive` GCS bucket is required. If you don't have access, ask someone with permissions to run this step for you.
+
 The snapshot references Prow job artifacts by URL. Archive them to the `prow-artifact-archive` bucket so they remain available after the original bucket expires:
 
 ```bash
