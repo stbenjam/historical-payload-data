@@ -8,6 +8,8 @@ rewrites bucket references and recursively archives dependent jobs.
 import argparse
 import concurrent.futures
 import functools
+import glob
+import json
 import os
 import queue
 import re
@@ -203,6 +205,25 @@ def normalize_path(path):
     return path.rstrip("/")
 
 
+def extract_jobs_from_snapshot(snapshot_dir):
+    """Extract job paths from a payload snapshot directory."""
+    job_paths = set()
+    for filepath in glob.glob(os.path.join(snapshot_dir, "**", "*.json"), recursive=True):
+        try:
+            with open(filepath) as f:
+                data = json.load(f)
+        except (json.JSONDecodeError, UnicodeDecodeError):
+            continue
+        if isinstance(data, dict) and "gcs_bucket_path" in data:
+            raw = data["gcs_bucket_path"]
+            for bucket in (SOURCE_BUCKET, DEST_BUCKET):
+                if raw.startswith(bucket + "/"):
+                    raw = raw[len(bucket) + 1:]
+                    break
+            job_paths.add(raw)
+    return sorted(job_paths)
+
+
 def fix_all_prowjobs(parallel):
     """Find and rewrite all prowjob.json files in the dest bucket that still reference the old bucket."""
     print("Listing all prowjob.json files in dest bucket...")
@@ -258,6 +279,10 @@ def main():
         help="Read job paths from a file (one per line)",
     )
     parser.add_argument(
+        "--from-snapshot", "-s",
+        help="Extract and archive all jobs referenced in a payload snapshot directory",
+    )
+    parser.add_argument(
         "--dry-run", "-n", action="store_true",
         help="Print what would be archived without doing it",
     )
@@ -289,6 +314,11 @@ def main():
                 line = line.strip()
                 if line and not line.startswith("#"):
                     job_paths.append(normalize_path(line))
+
+    if args.from_snapshot:
+        snapshot_jobs = extract_jobs_from_snapshot(args.from_snapshot)
+        print(f"Found {len(snapshot_jobs)} jobs in snapshot {args.from_snapshot}")
+        job_paths.extend(snapshot_jobs)
 
     if not job_paths:
         parser.error("No job paths specified. Provide paths as arguments or use --from-file.")
