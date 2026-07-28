@@ -126,25 +126,35 @@ def rewrite_prowjob(job_path):
             os.unlink(tmppath)
 
 
-def archive_job(job_path, archived, dry_run=False, recursive=True, executor=None, pending_futures=None):
+def archive_job(job_path, archived, dry_run=False, recursive=True, rewrite_only=False,
+                executor=None, pending_futures=None):
     with _archived_lock:
         if job_path in archived:
             return
         archived.add(job_path)
 
     try:
-        _archive_job_inner(job_path, archived, dry_run, recursive, executor, pending_futures)
+        _archive_job_inner(job_path, archived, dry_run, recursive, rewrite_only, executor, pending_futures)
     except Exception as e:
         print(f"  ERROR ({job_path}): {e}", file=sys.stderr)
 
 
-def _archive_job_inner(job_path, archived, dry_run, recursive, executor, pending_futures):
+def _archive_job_inner(job_path, archived, dry_run, recursive, rewrite_only, executor, pending_futures):
+
+    if rewrite_only:
+        if not job_exists_in_dest(job_path):
+            print(f"  SKIP (not in dest): {job_path}")
+            return
+        print(f"  REWRITING: {job_path}")
+        rewrite_and_find_refs(job_path)
+        print(f"  DONE: {job_path}")
+        return
 
     if job_exists_in_dest(job_path):
         print(f"  SKIP (already archived): {job_path}")
         if recursive and is_aggregated(job_path):
             referenced = rewrite_and_find_refs(job_path)
-            _queue_refs(referenced, archived, dry_run, recursive, executor, pending_futures)
+            _queue_refs(referenced, archived, dry_run, recursive, rewrite_only, executor, pending_futures)
         return
 
     if not job_exists_in_source(job_path):
@@ -160,19 +170,15 @@ def _archive_job_inner(job_path, archived, dry_run, recursive, executor, pending
     if not server_side_copy(job_path):
         return
 
-    referenced = set()
-    if is_aggregated(job_path):
-        referenced = rewrite_and_find_refs(job_path)
-    else:
-        rewrite_prowjob(job_path)
+    referenced = rewrite_and_find_refs(job_path)
 
     print(f"  DONE: {job_path}")
 
     if recursive and referenced:
-        _queue_refs(referenced, archived, dry_run, recursive, executor, pending_futures)
+        _queue_refs(referenced, archived, dry_run, recursive, rewrite_only, executor, pending_futures)
 
 
-def _queue_refs(referenced, archived, dry_run, recursive, executor, pending_futures=None):
+def _queue_refs(referenced, archived, dry_run, recursive, rewrite_only, executor, pending_futures=None):
     with _archived_lock:
         new_refs = referenced - archived
     if not new_refs:
@@ -182,12 +188,13 @@ def _queue_refs(referenced, archived, dry_run, recursive, executor, pending_futu
         for ref_path in sorted(new_refs):
             pending_futures.put(executor.submit(
                 archive_job, ref_path, archived,
-                dry_run=dry_run, recursive=recursive,
+                dry_run=dry_run, recursive=recursive, rewrite_only=rewrite_only,
                 executor=executor, pending_futures=pending_futures,
             ))
     else:
         for ref_path in sorted(new_refs):
-            archive_job(ref_path, archived, dry_run=dry_run, recursive=recursive)
+            archive_job(ref_path, archived, dry_run=dry_run, recursive=recursive,
+                        rewrite_only=rewrite_only)
 
 
 def normalize_path(path):
@@ -298,6 +305,10 @@ def main():
         "--fix-prowjobs", action="store_true",
         help="Rewrite prowjob.json for all jobs in dest bucket to fix old bucket references",
     )
+    parser.add_argument(
+        "--rewrite", action="store_true",
+        help="Rewrite all text files in already-archived jobs (use with job paths or --from-snapshot)",
+    )
     args = parser.parse_args()
 
     if args.fix_prowjobs:
@@ -335,6 +346,7 @@ def main():
                 archive_job, job_path, archived,
                 dry_run=args.dry_run,
                 recursive=not args.no_recursive,
+                rewrite_only=args.rewrite,
                 executor=executor,
                 pending_futures=pending,
             ))
