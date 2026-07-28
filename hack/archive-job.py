@@ -1,0 +1,248 @@
+#!/usr/bin/env python3
+"""Archive Prow jobs from test-platform-results to prow-artifact-archive.
+
+Copies job artifacts via server-side GCS copy. For aggregated-* jobs, also
+rewrites bucket references and recursively archives dependent jobs.
+"""
+
+import argparse
+import concurrent.futures
+import functools
+import os
+import queue
+import re
+import subprocess
+import sys
+import tempfile
+import threading
+import time
+
+print = functools.partial(print, flush=True)
+
+SOURCE_BUCKET = "test-platform-results"
+DEST_BUCKET = "prow-artifact-archive"
+
+JOB_PATH_RE = re.compile(
+    r"(?:test-platform-results|prow-artifact-archive)/((?:logs|pr-logs)/[a-zA-Z0-9/._-]+?/\d{16,})"
+)
+
+_archived_lock = threading.Lock()
+
+
+def gcs_run(*args, check=False):
+    cmd = ["gcloud", "storage"] + list(args)
+    return subprocess.run(cmd, capture_output=True, text=True, check=check)
+
+
+def job_exists_in_dest(job_path):
+    result = gcs_run("ls", f"gs://{DEST_BUCKET}/{job_path}/started.json")
+    return result.returncode == 0
+
+
+def job_exists_in_source(job_path):
+    result = gcs_run("ls", f"gs://{SOURCE_BUCKET}/{job_path}/started.json")
+    return result.returncode == 0
+
+
+def server_side_copy(job_path):
+    """Copy job between buckets server-side (no local download)."""
+    result = gcs_run(
+        "cp", "-r",
+        f"gs://{SOURCE_BUCKET}/{job_path}/*",
+        f"gs://{DEST_BUCKET}/{job_path}/",
+    )
+    if result.returncode != 0:
+        print(f"  ERROR copying: {result.stderr.strip()}", file=sys.stderr)
+        return False
+    return True
+
+
+def is_aggregated(job_path):
+    job_name = job_path.split("/")[1] if "/" in job_path else ""
+    return job_name.startswith("aggregated-")
+
+
+def rewrite_and_find_refs(job_path):
+    """Download text files from dest, rewrite refs, re-upload. Returns referenced job paths."""
+    referenced = set()
+    with tempfile.TemporaryDirectory() as tmpdir:
+        result = gcs_run(
+            "cp", "-r",
+            f"gs://{DEST_BUCKET}/{job_path}/*",
+            f"{tmpdir}/",
+        )
+        if result.returncode != 0:
+            print(f"  ERROR downloading for rewrite: {result.stderr.strip()}", file=sys.stderr)
+            return referenced
+
+        modified_files = []
+        for root, _dirs, files in os.walk(tmpdir):
+            for fname in files:
+                fpath = os.path.join(root, fname)
+                try:
+                    with open(fpath, "r", encoding="utf-8", errors="strict") as f:
+                        content = f.read()
+                except (UnicodeDecodeError, ValueError):
+                    continue
+
+                for m in JOB_PATH_RE.finditer(content):
+                    referenced.add(m.group(1))
+
+                rewritten = content.replace(SOURCE_BUCKET, DEST_BUCKET)
+                if rewritten != content:
+                    with open(fpath, "w", encoding="utf-8") as f:
+                        f.write(rewritten)
+                    modified_files.append(fpath)
+
+        if modified_files:
+            result = gcs_run(
+                "cp", "-r",
+                f"{tmpdir}/*",
+                f"gs://{DEST_BUCKET}/{job_path}/",
+            )
+            if result.returncode != 0:
+                print(f"  ERROR re-uploading: {result.stderr.strip()}", file=sys.stderr)
+
+    return referenced
+
+
+def archive_job(job_path, archived, dry_run=False, recursive=True, executor=None, pending_futures=None):
+    with _archived_lock:
+        if job_path in archived:
+            return
+        archived.add(job_path)
+
+    try:
+        _archive_job_inner(job_path, archived, dry_run, recursive, executor, pending_futures)
+    except Exception as e:
+        print(f"  ERROR ({job_path}): {e}", file=sys.stderr)
+
+
+def _archive_job_inner(job_path, archived, dry_run, recursive, executor, pending_futures):
+
+    if job_exists_in_dest(job_path):
+        print(f"  SKIP (already archived): {job_path}")
+        if recursive and is_aggregated(job_path):
+            referenced = rewrite_and_find_refs(job_path)
+            _queue_refs(referenced, archived, dry_run, recursive, executor, pending_futures)
+        return
+
+    if not job_exists_in_source(job_path):
+        print(f"  SKIP (not in source): {job_path}")
+        return
+
+    if dry_run:
+        print(f"  WOULD ARCHIVE: {job_path}")
+        return
+
+    print(f"  ARCHIVING: {job_path}")
+
+    if not server_side_copy(job_path):
+        return
+
+    referenced = set()
+    if is_aggregated(job_path):
+        referenced = rewrite_and_find_refs(job_path)
+
+    print(f"  DONE: {job_path}")
+
+    if recursive and referenced:
+        _queue_refs(referenced, archived, dry_run, recursive, executor, pending_futures)
+
+
+def _queue_refs(referenced, archived, dry_run, recursive, executor, pending_futures=None):
+    with _archived_lock:
+        new_refs = referenced - archived
+    if not new_refs:
+        return
+    print(f"  Found {len(new_refs)} new referenced job(s) to archive")
+    if executor and pending_futures is not None:
+        for ref_path in sorted(new_refs):
+            pending_futures.put(executor.submit(
+                archive_job, ref_path, archived,
+                dry_run=dry_run, recursive=recursive,
+                executor=executor, pending_futures=pending_futures,
+            ))
+    else:
+        for ref_path in sorted(new_refs):
+            archive_job(ref_path, archived, dry_run=dry_run, recursive=recursive)
+
+
+def normalize_path(path):
+    """Strip bucket name, gs:// prefix, or URL components to get a bare job path."""
+    path = path.strip().rstrip("/")
+    for prefix in [
+        f"gs://{SOURCE_BUCKET}/",
+        f"{SOURCE_BUCKET}/",
+        f"https://prow.ci.openshift.org/view/gs/{SOURCE_BUCKET}/",
+        f"https://gcsweb-ci.apps.ci.l2s4.p1.openshiftapps.com/gcs/{SOURCE_BUCKET}/",
+    ]:
+        if path.startswith(prefix):
+            path = path[len(prefix):]
+            break
+    return path.rstrip("/")
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument(
+        "jobs", nargs="*",
+        help="Job path(s), e.g. logs/<job-name>/<build-id>",
+    )
+    parser.add_argument(
+        "--from-file", "-f",
+        help="Read job paths from a file (one per line)",
+    )
+    parser.add_argument(
+        "--dry-run", "-n", action="store_true",
+        help="Print what would be archived without doing it",
+    )
+    parser.add_argument(
+        "--no-recursive", action="store_true",
+        help="Don't recursively archive referenced jobs",
+    )
+    parser.add_argument(
+        "--parallel", "-p", type=int, default=4,
+        help="Number of jobs to archive in parallel (default: 4)",
+    )
+    args = parser.parse_args()
+
+    job_paths = []
+    for j in args.jobs or []:
+        job_paths.append(normalize_path(j))
+
+    if args.from_file:
+        with open(args.from_file) as f:
+            for line in f:
+                line = line.strip()
+                if line and not line.startswith("#"):
+                    job_paths.append(normalize_path(line))
+
+    if not job_paths:
+        parser.error("No job paths specified. Provide paths as arguments or use --from-file.")
+
+    archived = set()
+    total = len(job_paths)
+    start = time.time()
+
+    pending = queue.Queue()
+    with concurrent.futures.ThreadPoolExecutor(max_workers=args.parallel) as executor:
+        for i, job_path in enumerate(job_paths, 1):
+            print(f"[{i}/{total}] {job_path}")
+            pending.put(executor.submit(
+                archive_job, job_path, archived,
+                dry_run=args.dry_run,
+                recursive=not args.no_recursive,
+                executor=executor,
+                pending_futures=pending,
+            ))
+        while not pending.empty():
+            f = pending.get()
+            f.result()
+
+    elapsed = time.time() - start
+    print(f"\nDone. {len(archived)} job(s) processed in {elapsed:.0f}s.")
+
+
+if __name__ == "__main__":
+    main()
