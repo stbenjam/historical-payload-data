@@ -6,21 +6,17 @@ Job artifacts are stored in the `prow-artifact-archive` GCS bucket and reference
 
 ## Adding a new snapshot
 
-### 1. Run the payload snapshot script
+### 1. Get the snapshot from the payload agent's CI job
 
-From the [ai-helpers](https://github.com/openshift-eng/ai-helpers) repo:
-
-```bash
-python3 plugins/ci/skills/payload-snapshot/scripts/payload_snapshot.py <payload-tag>
-```
-
-For example:
+The snapshot is produced by the payload analysis agent's Prow job for each release payload. Download it from the job's GCS artifacts:
 
 ```bash
-python3 plugins/ci/skills/payload-snapshot/scripts/payload_snapshot.py 4.22.0-0.nightly-2026-03-26-231124
+# Find the payload agent job for the release payload in question,
+# then download its snapshot from the job artifacts
+gcloud storage cp -r \
+  gs://test-platform-results/<job-path>/artifacts/<step>/artifacts/<payload-tag>/ \
+  .
 ```
-
-This creates a directory tree with all payload data (release controller info, job results, JUnit, PR diffs, etc).
 
 ### 2. Archive referenced jobs to GCS
 
