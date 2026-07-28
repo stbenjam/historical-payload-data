@@ -106,6 +106,24 @@ def rewrite_and_find_refs(job_path):
     return referenced
 
 
+def rewrite_prowjob(job_path):
+    """Rewrite just prowjob.json in dest bucket to fix bucket references."""
+    gcs_path = f"gs://{DEST_BUCKET}/{job_path}/prowjob.json"
+    result = gcs_run("cat", gcs_path)
+    if result.returncode != 0:
+        return
+    content = result.stdout
+    rewritten = content.replace(SOURCE_BUCKET, DEST_BUCKET)
+    if rewritten != content:
+        with tempfile.NamedTemporaryFile(mode="w", suffix=".json", delete=False) as f:
+            f.write(rewritten)
+            tmppath = f.name
+        try:
+            gcs_run("cp", tmppath, gcs_path)
+        finally:
+            os.unlink(tmppath)
+
+
 def archive_job(job_path, archived, dry_run=False, recursive=True, executor=None, pending_futures=None):
     with _archived_lock:
         if job_path in archived:
@@ -143,6 +161,8 @@ def _archive_job_inner(job_path, archived, dry_run, recursive, executor, pending
     referenced = set()
     if is_aggregated(job_path):
         referenced = rewrite_and_find_refs(job_path)
+    else:
+        rewrite_prowjob(job_path)
 
     print(f"  DONE: {job_path}")
 
@@ -183,6 +203,50 @@ def normalize_path(path):
     return path.rstrip("/")
 
 
+def fix_all_prowjobs(parallel):
+    """Find and rewrite all prowjob.json files in the dest bucket that still reference the old bucket."""
+    print("Listing all prowjob.json files in dest bucket...")
+    result = gcs_run("ls", f"gs://{DEST_BUCKET}/logs/*/*/prowjob.json")
+    if result.returncode != 0:
+        print(f"ERROR listing: {result.stderr.strip()}", file=sys.stderr)
+        return
+
+    all_paths = [line.strip() for line in result.stdout.splitlines() if line.strip()]
+    print(f"Found {len(all_paths)} prowjob.json files")
+
+    fixed = []
+    fixed_lock = threading.Lock()
+
+    def check_and_fix(gcs_path):
+        r = gcs_run("cat", gcs_path)
+        if r.returncode != 0 or SOURCE_BUCKET not in r.stdout:
+            return
+        rewritten = r.stdout.replace(SOURCE_BUCKET, DEST_BUCKET)
+        with tempfile.NamedTemporaryFile(mode="w", suffix=".json", delete=False) as f:
+            f.write(rewritten)
+            tmppath = f.name
+        try:
+            gcs_run("cp", tmppath, gcs_path)
+        finally:
+            os.unlink(tmppath)
+        with fixed_lock:
+            fixed.append(gcs_path)
+            if len(fixed) % 50 == 0:
+                print(f"  Fixed {len(fixed)} so far...")
+
+    start = time.time()
+    with concurrent.futures.ThreadPoolExecutor(max_workers=parallel) as executor:
+        futures = [executor.submit(check_and_fix, p) for p in all_paths]
+        for f in concurrent.futures.as_completed(futures):
+            try:
+                f.result()
+            except Exception as e:
+                print(f"  ERROR: {e}", file=sys.stderr)
+
+    elapsed = time.time() - start
+    print(f"\nDone. Fixed {len(fixed)} of {len(all_paths)} prowjob.json files in {elapsed:.0f}s.")
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
@@ -205,7 +269,15 @@ def main():
         "--parallel", "-p", type=int, default=4,
         help="Number of jobs to archive in parallel (default: 4)",
     )
+    parser.add_argument(
+        "--fix-prowjobs", action="store_true",
+        help="Rewrite prowjob.json for all jobs in dest bucket to fix old bucket references",
+    )
     args = parser.parse_args()
+
+    if args.fix_prowjobs:
+        fix_all_prowjobs(args.parallel)
+        return
 
     job_paths = []
     for j in args.jobs or []:
