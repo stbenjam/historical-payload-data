@@ -1,0 +1,619 @@
+diff --git a/cmd/bridge/config/auth/authoptions.go b/cmd/bridge/config/auth/authoptions.go
+index 2b681880f93..edb678531c0 100644
+--- a/cmd/bridge/config/auth/authoptions.go
++++ b/cmd/bridge/config/auth/authoptions.go
+@@ -230,6 +230,7 @@ func (c *completedOptions) ApplyTo(
+ 	var err error
+ 	srv.Authenticator, err = c.getAuthenticator(
+ 		srv.BaseURL,
++		srv.AdditionalBaseURLs,
+ 		k8sEndpoint,
+ 		caCertFilePath,
+ 		srv.InternalProxiedK8SClientConfig,
+@@ -242,12 +243,14 @@ func (c *completedOptions) ApplyTo(
+ 		return err
+ 	}
+ 
+-	srv.CSRFVerifier = csrfverifier.NewCSRFVerifier(srv.BaseURL, useSecureCookies)
++	allBaseURLs := append([]*url.URL{srv.BaseURL}, srv.AdditionalBaseURLs...)
++	srv.CSRFVerifier = csrfverifier.NewCSRFVerifier(allBaseURLs, useSecureCookies)
+ 	return nil
+ }
+ 
+ func (c *completedOptions) getAuthenticator(
+ 	baseURL *url.URL,
++	additionalBaseURLs []*url.URL,
+ 	k8sEndpoint *url.URL,
+ 	caCertFilePath string,
+ 	k8sClientConfig *rest.Config,
+@@ -273,13 +276,19 @@ func (c *completedOptions) getAuthenticator(
+ 	var (
+ 		err                      error
+ 		userAuthOIDCIssuerURL    *url.URL
+-		authLoginErrorEndpoint   = proxy.SingleJoiningSlash(baseURL.String(), server.AuthLoginErrorEndpoint)
+-		authLoginSuccessEndpoint = proxy.SingleJoiningSlash(baseURL.String(), server.AuthLoginSuccessEndpoint)
++		authLoginErrorEndpoint   = proxy.SingleJoiningSlash(baseURL.Path, server.AuthLoginErrorEndpoint)
++		authLoginSuccessEndpoint = proxy.SingleJoiningSlash(baseURL.Path, server.AuthLoginSuccessEndpoint)
+ 		oidcClientSecret         = c.ClientSecret
+ 		// Abstraction leak required by NewAuthenticator. We only want the browser to send the auth token for paths starting with basePath/api.
+ 		cookiePath = proxy.SingleJoiningSlash(baseURL.Path, "/api")
+ 	)
+ 
++	allowedRedirectHosts := make(map[string]bool, 1+len(additionalBaseURLs))
++	allowedRedirectHosts[baseURL.Host] = true
++	for _, u := range additionalBaseURLs {
++		allowedRedirectHosts[u.Host] = true
++	}
++
+ 	var scopes []string
+ 	authSource := oauth2.AuthSourceOIDC
+ 
+@@ -294,8 +303,6 @@ func (c *completedOptions) getAuthenticator(
+ 
+ 	}
+ 
+-	oidcClientSecret = c.ClientSecret
+-
+ 	// Config for logging into console.
+ 	oidcClientConfig := &oauth2.Config{
+ 		AuthSource:         authSource,
+@@ -320,8 +327,9 @@ func (c *completedOptions) getAuthenticator(
+ 		CookieEncryptionKey:     sessionConfig.CookieEncryptionKey,
+ 		CookieAuthenticationKey: sessionConfig.CookieAuthenticationKey,
+ 
+-		K8sConfig: k8sClientConfig,
+-		Metrics:   authMetrics,
++		K8sConfig:            k8sClientConfig,
++		Metrics:              authMetrics,
++		AllowedRedirectHosts: allowedRedirectHosts,
+ 	}
+ 
+ 	if c.LogoutRedirectURL != nil {
+diff --git a/cmd/bridge/main.go b/cmd/bridge/main.go
+index 3dba1447e23..ed50747d3a7 100644
+--- a/cmd/bridge/main.go
++++ b/cmd/bridge/main.go
+@@ -99,6 +99,7 @@ func main() {
+ 	fListen := fs.String("listen", "http://0.0.0.0:9000", "")
+ 
+ 	fBaseAddress := fs.String("base-address", "", "Format: <http | https>://domainOrIPAddress[:port]. Example: https://openshift.example.com.")
++	fAdditionalBaseAddresses := fs.String("additional-base-addresses", "", "Comma-separated additional console base URLs for multi-domain support.")
+ 	fBasePath := fs.String("base-path", "/", "")
+ 
+ 	// See https://github.com/openshift/service-serving-cert-signer
+@@ -206,6 +207,25 @@ func main() {
+ 	}
+ 	baseURL.Path = *fBasePath
+ 
++	var additionalBaseURLs []*url.URL
++	if *fAdditionalBaseAddresses != "" {
++		for _, addr := range strings.Split(*fAdditionalBaseAddresses, ",") {
++			addr = strings.TrimSpace(addr)
++			if addr == "" {
++				continue
++			}
++			u, err := url.Parse(addr)
++			if err != nil {
++				klog.Fatalf("invalid additional base address %q: %v", addr, err)
++			}
++			if u.Scheme == "" || u.Host == "" {
++				klog.Fatalf("additional base address %q must be an absolute URL with scheme and host", addr)
++			}
++			u.Path = *fBasePath
++			additionalBaseURLs = append(additionalBaseURLs, u)
++		}
++	}
++
+ 	documentationBaseURL := &url.URL{}
+ 	if *fDocumentationBaseURL != "" {
+ 		if !strings.HasSuffix(*fDocumentationBaseURL, "/") {
+@@ -325,6 +345,7 @@ func main() {
+ 	srv := &server.Server{
+ 		PublicDir:                    *fPublicDir,
+ 		BaseURL:                      baseURL,
++		AdditionalBaseURLs:           additionalBaseURLs,
+ 		Branding:                     branding,
+ 		CustomProductName:            *fCustomProductName,
+ 		CustomLogoFiles:              customLogoFlags,
+diff --git a/pkg/auth/csrfverifier/csfr_test.go b/pkg/auth/csrfverifier/csfr_test.go
+index 090d37c1164..e898bff60b7 100644
+--- a/pkg/auth/csrfverifier/csfr_test.go
++++ b/pkg/auth/csrfverifier/csfr_test.go
+@@ -14,7 +14,7 @@ func testReferer(t *testing.T, referer string, accept bool) {
+ 	refererURL, err := url.Parse(validReferer)
+ 	require.NoError(t, err)
+ 
+-	a := CSRFVerifier{refererURL: refererURL}
++	a := CSRFVerifier{refererURLs: []*url.URL{refererURL}}
+ 
+ 	r, err := http.NewRequest("POST", "/some-path", nil)
+ 
+@@ -62,6 +62,73 @@ func TestReferer(t *testing.T) {
+ 	testReferer(t, "https://google.com/asdf/", false)
+ }
+ 
++func TestRefererMultipleURLs(t *testing.T) {
++	primaryURL, err := url.Parse("https://console.example.com/")
++	require.NoError(t, err)
++	secondaryURL, err := url.Parse("https://console-alt.example.com/")
++	require.NoError(t, err)
++	thirdURL, err := url.Parse("https://console.internal.example.com:8443/")
++	require.NoError(t, err)
++
++	a := CSRFVerifier{refererURLs: []*url.URL{primaryURL, secondaryURL, thirdURL}}
++
++	tests := []struct {
++		name    string
++		referer string
++		accept  bool
++	}{
++		{"primary URL accepted", "https://console.example.com/", true},
++		{"primary URL with path accepted", "https://console.example.com/k8s/cluster/nodes", true},
++		{"secondary URL accepted", "https://console-alt.example.com/", true},
++		{"secondary URL with path accepted", "https://console-alt.example.com/dashboards", true},
++		{"third URL with port accepted", "https://console.internal.example.com:8443/", true},
++		{"third URL with port and path accepted", "https://console.internal.example.com:8443/overview", true},
++		{"unknown host rejected", "https://evil.example.com/", false},
++		{"wrong scheme rejected", "http://console.example.com/", false},
++		{"wrong port rejected", "https://console.example.com:9999/", false},
++		{"empty referer rejected", "", false},
++	}
++
++	for _, tt := range tests {
++		t.Run(tt.name, func(t *testing.T) {
++			r, err := http.NewRequest("POST", "/some-path", nil)
++			require.NoError(t, err)
++			if tt.referer != "" {
++				r.Header.Set("Referer", tt.referer)
++			}
++			err = a.verifySourceOrigin(r)
++			if tt.accept {
++				require.NoError(t, err, "expected referer %q to be accepted", tt.referer)
++			} else {
++				require.Error(t, err, "expected referer %q to be rejected", tt.referer)
++			}
++		})
++	}
++}
++
++func TestRefererOriginHeaderMultipleURLs(t *testing.T) {
++	primaryURL, err := url.Parse("https://console.example.com/")
++	require.NoError(t, err)
++	secondaryURL, err := url.Parse("https://console-alt.example.com/")
++	require.NoError(t, err)
++
++	a := CSRFVerifier{refererURLs: []*url.URL{primaryURL, secondaryURL}}
++
++	t.Run("Origin header for secondary URL accepted", func(t *testing.T) {
++		r, err := http.NewRequest("POST", "/some-path", nil)
++		require.NoError(t, err)
++		r.Header.Set("Origin", "https://console-alt.example.com")
++		require.NoError(t, a.verifySourceOrigin(r))
++	})
++
++	t.Run("Origin header for unknown URL rejected", func(t *testing.T) {
++		r, err := http.NewRequest("POST", "/some-path", nil)
++		require.NoError(t, err)
++		r.Header.Set("Origin", "https://evil.example.com")
++		require.Error(t, a.verifySourceOrigin(r))
++	})
++}
++
+ func testCSRF(t *testing.T, token string, cookie string, accept bool) {
+ 	a := CSRFVerifier{secureCookies: false}
+ 
+diff --git a/pkg/auth/csrfverifier/csrf.go b/pkg/auth/csrfverifier/csrf.go
+index 3e773aef394..888a85a8b41 100644
+--- a/pkg/auth/csrfverifier/csrf.go
++++ b/pkg/auth/csrfverifier/csrf.go
+@@ -17,14 +17,14 @@ const (
+ )
+ 
+ type CSRFVerifier struct {
+-	refererURL    *url.URL
++	refererURLs   []*url.URL
+ 	secureCookies bool
+ }
+ 
+-func NewCSRFVerifier(refererURL *url.URL, secureCookies bool) *CSRFVerifier {
++func NewCSRFVerifier(refererURLs []*url.URL, secureCookies bool) *CSRFVerifier {
+ 	return &CSRFVerifier{
+ 		secureCookies: secureCookies,
+-		refererURL:    refererURL,
++		refererURLs:   refererURLs,
+ 	}
+ }
+ 
+@@ -90,16 +90,17 @@ func (c *CSRFVerifier) verifySourceOrigin(r *http.Request) (err error) {
+ 		return err
+ 	}
+ 
+-	isValid := c.refererURL.Hostname() == u.Hostname() &&
+-		c.refererURL.Port() == u.Port() &&
+-		c.refererURL.Scheme == u.Scheme &&
+-		// The Origin header does not have a path
+-		(u.Path == "" || strings.HasPrefix(u.Path, c.refererURL.Path))
+-
+-	if !isValid {
+-		return fmt.Errorf("invalid Origin or Referer: %v expected `%v`", source, c.refererURL)
++	for _, refererURL := range c.refererURLs {
++		isValid := refererURL.Hostname() == u.Hostname() &&
++			refererURL.Port() == u.Port() &&
++			refererURL.Scheme == u.Scheme &&
++			// The Origin header does not have a path
++			(u.Path == "" || strings.HasPrefix(u.Path, refererURL.Path))
++		if isValid {
++			return nil
++		}
+ 	}
+-	return nil
++	return fmt.Errorf("invalid Origin or Referer: %v expected one of %v", source, c.refererURLs)
+ }
+ 
+ func (c *CSRFVerifier) verifyCSRFToken(r *http.Request) error {
+diff --git a/pkg/auth/oauth2/auth.go b/pkg/auth/oauth2/auth.go
+index 9294cbee155..dbd9c8c987d 100644
+--- a/pkg/auth/oauth2/auth.go
++++ b/pkg/auth/oauth2/auth.go
+@@ -66,6 +66,10 @@ type OAuth2Authenticator struct {
+ 
+ 	// Custom login command to display in the console
+ 	ocLoginCommand string
++
++	// allowedRedirectHosts maps host (or host:port) strings that are
++	// allowed for dynamic OAuth redirect_uri selection.
++	allowedRedirectHosts map[string]bool
+ }
+ 
+ // loginMethod is used to handle OAuth2 responses and associate bearer tokens
+@@ -130,6 +134,10 @@ type Config struct {
+ 
+ 	// Custom login command to display in the console
+ 	OCLoginCommand string
++
++	// AllowedRedirectHosts maps host (or host:port) strings that are allowed
++	// for dynamic OAuth redirect_uri rewriting (multi-domain console support).
++	AllowedRedirectHosts map[string]bool
+ }
+ 
+ type completedConfig struct {
+@@ -259,6 +267,24 @@ func (a *OAuth2Authenticator) oauth2ConfigConstructor(endpointConfig oauth2.Endp
+ 	return &baseOAuth2Config
+ }
+ 
++// oauth2ConfigForHost returns an oauth2.Config with the redirect URL rewritten
++// to use the given host, if that host is in the allowed set. Otherwise it
++// returns the default config with the original redirect URL.
++func (a *OAuth2Authenticator) oauth2ConfigForHost(host string) *oauth2.Config {
++	cfg := a.oauth2Config()
++	if host == "" || !a.allowedRedirectHosts[host] {
++		return cfg
++	}
++	u, err := url.Parse(a.redirectURL)
++	if err != nil {
++		klog.Errorf("failed to parse redirect URL %q: %v", a.redirectURL, err)
++		return cfg
++	}
++	u.Host = host
++	cfg.RedirectURL = u.String()
++	return cfg
++}
++
+ func newUnstartedAuthenticator(c *completedConfig) *OAuth2Authenticator {
+ 	return &OAuth2Authenticator{
+ 		clientFunc: c.clientFunc,
+@@ -267,13 +293,14 @@ func newUnstartedAuthenticator(c *completedConfig) *OAuth2Authenticator {
+ 		clientSecret: c.ClientSecret,
+ 		scopes:       c.Scope,
+ 
+-		redirectURL:    c.RedirectURL,
+-		errorURL:       c.ErrorURL,
+-		successURL:     c.SuccessURL,
+-		secureCookies:  c.SecureCookies,
+-		k8sConfig:      c.K8sConfig,
+-		metrics:        c.Metrics,
+-		ocLoginCommand: c.OCLoginCommand,
++		redirectURL:          c.RedirectURL,
++		errorURL:             c.ErrorURL,
++		successURL:           c.SuccessURL,
++		secureCookies:        c.SecureCookies,
++		k8sConfig:            c.K8sConfig,
++		metrics:              c.Metrics,
++		ocLoginCommand:       c.OCLoginCommand,
++		allowedRedirectHosts: c.AllowedRedirectHosts,
+ 	}
+ }
+ 
+@@ -298,7 +325,7 @@ func (a *OAuth2Authenticator) LoginFunc(w http.ResponseWriter, r *http.Request)
+ 		MaxAge:   300,
+ 	}
+ 	http.SetCookie(w, &cookie)
+-	http.Redirect(w, r, a.oauth2Config().AuthCodeURL(state), http.StatusSeeOther)
++	http.Redirect(w, r, a.oauth2ConfigForHost(r.Host).AuthCodeURL(state), http.StatusSeeOther)
+ }
+ 
+ // LogoutFunc cleans up session cookies.
+@@ -362,7 +389,7 @@ func (a *OAuth2Authenticator) CallbackFunc(fn func(loginInfo sessions.LoginJSON,
+ 		http.SetCookie(w, &http.Cookie{Name: cookieState.Name, Path: "/auth", MaxAge: -1})
+ 
+ 		ctx := oidc.ClientContext(r.Context(), a.clientFunc())
+-		oauthConfig := a.oauth2Config()
++		oauthConfig := a.oauth2ConfigForHost(r.Host)
+ 		token, err := oauthConfig.Exchange(ctx, code)
+ 		if err != nil {
+ 			klog.Errorf("unable to verify auth code with issuer: %v", err)
+diff --git a/pkg/auth/oauth2/auth_test.go b/pkg/auth/oauth2/auth_test.go
+index d88c3af7d6f..9c0318c007d 100644
+--- a/pkg/auth/oauth2/auth_test.go
++++ b/pkg/auth/oauth2/auth_test.go
+@@ -168,6 +168,159 @@ func TestRedirectAuthError(t *testing.T) {
+ 	}
+ }
+ 
++func TestOAuth2ConfigForHost(t *testing.T) {
++	p := &mockOIDCProvider{}
++	s := httptest.NewServer(http.HandlerFunc(p.handleDiscovery))
++	defer s.Close()
++	p.issuer = s.URL
++
++	ccfg := &Config{
++		ClientID:     "fake-client-id",
++		ClientSecret: "fake-secret",
++		Scope:        []string{"openid"},
++		RedirectURL:  "https://console.example.com/auth/callback",
++		IssuerURL:    p.issuer,
++		ErrorURL:     "/auth/error",
++		SuccessURL:   "/",
++		CookiePath:   "/api",
++		K8sConfig:    &rest.Config{},
++		AllowedRedirectHosts: map[string]bool{
++			"console.example.com":               true,
++			"console-alt.example.com":           true,
++			"console.internal.example.com:8443": true,
++		},
++	}
++
++	ctx, cancel := context.WithCancel(context.Background())
++	defer cancel()
++
++	a, err := NewOAuth2Authenticator(ctx, ccfg)
++	if err != nil {
++		t.Fatal(err)
++	}
++
++	tests := []struct {
++		name            string
++		host            string
++		wantRedirectURL string
++	}{
++		{
++			name:            "primary host returns original redirect URL",
++			host:            "console.example.com",
++			wantRedirectURL: "https://console.example.com/auth/callback",
++		},
++		{
++			name:            "secondary host rewrites redirect URL",
++			host:            "console-alt.example.com",
++			wantRedirectURL: "https://console-alt.example.com/auth/callback",
++		},
++		{
++			name:            "host with port rewrites redirect URL",
++			host:            "console.internal.example.com:8443",
++			wantRedirectURL: "https://console.internal.example.com:8443/auth/callback",
++		},
++		{
++			name:            "unknown host returns original redirect URL",
++			host:            "evil.example.com",
++			wantRedirectURL: "https://console.example.com/auth/callback",
++		},
++		{
++			name:            "empty host returns original redirect URL",
++			host:            "",
++			wantRedirectURL: "https://console.example.com/auth/callback",
++		},
++	}
++
++	for _, tt := range tests {
++		t.Run(tt.name, func(t *testing.T) {
++			cfg := a.oauth2ConfigForHost(tt.host)
++			if cfg.RedirectURL != tt.wantRedirectURL {
++				t.Errorf("oauth2ConfigForHost(%q).RedirectURL = %q, want %q",
++					tt.host, cfg.RedirectURL, tt.wantRedirectURL)
++			}
++		})
++	}
++}
++
++func TestOAuth2ConfigForHostNilAllowedHosts(t *testing.T) {
++	p := &mockOIDCProvider{}
++	s := httptest.NewServer(http.HandlerFunc(p.handleDiscovery))
++	defer s.Close()
++	p.issuer = s.URL
++
++	ccfg := &Config{
++		ClientID:     "fake-client-id",
++		ClientSecret: "fake-secret",
++		Scope:        []string{"openid"},
++		RedirectURL:  "https://console.example.com/auth/callback",
++		IssuerURL:    p.issuer,
++		ErrorURL:     "/auth/error",
++		SuccessURL:   "/",
++		CookiePath:   "/api",
++		K8sConfig:    &rest.Config{},
++	}
++
++	ctx, cancel := context.WithCancel(context.Background())
++	defer cancel()
++
++	a, err := NewOAuth2Authenticator(ctx, ccfg)
++	if err != nil {
++		t.Fatal(err)
++	}
++
++	cfg := a.oauth2ConfigForHost("anything.example.com")
++	if cfg.RedirectURL != "https://console.example.com/auth/callback" {
++		t.Errorf("expected original redirect URL, got %q", cfg.RedirectURL)
++	}
++}
++
++func TestLoginFuncUsesRequestHost(t *testing.T) {
++	p := &mockOIDCProvider{}
++	s := httptest.NewServer(http.HandlerFunc(p.handleDiscovery))
++	defer s.Close()
++	p.issuer = s.URL
++
++	ccfg := &Config{
++		ClientID:     "fake-client-id",
++		ClientSecret: "fake-secret",
++		Scope:        []string{"openid"},
++		RedirectURL:  "https://console.example.com/auth/callback",
++		IssuerURL:    p.issuer,
++		ErrorURL:     "/auth/error",
++		SuccessURL:   "/",
++		CookiePath:   "/api",
++		K8sConfig:    &rest.Config{},
++		AllowedRedirectHosts: map[string]bool{
++			"console.example.com":     true,
++			"console-alt.example.com": true,
++		},
++	}
++
++	ctx, cancel := context.WithCancel(context.Background())
++	defer cancel()
++
++	a, err := NewOAuth2Authenticator(ctx, ccfg)
++	if err != nil {
++		t.Fatal(err)
++	}
++
++	rr := httptest.NewRecorder()
++	req := httptest.NewRequest("GET", "https://console-alt.example.com/", nil)
++
++	a.LoginFunc(rr, req)
++
++	loc := rr.Header().Get("Location")
++	u, err := url.Parse(loc)
++	if err != nil {
++		t.Fatalf("failed to parse location header: %v", err)
++	}
++
++	redirectURI := u.Query().Get("redirect_uri")
++	if redirectURI != "https://console-alt.example.com/auth/callback" {
++		t.Errorf("LoginFunc redirect_uri = %q, want %q", redirectURI, "https://console-alt.example.com/auth/callback")
++	}
++}
++
+ func makeAuthenticator() (*OAuth2Authenticator, error) {
+ 	errURL := "https://example.com/error"
+ 	sucURL := "https://example.com/success"
+diff --git a/pkg/server/server.go b/pkg/server/server.go
+index 287de230d65..0b3fd669a6c 100644
+--- a/pkg/server/server.go
++++ b/pkg/server/server.go
+@@ -160,6 +160,7 @@ type Server struct {
+ 	Authenticator                       auth.Authenticator
+ 	AuthMetrics                         *auth.Metrics
+ 	BaseURL                             *url.URL
++	AdditionalBaseURLs                  []*url.URL
+ 	Branding                            string
+ 	Capabilities                        []operatorv1.Capability
+ 	CatalogdProxyConfig                 *proxy.Config
+@@ -776,9 +777,9 @@ func (s *Server) indexHandler(w http.ResponseWriter, r *http.Request) {
+ 		KubeAdminLogoutURL:        s.Authenticator.GetSpecialURLs().KubeAdminLogout,
+ 		KubeAPIServerURL:          s.KubeAPIServerURL,
+ 		LoadTestFactor:            s.LoadTestFactor,
+-		LoginErrorURL:             proxy.SingleJoiningSlash(s.BaseURL.String(), AuthLoginErrorEndpoint),
+-		LoginSuccessURL:           proxy.SingleJoiningSlash(s.BaseURL.String(), AuthLoginSuccessEndpoint),
+-		LoginURL:                  proxy.SingleJoiningSlash(s.BaseURL.String(), authLoginEndpoint),
++		LoginErrorURL:             proxy.SingleJoiningSlash(s.BaseURL.Path, AuthLoginErrorEndpoint),
++		LoginSuccessURL:           proxy.SingleJoiningSlash(s.BaseURL.Path, AuthLoginSuccessEndpoint),
++		LoginURL:                  proxy.SingleJoiningSlash(s.BaseURL.Path, authLoginEndpoint),
+ 		LogoutRedirect:            s.Authenticator.LogoutRedirectURL(),
+ 		LogoutURL:                 authLogoutEndpoint,
+ 		NodeArchitectures:         s.NodeArchitectures,
+diff --git a/pkg/serverconfig/config.go b/pkg/serverconfig/config.go
+index 3f25b9338d9..ca3a2abf741 100644
+--- a/pkg/serverconfig/config.go
++++ b/pkg/serverconfig/config.go
+@@ -260,6 +260,10 @@ func addClusterInfo(fs *flag.FlagSet, clusterInfo *ClusterInfo) {
+ 		fs.Set("base-address", clusterInfo.ConsoleBaseAddress)
+ 	}
+ 
++	if len(clusterInfo.AdditionalConsoleBaseAddresses) > 0 {
++		fs.Set("additional-base-addresses", strings.Join(clusterInfo.AdditionalConsoleBaseAddresses, ","))
++	}
++
+ 	if clusterInfo.ConsoleBasePath != "" {
+ 		fs.Set("base-path", clusterInfo.ConsoleBasePath)
+ 	}
+diff --git a/pkg/serverconfig/config_test.go b/pkg/serverconfig/config_test.go
+index 534871942eb..30beea90012 100644
+--- a/pkg/serverconfig/config_test.go
++++ b/pkg/serverconfig/config_test.go
+@@ -291,6 +291,25 @@ func TestSetFlagsFromConfig(t *testing.T) {
+ 			},
+ 			expectedError: nil,
+ 		},
++		{
++			name: "Should apply additional console base addresses",
++			config: Config{
++				APIVersion: "console.openshift.io/v1",
++				Kind:       "ConsoleConfig",
++				ClusterInfo: ClusterInfo{
++					ConsoleBaseAddress: "https://console.example.com",
++					AdditionalConsoleBaseAddresses: []string{
++						"https://console-alt.example.com",
++						"https://console.internal.example.com:8443",
++					},
++				},
++			},
++			expectedFlagValues: map[string]string{
++				"base-address":              "https://console.example.com",
++				"additional-base-addresses": "https://console-alt.example.com,https://console.internal.example.com:8443",
++			},
++			expectedError: nil,
++		},
+ 		{
+ 			name: "Applies OLM lifecycle metadata when enabled",
+ 			config: Config{
+@@ -325,6 +344,8 @@ func TestSetFlagsFromConfig(t *testing.T) {
+ 		t.Run(test.name, func(t *testing.T) {
+ 			fs := &flag.FlagSet{}
+ 			fs.String("config", "", "")
++			fs.String("base-address", "", "")
++			fs.String("additional-base-addresses", "", "")
+ 			fs.Var(&MultiKeyValue{}, "plugins", "")
+ 			fs.Var(&MultiKeyValue{}, "telemetry", "")
+ 			fs.Var(&MultiKeyValue{}, "content-security-policy", "")
+diff --git a/pkg/serverconfig/types.go b/pkg/serverconfig/types.go
+index 2d62cd70e2f..2fa2ca9ae6d 100644
+--- a/pkg/serverconfig/types.go
++++ b/pkg/serverconfig/types.go
+@@ -72,16 +72,17 @@ type MonitoringInfo struct {
+ 
+ // ClusterInfo holds information the about the cluster such as master public URL and console public URL.
+ type ClusterInfo struct {
+-	ConsoleBaseAddress          string                `yaml:"consoleBaseAddress,omitempty"`
+-	ConsoleBasePath             string                `yaml:"consoleBasePath,omitempty"`
+-	MasterPublicURL             string                `yaml:"masterPublicURL,omitempty"`
+-	ControlPlaneTopology        configv1.TopologyMode `yaml:"controlPlaneTopology,omitempty"`
+-	ReleaseVersion              string                `yaml:"releaseVersion,omitempty"`
+-	NodeArchitectures           []string              `yaml:"nodeArchitectures,omitempty"`
+-	NodeOperatingSystems        []string              `yaml:"nodeOperatingSystems,omitempty"`
+-	CopiedCSVsDisabled          bool                  `yaml:"copiedCSVsDisabled,omitempty"`
+-	TechPreviewEnabled          bool                  `yaml:"techPreviewEnabled,omitempty"`
+-	OLMLifecycleMetadataEnabled bool                  `yaml:"olmLifecycleMetadataEnabled,omitempty"`
++	ConsoleBaseAddress             string                `yaml:"consoleBaseAddress,omitempty"`
++	AdditionalConsoleBaseAddresses []string              `yaml:"additionalConsoleBaseAddresses,omitempty"`
++	ConsoleBasePath                string                `yaml:"consoleBasePath,omitempty"`
++	MasterPublicURL                string                `yaml:"masterPublicURL,omitempty"`
++	ControlPlaneTopology           configv1.TopologyMode `yaml:"controlPlaneTopology,omitempty"`
++	ReleaseVersion                 string                `yaml:"releaseVersion,omitempty"`
++	NodeArchitectures              []string              `yaml:"nodeArchitectures,omitempty"`
++	NodeOperatingSystems           []string              `yaml:"nodeOperatingSystems,omitempty"`
++	CopiedCSVsDisabled             bool                  `yaml:"copiedCSVsDisabled,omitempty"`
++	TechPreviewEnabled             bool                  `yaml:"techPreviewEnabled,omitempty"`
++	OLMLifecycleMetadataEnabled    bool                  `yaml:"olmLifecycleMetadataEnabled,omitempty"`
+ }
+ 
+ // Auth holds configuration for authenticating with OpenShift. The auth method is assumed to be "openshift".

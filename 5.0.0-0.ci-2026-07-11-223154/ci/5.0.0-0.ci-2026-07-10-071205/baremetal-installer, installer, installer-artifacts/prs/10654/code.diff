@@ -1,0 +1,241 @@
+diff --git a/pkg/infrastructure/azure/azure.go b/pkg/infrastructure/azure/azure.go
+index 4d3995fda4d..fd1b203533a 100644
+--- a/pkg/infrastructure/azure/azure.go
++++ b/pkg/infrastructure/azure/azure.go
+@@ -51,6 +51,17 @@ const (
+ 	stackDNSAPIVersion = "2018-05-01"
+ )
+ 
++// rhcosImageInfo holds the RHCos image information extracted from stream metadata.
++type rhcosImageInfo struct {
++	ImageURL                    string
++	ImageLength                 int64
++	GalleryName                 string
++	GalleryImageName            string
++	GalleryImageVersionName     string
++	GalleryGen2ImageName        string
++	GalleryGen2ImageVersionName string
++}
++
+ // Provider implements Azure CAPI installation.
+ type Provider struct {
+ 	ResourceGroupName     string
+@@ -97,6 +108,53 @@ func (p Provider) ProvisionTimeout() time.Duration {
+ // in the status and should use the API load balancer when gathering bootstrap log bundles.
+ func (*Provider) PublicGatherEndpoint() clusterapi.GatherEndpoint { return clusterapi.APILoadBalancer }
+ 
++// getRHCOSImageInfo fetches the RHCOS stream metadata and computes Azure-specific
++// image information including gallery names, image URL, and validates image alignment.
++func getRHCOSImageInfo(ctx context.Context, installConfig *types.InstallConfig, infraID string) (*rhcosImageInfo, error) {
++	stream, err := rhcos.FetchCoreOSBuild(ctx, installConfig.OSImageStream)
++	if err != nil {
++		return nil, fmt.Errorf("failed to get rhcos stream: %w", err)
++	}
++
++	archName := arch.RpmArch(string(installConfig.ControlPlane.Architecture))
++	streamArch, err := stream.GetArchitecture(archName)
++	if err != nil {
++		return nil, fmt.Errorf("failed to get rhcos architecture: %w", err)
++	}
++
++	azureDisk := streamArch.RHELCoreOSExtensions.AzureDisk
++	imageURL := azureDisk.URL
++
++	rawImageVersion := strings.ReplaceAll(azureDisk.Release, "-", "_")
++	imageVersion := rawImageVersion[:len(rawImageVersion)-6]
++
++	galleryName := fmt.Sprintf("gallery_%s", strings.ReplaceAll(infraID, "-", "_"))
++	galleryImageName := infraID
++	galleryImageVersionName := imageVersion
++	galleryGen2ImageName := fmt.Sprintf("%s-gen2", infraID)
++	galleryGen2ImageVersionName := imageVersion
++
++	headResponse, err := http.Head(imageURL) // nolint:gosec
++	if err != nil {
++		return nil, fmt.Errorf("failed HEAD request for image URL %s: %w", imageURL, err)
++	}
++
++	imageLength := headResponse.ContentLength
++	if imageLength%512 != 0 {
++		return nil, fmt.Errorf("image length is not aligned on a 512 byte boundary")
++	}
++
++	return &rhcosImageInfo{
++		ImageURL:                    imageURL,
++		ImageLength:                 imageLength,
++		GalleryName:                 galleryName,
++		GalleryImageName:            galleryImageName,
++		GalleryImageVersionName:     galleryImageVersionName,
++		GalleryGen2ImageName:        galleryGen2ImageName,
++		GalleryGen2ImageVersionName: galleryGen2ImageVersionName,
++	}, nil
++}
++
+ // InfraReady is called once the installer infrastructure is ready.
+ func (p *Provider) InfraReady(ctx context.Context, in clusterapi.InfraReadyInput) error {
+ 	session, err := in.InstallConfig.Azure.Session()
+@@ -188,43 +246,16 @@ func (p *Provider) InfraReady(ctx context.Context, in clusterapi.InfraReadyInput
+ 		architecture = armcompute.ArchitectureX64
+ 	}
+ 
++	// Get information regarding the RHCOS Image Stream
++	imageInfo, err := getRHCOSImageInfo(ctx, installConfig, in.InfraID)
++	if err != nil {
++		return err
++	}
+ 	resourceGroupName := p.ResourceGroupName
+ 	storageAccountName := aztypes.GetStorageAccountName(in.InfraID)
+ 	containerName := "vhd"
+ 	blobName := fmt.Sprintf("rhcos%s.vhd", randomString(5))
+ 
+-	stream, err := rhcos.FetchCoreOSBuild(ctx, in.InstallConfig.Config.OSImageStream)
+-	if err != nil {
+-		return fmt.Errorf("failed to get rhcos stream: %w", err)
+-	}
+-	archName := arch.RpmArch(string(installConfig.ControlPlane.Architecture))
+-	streamArch, err := stream.GetArchitecture(archName)
+-	if err != nil {
+-		return fmt.Errorf("failed to get rhcos architecture: %w", err)
+-	}
+-
+-	azureDisk := streamArch.RHELCoreOSExtensions.AzureDisk
+-	imageURL := azureDisk.URL
+-
+-	rawImageVersion := strings.ReplaceAll(azureDisk.Release, "-", "_")
+-	imageVersion := rawImageVersion[:len(rawImageVersion)-6]
+-
+-	galleryName := fmt.Sprintf("gallery_%s", strings.ReplaceAll(in.InfraID, "-", "_"))
+-	galleryImageName := in.InfraID
+-	galleryImageVersionName := imageVersion
+-	galleryGen2ImageName := fmt.Sprintf("%s-gen2", in.InfraID)
+-	galleryGen2ImageVersionName := imageVersion
+-
+-	headResponse, err := http.Head(imageURL) // nolint:gosec
+-	if err != nil {
+-		return fmt.Errorf("failed HEAD request for image URL %s: %w", imageURL, err)
+-	}
+-
+-	imageLength := headResponse.ContentLength
+-	if imageLength%512 != 0 {
+-		return fmt.Errorf("image length is not aligned on a 512 byte boundary")
+-	}
+-
+ 	storageURL := fmt.Sprintf("https://%s.blob.%s", storageAccountName, session.Environment.StorageEndpointSuffix)
+ 	blobURL := fmt.Sprintf("%s/%s/%s", storageURL, containerName, blobName)
+ 
+@@ -286,8 +317,8 @@ func (p *Provider) InfraReady(ctx context.Context, in clusterapi.InfraReadyInput
+ 		_, err = CreatePageBlob(ctx, &CreatePageBlobInput{
+ 			StorageURL:           storageURL,
+ 			BlobURL:              blobURL,
+-			ImageURL:             imageURL,
+-			ImageLength:          imageLength,
++			ImageURL:             imageInfo.ImageURL,
++			ImageLength:          imageInfo.ImageLength,
+ 			CloudEnvironment:     in.InstallConfig.Azure.CloudName,
+ 			AllowSharedKeyAccess: sharedKey,
+ 			TokenCredential:      session.TokenCreds,
+@@ -303,7 +334,7 @@ func (p *Provider) InfraReady(ctx context.Context, in clusterapi.InfraReadyInput
+ 		createImageGalleryOutput, err := CreateImageGallery(ctx, &CreateImageGalleryInput{
+ 			SubscriptionID:    subscriptionID,
+ 			ResourceGroupName: resourceGroupName,
+-			GalleryName:       galleryName,
++			GalleryName:       imageInfo.GalleryName,
+ 			Region:            platform.Region,
+ 			Tags:              tags,
+ 			TokenCredential:   p.TokenCredential,
+@@ -318,8 +349,8 @@ func (p *Provider) InfraReady(ctx context.Context, in clusterapi.InfraReadyInput
+ 		// Create gallery images
+ 		_, err = CreateGalleryImage(ctx, &CreateGalleryImageInput{
+ 			ResourceGroupName:    resourceGroupName,
+-			GalleryName:          galleryName,
+-			GalleryImageName:     galleryImageName,
++			GalleryName:          imageInfo.GalleryName,
++			GalleryImageName:     imageInfo.GalleryImageName,
+ 			Region:               platform.Region,
+ 			Publisher:            "RedHat",
+ 			Offer:                "rhcos",
+@@ -344,8 +375,8 @@ func (p *Provider) InfraReady(ctx context.Context, in clusterapi.InfraReadyInput
+ 
+ 		_, err = CreateGalleryImage(ctx, &CreateGalleryImageInput{
+ 			ResourceGroupName:    resourceGroupName,
+-			GalleryName:          galleryName,
+-			GalleryImageName:     galleryGen2ImageName,
++			GalleryName:          imageInfo.GalleryName,
++			GalleryImageName:     imageInfo.GalleryGen2ImageName,
+ 			Region:               platform.Region,
+ 			Publisher:            "RedHat-gen2",
+ 			Offer:                "rhcos-gen2",
+@@ -368,9 +399,9 @@ func (p *Provider) InfraReady(ctx context.Context, in clusterapi.InfraReadyInput
+ 		_, err = CreateGalleryImageVersion(ctx, &CreateGalleryImageVersionInput{
+ 			ResourceGroupName:       resourceGroupName,
+ 			StorageAccountID:        *storageAccount.ID,
+-			GalleryName:             galleryName,
+-			GalleryImageName:        galleryImageName,
+-			GalleryImageVersionName: galleryImageVersionName,
++			GalleryName:             imageInfo.GalleryName,
++			GalleryImageName:        imageInfo.GalleryImageName,
++			GalleryImageVersionName: imageInfo.GalleryImageVersionName,
+ 			Region:                  platform.Region,
+ 			BlobURL:                 blobURL,
+ 			RegionalReplicaCount:    int32(1),
+@@ -383,9 +414,9 @@ func (p *Provider) InfraReady(ctx context.Context, in clusterapi.InfraReadyInput
+ 		_, err = CreateGalleryImageVersion(ctx, &CreateGalleryImageVersionInput{
+ 			ResourceGroupName:       resourceGroupName,
+ 			StorageAccountID:        *storageAccount.ID,
+-			GalleryName:             galleryName,
+-			GalleryImageName:        galleryGen2ImageName,
+-			GalleryImageVersionName: galleryGen2ImageVersionName,
++			GalleryName:             imageInfo.GalleryName,
++			GalleryImageName:        imageInfo.GalleryGen2ImageName,
++			GalleryImageVersionName: imageInfo.GalleryGen2ImageVersionName,
+ 			Region:                  platform.Region,
+ 			BlobURL:                 blobURL,
+ 			RegionalReplicaCount:    int32(1),
+diff --git a/pkg/types/validation/installconfig.go b/pkg/types/validation/installconfig.go
+index a43e29711b1..841e8a5c322 100644
+--- a/pkg/types/validation/installconfig.go
++++ b/pkg/types/validation/installconfig.go
+@@ -133,7 +133,7 @@ func ValidateInstallConfig(c *types.InstallConfig, usingAgentMethod bool) field.
+ 	}
+ 	if c.Networking != nil {
+ 		allErrs = append(allErrs, validateNetworking(c.Networking, field.NewPath("networking"))...)
+-		allErrs = append(allErrs, validateNetworkingIPVersion(c.Networking, &c.Platform)...)
++		allErrs = append(allErrs, validateNetworkingIPVersion(c)...)
+ 		allErrs = append(allErrs, validateNetworkingClusterNetworkMTU(c, field.NewPath("networking", "clusterNetworkMTU"))...)
+ 		allErrs = append(allErrs, validateVIPsForPlatform(c.Networking, &c.Platform, usingAgentMethod, field.NewPath("platform"))...)
+ 		allErrs = append(allErrs, validateOVNKubernetesConfig(c.Networking, field.NewPath("networking"))...)
+@@ -365,9 +365,12 @@ func ipnetworksToStrings(networks []ipnet.IPNet) []string {
+ 
+ // validateNetworkingIPVersion checks parameters for consistency when the user
+ // requests single-stack IPv6 or dual-stack modes.
+-func validateNetworkingIPVersion(n *types.Networking, p *types.Platform) field.ErrorList {
++func validateNetworkingIPVersion(c *types.InstallConfig) field.ErrorList {
+ 	var allErrs field.ErrorList
+ 
++	n := c.Networking
++	p := &c.Platform
++
+ 	hasIPv4, hasIPv6, presence, addresses := inferIPVersionFromInstallConfig(n)
+ 
+ 	switch {
+@@ -377,10 +380,17 @@ func validateNetworkingIPVersion(n *types.Networking, p *types.Platform) field.E
+ 		}
+ 
+ 		allowV6Primary := false
+-		experimentalDualStackEnabled, _ := strconv.ParseBool(os.Getenv("OPENSHIFT_INSTALL_EXPERIMENTAL_DUAL_STACK"))
+ 		switch {
+-		case p.Azure != nil && experimentalDualStackEnabled:
+-			logrus.Warnf("Using experimental Azure dual-stack support")
++		case p.Azure != nil:
++			logrus.Info("Dual Stack support on Azure is still in Dev Preview")
++			// Dualstack is only allowed if platform.azure.ipFamily is set to dual-stack variants
++			if ipFamily := p.Azure.IPFamily; ipFamily.DualStackEnabled() {
++				if ipFamily == network.DualStackIPv6Primary {
++					allowV6Primary = true
++				}
++				break
++			}
++			allErrs = append(allErrs, field.Invalid(field.NewPath("networking"), "DualStack", fmt.Sprintf("dual-stack IPv4/IPv6 can only be specified when platform.azure.ipFamily is %s or %s", network.DualStackIPv4Primary, network.DualStackIPv6Primary)))
+ 		case p.BareMetal != nil:
+ 			// We now support ipv6-primary dual stack on baremetal
+ 			allowV6Primary = true

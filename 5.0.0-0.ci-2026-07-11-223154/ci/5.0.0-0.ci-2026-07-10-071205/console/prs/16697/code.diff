@@ -1,0 +1,536 @@
+diff --git a/frontend/packages/console-app/src/components/nodes/NodeWorkload.tsx b/frontend/packages/console-app/src/components/nodes/NodeWorkload.tsx
+index ccf72a51a74..d57f35550f0 100644
+--- a/frontend/packages/console-app/src/components/nodes/NodeWorkload.tsx
++++ b/frontend/packages/console-app/src/components/nodes/NodeWorkload.tsx
+@@ -4,7 +4,7 @@ import { PodsPage } from '@console/internal/components/pod-list';
+ import type { PageComponentProps } from '@console/internal/components/utils';
+ import { NodeSubNavPage } from './NodeSubNavPage';
+ 
+-const WORKLOAD_PAGE_ID = 'workload';
++export const WORKLOAD_PAGE_ID = 'workload';
+ 
+ const NodePodsPage: FC<PageComponentProps<NodeKind>> = ({ obj }) => (
+   <PodsPage
+diff --git a/frontend/packages/console-app/src/components/nodes/NodesPage.tsx b/frontend/packages/console-app/src/components/nodes/NodesPage.tsx
+index f01df5ac689..ed5d9003ed5 100644
+--- a/frontend/packages/console-app/src/components/nodes/NodesPage.tsx
++++ b/frontend/packages/console-app/src/components/nodes/NodesPage.tsx
+@@ -23,7 +23,6 @@ import type {
+ } from '@console/app/src/components/data-view/types';
+ import { useDataViewSelection } from '@console/app/src/components/data-view/useDataViewSelection';
+ import { useColumnWidthSettings } from '@console/app/src/components/data-view/useResizableColumnProps';
+-import NodeGroupEditButton from '@console/app/src/components/nodes/NodeGroupEditButton';
+ import { FLAG_NODE_MGMT_V1 } from '@console/app/src/consts';
+ import type { K8sModel } from '@console/dynamic-plugin-sdk/src/api/core-api';
+ import {
+@@ -100,6 +99,7 @@ import { nodeStatus } from '../../status/node';
+ import { useIsKubevirtPluginActive } from '../../utils/kubevirt';
+ import { getNodeClientCSRs, isCSRResource } from './csr';
+ import NodeUptime from './node-dashboard/NodeUptime';
++import NodeGroupEditButton from './NodeGroupEditButton';
+ import NodeRoles from './NodeRoles';
+ import { NodeStatusWithExtensions } from './NodeStatus';
+ import ClientCSRStatus from './status/CSRStatus';
+diff --git a/frontend/packages/console-app/src/components/nodes/node-dashboard/InventoryCard.tsx b/frontend/packages/console-app/src/components/nodes/node-dashboard/InventoryCard.tsx
+index a84c1304294..e8370fd4e85 100644
+--- a/frontend/packages/console-app/src/components/nodes/node-dashboard/InventoryCard.tsx
++++ b/frontend/packages/console-app/src/components/nodes/node-dashboard/InventoryCard.tsx
+@@ -3,8 +3,10 @@ import { useMemo, useContext } from 'react';
+ import { useResolvedExtensions } from '@openshift/dynamic-plugin-sdk';
+ import { Card, CardBody, CardHeader, CardTitle, Stack, StackItem } from '@patternfly/react-core';
+ import { useTranslation } from 'react-i18next';
++import { FLAG_NODE_MGMT_V1 } from '@console/app/src/consts';
+ import type { NodeInventoryExtensionItem } from '@console/dynamic-plugin-sdk/src/extensions/node';
+ import { isNodeInventoryItem } from '@console/dynamic-plugin-sdk/src/extensions/node';
++import { useFlag } from '@console/dynamic-plugin-sdk/src/utils/flags';
+ import { useK8sWatchResource } from '@console/internal/components/utils/k8s-watch-hook';
+ import { resourcePathFromModel } from '@console/internal/components/utils/resource-link';
+ import { PodModel, NodeModel } from '@console/internal/models';
+@@ -15,10 +17,12 @@ import {
+ } from '@console/shared/src/components/dashboard/inventory-card/InventoryItem';
+ import { getPodStatusGroups } from '@console/shared/src/components/dashboard/inventory-card/utils';
+ import { getName } from '@console/shared/src/selectors/common';
++import { WORKLOAD_PAGE_ID } from '../NodeWorkload';
+ import { NodeDashboardContext } from './NodeDashboardContext';
+ 
+ const NodePodInventoryItem: ComponentType<{ obj: NodeKind }> = ({ obj }) => {
+   const nodeName = getName(obj);
++  const nodeMgmtV1Enabled = useFlag(FLAG_NODE_MGMT_V1);
+ 
+   const podResource = useMemo(
+     () =>
+@@ -38,7 +42,9 @@ const NodePodInventoryItem: ComponentType<{ obj: NodeKind }> = ({ obj }) => {
+     return <InventoryItem title={PodModel.label} count={0} isLoading={!podsLoaded} />;
+   }
+ 
+-  const basePath = `${resourcePathFromModel(NodeModel, nodeName)}/pods`;
++  const basePath = nodeMgmtV1Enabled
++    ? `${resourcePathFromModel(NodeModel, nodeName)}/${WORKLOAD_PAGE_ID}/pods`
++    : `${resourcePathFromModel(NodeModel, nodeName)}/pods`;
+ 
+   return (
+     <StackItem>
+diff --git a/frontend/packages/console-app/src/components/nodes/node-dashboard/NodeDashboard.tsx b/frontend/packages/console-app/src/components/nodes/node-dashboard/NodeDashboard.tsx
+index e3ca7d7f10a..309a396ef91 100644
+--- a/frontend/packages/console-app/src/components/nodes/node-dashboard/NodeDashboard.tsx
++++ b/frontend/packages/console-app/src/components/nodes/node-dashboard/NodeDashboard.tsx
+@@ -1,6 +1,8 @@
+ import type { FC } from 'react';
+-import { useReducer, useCallback, useEffect } from 'react';
++import { useMemo, useReducer, useCallback, useEffect } from 'react';
+ import * as _ from 'lodash';
++import { FLAG_NODE_MGMT_V1 } from '@console/app/src/consts';
++import { useFlag } from '@console/dynamic-plugin-sdk/src/utils/flags';
+ import type { NodeKind } from '@console/internal/module/k8s';
+ import Dashboard from '@console/shared/src/components/dashboard/Dashboard';
+ import DashboardGrid from '@console/shared/src/components/dashboard/DashboardGrid';
+@@ -75,6 +77,7 @@ const reducer = (state: NodeDashboardState, action: NodeDashboardAction) => {
+ };
+ 
+ const NodeDashboard: FC<NodeDashboardProps> = ({ obj }) => {
++  const nodeMgmtV1Enabled = useFlag(FLAG_NODE_MGMT_V1);
+   const [state, dispatch] = useReducer(reducer, initialState(obj));
+ 
+   useEffect(() => {
+@@ -94,20 +97,35 @@ const NodeDashboard: FC<NodeDashboardProps> = ({ obj }) => {
+     [],
+   );
+ 
+-  const context = {
+-    obj,
+-    cpuLimit: state.cpuLimit,
+-    memoryLimit: state.memoryLimit,
+-    healthCheck: state.healthCheck,
+-    setCPULimit,
+-    setMemoryLimit,
+-    setHealthCheck,
+-  };
++  const context = useMemo(
++    () => ({
++      obj,
++      cpuLimit: state.cpuLimit,
++      memoryLimit: state.memoryLimit,
++      healthCheck: state.healthCheck,
++      setCPULimit,
++      setMemoryLimit,
++      setHealthCheck,
++    }),
++    [
++      obj,
++      setCPULimit,
++      setHealthCheck,
++      setMemoryLimit,
++      state.cpuLimit,
++      state.healthCheck,
++      state.memoryLimit,
++    ],
++  );
+ 
+   return (
+     <NodeDashboardContext.Provider value={context}>
+       <Dashboard>
+-        <DashboardGrid mainCards={mainCards} leftCards={leftCards} rightCards={rightCards} />
++        <DashboardGrid
++          mainCards={mainCards}
++          leftCards={leftCards}
++          rightCards={nodeMgmtV1Enabled ? undefined : rightCards}
++        />
+       </Dashboard>
+     </NodeDashboardContext.Provider>
+   );
+diff --git a/frontend/packages/console-app/src/components/nodes/node-dashboard/__tests__/InventoryCard.spec.tsx b/frontend/packages/console-app/src/components/nodes/node-dashboard/__tests__/InventoryCard.spec.tsx
+index 286a9eaa5c2..fe378d0a7fc 100644
+--- a/frontend/packages/console-app/src/components/nodes/node-dashboard/__tests__/InventoryCard.spec.tsx
++++ b/frontend/packages/console-app/src/components/nodes/node-dashboard/__tests__/InventoryCard.spec.tsx
+@@ -1,5 +1,6 @@
+ import { useResolvedExtensions } from '@openshift/dynamic-plugin-sdk';
+ import { render, screen } from '@testing-library/react';
++import { useFlag } from '@console/dynamic-plugin-sdk/src/utils/flags';
+ import { useK8sWatchResource } from '@console/internal/components/utils/k8s-watch-hook';
+ import type { NodeKind } from '@console/internal/module/k8s';
+ import InventoryCard from '../InventoryCard';
+@@ -10,15 +11,24 @@ jest.mock('@openshift/dynamic-plugin-sdk', () => ({
+   useResolvedExtensions: jest.fn(),
+ }));
+ 
++jest.mock('@console/dynamic-plugin-sdk/src/utils/flags', () => ({
++  useFlag: jest.fn(() => false),
++}));
++
+ jest.mock('@console/internal/components/utils/k8s-watch-hook', () => ({
+   useK8sWatchResource: jest.fn(),
+ }));
+ 
++const mockResourceInventoryItem = jest.fn();
++
+ jest.mock('@console/shared/src/components/dashboard/inventory-card/InventoryItem', () => ({
+   InventoryItem: ({ title, count }: { title: string; count?: number }) => (
+     <div data-test-inventory-item={`${title}:${count ?? 0}`}>{`${title}: ${count ?? 0}`}</div>
+   ),
+-  ResourceInventoryItem: () => <div data-test-inventory-item="pods">Pod Inventory</div>,
++  ResourceInventoryItem: (props: { basePath: string }) => {
++    mockResourceInventoryItem(props);
++    return <div data-test-inventory-item="pods">Pod Inventory</div>;
++  },
+ }));
+ 
+ const MockExtensionInventoryItem = jest.fn(() => (
+@@ -27,6 +37,7 @@ const MockExtensionInventoryItem = jest.fn(() => (
+ 
+ const useResolvedExtensionsMock = useResolvedExtensions as jest.Mock;
+ const useK8sWatchResourceMock = useK8sWatchResource as jest.Mock;
++const useFlagMock = useFlag as jest.Mock;
+ 
+ describe('InventoryCard', () => {
+   const mockNode: NodeKind = {
+@@ -59,6 +70,7 @@ describe('InventoryCard', () => {
+ 
+   beforeEach(() => {
+     jest.clearAllMocks();
++    useFlagMock.mockReturnValue(false);
+     useResolvedExtensionsMock.mockReturnValue([[], true]);
+     useK8sWatchResourceMock.mockReturnValue([[], true, undefined]);
+   });
+@@ -126,6 +138,30 @@ describe('InventoryCard', () => {
+     expect(screen.getByText('Extension Inventory Item')).toBeVisible();
+   });
+ 
++  it('should use legacy pods path when FLAG_NODE_MGMT_V1 is disabled', () => {
++    useFlagMock.mockReturnValue(false);
++
++    renderWithContext();
++
++    expect(mockResourceInventoryItem).toHaveBeenCalledWith(
++      expect.objectContaining({
++        basePath: '/k8s/cluster/nodes/test-node/pods',
++      }),
++    );
++  });
++
++  it('should use workload pods path when FLAG_NODE_MGMT_V1 is enabled', () => {
++    useFlagMock.mockReturnValue(true);
++
++    renderWithContext();
++
++    expect(mockResourceInventoryItem).toHaveBeenCalledWith(
++      expect.objectContaining({
++        basePath: '/k8s/cluster/nodes/test-node/workload/pods',
++      }),
++    );
++  });
++
+   it('should sort inventory items by priority from highest to lowest', () => {
+     useResolvedExtensionsMock.mockReturnValue([
+       [
+diff --git a/frontend/packages/console-app/src/components/nodes/node-dashboard/__tests__/NodeDashboard.spec.tsx b/frontend/packages/console-app/src/components/nodes/node-dashboard/__tests__/NodeDashboard.spec.tsx
+new file mode 100644
+index 00000000000..1f8445cd716
+--- /dev/null
++++ b/frontend/packages/console-app/src/components/nodes/node-dashboard/__tests__/NodeDashboard.spec.tsx
+@@ -0,0 +1,113 @@
++import { render } from '@testing-library/react';
++import * as flagsModule from '@console/dynamic-plugin-sdk/src/utils/flags';
++import type { NodeKind } from '@console/internal/module/k8s';
++import * as DashboardGridModule from '@console/shared/src/components/dashboard/DashboardGrid';
++import ActivityCard from '../ActivityCard';
++import NodeDashboard from '../NodeDashboard';
++
++jest.mock('@console/dynamic-plugin-sdk/src/utils/flags', () => ({
++  useFlag: jest.fn(),
++}));
++
++jest.mock('@console/shared/src/components/dashboard/Dashboard', () => ({
++  __esModule: true,
++  default: ({ children }) => <div>{children}</div>,
++}));
++
++jest.mock('@console/shared/src/components/dashboard/DashboardGrid', () => ({
++  __esModule: true,
++  default: jest.fn(() => null),
++}));
++
++const mockNode: NodeKind = {
++  apiVersion: 'v1',
++  kind: 'Node',
++  metadata: {
++    name: 'test-node',
++    uid: 'test-node-uid',
++    resourceVersion: '12345',
++    creationTimestamp: '2024-01-01T00:00:00Z',
++  },
++  spec: {},
++  status: {
++    conditions: [],
++    addresses: [],
++  },
++};
++
++describe('NodeDashboard', () => {
++  beforeEach(() => {
++    jest.spyOn(flagsModule, 'useFlag').mockReturnValue(false);
++    jest.spyOn(DashboardGridModule, 'default').mockReturnValue(null);
++  });
++
++  afterEach(() => {
++    jest.restoreAllMocks();
++  });
++
++  describe('when rendering with node object', () => {
++    it('should render Dashboard with DashboardGrid', () => {
++      render(<NodeDashboard obj={mockNode} />);
++
++      expect(DashboardGridModule.default).toHaveBeenCalled();
++    });
++
++    it('should pass mainCards and leftCards to DashboardGrid', () => {
++      render(<NodeDashboard obj={mockNode} />);
++
++      expect(DashboardGridModule.default).toHaveBeenCalledWith(
++        expect.objectContaining({
++          mainCards: expect.arrayContaining([
++            expect.objectContaining({ Card: expect.any(Function) }),
++          ]),
++          leftCards: expect.arrayContaining([
++            expect.objectContaining({ Card: expect.any(Function) }),
++          ]),
++        }),
++        expect.any(Object),
++      );
++    });
++  });
++
++  describe('when NODE_MGMT_V1 flag is disabled', () => {
++    it('should pass rightCards, mainCards, and leftCards to DashboardGrid', () => {
++      jest.spyOn(flagsModule, 'useFlag').mockReturnValue(false);
++
++      render(<NodeDashboard obj={mockNode} />);
++
++      expect(DashboardGridModule.default).toHaveBeenCalledWith(
++        expect.objectContaining({
++          rightCards: [{ Card: ActivityCard }],
++          mainCards: expect.arrayContaining([
++            expect.objectContaining({ Card: expect.any(Function) }),
++          ]),
++          leftCards: expect.arrayContaining([
++            expect.objectContaining({ Card: expect.any(Function) }),
++          ]),
++        }),
++        expect.any(Object),
++      );
++    });
++  });
++
++  describe('when NODE_MGMT_V1 flag is enabled', () => {
++    it('should not pass rightCards to DashboardGrid', () => {
++      jest.spyOn(flagsModule, 'useFlag').mockReturnValue(true);
++
++      render(<NodeDashboard obj={mockNode} />);
++
++      expect(DashboardGridModule.default).toHaveBeenCalledWith(
++        expect.objectContaining({
++          rightCards: undefined,
++          mainCards: expect.arrayContaining([
++            expect.objectContaining({ Card: expect.any(Function) }),
++          ]),
++          leftCards: expect.arrayContaining([
++            expect.objectContaining({ Card: expect.any(Function) }),
++          ]),
++        }),
++        expect.any(Object),
++      );
++    });
++  });
++});
+diff --git a/frontend/packages/console-shared/src/components/dashboard/DashboardGrid.tsx b/frontend/packages/console-shared/src/components/dashboard/DashboardGrid.tsx
+index e098953db56..163163e11f3 100644
+--- a/frontend/packages/console-shared/src/components/dashboard/DashboardGrid.tsx
++++ b/frontend/packages/console-shared/src/components/dashboard/DashboardGrid.tsx
+@@ -35,6 +35,9 @@ const DashboardGrid: FC<OverviewGridProps> = ({ mainCards, leftCards, rightCards
+     smallGrid,
+   ]);
+ 
++  const mainGridSpan =
++    leftCards?.length && rightCards?.length ? 6 : leftCards?.length || rightCards?.length ? 9 : 12;
++
+   return (
+     <div ref={containerRef}>
+       {smallGrid ? (
+@@ -51,15 +54,19 @@ const DashboardGrid: FC<OverviewGridProps> = ({ mainCards, leftCards, rightCards
+         </Grid>
+       ) : (
+         <Grid className="co-dashboard-grid">
+-          <GridItem lg={3} md={3} sm={3}>
+-            <Grid className="co-dashboard-grid">{leftGridCards}</Grid>
+-          </GridItem>
+-          <GridItem lg={6} md={6} sm={6}>
++          {leftCards?.length ? (
++            <GridItem lg={3} md={3} sm={3}>
++              <Grid className="co-dashboard-grid">{leftGridCards}</Grid>
++            </GridItem>
++          ) : null}
++          <GridItem lg={mainGridSpan} md={mainGridSpan} sm={mainGridSpan}>
+             <Grid className="co-dashboard-grid">{mainGridCards}</Grid>
+           </GridItem>
+-          <GridItem lg={3} md={3} sm={3}>
+-            <Grid className="co-dashboard-grid">{rightGridCards}</Grid>
+-          </GridItem>
++          {rightCards?.length ? (
++            <GridItem lg={3} md={3} sm={3}>
++              <Grid className="co-dashboard-grid">{rightGridCards}</Grid>
++            </GridItem>
++          ) : null}
+         </Grid>
+       )}
+     </div>
+diff --git a/frontend/packages/console-shared/src/components/dashboard/__tests__/DashboardGrid.spec.tsx b/frontend/packages/console-shared/src/components/dashboard/__tests__/DashboardGrid.spec.tsx
+new file mode 100644
+index 00000000000..a13012ec79a
+--- /dev/null
++++ b/frontend/packages/console-shared/src/components/dashboard/__tests__/DashboardGrid.spec.tsx
+@@ -0,0 +1,146 @@
++import { GridItem } from '@patternfly/react-core';
++import { render, screen } from '@testing-library/react';
++import type { OverviewGridCard } from '@console/dynamic-plugin-sdk';
++import * as refWidthHook from '@console/internal/components/utils/ref-width-hook';
++import DashboardGrid from '../DashboardGrid';
++
++jest.mock('@patternfly/react-core', () => ({
++  ...jest.requireActual('@patternfly/react-core'),
++  GridItem: jest.fn(jest.requireActual('@patternfly/react-core').GridItem),
++}));
++
++jest.mock('@console/internal/components/utils/ref-width-hook', () => ({
++  useRefWidth: jest.fn(),
++}));
++
++const createMockCards = (count: number, label: string): OverviewGridCard[] =>
++  Array.from({ length: count }, (_, index) => ({
++    Card: () => <div>{`${label} Card ${index + 1}`}</div>,
++    span: 12,
++  }));
++
++const getLayoutGridItemSizes = () =>
++  jest
++    .mocked(GridItem)
++    .mock.calls.filter(([{ lg }]) => lg !== undefined)
++    .map(([{ lg, md, sm }]) => ({ lg, md, sm }));
++
++const expectLayoutGridItems = (...sizes: number[]) => {
++  expect(getLayoutGridItemSizes()).toEqual(sizes.map((size) => ({ lg: size, md: size, sm: size })));
++};
++
++describe('DashboardGrid', () => {
++  beforeEach(() => {
++    (refWidthHook.useRefWidth as jest.Mock).mockReturnValue([jest.fn(), 1200]);
++    jest.mocked(GridItem).mockClear();
++  });
++
++  afterEach(() => {
++    jest.restoreAllMocks();
++  });
++
++  describe('when rendering with main cards only', () => {
++    it('should render main cards in a 12-column grid', () => {
++      const mainCards = createMockCards(2, 'Main');
++
++      render(<DashboardGrid mainCards={mainCards} />);
++
++      expect(screen.getByText('Main Card 1')).toBeVisible();
++      expect(screen.getByText('Main Card 2')).toBeVisible();
++
++      expectLayoutGridItems(12);
++    });
++
++    it('should not render left or right columns', () => {
++      const mainCards = createMockCards(1, 'Main');
++
++      render(<DashboardGrid mainCards={mainCards} />);
++
++      expect(screen.queryByText('Left Card 1')).not.toBeInTheDocument();
++      expect(screen.queryByText('Right Card 1')).not.toBeInTheDocument();
++
++      expectLayoutGridItems(12);
++    });
++  });
++
++  describe('when rendering with left cards', () => {
++    it('should render both main and left cards', () => {
++      const mainCards = createMockCards(1, 'Main');
++      const leftCards = createMockCards(1, 'Left');
++
++      render(<DashboardGrid mainCards={mainCards} leftCards={leftCards} />);
++
++      expect(screen.getByText('Main Card 1')).toBeVisible();
++      expect(screen.getByText('Left Card 1')).toBeVisible();
++
++      expectLayoutGridItems(3, 9);
++    });
++  });
++
++  describe('when rendering with right cards', () => {
++    it('should render both main and right cards', () => {
++      const mainCards = createMockCards(1, 'Main');
++      const rightCards = createMockCards(1, 'Right');
++
++      render(<DashboardGrid mainCards={mainCards} rightCards={rightCards} />);
++
++      expect(screen.getByText('Main Card 1')).toBeVisible();
++      expect(screen.getByText('Right Card 1')).toBeVisible();
++
++      expectLayoutGridItems(9, 3);
++    });
++  });
++
++  describe('when rendering with left and right cards', () => {
++    it('should render all three card sections', () => {
++      const mainCards = createMockCards(1, 'Main');
++      const leftCards = createMockCards(1, 'Left');
++      const rightCards = createMockCards(1, 'Right');
++
++      render(<DashboardGrid mainCards={mainCards} leftCards={leftCards} rightCards={rightCards} />);
++
++      expect(screen.getByText('Main Card 1')).toBeVisible();
++      expect(screen.getByText('Left Card 1')).toBeVisible();
++      expect(screen.getByText('Right Card 1')).toBeVisible();
++
++      expectLayoutGridItems(3, 6, 3);
++    });
++  });
++
++  describe('when viewport is small', () => {
++    beforeEach(() => {
++      (refWidthHook.useRefWidth as jest.Mock).mockReturnValue([jest.fn(), 800]);
++    });
++
++    it('should render all cards stacked vertically', () => {
++      const mainCards = createMockCards(1, 'Main');
++      const leftCards = createMockCards(1, 'Left');
++      const rightCards = createMockCards(1, 'Right');
++
++      render(<DashboardGrid mainCards={mainCards} leftCards={leftCards} rightCards={rightCards} />);
++
++      expect(screen.getByText('Main Card 1')).toBeVisible();
++      expect(screen.getByText('Left Card 1')).toBeVisible();
++      expect(screen.getByText('Right Card 1')).toBeVisible();
++
++      expectLayoutGridItems(12, 12, 12);
++    });
++  });
++
++  describe('when rendering multiple cards', () => {
++    it('should render all cards in their respective sections', () => {
++      const mainCards = createMockCards(3, 'Main');
++      const leftCards = createMockCards(2, 'Left');
++
++      render(<DashboardGrid mainCards={mainCards} leftCards={leftCards} />);
++
++      expect(screen.getByText('Main Card 1')).toBeVisible();
++      expect(screen.getByText('Main Card 2')).toBeVisible();
++      expect(screen.getByText('Main Card 3')).toBeVisible();
++      expect(screen.getByText('Left Card 1')).toBeVisible();
++      expect(screen.getByText('Left Card 2')).toBeVisible();
++
++      expectLayoutGridItems(3, 9);
++    });
++  });
++});

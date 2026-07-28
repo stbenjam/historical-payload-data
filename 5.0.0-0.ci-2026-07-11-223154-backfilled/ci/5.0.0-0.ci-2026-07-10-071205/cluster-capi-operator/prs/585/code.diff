@@ -1,0 +1,619 @@
+diff --git a/.claude/skills/rbac-review/SKILL.md b/.claude/skills/rbac-review/SKILL.md
+new file mode 100644
+index 000000000..179c327fd
+--- /dev/null
++++ b/.claude/skills/rbac-review/SKILL.md
+@@ -0,0 +1,100 @@
++---
++name: rbac-review
++description: "Use when the user wants to audit, update, or regenerate RBAC permissions for a controller or service account. Covers: adding new permissions after code changes, auditing a service account for least privilege, periodic RBAC reviews, or regenerating RBAC manifests after adding new CRD types or controllers. Trigger on any mention of \"rbac\" in the context of updating or reviewing permissions."
++disable-model-invocation: false
++---
++
++Audit and regenerate RBAC permissions for a ServiceAccount. Requires an active cluster connection (`oc whoami` must succeed).
++
++The target ServiceAccount is specified via `$ARGUMENTS` (e.g., `/rbac-review openshift-cluster-api:capi-controllers`). If not provided, ask the user.
++
++## Prerequisites
++
++Verify before starting:
++```bash
++oc whoami
++which audit2rbac || echo "audit2rbac not found — install with: go install github.com/liggitt/audit2rbac/cmd/audit2rbac@latest"
++```
++
++If `oc whoami` fails, stop and ask the user to connect to a cluster first.
++
++If `audit2rbac` is not found, build from source (go install fails due to replace directives):
++```bash
++cd /tmp && git clone https://github.com/liggitt/audit2rbac.git audit2rbac-build \
++  && cd audit2rbac-build && go build -o ~/go/bin/audit2rbac ./cmd/audit2rbac
++```
++
++## Steps 1 & 2: Run in parallel
++
++Step 1 (e2e + audit2rbac) and Step 2 (static analysis) are independent. Start e2e first (it takes ~20 minutes), then do static analysis while it runs. Merge results in Step 3.
++
++### Step 1: Run e2e tests and collect audit2rbac baseline
++
++The cluster must have RBAC that doesn't cause controllers to crash on 403s (so all code paths are exercised).
++
++**Restart the target Deployment before running e2e** so that startup-only operations (pod self-read, initial lease create, ClusterOperator create) appear in the audit window. Without this, those operations are "Code only" in the gap report.
++
++```bash
++oc rollout restart deployment/<name> -n <namespace>
++oc rollout status deployment/<name> -n <namespace> --timeout=120s
++make e2e 2>&1 | tee /tmp/e2e-baseline.log
++```
++
++Collect and clean audit logs. `oc adm node-logs` prefixes each line with the node hostname, which breaks audit2rbac's JSON parser — strip it with `sed`:
++
++```bash
++oc adm node-logs --role=master --path=kube-apiserver/audit.log \
++  | sed 's/^[^ ]* //' > /tmp/audit-clean.log
++audit2rbac --filename=/tmp/audit-clean.log \
++  --serviceaccount=<namespace>:<name> | tee /tmp/audit2rbac-output.yaml
++```
++
++### Step 2: Static analysis of controller code
++
++Find all Deployments that use the target ServiceAccount (search `manifests/` for `serviceAccountName`). From each Deployment, identify its containers and binaries, then find all controllers each binary registers. For each controller, trace resource access:
++
++- `client.Get/List/Create/Update/Patch/Delete` — determines verbs. Note: controller-runtime backs `client.Get` with an informer cache, so any resource accessed via `Get` also needs `list` and `watch`
++- `Status().Patch/Update` — requires `/status` subresource rule
++- `builder.For/Watches/Owns` in `SetupWithManager()` — requires `get, list, watch`
++- `Recorder.Event/Eventf` — requires `events` create/patch
++- `ownerReference` with `blockOwnerDeletion: true` — requires `update` on the owner's `/finalizers` subresource (invisible to audit2rbac)
++- `ValidatingAdmissionPolicyBinding` with `spec.paramRef` — the API server requires `list` permission on the `spec.paramKind` resource type in the `spec.paramRef.namespace` when creating or updating the binding. This is invisible to both audit2rbac and naive code tracing. Check what `paramKind` each VAP uses and add `list` for those resource types.
++- Leader election leases and feature gate informers
++
++For vendored libraries (boxcutter, controller-runtime, etc.), trust audit2rbac over static analysis for verb accuracy. These libraries may use `update` (PUT) internally even when the calling code only shows `patch` calls.
++
++Map each resource to the namespace where it's accessed. Check `pkg/util/platform.go` for the full list of platform-specific infra types.
++
++## Step 3: Gap report
++
++Wait for **both** Step 1 and Step 2 to complete before presenting the gap report. Present it once, not incrementally.
++
++Compare audit2rbac output against static analysis. Produce a table with columns: API Group, Resource, Verbs, Scope, Code evidence, Status.
++
++Status values:
++- **Confirmed** — in both audit2rbac and code
++- **Code only** — in code but not audit2rbac. Must be justified (different platform, first-install path, `blockOwnerDeletion`, VAP paramRef authorization, etc.)
++- **Audit only** — in audit2rbac but not code. Investigate.
++
++Present the gap report and wait for user approval before proceeding.
++
++## Step 4: Build new RBAC
++
++Find the existing RBAC manifests for the target ServiceAccount (search `manifests/` for ClusterRole/Role and ClusterRoleBinding/RoleBinding referencing the SA). Update them following the scoping principle: ClusterRole for cluster-scoped resources, namespace-scoped Roles for everything else.
++
++## Step 5: Verify by running e2e tests
++
++Use `oc replace` (not `oc apply`) to deploy the updated RBAC manifests — `oc apply` on CVO-managed resources does not fully replace rules because the `last-applied-configuration` annotation is missing, so old wildcard rules survive alongside new enumerated rules, giving false confidence.
++
++```bash
++oc replace -f <roles-manifest>
++oc replace -f <bindings-manifest>
++```
++
++For new Roles/RoleBindings that don't exist yet on the cluster, use `oc create` first or `oc replace --force` (which deletes and recreates).
++
++Then restart the Deployments that use the SA, check controller logs for `forbidden`/`403` errors, and run `make e2e`.
++
++## Step 6: Update docs/rbac.md
++
++Update `docs/rbac.md` to reflect the new RBAC structure — which Roles/ClusterRoles exist, their scopes, and what they cover.
+diff --git a/docs/rbac.md b/docs/rbac.md
+index 71b937cfe..39518b15c 100644
+--- a/docs/rbac.md
++++ b/docs/rbac.md
+@@ -8,8 +8,9 @@ The `capi-operator` and `capi-installer` ServiceAccounts (in `openshift-cluster-
+ 
+ | Manifest | Kind | Scope | SA | Purpose |
+ |----------|------|-------|----|---------|
+-| `0000_30_cluster-api-operator_03_clusterrole.yaml` | ClusterRole `openshift-capi-operator` | cluster-wide | `capi-operator` | config.openshift.io resources, ClusterOperator management, ClusterAPI/ConfigMap/Deployment read |
+-| `0000_30_cluster-api-operator_03_clusterrole.yaml` | Role `capi-operator` | `openshift-cluster-api-operator` | `capi-operator` | Leader election leases, Deployment write (capi-installer), pod self-read, events |
++| `0000_30_cluster-api-operator_03_clusterrole.yaml` | ClusterRole `openshift-capi-operator` | cluster-wide | `capi-operator` | config.openshift.io resources, ClusterOperator management, ClusterAPI CR read |
++| `0000_30_cluster-api-operator_03_clusterrole.yaml` | Role `capi-operator` | `openshift-cluster-api-operator` | `capi-operator` | Leader election leases, Deployment write (capi-installer), ConfigMap read, pod self-read, events |
++| `0000_30_cluster-api-operator_03_clusterrole.yaml` | Role `capi-operator` | `openshift-cluster-api` | `capi-operator` | Deployment read, ConfigMap read |
+ | `0000_30_cluster-api-operator_03_capi-installer-clusterrole.yaml` | ClusterRole `openshift-capi-installer` | cluster-wide | `capi-installer` | CRDs, admission resources, cluster RBAC, config.openshift.io, ClusterAPI/ClusterOperator status, tracking cache informers |
+ | `0000_30_cluster-api-operator_03_capi-installer-clusterrole.yaml` | Role `capi-installer` | `openshift-cluster-api-operator` | `capi-installer` | Leader election leases, pod self-read, ConfigMap read, events |
+ | `0000_30_cluster-api-operator_03_capi-installer-clusterrole.yaml` | Role `capi-installer` | `openshift-cluster-api` | `capi-installer` | boxcutter-managed resources (ServiceAccounts, Services, Deployments, Roles, RoleBindings), VAP paramRef list |
+@@ -23,11 +24,13 @@ The `capi-controllers` ServiceAccount (used by both the `capi-controllers` and `
+ 
+ | Manifest | Kind | Scope | Purpose |
+ |----------|------|-------|---------|
+-| `03_rbac_roles.yaml` | ClusterRole `openshift-capi-controllers` | cluster-wide | Cluster-scoped resources only: infrastructures, clusteroperators, featuregates, clusterversions, nodes, CRDs |
+-| `03_rbac_roles.yaml` | Role `capi-controllers` | `openshift-cluster-api` | CAPI core + infra provider resources, secrets, events, leases |
+-| `03_rbac_roles.yaml` | Role `capi-controllers` | `openshift-machine-api` | MAPI machines, machinesets, controlplanemachinesets, secrets, events |
+-| `03_rbac_roles.yaml` | Role `capi-controllers-kube-system` | `kube-system` | Secrets (vSphere credentials) |
+-| `03_rbac_roles.yaml` | Role `cluster-capi-operator-pull-secret` | `openshift-config` | Pull-secret read |
++| `0000_30_cluster-api_03_rbac_roles.yaml` | ClusterRole `openshift-capi-controllers` | cluster-wide | Cluster-scoped resources only: infrastructures, clusteroperators, featuregates, clusterversions, nodes, CRDs |
++| `0000_30_cluster-api_03_rbac_roles.yaml` | Role `capi-controllers` | `openshift-cluster-api` | CAPI core + infra provider resources, secrets, pod self-read, events, leases |
++| `0000_30_cluster-api_03_rbac_roles.yaml` | Role `capi-controllers` | `openshift-machine-api` | MAPI machines, machinesets, controlplanemachinesets, secrets, events |
++| `0000_30_cluster-api_03_rbac_roles.yaml` | Role `capi-controllers-kube-system` | `kube-system` | Secrets (vSphere credentials) |
++| `0000_30_cluster-api_03_rbac_roles.yaml` | Role `cluster-capi-operator-pull-secret` | `openshift-config` | Pull-secret read |
++
++This SA also binds to ClusterRole `system:openshift:openshift-cluster-api:read-tls-configuration` for APIServer TLS profile reading.
+ 
+ ## Principles
+ 
+diff --git a/manifests/0000_30_cluster-api_03_rbac_roles.yaml b/manifests/0000_30_cluster-api_03_rbac_roles.yaml
+index 26068a139..ac650868a 100644
+--- a/manifests/0000_30_cluster-api_03_rbac_roles.yaml
++++ b/manifests/0000_30_cluster-api_03_rbac_roles.yaml
+@@ -10,11 +10,65 @@ metadata:
+   name: openshift-capi-controllers
+ rules:
+ - apiGroups:
+-  - '*'
++  - config.openshift.io
+   resources:
+-  - '*'
++  - infrastructures
+   verbs:
+-  - '*'
++  - get
++  - list
++  - watch
++- apiGroups:
++  - config.openshift.io
++  resources:
++  - clusteroperators
++  verbs:
++  - list
++  - watch
++- apiGroups:
++  - config.openshift.io
++  resources:
++  - clusteroperators
++  resourceNames:
++  - cluster-api
++  verbs:
++  - get
++  - patch
++- apiGroups:
++  - config.openshift.io
++  resources:
++  - clusteroperators/status
++  resourceNames:
++  - cluster-api
++  verbs:
++  - update
++  - patch
++- apiGroups:
++  - config.openshift.io
++  resources:
++  - featuregates
++  - clusterversions
++  verbs:
++  - get
++  - list
++  - watch
++- apiGroups:
++  - apiextensions.k8s.io
++  resources:
++  - customresourcedefinitions
++  verbs:
++  - get
++  - list
++  - watch
++- apiGroups:
++  - ""
++  resources:
++  - nodes
++  verbs:
++  - get
++  - list
++  - watch
++  - patch
++  - update
+ ---
+ apiVersion: rbac.authorization.k8s.io/v1
+ kind: Role
+@@ -28,11 +82,251 @@ metadata:
+   namespace: openshift-cluster-api
+ rules:
+ - apiGroups:
+-  - '*'
++  - coordination.k8s.io
++  resources:
++  - leases
++  verbs:
++  - get
++  - list
++  - watch
++  - create
++  - update
++  - patch
++  - delete
++- apiGroups:
++  - cluster.x-k8s.io
++  resources:
++  - clusters
++  - machines
++  - machinesets
++  verbs:
++  - get
++  - list
++  - watch
++  - create
++  - update
++  - patch
++  - delete
++- apiGroups:
++  - cluster.x-k8s.io
+   resources:
+-  - '*'
++  - clusters/status
++  - machines/status
++  - machinesets/status
+   verbs:
+-  - '*'
++  - update
++  - patch
++- apiGroups:
++  - cluster.x-k8s.io
++  resources:
++  - clusters/finalizers
++  - machines/finalizers
++  - machinesets/finalizers
++  verbs:
++  - update
++- apiGroups:
++  - infrastructure.cluster.x-k8s.io
++  resources:
++  - awsclusters
++  - azureclusters
++  - gcpclusters
++  - vsphereclusters
++  - openstackclusters
++  - metal3clusters
++  - ibmpowervsclusters
++  verbs:
++  - get
++  - list
++  - watch
++  - create
++  - update
++  - patch
++- apiGroups:
++  - infrastructure.cluster.x-k8s.io
++  resources:
++  - awsclusters/status
++  - azureclusters/status
++  - gcpclusters/status
++  - vsphereclusters/status
++  - openstackclusters/status
++  - metal3clusters/status
++  - ibmpowervsclusters/status
++  verbs:
++  - update
++  - patch
++- apiGroups:
++  - infrastructure.cluster.x-k8s.io
++  resources:
++  - azureclusteridentities
++  verbs:
++  - get
++  - list
++  - watch
++  - create
++- apiGroups:
++  - infrastructure.cluster.x-k8s.io
++  resources:
++  - awsmachines
++  - azuremachines
++  - gcpmachines
++  - vspheremachines
++  - openstackmachines
++  - metal3machines
++  - ibmpowervsmachines
++  verbs:
++  - get
++  - list
++  - watch
++  - create
++  - update
++  - patch
++  - delete
++- apiGroups:
++  - infrastructure.cluster.x-k8s.io
++  resources:
++  - awsmachines/status
++  - azuremachines/status
++  - gcpmachines/status
++  - vspheremachines/status
++  - openstackmachines/status
++  - metal3machines/status
++  - ibmpowervsmachines/status
++  verbs:
++  - update
++  - patch
++- apiGroups:
++  - infrastructure.cluster.x-k8s.io
++  resources:
++  - awsmachinetemplates
++  - azuremachinetemplates
++  - gcpmachinetemplates
++  - vspheremachinetemplates
++  - openstackmachinetemplates
++  - metal3machinetemplates
++  - ibmpowervsmachinetemplates
++  verbs:
++  - get
++  - list
++  - watch
++  - create
++  - update
++  - patch
++  - delete
++  - deletecollection
++- apiGroups:
++  - ""
++  resources:
++  - pods
++  verbs:
++  - get
++- apiGroups:
++  - ""
++  resources:
++  - secrets
++  verbs:
++  - get
++  - list
++  - watch
++  - create
++  - update
++  - patch
++- apiGroups:
++  - ""
++  resources:
++  - events
++  verbs:
++  - create
++  - patch
++---
++apiVersion: rbac.authorization.k8s.io/v1
++kind: Role
++metadata:
++  annotations:
++    exclude.release.openshift.io/internal-openshift-hosted: "true"
++    include.release.openshift.io/self-managed-high-availability: "true"
++    include.release.openshift.io/single-node-developer: "true"
++    release.openshift.io/feature-gate: "ClusterAPIMachineManagement"
++  name: capi-controllers
++  namespace: openshift-machine-api
++rules:
++- apiGroups:
++  - machine.openshift.io
++  resources:
++  - machines
++  - machinesets
++  verbs:
++  - get
++  - list
++  - watch
++  - create
++  - update
++  - patch
++  - delete
++- apiGroups:
++  - machine.openshift.io
++  resources:
++  - machines/status
++  - machinesets/status
++  verbs:
++  - update
++  - patch
++- apiGroups:
++  - machine.openshift.io
++  resources:
++  - machines/finalizers
++  - machinesets/finalizers
++  verbs:
++  - update
++- apiGroups:
++  - machine.openshift.io
++  resources:
++  - controlplanemachinesets
++  verbs:
++  - get
++  - list
++  - watch
++- apiGroups:
++  - ""
++  resources:
++  - secrets
++  verbs:
++  - get
++  - list
++  - watch
++- apiGroups:
++  - ""
++  resources:
++  - events
++  verbs:
++  - create
++  - patch
++---
++apiVersion: rbac.authorization.k8s.io/v1
++kind: Role
++metadata:
++  annotations:
++    exclude.release.openshift.io/internal-openshift-hosted: "true"
++    include.release.openshift.io/self-managed-high-availability: "true"
++    include.release.openshift.io/single-node-developer: "true"
++    release.openshift.io/feature-gate: "ClusterAPIMachineManagement"
++  name: capi-controllers-kube-system
++  namespace: kube-system
++rules:
++- apiGroups:
++  - ""
++  resources:
++  - secrets
++  verbs:
++  - list
++  - watch
++- apiGroups:
++  - ""
++  resources:
++  - secrets
++  resourceNames:
++  - vsphere-creds
++  verbs:
++  - get
+ ---
+ apiVersion: rbac.authorization.k8s.io/v1
+ kind: Role
+diff --git a/manifests/0000_30_cluster-api_04_rbac_bindings.yaml b/manifests/0000_30_cluster-api_04_rbac_bindings.yaml
+index 44aeef10e..64a7e2081 100644
+--- a/manifests/0000_30_cluster-api_04_rbac_bindings.yaml
++++ b/manifests/0000_30_cluster-api_04_rbac_bindings.yaml
+@@ -56,6 +56,44 @@ subjects:
+ ---
+ apiVersion: rbac.authorization.k8s.io/v1
+ kind: RoleBinding
++metadata:
++  name: capi-controllers
++  namespace: openshift-machine-api
++  annotations:
++    exclude.release.openshift.io/internal-openshift-hosted: "true"
++    include.release.openshift.io/self-managed-high-availability: "true"
++    include.release.openshift.io/single-node-developer: "true"
++    release.openshift.io/feature-gate: "ClusterAPIMachineManagement"
++roleRef:
++  kind: Role
++  name: capi-controllers
++  apiGroup: rbac.authorization.k8s.io
++subjects:
++- kind: ServiceAccount
++  namespace: openshift-cluster-api
++  name: capi-controllers
++---
++apiVersion: rbac.authorization.k8s.io/v1
++kind: RoleBinding
++metadata:
++  name: capi-controllers-kube-system
++  namespace: kube-system
++  annotations:
++    exclude.release.openshift.io/internal-openshift-hosted: "true"
++    include.release.openshift.io/self-managed-high-availability: "true"
++    include.release.openshift.io/single-node-developer: "true"
++    release.openshift.io/feature-gate: "ClusterAPIMachineManagement"
++roleRef:
++  kind: Role
++  name: capi-controllers-kube-system
++  apiGroup: rbac.authorization.k8s.io
++subjects:
++- kind: ServiceAccount
++  namespace: openshift-cluster-api
++  name: capi-controllers
++---
++apiVersion: rbac.authorization.k8s.io/v1
++kind: RoleBinding
+ metadata:
+   name: cluster-capi-operator-pull-secret
+   namespace: openshift-config
+diff --git a/pkg/controllers/infracluster/infracluster_controller.go b/pkg/controllers/infracluster/infracluster_controller.go
+index 3e29ea1db..a77fe6f3e 100644
+--- a/pkg/controllers/infracluster/infracluster_controller.go
++++ b/pkg/controllers/infracluster/infracluster_controller.go
+@@ -238,7 +238,7 @@ func (r *InfraClusterController) ensureInfraCluster(ctx context.Context, log log
+ 
+ // setAvailableCondition sets the ClusterOperator status condition to Available.
+ func (r *InfraClusterController) setAvailableCondition(ctx context.Context, log logr.Logger) error {
+-	co, err := r.GetOrCreateClusterOperator(ctx)
++	co, err := r.GetClusterOperator(ctx)
+ 	if err != nil {
+ 		return fmt.Errorf("failed to get cluster operator: %w", err)
+ 	}
+diff --git a/pkg/controllers/secretsync/secret_sync_controller.go b/pkg/controllers/secretsync/secret_sync_controller.go
+index e3c35749d..ffef8de7b 100644
+--- a/pkg/controllers/secretsync/secret_sync_controller.go
++++ b/pkg/controllers/secretsync/secret_sync_controller.go
+@@ -186,7 +186,7 @@ func (r *UserDataSecretController) SetupWithManager(mgr ctrl.Manager) error {
+ }
+ 
+ func (r *UserDataSecretController) setAvailableCondition(ctx context.Context, log logr.Logger) error {
+-	co, err := r.GetOrCreateClusterOperator(ctx)
++	co, err := r.GetClusterOperator(ctx)
+ 	if err != nil {
+ 		return fmt.Errorf("unable to get cluster operator: %w", err)
+ 	}
+@@ -208,7 +208,7 @@ func (r *UserDataSecretController) setAvailableCondition(ctx context.Context, lo
+ }
+ 
+ func (r *UserDataSecretController) setDegradedCondition(ctx context.Context, log logr.Logger) error {
+-	co, err := r.GetOrCreateClusterOperator(ctx)
++	co, err := r.GetClusterOperator(ctx)
+ 	if err != nil {
+ 		return fmt.Errorf("unable to get cluster operator: %w", err)
+ 	}
+diff --git a/pkg/operatorstatus/operator_status.go b/pkg/operatorstatus/operator_status.go
+index 06932b114..6b2b0fa26 100644
+--- a/pkg/operatorstatus/operator_status.go
++++ b/pkg/operatorstatus/operator_status.go
+@@ -21,7 +21,6 @@ import (
+ 
+ 	corev1 "k8s.io/api/core/v1"
+ 	"k8s.io/apimachinery/pkg/api/equality"
+-	"k8s.io/apimachinery/pkg/api/errors"
+ 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+ 	"k8s.io/client-go/tools/record"
+ 	"k8s.io/utils/clock"
+@@ -53,7 +52,7 @@ type ClusterOperatorStatusClient struct {
+ func (r *ClusterOperatorStatusClient) SetStatusAvailable(ctx context.Context, availableConditionMsg string, opts ...SyncStatusOption) error {
+ 	log := ctrl.LoggerFrom(ctx)
+ 
+-	co, err := r.GetOrCreateClusterOperator(ctx)
++	co, err := r.GetClusterOperator(ctx)
+ 	if err != nil {
+ 		log.Error(err, "unable to set cluster operator status available")
+ 		return err
+@@ -81,7 +80,7 @@ func (r *ClusterOperatorStatusClient) SetStatusAvailable(ctx context.Context, av
+ func (r *ClusterOperatorStatusClient) SetStatusDegraded(ctx context.Context, reconcileErr error, opts ...SyncStatusOption) error {
+ 	log := ctrl.LoggerFrom(ctx)
+ 
+-	co, err := r.GetOrCreateClusterOperator(ctx)
++	co, err := r.GetClusterOperator(ctx)
+ 	if err != nil {
+ 		log.Error(err, "unable to set cluster operator status degraded")
+ 		return err
+@@ -101,30 +100,12 @@ func (r *ClusterOperatorStatusClient) SetStatusDegraded(ctx context.Context, rec
+ 	return r.SyncStatus(ctx, co, append(opts, WithConditions(conds))...)
+ }
+ 
+-// GetOrCreateClusterOperator is responsible for fetching the cluster operator should it exist,
+-// or creating a new cluster operator if it does not already exist.
+-func (r *ClusterOperatorStatusClient) GetOrCreateClusterOperator(ctx context.Context) (*configv1.ClusterOperator, error) {
+-	log := ctrl.LoggerFrom(ctx)
+-
+-	co := &configv1.ClusterOperator{
+-		ObjectMeta: metav1.ObjectMeta{
+-			Name: controllers.ClusterOperatorName,
+-		},
+-	}
++// GetClusterOperator fetches the ClusterOperator object.
++// The ClusterOperator is created by CVO, not by this operator.
++func (r *ClusterOperatorStatusClient) GetClusterOperator(ctx context.Context) (*configv1.ClusterOperator, error) {
++	co := &configv1.ClusterOperator{}
+ 
+-	err := r.Get(ctx, client.ObjectKey{Name: controllers.ClusterOperatorName}, co)
+-	if errors.IsNotFound(err) {
+-		log.Info("ClusterOperator does not exist, creating a new one.")
+-
+-		err = r.Create(ctx, co)
+-		if err != nil {
+-			return nil, fmt.Errorf("failed to create cluster operator: %w", err)
+-		}
+-
+-		return co, nil
+-	}
+-
+-	if err != nil {
++	if err := r.Get(ctx, client.ObjectKey{Name: controllers.ClusterOperatorName}, co); err != nil {
+ 		return nil, fmt.Errorf("failed to get clusterOperator %q: %w", controllers.ClusterOperatorName, err)
+ 	}
+ 

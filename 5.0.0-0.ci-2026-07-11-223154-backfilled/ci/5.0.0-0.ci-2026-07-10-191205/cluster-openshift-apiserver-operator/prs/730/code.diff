@@ -1,0 +1,779 @@
+diff --git a/cmd/cluster-openshift-apiserver-operator/main.go b/cmd/cluster-openshift-apiserver-operator/main.go
+index 788c9f06e..7ce60e710 100644
+--- a/cmd/cluster-openshift-apiserver-operator/main.go
++++ b/cmd/cluster-openshift-apiserver-operator/main.go
+@@ -5,13 +5,12 @@ import (
+ 	"os"
+ 
+ 	"github.com/spf13/cobra"
+-	"k8s.io/client-go/rest"
+ 
+ 	"k8s.io/component-base/cli"
+ 
+ 	kmshealth "github.com/openshift/library-go/pkg/operator/encryption/kms/health"
++	kmswriters "github.com/openshift/library-go/pkg/operator/encryption/kms/health/writers"
+ 	kmspreflight "github.com/openshift/library-go/pkg/operator/encryption/kms/preflight"
+-	"github.com/openshift/library-go/pkg/operator/v1helpers"
+ 
+ 	"github.com/openshift/cluster-openshift-apiserver-operator/pkg/cmd/operator"
+ 	"github.com/openshift/cluster-openshift-apiserver-operator/pkg/cmd/resourcegraph"
+@@ -35,11 +34,7 @@ func NewSSCSCommand() *cobra.Command {
+ 
+ 	cmd.AddCommand(operator.NewOperator())
+ 	cmd.AddCommand(resourcegraph.NewResourceChainCommand())
+-	cmd.AddCommand(kmshealth.NewCommand(context.Background(), func(config *rest.Config) (v1helpers.OperatorClient, error) {
+-		// TODO: replace with a real operator client once the health reporter's condition writer
+-		// is implemented in library-go.
+-		return nil, nil
+-	}))
++	cmd.AddCommand(kmshealth.NewCommand(context.Background(), kmswriters.NewOpenShiftAPIServerWriter))
+ 	cmd.AddCommand(kmspreflight.NewCommand(context.Background()))
+ 
+ 	return cmd
+diff --git a/go.mod b/go.mod
+index ce3d8a9ad..9c7cc679e 100644
+--- a/go.mod
++++ b/go.mod
+@@ -13,7 +13,7 @@ require (
+ 	github.com/openshift/api v0.0.0-20260623101811-c5eb460d04e3
+ 	github.com/openshift/build-machinery-go v0.0.0-20251023084048-5d77c1a5e5af
+ 	github.com/openshift/client-go v0.0.0-20260622130833-df412d4d283e
+-	github.com/openshift/library-go v0.0.0-20260702085952-fd74bb5c4240
++	github.com/openshift/library-go v0.0.0-20260709124617-64c3ee5daeea
+ 	github.com/spf13/cobra v1.10.0
+ 	github.com/stretchr/testify v1.11.1
+ 	k8s.io/api v0.35.2
+diff --git a/go.sum b/go.sum
+index 1bcfba297..4472a1c2a 100644
+--- a/go.sum
++++ b/go.sum
+@@ -200,8 +200,8 @@ github.com/openshift/build-machinery-go v0.0.0-20251023084048-5d77c1a5e5af h1:Ui
+ github.com/openshift/build-machinery-go v0.0.0-20251023084048-5d77c1a5e5af/go.mod h1:8jcm8UPtg2mCAsxfqKil1xrmRMI3a+XU2TZ9fF8A7TE=
+ github.com/openshift/client-go v0.0.0-20260622130833-df412d4d283e h1:NrVmCwy3vBk6UTY+cNNFHbnB40FyusJmeUIInQod/v8=
+ github.com/openshift/client-go v0.0.0-20260622130833-df412d4d283e/go.mod h1:lMQvYPtn6LrPO/YX2j5xdv2h6BRWgYVq1tMA3qA3N9k=
+-github.com/openshift/library-go v0.0.0-20260702085952-fd74bb5c4240 h1:OZq/eCJy3uxGArBnzzGyFSRej4TAZqj3Addfde4Dg6o=
+-github.com/openshift/library-go v0.0.0-20260702085952-fd74bb5c4240/go.mod h1:8d0qQEDq2kpIZmaE1tKpvZ4pLeQZT+mW2JpqAh3iZIc=
++github.com/openshift/library-go v0.0.0-20260709124617-64c3ee5daeea h1:4Ru0RpV+dyxjmWufh5AHK9fDr7a9n5XV3ra6oUVzWgw=
++github.com/openshift/library-go v0.0.0-20260709124617-64c3ee5daeea/go.mod h1:8d0qQEDq2kpIZmaE1tKpvZ4pLeQZT+mW2JpqAh3iZIc=
+ github.com/openshift/onsi-ginkgo/v2 v2.6.1-0.20260303184444-1cc650aa0565 h1:3/q8qM4HbFa+Een8wgzpwO8W6mO7Po+MwY6uxiXi/ac=
+ github.com/openshift/onsi-ginkgo/v2 v2.6.1-0.20260303184444-1cc650aa0565/go.mod h1:ArE1D/XhNXBXCBkKOLkbsb2c81dQHCRcF5zwn/ykDRo=
+ github.com/orisano/pixelmatch v0.0.0-20220722002657-fb0b55479cde/go.mod h1:nZgzbfBr3hhjoZnS66nKrHmduYNpc34ny7RK4z5/HM0=
+diff --git a/vendor/github.com/openshift/library-go/pkg/operator/encryption/kms/health/cmd.go b/vendor/github.com/openshift/library-go/pkg/operator/encryption/kms/health/cmd.go
+index e0d413040..d1f540e3f 100644
+--- a/vendor/github.com/openshift/library-go/pkg/operator/encryption/kms/health/cmd.go
++++ b/vendor/github.com/openshift/library-go/pkg/operator/encryption/kms/health/cmd.go
+@@ -6,50 +6,46 @@ import (
+ 	"regexp"
+ 	"time"
+ 
+-	"github.com/openshift/library-go/pkg/operator/v1helpers"
+ 	"github.com/spf13/cobra"
+-	"github.com/spf13/pflag"
+ 
+-	"k8s.io/apimachinery/pkg/util/sets"
+ 	"k8s.io/apimachinery/pkg/util/wait"
+ 	"k8s.io/apiserver/pkg/server"
+ 	k8senvelopekmsv2 "k8s.io/apiserver/pkg/storage/value/encrypt/envelope/kmsv2"
+ 	"k8s.io/client-go/rest"
+-	"k8s.io/client-go/tools/clientcmd"
+ 	"k8s.io/klog/v2"
++
++	applyoperatorv1 "github.com/openshift/client-go/operator/applyconfigurations/operator/v1"
+ )
+ 
+-const Subcommand = "kms-health-reporter"
++const (
++	Subcommand = "kms-health-reporter"
++)
+ 
+ // kmsSocketPattern matches the socket path each co-located KMSv2 plugin is
+ // mounted at, e.g. unix:///var/run/kmsplugin/kms-1.sock.
+ var kmsSocketPattern = regexp.MustCompile(`^unix:///var/run/kmsplugin/kms-(\d+)\.sock$`)
+ 
+-// options' flag-bound fields are exported so the struct can be logged as a
+-// whole via klog.InfoS, which JSON-marshals its values.
+-type options struct {
+-	KMSSockets   []string
+-	Interval     time.Duration
+-	ReadTimeout  time.Duration
+-	WriteTimeout time.Duration
+-	NodeName     string
+-	Kubeconfig   string
+-
+-	newOperatorClient func(*rest.Config) (v1helpers.OperatorClient, error)
+-}
++// NewEncryptionStatusWriterFunc builds the EncryptionStatusWriter for a target
++// apiserver operator status CR. fieldManager sets the owner in the
++// managedFields when doing SSA.
++type NewEncryptionStatusWriterFunc func(restConfig *rest.Config, fieldManager string) (EncryptionStatusWriter, error)
++
++// EncryptionStatusWriter is capable of applying the
++// KMSEncryptionStatusApplyConfiguration at the correct place in the operator's
++// status.
++type EncryptionStatusWriter func(ctx context.Context, status *applyoperatorv1.KMSEncryptionStatusApplyConfiguration) error
+ 
+ type Config struct {
+-	operatorClient v1helpers.OperatorClient
+-	prober         *prober
++	writeStatus EncryptionStatusWriter
++	prober      *prober
+ 
+ 	interval     time.Duration
+ 	writeTimeout time.Duration
+-	nodeName     string
+ }
+ 
+-func NewCommand(ctx context.Context, newOperatorClient func(*rest.Config) (v1helpers.OperatorClient, error)) *cobra.Command {
++func NewCommand(ctx context.Context, newWriter NewEncryptionStatusWriterFunc) *cobra.Command {
+ 	o := &options{
+-		newOperatorClient: newOperatorClient,
++		newWriter: newWriter,
+ 	}
+ 
+ 	cmd := &cobra.Command{
+@@ -78,80 +74,17 @@ func NewCommand(ctx context.Context, newOperatorClient func(*rest.Config) (v1hel
+ 	return cmd
+ }
+ 
+-func (o *options) addFlags(fs *pflag.FlagSet) {
+-	fs.StringSliceVar(&o.KMSSockets, "kms-sockets", nil, "KMS plugin endpoints in unix:// URI format (e.g. unix:///var/run/kmsplugin/kms-1.sock)")
+-	fs.DurationVar(&o.Interval, "interval", 30*time.Second, "cadence between probe+emit cycles")
+-	fs.DurationVar(&o.ReadTimeout, "read-timeout", 5*time.Second, "deadline for each Status RPC")
+-	fs.DurationVar(&o.WriteTimeout, "write-timeout", 10*time.Second, "deadline for each condition update")
+-	fs.StringVar(&o.NodeName, "node-name", "", "node name recorded in the condition used to help to identify the origin")
+-	fs.StringVar(&o.Kubeconfig, "kubeconfig", "", "path to a kubeconfig; empty uses in-cluster config")
+-}
+-
+-func (o *options) validate() error {
+-	if len(o.KMSSockets) == 0 {
+-		return fmt.Errorf("--kms-sockets is required, at least one")
+-	}
+-	socketSet := sets.New[string]()
+-	for _, s := range o.KMSSockets {
+-		if !kmsSocketPattern.MatchString(s) {
+-			return fmt.Errorf("--kms-sockets entry %q must match %s", s, kmsSocketPattern)
+-		}
+-		if socketSet.Has(s) {
+-			return fmt.Errorf("--kms-sockets entry %q is duplicated", s)
+-		}
+-		socketSet.Insert(s)
+-	}
+-
+-	if o.Interval <= 0 {
+-		return fmt.Errorf("--interval must be positive")
+-	}
+-	if o.ReadTimeout <= 0 {
+-		return fmt.Errorf("--read-timeout must be positive")
+-	}
+-	if o.WriteTimeout <= 0 {
+-		return fmt.Errorf("--write-timeout must be positive")
+-	}
+-	if o.NodeName == "" {
+-		return fmt.Errorf("--node-name is required")
+-	}
+-
+-	return nil
+-}
+-
+-func (o *options) Config(ctx context.Context) (*Config, error) {
+-	// Empty kubeconfig falls back to the in-cluster config (service account
+-	// token + KUBERNETES_SERVICE_HOST), which is the deployed path.
+-	restCfg, err := clientcmd.BuildConfigFromFlags("", o.Kubeconfig)
+-	if err != nil {
+-		return nil, fmt.Errorf("build rest config: %w", err)
+-	}
+-
+-	operatorClient, err := o.newOperatorClient(restCfg)
+-	if err != nil {
+-		return nil, fmt.Errorf("build operator client: %w", err)
+-	}
+-
+-	plugins, err := buildPlugins(ctx, o.KMSSockets, o.ReadTimeout)
+-	if err != nil {
+-		return nil, err
+-	}
+-
+-	return &Config{
+-		operatorClient: operatorClient,
+-		prober:         newProber(plugins),
+-		interval:       o.Interval,
+-		writeTimeout:   o.WriteTimeout,
+-		nodeName:       o.NodeName,
+-	}, nil
+-}
+-
+ func (c *Config) Run(ctx context.Context) error {
+ 	wait.JitterUntilWithContext(ctx, func(ctx context.Context) {
+ 		// Each Status RPC enforces the read timeout internally (set at dial
+ 		// time); ctx here only carries shutdown cancellation.
+-		conditions := c.prober.probeAll(ctx)
+-		// TODO: hand conditions to the writer once it lands; logging is a placeholder.
+-		klog.InfoS("kms plugin health", "conditions", conditions)
++		reports := c.prober.probeAll(ctx)
++
++		writeCtx, cancel := context.WithTimeout(ctx, c.writeTimeout)
++		defer cancel()
++		if err := c.writeStatus(writeCtx, reports); err != nil {
++			klog.ErrorS(err, "failed to publish kms plugin health")
++		}
+ 	}, c.interval, 0.1, false)
+ 
+ 	return nil
+@@ -168,7 +101,7 @@ func buildPlugins(ctx context.Context, sockets []string, timeout time.Duration)
+ 
+ 		// Unique name per plugin so the gRPC client's KMS operation metrics
+ 		// don't merge both plugins into one series.
+-		service, err := k8senvelopekmsv2.NewGRPCService(ctx, socket, Subcommand+"-"+keyID, timeout)
++		service, err := k8senvelopekmsv2.NewGRPCService(ctx, socket, Subcommand, timeout)
+ 		if err != nil {
+ 			// With the current dependency version this should never happen with a validated GRPC endpoint.
+ 			return nil, fmt.Errorf("setting up grpc service failed at %q: %w", socket, err)
+diff --git a/vendor/github.com/openshift/library-go/pkg/operator/encryption/kms/health/options.go b/vendor/github.com/openshift/library-go/pkg/operator/encryption/kms/health/options.go
+new file mode 100644
+index 000000000..68c11ea78
+--- /dev/null
++++ b/vendor/github.com/openshift/library-go/pkg/operator/encryption/kms/health/options.go
+@@ -0,0 +1,102 @@
++package health
++
++import (
++	"context"
++	"fmt"
++	"time"
++
++	"github.com/spf13/pflag"
++
++	metav1validation "k8s.io/apimachinery/pkg/apis/meta/v1/validation"
++	"k8s.io/apimachinery/pkg/util/sets"
++	"k8s.io/client-go/tools/clientcmd"
++)
++
++// options' flag-bound fields are exported so the struct can be logged as a
++// whole via klog.InfoS, which JSON-marshals its values.
++type options struct {
++	KMSSockets   []string
++	Interval     time.Duration
++	ReadTimeout  time.Duration
++	WriteTimeout time.Duration
++	NodeName     string
++	Kubeconfig   string
++
++	newWriter NewEncryptionStatusWriterFunc
++}
++
++func (o *options) addFlags(fs *pflag.FlagSet) {
++	fs.StringSliceVar(&o.KMSSockets, "kms-sockets", nil, "KMS plugin endpoints in unix:// URI format (e.g. unix:///var/run/kmsplugin/kms-1.sock)")
++	fs.DurationVar(&o.Interval, "interval", 30*time.Second, "cadence between probe+emit cycles")
++	fs.DurationVar(&o.ReadTimeout, "read-timeout", 5*time.Second, "deadline for each Status RPC")
++	fs.DurationVar(&o.WriteTimeout, "write-timeout", 10*time.Second, "deadline for each condition update")
++	fs.StringVar(&o.NodeName, "node-name", "", "identifier for this reporter: must be unique among reporters writing to the same operator CR")
++	fs.StringVar(&o.Kubeconfig, "kubeconfig", "", "path to a kubeconfig; empty uses in-cluster config")
++}
++
++func (o *options) validate() error {
++	if len(o.KMSSockets) == 0 {
++		return fmt.Errorf("--kms-sockets is required, at least one")
++	}
++	socketSet := sets.New[string]()
++	for _, s := range o.KMSSockets {
++		if !kmsSocketPattern.MatchString(s) {
++			return fmt.Errorf("--kms-sockets entry %q must match %s", s, kmsSocketPattern)
++		}
++		if socketSet.Has(s) {
++			return fmt.Errorf("--kms-sockets entry %q is duplicated", s)
++		}
++		socketSet.Insert(s)
++	}
++
++	if o.Interval <= 0 {
++		return fmt.Errorf("--interval must be positive")
++	}
++	if o.ReadTimeout <= 0 {
++		return fmt.Errorf("--read-timeout must be positive")
++	}
++	if o.WriteTimeout <= 0 {
++		return fmt.Errorf("--write-timeout must be positive")
++	}
++	if o.NodeName == "" {
++		return fmt.Errorf("--node-name is required")
++	}
++	if fieldManager := fmt.Sprintf("%s-%s", Subcommand, o.NodeName); len(fieldManager) > metav1validation.FieldManagerMaxLength {
++		return fmt.Errorf("--node-name too long: reporter identity %q is %d chars, exceeds the %d-char fieldManager limit", fieldManager, len(fieldManager), metav1validation.FieldManagerMaxLength)
++	}
++
++	return nil
++}
++
++func (o *options) Config(ctx context.Context) (*Config, error) {
++	// Empty kubeconfig falls back to the in-cluster config (service account
++	// token + KUBERNETES_SERVICE_HOST), which is the deployed path.
++	restCfg, err := clientcmd.BuildConfigFromFlags("", o.Kubeconfig)
++	if err != nil {
++		return nil, fmt.Errorf("build rest config: %w", err)
++	}
++
++	// fieldManager is this reporter's SSA ownership identity: apply tracks
++	// ownership per manager. Reporters sharing one would fight over the same
++	// CR status.
++	// kube-apiserver runs one reporter per node: node-name must be unique!
++	// single-reporter operators, like oauth- / openshift-apiserver, can pass
++	// any constant value.
++	fieldManager := fmt.Sprintf("%s-%s", Subcommand, o.NodeName)
++	writeStatus, err := o.newWriter(restCfg, fieldManager)
++	if err != nil {
++		return nil, fmt.Errorf("build encryption status writer: %w", err)
++	}
++
++	plugins, err := buildPlugins(ctx, o.KMSSockets, o.ReadTimeout)
++	if err != nil {
++		return nil, err
++	}
++
++	return &Config{
++		writeStatus:  writeStatus,
++		prober:       newProber(o.NodeName, plugins),
++		interval:     o.Interval,
++		writeTimeout: o.WriteTimeout,
++	}, nil
++}
+diff --git a/vendor/github.com/openshift/library-go/pkg/operator/encryption/kms/health/prober.go b/vendor/github.com/openshift/library-go/pkg/operator/encryption/kms/health/prober.go
+index 84db02fe1..55f05edb4 100644
+--- a/vendor/github.com/openshift/library-go/pkg/operator/encryption/kms/health/prober.go
++++ b/vendor/github.com/openshift/library-go/pkg/operator/encryption/kms/health/prober.go
+@@ -2,31 +2,22 @@ package health
+ 
+ import (
+ 	"context"
++	"errors"
+ 	"sync"
+ 	"time"
+ 
++	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+ 	kmsservice "k8s.io/kms/pkg/service"
++
++	operatorv1 "github.com/openshift/api/operator/v1"
++	applyoperatorv1 "github.com/openshift/client-go/operator/applyconfigurations/operator/v1"
+ )
+ 
+ // healthzOK is the value the KMS plugin returns when healthy.
+ // See https://github.com/kubernetes/kubernetes/blob/master/staging/src/k8s.io/kms/apis/v2/api.proto#L39
+ const healthzOK = "ok"
+ 
+-const (
+-	statusHealthy   = "healthy"
+-	statusUnhealthy = "unhealthy"
+-	statusError     = "error"
+-)
+-
+-type pluginHealthReport struct {
+-	// KeyID is the controller's sequential key id; KEKID is the KMS provider's
+-	// encryption key id. Distinct identifiers, easy to confuse.
+-	KeyID       string
+-	KEKID       string
+-	Status      string
+-	LastChecked time.Time
+-	Detail      string
+-}
++var errResponseless error = errors.New("kms plugin returned nil status response")
+ 
+ // pluginClient is the dialed handle to one co-located KMS plugin; the plugin
+ // itself is a separate process behind the unix socket.
+@@ -36,14 +27,16 @@ type pluginClient struct {
+ }
+ 
+ type prober struct {
+-	plugins []pluginClient
+-	now     func() time.Time
++	nodeName string
++	plugins  []pluginClient
++	now      func() time.Time
+ }
+ 
+-func newProber(plugins []pluginClient) *prober {
++func newProber(nodeName string, plugins []pluginClient) *prober {
+ 	return &prober{
+-		plugins: plugins,
+-		now:     time.Now,
++		nodeName: nodeName,
++		plugins:  plugins,
++		now:      time.Now,
+ 	}
+ }
+ 
+@@ -51,8 +44,8 @@ func newProber(plugins []pluginClient) *prober {
+ // with Status "error" so the caller always gets one entry per plugin.
+ // Probes run concurrently so one hung plugin doesn't delay the others;
+ // worst-case duration is one read-timeout, not the sum.
+-func (p *prober) probeAll(ctx context.Context) []pluginHealthReport {
+-	reports := make([]pluginHealthReport, len(p.plugins))
++func (p *prober) probeAll(ctx context.Context) *applyoperatorv1.KMSEncryptionStatusApplyConfiguration {
++	reports := make([]*applyoperatorv1.KMSPluginHealthReportApplyConfiguration, len(p.plugins))
+ 
+ 	var wg sync.WaitGroup
+ 	for i, plugin := range p.plugins {
+@@ -62,31 +55,31 @@ func (p *prober) probeAll(ctx context.Context) []pluginHealthReport {
+ 	}
+ 	wg.Wait()
+ 
+-	return reports
++	return applyoperatorv1.KMSEncryptionStatus().WithHealthReports(reports...)
+ }
+ 
+-func (p *prober) probe(ctx context.Context, plugin pluginClient) pluginHealthReport {
+-	report := pluginHealthReport{
+-		KeyID:       plugin.keyID,
+-		LastChecked: p.now(),
+-	}
++func (p *prober) probe(ctx context.Context, plugin pluginClient) *applyoperatorv1.KMSPluginHealthReportApplyConfiguration {
++	report := applyoperatorv1.KMSPluginHealthReport().
++		WithNodeName(p.nodeName).
++		WithKeyId(plugin.keyID).
++		WithLastCheckedTime(metav1.NewTime(p.now()))
+ 
+ 	resp, err := plugin.service.Status(ctx)
+ 	switch {
+ 	case err != nil:
+-		report.Status = statusError
+-		report.Detail = err.Error()
++		report.WithStatus(operatorv1.KMSPluginHealthStatusError).
++			WithDetail(err.Error())
+ 	case resp == nil:
+ 		// The in-tree gRPC client never returns (nil, nil), but a misbehaving
+ 		// plugin must not panic the reporter.
+-		report.Status = statusError
+-		report.Detail = "kms plugin returned nil status response"
++		report.WithStatus(operatorv1.KMSPluginHealthStatusError).
++			WithDetail(errResponseless.Error())
+ 	case resp.Healthz == healthzOK:
+-		report.Status = statusHealthy
+-		report.KEKID = resp.KeyID
++		report.WithStatus(operatorv1.KMSPluginHealthStatusHealthy).
++			WithKEKId(resp.KeyID)
+ 	default:
+-		report.Status = statusUnhealthy
+-		report.Detail = resp.Healthz
++		report.WithStatus(operatorv1.KMSPluginHealthStatusUnhealthy).
++			WithDetail(resp.Healthz)
+ 	}
+ 
+ 	return report
+diff --git a/vendor/github.com/openshift/library-go/pkg/operator/encryption/kms/health/writers/writers.go b/vendor/github.com/openshift/library-go/pkg/operator/encryption/kms/health/writers/writers.go
+new file mode 100644
+index 000000000..5a866e68c
+--- /dev/null
++++ b/vendor/github.com/openshift/library-go/pkg/operator/encryption/kms/health/writers/writers.go
+@@ -0,0 +1,85 @@
++// Package writers provides the per-operator EncryptionStatusWriter
++// implementations for the KMS health reporter.
++//
++// The health package builds the shared leaf (KMSEncryptionStatus) and ships the
++// reporter command; each apiserver operator nests that leaf into a different
++// status CR. These constructors carry that per-operator placement so an operator
++// wires one function into health.NewCommand instead of hand-rolling the apply.
++package writers
++
++import (
++	"context"
++
++	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
++	"k8s.io/client-go/rest"
++
++	applyoperatorv1 "github.com/openshift/client-go/operator/applyconfigurations/operator/v1"
++	operatorclient "github.com/openshift/client-go/operator/clientset/versioned"
++
++	"github.com/openshift/library-go/pkg/operator/encryption/kms/health"
++)
++
++// NewAuthenticationWriter writes into Authentication/cluster at
++// .status.oauthAPIServer.encryptionStatus. The auth operator manages the
++// oauth-apiserver. There is an extra hop the other two operators don't have.
++func NewAuthenticationWriter(restConfig *rest.Config, fieldManager string) (health.EncryptionStatusWriter, error) {
++	client, err := operatorclient.NewForConfig(restConfig)
++	if err != nil {
++		return nil, err
++	}
++
++	return func(ctx context.Context, status *applyoperatorv1.KMSEncryptionStatusApplyConfiguration) error {
++		_, err := client.OperatorV1().Authentications().ApplyStatus(
++			ctx,
++			applyoperatorv1.Authentication("cluster").WithStatus(
++				applyoperatorv1.AuthenticationStatus().WithOAuthAPIServer(
++					applyoperatorv1.OAuthAPIServerStatus().WithEncryptionStatus(status),
++				),
++			),
++
++			metav1.ApplyOptions{FieldManager: fieldManager, Force: true},
++		)
++		return err
++	}, nil
++}
++
++// NewKubeAPIServerWriter writes into KubeAPIServer/cluster at
++// .status.encryptionStatus.
++func NewKubeAPIServerWriter(restConfig *rest.Config, fieldManager string) (health.EncryptionStatusWriter, error) {
++	client, err := operatorclient.NewForConfig(restConfig)
++	if err != nil {
++		return nil, err
++	}
++
++	return func(ctx context.Context, status *applyoperatorv1.KMSEncryptionStatusApplyConfiguration) error {
++		_, err := client.OperatorV1().KubeAPIServers().ApplyStatus(
++			ctx,
++			applyoperatorv1.KubeAPIServer("cluster").WithStatus(
++				applyoperatorv1.KubeAPIServerStatus().WithEncryptionStatus(status),
++			),
++			metav1.ApplyOptions{FieldManager: fieldManager, Force: true},
++		)
++		return err
++	}, nil
++}
++
++// NewOpenShiftAPIServerWriter writes into OpenShiftAPIServer/cluster at
++// .status.encryptionStatus.
++func NewOpenShiftAPIServerWriter(restConfig *rest.Config, fieldManager string) (health.EncryptionStatusWriter, error) {
++	client, err := operatorclient.NewForConfig(restConfig)
++	if err != nil {
++		return nil, err
++	}
++
++	return func(ctx context.Context, status *applyoperatorv1.KMSEncryptionStatusApplyConfiguration) error {
++		_, err := client.OperatorV1().OpenShiftAPIServers().ApplyStatus(
++			ctx,
++			applyoperatorv1.OpenShiftAPIServer("cluster").WithStatus(
++				applyoperatorv1.OpenShiftAPIServerStatus().WithEncryptionStatus(status),
++			),
++
++			metav1.ApplyOptions{FieldManager: fieldManager, Force: true},
++		)
++		return err
++	}, nil
++}
+diff --git a/vendor/github.com/openshift/library-go/pkg/operator/encryption/kms/preflight/assets/kms-preflight-pod.yaml b/vendor/github.com/openshift/library-go/pkg/operator/encryption/kms/preflight/assets/kms-preflight-pod.yaml
+index a9990d184..ccec6965f 100644
+--- a/vendor/github.com/openshift/library-go/pkg/operator/encryption/kms/preflight/assets/kms-preflight-pod.yaml
++++ b/vendor/github.com/openshift/library-go/pkg/operator/encryption/kms/preflight/assets/kms-preflight-pod.yaml
+@@ -12,7 +12,9 @@ spec:
+   # This is a one-shot preflight check, not a long-running pod.
+   # The operator creates it, waits for completion, and inspects the result.
+   restartPolicy: Never
++{{- if not .StaticPod}}
+   serviceAccountName: kms-preflight
++{{- end}}
+   priorityClassName: system-cluster-critical
+   nodeSelector:
+     node-role.kubernetes.io/master: ""
+@@ -24,6 +26,13 @@ spec:
+     - key: "node-role.kubernetes.io/master"
+       operator: "Exists"
+       effect: "NoExecute"
++{{- if .StaticPod}}
++  hostNetwork: true
++  volumes:
++    - name: resource-dir
++      hostPath:
++        path: /etc/kubernetes/manifests
++{{- end}}
+   containers:
+     - name: kms-preflight-check
+       image: {{.OperatorImage}}
+@@ -32,8 +41,10 @@ spec:
+         - --kms-call-timeout={{.KMSCallTimeout}}
+         - --config-hash=$(CONFIG_HASH)
+         - --pod-name=$(POD_NAME)
+-        - --pod-namespace=$(POD_NAMESPACE){{if .Kubeconfig}}
+-        - --kubeconfig={{.Kubeconfig}}{{end}}
++        - --pod-namespace=$(POD_NAMESPACE)
++{{- if .StaticPod}}
++        - --kubeconfig=/etc/kubernetes/static-pod-resources/secrets/kms-preflight-encryption-config/lb-int.kubeconfig
++{{- end}}
+       env:
+       - name: POD_NAME
+         valueFrom: { fieldRef: { fieldPath: metadata.name } }
+@@ -46,3 +57,11 @@ spec:
+         requests:
+           memory: 50Mi
+           cpu: 5m
++{{- if .StaticPod}}
++      securityContext:
++        runAsUser: 0
++      volumeMounts:
++        - name: resource-dir
++          mountPath: /etc/kubernetes/static-pod-resources
++          readOnly: true
++{{- end}}
+diff --git a/vendor/github.com/openshift/library-go/pkg/operator/encryption/kms/preflight/deployer.go b/vendor/github.com/openshift/library-go/pkg/operator/encryption/kms/preflight/deployer.go
+index 2b6582520..c6c2f349f 100644
+--- a/vendor/github.com/openshift/library-go/pkg/operator/encryption/kms/preflight/deployer.go
++++ b/vendor/github.com/openshift/library-go/pkg/operator/encryption/kms/preflight/deployer.go
+@@ -75,7 +75,6 @@ func (d *PodPreflightDeployer) Deploy(ctx context.Context, configHash string, en
+ 		d.operatorImage,
+ 		d.operatorCommand,
+ 		d.kmsCallTimeout,
+-		"",
+ 	)
+ 	if err != nil {
+ 		return fmt.Errorf("failed to generate preflight pod template: %w", err)
+diff --git a/vendor/github.com/openshift/library-go/pkg/operator/encryption/kms/preflight/pod_template.go b/vendor/github.com/openshift/library-go/pkg/operator/encryption/kms/preflight/pod_template.go
+index 3c079ff09..1fc78f0ba 100644
+--- a/vendor/github.com/openshift/library-go/pkg/operator/encryption/kms/preflight/pod_template.go
++++ b/vendor/github.com/openshift/library-go/pkg/operator/encryption/kms/preflight/pod_template.go
+@@ -19,38 +19,78 @@ type kmsPreflightTemplate struct {
+ 	OperatorImage  string
+ 	Command        string
+ 	KMSCallTimeout string
+-	Kubeconfig     string
++	StaticPod      bool
+ }
+ 
+-// generatePodTemplate renders the KMS preflight pod YAML template.
+-// The pod runs the preflight checker as a one-shot command and shares an emptyDir
+-// volume with the KMS plugin sidecar at /var/run/kmsplugin.
+-func generatePodTemplate(
++func newKmsPreflightTemplate(
+ 	podName string,
+ 	namespace string,
+ 	configHash string,
+ 	operatorImage string,
+ 	operatorCommand []string,
+ 	kmsCallTimeout time.Duration,
+-	kubeconfig string,
+-) (*corev1.Pod, error) {
+-	rawManifest := mustAsset("assets/kms-preflight-pod.yaml")
+-
++	staticPod bool,
++) kmsPreflightTemplate {
+ 	operatorCommandQuoted := make([]string, len(operatorCommand))
+ 	for i, cmd := range operatorCommand {
+ 		operatorCommandQuoted[i] = fmt.Sprintf("%q", cmd)
+ 	}
+ 
+-	tmplVal := kmsPreflightTemplate{
++	return kmsPreflightTemplate{
+ 		PodName:        podName,
+ 		Namespace:      namespace,
+ 		ConfigHash:     configHash,
+ 		OperatorImage:  operatorImage,
+ 		Command:        strings.Join(operatorCommandQuoted, ","),
+ 		KMSCallTimeout: kmsCallTimeout.String(),
+-		Kubeconfig:     kubeconfig,
++		StaticPod:      staticPod,
+ 	}
+-	tmpl, err := template.New("kms-preflight").Parse(string(rawManifest))
++}
++
++// generatePodTemplate renders the KMS preflight pod YAML template.
++// The pod runs the preflight checker as a one-shot command and shares an emptyDir
++// volume with the KMS plugin sidecar at /var/run/kmsplugin.
++func generatePodTemplate(
++	podName string,
++	namespace string,
++	configHash string,
++	operatorImage string,
++	operatorCommand []string,
++	kmsCallTimeout time.Duration,
++) (*corev1.Pod, error) {
++	return renderPreflightPodTemplate(podName, namespace, configHash, operatorImage, operatorCommand, kmsCallTimeout, false)
++}
++
++// generateStaticPodTemplate renders the KMS preflight static pod YAML template.
++func generateStaticPodTemplate(
++	podName string,
++	namespace string,
++	configHash string,
++	operatorImage string,
++	operatorCommand []string,
++	kmsCallTimeout time.Duration,
++) (*corev1.Pod, error) {
++	return renderPreflightPodTemplate(podName, namespace, configHash, operatorImage, operatorCommand, kmsCallTimeout, true)
++}
++
++func renderPreflightPodTemplate(
++	podName string,
++	namespace string,
++	configHash string,
++	operatorImage string,
++	operatorCommand []string,
++	kmsCallTimeout time.Duration,
++	staticPod bool,
++) (*corev1.Pod, error) {
++	rawManifest := mustAsset("assets/kms-preflight-pod.yaml")
++	tmplVal := newKmsPreflightTemplate(
++		podName, namespace, configHash, operatorImage, operatorCommand, kmsCallTimeout, staticPod,
++	)
++	return renderPodTemplate("kms-preflight", string(rawManifest), tmplVal)
++}
++
++func renderPodTemplate(name, rawManifest string, tmplVal any) (*corev1.Pod, error) {
++	tmpl, err := template.New(name).Parse(rawManifest)
+ 	if err != nil {
+ 		return nil, err
+ 	}
+diff --git a/vendor/github.com/openshift/library-go/test/library/encryption/helpers.go b/vendor/github.com/openshift/library-go/test/library/encryption/helpers.go
+index e0f836bee..b63ef98ed 100644
+--- a/vendor/github.com/openshift/library-go/test/library/encryption/helpers.go
++++ b/vendor/github.com/openshift/library-go/test/library/encryption/helpers.go
+@@ -7,6 +7,7 @@ import (
+ 	"sort"
+ 	"strconv"
+ 	"strings"
++	"sync"
+ 	"testing"
+ 	"time"
+ 
+@@ -475,3 +476,35 @@ func WaitForCurrentKeyMigrated(t testing.TB, kubeClient kubernetes.Interface, pr
+ 		require.NoError(t, newErr)
+ 	}
+ }
++
++// inParallel returns a single testStep that runs the given steps
++// concurrently and waits for all to finish before returning.
++// Panics are caught and reported via t.Errorf. Failures from
++// t.FailNow/require (runtime.Goexit) are handled naturally since
++// the testing framework already records the error on t.
++func inParallel(steps ...testStep) testStep {
++	if len(steps) == 1 {
++		return steps[0]
++	}
++	names := make([]string, len(steps))
++	for i, s := range steps {
++		names[i] = s.name
++	}
++	return testStep{
++		name: strings.Join(names, " | "),
++		testFunc: func(t testing.TB) {
++			var wg sync.WaitGroup
++			for _, s := range steps {
++				wg.Go(func() {
++					defer func() {
++						if r := recover(); r != nil {
++							t.Errorf("step %q panicked: %v", s.name, r)
++						}
++					}()
++					s.testFunc(t)
++				})
++			}
++			wg.Wait()
++		},
++	}
++}
+diff --git a/vendor/modules.txt b/vendor/modules.txt
+index e6eb00152..56b2a00fe 100644
+--- a/vendor/modules.txt
++++ b/vendor/modules.txt
+@@ -429,7 +429,7 @@ github.com/openshift/client-go/operatorcontrolplane/informers/externalversions/i
+ github.com/openshift/client-go/operatorcontrolplane/informers/externalversions/operatorcontrolplane
+ github.com/openshift/client-go/operatorcontrolplane/informers/externalversions/operatorcontrolplane/v1alpha1
+ github.com/openshift/client-go/operatorcontrolplane/listers/operatorcontrolplane/v1alpha1
+-# github.com/openshift/library-go v0.0.0-20260702085952-fd74bb5c4240
++# github.com/openshift/library-go v0.0.0-20260709124617-64c3ee5daeea
+ ## explicit; go 1.25.0
+ github.com/openshift/library-go/pkg/apiserver/jsonpatch
+ github.com/openshift/library-go/pkg/apps/deployment
+@@ -471,6 +471,7 @@ github.com/openshift/library-go/pkg/operator/encryption/encoding
+ github.com/openshift/library-go/pkg/operator/encryption/encryptiondata
+ github.com/openshift/library-go/pkg/operator/encryption/encryptiondata/testing
+ github.com/openshift/library-go/pkg/operator/encryption/kms/health
++github.com/openshift/library-go/pkg/operator/encryption/kms/health/writers
+ github.com/openshift/library-go/pkg/operator/encryption/kms/pluginlifecycle
+ github.com/openshift/library-go/pkg/operator/encryption/kms/preflight
+ github.com/openshift/library-go/pkg/operator/encryption/observer

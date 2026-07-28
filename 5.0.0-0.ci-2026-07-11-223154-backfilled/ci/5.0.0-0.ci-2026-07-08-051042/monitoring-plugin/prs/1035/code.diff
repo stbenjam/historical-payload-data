@@ -1,0 +1,137 @@
+diff --git a/web/src/components/Incidents/processAlerts.spec.ts b/web/src/components/Incidents/processAlerts.spec.ts
+index 8c424a72d..011e8aaba 100644
+--- a/web/src/components/Incidents/processAlerts.spec.ts
++++ b/web/src/components/Incidents/processAlerts.spec.ts
+@@ -275,9 +275,9 @@ describe('convertToAlerts', () => {
+     });
+ 
+     it('should mark alert as firing if ended less than 10 minutes ago', () => {
+-      const recentTimestamp = nowSeconds - 840; // 14 minutes ago
+-      // After padding (+300s), last timestamp will be 9 minutes ago (840-300=540s ago)
+-      // which is < 10 minutes, so it should still be firing
++      // Resolution is determined from original (pre-padding) timestamps.
++      // 9 minutes ago is < 10-minute threshold, so it should still be firing.
++      const recentTimestamp = nowSeconds - 540;
+ 
+       const prometheusResults: PrometheusResult[] = [
+         {
+diff --git a/web/src/components/Incidents/processAlerts.ts b/web/src/components/Incidents/processAlerts.ts
+index 2f11b4218..acb8aca41 100644
+--- a/web/src/components/Incidents/processAlerts.ts
++++ b/web/src/components/Incidents/processAlerts.ts
+@@ -239,8 +239,8 @@ export function convertToAlerts(
+ 
+       // Determine resolved status based on original values before padding
+       const sortedValues = values.sort((a, b) => a[0] - b[0]);
+-      let lastTimestamp = sortedValues[sortedValues.length - 1][0];
+-      const resolved = isResolved(lastTimestamp, currentTime);
++      const lastOriginalTimestamp = sortedValues[sortedValues.length - 1][0];
++      const resolved = isResolved(lastOriginalTimestamp, currentTime);
+ 
+       // Find the associated incident, if it's one of the select ones
+       // Since incidents are already merged by (group_id, src_alertname, src_namespace, src_severity),
+@@ -260,7 +260,7 @@ export function convertToAlerts(
+       // Add padding points for chart rendering
+       const paddedValues = insertPaddingPointsForChart(sortedValues, currentTime);
+       const firstTimestamp = paddedValues[0][0];
+-      lastTimestamp = paddedValues[paddedValues.length - 1][0];
++      const lastTimestamp = paddedValues[paddedValues.length - 1][0];
+ 
+       return {
+         alertname: alert.metric.alertname,
+diff --git a/web/src/components/dashboards/legacy/variable-utils.spec.ts b/web/src/components/dashboards/legacy/variable-utils.spec.ts
+index 41243df70..65a5eae16 100644
+--- a/web/src/components/dashboards/legacy/variable-utils.spec.ts
++++ b/web/src/components/dashboards/legacy/variable-utils.spec.ts
+@@ -1,3 +1,7 @@
++jest.mock('@openshift-console/dynamic-plugin-sdk', () => ({
++  ...jest.requireActual('@openshift-console/dynamic-plugin-sdk/lib/api/common-types'),
++}));
++
+ import { evaluateVariableTemplate, Variable } from './variable-utils';
+ import { MONITORING_DASHBOARDS_VARIABLE_ALL_OPTION_KEY } from './utils';
+ 
+diff --git a/web/src/components/dashboards/legacy/variable-utils.ts b/web/src/components/dashboards/legacy/variable-utils.ts
+index 461b10e11..ccf0203c6 100644
+--- a/web/src/components/dashboards/legacy/variable-utils.ts
++++ b/web/src/components/dashboards/legacy/variable-utils.ts
+@@ -5,7 +5,9 @@ import { ALL_NAMESPACES_KEY } from '../../utils';
+ const intervalVariableRegExps = ['__interval', '__rate_interval', '__auto_interval_[a-z]+'];
+ 
+ export const isIntervalVariable = (itemKey: string): boolean =>
+-  _.some(intervalVariableRegExps, (re) => itemKey?.match(new RegExp(`\\$${re}`, 'g')));
++  _.some(intervalVariableRegExps, (re) =>
++    itemKey?.match(new RegExp(`\\$${re}(?![a-zA-Z0-9_])`, 'g')),
++  );
+ 
+ export type Variable = {
+   isHidden?: boolean;
+@@ -62,7 +64,7 @@ export const evaluateVariableTemplate = (
+ 
+   let result = template;
+   _.each(allVariables, (v, k) => {
+-    const re = new RegExp(`\\$${k}`, 'g');
++    const re = new RegExp(`\\$${k}(?![a-zA-Z0-9_])`, 'g');
+     if (result.match(re)) {
+       if (v.isLoading) {
+         result = undefined;
+diff --git a/web/src/components/utils.spec.ts b/web/src/components/utils.spec.ts
+index e722c6534..f506915d7 100644
+--- a/web/src/components/utils.spec.ts
++++ b/web/src/components/utils.spec.ts
+@@ -60,23 +60,23 @@ describe('severitySort', () => {
+   });
+ 
+   it('should sort critical above warning', () => {
+-    expect(severitySort(makeSeverity('critical'), makeSeverity('warning'))).toBeGreaterThan(0);
+-    expect(severitySort(makeSeverity('warning'), makeSeverity('critical'))).toBeLessThan(0);
++    expect(severitySort(makeSeverity('critical'), makeSeverity('warning'))).toBeLessThan(0);
++    expect(severitySort(makeSeverity('warning'), makeSeverity('critical'))).toBeGreaterThan(0);
+   });
+ 
+   it('should sort warning above info', () => {
+-    expect(severitySort(makeSeverity('warning'), makeSeverity('info'))).toBeGreaterThan(0);
+-    expect(severitySort(makeSeverity('info'), makeSeverity('warning'))).toBeLessThan(0);
++    expect(severitySort(makeSeverity('warning'), makeSeverity('info'))).toBeLessThan(0);
++    expect(severitySort(makeSeverity('info'), makeSeverity('warning'))).toBeGreaterThan(0);
+   });
+ 
+   it('should sort critical above none', () => {
+-    expect(severitySort(makeSeverity('critical'), makeSeverity('none'))).toBeGreaterThan(0);
+-    expect(severitySort(makeSeverity('none'), makeSeverity('critical'))).toBeLessThan(0);
++    expect(severitySort(makeSeverity('critical'), makeSeverity('none'))).toBeLessThan(0);
++    expect(severitySort(makeSeverity('none'), makeSeverity('critical'))).toBeGreaterThan(0);
+   });
+ 
+   it('should sort info above none', () => {
+-    expect(severitySort(makeSeverity('info'), makeSeverity('none'))).toBeGreaterThan(0);
+-    expect(severitySort(makeSeverity('none'), makeSeverity('info'))).toBeLessThan(0);
++    expect(severitySort(makeSeverity('info'), makeSeverity('none'))).toBeLessThan(0);
++    expect(severitySort(makeSeverity('none'), makeSeverity('info'))).toBeGreaterThan(0);
+   });
+ 
+   it('should handle objects with severity property (AggregatedAlert shape)', () => {
+@@ -84,13 +84,13 @@ describe('severitySort', () => {
+     const a = { severity: AlertSeverity.Critical } as any;
+     // eslint-disable-next-line @typescript-eslint/no-explicit-any
+     const b = { severity: AlertSeverity.Warning } as any;
+-    expect(severitySort(a, b)).toBeGreaterThan(0);
++    expect(severitySort(a, b)).toBeLessThan(0);
+   });
+ 
+   it('should handle missing severity labels as empty string', () => {
+     const noSeverity = { labels: {} } as unknown as Rule;
+     const withSeverity = makeSeverity('critical');
+-    expect(severitySort(withSeverity, noSeverity)).toBeGreaterThan(0);
++    expect(severitySort(withSeverity, noSeverity)).toBeLessThan(0);
+   });
+ 
+   it('should produce a stable sort order across all known severities', () => {
+@@ -102,6 +102,6 @@ describe('severitySort', () => {
+     ];
+     const sorted = [...items].sort(severitySort);
+     const severities = sorted.map((i) => i.labels.severity);
+-    expect(severities).toEqual(['none', 'info', 'warning', 'critical']);
++    expect(severities).toEqual(['critical', 'warning', 'info', 'none']);
+   });
+ });

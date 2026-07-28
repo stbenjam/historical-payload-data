@@ -1,0 +1,597 @@
+diff --git a/test/extended/edge_topologies/tnf_taint.go b/test/extended/edge_topologies/tnf_taint.go
+new file mode 100644
+index 000000000000..2ca15c4808bf
+--- /dev/null
++++ b/test/extended/edge_topologies/tnf_taint.go
+@@ -0,0 +1,386 @@
++package edge_topologies
++
++import (
++	"fmt"
++	"math/rand"
++	"strings"
++	"sync"
++	"time"
++
++	g "github.com/onsi/ginkgo/v2"
++	o "github.com/onsi/gomega"
++	v1 "github.com/openshift/api/config/v1"
++	"github.com/openshift/origin/test/extended/edge_topologies/utils"
++	"github.com/openshift/origin/test/extended/edge_topologies/utils/services"
++	"github.com/openshift/origin/test/extended/etcd/helpers"
++	exutil "github.com/openshift/origin/test/extended/util"
++	corev1 "k8s.io/api/core/v1"
++	"k8s.io/kubernetes/test/e2e/framework"
++)
++
++const (
++	taintAppliedTimeout = 5 * time.Minute
++	taintRemovedTimeout = 10 * time.Minute
++	journalCheckTimeout = 2 * time.Minute
++)
++
++// checkJournalOnNodes searches the systemd journal on the given nodes for a log
++// entry matching the tag and pattern, returning true if found on any node.
++func checkJournalOnNodes(oc *exutil.CLI, nodes []corev1.Node, tag, pattern, since string) bool {
++	for _, node := range nodes {
++		output, err := services.JournalGrepViaDebug(oc, node.Name, tag, pattern, since)
++		if err != nil {
++			framework.Logf("Warning: journal grep failed on %s: %v", node.Name, err)
++			continue
++		}
++		if strings.TrimSpace(output) != "" {
++			framework.Logf("Journal match on %s (tag=%s): %s", node.Name, tag, strings.TrimSpace(output))
++			return true
++		}
++	}
++	return false
++}
++
++// taintObserver polls both nodes for the out-of-service taint and annotation in
++// a background goroutine so the test can detect transient taints that are applied
++// and removed while other validations (e.g. etcd recovery) are still in progress.
++type taintObserver struct {
++	oc       *exutil.CLI
++	nodes    []string
++	interval time.Duration
++
++	mu                 sync.Mutex
++	taintedNode        string
++	observed           bool
++	annotationObserved bool
++	stopCh             chan struct{}
++	stopOnce           sync.Once
++}
++
++func newTaintObserver(oc *exutil.CLI, nodes []string, interval time.Duration) *taintObserver {
++	return &taintObserver{
++		oc:       oc,
++		nodes:    nodes,
++		interval: interval,
++		stopCh:   make(chan struct{}),
++	}
++}
++
++func (t *taintObserver) Start() {
++	go func() {
++		for {
++			select {
++			case <-t.stopCh:
++				return
++			default:
++				for _, name := range t.nodes {
++					node, err := services.FetchNodeObject(t.oc, name)
++					if err != nil {
++						continue
++					}
++					if services.HasOutOfServiceTaint(node) {
++						t.mu.Lock()
++						if !t.observed {
++							framework.Logf("taintObserver: detected out-of-service taint on %s", name)
++						}
++						t.taintedNode = name
++						t.observed = true
++						if services.HasOutOfServiceAnnotation(node) {
++							if !t.annotationObserved {
++								framework.Logf("taintObserver: detected out-of-service annotation on %s", name)
++							}
++							t.annotationObserved = true
++						}
++						t.mu.Unlock()
++					}
++				}
++				time.Sleep(t.interval)
++			}
++		}
++	}()
++}
++
++func (t *taintObserver) Stop() {
++	t.stopOnce.Do(func() { close(t.stopCh) })
++}
++
++func (t *taintObserver) WasTaintObserved() (nodeName string, observed bool) {
++	t.mu.Lock()
++	defer t.mu.Unlock()
++	return t.taintedNode, t.observed
++}
++
++func (t *taintObserver) WasAnnotationObserved() bool {
++	t.mu.Lock()
++	defer t.mu.Unlock()
++	return t.annotationObserved
++}
++
++var _ = g.Describe("[sig-node][apigroup:config.openshift.io][OCPFeatureGate:DualReplica][Suite:openshift/two-node] Two Node with Fencing taint safety", func() {
++	defer g.GinkgoRecover()
++
++	var (
++		oc = exutil.NewCLIWithoutNamespace("").AsAdmin()
++	)
++
++	g.BeforeEach(func() {
++		utils.SkipIfNotTopology(oc, v1.DualReplicaTopologyMode)
++
++		// Skip the test if cluster version is below 5.0, as fencing taint was introduced in that version
++		utils.SkipIfVersionBelow(oc, 5, 0)
++	})
++
++	g.It("should have pacemaker taint and untaint alerts registered", func() {
++		nodes, err := utils.GetNodes(oc, utils.LabelNodeRoleControlPlane)
++		o.Expect(err).ShouldNot(o.HaveOccurred(), "Expected to retrieve control-plane nodes")
++		o.Expect(nodes.Items).NotTo(o.BeEmpty(), "Expected at least one control-plane node")
++
++		execNode := nodes.Items[0]
++
++		g.By("Checking pacemaker alert configuration")
++		alertOutput, err := services.PcsAlertConfigViaDebug(oc, execNode.Name)
++		o.Expect(err).ToNot(o.HaveOccurred(), "Expected pcs alert config to succeed")
++
++		o.Expect(alertOutput).To(o.ContainSubstring(services.TaintAlertID),
++			fmt.Sprintf("Expected pacemaker alert %s to be registered", services.TaintAlertID))
++		o.Expect(alertOutput).To(o.ContainSubstring(services.UntaintAlertID),
++			fmt.Sprintf("Expected pacemaker alert %s to be registered", services.UntaintAlertID))
++		framework.Logf("Pacemaker alert config:\n%s", alertOutput)
++
++		g.By("Verifying alert scripts exist on disk")
++		for _, script := range []string{services.TaintAlertScriptPath, services.UntaintAlertScriptPath} {
++			output, err := exutil.DebugNodeRetryWithOptionsAndChroot(oc, execNode.Name, "default",
++				"bash", "-c", fmt.Sprintf("test -x %s && echo EXISTS || echo MISSING", script))
++			o.Expect(err).ToNot(o.HaveOccurred(),
++				fmt.Sprintf("Expected to check existence of %s", script))
++			o.Expect(strings.TrimSpace(output)).To(o.Equal("EXISTS"),
++				fmt.Sprintf("Expected %s to exist and be executable", script))
++		}
++	})
++})
++
++var _ = g.Describe("[sig-etcd][apigroup:config.openshift.io][OCPFeatureGate:DualReplica][Suite:openshift/two-node][Serial][Disruptive] Two Node with Fencing taint lifecycle", func() {
++	defer g.GinkgoRecover()
++
++	var (
++		oc                   = exutil.NewCLIWithoutNamespace("").AsAdmin()
++		etcdClientFactory    *helpers.EtcdClientFactoryImpl
++		peerNode, targetNode corev1.Node
++	)
++
++	g.BeforeEach(func() {
++		utils.SkipIfNotTopology(oc, v1.DualReplicaTopologyMode)
++
++		// Skip the test if cluster version is below 5.0, as fencing taint was introduced in that version
++		utils.SkipIfVersionBelow(oc, 5, 0)
++
++		etcdClientFactory = helpers.NewEtcdClientFactory(oc.KubeClient())
++
++		utils.SkipIfClusterIsNotHealthy(oc, etcdClientFactory)
++
++		nodes, err := utils.GetNodes(oc, utils.AllNodes)
++		o.Expect(err).ShouldNot(o.HaveOccurred(), "Expected to retrieve nodes without error")
++		o.Expect(len(nodes.Items)).To(o.BeNumerically(">=", 2),
++			"Expected at least 2 nodes for two-node fencing test")
++
++		randomIndex := rand.Intn(len(nodes.Items))
++		peerNode = nodes.Items[randomIndex]
++		targetNode = nodes.Items[(randomIndex+1)%len(nodes.Items)]
++
++		// Safety net: remove any lingering taint/annotation that could break
++		// subsequent tests if this test fails mid-way.
++		g.DeferCleanup(func() {
++			services.RemoveTaintAndAnnotation(oc, peerNode.Name)
++			services.RemoveTaintAndAnnotation(oc, targetNode.Name)
++		})
++
++		// LIFO: registered last so it runs first, capturing state before cleanup.
++		g.DeferCleanup(func() {
++			logFinalClusterStatus([]corev1.Node{peerNode, targetNode})
++		})
++	})
++
++	g.It("should apply and remove out-of-service taint and annotation during network disruption recovery", func() {
++		g.By("Recording timestamp before disruption for journal log scoping")
++		baseTimestamp, err := services.GetTimestampViaDebug(oc, peerNode.Name)
++		o.Expect(err).ToNot(o.HaveOccurred(), "Expected to capture baseline timestamp")
++		framework.Logf("Baseline timestamp: %s", baseTimestamp)
++
++		g.By("Starting background taint observer on both nodes")
++		observer := newTaintObserver(oc, []string{peerNode.Name, targetNode.Name}, 2*time.Second)
++		observer.Start()
++		defer observer.Stop()
++
++		g.By(fmt.Sprintf("Blocking network communication between %s and %s for %v",
++			targetNode.Name, peerNode.Name, networkDisruptionDuration))
++		command, err := exutil.TriggerNetworkDisruption(oc.KubeClient(), &targetNode, &peerNode, networkDisruptionDuration)
++		o.Expect(err).To(o.BeNil(), "Expected to disrupt network without errors")
++		framework.Logf("Network disruption command: %s", command)
++
++		g.By(fmt.Sprintf("Ensuring cluster recovery with proper leader/learner roles (timeout: %v)", memberIsLeaderTimeout))
++		leaderNode, learnerNode, learnerStarted := validateEtcdRecoveryStateWithoutAssumingLeader(
++			oc, etcdClientFactory, &peerNode, &targetNode, memberIsLeaderTimeout, utils.FiveSecondPollInterval)
++		framework.Logf("Leader: %s, Learner (fenced): %s, learner already started: %v",
++			leaderNode.Name, learnerNode.Name, learnerStarted)
++
++		// --- Taint Application Checks ---
++
++		// Determine which node was actually fenced by pacemaker. The fenced
++		// node is not necessarily the etcd learner - pacemaker makes an
++		// independent fencing decision. We check the background observer
++		// first (catches transient taints), then poll both nodes live.
++		var fencedNode, survivedNode *corev1.Node
++
++		observedNode, taintSeen := observer.WasTaintObserved()
++		if taintSeen {
++			framework.Logf("Out-of-service taint was observed on %s by background observer", observedNode)
++		}
++
++		// Check both nodes for a current taint
++		for _, candidate := range []*corev1.Node{leaderNode, learnerNode} {
++			n, fetchErr := services.FetchNodeObject(oc, candidate.Name)
++			o.Expect(fetchErr).ToNot(o.HaveOccurred())
++			if services.HasOutOfServiceTaint(n) {
++				framework.Logf("Out-of-service taint is currently present on %s", candidate.Name)
++				fencedNode = candidate
++				break
++			}
++		}
++
++		// If no taint found yet (not observed, not currently present), wait for it on either node
++		if fencedNode == nil && !taintSeen {
++			g.By(fmt.Sprintf("Waiting for out-of-service taint to appear on either node (timeout: %v)",
++				taintAppliedTimeout))
++			o.Eventually(func() bool {
++				name, seen := observer.WasTaintObserved()
++				if seen {
++					observedNode = name
++					return true
++				}
++				for _, candidate := range []*corev1.Node{leaderNode, learnerNode} {
++					n, fetchErr := services.FetchNodeObject(oc, candidate.Name)
++					if fetchErr != nil {
++						framework.Logf("Waiting for taint: could not fetch node %s: %v", candidate.Name, fetchErr)
++						continue
++					}
++					if services.HasOutOfServiceTaint(n) {
++						return true
++					}
++				}
++				return false
++			}, taintAppliedTimeout, utils.FiveSecondPollInterval).Should(o.BeTrue(),
++				"Out-of-service taint should appear on exactly one node")
++		}
++
++		// Resolve fencedNode from observer if we only saw it transiently
++		if fencedNode == nil && observedNode == "" {
++			observedNode, _ = observer.WasTaintObserved()
++		}
++		if fencedNode == nil {
++			o.Expect(observedNode).ToNot(o.BeEmpty(), "Should have identified the fenced node via taint observation")
++			if observedNode == leaderNode.Name {
++				fencedNode = leaderNode
++			} else {
++				fencedNode = learnerNode
++			}
++		}
++
++		if fencedNode.Name == leaderNode.Name {
++			survivedNode = learnerNode
++		} else {
++			survivedNode = leaderNode
++		}
++		framework.Logf("Fenced node: %s, Survived node: %s", fencedNode.Name, survivedNode.Name)
++
++		g.By(fmt.Sprintf("Verifying out-of-service annotation was applied to fenced node %s", fencedNode.Name))
++		if !observer.WasAnnotationObserved() {
++			// Annotation not caught by observer - check the node live (it may
++			// still be present, or the taint script log already confirmed it).
++			fencedRefreshForAnnotation, fetchErr := services.FetchNodeObject(oc, fencedNode.Name)
++			if fetchErr == nil && services.HasOutOfServiceAnnotation(fencedRefreshForAnnotation) {
++				framework.Logf("Out-of-service annotation is currently present on %s", fencedNode.Name)
++			} else {
++				// The annotation may have already been removed by the untaint
++				// script. Fall back to the journal: the taint script logs
++				// "Successfully tainted and annotated" only after the atomic
++				// patch that sets both taint and annotation, so a match proves
++				// the annotation was applied.
++				framework.Logf("Annotation not live on %s (may already be removed) - will verify via taint script journal", fencedNode.Name)
++			}
++		}
++
++		g.By(fmt.Sprintf("Verifying survived node %s is NOT tainted", survivedNode.Name))
++		survivedRefresh, err := services.FetchNodeObject(oc, survivedNode.Name)
++		o.Expect(err).ToNot(o.HaveOccurred())
++		o.Expect(services.HasOutOfServiceTaint(survivedRefresh)).To(o.BeFalse(),
++			fmt.Sprintf("Survived node %s should NOT have out-of-service taint", survivedNode.Name))
++		o.Expect(services.HasOutOfServiceAnnotation(survivedRefresh)).To(o.BeFalse(),
++			fmt.Sprintf("Survived node %s should NOT have out-of-service annotation", survivedNode.Name))
++
++		g.By("Verifying taint alert journal log on survived node")
++		o.Eventually(func() bool {
++			return checkJournalOnNodes(oc, []corev1.Node{*survivedNode},
++				services.TaintAlertLogTag, services.TaintAlertFencingLog, baseTimestamp)
++		}, journalCheckTimeout, utils.FiveSecondPollInterval).Should(o.BeTrue(),
++			"tnf-taint-alert should log fencing success on survived node")
++
++		g.By("Verifying taint script journal confirms taint and annotation were applied")
++		o.Eventually(func() bool {
++			return checkJournalOnNodes(oc, []corev1.Node{*survivedNode},
++				services.TaintScriptLogTag, services.TaintSuccessLog, baseTimestamp)
++		}, journalCheckTimeout, utils.FiveSecondPollInterval).Should(o.BeTrue(),
++			"taint-fenced-node should log successful taint and annotation application")
++		// --- Recovery Wait ---
++
++		if !learnerStarted {
++			g.By(fmt.Sprintf("Ensuring %s rejoins as learner (timeout: %v)",
++				learnerNode.Name, memberRejoinedLearnerTimeout))
++			validateEtcdRecoveryState(oc, etcdClientFactory,
++				leaderNode,
++				learnerNode, true, true,
++				memberRejoinedLearnerTimeout, utils.FiveSecondPollInterval)
++		}
++
++		g.By(fmt.Sprintf("Ensuring %s is promoted back as voting member (timeout: %v)",
++			learnerNode.Name, memberPromotedVotingTimeout))
++		validateEtcdRecoveryState(oc, etcdClientFactory,
++			leaderNode,
++			learnerNode, true, false,
++			memberPromotedVotingTimeout, utils.FiveSecondPollInterval)
++
++		// --- Taint Removal Checks ---
++
++		g.By(fmt.Sprintf("Verifying out-of-service taint is removed from fenced node %s after recovery (timeout: %v)",
++			fencedNode.Name, taintRemovedTimeout))
++		o.Eventually(func() bool {
++			node, err := services.FetchNodeObject(oc, fencedNode.Name)
++			if err != nil {
++				framework.Logf("Waiting for untaint: could not fetch node %s: %v", fencedNode.Name, err)
++				return false
++			}
++			return !services.HasOutOfServiceTaint(node)
++		}, taintRemovedTimeout, utils.FiveSecondPollInterval).Should(o.BeTrue(),
++			fmt.Sprintf("Taint should be removed from fenced node %s after recovery", fencedNode.Name))
++
++		g.By(fmt.Sprintf("Verifying out-of-service annotation is removed from fenced node %s after recovery", fencedNode.Name))
++		fencedRefresh, err := services.FetchNodeObject(oc, fencedNode.Name)
++		o.Expect(err).ToNot(o.HaveOccurred())
++		o.Expect(services.HasOutOfServiceAnnotation(fencedRefresh)).To(o.BeFalse(),
++			fmt.Sprintf("Annotation should be removed from fenced node %s after recovery", fencedNode.Name))
++
++		g.By("Verifying untaint alert journal log")
++		bothNodes := []corev1.Node{*survivedNode, *fencedNode}
++		o.Eventually(func() bool {
++			return checkJournalOnNodes(oc, bothNodes,
++				services.UntaintAlertLogTag, services.UntaintAlertRejoinLog, baseTimestamp)
++		}, journalCheckTimeout, utils.FiveSecondPollInterval).Should(o.BeTrue(),
++			"tnf-untaint-alert should log node rejoin event on at least one node")
++
++		g.By("Verifying untaint script journal log")
++		o.Eventually(func() bool {
++			return checkJournalOnNodes(oc, bothNodes,
++				services.UntaintScriptLogTag, services.UntaintSuccessLog, baseTimestamp)
++		}, taintRemovedTimeout, utils.FiveSecondPollInterval).Should(o.BeTrue(),
++			"untaint-fenced-node should log successful untaint on at least one node")
++	})
++})
+diff --git a/test/extended/edge_topologies/utils/common.go b/test/extended/edge_topologies/utils/common.go
+index 2bcd0eb17814..5d72fc4869e1 100644
+--- a/test/extended/edge_topologies/utils/common.go
++++ b/test/extended/edge_topologies/utils/common.go
+@@ -11,6 +11,7 @@ import (
+ 	"strings"
+ 	"time"
+ 
++	"github.com/blang/semver/v4"
+ 	g "github.com/onsi/ginkgo/v2"
+ 	o "github.com/onsi/gomega"
+ 	v1 "github.com/openshift/api/config/v1"
+@@ -128,6 +129,23 @@ func SkipIfNotTopology(oc *exutil.CLI, wanted v1.TopologyMode) {
+ 	}
+ }
+ 
++// SkipIfVersionBelow skips the test if the cluster version is below the specified minimum.
++func SkipIfVersionBelow(oc *exutil.CLI, minMajor, minMinor uint64) {
++	framework.Logf("%s", preconditions.RecordCheck("validating cluster version >= %d.%d", minMajor, minMinor))
++
++	versionStr, err := exutil.GetCurrentVersion(context.Background(), oc.AdminConfig())
++	if err != nil {
++		e2eskipper.Skipf("Cannot determine cluster version: %v", err)
++	}
++	ver, err := semver.Parse(versionStr)
++	if err != nil {
++		e2eskipper.Skipf("Cannot parse cluster version %q: %v", versionStr, err)
++	}
++	if ver.Major < minMajor || (ver.Major == minMajor && ver.Minor < minMinor) {
++		e2eskipper.Skipf("Test requires OpenShift >= %d.%d, cluster is running %s", minMajor, minMinor, versionStr)
++	}
++}
++
+ // SkipIfClusterIsNotHealthy skips the test if cluster health checks fail.
+ // Performs comprehensive validation: all nodes ready, all cluster operators healthy,
+ // etcd pods running, two voting etcd members, cluster-etcd-operator healthy, and
+diff --git a/test/extended/edge_topologies/utils/services/taint.go b/test/extended/edge_topologies/utils/services/taint.go
+new file mode 100644
+index 000000000000..d838da5e1a77
+--- /dev/null
++++ b/test/extended/edge_topologies/utils/services/taint.go
+@@ -0,0 +1,163 @@
++// Package services provides taint/untaint utilities for TNF (Two Node with Fencing) fencing alert validation.
++package services
++
++import (
++	"context"
++	"fmt"
++	"strings"
++
++	exutil "github.com/openshift/origin/test/extended/util"
++	corev1 "k8s.io/api/core/v1"
++	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
++	e2e "k8s.io/kubernetes/test/e2e/framework"
++)
++
++const (
++	// OutOfServiceTaintKey is the Kubernetes taint key applied to fenced nodes.
++	OutOfServiceTaintKey = "node.kubernetes.io/out-of-service"
++	// OutOfServiceTaintValue is the taint value indicating the node was shut down.
++	OutOfServiceTaintValue = "nodeshutdown"
++	// OutOfServiceAnnotationKey tracks which component applied the out-of-service taint.
++	OutOfServiceAnnotationKey = "node.kubernetes.io/out-of-service-applied-by"
++	// OutOfServiceAnnotationValue identifies pacemaker as the taint originator.
++	OutOfServiceAnnotationValue = "pacemaker"
++
++	// TaintScriptLogTag is the syslog tag used by /usr/local/bin/taint-fenced-node.sh.
++	TaintScriptLogTag = "taint-fenced-node"
++	// UntaintScriptLogTag is the syslog tag used by /usr/local/bin/untaint-fenced-node.sh.
++	UntaintScriptLogTag = "untaint-fenced-node"
++	// TaintAlertLogTag is the syslog tag used by /var/lib/pacemaker/alerts/tnf-taint-alert.sh.
++	TaintAlertLogTag = "tnf-taint-alert"
++	// UntaintAlertLogTag is the syslog tag used by /var/lib/pacemaker/alerts/tnf-untaint-alert.sh.
++	UntaintAlertLogTag = "tnf-untaint-alert"
++
++	// TaintSuccessLog is the message logged after the taint and annotation are applied.
++	TaintSuccessLog = "Successfully tainted and annotated"
++	// UntaintSuccessLog is the message logged after the taint and annotation are removed.
++	UntaintSuccessLog = "Successfully untainted and removed annotation"
++	// TaintAlertFencingLog is the message logged when the taint alert fires on a successful fence.
++	TaintAlertFencingLog = "Fencing succeeded"
++	// UntaintAlertRejoinLog is the message logged when the untaint alert fires on node rejoin.
++	UntaintAlertRejoinLog = "rejoined cluster (membership)"
++
++	// TaintAlertID is the pacemaker alert ID for the taint agent.
++	TaintAlertID = "tnf-taint-alert"
++	// UntaintAlertID is the pacemaker alert ID for the untaint agent.
++	UntaintAlertID = "tnf-untaint-alert"
++
++	// TaintAlertScriptPath is the path to the taint alert script on the node.
++	TaintAlertScriptPath = "/var/lib/pacemaker/alerts/tnf-taint-alert.sh"
++	// UntaintAlertScriptPath is the path to the untaint alert script on the node.
++	UntaintAlertScriptPath = "/var/lib/pacemaker/alerts/tnf-untaint-alert.sh"
++)
++
++// HasOutOfServiceTaint returns true if the node has the out-of-service taint
++// with the expected key, value, and NoExecute effect.
++func HasOutOfServiceTaint(node *corev1.Node) bool {
++	for _, taint := range node.Spec.Taints {
++		if taint.Key == OutOfServiceTaintKey &&
++			taint.Value == OutOfServiceTaintValue &&
++			taint.Effect == corev1.TaintEffectNoExecute {
++			return true
++		}
++	}
++	return false
++}
++
++// HasOutOfServiceAnnotation returns true if the node has the pacemaker
++// out-of-service annotation.
++func HasOutOfServiceAnnotation(node *corev1.Node) bool {
++	if node.Annotations == nil {
++		return false
++	}
++	return node.Annotations[OutOfServiceAnnotationKey] == OutOfServiceAnnotationValue
++}
++
++// JournalGrepViaDebug searches the systemd journal on a node for log entries
++// matching the given syslog tag and pattern, scoped to entries after sinceTimestamp.
++// Returns matching lines or an error if the debug command fails.
++//
++//	output, err := JournalGrepViaDebug(oc, "master-0", "taint-fenced-node", "Successfully tainted", "2024-01-01 00:00:00")
++func JournalGrepViaDebug(oc *exutil.CLI, nodeName, tag, pattern, sinceTimestamp string) (string, error) {
++	cmd := fmt.Sprintf(
++		`journalctl -t %s --since '%s' --no-pager | grep -F %q | tail -5`,
++		tag, sinceTimestamp, pattern)
++	return exutil.DebugNodeRetryWithOptionsAndChroot(oc, nodeName, "openshift-etcd",
++		"bash", "-c", cmd)
++}
++
++// GetTimestampViaDebug captures a UTC timestamp from a node, used to scope
++// journal log searches to entries emitted after this point.
++//
++//	ts, err := GetTimestampViaDebug(oc, "master-0")
++func GetTimestampViaDebug(oc *exutil.CLI, nodeName string) (string, error) {
++	output, err := exutil.DebugNodeRetryWithOptionsAndChroot(oc, nodeName, "openshift-etcd",
++		"bash", "-c", "date -u '+%Y-%m-%d %H:%M:%S'")
++	if err != nil {
++		return "", fmt.Errorf("failed to get timestamp from %s: %v", nodeName, err)
++	}
++	return strings.TrimSpace(output), nil
++}
++
++// PcsAlertConfigViaDebug runs "pcs alert config" on a node via a debug container
++// and returns the output showing all registered pacemaker alert agents.
++//
++//	output, err := PcsAlertConfigViaDebug(oc, "master-0")
++func PcsAlertConfigViaDebug(oc *exutil.CLI, nodeName string) (string, error) {
++	return exutil.DebugNodeRetryWithOptionsAndChroot(oc, nodeName, "default",
++		"bash", "-c", "sudo pcs alert config")
++}
++
++// FetchNodeObject retrieves a fresh node object from the Kubernetes API.
++// Use this instead of a cached node when checking mutable state like taints or annotations.
++//
++//	node, err := FetchNodeObject(oc, "master-0")
++func FetchNodeObject(oc *exutil.CLI, nodeName string) (*corev1.Node, error) {
++	return oc.AdminKubeClient().CoreV1().Nodes().Get(
++		context.Background(), nodeName, metav1.GetOptions{})
++}
++
++// RemoveTaintAndAnnotation removes the out-of-service taint and pacemaker annotation
++// from a node. Retries on conflict up to 3 times. Errors are logged but not returned
++// (best-effort cleanup).
++func RemoveTaintAndAnnotation(oc *exutil.CLI, nodeName string) {
++	for attempt := 0; attempt < 3; attempt++ {
++		node, err := FetchNodeObject(oc, nodeName)
++		if err != nil {
++			e2e.Logf("Cleanup: could not fetch node %s: %v", nodeName, err)
++			return
++		}
++
++		changed := false
++
++		var filtered []corev1.Taint
++		for _, t := range node.Spec.Taints {
++			if t.Key == OutOfServiceTaintKey {
++				changed = true
++				continue
++			}
++			filtered = append(filtered, t)
++		}
++		node.Spec.Taints = filtered
++
++		if node.Annotations != nil {
++			if _, exists := node.Annotations[OutOfServiceAnnotationKey]; exists {
++				delete(node.Annotations, OutOfServiceAnnotationKey)
++				changed = true
++			}
++		}
++
++		if !changed {
++			return
++		}
++
++		_, err = oc.AdminKubeClient().CoreV1().Nodes().Update(
++			context.Background(), node, metav1.UpdateOptions{})
++		if err == nil {
++			e2e.Logf("Cleanup: removed out-of-service taint and annotation from %s", nodeName)
++			return
++		}
++		e2e.Logf("Cleanup: attempt %d failed to update node %s: %v", attempt+1, nodeName, err)
++	}
++	e2e.Logf("Cleanup: exhausted retries for node %s", nodeName)
++}

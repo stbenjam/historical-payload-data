@@ -1,0 +1,408 @@
+diff --git a/pkg/controller/operator.go b/pkg/controller/operator.go
+index 6b9c54e98..385be4d57 100644
+--- a/pkg/controller/operator.go
++++ b/pkg/controller/operator.go
+@@ -7,6 +7,7 @@ import (
+ 	"strings"
+ 	"time"
+ 
++	configv1 "github.com/openshift/api/config/v1"
+ 	"github.com/openshift/api/features"
+ 	insightsv1 "github.com/openshift/api/insights/v1"
+ 	configv1client "github.com/openshift/client-go/config/clientset/versioned"
+@@ -145,6 +146,10 @@ func (s *Operator) Run(ctx context.Context, controller *controllercmd.Controller
+ 	// updateCh is used to signal a version update to the runtimeextractor controller
+ 	updateCh := make(chan struct{}, 1)
+ 
++	// Fetch TLS profile once at startup. The operator is restarted by the SecurityProfileWatcher
++	// in manager.go when the TLS profile changes, so no watch is needed here.
++	tlsProfile := fetchTLSProfile(ctx, configClient)
++
+ 	// Create informer factory for runtime-extractor resources in openshift-insights namespace
+ 	runtimeExtractorInformerFactory := clientInformers.NewSharedInformerFactoryWithOptions(
+ 		kubeClient,
+@@ -169,6 +174,7 @@ func (s *Operator) Run(ctx context.Context, controller *controllercmd.Controller
+ 	runtimeExtractorCtrl := runtimeextractor.NewRuntimeExtractorController(
+ 		configAggregator,
+ 		updateCh,
++		tlsProfile,
+ 		kubeClient,
+ 		controller.EventRecorder,
+ 		runtimeExtractorResourceInformer,
+@@ -442,6 +448,17 @@ func createTechPreviewInformers(
+ 	}, nil
+ }
+ 
++// fetchTLSProfile reads the TLS security profile from the cluster's APIServer configuration.
++// Returns nil if the profile cannot be read, which will default to Intermediate.
++func fetchTLSProfile(ctx context.Context, configClient configv1client.Interface) *configv1.TLSSecurityProfile {
++	apiServer, err := configClient.ConfigV1().APIServers().Get(ctx, "cluster", metav1.GetOptions{})
++	if err != nil {
++		klog.Warningf("Failed to get APIServer config, defaulting to Intermediate TLS profile: %v", err)
++		return nil
++	}
++	return apiServer.Spec.TLSSecurityProfile
++}
++
+ // deleteAllRunningGatheringsPods deletes all the active jobs (and their Pods) with the "periodic-gathering-"
+ // prefix in the openshift-insights namespace
+ func deleteAllRunningGatheringsPods(
+diff --git a/pkg/controller/runtimeextractor/controller.go b/pkg/controller/runtimeextractor/controller.go
+index 31a21a262..437924c42 100644
+--- a/pkg/controller/runtimeextractor/controller.go
++++ b/pkg/controller/runtimeextractor/controller.go
+@@ -3,6 +3,7 @@ package runtimeextractor
+ import (
+ 	"context"
+ 
++	configv1 "github.com/openshift/api/config/v1"
+ 	"github.com/openshift/insights-operator/pkg/config"
+ 	"github.com/openshift/insights-operator/pkg/controller/runtimeextractor/resources"
+ 	"github.com/openshift/library-go/pkg/controller/factory"
+@@ -23,7 +24,7 @@ type ConfigNotifier interface {
+ // ResourceManager manages the lifecycle of runtime extractor Kubernetes resources
+ type ResourceManager interface {
+ 	// ApplyRuntimeExtractorResources creates or updates all runtime extractor resources
+-	ApplyRuntimeExtractorResources(ctx context.Context) error
++	ApplyRuntimeExtractorResources(ctx context.Context, tlsProfile *configv1.TLSSecurityProfile) error
+ 	// DeleteRuntimeExtractorResources removes all runtime extractor resources
+ 	DeleteRuntimeExtractorResources(ctx context.Context) error
+ 	// ResourcesExists checks if runtime extractor resources are deployed
+@@ -51,6 +52,9 @@ type runtimeExtractorController struct {
+ 	config ConfigNotifier
+ 	// updateCh receives notifications when the cluster version changes, triggering DaemonSet image updates
+ 	updateCh chan struct{}
++	// tlsProfile is the cluster's TLS security profile, fetched once at startup.
++	// The operator is restarted by the SecurityProfileWatcher when the TLS profile changes.
++	tlsProfile *configv1.TLSSecurityProfile
+ 	// resourceInformer watches for external modifications to runtime-extractor resources
+ 	resourceInformer ResourceInformer
+ 	// resourceManager handles creation, update, and deletion of runtime extractor Kubernetes resources
+@@ -62,6 +66,7 @@ type runtimeExtractorController struct {
+ func NewRuntimeExtractorController(
+ 	configNotifier ConfigNotifier,
+ 	updateCh chan struct{},
++	tlsProfile *configv1.TLSSecurityProfile,
+ 	kubeClient *kubernetes.Clientset,
+ 	recorder events.Recorder,
+ 	resourceInformer ResourceInformer,
+@@ -74,6 +79,7 @@ func NewRuntimeExtractorController(
+ 	return &runtimeExtractorController{
+ 		config:           configNotifier,
+ 		updateCh:         updateCh,
++		tlsProfile:       tlsProfile,
+ 		resourceManager:  rm,
+ 		resourceInformer: resourceInformer,
+ 	}
+@@ -151,7 +157,7 @@ func (re *runtimeExtractorController) isCreated(ctx context.Context) bool {
+ func (re *runtimeExtractorController) createDeployment(ctx context.Context) {
+ 	klog.Info("Creating runtime extractor resources")
+ 
+-	if err := re.resourceManager.ApplyRuntimeExtractorResources(ctx); err != nil {
++	if err := re.resourceManager.ApplyRuntimeExtractorResources(ctx, re.tlsProfile); err != nil {
+ 		klog.Errorf("Failed to apply runtime extractor resources: %v", err)
+ 	}
+ }
+@@ -172,13 +178,12 @@ func (re *runtimeExtractorController) deleteDeployment(ctx context.Context) {
+ func (re *runtimeExtractorController) updateDeployment(ctx context.Context) {
+ 	klog.Info("Updating runtime extractor resources")
+ 
+-	// Avoid creating it when the cluster version is updated
+ 	if !re.isCreated(ctx) {
+ 		klog.Info("Runtime extractor resources not found, skipping update")
+ 		return
+ 	}
+ 
+-	if err := re.resourceManager.ApplyRuntimeExtractorResources(ctx); err != nil {
++	if err := re.resourceManager.ApplyRuntimeExtractorResources(ctx, re.tlsProfile); err != nil {
+ 		klog.Errorf("Failed to apply runtime extractor resources: %v", err)
+ 	}
+ }
+@@ -197,7 +202,7 @@ func (re *runtimeExtractorController) handleResourceDrift(ctx context.Context) {
+ 	}
+ 
+ 	// Reapply resources to correct any drift
+-	if err := re.resourceManager.ApplyRuntimeExtractorResources(ctx); err != nil {
++	if err := re.resourceManager.ApplyRuntimeExtractorResources(ctx, re.tlsProfile); err != nil {
+ 		klog.Errorf("Failed to correct runtime extractor resource drift: %v", err)
+ 	} else {
+ 		klog.Info("Successfully reconciled runtime extractor resources")
+diff --git a/pkg/controller/runtimeextractor/resources/daemonset.go b/pkg/controller/runtimeextractor/resources/daemonset.go
+index 0a6eafa3e..6cedce5ab 100644
+--- a/pkg/controller/runtimeextractor/resources/daemonset.go
++++ b/pkg/controller/runtimeextractor/resources/daemonset.go
+@@ -5,7 +5,11 @@ import (
+ 	_ "embed"
+ 	"fmt"
+ 	"os"
++	"strings"
+ 
++	configv1 "github.com/openshift/api/config/v1"
++	utiltls "github.com/openshift/controller-runtime-common/pkg/tls"
++	"github.com/openshift/library-go/pkg/crypto"
+ 	"github.com/openshift/library-go/pkg/operator/resource/resourceapply"
+ 	appsv1 "k8s.io/api/apps/v1"
+ 	apierrors "k8s.io/apimachinery/pkg/api/errors"
+@@ -27,8 +31,9 @@ const (
+ 	exporterImageEnv     = "RELATED_IMAGE_INSIGHTS_RUNTIME_EXPORTER"
+ 	exporterDefaultImage = "quay.io/openshift/origin-insights-runtime-exporter:latest"
+ 
+-	proxyImageEnv     = "RELATED_IMAGE_KUBE_RBAC_PROXY"
+-	proxyDefaultImage = "quay.io/openshift/origin-kube-rbac-proxy:latest"
++	proxyImageEnv              = "RELATED_IMAGE_KUBE_RBAC_PROXY"
++	proxyDefaultImage          = "quay.io/openshift/origin-kube-rbac-proxy:latest"
++	kubeRbacProxyContainerName = "kube-rbac-proxy"
+ 
+ 	envImageErrMsg = "Failed to get image from environment variable %s, using default image %s"
+ )
+@@ -47,13 +52,14 @@ func loadRuntimeExtractorDaemonSet() (*appsv1.DaemonSet, error) {
+ 
+ // applyDaemonSet creates or updates the runtime extractor DaemonSet
+ // Retries on conflict errors using exponential backoff
+-func (rm *ResourceManager) applyDaemonSet(ctx context.Context) (*appsv1.DaemonSet, error) {
++func (rm *ResourceManager) applyDaemonSet(ctx context.Context, tlsProfile *configv1.TLSSecurityProfile) (*appsv1.DaemonSet, error) {
+ 	daemonSet, err := loadRuntimeExtractorDaemonSet()
+ 	if err != nil {
+ 		return nil, err
+ 	}
+ 
+ 	rm.updateContainerImages(daemonSet)
++	updateKubeRBACProxyTLSArgs(daemonSet, tlsProfile)
+ 
+ 	// Retry with exponential backoff on conflict errors
+ 	var appliedDaemonSet *appsv1.DaemonSet
+@@ -94,7 +100,7 @@ func (rm *ResourceManager) updateContainerImages(ds *appsv1.DaemonSet) {
+ 		case "exporter":
+ 			container.Image = exporterReleaseVersion
+ 			klog.Infof("Updated runtime exporter container image to %s", container.Image)
+-		case "kube-rbac-proxy":
++		case kubeRbacProxyContainerName:
+ 			// kube-rbac-proxy uses its own versioning, keep as-is
+ 			// Could be updated separately if needed
+ 			container.Image = proxyReleaseVersion
+@@ -103,6 +109,59 @@ func (rm *ResourceManager) updateContainerImages(ds *appsv1.DaemonSet) {
+ 	}
+ }
+ 
++// kubeRBACProxyTLSArgs generates --tls-cipher-suites and --tls-min-version
++// arguments for kube-rbac-proxy based on the cluster's TLS security profile.
++func kubeRBACProxyTLSArgs(profile *configv1.TLSSecurityProfile) []string {
++	profileSpec, err := utiltls.GetTLSProfileSpec(profile)
++	if err != nil {
++		klog.Warningf("Failed to get TLS profile spec, using Intermediate: %v", err)
++		profileSpec = *configv1.TLSProfiles[configv1.TLSProfileIntermediateType]
++	}
++
++	cipherNames := crypto.OpenSSLToIANACipherSuites(profileSpec.Ciphers)
++
++	var supportedCiphers []string
++	for _, name := range cipherNames {
++		if _, err := crypto.CipherSuite(name); err != nil {
++			klog.Warningf("Dropping unsupported TLS cipher %q", name)
++			continue
++		}
++		supportedCiphers = append(supportedCiphers, name)
++	}
++
++	if len(supportedCiphers) == 0 {
++		klog.Warning("All TLS ciphers unsupported, falling back to Intermediate cipher list")
++		intermediateCiphers := configv1.TLSProfiles[configv1.TLSProfileIntermediateType].Ciphers
++		cipherNames = crypto.OpenSSLToIANACipherSuites(intermediateCiphers)
++		supportedCiphers = make([]string, 0, len(cipherNames))
++		for _, name := range cipherNames {
++			if _, err := crypto.CipherSuite(name); err == nil {
++				supportedCiphers = append(supportedCiphers, name)
++			}
++		}
++	}
++
++	return []string{
++		"--tls-cipher-suites=" + strings.Join(supportedCiphers, ","),
++		"--tls-min-version=" + string(profileSpec.MinTLSVersion),
++	}
++}
++
++// updateKubeRBACProxyTLSArgs appends TLS cipher and version args to the
++// kube-rbac-proxy container based on the cluster's TLS security profile.
++func updateKubeRBACProxyTLSArgs(ds *appsv1.DaemonSet, profile *configv1.TLSSecurityProfile) {
++	tlsArgs := kubeRBACProxyTLSArgs(profile)
++	for i := range ds.Spec.Template.Spec.Containers {
++		if ds.Spec.Template.Spec.Containers[i].Name == kubeRbacProxyContainerName {
++			ds.Spec.Template.Spec.Containers[i].Args = append(
++				ds.Spec.Template.Spec.Containers[i].Args,
++				tlsArgs...,
++			)
++			return
++		}
++	}
++}
++
+ // loadImagesFromEnvs loads container image references from environment variables.
+ // Default values are returned for any missing environment variables, with errors logged.
+ func loadImagesFromEnvs() (extractorReleaseVersion, exporterReleaseVersion, proxyReleaseVersion string) {
+diff --git a/pkg/controller/runtimeextractor/resources/daemonset_test.go b/pkg/controller/runtimeextractor/resources/daemonset_test.go
+index 70b5afa23..db4de39ef 100644
+--- a/pkg/controller/runtimeextractor/resources/daemonset_test.go
++++ b/pkg/controller/runtimeextractor/resources/daemonset_test.go
+@@ -3,8 +3,10 @@ package resources
+ import (
+ 	"context"
+ 	"os"
++	"strings"
+ 	"testing"
+ 
++	configv1 "github.com/openshift/api/config/v1"
+ 	"github.com/stretchr/testify/assert"
+ 	appsv1 "k8s.io/api/apps/v1"
+ 	corev1 "k8s.io/api/core/v1"
+@@ -57,7 +59,7 @@ func Test_applyDaemonSet(t *testing.T) {
+ 			recorder := events.NewInMemoryRecorder("test", clock.RealClock{})
+ 			rm := NewResourceManager(coreClient.AppsV1(), recorder)
+ 
+-			ds, err := rm.applyDaemonSet(context.Background())
++			ds, err := rm.applyDaemonSet(context.Background(), nil)
+ 
+ 			if tt.wantErr {
+ 				assert.Error(t, err)
+@@ -372,3 +374,104 @@ func Test_loadImagesFromEnvs(t *testing.T) {
+ 		})
+ 	}
+ }
++
++func Test_kubeRBACProxyTLSArgs(t *testing.T) {
++	tests := []struct {
++		name               string
++		profile            *configv1.TLSSecurityProfile
++		wantMinVersion     string
++		wantCipherContains string
++		wantArgCount       int
++	}{
++		{
++			name:               "nil profile defaults to Intermediate",
++			profile:            nil,
++			wantMinVersion:     "VersionTLS12",
++			wantCipherContains: "TLS_ECDHE",
++			wantArgCount:       2,
++		},
++		{
++			name: "Intermediate profile",
++			profile: &configv1.TLSSecurityProfile{
++				Type: configv1.TLSProfileIntermediateType,
++			},
++			wantMinVersion:     "VersionTLS12",
++			wantCipherContains: "TLS_ECDHE",
++			wantArgCount:       2,
++		},
++		{
++			name: "Old profile",
++			profile: &configv1.TLSSecurityProfile{
++				Type: configv1.TLSProfileOldType,
++			},
++			wantMinVersion:     "VersionTLS10",
++			wantCipherContains: "TLS_",
++			wantArgCount:       2,
++		},
++		{
++			name: "Modern profile",
++			profile: &configv1.TLSSecurityProfile{
++				Type: configv1.TLSProfileModernType,
++			},
++			wantMinVersion:     "VersionTLS13",
++			wantCipherContains: "TLS_",
++			wantArgCount:       2,
++		},
++	}
++	for _, tt := range tests {
++		t.Run(tt.name, func(t *testing.T) {
++			args := kubeRBACProxyTLSArgs(tt.profile)
++
++			assert.Len(t, args, tt.wantArgCount)
++
++			// Check --tls-cipher-suites arg
++			assert.True(t, strings.HasPrefix(args[0], "--tls-cipher-suites="), "first arg should be --tls-cipher-suites")
++			assert.Contains(t, args[0], tt.wantCipherContains)
++
++			// Check --tls-min-version arg
++			assert.Equal(t, "--tls-min-version="+tt.wantMinVersion, args[1])
++		})
++	}
++}
++
++func Test_updateKubeRBACProxyTLSArgs(t *testing.T) {
++	ds := &appsv1.DaemonSet{
++		Spec: appsv1.DaemonSetSpec{
++			Template: corev1.PodTemplateSpec{
++				Spec: corev1.PodSpec{
++					Containers: []corev1.Container{
++						{
++							Name: "kube-rbac-proxy",
++							Args: []string{
++								"--secure-listen-address=:8443",
++								"--upstream=http://127.0.0.1:8000",
++							},
++						},
++						{
++							Name: "extractor",
++						},
++					},
++				},
++			},
++		},
++	}
++
++	updateKubeRBACProxyTLSArgs(ds, nil) // nil defaults to Intermediate
++
++	proxyContainer := ds.Spec.Template.Spec.Containers[0]
++	assert.Equal(t, "kube-rbac-proxy", proxyContainer.Name)
++
++	// Should have original 2 args + 2 TLS args
++	assert.Len(t, proxyContainer.Args, 4)
++
++	// Original args preserved
++	assert.Equal(t, "--secure-listen-address=:8443", proxyContainer.Args[0])
++	assert.Equal(t, "--upstream=http://127.0.0.1:8000", proxyContainer.Args[1])
++
++	// TLS args appended
++	assert.True(t, strings.HasPrefix(proxyContainer.Args[2], "--tls-cipher-suites="))
++	assert.Equal(t, "--tls-min-version=VersionTLS12", proxyContainer.Args[3])
++
++	// Extractor container should be unchanged
++	assert.Empty(t, ds.Spec.Template.Spec.Containers[1].Args)
++}
+diff --git a/pkg/controller/runtimeextractor/resources/manager.go b/pkg/controller/runtimeextractor/resources/manager.go
+index b8fe6dd7c..3107996db 100644
+--- a/pkg/controller/runtimeextractor/resources/manager.go
++++ b/pkg/controller/runtimeextractor/resources/manager.go
+@@ -4,6 +4,7 @@ import (
+ 	"context"
+ 	"fmt"
+ 
++	configv1 "github.com/openshift/api/config/v1"
+ 	"github.com/openshift/library-go/pkg/operator/events"
+ 	appsclientv1 "k8s.io/client-go/kubernetes/typed/apps/v1"
+ )
+@@ -28,9 +29,9 @@ func NewResourceManager(
+ // ApplyRuntimeExtractorResources creates or updates the runtime extractor DaemonSet
+ // This should be called when the runtime extractor should be deployed or updated
+ func (rm *ResourceManager) ApplyRuntimeExtractorResources(
+-	ctx context.Context,
++	ctx context.Context, tlsProfile *configv1.TLSSecurityProfile,
+ ) error {
+-	if _, err := rm.applyDaemonSet(ctx); err != nil {
++	if _, err := rm.applyDaemonSet(ctx, tlsProfile); err != nil {
+ 		return fmt.Errorf("failed to apply daemonset: %v", err)
+ 	}
+ 
+diff --git a/pkg/controller/runtimeextractor/resources/retry_test.go b/pkg/controller/runtimeextractor/resources/retry_test.go
+index b8c1becdd..9bf651f5b 100644
+--- a/pkg/controller/runtimeextractor/resources/retry_test.go
++++ b/pkg/controller/runtimeextractor/resources/retry_test.go
+@@ -72,7 +72,7 @@ func Test_applyDaemonSet_RetryOnConflict(t *testing.T) {
+ 	)
+ 
+ 	// This should succeed after retry
+-	_, err := rm.applyDaemonSet(ctx)
++	_, err := rm.applyDaemonSet(ctx, nil)
+ 	if err != nil {
+ 		t.Fatalf("Expected applyDaemonSet to succeed after retry, got error: %v", err)
+ 	}

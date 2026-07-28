@@ -1,0 +1,426 @@
+diff --git a/docs/gathered-data.md b/docs/gathered-data.md
+index 7088a523e..a38d9a46d 100644
+--- a/docs/gathered-data.md
++++ b/docs/gathered-data.md
+@@ -801,6 +801,33 @@ The gatherer finds the Pods (and containers) that match the requested data and f
+ to match the specific messages up to a maximum of 6 hours old.
+ 
+ 
++## ControlPlaneMachineSet
++
++Collects `ControlPlaneMachineSet` information.
++
++### API Reference
++- https://docs.redhat.com/en/documentation/openshift_container_platform/4.21/html/machine_apis/controlplanemachineset-machine-openshift-io-v1
++
++### Sample data
++- [docs/insights-archive-sample/config/controlplanemachinesets/openshift-machine-api/cluster.json](./insights-archive-sample/config/controlplanemachinesets/openshift-machine-api/cluster.json)
++
++### Location in archive
++- `config/controlplanemachinesets/{resource}`
++- `config/controlplanemachinesets/{namespace}/{resource}`
++
++### Config ID
++`clusterconfig/control_plane_machine_sets`
++
++### Released version
++- 4.23.0
++
++### Backported versions
++- 4.19
++
++### Changes
++None
++
++
+ ## CostManagementMetricsConfigs
+ 
+ Collects `CostManagementMetricsConfigs` definitions.
+diff --git a/docs/insights-archive-sample/config/controlplanemachinesets/openshift-machine-api/cluster.json b/docs/insights-archive-sample/config/controlplanemachinesets/openshift-machine-api/cluster.json
+new file mode 100644
+index 000000000..f83b2242e
+--- /dev/null
++++ b/docs/insights-archive-sample/config/controlplanemachinesets/openshift-machine-api/cluster.json
+@@ -0,0 +1,70 @@
++{
++    "apiVersion": "machine.openshift.io/v1",
++    "kind": "ControlPlaneMachineSet",
++    "metadata": {
++        "creationTimestamp": "2026-05-27T10:18:50Z",
++        "finalizers": ["controlplanemachineset.machine.openshift.io"],
++        "generation": 1,
++        "labels": {
++            "machine.openshift.io/cluster-api-cluster": "ci-ln-vwyf9k2-76ef8-r5shb"
++        },
++        "name": "cluster",
++        "namespace": "openshift-machine-api",
++        "resourceVersion": "16052",
++        "uid": "00ceb81c-e5c8-49d0-b240-87e997bb3f8c"
++    },
++    "spec": {
++        "replicas": 3,
++        "selector": {
++            "matchLabels": {
++                "machine.openshift.io/cluster-api-cluster": "ci-ln-vwyf9k2-76ef8-r5shb",
++                "machine.openshift.io/cluster-api-machine-role": "master",
++                "machine.openshift.io/cluster-api-machine-type": "master"
++            }
++        },
++        "state": "Active",
++        "strategy": { "type": "RollingUpdate" },
++        "template": null,
++        "templates": null
++    },
++    "status": {
++        "conditions": [
++            {
++                "lastTransitionTime": "2026-05-27T10:22:45Z",
++                "message": "",
++                "observedGeneration": 1,
++                "reason": "AsExpected",
++                "status": "False",
++                "type": "Error"
++            },
++            {
++                "lastTransitionTime": "2026-05-27T10:27:53Z",
++                "message": "",
++                "observedGeneration": 1,
++                "reason": "AllReplicasAvailable",
++                "status": "True",
++                "type": "Available"
++            },
++            {
++                "lastTransitionTime": "2026-05-27T10:27:53Z",
++                "message": "",
++                "observedGeneration": 1,
++                "reason": "AsExpected",
++                "status": "False",
++                "type": "Degraded"
++            },
++            {
++                "lastTransitionTime": "2026-05-27T10:26:53Z",
++                "message": "",
++                "observedGeneration": 1,
++                "reason": "AllReplicasUpdated",
++                "status": "False",
++                "type": "Progressing"
++            }
++        ],
++        "observedGeneration": 1,
++        "readyReplicas": 3,
++        "replicas": 3,
++        "updatedReplicas": 3
++    }
++}
+diff --git a/manifests/03-clusterrole.yaml b/manifests/03-clusterrole.yaml
+index 25276ee87..573c96fd1 100644
+--- a/manifests/03-clusterrole.yaml
++++ b/manifests/03-clusterrole.yaml
+@@ -247,6 +247,7 @@ rules:
+       - machine.openshift.io
+     resources:
+       - machinesets
++      - controlplanemachineset
+     verbs:
+       - get
+       - list
+diff --git a/pkg/gatherers/clusterconfig/clusterconfig_gatherer.go b/pkg/gatherers/clusterconfig/clusterconfig_gatherer.go
+index c392faea6..ecf82dea9 100644
+--- a/pkg/gatherers/clusterconfig/clusterconfig_gatherer.go
++++ b/pkg/gatherers/clusterconfig/clusterconfig_gatherer.go
+@@ -36,6 +36,7 @@ var gatheringFunctions = map[string]gathererFuncPtr{
+ 	"config_maps":                      (*Gatherer).GatherConfigMaps,
+ 	"container_images":                 (*Gatherer).GatherContainerImages,
+ 	"container_runtime_configs":        (*Gatherer).GatherContainerRuntimeConfig,
++	"control_plane_machine_sets":       (*Gatherer).GatherControlPlaneMachineSet,
+ 	"cost_management_metrics_configs":  (*Gatherer).GatherCostManagementMetricsConfigs,
+ 	"crds":                             (*Gatherer).GatherCRD,
+ 	"dvo_metrics":                      (*Gatherer).GatherDVOMetrics,
+diff --git a/pkg/gatherers/clusterconfig/const.go b/pkg/gatherers/clusterconfig/const.go
+index a3d3468f1..4682f92e9 100644
+--- a/pkg/gatherers/clusterconfig/const.go
++++ b/pkg/gatherers/clusterconfig/const.go
+@@ -98,6 +98,11 @@ var (
+ 		Version:  "v1alpha1",
+ 		Resource: "subscriptions",
+ 	}
++	controlPlaneMachineSetVersionResource = schema.GroupVersionResource{
++		Group:    "machine.openshift.io",
++		Version:  "v1",
++		Resource: "controlplanemachinesets",
++	}
+ 
+ 	nodeNetConfPoliciesV1GVR = schema.GroupVersionResource{Group: "nmstate.io", Version: "v1", Resource: "nodenetworkconfigurationpolicies"}
+ 	nodeNetStatesV1Beta1GVR  = schema.GroupVersionResource{Group: "nmstate.io", Version: "v1beta1", Resource: "nodenetworkstates"}
+diff --git a/pkg/gatherers/clusterconfig/gather_control_plane_machine_sets.go b/pkg/gatherers/clusterconfig/gather_control_plane_machine_sets.go
+new file mode 100644
+index 000000000..cdc53a11a
+--- /dev/null
++++ b/pkg/gatherers/clusterconfig/gather_control_plane_machine_sets.go
+@@ -0,0 +1,84 @@
++package clusterconfig
++
++import (
++	"context"
++	"fmt"
++
++	"github.com/openshift/insights-operator/pkg/record"
++	"k8s.io/apimachinery/pkg/api/errors"
++	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
++	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
++	"k8s.io/client-go/dynamic"
++	"k8s.io/klog/v2"
++)
++
++// GatherControlPlaneMachineSet Collects `ControlPlaneMachineSet` information.
++//
++// ### API Reference
++// - https://docs.redhat.com/en/documentation/openshift_container_platform/4.21/html/machine_apis/controlplanemachineset-machine-openshift-io-v1
++//
++// ### Sample data
++// - docs/insights-archive-sample/config/controlplanemachinesets/openshift-machine-api/cluster.json
++//
++// ### Location in archive
++// - `config/controlplanemachinesets/{resource}`
++// - `config/controlplanemachinesets/{namespace}/{resource}`
++//
++// ### Config ID
++// `clusterconfig/control_plane_machine_sets`
++//
++// ### Released version
++// - 4.23.0
++//
++// ### Backported versions
++// - 4.19
++//
++// ### Changes
++// None
++func (g *Gatherer) GatherControlPlaneMachineSet(ctx context.Context) ([]record.Record, []error) {
++	dynamicClient, err := dynamic.NewForConfig(g.gatherKubeConfig)
++	if err != nil {
++		return nil, []error{err}
++	}
++
++	return gatherControlPlaneMachineSet(ctx, dynamicClient)
++}
++
++func gatherControlPlaneMachineSet(ctx context.Context, dynamicClient dynamic.Interface) ([]record.Record, []error) {
++	controlPlaneMachineSets, err := dynamicClient.Resource(controlPlaneMachineSetVersionResource).List(ctx, metav1.ListOptions{})
++	if errors.IsNotFound(err) {
++		return nil, nil
++	}
++	if err != nil {
++		return nil, []error{err}
++	}
++
++	var errs []error
++	var records []record.Record
++	for _, ms := range controlPlaneMachineSets.Items {
++		recordName := fmt.Sprintf("config/controlplanemachinesets/%s", ms.GetName())
++		if ms.GetNamespace() != "" {
++			recordName = fmt.Sprintf("config/controlplanemachinesets/%s/%s", ms.GetNamespace(), ms.GetName())
++		}
++
++		// remove the sensitive content by overwriting the values
++		err = unstructured.SetNestedField(ms.Object, nil, "spec", "templates")
++		if err != nil {
++			klog.Errorf("unable to set nested field: %v", err)
++			errs = append(errs, err)
++		}
++
++		err = unstructured.SetNestedField(ms.Object, nil, "spec", "template")
++		if err != nil {
++			klog.Errorf("unable to set nested field: %v", err)
++			errs = append(errs, err)
++		}
++
++		records = append(records, record.Record{
++			Name: recordName,
++			Item: record.ResourceMarshaller{Resource: &ms},
++		})
++	}
++
++	return records, errs
++}
+diff --git a/pkg/gatherers/clusterconfig/gather_control_plane_machine_sets_test.go b/pkg/gatherers/clusterconfig/gather_control_plane_machine_sets_test.go
+new file mode 100644
+index 000000000..34366b9ad
+--- /dev/null
++++ b/pkg/gatherers/clusterconfig/gather_control_plane_machine_sets_test.go
+@@ -0,0 +1,176 @@
++package clusterconfig
++
++import (
++	"context"
++	"testing"
++
++	"github.com/openshift/insights-operator/pkg/record"
++	"github.com/stretchr/testify/assert"
++	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
++	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
++	"k8s.io/apimachinery/pkg/runtime"
++	"k8s.io/apimachinery/pkg/runtime/schema"
++	"k8s.io/apimachinery/pkg/runtime/serializer/yaml"
++	dynamicfake "k8s.io/client-go/dynamic/fake"
++)
++
++const (
++	controlPlaneMachineSetYAML = `
++apiVersion: machine.openshift.io/v1
++kind: ControlPlaneMachineSet
++metadata:
++    name: cluster
++spec:
++    replicas: 3
++    template:
++        machineType: machines_v1beta1_machine_openshift_io
++        machines_v1beta1_machine_openshift_io:
++            metadata:
++                labels:
++                    machine.openshift.io/cluster-api-cluster: cluster
++            spec:
++                providerSpec:
++                    value:
++                        apiVersion: machine.openshift.io/v1beta1
++                        kind: AWSMachineProviderConfig
++`
++
++	controlPlaneMachineSet2YAML = `
++apiVersion: machine.openshift.io/v1
++kind: ControlPlaneMachineSet
++metadata:
++    name: cluster-2
++    namespace: openshift-machine-api
++spec:
++    replicas: 3
++    templates:
++        - machineType: machines_v1beta1_machine_openshift_io
++          machines_v1beta1_machine_openshift_io:
++              metadata:
++                  labels:
++                      machine.openshift.io/cluster-api-cluster: cluster
++              spec:
++                  providerSpec:
++                      value:
++                          apiVersion: machine.openshift.io/v1beta1
++                          kind: AWSMachineProviderConfig
++`
++)
++
++func Test_GatherControlPlaneMachineSet(t *testing.T) {
++	tests := []struct {
++		name                string
++		objects             []string
++		namespaces          []string
++		expectedRecordCount int
++		expectedRecordNames []string
++	}{
++		{
++			name:                "single resource with namespace",
++			objects:             []string{controlPlaneMachineSetYAML},
++			namespaces:          []string{"openshift-machine-api"},
++			expectedRecordCount: 1,
++			expectedRecordNames: []string{"config/controlplanemachinesets/openshift-machine-api/cluster"},
++		},
++		{
++			name:                "single resource without namespace",
++			objects:             []string{controlPlaneMachineSetYAML},
++			namespaces:          []string{""},
++			expectedRecordCount: 1,
++			expectedRecordNames: []string{"config/controlplanemachinesets/cluster"},
++		},
++		{
++			name:                "empty list",
++			objects:             []string{},
++			namespaces:          []string{},
++			expectedRecordCount: 0,
++			expectedRecordNames: []string{},
++		},
++		{
++			name:                "multiple resources",
++			objects:             []string{controlPlaneMachineSetYAML, controlPlaneMachineSet2YAML},
++			namespaces:          []string{"openshift-machine-api", "openshift-machine-api"},
++			expectedRecordCount: 2,
++			expectedRecordNames: []string{
++				"config/controlplanemachinesets/openshift-machine-api/cluster",
++				"config/controlplanemachinesets/openshift-machine-api/cluster-2",
++			},
++		},
++	}
++
++	for _, tt := range tests {
++		t.Run(tt.name, func(t *testing.T) {
++			client := dynamicfake.NewSimpleDynamicClientWithCustomListKinds(runtime.NewScheme(), map[schema.GroupVersionResource]string{
++				controlPlaneMachineSetVersionResource: "ControlPlaneMachineSetList",
++			})
++			decUnstructured := yaml.NewDecodingSerializer(unstructured.UnstructuredJSONScheme)
++
++			for i, objYAML := range tt.objects {
++				obj := &unstructured.Unstructured{}
++				_, _, err := decUnstructured.Decode([]byte(objYAML), nil, obj)
++				if err != nil {
++					t.Fatalf("unable to decode controlplanemachineset %d: %v", i, err)
++				}
++
++				if tt.namespaces[i] != "" {
++					_, err = client.Resource(controlPlaneMachineSetVersionResource).Namespace(tt.namespaces[i]).Create(
++						context.Background(),
++						obj,
++						metav1.CreateOptions{},
++					)
++				} else {
++					_, err = client.Resource(controlPlaneMachineSetVersionResource).Create(
++						context.Background(),
++						obj,
++						metav1.CreateOptions{},
++					)
++				}
++				if err != nil {
++					t.Fatalf("unable to create fake controlplanemachineset %d: %v", i, err)
++				}
++			}
++
++			ctx := context.Background()
++			records, errs := gatherControlPlaneMachineSet(ctx, client)
++			assert.Empty(t, errs)
++			assert.Len(t, records, tt.expectedRecordCount)
++
++			recordNames := make(map[string]bool)
++			for _, rec := range records {
++				recordNames[rec.Name] = true
++
++				// Verify that sensitive fields have been removed
++				if tt.expectedRecordCount > 0 {
++					marshaller := rec.Item.(record.ResourceMarshaller)
++					unstructuredObj, ok := marshaller.Resource.(*unstructured.Unstructured)
++					assert.True(t, ok, "expected unstructured.Unstructured type")
++					if ok {
++						// Verify spec.template is removed
++						template, found, err := unstructured.NestedFieldNoCopy(unstructuredObj.Object, "spec", "template")
++						assert.NoError(t, err)
++						if found {
++							assert.Nil(t, template, "spec.template should be nil after sanitization")
++						}
++
++						// Verify spec.templates is removed
++						templates, found, err := unstructured.NestedFieldNoCopy(unstructuredObj.Object, "spec", "templates")
++						assert.NoError(t, err)
++						if found {
++							assert.Nil(t, templates, "spec.templates should be nil after sanitization")
++						}
++
++						// Verify other fields like replicas are still present
++						replicas, found, err := unstructured.NestedInt64(unstructuredObj.Object, "spec", "replicas")
++						assert.NoError(t, err)
++						if found {
++							assert.Equal(t, int64(3), replicas, "spec.replicas should still be present")
++						}
++					}
++				}
++			}
++			for _, expectedName := range tt.expectedRecordNames {
++				assert.True(t, recordNames[expectedName], "missing expected record: %s", expectedName)
++			}
++		})
++	}
++}

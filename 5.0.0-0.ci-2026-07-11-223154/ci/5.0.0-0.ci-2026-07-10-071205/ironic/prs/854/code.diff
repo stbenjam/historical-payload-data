@@ -1,0 +1,828 @@
+diff --git a/.github/workflows/update-requirements.yml b/.github/workflows/update-requirements.yml
+index 153c60240..6f31b7a7a 100644
+--- a/.github/workflows/update-requirements.yml
++++ b/.github/workflows/update-requirements.yml
+@@ -21,9 +21,11 @@ env:
+   # Repositories to track
+   IRONIC_REPO: "openshift/openstack-ironic"
+   SUSHY_REPO: "openshift/openstack-sushy"
++  NGS_REPO: "openshift/openstack-networking-generic-switch"
+   # Default branches to track
+   IRONIC_BRANCH: "main"
+   SUSHY_BRANCH: "main"
++  NGS_BRANCH: "main"
+ 
+ jobs:
+   update-requirements:
+@@ -64,11 +66,18 @@ jobs:
+           "https://api.github.com/repos/${{ env.SUSHY_REPO }}/commits/${{ env.SUSHY_BRANCH }}" | \
+           jq -r '.sha')
+ 
++        # Get latest commit hash from networking-generic-switch repository
++        NGS_HASH=$(curl -s -H "Authorization: token ${{ secrets.GITHUB_TOKEN }}" \
++          "https://api.github.com/repos/${{ env.NGS_REPO }}/commits/${{ env.NGS_BRANCH }}" | \
++          jq -r '.sha')
++
+         echo "ironic_hash=$IRONIC_HASH" >> $GITHUB_OUTPUT
+         echo "sushy_hash=$SUSHY_HASH" >> $GITHUB_OUTPUT
++        echo "ngs_hash=$NGS_HASH" >> $GITHUB_OUTPUT
+ 
+         echo "Latest Ironic commit: $IRONIC_HASH"
+         echo "Latest Sushy commit: $SUSHY_HASH"
++        echo "Latest Networking Generic Switch commit: $NGS_HASH"
+ 
+     - name: Check current hashes in requirements.cachito
+       id: current-hashes
+@@ -76,12 +85,15 @@ jobs:
+         # Extract current hashes from requirements.cachito
+         CURRENT_IRONIC=$(grep "^ironic @ git+" requirements.cachito | sed 's/.*@//' || echo "")
+         CURRENT_SUSHY=$(grep "^sushy @ git+" requirements.cachito | sed 's/.*@//' || echo "")
++        CURRENT_NGS=$(grep "^networking-generic-switch @ git+" requirements.cachito | sed 's/.*@//' || echo "")
+ 
+         echo "current_ironic=$CURRENT_IRONIC" >> $GITHUB_OUTPUT
+         echo "current_sushy=$CURRENT_SUSHY" >> $GITHUB_OUTPUT
++        echo "current_ngs=$CURRENT_NGS" >> $GITHUB_OUTPUT
+ 
+         echo "Current Ironic hash: $CURRENT_IRONIC"
+         echo "Current Sushy hash: $CURRENT_SUSHY"
++        echo "Current Networking Generic Switch hash: $CURRENT_NGS"
+ 
+     - name: Check if update is needed
+       id: check-update
+@@ -98,6 +110,11 @@ jobs:
+           NEED_UPDATE=true
+         fi
+ 
++        if [ "${{ steps.get-commits.outputs.ngs_hash }}" != "${{ steps.current-hashes.outputs.current_ngs }}" ]; then
++          echo "Networking Generic Switch hash changed"
++          NEED_UPDATE=true
++        fi
++
+         if [ "${{ github.event.inputs.force_update }}" = "true" ]; then
+           echo "Force update requested"
+           NEED_UPDATE=true
+@@ -111,6 +128,7 @@ jobs:
+         # Update the file
+         sed -i "s|ironic @ git+https://github.com/${{ env.IRONIC_REPO }}@.*|ironic @ git+https://github.com/${{ env.IRONIC_REPO }}@${{ steps.get-commits.outputs.ironic_hash }}|" requirements.cachito
+         sed -i "s|sushy @ git+https://github.com/${{ env.SUSHY_REPO }}@.*|sushy @ git+https://github.com/${{ env.SUSHY_REPO }}@${{ steps.get-commits.outputs.sushy_hash }}|" requirements.cachito
++        sed -i "s|networking-generic-switch @ git+https://github.com/${{ env.NGS_REPO }}@.*|networking-generic-switch @ git+https://github.com/${{ env.NGS_REPO }}@${{ steps.get-commits.outputs.ngs_hash }}|" requirements.cachito
+ 
+         echo "Updated requirements.cachito:"
+         cat requirements.cachito
+@@ -126,6 +144,7 @@ jobs:
+ 
+           - Ironic: ${{ steps.get-commits.outputs.ironic_hash }}
+           - Sushy: ${{ steps.get-commits.outputs.sushy_hash }}
++          - Networking Generic Switch: ${{ steps.get-commits.outputs.ngs_hash }}
+         title: "NO-ISSUE: Update requirements.cachito with latest openshift forks commits"
+         body: |
+           ## Automated Requirements Update
+@@ -141,7 +160,11 @@ jobs:
+           #### Sushy ({0})
+           - **Previous**: `{1}`
+           - **New**: `{2}`
+-          - **Compare**: https://github.com/{0}/compare/{1}..{2}', env.SUSHY_REPO, steps.current-hashes.outputs.current_sushy, steps.get-commits.outputs.sushy_hash) || '' }}
++          - **Compare**: https://github.com/{0}/compare/{1}..{2}', env.SUSHY_REPO, steps.current-hashes.outputs.current_sushy, steps.get-commits.outputs.sushy_hash) || '' }}${{ steps.get-commits.outputs.ngs_hash != steps.current-hashes.output.current_ngs && format('
++          #### Networking Generic Switch ({0})
++          - **Previous**: `{1}`
++          - **New**: `{2}`
++          - **Compare**: https://github.com/{0}/compare/{1}..{2}', env.NGS_REPO, steps.current-hashes.outputs.current_ngs, steps.get-commits.outputs.ngs_hash) || '' }}
+ 
+           ### Verification
+ 
+@@ -167,6 +190,7 @@ jobs:
+           echo "Requirements updated and PR created"
+           echo "- Ironic: ${{ steps.get-commits.outputs.ironic_hash }}"
+           echo "- Sushy: ${{ steps.get-commits.outputs.sushy_hash }}"
++          echo "- Networking Generic Switch: ${{ steps.get-commits.outputs.ngs_hash }}"
+         else
+           echo "No updates needed - all hashes are current"
+         fi
+@@ -183,6 +207,8 @@ jobs:
+         IRONIC_HASH: ${{ steps.get-commits.outputs.ironic_hash }}
+         CURRENT_SUSHY: ${{ steps.current-hashes.outputs.current_sushy }}
+         SUSHY_HASH: ${{ steps.get-commits.outputs.sushy_hash }}
++        CURRENT_NGS: ${{ steps.current-hashes.output.current_ngs }}
++        NGS_HASH: ${{ steps.get-commits.outputs.ngs_hash }}
+         PR_URL: ${{ steps.create-pr.outputs.pull-request-url }}
+       run: |
+         if [ -z "${SLACK_WEBHOOK_URL}" ]; then
+@@ -197,7 +223,9 @@ jobs:
+               "• Ironic previous: \`${CURRENT_IRONIC}\`" \
+               "• Ironic new: \`${IRONIC_HASH}\`" \
+               "• Sushy previous: \`${CURRENT_SUSHY}\`" \
+-              "• Sushy new: \`${SUSHY_HASH}\`")
++              "• Sushy new: \`${SUSHY_HASH}\`" \
++              "• Networking Generic Switch previous: \`${CURRENT_NGS}\`" \
++              "• Networking Generic Switch new: \`${NGS_HASH}\`")
+             if [ -n "${PR_URL}" ]; then
+               TEXT=$(printf '%s\n' "${TEXT}" "• PR: ${PR_URL}")
+             fi
+diff --git a/Dockerfile.ocp b/Dockerfile.ocp
+index 641c0389e..4c7eecce5 100644
+--- a/Dockerfile.ocp
++++ b/Dockerfile.ocp
+@@ -54,7 +54,7 @@ RUN --mount=from=wheel-builder,source=/wheels,target=/wheels \
+ # IRONIC #
+ COPY --from=builder /tmp/uefi_esp_*.img /templates/
+ 
+-COPY ironic-config/ironic.conf.j2 /etc/ironic/
++COPY ironic-config/ironic.conf.j2 ironic-config/ironic-networking.conf.j2 /etc/ironic/
+ 
+ # Custom httpd config, removes all but the bare minimum needed modules
+ COPY ironic-config/httpd.conf.j2 /etc/httpd/conf/
+diff --git a/README.md b/README.md
+index 112886e8e..795ea510e 100644
+--- a/README.md
++++ b/README.md
+@@ -19,6 +19,9 @@ The following entry points are provided:
+    the provisioning of baremetal nodes.  Details on Ironic can be found at
+    <https://docs.openstack.org/ironic/latest/>.  This is the default entry point
+    used by the Dockerfile.
++- `runironic-networking` - Starts the ironic-networking service for standalone
++   network management of baremetal nodes. This service handles switch port
++   configuration for node provisioning, cleaning, and inspection operations.
+ - `rundnsmasq` - Runs the dnmasq dhcp server to provide addresses and initiate
+    PXE boot of baremetal nodes.  This includes a lightweight TFTP server.
+    Details on dnsmasq can be found at
+@@ -59,6 +62,11 @@ functionality:
+    addresses like `00:20:e0:3b:13:af;00:20:e0:3b:14:af` (empty by default). For
+    more details on `dhcp-host` see
+    [the man page](https://thekelleys.org.uk/dnsmasq/docs/dnsmasq-man.html).
++- `DHCP_OPTIONS` - a `;` separated list of additional `dhcp-option` directives
++   that allows passing specific network configuration parameters (like routers,
++   DNS servers, and NTP) to DHCP clients (empty by default). Only applies to
++   IPv4 provisioning (`IPV=4` or unset). For more details on `dhcp-option` see
++   [the man page](https://thekelleys.org.uk/dnsmasq/docs/dnsmasq-man.html).
+ - `DHCP_IGNORE` - a set of tags on hosts that should be ignored and not allocate
+    DHCP leases for, e.g. `tag:!known` to ignore any unknown hosts (empty by
+    default)
+@@ -169,6 +177,39 @@ media HTTP server configuration:
+   `true` will make the server enforce its cipher list ordering for TLS version
+   up to 1.2, defaults to `false`
+ 
++## Ironic Networking
++
++The ironic networking configuration can be overridden by various environment
++variables.  The following can serve as an example of those most common settings.
++
++- `IRONIC_NETWORKING_ENABLED` - Enable standalone networking service
++   (default `false`)
++- `IRONIC_NETWORKING_JSON_RPC_HOST` - JSON-RPC host for networking service
++   (default `localhost`)
++- `IRONIC_NETWORKING_JSON_RPC_PORT` - JSON-RPC port for networking service
++   (default `8090`)
++- `IRONIC_NETWORKING_ENABLED_SWITCH_DRIVERS` - Enabled switch drivers (default
++   `generic-switch`)
++- `IRONIC_NETWORKING_SWITCH_CONFIGS` - Path to switch configuration file.
++   Switch configurations and SSH keys should be stored in a Secret and mounted
++   to the Pod as a file and referenced by this variable.
++   (default `${IRONIC_CONF_DIR}/networking/switch-configs.conf`)
++- `IRONIC_NETWORKING_PROVISIONING_NETWORK` - Network details for the
++   provisioning network (e.g., mode=access/native_vlan=123)
++- `IRONIC_NETWORKING_INSPECTION_NETWORK` - Network details for the inspection
++   network (e.g., mode=access/native_vlan=123)
++- `IRONIC_NETWORKING_SERVICING_NETWORK` - Network details for the servicing
++   network (e.g., mode=access/native_vlan=123)
++- `IRONIC_NETWORKING_CLEANING_NETWORK` - Network details for the cleaning
++   network (e.g., mode=access/native_vlan=123)
++- `IRONIC_NETWORKING_RESCUING_NETWORK` - Network details for the rescuing
++   network (e.g., mode=access/native_vlan=123)
++- `IRONIC_NETWORKING_IDLE_NETWORK` - Network details for the idle
++   network (e.g., mode=access/native_vlan=123)
++
++**Note:**  The ironic-networking service requires the `networking-generic-switch`
++  package.
++
+ ## Using a read-only root filesystem
+ 
+ The ironic-image can operate with a read-only root filesystem. However,
+diff --git a/ironic-config/apache2-ipxe.conf.j2 b/ironic-config/apache2-ipxe.conf.j2
+index 395443c4d..804f7985d 100644
+--- a/ironic-config/apache2-ipxe.conf.j2
++++ b/ironic-config/apache2-ipxe.conf.j2
+@@ -18,6 +18,11 @@ Listen {{ env.IPXE_TLS_PORT }}
+     <Directory ~ "/shared/html/(redfish|ilo|images)/?">
+         Require all denied
+     </Directory>
++    <Directory "/shared/html/images">
++        <FilesMatch "^ironic-python-agent\.">
++            Require all granted
++        </FilesMatch>
++    </Directory>
+ 
+     <Location ~ "^/.*">
+         SSLRequireSSL
+diff --git a/ironic-config/dnsmasq.conf.j2 b/ironic-config/dnsmasq.conf.j2
+index f22699023..931cf54e1 100644
+--- a/ironic-config/dnsmasq.conf.j2
++++ b/ironic-config/dnsmasq.conf.j2
+@@ -35,6 +35,12 @@ dhcp-option=3
+ dhcp-option=option:router,{{ env["GATEWAY_IP"] }}
+ {% endif %}
+ 
++{%- if env.get("DHCP_OPTIONS", "") | length %}
++{%- for opt in env.DHCP_OPTIONS.split(";") %}
++dhcp-option={{ opt }}
++{%- endfor %}
++{% endif %}
++
+ # Note: Need to test EFI booting
+ dhcp-match=set:efi,option:client-arch,7
+ dhcp-match=set:efi,option:client-arch,9
+diff --git a/ironic-config/inspector.ipxe.j2 b/ironic-config/inspector.ipxe.j2
+index 32071bc3b..6f0545e41 100644
+--- a/ironic-config/inspector.ipxe.j2
++++ b/ironic-config/inspector.ipxe.j2
+@@ -3,7 +3,7 @@
+ echo In inspector.ipxe
+ 
+ {%- macro kernel_cmdline(kernel_path, ramdisk_name) -%}
+-kernel --timeout 60000 {{ kernel_path }} ipa-insecure={{ env.IRONIC_IPA_INSECURE | default('1') }} ipa-inspection-collectors={{ env.IRONIC_IPA_COLLECTORS }} systemd.journald.forward_to_console={{ env.IPA_FORWARD_CONSOLE | default('yes') }} BOOTIF=${mac} ipa-debug={{ env.IRONIC_IPA_DEBUG | default('1') }} ipa-enable-vlan-interfaces={{ env.IRONIC_ENABLE_VLAN_INTERFACES }} ipa-inspection-dhcp-all-interfaces={{ env.IRONIC_IPA_INSPECTION_DHCP_ALL_INTERFACES | default('1') }} ipa-collect-lldp={{ env.IRONIC_IPA_COLLECT_LLDP | default('1') }} {{ env.INSPECTOR_EXTRA_ARGS }} initrd={{ ramdisk_name }} {% if env.IRONIC_RAMDISK_SSH_KEY %}sshkey="{{ env.IRONIC_RAMDISK_SSH_KEY|trim }}"{% endif %} {{ env.IRONIC_KERNEL_PARAMS|trim }} || goto retry_boot
++kernel --timeout 60000 {{ kernel_path }} ipa-insecure={{ env.IRONIC_IPA_INSECURE | default('1') }} ipa-inspection-collectors={{ env.IRONIC_IPA_COLLECTORS }} systemd.journald.forward_to_console={{ env.IPA_FORWARD_CONSOLE | default('yes') }} BOOTIF=${mac} ipa-debug={{ env.IRONIC_IPA_DEBUG | default('1') }} ipa-enable-vlan-interfaces={{ env.IRONIC_ENABLE_VLAN_INTERFACES }} ipa-inspection-dhcp-all-interfaces={{ env.IRONIC_IPA_INSPECTION_DHCP_ALL_INTERFACES | default('1') }} ipa-collect-lldp={{ env.IRONIC_IPA_COLLECT_LLDP | default('1') }} {{ env.INSPECTOR_EXTRA_ARGS }} initrd={{ ramdisk_name }} {% if env.IRONIC_INJECT_IPA == 'true' %}initrd=ipa-cacert-bundle{% endif %} {% if env.IRONIC_RAMDISK_SSH_KEY %}sshkey="{{ env.IRONIC_RAMDISK_SSH_KEY|trim }}"{% endif %} {{ env.IRONIC_KERNEL_PARAMS|trim }} || goto retry_boot
+ {%- endmacro -%}
+ 
+ {% if env.DEPLOY_KERNEL_BY_ARCH is defined %}
+diff --git a/ironic-config/ipxe_config.template b/ironic-config/ipxe_config.template
+index 33ba26eb4..66da09c2a 100644
+--- a/ironic-config/ipxe_config.template
++++ b/ironic-config/ipxe_config.template
+@@ -7,21 +7,29 @@ goto deploy
+ 
+ :deploy
+ imgfree
++{%- if ipxe_tls_setup %}
+ {%- if pxe_options.deployment_aki_path %}
+ {%- set aki_path_https_elements = pxe_options.deployment_aki_path.split(':') %}
+ {%- set aki_port_and_path = aki_path_https_elements[2].split('/') %}
+ {%- set aki_afterport = aki_port_and_path[1:]|join('/') %}
+-{%- set aki_path_https = ['https:', aki_path_https_elements[1], ':8084/', aki_afterport]|join %}
++{%- set aki_path = ['https:', aki_path_https_elements[1], ':', ipxe_tls_port, '/', aki_afterport]|join %}
+ {%- endif %}
+ {%- if pxe_options.deployment_ari_path %}
+ {%- set ari_path_https_elements = pxe_options.deployment_ari_path.split(':') %}
+ {%- set ari_port_and_path = ari_path_https_elements[2].split('/') %}
+ {%- set ari_afterport = ari_port_and_path[1:]|join('/') %}
+-{%- set ari_path_https = ['https:', ari_path_https_elements[1], ':8084/', ari_afterport]|join %}
++{%- set ari_path = ['https:', ari_path_https_elements[1], ':', ipxe_tls_port, '/', ari_afterport]|join %}
+ {%- endif %}
+-kernel {% if pxe_options.ipxe_timeout > 0 %}--timeout {{ pxe_options.ipxe_timeout }} {% endif %}{{ aki_path_https }} selinux=0 troubleshoot=0 text {{ pxe_options.pxe_append_params|default("", true) }} BOOTIF=${mac} initrd={{ pxe_options.initrd_filename|default("deploy_ramdisk", true) }} || goto retry
++{%- else %}
++{%- set ari_path = pxe_options.deployment_ari_path %}
++{%- set aki_path = pxe_options.deployment_aki_path %}
++{%- endif %}
++kernel {% if pxe_options.ipxe_timeout > 0 %}--timeout {{ pxe_options.ipxe_timeout }} {% endif %}{{ aki_path }} selinux=0 troubleshoot=0 text {{ pxe_options.pxe_append_params|default("", true) }} BOOTIF=${mac} initrd={{ pxe_options.initrd_filename|default("deploy_ramdisk", true) }} {% if inject_cacert_bundle %}initrd=ipa-cacert-bundle{% endif %} || goto retry
+ 
+-initrd {% if pxe_options.ipxe_timeout > 0 %}--timeout {{ pxe_options.ipxe_timeout }} {% endif %}{{ ari_path_https }} || goto retry
++initrd {% if pxe_options.ipxe_timeout > 0 %}--timeout {{ pxe_options.ipxe_timeout }} {% endif %}{{ ari_path }} || goto retry
++{%- if inject_cacert_bundle %}
++initrd {% if pxe_options.ipxe_timeout > 0 %}--timeout {{ pxe_options.ipxe_timeout }} {% endif %} ../ipa-cacert-bundle || goto retry
++{%- endif %}
+ boot
+ 
+ :retry
+@@ -39,8 +47,8 @@ poweroff
+ 
+ :boot_anaconda
+ imgfree
+-kernel {% if pxe_options.ipxe_timeout > 0 %}--timeout {{ pxe_options.ipxe_timeout }} {% endif %}{{ aki_path_https }} text {{ pxe_options.pxe_append_params|default("", true) }} inst.ks={{ pxe_options.ks_cfg_url }} {% if pxe_options.repo_url %}inst.repo={{ pxe_options.repo_url }}{% else %}inst.stage2={{ pxe_options.stage2_url }}{% endif %} initrd=ramdisk || goto boot_anaconda
+-initrd {% if pxe_options.ipxe_timeout > 0 %}--timeout {{ pxe_options.ipxe_timeout }} {% endif %}{{ ari_path_https }} || goto boot_anaconda
++kernel {% if pxe_options.ipxe_timeout > 0 %}--timeout {{ pxe_options.ipxe_timeout }} {% endif %}{{ aki_path }} text {{ pxe_options.pxe_append_params|default("", true) }} inst.ks={{ pxe_options.ks_cfg_url }} {% if pxe_options.repo_url %}inst.repo={{ pxe_options.repo_url }}{% else %}inst.stage2={{ pxe_options.stage2_url }}{% endif %} initrd=ramdisk || goto boot_anaconda
++initrd {% if pxe_options.ipxe_timeout > 0 %}--timeout {{ pxe_options.ipxe_timeout }} {% endif %}{{ ari_path }} || goto boot_anaconda
+ boot
+ 
+ :boot_ramdisk
+@@ -48,8 +56,8 @@ imgfree
+ {%- if pxe_options.boot_iso_url %}
+ sanboot {{ pxe_options.boot_iso_url }}
+ {%- else %}
+-kernel {% if pxe_options.ipxe_timeout > 0 %}--timeout {{ pxe_options.ipxe_timeout }} {% endif %}{{ aki_path_https }} root=/dev/ram0 text {{ pxe_options.pxe_append_params|default("", true) }} {{ pxe_options.ramdisk_opts|default('', true) }} initrd=ramdisk || goto boot_ramdisk
+-initrd {% if pxe_options.ipxe_timeout > 0 %}--timeout {{ pxe_options.ipxe_timeout }} {% endif %}{{ ari_path_https }} || goto boot_ramdisk
++kernel {% if pxe_options.ipxe_timeout > 0 %}--timeout {{ pxe_options.ipxe_timeout }} {% endif %}{{ aki_path }} root=/dev/ram0 text {{ pxe_options.pxe_append_params|default("", true) }} {{ pxe_options.ramdisk_opts|default('', true) }} initrd=ramdisk || goto boot_ramdisk
++initrd {% if pxe_options.ipxe_timeout > 0 %}--timeout {{ pxe_options.ipxe_timeout }} {% endif %}{{ ari_path }} || goto boot_ramdisk
+ boot
+ {%- endif %}
+ 
+diff --git a/ironic-config/ironic-networking.conf.j2 b/ironic-config/ironic-networking.conf.j2
+new file mode 100644
+index 000000000..f5d96b227
+--- /dev/null
++++ b/ironic-config/ironic-networking.conf.j2
+@@ -0,0 +1,28 @@
++[DEFAULT]
++debug = true
++auth_strategy = http_basic
++http_basic_auth_user_file = {{ env.IRONIC_RPC_HTPASSWD_FILE }}
++rpc_transport = json-rpc
++use_stderr = true
++
++[ironic_networking_json_rpc]
++auth_strategy = http_basic
++http_basic_auth_user_file = {{ env.IRONIC_RPC_HTPASSWD_FILE }}
++host_ip = {{ env.IRONIC_NETWORKING_JSON_RPC_HOST }}
++port = {{ env.IRONIC_NETWORKING_JSON_RPC_PORT }}
++{% if env.IRONIC_TLS_SETUP == "true" %}
++use_ssl = true
++cafile = {{ env.IRONIC_CACERT_FILE }}
++insecure = {{ env.IRONIC_INSECURE }}
++{% endif %}
++
++{% if env.IRONIC_TLS_SETUP == "true" %}
++[ssl]
++cert_file = {{ env.IRONIC_CERT_FILE }}
++key_file = {{ env.IRONIC_KEY_FILE }}
++{% endif %}
++
++[ironic_networking]
++enabled_switch_drivers = {{ env.IRONIC_NETWORKING_ENABLED_SWITCH_DRIVERS }}
++driver_config_dir = {{ env.IRONIC_NETWORKING_DRIVER_CONFIG_DIR }}
++switch_config_file = {{ env.IRONIC_NETWORKING_SWITCH_CONFIGS }}
+diff --git a/ironic-config/ironic.conf.j2 b/ironic-config/ironic.conf.j2
+index bff558369..8e4d1c483 100644
+--- a/ironic-config/ironic.conf.j2
++++ b/ironic-config/ironic.conf.j2
+@@ -8,7 +8,11 @@ auth_strategy = noauth
+ debug = true
+ default_deploy_interface = direct
+ default_inspect_interface = agent
++{%- if env.IRONIC_NETWORKING_ENABLED | lower == "true" %}
++default_network_interface = ironic-networking
++{% else %}
+ default_network_interface = noop
++{% endif -%}
+ enabled_bios_interfaces = no-bios,redfish,idrac-redfish
+ enabled_boot_interfaces = ipxe,pxe,fake,redfish-virtual-media,idrac-redfish-virtual-media,redfish-https
+ enabled_deploy_interfaces = direct,fake,ramdisk,custom-agent,bootc
+@@ -18,7 +22,11 @@ enabled_firmware_interfaces = no-firmware,fake,redfish
+ enabled_hardware_types = ipmi,idrac,fake-hardware,redfish,manual-management
+ enabled_inspect_interfaces = agent,fake,redfish
+ enabled_management_interfaces = ipmitool,fake,redfish,idrac-redfish,noop
++{%- if env.IRONIC_NETWORKING_ENABLED | lower == "true" %}
++enabled_network_interfaces = ironic-networking,noop
++{% else %}
+ enabled_network_interfaces = noop
++{% endif -%}
+ enabled_power_interfaces = ipmitool,fake,redfish,idrac-redfish
+ enabled_raid_interfaces = no-raid,agent,fake,redfish,idrac-redfish
+ enabled_vendor_interfaces = no-vendor,ipmitool,idrac-redfish,redfish,fake
+@@ -65,6 +73,9 @@ deploy_logs_local_path = /shared/log/ironic/deploy
+ # See https://bugzilla.redhat.com/show_bug.cgi?id=1822763
+ max_command_attempts = 30
+ certificates_path = {{ env.IRONIC_GEN_CERT_DIR }}
++{% if env.IRONIC_INJECT_IPA == 'true' %}
++api_ca_file = {{ env.IPA_CACERT_FILE }}
++{% endif %}
+ 
+ [api]
+ {% if env.IRONIC_REVERSE_PROXY_SETUP == "true" %}
+@@ -165,10 +176,11 @@ power_off = {{ false if env.IRONIC_FAST_TRACK == "true" else true }}
+ # NOTE(dtantsur): keep inspection arguments synchronized with inspector.ipxe
+ # Also keep in mind that only parameters unique for inspection go here.
+ # No need to duplicate pxe_append_params/kernel_append_params.
+-extra_kernel_params = ipa-inspection-collectors={{ env.IRONIC_IPA_COLLECTORS }} ipa-enable-vlan-interfaces={{ env.IRONIC_ENABLE_VLAN_INTERFACES }} ipa-inspection-dhcp-all-interfaces=1 ipa-collect-lldp=1
+-hooks = $default_hooks,parse-lldp
++extra_kernel_params = ipa-inspection-collectors={{ env.IRONIC_IPA_COLLECTORS }} ipa-enable-vlan-interfaces={{ env.IRONIC_ENABLE_VLAN_INTERFACES }} ipa-inspection-dhcp-all-interfaces=1 ipa-collect-lldp={{ env.IRONIC_IPA_COLLECT_LLDP | default('1') }}
++hooks = $default_hooks{% if env.IRONIC_IPA_COLLECT_LLDP | default('1') == '1' %},parse-lldp{% if env.IRONIC_NETWORKING_ENABLED | lower == "true" %},local-link-connection{% endif %}{% endif %}
+ add_ports = all
+ keep_ports = present
++force_dhcp = {{ env.IRONIC_FORCE_DHCP }}
+ 
+ [auto_discovery]
+ enabled = {{ env.IRONIC_ENABLE_DISCOVERY }}
+@@ -250,20 +262,18 @@ images_path = /shared/html/tmp
+ instance_master_path = /shared/html/master_images
+ tftp_master_path = /shared/tftpboot/master_images
+ tftp_root = /shared/tftpboot
+-kernel_append_params = nofb nomodeset vga=normal ipa-insecure=1 {% if env.ENABLE_FIPS_IPA %}fips={{ env.ENABLE_FIPS_IPA|trim }}{% endif %} {% if env.IRONIC_RAMDISK_SSH_KEY %}sshkey="{{ env.IRONIC_RAMDISK_SSH_KEY|trim }}"{% endif %} {{ env.IRONIC_KERNEL_PARAMS|trim }} systemd.journald.forward_to_console={{ env.IPA_FORWARD_CONSOLE | default('yes') }}
++kernel_append_params = nofb nomodeset vga=normal ipa-insecure={{ env.IRONIC_IPA_INSECURE | default('1') }} {% if env.ENABLE_FIPS_IPA %}fips={{ env.ENABLE_FIPS_IPA|trim }}{% endif %} {% if env.IRONIC_RAMDISK_SSH_KEY %}sshkey="{{ env.IRONIC_RAMDISK_SSH_KEY|trim }}"{% endif %} {{ env.IRONIC_KERNEL_PARAMS|trim }} systemd.journald.forward_to_console={{ env.IPA_FORWARD_CONSOLE | default('yes') }}
+ # This makes networking boot templates generated even for nodes using local
+ # boot (the default), ensuring that they boot correctly even if they start
+ # netbooting for some reason (e.g. with the noop management interface).
+ enable_netboot_fallback = true
+ # Enable the fallback path to in-band inspection
+ ipxe_fallback_script = inspector.ipxe
+-{% if env.IPXE_TLS_SETUP | lower == "true" %}
+-ipxe_config_template = /templates/ipxe_config.template
+-{% endif %}
++ipxe_config_template = {{ env.IRONIC_CONF_DIR }}/ipxe_config.template
+ 
+ [redfish]
+ use_swift = false
+-kernel_append_params = nofb nomodeset vga=normal ipa-insecure=1 {% if env.ENABLE_FIPS_IPA %}fips={{ env.ENABLE_FIPS_IPA|trim }}{% endif %} {% if env.IRONIC_RAMDISK_SSH_KEY %}sshkey="{{ env.IRONIC_RAMDISK_SSH_KEY|trim }}"{% endif %} {{ env.IRONIC_KERNEL_PARAMS|trim }} systemd.journald.forward_to_console={{ env.IPA_FORWARD_CONSOLE | default('yes') }}
++kernel_append_params = nofb nomodeset vga=normal ipa-insecure={{ env.IRONIC_IPA_INSECURE | default('1') }} {% if env.ENABLE_FIPS_IPA %}fips={{ env.ENABLE_FIPS_IPA|trim }}{% endif %} {% if env.IRONIC_RAMDISK_SSH_KEY %}sshkey="{{ env.IRONIC_RAMDISK_SSH_KEY|trim }}"{% endif %} {{ env.IRONIC_KERNEL_PARAMS|trim }} systemd.journald.forward_to_console={{ env.IPA_FORWARD_CONSOLE | default('yes') }}
+ {% if env.BMC_TLS_ENABLED == "true" %}
+ # idrac uses the same options as the redfish driver
+ verify_ca = {{ env.BMC_CACERT_FILE }}
+@@ -282,3 +292,39 @@ key_file = {{ env.IRONIC_KEY_FILE }}
+ {% if env.IRONIC_OCI_AUTH_CONFIG is defined %}
+ authentication_config = {{ env.IRONIC_OCI_AUTH_CONFIG }}
+ {% endif %}
++
++{% if env.IRONIC_NETWORKING_ENABLED | lower == "true" %}
++[ironic_networking_json_rpc]
++auth_strategy = http_basic
++http_basic_auth_user_file = {{ env.IRONIC_RPC_HTPASSWD_FILE }}
++host_ip = {{ env.IRONIC_NETWORKING_JSON_RPC_HOST }}
++port = {{ env.IRONIC_NETWORKING_JSON_RPC_PORT }}
++{% if env.IRONIC_TLS_SETUP == "true" %}
++use_ssl = true
++cafile = {{ env.IRONIC_CACERT_FILE }}
++insecure = {{ env.IRONIC_INSECURE }}
++{% endif %}
++{% endif %}
++
++{% if env.IRONIC_NETWORKING_ENABLED | lower == "true" %}
++[ironic_networking]
++rpc_transport = json-rpc
++{%- if env.IRONIC_NETWORKING_IDLE_NETWORK is defined %}
++idle_network = {{ env.IRONIC_NETWORKING_IDLE_NETWORK }}
++{%- endif %}
++{%- if env.IRONIC_NETWORKING_PROVISIONING_NETWORK is defined %}
++provisioning_network = {{ env.IRONIC_NETWORKING_PROVISIONING_NETWORK }}
++{%- endif %}
++{%- if env.IRONIC_NETWORKING_INSPECTION_NETWORK is defined %}
++inspection_network = {{ env.IRONIC_NETWORKING_INSPECTION_NETWORK }}
++{%- endif %}
++{%- if env.IRONIC_NETWORKING_CLEANING_NETWORK is defined %}
++cleaning_network = {{ env.IRONIC_NETWORKING_CLEANING_NETWORK }}
++{%- endif %}
++{%- if env.IRONIC_NETWORKING_RESCUING_NETWORK is defined %}
++rescuing_network = {{ env.IRONIC_NETWORKING_RESCUING_NETWORK }}
++{%- endif %}
++{%- if env.IRONIC_NETWORKING_SERVICING_NETWORK is defined %}
++servicing_network = {{ env.IRONIC_NETWORKING_SERVICING_NETWORK }}
++{%- endif %}
++{% endif %}
+diff --git a/main-packages-list.ocp b/main-packages-list.ocp
+index a205316d5..c85bd96e6 100644
+--- a/main-packages-list.ocp
++++ b/main-packages-list.ocp
+@@ -21,6 +21,7 @@ python3.12-construct
+ python3.12-cotyledon >= 2.0.0-1
+ python3.12-debtcollector >= 3.0.0-0.20250214185317.0e6ce1c.el9
+ python3.12-defusedxml >= 0.7.1-1.el9
++python3.12-etcd3gw >= 2.3.0
+ python3.12-eventlet >= 0.40.3-2.el9ocp
+ python3.12-flask >= 1:2.2.5-3.1.el9ocp
+ python3.12-flexcache >= 0.3-3.el9ocp
+@@ -42,6 +43,8 @@ python3.12-markupsafe >= 2.1.1-4.el9
+ python3.12-microversion-parse >= 1.0.1-0.20240424173932.2c36df6.el9
+ python3.12-msgpack >= 0.6.2-2.el9
+ python3.12-netaddr >= 0.10.1-2.el9
++python3.12-netmiko >= 4.7.0-1.el9ocp
++python3.12-neutron-lib >= 4.1.0
+ python3.12-openstacksdk >= 4.9.0
+ python3.12-os-traits >= 3.3.0
+ python3.12-osc-lib >= 3.2.0
+@@ -63,6 +66,7 @@ python3.12-oslo-utils >= 8.2.0
+ python3.12-oslo-versionedobjects >= 3.6.0
+ python3.12-osprofiler >= 4.2.0-0.20250214190140.3fb0487.el9
+ python3.12-packaging >= 24.2-1.el9ocp
++python3.12-paramiko >= 4.0.0-1.el9ocp
+ python3.12-paste >= 3.5.0-3.el9.1
+ python3.12-paste-deploy >= 2.0.1-5.el9
+ python3.12-pbr >= 6.0.0-1.el9
+@@ -73,6 +77,7 @@ python3.12-pyasn1 >= 0.5.1-5.el9ocp
+ python3.12-pyasn1-modules >= 0.5.1-5.el9ocp
+ python3.12-pycdlib
+ python3.12-pyghmi >= 1.5.14-2.1.el9ost
++python3.12-pyroute2 >= 0.7.3
+ python3.12-pysnmp-lextudio >= 5.0.33-1.el9
+ python3.12-pyyaml >= 6.0.2-2.el9ocp
+ python3.12-requests >= 2.32.3-2.el9
+diff --git a/requirements.cachito b/requirements.cachito
+index 03efef9f7..53d09451d 100644
+--- a/requirements.cachito
++++ b/requirements.cachito
+@@ -13,8 +13,9 @@
+ 
+ ironic @ git+https://github.com/openshift/openstack-ironic@893fb5ff41fca109225d7589eb3358d612cda5cb
+ sushy @ git+https://github.com/openshift/openstack-sushy@13acced61644ab5a2ff88eff498cd599d16fde42
++networking-generic-switch @ git+https://github.com/openshift/openstack-networking-generic-switch@fe3cd8ff8ed2d08757942b925a927a2619d63189
+ 
+ proliantutils===2.16.3
+ python-scciclient===0.17.0
+ 
+-# DEPENDENCIES
++# DEPENDENCIES
+\ No newline at end of file
+diff --git a/scripts/auth-common.sh b/scripts/auth-common.sh
+index 7c56d77ba..345e213c6 100644
+--- a/scripts/auth-common.sh
++++ b/scripts/auth-common.sh
+@@ -46,22 +46,20 @@ fi
+ 
+ configure_json_rpc_auth()
+ {
+-    if [[ "${IRONIC_EXPOSE_JSON_RPC}" != "true" ]]; then
+-        return
+-    fi
++    local GROUP=${1:-json_rpc}
+ 
+     local auth_config_file="/auth/ironic-rpc/auth-config"
+     local username_file="/auth/ironic-rpc/username"
+     local password_file="/auth/ironic-rpc/password"
+     if [[ -f "${username_file}" ]] && [[ -f "${password_file}" ]]; then
+-        crudini --set "${IRONIC_CONFIG}" json_rpc username "$(<${username_file})"
++        crudini --set "${IRONIC_CONFIG}" "${GROUP}" username "$(<${username_file})"
+         set +x
+-        crudini --set "${IRONIC_CONFIG}" json_rpc password "$(<${password_file})"
++        crudini --set "${IRONIC_CONFIG}" "${GROUP}" password "$(<${password_file})"
+         set -x
+     elif [[ -f "${auth_config_file}" ]]; then
+         echo "WARNING: using auth-config is deprecated, mount a secret directly"
+-        # Merge configurations in the "auth" directory into the default ironic configuration file
+-        crudini --merge "${IRONIC_CONFIG}" < "${auth_config_file}"
++        # Merge configurations in the "auth" directory into the target group
++        crudini --merge "${IRONIC_CONFIG}" "${GROUP}" < "${auth_config_file}"
+     else
+         echo "FATAL: no client-side credentials provided for JSON RPC"
+         echo "HINT: mount a secret with username and password fields under /auth/ironic-rpc"
+diff --git a/scripts/configure-ironic-networking.sh b/scripts/configure-ironic-networking.sh
+new file mode 100755
+index 000000000..8f23736b7
+--- /dev/null
++++ b/scripts/configure-ironic-networking.sh
+@@ -0,0 +1,36 @@
++#!/usr/bin/bash
++
++set -euxo pipefail
++
++# No need to rely on this being set by whoever created this service since this
++# only gets run when ironic-networking is enabled.
++export IRONIC_NETWORKING_ENABLED=true
++
++# shellcheck disable=SC1091
++. /bin/tls-common.sh
++# shellcheck disable=SC1091
++. /bin/ironic-common.sh
++# shellcheck disable=SC1091
++. /bin/ironic-networking-common.sh
++# shellcheck disable=SC1091
++. /bin/auth-common.sh
++
++# zero makes it do cpu number detection on Ironic side
++export NUMWORKERS=${NUMWORKERS:-0}
++
++if [[ -f "${IRONIC_CONF_DIR}/ironic.conf" ]]; then
++    # Make a copy of the original supposed empty configuration file
++    cp "${IRONIC_CONF_DIR}/ironic.conf" "${IRONIC_CONF_DIR}/ironic.conf.orig"
++fi
++
++# The original ironic.conf is empty, and can be found in ironic.conf.orig
++render_j2_config "/etc/ironic/ironic-networking.conf.j2" \
++    "${IRONIC_CONF_DIR}/ironic.conf"
++
++configure_json_rpc_auth "ironic_networking_json_rpc"
++
++# Make sure ironic traffic bypasses any proxies
++export NO_PROXY="${NO_PROXY:-},${IRONIC_IP}"
++
++# Ensure driver config directory exists
++mkdir -p "${IRONIC_NETWORKING_DRIVER_CONFIG_DIR}"
+diff --git a/scripts/configure-ironic.sh b/scripts/configure-ironic.sh
+index d88a51e1b..9a992b513 100755
+--- a/scripts/configure-ironic.sh
++++ b/scripts/configure-ironic.sh
+@@ -15,6 +15,8 @@ export IRONIC_ENABLE_VLAN_INTERFACES=${IRONIC_ENABLE_VLAN_INTERFACES:-all}
+ # shellcheck disable=SC1091
+ . /bin/ironic-common.sh
+ # shellcheck disable=SC1091
++. /bin/ironic-networking-common.sh
++# shellcheck disable=SC1091
+ . /bin/auth-common.sh
+ 
+ if [[ "${IRONIC_USE_MARIADB}" == true ]]; then
+@@ -25,10 +27,12 @@ if [[ "${IRONIC_USE_MARIADB}" == true ]]; then
+     MARIADB_DATABASE=${MARIADB_DATABASE:-ironic}
+     MARIADB_USER=${MARIADB_USER:-ironic}
+     MARIADB_HOST=${MARIADB_HOST:-127.0.0.1}
++    set +x
+     export MARIADB_CONNECTION="mysql+pymysql://${MARIADB_USER}:${MARIADB_PASSWORD}@${MARIADB_HOST}/${MARIADB_DATABASE}?charset=utf8"
+     if [[ "$MARIADB_TLS_ENABLED" == "true" ]]; then
+         export MARIADB_CONNECTION="${MARIADB_CONNECTION}&ssl=on&ssl_ca=${MARIADB_CACERT_FILE}"
+     fi
++    set -x
+ fi
+ 
+ # zero makes it do cpu number detection on Ironic side
+@@ -96,11 +100,23 @@ if [[ -f /proc/sys/crypto/fips_enabled ]]; then
+     export ENABLE_FIPS_IPA
+ fi
+ 
+-# The original ironic.conf is empty, and can be found in ironic.conf_orig
++# inject TLS and cacert bundle variables in ipxe_template
++sed "1 a\
++\{%- set ipxe_tls_setup = $IPXE_TLS_SETUP %}\\
++\{%- set inject_cacert_bundle = $IRONIC_INJECT_IPA %}\\
++\{%- set ipxe_tls_port = $IPXE_TLS_PORT %}" /templates/ipxe_config.template > "${IRONIC_CONF_DIR}/ipxe_config.template"
++
++# The original ironic.conf is empty, and can be found in ironic.conf.orig
+ render_j2_config "/etc/ironic/ironic.conf.j2" \
+     "${IRONIC_CONF_DIR}/ironic.conf"
+ 
+-configure_json_rpc_auth
++if [[ "${IRONIC_EXPOSE_JSON_RPC}" == "true" ]]; then
++    configure_json_rpc_auth
++fi
++
++if [[ "${IRONIC_NETWORKING_ENABLED}" == "true" ]]; then
++    configure_json_rpc_auth "ironic_networking_json_rpc"
++fi
+ 
+ # Make sure ironic traffic bypasses any proxies
+ export NO_PROXY="${NO_PROXY:-},$IRONIC_IP"
+diff --git a/scripts/ironic-common.sh b/scripts/ironic-common.sh
+index ec98aa98b..bab79e9b7 100644
+--- a/scripts/ironic-common.sh
++++ b/scripts/ironic-common.sh
+@@ -36,7 +36,10 @@ mkdir -p "${IRONIC_CONF_DIR}" "${PROBE_CONF_DIR}" "${HTTPD_CONF_DIR}" \
+ export HTPASSWD_FILE="${IRONIC_CONF_DIR}/htpasswd"
+ export LOCAL_DB_URI="sqlite:///${IRONIC_DB_DIR}/ironic.sqlite"
+ 
+-export IRONIC_USE_MARIADB=${IRONIC_USE_MARIADB:-false}
++export IRONIC_USE_MARIADB="${IRONIC_USE_MARIADB:-false}"
++
++# Allow override in ironic-networking use cases
++export IRONIC_FORCE_DHCP="${IRONIC_FORCE_DHCP:-false}"
+ 
+ get_provisioning_interface()
+ {
+@@ -144,6 +147,12 @@ wait_for_interface_or_ip()
+     export IRONIC_HTTP_URL="${IRONIC_HTTP_URL:-http://${IRONIC_URL_HOST}:${HTTP_PORT}}"
+     export IRONIC_TFTP_URL="${IRONIC_TFTP_URL:-tftp://${IRONIC_URL_HOST}}"
+     export IRONIC_BASE_URL=${IRONIC_BASE_URL:-"${IRONIC_SCHEME}://${IRONIC_URL_HOST}:${IRONIC_ACCESS_PORT}"}
++
++    if [[ "${IPXE_TLS_SETUP:-false}" == "true" ]]; then
++        export IRONIC_IPA_BASE_URL="${IRONIC_IPA_BASE_URL:-${IPXE_SCHEME}://${IRONIC_URL_HOST}:${IPXE_TLS_PORT}}"
++    else
++        export IRONIC_IPA_BASE_URL="${IRONIC_IPA_BASE_URL:-${IRONIC_HTTP_URL}}"
++    fi
+ }
+ 
+ render_j2_config()
+diff --git a/scripts/ironic-networking-common.sh b/scripts/ironic-networking-common.sh
+new file mode 100644
+index 000000000..48a870bec
+--- /dev/null
++++ b/scripts/ironic-networking-common.sh
+@@ -0,0 +1,10 @@
++#!/usr/bin/bash
++
++export IRONIC_NETWORKING_ENABLED="${IRONIC_NETWORKING_ENABLED:-false}"
++export IRONIC_NETWORKING_DRIVER_CONFIG_DIR="${IRONIC_NETWORKING_DRIVER_CONFIG_DIR:-${IRONIC_CONF_DIR}/drivers}"
++export IRONIC_NETWORKING_JSON_RPC_HOST="${IRONIC_NETWORKING_JSON_RPC_HOST:-localhost}"
++export IRONIC_NETWORKING_JSON_RPC_PORT="${IRONIC_NETWORKING_JSON_RPC_PORT:-8090}"
++export IRONIC_NETWORKING_ENABLED_SWITCH_DRIVERS="${IRONIC_NETWORKING_ENABLED_SWITCH_DRIVERS:-generic-switch}"
++# This is expected to be a secret mounted to this location so nothing else
++# should be written to this directory.
++export IRONIC_NETWORKING_SWITCH_CONFIGS="${IRONIC_NETWORKING_SWITCH_CONFIGS:-${IRONIC_CONF_DIR}/networking/switch-configs.conf}"
+diff --git a/scripts/runhttpd b/scripts/runhttpd
+index ac096e1bc..85ad33706 100755
+--- a/scripts/runhttpd
++++ b/scripts/runhttpd
+@@ -71,12 +71,23 @@ fi
+ 
+ # Render httpd TLS configuration for /shared/html
+ if [[ "$IPXE_TLS_SETUP" == "true" ]]; then
+-    mkdir -p /shared/html/custom-ipxe
+-    chmod 0777 /shared/html/custom-ipxe
++    HTTPS_IPXE_BOOT_DIR="/shared/html/custom-ipxe"
++    mkdir -p "${HTTPS_IPXE_BOOT_DIR}"
++    chmod 0777 "${HTTPS_IPXE_BOOT_DIR}"
+     render_j2_config "/templates/httpd-ipxe.conf.j2" "${HTTPD_CONF_DIR_D}/ipxe.conf"
+-    cp "${IPXE_CUSTOM_FIRMWARE_DIR}/undionly.kpxe" \
+-       "${IPXE_CUSTOM_FIRMWARE_DIR}/snponly.efi" \
+-       "/shared/html/custom-ipxe"
++    for fw_file in undionly.kpxe snponly-x86_64.efi snponly-arm64.efi; do
++        if [[ -f "${IPXE_CUSTOM_FIRMWARE_DIR}/${fw_file}" ]]; then
++            cp "${IPXE_CUSTOM_FIRMWARE_DIR}/${fw_file}" "${HTTPS_IPXE_BOOT_DIR}"
++        else
++            echo "INFO: ${IPXE_CUSTOM_FIRMWARE_DIR}/${fw_file} is unavailable, skipping."
++        fi
++    done
++
++    # Validate that at least one legacy bios and one efi iPXE binary was successfully copied
++    if ! ls "${HTTPS_IPXE_BOOT_DIR}/"*.{kpxe,efi} &>/dev/null; then
++        echo "ERROR: No iPXE firmware files found in ${HTTPS_IPXE_BOOT_DIR} after copying from ${IPXE_CUSTOM_FIRMWARE_DIR}!"
++        exit 1
++    fi
+ fi
+ 
+ # Set up inotify to kill the container (restart) whenever cert files for ironic api change
+diff --git a/scripts/runironic b/scripts/runironic
+index ff0e851b1..d142ec616 100755
+--- a/scripts/runironic
++++ b/scripts/runironic
+@@ -11,6 +11,10 @@ if [[ "${IRONIC_SKIP_DBSYNC:-false}" != true ]]; then
+     run_ironic_dbsync
+ fi
+ 
++if [[ "${IRONIC_INJECT_IPA}" == "true" ]]; then
++    generate_cacert_bundle_initrd /shared/html/ipa-cacert-bundle
++fi
++configure_restart_on_certificate_update "${IRONIC_INJECT_IPA}" ironic "${WEBSERVER_CACERT_FILE:-}"
+ configure_restart_on_certificate_update "${IRONIC_TLS_SETUP}" ironic "${IRONIC_CERT_FILE}"
+ 
+ configure_ironic_auth
+diff --git a/scripts/runironic-networking b/scripts/runironic-networking
+new file mode 100755
+index 000000000..f6fc4e1d5
+--- /dev/null
++++ b/scripts/runironic-networking
+@@ -0,0 +1,10 @@
++#!/usr/bin/bash
++
++# shellcheck disable=SC1091
++. /bin/configure-ironic-networking.sh
++
++configure_restart_on_certificate_update "${IRONIC_TLS_SETUP}" ironic-networking "${IRONIC_CERT_FILE}"
++
++# Dynamically written driver files will be written to the driver config dir
++# therefore we use --config-dir to scan all of those potential files.
++exec /usr/bin/ironic-networking --config-file "${IRONIC_CONF_DIR}/ironic.conf" --config-dir "${IRONIC_NETWORKING_DRIVER_CONFIG_DIR}"
+diff --git a/scripts/runlogwatch.sh b/scripts/runlogwatch.sh
+index 95cec2c6e..17940c9a9 100755
+--- a/scripts/runlogwatch.sh
++++ b/scripts/runlogwatch.sh
+@@ -1,4 +1,5 @@
+ #!/usr/bin/bash
++set -euxo pipefail
+ 
+ # Ramdisk logs path
+ export LOG_DIR="/shared/log/ironic/deploy"
+@@ -14,7 +15,7 @@ process_log_file() {
+     echo "************ Contents of ${LOG_DIR}/${FILENAME} ramdisk log file bundle **************"
+     tar -tzf "${FILEPATH}" | while read -r entry; do
+         echo "${FILENAME}: **** Entry: ${entry} ****"
+-        tar -xOzf "${FILEPATH}" "${entry}" | sed -e "s/^/${FILENAME}: /"
++        tar -xOzf "${FILEPATH}" -- "${entry}" | sed -e "s/^/${FILENAME}: /"
+         echo
+     done
+     rm -f "${FILEPATH}"
+diff --git a/scripts/tls-common.sh b/scripts/tls-common.sh
+index 723133e9c..287c546c0 100644
+--- a/scripts/tls-common.sh
++++ b/scripts/tls-common.sh
+@@ -22,7 +22,8 @@ export RESTART_CONTAINER_CERTIFICATE_UPDATED=${RESTART_CONTAINER_CERTIFICATE_UPD
+ export MARIADB_CACERT_FILE=/certs/ca/mariadb/tls.crt
+ export BMC_CACERTS_PATH=/certs/ca/bmc
+ export BMC_CACERT_FILE=/conf/bmc-tls.pem
+-export IRONIC_CACERT_FILE=/certs/ca/ironic/tls.crt
++export IRONIC_CACERT_FILE=${IRONIC_CACERT_FILE:-"/certs/ca/ironic/tls.crt"}
++export IPA_CACERT_FILE=/conf/ipa-tls.pem
+ 
+ export IPXE_TLS_PORT="${IPXE_TLS_PORT:-8084}"
+ 
+@@ -128,3 +129,38 @@ if ls "${BMC_CACERTS_PATH}"/* > /dev/null 2>&1; then
+ else
+     export BMC_TLS_ENABLED="false"
+ fi
++
++if [[ -f "${WEBSERVER_CACERT_FILE:-}" ]]; then
++    export IRONIC_INJECT_IPA="true"
++    copy_atomic "${WEBSERVER_CACERT_FILE}" "${IPA_CACERT_FILE}"
++    
++    if [[ -f "${IRONIC_CACERT_FILE}" ]]; then
++        cat "${IRONIC_CACERT_FILE}" >> "${IPA_CACERT_FILE}"
++    fi
++else
++    export IRONIC_INJECT_IPA="false"
++fi
++
++generate_cacert_bundle_initrd()
++(
++    set -euo pipefail
++
++    local output_path="$1"
++    local temp_dir
++
++    temp_dir="$(mktemp -d)"
++    trap 'rm -rf "${temp_dir}"' EXIT
++
++    chmod 0755 "${temp_dir}"
++
++    cd "${temp_dir}"
++
++    mkdir -p etc/ironic-python-agent.d etc/ironic-python-agent
++    cp "${IPA_CACERT_FILE}" etc/ironic-python-agent/ironic.crt
++    cat > etc/ironic-python-agent.d/ironic-tls.conf <<EOF
++[DEFAULT]
++cafile = /etc/ironic-python-agent/ironic.crt
++EOF
++
++    find . -print0 | sort -z | cpio -0 -o -H newc -R +0:+0 --reproducible >> "${output_path}"
++)
+diff --git a/tools/check-requirements.sh b/tools/check-requirements.sh
+index 5589d9571..5bd70c031 100755
+--- a/tools/check-requirements.sh
++++ b/tools/check-requirements.sh
+@@ -4,7 +4,7 @@ set -euxo pipefail
+ 
+ CHECK_RELEASE=${CHECK_RELEASE:-"main"}
+ 
+-for repo in "openstack-ironic" "openstack-sushy"
++for repo in "openstack-ironic" "openstack-sushy" "openstack-networking-generic-switch"
+ do
+   line=$(grep "$repo@" requirements.cachito)
+   echo $line

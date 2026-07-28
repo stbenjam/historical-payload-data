@@ -1,0 +1,197 @@
+diff --git a/cmd/cluster-authentication-operator-tests-ext/main.go b/cmd/cluster-authentication-operator-tests-ext/main.go
+index 268a3d2637..2c7cf8e242 100644
+--- a/cmd/cluster-authentication-operator-tests-ext/main.go
++++ b/cmd/cluster-authentication-operator-tests-ext/main.go
+@@ -13,6 +13,7 @@ import (
+ 	"github.com/openshift/cluster-authentication-operator/pkg/version"
+ 
+ 	_ "github.com/openshift/cluster-authentication-operator/test/e2e"
++	_ "github.com/openshift/cluster-authentication-operator/test/e2e-encryption"
+ 	_ "github.com/openshift/cluster-authentication-operator/test/e2e-encryption-kms"
+ 	_ "github.com/openshift/cluster-authentication-operator/test/e2e-encryption-perf"
+ 	_ "github.com/openshift/cluster-authentication-operator/test/e2e-encryption-rotation"
+@@ -94,6 +95,16 @@ func prepareOperatorTestsRegistry() (*oteextension.Registry, error) {
+ 		ClusterStability: oteextension.ClusterStabilityDisruptive,
+ 	})
+ 
++	// ClusterStability set to Disruptive: encryption tests trigger API server rollouts.
++	extension.AddSuite(oteextension.Suite{
++		Name:             "openshift/cluster-authentication-operator/operator-encryption/serial",
++		Parallelism:      1,
++		ClusterStability: oteextension.ClusterStabilityDisruptive,
++		Qualifiers: []string{
++			`name.contains("[Encryption]") && name.contains("[Serial]") && !name.contains("Rotation") && !name.contains("Perf") && !name.contains("KMS")`,
++		},
++	})
++
+ 	// ClusterStability set to Disruptive: encryption perf tests trigger API server rollouts.
+ 	extension.AddSuite(oteextension.Suite{
+ 		Name:             "openshift/cluster-authentication-operator/operator-encryption-perf/serial",
+diff --git a/test/e2e-encryption/encryption.go b/test/e2e-encryption/encryption.go
+new file mode 100644
+index 0000000000..c9a29ff4b1
+--- /dev/null
++++ b/test/e2e-encryption/encryption.go
+@@ -0,0 +1,77 @@
++package e2e_encryption
++
++import (
++	"context"
++	"testing"
++	"time"
++
++	g "github.com/onsi/ginkgo/v2"
++	"k8s.io/apimachinery/pkg/runtime"
++
++	configv1 "github.com/openshift/api/config/v1"
++	library "github.com/openshift/library-go/test/library/encryption"
++)
++
++var _ = g.Describe("[sig-auth] authentication operator", func() {
++	g.It("[Encryption][Serial] TestEncryptionTypeIdentity", func(ctx context.Context) {
++		testEncryptionTypeIdentity(ctx, g.GinkgoTB())
++	})
++
++	g.It("[Encryption][Serial] TestEncryptionTypeUnset", func(ctx context.Context) {
++		testEncryptionTypeUnset(ctx, g.GinkgoTB())
++	})
++
++	g.It("[Encryption][Serial] TestEncryptionTurnOnAndOff [Timeout:60m]", func(ctx context.Context) {
++		testEncryptionTurnOnAndOff(ctx, g.GinkgoTB())
++	})
++})
++
++func testEncryptionTypeIdentity(ctx context.Context, tt testing.TB) {
++	library.TestEncryptionTypeIdentity(ctx, tt, library.BasicScenario{
++		Namespace:                       "openshift-config-managed",
++		LabelSelector:                   "encryption.apiserver.operator.openshift.io/component=openshift-oauth-apiserver",
++		EncryptionConfigSecretName:      "encryption-config-openshift-oauth-apiserver",
++		EncryptionConfigSecretNamespace: "openshift-config-managed",
++		OperatorNamespace:               "openshift-authentication-operator",
++		TargetGRs:                       library.AuthTargetGRs,
++		AssertFunc:                      library.AssertTokens,
++	})
++}
++
++func testEncryptionTypeUnset(ctx context.Context, tt testing.TB) {
++	library.TestEncryptionTypeUnset(ctx, tt, library.BasicScenario{
++		Namespace:                       "openshift-config-managed",
++		LabelSelector:                   "encryption.apiserver.operator.openshift.io/component=openshift-oauth-apiserver",
++		EncryptionConfigSecretName:      "encryption-config-openshift-oauth-apiserver",
++		EncryptionConfigSecretNamespace: "openshift-config-managed",
++		OperatorNamespace:               "openshift-authentication-operator",
++		TargetGRs:                       library.AuthTargetGRs,
++		AssertFunc:                      library.AssertTokens,
++	})
++}
++
++func testEncryptionTurnOnAndOff(ctx context.Context, tt testing.TB) {
++	library.TestEncryptionTurnOnAndOff(ctx, tt, library.OnOffScenario{
++		BasicScenario: library.BasicScenario{
++			Namespace:                       "openshift-config-managed",
++			LabelSelector:                   "encryption.apiserver.operator.openshift.io/component=openshift-oauth-apiserver",
++			EncryptionConfigSecretName:      "encryption-config-openshift-oauth-apiserver",
++			EncryptionConfigSecretNamespace: "openshift-config-managed",
++			OperatorNamespace:               "openshift-authentication-operator",
++			TargetGRs:                       library.AuthTargetGRs,
++			AssertFunc:                      library.AssertTokens,
++		},
++		CreateResourceFunc: func(t testing.TB, _ library.ClientSet, _ string) runtime.Object {
++			ctx, cancel := context.WithTimeout(ctx, 2*time.Minute)
++			t.Cleanup(cancel)
++			return library.CreateAndStoreTokenOfLife(ctx, t, library.GetClients(t))
++		},
++		AssertResourceEncryptedFunc:    library.AssertTokenOfLifeEncrypted,
++		AssertResourceNotEncryptedFunc: library.AssertTokenOfLifeNotEncrypted,
++		ResourceFunc:                   library.TokenOfLife,
++		ResourceName:                   "TokenOfLife",
++		EncryptionProvider: library.EncryptionProvider{
++			APIServerEncryption: configv1.APIServerEncryption{Type: configv1.EncryptionType("aescbc")},
++		},
++	})
++}
+diff --git a/test/e2e-encryption/encryption_test.go b/test/e2e-encryption/encryption_test.go
+index a5b556361a..5cd9fe526b 100644
+--- a/test/e2e-encryption/encryption_test.go
++++ b/test/e2e-encryption/encryption_test.go
+@@ -1,60 +1,23 @@
+-package e2eencryption
++package e2e_encryption
+ 
+ import (
+-	"context"
+-	"fmt"
+ 	"testing"
+-
+-	"k8s.io/apimachinery/pkg/runtime"
+-
+-	configv1 "github.com/openshift/api/config/v1"
+-	library "github.com/openshift/library-go/test/library/encryption"
+ )
+ 
++// These tests call the shared test functions which
++// can be called from both standard Go tests and Ginkgo tests.
++//
++// This situation is temporary until we verify the new e2e-aws-operator-encryption-serial-ote job.
++// Eventually all tests will be run only as part of the OTE framework.
++
+ func TestEncryptionTypeIdentity(t *testing.T) {
+-	library.TestEncryptionTypeIdentity(t.Context(), t, library.BasicScenario{
+-		Namespace:                       "openshift-config-managed",
+-		LabelSelector:                   "encryption.apiserver.operator.openshift.io/component" + "=" + "openshift-oauth-apiserver",
+-		EncryptionConfigSecretName:      fmt.Sprintf("encryption-config-openshift-oauth-apiserver"),
+-		EncryptionConfigSecretNamespace: "openshift-config-managed",
+-		OperatorNamespace:               "openshift-authentication-operator",
+-		TargetGRs:                       library.AuthTargetGRs,
+-		AssertFunc:                      library.AssertTokens,
+-	})
++	testEncryptionTypeIdentity(t.Context(), t)
+ }
+ 
+ func TestEncryptionTypeUnset(t *testing.T) {
+-	library.TestEncryptionTypeUnset(t.Context(), t, library.BasicScenario{
+-		Namespace:                       "openshift-config-managed",
+-		LabelSelector:                   "encryption.apiserver.operator.openshift.io/component" + "=" + "openshift-oauth-apiserver",
+-		EncryptionConfigSecretName:      fmt.Sprintf("encryption-config-openshift-oauth-apiserver"),
+-		EncryptionConfigSecretNamespace: "openshift-config-managed",
+-		OperatorNamespace:               "openshift-authentication-operator",
+-		TargetGRs:                       library.AuthTargetGRs,
+-		AssertFunc:                      library.AssertTokens,
+-	})
++	testEncryptionTypeUnset(t.Context(), t)
+ }
+ 
+ func TestEncryptionTurnOnAndOff(t *testing.T) {
+-	library.TestEncryptionTurnOnAndOff(t.Context(), t, library.OnOffScenario{
+-		BasicScenario: library.BasicScenario{
+-			Namespace:                       "openshift-config-managed",
+-			LabelSelector:                   "encryption.apiserver.operator.openshift.io/component" + "=" + "openshift-oauth-apiserver",
+-			EncryptionConfigSecretName:      fmt.Sprintf("encryption-config-openshift-oauth-apiserver"),
+-			EncryptionConfigSecretNamespace: "openshift-config-managed",
+-			OperatorNamespace:               "openshift-authentication-operator",
+-			TargetGRs:                       library.AuthTargetGRs,
+-			AssertFunc:                      library.AssertTokens,
+-		},
+-		CreateResourceFunc: func(t testing.TB, _ library.ClientSet, _ string) runtime.Object {
+-			return library.CreateAndStoreTokenOfLife(context.TODO(), t, library.GetClients(t))
+-		},
+-		AssertResourceEncryptedFunc:    library.AssertTokenOfLifeEncrypted,
+-		AssertResourceNotEncryptedFunc: library.AssertTokenOfLifeNotEncrypted,
+-		ResourceFunc:                   library.TokenOfLife,
+-		ResourceName:                   "TokenOfLife",
+-		EncryptionProvider: library.EncryptionProvider{
+-			APIServerEncryption: configv1.APIServerEncryption{Type: configv1.EncryptionType("aescbc")},
+-		},
+-	})
++	testEncryptionTurnOnAndOff(t.Context(), t)
+ }
+diff --git a/test/e2e-encryption/main_test.go b/test/e2e-encryption/main_test.go
+index b9a4df642b..4b83293c1e 100644
+--- a/test/e2e-encryption/main_test.go
++++ b/test/e2e-encryption/main_test.go
+@@ -1,4 +1,4 @@
+-package e2eencryption
++package e2e_encryption
+ 
+ import (
+ 	"math/rand"

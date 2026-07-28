@@ -1,0 +1,450 @@
+diff --git a/pkg/console/operator/sync_v400.go b/pkg/console/operator/sync_v400.go
+index b0b1edb54..082b383aa 100644
+--- a/pkg/console/operator/sync_v400.go
++++ b/pkg/console/operator/sync_v400.go
+@@ -130,6 +130,12 @@ func (co *consoleOperator) sync_v400(ctx context.Context, controllerContext fact
+ 		return statusHandler.FlushAndReturn(techPreviewErr)
+ 	}
+ 
++	olmLifecycleMetadataEnabled, olmLifecycleMetadataErrReason, olmLifecycleMetadataErr := co.SyncOLMLifecycleMetadata()
++	statusHandler.AddConditions(status.HandleProgressingOrDegraded("OLMLifecycleMetadataSync", olmLifecycleMetadataErrReason, olmLifecycleMetadataErr))
++	if olmLifecycleMetadataErr != nil {
++		return statusHandler.FlushAndReturn(olmLifecycleMetadataErr)
++	}
++
+ 	cm, cmErrReason, cmErr := co.SyncConfigMap(
+ 		ctx,
+ 		set.Operator,
+@@ -141,6 +147,7 @@ func (co *consoleOperator) sync_v400(ctx context.Context, controllerContext fact
+ 		controllerContext.Recorder(),
+ 		consoleURL.Hostname(),
+ 		techPreviewEnabled,
++		olmLifecycleMetadataEnabled,
+ 	)
+ 	statusHandler.AddConditions(status.HandleProgressingOrDegraded("ConfigMapSync", cmErrReason, cmErr))
+ 	if cmErr != nil {
+@@ -352,6 +359,7 @@ func (co *consoleOperator) SyncConfigMap(
+ 	recorder events.Recorder,
+ 	consoleHost string,
+ 	techPreviewEnabled bool,
++	olmLifecycleMetadataEnabled bool,
+ ) (consoleConfigMap *corev1.ConfigMap, reason string, err error) {
+ 
+ 	managedConfig, mcErr := co.managedNSConfigMapLister.ConfigMaps(api.OpenShiftConfigManagedNamespace).Get(api.OpenShiftConsoleConfigMapName)
+@@ -426,6 +434,7 @@ func (co *consoleOperator) SyncConfigMap(
+ 		telemetryConfig,
+ 		consoleHost,
+ 		techPreviewEnabled,
++		olmLifecycleMetadataEnabled,
+ 	)
+ 	if err != nil {
+ 		return nil, "FailedConsoleConfigBuilder", err
+@@ -599,7 +608,7 @@ func (co *consoleOperator) SyncTrustedCAConfigMap(ctx context.Context, operatorC
+ func (co *consoleOperator) SyncTechPreview() (techPreviewEnabled bool, reason string, err error) {
+ 	featureGate, err := co.featureGateLister.Get(api.ConfigResourceName)
+ 	if err != nil {
+-		klog.V(4).Infof("failed to get FeatureGate resource: %v.", err)
++		klog.V(4).Infof("failed to get FeatureGate resource: %v", err)
+ 		return false, "FailedGet", err
+ 	}
+ 
+@@ -611,6 +620,29 @@ func (co *consoleOperator) SyncTechPreview() (techPreviewEnabled bool, reason st
+ 	return techPreviewEnabled, "", nil
+ }
+ 
++// Replace with features.FeatureGateOLMLifecycleAndCompatibility once openshift/api is bumped.
++const olmLifecycleAndCompatibilityFeatureGate configv1.FeatureGateName = "OLMLifecycleAndCompatibility"
++
++// SyncOLMLifecycleMetadata determines if OLM lifecycle metadata features should be enabled
++// by checking if the OLMLifecycleAndCompatibility feature gate is enabled in the cluster.
++func (co *consoleOperator) SyncOLMLifecycleMetadata() (olmLifecycleMetadataEnabled bool, reason string, err error) {
++	featureGate, err := co.featureGateLister.Get(api.ConfigResourceName)
++	if err != nil {
++		klog.V(4).Infof("failed to get FeatureGate resource: %v", err)
++		return false, "FailedGet", err
++	}
++
++	for _, versionedGates := range featureGate.Status.FeatureGates {
++		for _, gate := range versionedGates.Enabled {
++			if gate.Name == olmLifecycleAndCompatibilityFeatureGate {
++				klog.V(4).Infoln("OLM lifecycle metadata features are enabled based on the OLMLifecycleAndCompatibility feature gate")
++				return true, "", nil
++			}
++		}
++	}
++	return false, "", nil
++}
++
+ func (co *consoleOperator) SyncCustomLogos(operatorConfig *operatorv1.Console) (error, string) {
+ 	if operatorConfig.Spec.Customization.CustomLogoFile.Name != "" || operatorConfig.Spec.Customization.CustomLogoFile.Key != "" {
+ 		return co.SyncCustomLogoConfigMap(operatorConfig)
+diff --git a/pkg/console/subresource/configmap/configmap.go b/pkg/console/subresource/configmap/configmap.go
+index 710dc2316..2377ab4fd 100644
+--- a/pkg/console/subresource/configmap/configmap.go
++++ b/pkg/console/subresource/configmap/configmap.go
+@@ -49,6 +49,7 @@ func DefaultConfigMap(
+ 	telemeterConfig map[string]string,
+ 	consoleHost string,
+ 	techPreviewEnabled bool,
++	olmLifecycleMetadataEnabled bool,
+ ) (consoleConfigMap *corev1.ConfigMap, unsupportedOverridesHaveMerged bool, err error) {
+ 
+ 	apiServerURL := infrastructuresub.GetAPIServerURL(infrastructureConfig)
+@@ -66,9 +67,10 @@ func DefaultConfigMap(
+ 		NodeOperatingSystems(nodeOperatingSystems).
+ 		CopiedCSVsDisabled(copiedCSVsDisabled).
+ 		TechPreviewEnabled(techPreviewEnabled).
++		OLMLifecycleMetadataEnabled(olmLifecycleMetadataEnabled).
+ 		ConfigYAML()
+ 	if err != nil {
+-		klog.Errorf("failed to generate default console-config config: %v", err)
++		klog.Errorf("failed to generate default console-config: %v", err)
+ 		return nil, false, err
+ 	}
+ 
+@@ -106,9 +108,10 @@ func DefaultConfigMap(
+ 		AuthConfig(authConfig, apiServerURL).
+ 		Capabilities(operatorConfig.Spec.Customization.Capabilities).
+ 		TechPreviewEnabled(techPreviewEnabled).
++		OLMLifecycleMetadataEnabled(olmLifecycleMetadataEnabled).
+ 		ConfigYAML()
+ 	if err != nil {
+-		klog.Errorf("failed to generate user defined console-config config: %v", err)
++		klog.Errorf("failed to generate user-defined console-config: %v", err)
+ 		return nil, false, err
+ 	}
+ 
+diff --git a/pkg/console/subresource/configmap/configmap_test.go b/pkg/console/subresource/configmap/configmap_test.go
+index e07c6a0e5..0b7d4b5e0 100644
+--- a/pkg/console/subresource/configmap/configmap_test.go
++++ b/pkg/console/subresource/configmap/configmap_test.go
+@@ -1305,6 +1305,7 @@ providers: {}
+ 				tt.args.telemetryConfig,
+ 				tt.args.rt.Spec.Host,
+ 				false, // techPreviewEnabled - default to false for tests
++				false, // olmLifecycleMetadataEnabled - default to false for tests
+ 			)
+ 
+ 			// marshall the exampleYaml to map[string]interface{} so we can use it in diff below
+diff --git a/pkg/console/subresource/configmap/tech_preview_test.go b/pkg/console/subresource/configmap/tech_preview_test.go
+index 998aa4c17..f07722c7f 100644
+--- a/pkg/console/subresource/configmap/tech_preview_test.go
++++ b/pkg/console/subresource/configmap/tech_preview_test.go
+@@ -42,53 +42,79 @@ func TestTechPreviewEnabled(t *testing.T) {
+ 
+ 	for _, tt := range tests {
+ 		t.Run(tt.name, func(t *testing.T) {
+-			// Create minimal test configuration
+-			operatorConfig := &operatorv1.Console{
+-				ObjectMeta: metav1.ObjectMeta{
+-					Name: "cluster",
+-				},
+-				Spec: operatorv1.ConsoleSpec{},
+-			}
++			cm, _, err := DefaultConfigMap(
++				minimalOperatorConfig(),
++				minimalConsoleConfig(),
++				minimalAuthConfig(),
++				&corev1.ConfigMap{},
++				&corev1.ConfigMap{},
++				minimalInfrastructureConfig(),
++				minimalRoute(),
++				0,                            // inactivityTimeoutSeconds
++				[]*consolev1.ConsolePlugin{}, // availablePlugins
++				[]string{"amd64"},            // nodeArchitectures
++				[]string{"linux"},            // nodeOperatingSystems
++				false,                        // copiedCSVsDisabled
++				map[string]string{},          // telemetryConfig
++				"console.test.cluster",       // consoleHost
++				tt.args.techPreviewEnabled,
++				false, // olmLifecycleMetadataEnabled
++			)
+ 
+-			consoleConfig := &configv1.Console{
+-				ObjectMeta: metav1.ObjectMeta{
+-					Name: "cluster",
+-				},
++			if err != nil {
++				t.Errorf("DefaultConfigMap() error = %v.", err)
++				return
+ 			}
+ 
+-			authConfig := &configv1.Authentication{
+-				ObjectMeta: metav1.ObjectMeta{
+-					Name: "cluster",
+-				},
++			var config consoleserver.Config
++			err = yaml.Unmarshal([]byte(cm.Data["console-config.yaml"]), &config)
++			if err != nil {
++				t.Errorf("Failed to unmarshal config: %v.", err)
++				return
+ 			}
+ 
+-			infrastructureConfig := &configv1.Infrastructure{
+-				ObjectMeta: metav1.ObjectMeta{
+-					Name: "cluster",
+-				},
+-				Status: configv1.InfrastructureStatus{
+-					APIServerURL: "https://api.test.cluster:6443",
+-				},
++			if config.ClusterInfo.TechPreviewEnabled != tt.want {
++				t.Errorf("TechPreviewEnabled: got %t, want %t (case %q, techPreviewEnabled input=%t).", config.ClusterInfo.TechPreviewEnabled, tt.want, tt.name, tt.args.techPreviewEnabled)
+ 			}
++		})
++	}
++}
+ 
+-			route := &routev1.Route{
+-				ObjectMeta: metav1.ObjectMeta{
+-					Name: "console",
+-				},
+-				Spec: routev1.RouteSpec{
+-					Host: "console.test.cluster",
+-				},
+-			}
++func TestOLMLifecycleMetadataEnabled(t *testing.T) {
++	type args struct {
++		olmLifecycleMetadataEnabled bool
++	}
++	tests := []struct {
++		name string
++		args args
++		want bool
++	}{
++		{
++			name: "OLM Lifecycle Metadata enabled",
++			args: args{
++				olmLifecycleMetadataEnabled: true,
++			},
++			want: true,
++		},
++		{
++			name: "OLM Lifecycle Metadata disabled",
++			args: args{
++				olmLifecycleMetadataEnabled: false,
++			},
++			want: false,
++		},
++	}
+ 
+-			// Generate configmap with tech preview setting
++	for _, tt := range tests {
++		t.Run(tt.name, func(t *testing.T) {
+ 			cm, _, err := DefaultConfigMap(
+-				operatorConfig,
+-				consoleConfig,
+-				authConfig,
++				minimalOperatorConfig(),
++				minimalConsoleConfig(),
++				minimalAuthConfig(),
+ 				&corev1.ConfigMap{},
+ 				&corev1.ConfigMap{},
+-				infrastructureConfig,
+-				route,
++				minimalInfrastructureConfig(),
++				minimalRoute(),
+ 				0,                            // inactivityTimeoutSeconds
+ 				[]*consolev1.ConsolePlugin{}, // availablePlugins
+ 				[]string{"amd64"},            // nodeArchitectures
+@@ -96,7 +122,8 @@ func TestTechPreviewEnabled(t *testing.T) {
+ 				false,                        // copiedCSVsDisabled
+ 				map[string]string{},          // telemetryConfig
+ 				"console.test.cluster",       // consoleHost
+-				tt.args.techPreviewEnabled,
++				false,                        // techPreviewEnabled
++				tt.args.olmLifecycleMetadataEnabled,
+ 			)
+ 
+ 			if err != nil {
+@@ -104,7 +131,6 @@ func TestTechPreviewEnabled(t *testing.T) {
+ 				return
+ 			}
+ 
+-			// Parse the generated config
+ 			var config consoleserver.Config
+ 			err = yaml.Unmarshal([]byte(cm.Data["console-config.yaml"]), &config)
+ 			if err != nil {
+@@ -112,10 +138,44 @@ func TestTechPreviewEnabled(t *testing.T) {
+ 				return
+ 			}
+ 
+-			// Verify tech preview setting
+-			if config.ClusterInfo.TechPreviewEnabled != tt.want {
+-				t.Errorf("TechPreviewEnabled: got %t, want %t (case %q, techPreviewEnabled input=%t).", config.ClusterInfo.TechPreviewEnabled, tt.want, tt.name, tt.args.techPreviewEnabled)
++			if config.ClusterInfo.OLMLifecycleMetadataEnabled != tt.want {
++				t.Errorf("OLMLifecycleMetadataEnabled: got %t, want %t (case %q, olmLifecycleMetadataEnabled input=%t).", config.ClusterInfo.OLMLifecycleMetadataEnabled, tt.want, tt.name, tt.args.olmLifecycleMetadataEnabled)
+ 			}
+ 		})
+ 	}
+ }
++
++func minimalOperatorConfig() *operatorv1.Console {
++	return &operatorv1.Console{
++		ObjectMeta: metav1.ObjectMeta{Name: "cluster"},
++		Spec:       operatorv1.ConsoleSpec{},
++	}
++}
++
++func minimalConsoleConfig() *configv1.Console {
++	return &configv1.Console{
++		ObjectMeta: metav1.ObjectMeta{Name: "cluster"},
++	}
++}
++
++func minimalAuthConfig() *configv1.Authentication {
++	return &configv1.Authentication{
++		ObjectMeta: metav1.ObjectMeta{Name: "cluster"},
++	}
++}
++
++func minimalInfrastructureConfig() *configv1.Infrastructure {
++	return &configv1.Infrastructure{
++		ObjectMeta: metav1.ObjectMeta{Name: "cluster"},
++		Status: configv1.InfrastructureStatus{
++			APIServerURL: "https://api.test.cluster:6443",
++		},
++	}
++}
++
++func minimalRoute() *routev1.Route {
++	return &routev1.Route{
++		ObjectMeta: metav1.ObjectMeta{Name: "console"},
++		Spec:       routev1.RouteSpec{Host: "console.test.cluster"},
++	}
++}
+diff --git a/pkg/console/subresource/consoleserver/config_builder.go b/pkg/console/subresource/consoleserver/config_builder.go
+index 373075450..c6d0052f5 100644
+--- a/pkg/console/subresource/consoleserver/config_builder.go
++++ b/pkg/console/subresource/consoleserver/config_builder.go
+@@ -46,43 +46,44 @@ var SupportedLightspeedArchitectures = []string{"amd64"}
+ //
+ //	b.Host().Brand("").Config()
+ type ConsoleServerCLIConfigBuilder struct {
+-	host                       string
+-	logoutRedirectURL          string
+-	brand                      operatorv1.Brand
+-	docURL                     string
+-	apiServerURL               string
+-	controlPlaneToplogy        configv1.TopologyMode
+-	statusPageID               string
+-	customProductName          string
+-	devCatalogCustomization    operatorv1.DeveloperConsoleCatalogCustomization
+-	projectAccess              operatorv1.ProjectAccess
+-	quickStarts                operatorv1.QuickStarts
+-	addPage                    operatorv1.AddPage
+-	perspectives               []operatorv1.Perspective
+-	CAFile                     string
+-	monitoring                 map[string]string
+-	customHostnameRedirectPort int
+-	inactivityTimeoutSeconds   int
+-	pluginsList                map[string]string
+-	pluginsOrder               []string
+-	i18nNamespaceList          []string
+-	proxyServices              []ProxyService
+-	telemetry                  map[string]string
+-	releaseVersion             string
+-	nodeArchitectures          []string
+-	nodeOperatingSystems       []string
+-	copiedCSVsDisabled         bool
+-	oauthClientID              string
+-	oidcExtraScopes            []string
+-	oidcIssuerURL              string
+-	oidcOCLoginCommand         string
+-	authType                   string
+-	sessionEncryptionFile      string
+-	sessionAuthenticationFile  string
+-	capabilities               []operatorv1.Capability
+-	contentSecurityPolicyList  map[v1.DirectiveType][]string
+-	logos                      []operatorv1.Logo
+-	techPreviewEnabled         bool
++	host                        string
++	logoutRedirectURL           string
++	brand                       operatorv1.Brand
++	docURL                      string
++	apiServerURL                string
++	controlPlaneToplogy         configv1.TopologyMode
++	statusPageID                string
++	customProductName           string
++	devCatalogCustomization     operatorv1.DeveloperConsoleCatalogCustomization
++	projectAccess               operatorv1.ProjectAccess
++	quickStarts                 operatorv1.QuickStarts
++	addPage                     operatorv1.AddPage
++	perspectives                []operatorv1.Perspective
++	CAFile                      string
++	monitoring                  map[string]string
++	customHostnameRedirectPort  int
++	inactivityTimeoutSeconds    int
++	pluginsList                 map[string]string
++	pluginsOrder                []string
++	i18nNamespaceList           []string
++	proxyServices               []ProxyService
++	telemetry                   map[string]string
++	releaseVersion              string
++	nodeArchitectures           []string
++	nodeOperatingSystems        []string
++	copiedCSVsDisabled          bool
++	oauthClientID               string
++	oidcExtraScopes             []string
++	oidcIssuerURL               string
++	oidcOCLoginCommand          string
++	authType                    string
++	sessionEncryptionFile       string
++	sessionAuthenticationFile   string
++	capabilities                []operatorv1.Capability
++	contentSecurityPolicyList   map[v1.DirectiveType][]string
++	logos                       []operatorv1.Logo
++	techPreviewEnabled          bool
++	olmLifecycleMetadataEnabled bool
+ }
+ 
+ func (b *ConsoleServerCLIConfigBuilder) Host(host string) *ConsoleServerCLIConfigBuilder {
+@@ -311,6 +312,11 @@ func (b *ConsoleServerCLIConfigBuilder) TechPreviewEnabled(techPreviewEnabled bo
+ 	return b
+ }
+ 
++func (b *ConsoleServerCLIConfigBuilder) OLMLifecycleMetadataEnabled(olmLifecycleMetadataEnabled bool) *ConsoleServerCLIConfigBuilder {
++	b.olmLifecycleMetadataEnabled = olmLifecycleMetadataEnabled
++	return b
++}
++
+ func (b *ConsoleServerCLIConfigBuilder) Config() Config {
+ 	return Config{
+ 		Kind:                  "ConsoleConfig",
+@@ -381,6 +387,7 @@ func (b *ConsoleServerCLIConfigBuilder) clusterInfo() ClusterInfo {
+ 	}
+ 	conf.CopiedCSVsDisabled = b.copiedCSVsDisabled
+ 	conf.TechPreviewEnabled = b.techPreviewEnabled
++	conf.OLMLifecycleMetadataEnabled = b.olmLifecycleMetadataEnabled
+ 	return conf
+ }
+ 
+diff --git a/pkg/console/subresource/consoleserver/types.go b/pkg/console/subresource/consoleserver/types.go
+index f2f552998..07c3b6c21 100644
+--- a/pkg/console/subresource/consoleserver/types.go
++++ b/pkg/console/subresource/consoleserver/types.go
+@@ -66,15 +66,16 @@ type ServingInfo struct {
+ 
+ // ClusterInfo holds information the about the cluster such as master public URL and console public URL.
+ type ClusterInfo struct {
+-	ConsoleBaseAddress   string                `yaml:"consoleBaseAddress,omitempty"`
+-	ConsoleBasePath      string                `yaml:"consoleBasePath,omitempty"`
+-	MasterPublicURL      string                `yaml:"masterPublicURL,omitempty"`
+-	ControlPlaneToplogy  configv1.TopologyMode `yaml:"controlPlaneTopology,omitempty"`
+-	ReleaseVersion       string                `yaml:"releaseVersion,omitempty"`
+-	NodeArchitectures    []string              `yaml:"nodeArchitectures,omitempty"`
+-	NodeOperatingSystems []string              `yaml:"nodeOperatingSystems,omitempty"`
+-	CopiedCSVsDisabled   bool                  `yaml:"copiedCSVsDisabled,omitempty"`
+-	TechPreviewEnabled   bool                  `yaml:"techPreviewEnabled,omitempty"`
++	ConsoleBaseAddress          string                `yaml:"consoleBaseAddress,omitempty"`
++	ConsoleBasePath             string                `yaml:"consoleBasePath,omitempty"`
++	MasterPublicURL             string                `yaml:"masterPublicURL,omitempty"`
++	ControlPlaneToplogy         configv1.TopologyMode `yaml:"controlPlaneTopology,omitempty"`
++	ReleaseVersion              string                `yaml:"releaseVersion,omitempty"`
++	NodeArchitectures           []string              `yaml:"nodeArchitectures,omitempty"`
++	NodeOperatingSystems        []string              `yaml:"nodeOperatingSystems,omitempty"`
++	CopiedCSVsDisabled          bool                  `yaml:"copiedCSVsDisabled,omitempty"`
++	TechPreviewEnabled          bool                  `yaml:"techPreviewEnabled,omitempty"`
++	OLMLifecycleMetadataEnabled bool                  `yaml:"olmLifecycleMetadataEnabled,omitempty"`
+ }
+ 
+ // MonitoringInfo holds configuration for monitoring related services

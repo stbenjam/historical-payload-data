@@ -1,0 +1,149 @@
+diff --git a/cmd/bridge/main.go b/cmd/bridge/main.go
+index d811fb0cf7d..3dba1447e23 100644
+--- a/cmd/bridge/main.go
++++ b/cmd/bridge/main.go
+@@ -178,6 +178,7 @@ func main() {
+ 	fNodeOperatingSystems := fs.String("node-operating-systems", "", "List of node operating systems. Example --node-operating-system=linux,windows")
+ 	fCopiedCSVsDisabled := fs.Bool("copied-csvs-disabled", false, "Flag to indicate if OLM copied CSVs are disabled.")
+ 	fTechPreview := fs.Bool("tech-preview", false, "Enable console Technology Preview features.")
++	fOLMLifecycleMetadata := fs.Bool("olm-lifecycle-metadata", false, "Enable OLM Operator lifecycle and compatibility features.")
+ 
+ 	cfg, err := serverconfig.Parse(fs, os.Args[1:], "BRIDGE")
+ 	if err != nil {
+@@ -357,6 +358,7 @@ func main() {
+ 		K8sMode:                      *fK8sMode,
+ 		CopiedCSVsDisabled:           *fCopiedCSVsDisabled,
+ 		TechPreview:                  *fTechPreview,
++		OLMLifecycleMetadata:         *fOLMLifecycleMetadata,
+ 		Capabilities:                 capabilities,
+ 	}
+ 
+diff --git a/frontend/@types/console/window.d.ts b/frontend/@types/console/window.d.ts
+index 5baf55c51a6..e6f45ccba27 100644
+--- a/frontend/@types/console/window.d.ts
++++ b/frontend/@types/console/window.d.ts
+@@ -64,6 +64,7 @@ declare interface Window {
+     hubConsoleURL: string;
+     k8sMode: string;
+     techPreview: boolean;
++    olmLifecycleMetadata: boolean;
+     capabilities: {
+       name: string;
+       visibility: { state: 'Enabled' | 'Disabled' };
+diff --git a/frontend/packages/operator-lifecycle-manager/src/features.ts b/frontend/packages/operator-lifecycle-manager/src/features.ts
+index 66b8808969f..fd760bd6418 100644
+--- a/frontend/packages/operator-lifecycle-manager/src/features.ts
++++ b/frontend/packages/operator-lifecycle-manager/src/features.ts
+@@ -2,5 +2,5 @@ import type { FeatureFlagHandler } from '@console/dynamic-plugin-sdk/src/extensi
+ import { Flags } from './const';
+ 
+ export const detectLifecycleMetadata: FeatureFlagHandler = (setFeatureFlag) => {
+-  setFeatureFlag(Flags.OPERATOR_LIFECYCLE_METADATA, !!window.SERVER_FLAGS.techPreview);
++  setFeatureFlag(Flags.OPERATOR_LIFECYCLE_METADATA, !!window.SERVER_FLAGS.olmLifecycleMetadata);
+ };
+diff --git a/pkg/server/server.go b/pkg/server/server.go
+index b403a5c494a..287de230d65 100644
+--- a/pkg/server/server.go
++++ b/pkg/server/server.go
+@@ -142,6 +142,7 @@ type jsGlobals struct {
+ 	Telemetry                       serverconfig.MultiKeyValue `json:"telemetry"`
+ 	ThanosPublicURL                 string                     `json:"thanosPublicURL"`
+ 	TechPreview                     bool                       `json:"techPreview"`
++	OLMLifecycleMetadata            bool                       `json:"olmLifecycleMetadata"`
+ 	UserSettingsLocation            string                     `json:"userSettingsLocation"`
+ 	DevConsoleProxyAvailable        bool                       `json:"devConsoleProxyAvailable"`
+ }
+@@ -172,6 +173,7 @@ type Server struct {
+ 	CSRFVerifier                        *csrfverifier.CSRFVerifier
+ 	CustomLogoFiles                     serverconfig.LogosKeyValue
+ 	TechPreview                         bool
++	OLMLifecycleMetadata                bool
+ 	CustomFaviconFiles                  serverconfig.LogosKeyValue
+ 	CustomProductName                   string
+ 	DevCatalogCategories                string
+@@ -790,6 +792,7 @@ func (s *Server) indexHandler(w http.ResponseWriter, r *http.Request) {
+ 		Telemetry:                 s.Telemetry,
+ 		ThanosPublicURL:           s.ThanosPublicURL.String(),
+ 		TechPreview:               s.TechPreview,
++		OLMLifecycleMetadata:      s.OLMLifecycleMetadata,
+ 		UserSettingsLocation:      s.UserSettingsLocation,
+ 		DevConsoleProxyAvailable:  true,
+ 	}
+diff --git a/pkg/serverconfig/config.go b/pkg/serverconfig/config.go
+index 0f6736783c0..3f25b9338d9 100644
+--- a/pkg/serverconfig/config.go
++++ b/pkg/serverconfig/config.go
+@@ -291,6 +291,10 @@ func addClusterInfo(fs *flag.FlagSet, clusterInfo *ClusterInfo) {
+ 	if clusterInfo.TechPreviewEnabled {
+ 		fs.Set("tech-preview", "true")
+ 	}
++
++	if clusterInfo.OLMLifecycleMetadataEnabled {
++		fs.Set("olm-lifecycle-metadata", "true")
++	}
+ }
+ 
+ func addProviders(fs *flag.FlagSet, providers *Providers) {
+diff --git a/pkg/serverconfig/config_test.go b/pkg/serverconfig/config_test.go
+index f2e6074edbf..534871942eb 100644
+--- a/pkg/serverconfig/config_test.go
++++ b/pkg/serverconfig/config_test.go
+@@ -291,6 +291,20 @@ func TestSetFlagsFromConfig(t *testing.T) {
+ 			},
+ 			expectedError: nil,
+ 		},
++		{
++			name: "Applies OLM lifecycle metadata when enabled",
++			config: Config{
++				APIVersion: "console.openshift.io/v1",
++				Kind:       "ConsoleConfig",
++				ClusterInfo: ClusterInfo{
++					OLMLifecycleMetadataEnabled: true,
++				},
++			},
++			expectedFlagValues: map[string]string{
++				"olm-lifecycle-metadata": "true",
++			},
++			expectedError: nil,
++		},
+ 		{
+ 			name: "Should apply CSP configuration",
+ 			config: Config{
+@@ -314,6 +328,7 @@ func TestSetFlagsFromConfig(t *testing.T) {
+ 			fs.Var(&MultiKeyValue{}, "plugins", "")
+ 			fs.Var(&MultiKeyValue{}, "telemetry", "")
+ 			fs.Var(&MultiKeyValue{}, "content-security-policy", "")
++			fs.Bool("olm-lifecycle-metadata", false, "")
+ 
+ 			actualError := SetFlagsFromConfig(fs, &test.config)
+ 			actual := make(map[string]string)
+diff --git a/pkg/serverconfig/types.go b/pkg/serverconfig/types.go
+index 9a161c93301..2d62cd70e2f 100644
+--- a/pkg/serverconfig/types.go
++++ b/pkg/serverconfig/types.go
+@@ -72,15 +72,16 @@ type MonitoringInfo struct {
+ 
+ // ClusterInfo holds information the about the cluster such as master public URL and console public URL.
+ type ClusterInfo struct {
+-	ConsoleBaseAddress   string                `yaml:"consoleBaseAddress,omitempty"`
+-	ConsoleBasePath      string                `yaml:"consoleBasePath,omitempty"`
+-	MasterPublicURL      string                `yaml:"masterPublicURL,omitempty"`
+-	ControlPlaneTopology configv1.TopologyMode `yaml:"controlPlaneTopology,omitempty"`
+-	ReleaseVersion       string                `yaml:"releaseVersion,omitempty"`
+-	NodeArchitectures    []string              `yaml:"nodeArchitectures,omitempty"`
+-	NodeOperatingSystems []string              `yaml:"nodeOperatingSystems,omitempty"`
+-	CopiedCSVsDisabled   bool                  `yaml:"copiedCSVsDisabled,omitempty"`
+-	TechPreviewEnabled   bool                  `yaml:"techPreviewEnabled,omitempty"`
++	ConsoleBaseAddress          string                `yaml:"consoleBaseAddress,omitempty"`
++	ConsoleBasePath             string                `yaml:"consoleBasePath,omitempty"`
++	MasterPublicURL             string                `yaml:"masterPublicURL,omitempty"`
++	ControlPlaneTopology        configv1.TopologyMode `yaml:"controlPlaneTopology,omitempty"`
++	ReleaseVersion              string                `yaml:"releaseVersion,omitempty"`
++	NodeArchitectures           []string              `yaml:"nodeArchitectures,omitempty"`
++	NodeOperatingSystems        []string              `yaml:"nodeOperatingSystems,omitempty"`
++	CopiedCSVsDisabled          bool                  `yaml:"copiedCSVsDisabled,omitempty"`
++	TechPreviewEnabled          bool                  `yaml:"techPreviewEnabled,omitempty"`
++	OLMLifecycleMetadataEnabled bool                  `yaml:"olmLifecycleMetadataEnabled,omitempty"`
+ }
+ 
+ // Auth holds configuration for authenticating with OpenShift. The auth method is assumed to be "openshift".

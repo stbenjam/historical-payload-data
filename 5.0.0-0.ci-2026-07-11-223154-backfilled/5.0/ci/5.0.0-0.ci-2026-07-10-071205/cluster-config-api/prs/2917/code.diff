@@ -1,0 +1,118 @@
+diff --git a/.golangci.yaml b/.golangci.yaml
+index 53c9b4009e3..e4e5b97612b 100644
+--- a/.golangci.yaml
++++ b/.golangci.yaml
+@@ -106,6 +106,10 @@ linters:
+         # This regex must always be updated in tandem with the regex in .golangci.go-validated.yaml that prevents `optionalfields` from being applied to the files in the path.
+         path: machine/v1beta1/(types_awsprovider.go|types_azureprovider.go|types_gcpprovider.go|types_vsphereprovider.go)|machine/v1alpha1/types_openstack.go
+         text: "optionalfields"
++      - linters:
++        - kubeapilinter
++        # osin/v1 types are config file APIs, not CRDs — validation is handled in Go code at config load time.
++        path: osin/v1/types.go
+       - linters:
+         - kubeapilinter
+         # Silence norefs lint for `Ref` field in ClusterAPI as it refers to an OCI image reference, not a kube object reference.
+diff --git a/openapi/generated_openapi/zz_generated.openapi.go b/openapi/generated_openapi/zz_generated.openapi.go
+index 77a74456362..780af028120 100644
+--- a/openapi/generated_openapi/zz_generated.openapi.go
++++ b/openapi/generated_openapi/zz_generated.openapi.go
+@@ -68373,6 +68373,13 @@ func schema_openshift_api_osin_v1_OAuthConfig(ref common.ReferenceCallback) comm
+ 							Ref:         ref(osinv1.OAuthTemplates{}.OpenAPIModelName()),
+ 						},
+ 					},
++					"proxyTrustedCA": {
++						SchemaProps: spec.SchemaProps{
++							Description: "proxyTrustedCA is an optional path to a PEM-encoded CA bundle used to verify connections to an HTTPS proxy during outbound IdP requests. When omitted, proxy connections use the system trust roots only.",
++							Type:        []string{"string"},
++							Format:      "",
++						},
++					},
+ 				},
+ 				Required: []string{"masterCA", "masterURL", "masterPublicURL", "loginURL", "assetPublicURL", "alwaysShowProviderSelection", "identityProviders", "grantConfig", "sessionConfig", "tokenConfig", "templates"},
+ 			},
+diff --git a/openapi/openapi.json b/openapi/openapi.json
+index 9949e9600bf..68fec893367 100644
+--- a/openapi/openapi.json
++++ b/openapi/openapi.json
+@@ -9257,7 +9257,7 @@
+       ],
+       "properties": {
+         "installationPolicy": {
+-          "description": "installationPolicy controls whether network observability is installed during cluster deployment. Valid values are \"InstallAndEnable\" and \"NoAction\". When set to \"InstallAndEnable\", ensure that network observability will be installed and enabled on the cluster. If already installed, no action taken, but if it gets uninstalled, it will install it again. When set to \"NoAction\", nothing will be done regarding Network observability.",
++          "description": "installationPolicy controls whether network observability is installed during cluster deployment. Valid values are \"InstallAndEnable\" and \"NoAction\". When set to \"InstallAndEnable\", ensure that network observability will be installed and enabled on the cluster. If already installed, no action taken, but if it gets uninstalled, it will install it again. When set to \"NoAction\", nothing will be done regarding Network observability. During the installation of NetworkObservability, the platform checks for any existing manual installations. If a successful installation using the OLMv0 or OLMv1 API is detected, it will be used. If the platform cannot determine how the current version was installed, or if the existing installation is incomplete, the installation process will stop.",
+           "type": "string"
+         }
+       }
+@@ -32116,8 +32116,8 @@
+       "description": "CustomSecretRotation holds configuration for custom secret rotation behavior.",
+       "type": "object",
+       "properties": {
+-        "rotationPollIntervalSeconds": {
+-          "description": "rotationPollIntervalSeconds is the minimum time in seconds between secret rotation attempts. The driver skips provider calls if less than this interval has elapsed since the last successful rotation. Must be at least 1 second and no more than 31560000 seconds (~1 year). When omitted, this means no opinion and the platform is left to choose a reasonable default, which is subject to change over time.",
++        "minimumRefreshAge": {
++          "description": "minimumRefreshAge is the minimum time in seconds between secret rotation attempts. Each time kubelet calls NodePublishVolume, the driver checks whether this interval has elapsed since the last successful provider call. If it has, the driver contacts the secret provider to fetch the latest secret values and updates the mounted volume. Setting this value below the kubelet syncFrequency (default: 1 minute) has no additional effect on the actual rotation cadence. Must be at least 1 second and no more than 31560000 seconds (~1 year). When omitted, this means no opinion and the platform is left to choose a reasonable default, which is subject to change over time.",
+           "type": "integer",
+           "format": "int32"
+         }
+@@ -33572,6 +33572,10 @@
+           "description": "endpointPublishingStrategy is used to publish the ingress controller endpoints to other networks, enable load balancer integrations, etc.\n\nIf unset, the default is based on infrastructure.config.openshift.io/cluster .status.platform:\n\n  AWS:          LoadBalancerService (with External scope)\n  Azure:        LoadBalancerService (with External scope)\n  GCP:          LoadBalancerService (with External scope)\n  IBMCloud:     LoadBalancerService (with External scope)\n  AlibabaCloud: LoadBalancerService (with External scope)\n  Libvirt:      HostNetwork\n\nAny other platform types (including None) default to HostNetwork.\n\nendpointPublishingStrategy cannot be updated.",
+           "$ref": "#/definitions/com.github.openshift.api.operator.v1.EndpointPublishingStrategy"
+         },
++        "haproxyVersion": {
++          "description": "haproxyVersion specifies the HAProxy version to use for this IngressController.\n\nOpenShift 5.0 introduces HAProxy 3.2 as its default version and supports HAProxy 2.8 from OpenShift 4.22 for migration purposes. When an OpenShift release introduces a new default HAProxy version, that HAProxy version becomes available as a pinnable value in subsequent OpenShift releases, providing a smooth migration path for administrators who want to defer HAProxy upgrades.\n\nValid values for OpenShift 5.0: - Unset (default): Uses HAProxy 3.2 (the default for OpenShift 5.0) - \"3.2\": Explicitly pins HAProxy 3.2 for preservation during cluster\n  upgrades to future OpenShift releases\n- \"2.8\": Uses HAProxy 2.8 from OpenShift 4.22 (migration support, will\n  be dropped in the next OpenShift release)\n\nIf a specific HAProxy version is set and would become unsupported in a target cluster upgrade, a preflight check will block the cluster upgrade until this field is updated to unset or a supported version.",
++          "type": "string"
++        },
+         "httpCompression": {
+           "description": "httpCompression defines a policy for HTTP traffic compression. By default, there is no HTTP compression.",
+           "default": {},
+@@ -33662,6 +33666,10 @@
+           "type": "string",
+           "default": ""
+         },
++        "effectiveHAProxyVersion": {
++          "description": "effectiveHAProxyVersion reports the HAProxy version currently in use by this IngressController. This reflects the resolved value of the spec.haproxyVersion field. When omitted, the effective value has not yet been resolved by the operator or the feature is not enabled for this cluster.\n\nExamples for OpenShift 5.0: - \"3.2\": Using HAProxy 3.2 - \"2.8\": Using HAProxy 2.8",
++          "type": "string"
++        },
+         "endpointPublishingStrategy": {
+           "description": "endpointPublishingStrategy is the actual strategy in use.",
+           "$ref": "#/definitions/com.github.openshift.api.operator.v1.EndpointPublishingStrategy"
+@@ -39838,6 +39846,10 @@
+           "type": "string",
+           "default": ""
+         },
++        "proxyTrustedCA": {
++          "description": "proxyTrustedCA is an optional path to a PEM-encoded CA bundle used to verify connections to an HTTPS proxy during outbound IdP requests. When omitted, proxy connections use the system trust roots only.",
++          "type": "string"
++        },
+         "sessionConfig": {
+           "description": "sessionConfig hold information about configuring sessions.",
+           "$ref": "#/definitions/com.github.openshift.api.osin.v1.SessionConfig"
+diff --git a/osin/v1/types.go b/osin/v1/types.go
+index 35eb3ee8b01..3f3af3cfa54 100644
+--- a/osin/v1/types.go
++++ b/osin/v1/types.go
+@@ -80,6 +80,11 @@ type OAuthConfig struct {
+ 
+ 	// templates allow you to customize pages like the login page.
+ 	Templates *OAuthTemplates `json:"templates"`
++
++	// proxyTrustedCA is an optional path to a PEM-encoded CA bundle used to
++	// verify connections to an HTTPS proxy during outbound IdP requests.
++	// When omitted, proxy connections use the system trust roots only.
++	ProxyTrustedCA string `json:"proxyTrustedCA,omitempty"`
+ }
+ 
+ // OAuthTemplates allow for customization of pages like the login page
+diff --git a/osin/v1/zz_generated.swagger_doc_generated.go b/osin/v1/zz_generated.swagger_doc_generated.go
+index 890928a7a4d..6594af9451a 100644
+--- a/osin/v1/zz_generated.swagger_doc_generated.go
++++ b/osin/v1/zz_generated.swagger_doc_generated.go
+@@ -154,6 +154,7 @@ var map_OAuthConfig = map[string]string{
+ 	"sessionConfig":               "sessionConfig hold information about configuring sessions.",
+ 	"tokenConfig":                 "tokenConfig contains options for authorization and access tokens",
+ 	"templates":                   "templates allow you to customize pages like the login page.",
++	"proxyTrustedCA":              "proxyTrustedCA is an optional path to a PEM-encoded CA bundle used to verify connections to an HTTPS proxy during outbound IdP requests. When omitted, proxy connections use the system trust roots only.",
+ }
+ 
+ func (OAuthConfig) SwaggerDoc() map[string]string {

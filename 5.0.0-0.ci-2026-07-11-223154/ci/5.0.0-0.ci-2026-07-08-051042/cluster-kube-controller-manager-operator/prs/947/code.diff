@@ -1,0 +1,102 @@
+diff --git a/pkg/operator/start_test.go b/pkg/operator/start_test.go
+deleted file mode 100644
+index cbe53c068..000000000
+--- a/pkg/operator/start_test.go
++++ /dev/null
+@@ -1,6 +0,0 @@
+-package operator
+-
+-import "testing"
+-
+-func TestNothing(t *testing.T) {
+-}
+diff --git a/pkg/operator/starter.go b/pkg/operator/starter.go
+index 251df93eb..50b5e51a0 100644
+--- a/pkg/operator/starter.go
++++ b/pkg/operator/starter.go
+@@ -4,6 +4,7 @@ import (
+ 	"context"
+ 	"fmt"
+ 	"os"
++	"regexp"
+ 	"time"
+ 
+ 	configv1 "github.com/openshift/api/config/v1"
+@@ -21,6 +22,7 @@ import (
+ 	"github.com/openshift/cluster-kube-controller-manager-operator/pkg/operator/resourcesynccontroller"
+ 	"github.com/openshift/cluster-kube-controller-manager-operator/pkg/operator/targetconfigcontroller"
+ 	"github.com/openshift/library-go/pkg/controller/controllercmd"
++	"github.com/openshift/library-go/pkg/operator/condition"
+ 	"github.com/openshift/library-go/pkg/operator/configobserver/featuregates"
+ 	"github.com/openshift/library-go/pkg/operator/genericoperatorclient"
+ 	"github.com/openshift/library-go/pkg/operator/latencyprofilecontroller"
+@@ -249,7 +251,7 @@ func RunOperator(ctx context.Context, cc *controllercmd.ControllerContext) error
+ 		versionRecorder,
+ 		cc.EventRecorder,
+ 		cc.Clock,
+-	)
++	).WithDegradedInertia(newDegradedInertia())
+ 
+ 	certRotationController, err := certrotationcontroller.NewCertRotationController(
+ 		v1helpers.CachedSecretGetter(kubeClient.CoreV1(), kubeInformersForNamespaces),
+@@ -311,6 +313,18 @@ func RunOperator(ctx context.Context, cc *controllercmd.ControllerContext) error
+ 	return nil
+ }
+ 
++func newDegradedInertia() status.Inertia {
++	return status.MustNewInertia(
++		2*time.Minute,
++		// Nodes may temporarily become unready during upgrades while the machine/kubelet restarts.
++		// Use a longer inertia to avoid flapping the ClusterOperator Degraded condition.
++		status.InertiaCondition{
++			ConditionTypeMatcher: regexp.MustCompile("^" + condition.NodeControllerDegradedConditionType + "$"),
++			Duration:             10 * time.Minute,
++		},
++	).Inertia
++}
++
+ // deploymentConfigMaps is a list of configmaps that are directly copied for the current values.  A different actor/controller modifies these.
+ // the first element should be the configmap that contains the static pod manifest
+ var deploymentConfigMaps = []revision.RevisionResource{
+diff --git a/pkg/operator/starter_test.go b/pkg/operator/starter_test.go
+new file mode 100644
+index 000000000..674ec2aa6
+--- /dev/null
++++ b/pkg/operator/starter_test.go
+@@ -0,0 +1,36 @@
++package operator
++
++import (
++	"testing"
++	"time"
++
++	operatorv1 "github.com/openshift/api/operator/v1"
++	condition "github.com/openshift/library-go/pkg/operator/condition"
++)
++
++func TestNewDegradedInertia(t *testing.T) {
++	inertia := newDegradedInertia()
++
++	tests := []struct {
++		conditionType string
++		expected      time.Duration
++	}{
++		{
++			conditionType: condition.NodeControllerDegradedConditionType,
++			expected:      10 * time.Minute,
++		},
++		{
++			conditionType: "TargetConfigControllerDegraded",
++			expected:      2 * time.Minute,
++		},
++	}
++
++	for _, tt := range tests {
++		t.Run(tt.conditionType, func(t *testing.T) {
++			got := inertia(operatorv1.OperatorCondition{Type: tt.conditionType})
++			if got != tt.expected {
++				t.Errorf("expected %v, got %v", tt.expected, got)
++			}
++		})
++	}
++}

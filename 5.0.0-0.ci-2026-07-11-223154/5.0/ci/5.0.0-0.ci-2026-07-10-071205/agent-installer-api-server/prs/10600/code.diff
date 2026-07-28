@@ -1,0 +1,157 @@
+diff --git a/deploy/operator/setup_hive.sh b/deploy/operator/setup_hive.sh
+index 358efb6fffae..c3ff8fa9882a 100755
+--- a/deploy/operator/setup_hive.sh
++++ b/deploy/operator/setup_hive.sh
+@@ -7,6 +7,68 @@ source ${__dir}/utils.sh
+ set -o xtrace
+ 
+ HIVE_IMAGE="${HIVE_IMAGE:-registry.ci.openshift.org/openshift/hive-v4.0:hive}"
++HIVE_CATALOG_IMAGE="${HIVE_CATALOG_IMAGE:-quay.io/operatorhubio/catalog:latest}"
++
++function configure_hive_catalog_source() {
++    if [[ -z "${HIVE_CATALOG_SOURCE:-}" ]]; then
++        local oc_major
++        oc_major=$(oc version -o json | jq --raw-output '.openshiftVersion' | cut -d'.' -f1)
++        if [[ "${oc_major}" -ge 5 ]]; then
++            # hive-operator was removed from community-operators starting with OCP 5.0.
++            HIVE_CATALOG_SOURCE="upstream-community-operators"
++        else
++            HIVE_CATALOG_SOURCE="community-operators"
++        fi
++        echo "Selected hive-operator catalog source ${HIVE_CATALOG_SOURCE} for OpenShift ${oc_major}.x"
++    fi
++
++    if [[ "${HIVE_CATALOG_SOURCE}" == "upstream-community-operators" ]]; then
++        ensure_upstream_community_operators_catalog
++    fi
++
++    export HIVE_CATALOG_SOURCE
++}
++
++function ensure_upstream_community_operators_catalog() {
++    local catalog_namespace="openshift-marketplace"
++
++    if ! oc get catalogsource "${HIVE_CATALOG_SOURCE}" -n "${catalog_namespace}" &>/dev/null; then
++        cat <<EOCR | oc apply -f -
++apiVersion: operators.coreos.com/v1alpha1
++kind: CatalogSource
++metadata:
++  name: ${HIVE_CATALOG_SOURCE}
++  namespace: ${catalog_namespace}
++spec:
++  displayName: Upstream Community Operators
++  image: ${HIVE_CATALOG_IMAGE}
++  publisher: OperatorHub.io
++  sourceType: grpc
++  updateStrategy:
++    registryPoll:
++      interval: 10m0s
++EOCR
++    fi
++
++    wait_for_catalogsource "${HIVE_CATALOG_SOURCE}" "${catalog_namespace}"
++}
++
++function wait_for_catalogsource() {
++    local catalog_source="$1"
++    local namespace="$2"
++    local counter=1
++    local retry=120
++
++    echo "Waiting for catalogsource ${catalog_source} in namespace ${namespace} to become ready..."
++    until [[ "$(oc get catalogsource "${catalog_source}" -n "${namespace}" -o jsonpath='{.status.connectionState.lastObservedState}' 2>/dev/null)" == "READY" ]]; do
++        if [[ "${counter}" -eq "${retry}" ]]; then
++            echo "$(date --rfc-3339=seconds) ERROR: catalogsource ${catalog_source} is not ready"
++            oc get catalogsource "${catalog_source}" -n "${namespace}" -o yaml
++            exit 1
++        fi
++        ((counter++)) && sleep 5
++    done
++}
+ 
+ function print_help() {
+     ALL_FUNCS="with_olm|from_upstream|enable_agent_install_strategy|print_help"
+@@ -23,6 +85,8 @@ function with_olm() {
+         return 1
+     fi
+ 
++    configure_hive_catalog_source
++
+     cat <<EOCR | oc apply -f -
+ apiVersion: v1
+ kind: Namespace
+@@ -48,7 +112,7 @@ metadata:
+ spec:
+   installPlanApproval: Automatic
+   name: hive-operator
+-  source: community-operators
++  source: ${HIVE_CATALOG_SOURCE}
+   sourceNamespace: openshift-marketplace
+   channel: alpha
+ EOCR
+diff --git a/docs/operator.md b/docs/operator.md
+index 679317e966f0..7eaa1cfcc43c 100644
+--- a/docs/operator.md
++++ b/docs/operator.md
+@@ -41,6 +41,36 @@ EOF
+ Having the ClusterDeployment CRD installed is a prerequisite.
+ Install Hive, if it has not already been installed.
+ 
++When installing hive-operator via OLM (`deploy/operator/setup_hive.sh with_olm`), the
++catalog source is selected automatically based on the hub cluster OpenShift version:
++
++- OpenShift **< 5.0** (e.g. 4.22): `community-operators` (shipped with the cluster)
++- OpenShift **>= 5.0**: `upstream-community-operators` (hive-operator was removed from
++  `community-operators` starting with OCP 5.0)
++
++Override with `HIVE_CATALOG_SOURCE` if needed. On OCP 5.0+ clusters that do not ship
++`upstream-community-operators` by default, the setup script creates it:
++
++``` bash
++cat <<EOF | kubectl create -f -
++apiVersion: operators.coreos.com/v1alpha1
++kind: CatalogSource
++metadata:
++  name: upstream-community-operators
++  namespace: openshift-marketplace
++spec:
++  displayName: Upstream Community Operators
++  image: quay.io/operatorhubio/catalog:latest
++  publisher: OperatorHub.io
++  sourceType: grpc
++  updateStrategy:
++    registryPoll:
++      interval: 10m0s
++EOF
++```
++
++On OpenShift < 5.0, subscribe directly to the built-in community catalog:
++
+ ``` bash
+ cat <<EOF | kubectl create -f -
+ apiVersion: operators.coreos.com/v1alpha1
+@@ -57,6 +87,24 @@ spec:
+ EOF
+ ```
+ 
++On OpenShift >= 5.0, use `upstream-community-operators` instead:
++
++``` bash
++cat <<EOF | kubectl create -f -
++apiVersion: operators.coreos.com/v1alpha1
++kind: Subscription
++metadata:
++  name: hive-operator
++  namespace: openshift-operators
++spec:
++  channel: alpha
++  installPlanApproval: Automatic
++  name: hive-operator
++  source: upstream-community-operators
++  sourceNamespace: openshift-marketplace
++EOF
++```
++
+ Deploy the operator using the operator-sdk:
+ 
+ ```bash

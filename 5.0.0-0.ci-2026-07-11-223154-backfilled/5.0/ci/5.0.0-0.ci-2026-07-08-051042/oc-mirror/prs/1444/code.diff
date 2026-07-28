@@ -1,0 +1,251 @@
+diff --git a/internal/pkg/cli/executor.go b/internal/pkg/cli/executor.go
+index e1b88f273..bd2d4f0c1 100644
+--- a/internal/pkg/cli/executor.go
++++ b/internal/pkg/cli/executor.go
+@@ -915,6 +915,12 @@ func (o *ExecutorSchema) RunMirrorToDisk(cmd *cobra.Command, args []string) erro
+ 
+ 	o.createConfigsWithPinnedCatalogs()
+ 
++	if err := version.WriteVersionMetadata(o.Opts.Global.WorkingDir, version.Get()); err != nil {
++		o.Log.Warn("unable to write oc-mirror version metadata: %v", err)
++	} else {
++		o.Log.Debug("wrote version metadata: %s", version.Get().GitVersion)
++	}
++
+ 	o.Log.Info(emoji.Package + " Preparing the tarball archive...")
+ 	return o.MirrorArchiver.BuildArchive(cmd.Context(), copiedSchema.AllImages)
+ }
+@@ -1010,6 +1016,12 @@ func (o *ExecutorSchema) RunDiskToMirror(cmd *cobra.Command, args []string) erro
+ 		return err
+ 	}
+ 
++	if warning := version.CheckVersionMetadata(o.Opts.Global.WorkingDir, version.Get()); warning != "" {
++		o.Log.Warn(emoji.Warning+"  %s", warning)
++	} else {
++		o.Log.Debug("version metadata check passed: %s", version.Get().GitVersion)
++	}
++
+ 	// start the local storage registry
+ 	o.Log.Debug(startMessage, o.Opts.Global.Port)
+ 
+diff --git a/internal/pkg/config/metadata.go b/internal/pkg/config/metadata.go
+index 437f2d703..42f783dbc 100644
+--- a/internal/pkg/config/metadata.go
++++ b/internal/pkg/config/metadata.go
+@@ -48,8 +48,14 @@ const (
+ 	// catalog include config data for incorporation
+ 	// into the metadata is located.
+ 	IncludeConfigFile = "include-config.gob"
++	// VersionMetadataFile records which oc-mirror build produced a mirror-to-disk archive.
++	VersionMetadataFile = "oc-mirror-version.json"
+ )
+ 
+ // MetadataBasePath is the local path relative to the oc-mirror workspace
+ // where metadata is stored.
+ var MetadataBasePath = filepath.Join(PublishDir, MetadataFile)
++
++// VersionMetadataPath is the local path relative to the oc-mirror workspace
++// where mirror-to-disk version metadata is stored.
++var VersionMetadataPath = filepath.Join(InternalDir, VersionMetadataFile)
+diff --git a/internal/pkg/version/metadata.go b/internal/pkg/version/metadata.go
+new file mode 100644
+index 000000000..a41c88291
+--- /dev/null
++++ b/internal/pkg/version/metadata.go
+@@ -0,0 +1,85 @@
++package version
++
++import (
++	"encoding/json"
++	"errors"
++	"fmt"
++	"os"
++	"path/filepath"
++
++	"github.com/openshift/oc-mirror/v2/internal/pkg/config"
++	"github.com/openshift/oc-mirror/v2/internal/pkg/parser"
++)
++
++const versionMismatchWarn = "It is recommended to use the same oc-mirror version for both mirror-to-disk and disk-to-mirror"
++
++// VersionMetadata records which oc-mirror build produced a mirror-to-disk archive.
++type VersionMetadata struct {
++	GitVersion string `json:"gitVersion"`
++	GitCommit  string `json:"gitCommit"`
++}
++
++// NewVersionMetadata builds metadata from the current binary version info.
++func NewVersionMetadata(info Info) VersionMetadata {
++	return VersionMetadata{
++		GitVersion: info.GitVersion,
++		GitCommit:  info.GitCommit,
++	}
++}
++
++// WriteVersionMetadata writes version metadata under workingDir/internal/.
++func WriteVersionMetadata(workingDir string, info Info) error {
++	internalDir := filepath.Join(workingDir, config.InternalDir)
++	if err := os.MkdirAll(internalDir, 0o755); err != nil {
++		return fmt.Errorf("unable to create internal directory: %w", err)
++	}
++
++	meta := NewVersionMetadata(info)
++	data, err := json.MarshalIndent(meta, "", "  ")
++	if err != nil {
++		return fmt.Errorf("unable to marshal version metadata: %w", err)
++	}
++
++	path := filepath.Join(workingDir, config.VersionMetadataPath)
++	if err := os.WriteFile(path, data, 0o644); err != nil { //nolint:gosec // version metadata is not sensitive info
++		return fmt.Errorf("unable to write version metadata: %w", err)
++	}
++
++	return nil
++}
++
++// ReadVersionMetadata reads version metadata from the given file path.
++func ReadVersionMetadata(path string) (VersionMetadata, error) {
++	meta, err := parser.ParseJsonFile[VersionMetadata](path)
++	if err != nil {
++		return VersionMetadata{}, fmt.Errorf("version metadata: %w", err)
++	}
++	return meta, nil
++}
++
++// CheckVersionMetadata returns a warning message when the archive metadata is missing,
++// unreadable, or does not match the current binary. An empty string means no warning.
++func CheckVersionMetadata(workingDir string, current Info) string {
++	path := filepath.Join(workingDir, config.VersionMetadataPath)
++
++	meta, err := ReadVersionMetadata(path)
++	if err != nil {
++		if errors.Is(err, os.ErrNotExist) {
++			return fmt.Sprintf("No oc-mirror version metadata found in this archive. Mirror-to-disk may have been run with an older oc-mirror release that did not record version information. %s.", versionMismatchWarn)
++		}
++		return fmt.Sprintf("Unable to read oc-mirror version metadata from %s: %v", path, err)
++	}
++
++	if meta.GitVersion == current.GitVersion && meta.GitCommit == current.GitCommit {
++		return ""
++	}
++
++	return fmt.Sprintf(
++		"oc-mirror version mismatch: this archive was created with version %s (commit %s), but the current binary is version %s (commit %s). %s.",
++		meta.GitVersion,
++		meta.GitCommit,
++		current.GitVersion,
++		current.GitCommit,
++		versionMismatchWarn,
++	)
++}
+diff --git a/internal/pkg/version/metadata_test.go b/internal/pkg/version/metadata_test.go
+new file mode 100644
+index 000000000..aec95295a
+--- /dev/null
++++ b/internal/pkg/version/metadata_test.go
+@@ -0,0 +1,105 @@
++package version
++
++import (
++	"os"
++	"path/filepath"
++	"testing"
++
++	"github.com/stretchr/testify/require"
++
++	"github.com/openshift/oc-mirror/v2/internal/pkg/config"
++)
++
++func TestWriteAndReadVersionMetadata(t *testing.T) {
++	t.Parallel()
++
++	workingDir := t.TempDir()
++	info := Info{
++		GitVersion: "v2.1.0",
++		GitCommit:  "abc123",
++	}
++
++	require.NoError(t, WriteVersionMetadata(workingDir, info))
++
++	path := filepath.Join(workingDir, config.VersionMetadataPath)
++	meta, err := ReadVersionMetadata(path)
++	require.NoError(t, err)
++	require.Equal(t, info.GitVersion, meta.GitVersion)
++	require.Equal(t, info.GitCommit, meta.GitCommit)
++}
++
++func TestCheckVersionMetadata(t *testing.T) {
++	t.Parallel()
++
++	current := Info{
++		GitVersion: "v2.1.0",
++		GitCommit:  "current-commit",
++	}
++
++	t.Run("missing file warns", func(t *testing.T) {
++		t.Parallel()
++
++		warning := CheckVersionMetadata(t.TempDir(), current)
++		require.NotEmpty(t, warning)
++	})
++
++	t.Run("matching version and commit does not warn", func(t *testing.T) {
++		t.Parallel()
++
++		workingDir := t.TempDir()
++		require.NoError(t, WriteVersionMetadata(workingDir, current))
++
++		warning := CheckVersionMetadata(workingDir, current)
++		require.Empty(t, warning)
++	})
++
++	t.Run("version mismatch warns", func(t *testing.T) {
++		t.Parallel()
++
++		workingDir := t.TempDir()
++		require.NoError(t, WriteVersionMetadata(workingDir, Info{
++			GitVersion: "v2.0.0",
++			GitCommit:  "current-commit",
++		}))
++
++		warning := CheckVersionMetadata(workingDir, current)
++		require.Contains(t, warning, "version mismatch")
++		require.Contains(t, warning, "v2.0.0")
++		require.Contains(t, warning, "v2.1.0")
++	})
++
++	t.Run("commit mismatch warns", func(t *testing.T) {
++		t.Parallel()
++
++		workingDir := t.TempDir()
++		require.NoError(t, WriteVersionMetadata(workingDir, Info{
++			GitVersion: "v2.1.0",
++			GitCommit:  "other-commit",
++		}))
++
++		warning := CheckVersionMetadata(workingDir, current)
++		require.Contains(t, warning, "version mismatch")
++		require.Contains(t, warning, "other-commit")
++		require.Contains(t, warning, "current-commit")
++	})
++
++	t.Run("corrupt json warns", func(t *testing.T) {
++		t.Parallel()
++
++		workingDir := t.TempDir()
++		internalDir := filepath.Join(workingDir, config.InternalDir)
++		require.NoError(t, os.MkdirAll(internalDir, 0o755))
++		path := filepath.Join(workingDir, config.VersionMetadataPath)
++		require.NoError(t, os.WriteFile(path, []byte("{invalid"), 0o600))
++
++		warning := CheckVersionMetadata(workingDir, current)
++		require.NotEmpty(t, warning)
++	})
++}
++
++func TestReadVersionMetadataErrors(t *testing.T) {
++	t.Parallel()
++
++	_, err := ReadVersionMetadata(filepath.Join(t.TempDir(), "missing.json"))
++	require.Error(t, err)
++}

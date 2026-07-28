@@ -1,0 +1,344 @@
+diff --git a/.gitignore b/.gitignore
+index f9ba205c11..3b838338a4 100644
+--- a/.gitignore
++++ b/.gitignore
+@@ -1,5 +1,6 @@
+ /cloud-credential-operator
+ /ccoctl
++/ccoctl-*
+ .vscode/
+ /_output/
+ .idea/
+diff --git a/pkg/cmd/provisioning/ibmcloud/create_service_id.go b/pkg/cmd/provisioning/ibmcloud/create_service_id.go
+index 9550a44cc6..eecb9751c6 100644
+--- a/pkg/cmd/provisioning/ibmcloud/create_service_id.go
++++ b/pkg/cmd/provisioning/ibmcloud/create_service_id.go
+@@ -52,6 +52,7 @@ func NewCreateServiceIDCmd() *cobra.Command {
+ 	createServiceIDCmd.PersistentFlags().StringVar(&Options.ResourceGroupName, "resource-group-name", "", "Name of the resource group used for scoping the access policies")
+ 	createServiceIDCmd.PersistentFlags().StringVar(&Options.TargetDir, "output-dir", "", "Directory to place generated files (defaults to current directory)")
+ 	createServiceIDCmd.PersistentFlags().BoolVar(&Options.EnableTechPreview, "enable-tech-preview", false, "Opt into processing CredentialsRequests marked as tech-preview")
++	createServiceIDCmd.PersistentFlags().StringVar(&Options.APIEndpoint, "api-endpoint", "", "Override the IBM Cloud API base domain (e.g. test.cloud.ibm.com)")
+ 
+ 	return createServiceIDCmd
+ }
+@@ -63,7 +64,8 @@ func createServiceIDCmd(cmd *cobra.Command, args []string) error {
+ 	}
+ 
+ 	params := &ibmcloud.ClientParams{
+-		InfraName: Options.Name,
++		InfraName:   Options.Name,
++		APIEndpoint: Options.APIEndpoint,
+ 	}
+ 
+ 	ibmclient, err := ibmcloud.NewClient(apiKey, params)
+diff --git a/pkg/cmd/provisioning/ibmcloud/delete_service_id.go b/pkg/cmd/provisioning/ibmcloud/delete_service_id.go
+index af788dcd36..88bf87132c 100644
+--- a/pkg/cmd/provisioning/ibmcloud/delete_service_id.go
++++ b/pkg/cmd/provisioning/ibmcloud/delete_service_id.go
+@@ -23,6 +23,7 @@ func NewDeleteServiceIDCmd() *cobra.Command {
+ 	deleteServiceIDCmd.PersistentFlags().StringVar(&Options.CredRequestDir, "credentials-requests-dir", "", "Directory containing files of CredentialsRequests to delete IAM Roles for (can be created by running 'oc adm release extract --credentials-requests --cloud=ibmcloud' against an OpenShift release image)")
+ 	deleteServiceIDCmd.MarkPersistentFlagRequired("credentials-requests-dir")
+ 	deleteServiceIDCmd.PersistentFlags().BoolVar(&Options.Force, "force", false, "delete all the service account forcefully(will delete all the entries with the name)")
++	deleteServiceIDCmd.PersistentFlags().StringVar(&Options.APIEndpoint, "api-endpoint", "", "Override the IBM Cloud API base domain (e.g. test.cloud.ibm.com)")
+ 
+ 	return deleteServiceIDCmd
+ }
+@@ -34,7 +35,8 @@ func deleteServiceIDCmd(cmd *cobra.Command, args []string) error {
+ 	}
+ 
+ 	params := &ibmcloud.ClientParams{
+-		InfraName: Options.Name,
++		InfraName:   Options.Name,
++		APIEndpoint: Options.APIEndpoint,
+ 	}
+ 
+ 	ibmclient, err := ibmcloud.NewClient(apiKey, params)
+diff --git a/pkg/cmd/provisioning/ibmcloud/ibmcloud.go b/pkg/cmd/provisioning/ibmcloud/ibmcloud.go
+index 33a1be4112..6be13d0df8 100644
+--- a/pkg/cmd/provisioning/ibmcloud/ibmcloud.go
++++ b/pkg/cmd/provisioning/ibmcloud/ibmcloud.go
+@@ -13,6 +13,9 @@ type options struct {
+ 	KubeConfigFile    string
+ 	Create            bool
+ 	EnableTechPreview bool
++	// APIEndpoint is the base domain of the IBM Cloud API to target (e.g. "test.cloud.ibm.com").
++	// When empty, production endpoints are used.
++	APIEndpoint string
+ }
+ 
+ // NewIBMCloudCmd implements the "ibmcloud" subcommand for the credentials provisioning
+diff --git a/pkg/cmd/provisioning/ibmcloud/refresh-keys.go b/pkg/cmd/provisioning/ibmcloud/refresh-keys.go
+index 25ae6b45dc..29524494f6 100644
+--- a/pkg/cmd/provisioning/ibmcloud/refresh-keys.go
++++ b/pkg/cmd/provisioning/ibmcloud/refresh-keys.go
+@@ -35,6 +35,7 @@ func NewRefreshKeysCmd() *cobra.Command {
+ 	refreshKeysCmd.PersistentFlags().StringVar(&Options.ResourceGroupName, "resource-group-name", "", "Name of the resource group used for scoping the access policies")
+ 	refreshKeysCmd.PersistentFlags().BoolVar(&Options.Create, "create", false, "Create the ServiceID if does not exists")
+ 	refreshKeysCmd.PersistentFlags().BoolVar(&Options.EnableTechPreview, "enable-tech-preview", false, "Opt into processing CredentialsRequests marked as tech-preview")
++	refreshKeysCmd.PersistentFlags().StringVar(&Options.APIEndpoint, "api-endpoint", "", "Override the IBM Cloud API base domain (e.g. test.cloud.ibm.com)")
+ 
+ 	return refreshKeysCmd
+ }
+@@ -46,7 +47,8 @@ func refreshKeysCmd(cmd *cobra.Command, args []string) error {
+ 	}
+ 
+ 	params := &ibmcloud.ClientParams{
+-		InfraName: Options.Name,
++		InfraName:   Options.Name,
++		APIEndpoint: Options.APIEndpoint,
+ 	}
+ 
+ 	ibmclient, err := ibmcloud.NewClient(apiKey, params)
+diff --git a/pkg/ibmcloud/client.go b/pkg/ibmcloud/client.go
+index b56550d0d4..3513455201 100644
+--- a/pkg/ibmcloud/client.go
++++ b/pkg/ibmcloud/client.go
+@@ -2,6 +2,7 @@ package ibmcloud
+ 
+ import (
+ 	"fmt"
++	"strings"
+ 
+ 	"github.com/IBM/go-sdk-core/v5/core"
+ 	identityv1 "github.com/IBM/platform-services-go-sdk/iamidentityv1"
+@@ -27,6 +28,9 @@ type Client interface {
+ 
+ type ClientParams struct {
+ 	InfraName string
++	// APIEndpoint is the base domain of the IBM Cloud API to target (e.g. "test.cloud.ibm.com").
++	// When empty, the SDK defaults (production cloud.ibm.com endpoints) are used.
++	APIEndpoint string
+ }
+ 
+ type ibmcloudClient struct {
+@@ -77,24 +81,62 @@ func (i *ibmcloudClient) CreatePolicy(options *pmv1.CreatePolicyOptions) (*pmv1.
+ 	return i.pmClient.CreatePolicy(options)
+ }
+ 
++// validateAPIEndpoint ensures the provided API endpoint is a bare hostname/domain with no
++// scheme or trailing slash (e.g. "test.cloud.ibm.com"), returns a cleaned value or an error.
++func validateAPIEndpoint(endpoint string) (string, error) {
++	// Strip a scheme the user may have accidentally included.
++	for _, scheme := range []string{"https://", "http://"} {
++		endpoint = strings.TrimPrefix(endpoint, scheme)
++	}
++	// Strip trailing slashes.
++	endpoint = strings.TrimRight(endpoint, "/")
++
++	// After stripping, the value must not still contain "://"
++	if strings.Contains(endpoint, "://") {
++		return "", fmt.Errorf("invalid api-endpoint %q: must be a bare domain (e.g. test.cloud.ibm.com), not a full URL", endpoint)
++	}
++	return endpoint, nil
++}
++
+ func NewClient(apiKey string, params *ClientParams) (Client, error) {
+ 	authenticator := &core.IamAuthenticator{
+ 		ApiKey: apiKey,
+ 	}
++
++	agentText := "defaultAgent"
++	var iamURL, resourceManagerURL string
++	if params != nil {
++		if params.InfraName != "" {
++			agentText = params.InfraName
++		}
++		if params.APIEndpoint != "" {
++			endpoint, err := validateAPIEndpoint(params.APIEndpoint)
++			if err != nil {
++				return nil, err
++			}
++			// Both the IAM Identity and IAM Policy Management APIs are served from the same iam.* host
++			iamURL = fmt.Sprintf("https://iam.%s", endpoint)
++			resourceManagerURL = fmt.Sprintf("https://resource-controller.%s", endpoint)
++		}
++	}
++
++	if iamURL != "" {
++		authenticator.URL = iamURL
++	}
++
+ 	err := authenticator.Validate()
+ 	if err != nil {
+ 		return nil, err
+ 	}
+ 
+-	agentText := "defaultAgent"
+-	if params != nil && params.InfraName != "" {
+-		agentText = params.InfraName
+-	}
+ 	userAgentString := fmt.Sprintf("OpenShift/4.x Cloud Credential Operator: %s", agentText)
+ 
+ 	serviceClientOptions := &pmv1.IamPolicyManagementV1Options{
+ 		Authenticator: authenticator,
+ 	}
++	if iamURL != "" {
++		serviceClientOptions.URL = iamURL
++	}
+ 	serviceClient, err := pmv1.NewIamPolicyManagementV1(serviceClientOptions)
+ 	if err != nil {
+ 		return nil, err
+@@ -104,6 +146,9 @@ func NewClient(apiKey string, params *ClientParams) (Client, error) {
+ 	identityv1Options := &identityv1.IamIdentityV1Options{
+ 		Authenticator: authenticator,
+ 	}
++	if iamURL != "" {
++		identityv1Options.URL = iamURL
++	}
+ 	identityClient, err := identityv1.NewIamIdentityV1(identityv1Options)
+ 	if err != nil {
+ 		return nil, err
+@@ -113,8 +158,14 @@ func NewClient(apiKey string, params *ClientParams) (Client, error) {
+ 	resourceManagerV2Options := &resourcemanagerv2.ResourceManagerV2Options{
+ 		Authenticator: authenticator,
+ 	}
++	if resourceManagerURL != "" {
++		resourceManagerV2Options.URL = resourceManagerURL
++	}
+ 
+ 	resourceManagerV2Client, err := resourcemanagerv2.NewResourceManagerV2(resourceManagerV2Options)
++	if err != nil {
++		return nil, err
++	}
+ 
+ 	return &ibmcloudClient{
+ 		authenticator:           authenticator,
+diff --git a/pkg/ibmcloud/client_test.go b/pkg/ibmcloud/client_test.go
+new file mode 100644
+index 0000000000..84e244eedb
+--- /dev/null
++++ b/pkg/ibmcloud/client_test.go
+@@ -0,0 +1,133 @@
++package ibmcloud
++
++import (
++	"testing"
++)
++
++func Test_validateAPIEndpoint(t *testing.T) {
++	tests := []struct {
++		name    string
++		input   string
++		want    string
++		wantErr bool
++	}{
++		{
++			name:  "bare domain passes unchanged",
++			input: "test.cloud.ibm.com",
++			want:  "test.cloud.ibm.com",
++		},
++		{
++			name:  "https scheme is stripped",
++			input: "https://test.cloud.ibm.com",
++			want:  "test.cloud.ibm.com",
++		},
++		{
++			name:  "http scheme is stripped",
++			input: "http://test.cloud.ibm.com",
++			want:  "test.cloud.ibm.com",
++		},
++		{
++			name:  "trailing slash is stripped",
++			input: "test.cloud.ibm.com/",
++			want:  "test.cloud.ibm.com",
++		},
++		{
++			name:  "https scheme and trailing slash are both stripped",
++			input: "https://test.cloud.ibm.com/",
++			want:  "test.cloud.ibm.com",
++		},
++		{
++			name:    "unsupported scheme returns error",
++			input:   "ftp://test.cloud.ibm.com",
++			wantErr: true,
++		},
++	}
++
++	for _, tt := range tests {
++		t.Run(tt.name, func(t *testing.T) {
++			got, err := validateAPIEndpoint(tt.input)
++			if tt.wantErr {
++				if err == nil {
++					t.Errorf("validateAPIEndpoint(%q) expected error, got nil", tt.input)
++				}
++				return
++			}
++			if err != nil {
++				t.Errorf("validateAPIEndpoint(%q) unexpected error: %v", tt.input, err)
++				return
++			}
++			if got != tt.want {
++				t.Errorf("validateAPIEndpoint(%q) = %q, want %q", tt.input, got, tt.want)
++			}
++		})
++	}
++}
++
++func Test_NewClient_URLConstruction(t *testing.T) {
++	const fakeKey = "fake-api-key-for-testing"
++
++	tests := []struct {
++		name                   string
++		params                 *ClientParams
++		wantIAMURL             string
++		wantResourceManagerURL string
++		wantErr                bool
++	}{
++		{
++			name:                   "nil params uses SDK defaults",
++			params:                 nil,
++			wantIAMURL:             "https://iam.cloud.ibm.com",
++			wantResourceManagerURL: "https://resource-controller.cloud.ibm.com",
++		},
++		{
++			name:                   "empty APIEndpoint uses SDK defaults",
++			params:                 &ClientParams{InfraName: "my-cluster"},
++			wantIAMURL:             "https://iam.cloud.ibm.com",
++			wantResourceManagerURL: "https://resource-controller.cloud.ibm.com",
++		},
++		{
++			name:                   "bare domain builds correct URLs",
++			params:                 &ClientParams{APIEndpoint: "test.cloud.ibm.com"},
++			wantIAMURL:             "https://iam.test.cloud.ibm.com",
++			wantResourceManagerURL: "https://resource-controller.test.cloud.ibm.com",
++		},
++		{
++			name:                   "domain with https scheme builds correct URLs",
++			params:                 &ClientParams{APIEndpoint: "https://test.cloud.ibm.com"},
++			wantIAMURL:             "https://iam.test.cloud.ibm.com",
++			wantResourceManagerURL: "https://resource-controller.test.cloud.ibm.com",
++		},
++		{
++			name:    "unsupported scheme returns error",
++			params:  &ClientParams{APIEndpoint: "ftp://test.cloud.ibm.com"},
++			wantErr: true,
++		},
++	}
++
++	for _, tt := range tests {
++		t.Run(tt.name, func(t *testing.T) {
++			client, err := NewClient(fakeKey, tt.params)
++			if tt.wantErr {
++				if err == nil {
++					t.Errorf("NewClient() expected error, got nil")
++				}
++				return
++			}
++			if err != nil {
++				t.Errorf("NewClient() unexpected error: %v", err)
++				return
++			}
++
++			c := client.(*ibmcloudClient)
++			if got := c.identityClient.GetServiceURL(); got != tt.wantIAMURL {
++				t.Errorf("identityClient URL = %q, want %q", got, tt.wantIAMURL)
++			}
++			if got := c.pmClient.GetServiceURL(); got != tt.wantIAMURL {
++				t.Errorf("pmClient URL = %q, want %q", got, tt.wantIAMURL)
++			}
++			if got := c.resourceManagerV2Client.GetServiceURL(); got != tt.wantResourceManagerURL {
++				t.Errorf("resourceManagerV2Client URL = %q, want %q", got, tt.wantResourceManagerURL)
++			}
++		})
++	}
++}

@@ -1,0 +1,462 @@
+diff --git a/openapi/generated_openapi/zz_generated.openapi.go b/openapi/generated_openapi/zz_generated.openapi.go
+index d81301eaaa6..685e2e2d8e8 100644
+--- a/openapi/generated_openapi/zz_generated.openapi.go
++++ b/openapi/generated_openapi/zz_generated.openapi.go
+@@ -55298,9 +55298,9 @@ func schema_openshift_api_operator_v1_CustomSecretRotation(ref common.ReferenceC
+ 				Description: "CustomSecretRotation holds configuration for custom secret rotation behavior.",
+ 				Type:        []string{"object"},
+ 				Properties: map[string]spec.Schema{
+-					"rotationPollIntervalSeconds": {
++					"minimumRefreshAge": {
+ 						SchemaProps: spec.SchemaProps{
+-							Description: "rotationPollIntervalSeconds is the minimum time in seconds between secret rotation attempts. The driver skips provider calls if less than this interval has elapsed since the last successful rotation. Must be at least 1 second and no more than 31560000 seconds (~1 year). When omitted, this means no opinion and the platform is left to choose a reasonable default, which is subject to change over time.",
++							Description: "minimumRefreshAge is the minimum time in seconds between secret rotation attempts. Each time kubelet calls NodePublishVolume, the driver checks whether this interval has elapsed since the last successful provider call. If it has, the driver contacts the secret provider to fetch the latest secret values and updates the mounted volume. Setting this value below the kubelet syncFrequency (default: 1 minute) has no additional effect on the actual rotation cadence. Must be at least 1 second and no more than 31560000 seconds (~1 year). When omitted, this means no opinion and the platform is left to choose a reasonable default, which is subject to change over time.",
+ 							Type:        []string{"integer"},
+ 							Format:      "int32",
+ 						},
+diff --git a/operator/v1/tests/clustercsidrivers.operator.openshift.io/AAA_ungated.yaml b/operator/v1/tests/clustercsidrivers.operator.openshift.io/AAA_ungated.yaml
+index 984ce2e802e..b9c13976d61 100644
+--- a/operator/v1/tests/clustercsidrivers.operator.openshift.io/AAA_ungated.yaml
++++ b/operator/v1/tests/clustercsidrivers.operator.openshift.io/AAA_ungated.yaml
+@@ -62,7 +62,7 @@ tests:
+               secretRotation:
+                 type: Custom
+                 custom:
+-                  rotationPollIntervalSeconds: 300
++                  minimumRefreshAge: 300
+       expectedError: "Invalid value: \"object\": secretsStore must be set if driverType is 'SecretsStore', but remain unset otherwise"
+     - name: Should reject secrets-store name with non-SecretsStore driverType
+       initial: |
+@@ -87,7 +87,7 @@ tests:
+               secretRotation:
+                 type: Custom
+                 custom:
+-                  rotationPollIntervalSeconds: 300
++                  minimumRefreshAge: 300
+       expectedError: "driverType 'SecretsStore' requires metadata.name 'secrets-store.csi.k8s.io'"
+     - name: Should allow secrets-store name without driverType for backward compatibility
+       initial: |
+@@ -214,7 +214,7 @@ tests:
+               secretRotation:
+                 type: Custom
+                 custom:
+-                  rotationPollIntervalSeconds: 300
++                  minimumRefreshAge: 300
+               tokenRequests:
+                 type: Managed
+                 managed:
+@@ -236,7 +236,7 @@ tests:
+               secretRotation:
+                 type: Custom
+                 custom:
+-                  rotationPollIntervalSeconds: 300
++                  minimumRefreshAge: 300
+               tokenRequests:
+                 type: Managed
+                 managed:
+@@ -496,7 +496,7 @@ tests:
+               secretRotation:
+                 type: Custom
+       expectedError: "custom must be set when type is 'Custom', and must not be set otherwise"
+-    - name: Should reject rotationPollIntervalSeconds below 1
++    - name: Should reject minimumRefreshAge below 1
+       initial: |
+         apiVersion: operator.openshift.io/v1
+         kind: ClusterCSIDriver
+@@ -509,9 +509,9 @@ tests:
+               secretRotation:
+                 type: Custom
+                 custom:
+-                  rotationPollIntervalSeconds: 0
+-      expectedError: "spec.driverConfig.secretsStore.secretRotation.custom.rotationPollIntervalSeconds: Invalid value"
+-    - name: Should reject rotationPollIntervalSeconds above 31560000
++                  minimumRefreshAge: 0
++      expectedError: "spec.driverConfig.secretsStore.secretRotation.custom.minimumRefreshAge: Invalid value"
++    - name: Should reject minimumRefreshAge above 31560000
+       initial: |
+         apiVersion: operator.openshift.io/v1
+         kind: ClusterCSIDriver
+@@ -524,8 +524,8 @@ tests:
+               secretRotation:
+                 type: Custom
+                 custom:
+-                  rotationPollIntervalSeconds: 31560001
+-      expectedError: "spec.driverConfig.secretsStore.secretRotation.custom.rotationPollIntervalSeconds: Invalid value"
++                  minimumRefreshAge: 31560001
++      expectedError: "spec.driverConfig.secretsStore.secretRotation.custom.minimumRefreshAge: Invalid value"
+     - name: Should reject Managed tokenRequests without managed field
+       initial: |
+         apiVersion: operator.openshift.io/v1
+@@ -697,7 +697,7 @@ tests:
+               secretRotation:
+                 type: Custom
+                 custom:
+-                  rotationPollIntervalSeconds: 300
++                  minimumRefreshAge: 300
+       expectedError: "tokenRequests type cannot be changed from Managed"
+     - name: Should allow changing tokenRequests type from Unmanaged to Managed
+       initial: |
+diff --git a/operator/v1/types_csi_cluster_driver.go b/operator/v1/types_csi_cluster_driver.go
+index 51ecab70c8c..fca2c808d34 100644
+--- a/operator/v1/types_csi_cluster_driver.go
++++ b/operator/v1/types_csi_cluster_driver.go
+@@ -506,16 +506,28 @@ type SecretsStoreSecretRotation struct {
+ // CustomSecretRotation holds configuration for custom secret rotation behavior.
+ // +kubebuilder:validation:MinProperties=1
+ type CustomSecretRotation struct {
+-	// rotationPollIntervalSeconds is the minimum time in seconds between secret
+-	// rotation attempts. The driver skips provider calls if less than this interval
+-	// has elapsed since the last successful rotation.
++	// minimumRefreshAge is the minimum time in seconds between secret
++	// rotation attempts. Each time kubelet calls NodePublishVolume, the driver
++	// checks whether this interval has elapsed since the last successful provider
++	// call. If it has, the driver contacts the secret provider to fetch the latest
++	// secret values and updates the mounted volume.
++	// Setting this value below the kubelet syncFrequency (default: 1 minute)
++	// has no additional effect on the actual rotation cadence.
+ 	// Must be at least 1 second and no more than 31560000 seconds (~1 year).
+ 	// When omitted, this means no opinion and the platform is left to choose a
+ 	// reasonable default, which is subject to change over time.
+ 	// +kubebuilder:validation:Minimum=1
+ 	// +kubebuilder:validation:Maximum=31560000
+ 	// +optional
+-	RotationPollIntervalSeconds int32 `json:"rotationPollIntervalSeconds,omitempty"`
++	MinimumRefreshAge int32 `json:"minimumRefreshAge,omitempty"`
++
++	// --- TOMBSTONE ---
++	// rotationPollIntervalSeconds was the previous name for minimumRefreshAge.
++	// The field has been renamed to better reflect its semantics.
++	// The JSON key is reserved to prevent reuse.
++	//
++	// +optional
++	// RotationPollIntervalSeconds int32 `json:"rotationPollIntervalSeconds,omitempty"`
+ }
+ 
+ // SecretsStoreTokenRequest specifies a service account token audience configuration
+diff --git a/operator/v1/zz_generated.crd-manifests/0000_50_csi-driver_01_clustercsidrivers-CustomNoUpgrade.crd.yaml b/operator/v1/zz_generated.crd-manifests/0000_50_csi-driver_01_clustercsidrivers-CustomNoUpgrade.crd.yaml
+index 02b95f82fe7..6c5120e1a69 100644
+--- a/operator/v1/zz_generated.crd-manifests/0000_50_csi-driver_01_clustercsidrivers-CustomNoUpgrade.crd.yaml
++++ b/operator/v1/zz_generated.crd-manifests/0000_50_csi-driver_01_clustercsidrivers-CustomNoUpgrade.crd.yaml
+@@ -278,11 +278,15 @@ spec:
+                               Only valid when type is "Custom".
+                             minProperties: 1
+                             properties:
+-                              rotationPollIntervalSeconds:
++                              minimumRefreshAge:
+                                 description: |-
+-                                  rotationPollIntervalSeconds is the minimum time in seconds between secret
+-                                  rotation attempts. The driver skips provider calls if less than this interval
+-                                  has elapsed since the last successful rotation.
++                                  minimumRefreshAge is the minimum time in seconds between secret
++                                  rotation attempts. Each time kubelet calls NodePublishVolume, the driver
++                                  checks whether this interval has elapsed since the last successful provider
++                                  call. If it has, the driver contacts the secret provider to fetch the latest
++                                  secret values and updates the mounted volume.
++                                  Setting this value below the kubelet syncFrequency (default: 1 minute)
++                                  has no additional effect on the actual rotation cadence.
+                                   Must be at least 1 second and no more than 31560000 seconds (~1 year).
+                                   When omitted, this means no opinion and the platform is left to choose a
+                                   reasonable default, which is subject to change over time.
+diff --git a/operator/v1/zz_generated.crd-manifests/0000_50_csi-driver_01_clustercsidrivers-Default.crd.yaml b/operator/v1/zz_generated.crd-manifests/0000_50_csi-driver_01_clustercsidrivers-Default.crd.yaml
+index 56859fc15a4..2ea91955ba9 100644
+--- a/operator/v1/zz_generated.crd-manifests/0000_50_csi-driver_01_clustercsidrivers-Default.crd.yaml
++++ b/operator/v1/zz_generated.crd-manifests/0000_50_csi-driver_01_clustercsidrivers-Default.crd.yaml
+@@ -278,11 +278,15 @@ spec:
+                               Only valid when type is "Custom".
+                             minProperties: 1
+                             properties:
+-                              rotationPollIntervalSeconds:
++                              minimumRefreshAge:
+                                 description: |-
+-                                  rotationPollIntervalSeconds is the minimum time in seconds between secret
+-                                  rotation attempts. The driver skips provider calls if less than this interval
+-                                  has elapsed since the last successful rotation.
++                                  minimumRefreshAge is the minimum time in seconds between secret
++                                  rotation attempts. Each time kubelet calls NodePublishVolume, the driver
++                                  checks whether this interval has elapsed since the last successful provider
++                                  call. If it has, the driver contacts the secret provider to fetch the latest
++                                  secret values and updates the mounted volume.
++                                  Setting this value below the kubelet syncFrequency (default: 1 minute)
++                                  has no additional effect on the actual rotation cadence.
+                                   Must be at least 1 second and no more than 31560000 seconds (~1 year).
+                                   When omitted, this means no opinion and the platform is left to choose a
+                                   reasonable default, which is subject to change over time.
+diff --git a/operator/v1/zz_generated.crd-manifests/0000_50_csi-driver_01_clustercsidrivers-DevPreviewNoUpgrade.crd.yaml b/operator/v1/zz_generated.crd-manifests/0000_50_csi-driver_01_clustercsidrivers-DevPreviewNoUpgrade.crd.yaml
+index f2be3b2eebc..d30ab1abe92 100644
+--- a/operator/v1/zz_generated.crd-manifests/0000_50_csi-driver_01_clustercsidrivers-DevPreviewNoUpgrade.crd.yaml
++++ b/operator/v1/zz_generated.crd-manifests/0000_50_csi-driver_01_clustercsidrivers-DevPreviewNoUpgrade.crd.yaml
+@@ -278,11 +278,15 @@ spec:
+                               Only valid when type is "Custom".
+                             minProperties: 1
+                             properties:
+-                              rotationPollIntervalSeconds:
++                              minimumRefreshAge:
+                                 description: |-
+-                                  rotationPollIntervalSeconds is the minimum time in seconds between secret
+-                                  rotation attempts. The driver skips provider calls if less than this interval
+-                                  has elapsed since the last successful rotation.
++                                  minimumRefreshAge is the minimum time in seconds between secret
++                                  rotation attempts. Each time kubelet calls NodePublishVolume, the driver
++                                  checks whether this interval has elapsed since the last successful provider
++                                  call. If it has, the driver contacts the secret provider to fetch the latest
++                                  secret values and updates the mounted volume.
++                                  Setting this value below the kubelet syncFrequency (default: 1 minute)
++                                  has no additional effect on the actual rotation cadence.
+                                   Must be at least 1 second and no more than 31560000 seconds (~1 year).
+                                   When omitted, this means no opinion and the platform is left to choose a
+                                   reasonable default, which is subject to change over time.
+diff --git a/operator/v1/zz_generated.crd-manifests/0000_50_csi-driver_01_clustercsidrivers-OKD.crd.yaml b/operator/v1/zz_generated.crd-manifests/0000_50_csi-driver_01_clustercsidrivers-OKD.crd.yaml
+index de5190a522f..118bcd135df 100644
+--- a/operator/v1/zz_generated.crd-manifests/0000_50_csi-driver_01_clustercsidrivers-OKD.crd.yaml
++++ b/operator/v1/zz_generated.crd-manifests/0000_50_csi-driver_01_clustercsidrivers-OKD.crd.yaml
+@@ -278,11 +278,15 @@ spec:
+                               Only valid when type is "Custom".
+                             minProperties: 1
+                             properties:
+-                              rotationPollIntervalSeconds:
++                              minimumRefreshAge:
+                                 description: |-
+-                                  rotationPollIntervalSeconds is the minimum time in seconds between secret
+-                                  rotation attempts. The driver skips provider calls if less than this interval
+-                                  has elapsed since the last successful rotation.
++                                  minimumRefreshAge is the minimum time in seconds between secret
++                                  rotation attempts. Each time kubelet calls NodePublishVolume, the driver
++                                  checks whether this interval has elapsed since the last successful provider
++                                  call. If it has, the driver contacts the secret provider to fetch the latest
++                                  secret values and updates the mounted volume.
++                                  Setting this value below the kubelet syncFrequency (default: 1 minute)
++                                  has no additional effect on the actual rotation cadence.
+                                   Must be at least 1 second and no more than 31560000 seconds (~1 year).
+                                   When omitted, this means no opinion and the platform is left to choose a
+                                   reasonable default, which is subject to change over time.
+diff --git a/operator/v1/zz_generated.crd-manifests/0000_50_csi-driver_01_clustercsidrivers-TechPreviewNoUpgrade.crd.yaml b/operator/v1/zz_generated.crd-manifests/0000_50_csi-driver_01_clustercsidrivers-TechPreviewNoUpgrade.crd.yaml
+index 51ffcfd9741..bd6f1a14d85 100644
+--- a/operator/v1/zz_generated.crd-manifests/0000_50_csi-driver_01_clustercsidrivers-TechPreviewNoUpgrade.crd.yaml
++++ b/operator/v1/zz_generated.crd-manifests/0000_50_csi-driver_01_clustercsidrivers-TechPreviewNoUpgrade.crd.yaml
+@@ -278,11 +278,15 @@ spec:
+                               Only valid when type is "Custom".
+                             minProperties: 1
+                             properties:
+-                              rotationPollIntervalSeconds:
++                              minimumRefreshAge:
+                                 description: |-
+-                                  rotationPollIntervalSeconds is the minimum time in seconds between secret
+-                                  rotation attempts. The driver skips provider calls if less than this interval
+-                                  has elapsed since the last successful rotation.
++                                  minimumRefreshAge is the minimum time in seconds between secret
++                                  rotation attempts. Each time kubelet calls NodePublishVolume, the driver
++                                  checks whether this interval has elapsed since the last successful provider
++                                  call. If it has, the driver contacts the secret provider to fetch the latest
++                                  secret values and updates the mounted volume.
++                                  Setting this value below the kubelet syncFrequency (default: 1 minute)
++                                  has no additional effect on the actual rotation cadence.
+                                   Must be at least 1 second and no more than 31560000 seconds (~1 year).
+                                   When omitted, this means no opinion and the platform is left to choose a
+                                   reasonable default, which is subject to change over time.
+diff --git a/operator/v1/zz_generated.featuregated-crd-manifests/clustercsidrivers.operator.openshift.io/AAA_ungated.yaml b/operator/v1/zz_generated.featuregated-crd-manifests/clustercsidrivers.operator.openshift.io/AAA_ungated.yaml
+index bef82d2356e..6d1fdafc93c 100644
+--- a/operator/v1/zz_generated.featuregated-crd-manifests/clustercsidrivers.operator.openshift.io/AAA_ungated.yaml
++++ b/operator/v1/zz_generated.featuregated-crd-manifests/clustercsidrivers.operator.openshift.io/AAA_ungated.yaml
+@@ -258,11 +258,15 @@ spec:
+                               Only valid when type is "Custom".
+                             minProperties: 1
+                             properties:
+-                              rotationPollIntervalSeconds:
++                              minimumRefreshAge:
+                                 description: |-
+-                                  rotationPollIntervalSeconds is the minimum time in seconds between secret
+-                                  rotation attempts. The driver skips provider calls if less than this interval
+-                                  has elapsed since the last successful rotation.
++                                  minimumRefreshAge is the minimum time in seconds between secret
++                                  rotation attempts. Each time kubelet calls NodePublishVolume, the driver
++                                  checks whether this interval has elapsed since the last successful provider
++                                  call. If it has, the driver contacts the secret provider to fetch the latest
++                                  secret values and updates the mounted volume.
++                                  Setting this value below the kubelet syncFrequency (default: 1 minute)
++                                  has no additional effect on the actual rotation cadence.
+                                   Must be at least 1 second and no more than 31560000 seconds (~1 year).
+                                   When omitted, this means no opinion and the platform is left to choose a
+                                   reasonable default, which is subject to change over time.
+diff --git a/operator/v1/zz_generated.featuregated-crd-manifests/clustercsidrivers.operator.openshift.io/AWSEuropeanSovereignCloudInstall.yaml b/operator/v1/zz_generated.featuregated-crd-manifests/clustercsidrivers.operator.openshift.io/AWSEuropeanSovereignCloudInstall.yaml
+index f18b4f07f7a..ce53fd9d5ac 100644
+--- a/operator/v1/zz_generated.featuregated-crd-manifests/clustercsidrivers.operator.openshift.io/AWSEuropeanSovereignCloudInstall.yaml
++++ b/operator/v1/zz_generated.featuregated-crd-manifests/clustercsidrivers.operator.openshift.io/AWSEuropeanSovereignCloudInstall.yaml
+@@ -258,11 +258,15 @@ spec:
+                               Only valid when type is "Custom".
+                             minProperties: 1
+                             properties:
+-                              rotationPollIntervalSeconds:
++                              minimumRefreshAge:
+                                 description: |-
+-                                  rotationPollIntervalSeconds is the minimum time in seconds between secret
+-                                  rotation attempts. The driver skips provider calls if less than this interval
+-                                  has elapsed since the last successful rotation.
++                                  minimumRefreshAge is the minimum time in seconds between secret
++                                  rotation attempts. Each time kubelet calls NodePublishVolume, the driver
++                                  checks whether this interval has elapsed since the last successful provider
++                                  call. If it has, the driver contacts the secret provider to fetch the latest
++                                  secret values and updates the mounted volume.
++                                  Setting this value below the kubelet syncFrequency (default: 1 minute)
++                                  has no additional effect on the actual rotation cadence.
+                                   Must be at least 1 second and no more than 31560000 seconds (~1 year).
+                                   When omitted, this means no opinion and the platform is left to choose a
+                                   reasonable default, which is subject to change over time.
+diff --git a/operator/v1/zz_generated.featuregated-crd-manifests/clustercsidrivers.operator.openshift.io/VSphereConfigurableMaxAllowedBlockVolumesPerNode.yaml b/operator/v1/zz_generated.featuregated-crd-manifests/clustercsidrivers.operator.openshift.io/VSphereConfigurableMaxAllowedBlockVolumesPerNode.yaml
+index 43e30ce938e..76f8ef3e851 100644
+--- a/operator/v1/zz_generated.featuregated-crd-manifests/clustercsidrivers.operator.openshift.io/VSphereConfigurableMaxAllowedBlockVolumesPerNode.yaml
++++ b/operator/v1/zz_generated.featuregated-crd-manifests/clustercsidrivers.operator.openshift.io/VSphereConfigurableMaxAllowedBlockVolumesPerNode.yaml
+@@ -254,11 +254,15 @@ spec:
+                               Only valid when type is "Custom".
+                             minProperties: 1
+                             properties:
+-                              rotationPollIntervalSeconds:
++                              minimumRefreshAge:
+                                 description: |-
+-                                  rotationPollIntervalSeconds is the minimum time in seconds between secret
+-                                  rotation attempts. The driver skips provider calls if less than this interval
+-                                  has elapsed since the last successful rotation.
++                                  minimumRefreshAge is the minimum time in seconds between secret
++                                  rotation attempts. Each time kubelet calls NodePublishVolume, the driver
++                                  checks whether this interval has elapsed since the last successful provider
++                                  call. If it has, the driver contacts the secret provider to fetch the latest
++                                  secret values and updates the mounted volume.
++                                  Setting this value below the kubelet syncFrequency (default: 1 minute)
++                                  has no additional effect on the actual rotation cadence.
+                                   Must be at least 1 second and no more than 31560000 seconds (~1 year).
+                                   When omitted, this means no opinion and the platform is left to choose a
+                                   reasonable default, which is subject to change over time.
+diff --git a/operator/v1/zz_generated.swagger_doc_generated.go b/operator/v1/zz_generated.swagger_doc_generated.go
+index a79189ffc20..b0171dfad2b 100644
+--- a/operator/v1/zz_generated.swagger_doc_generated.go
++++ b/operator/v1/zz_generated.swagger_doc_generated.go
+@@ -569,8 +569,8 @@ func (ClusterCSIDriverStatus) SwaggerDoc() map[string]string {
+ }
+ 
+ var map_CustomSecretRotation = map[string]string{
+-	"":                            "CustomSecretRotation holds configuration for custom secret rotation behavior.",
+-	"rotationPollIntervalSeconds": "rotationPollIntervalSeconds is the minimum time in seconds between secret rotation attempts. The driver skips provider calls if less than this interval has elapsed since the last successful rotation. Must be at least 1 second and no more than 31560000 seconds (~1 year). When omitted, this means no opinion and the platform is left to choose a reasonable default, which is subject to change over time.",
++	"":                  "CustomSecretRotation holds configuration for custom secret rotation behavior.",
++	"minimumRefreshAge": "minimumRefreshAge is the minimum time in seconds between secret rotation attempts. Each time kubelet calls NodePublishVolume, the driver checks whether this interval has elapsed since the last successful provider call. If it has, the driver contacts the secret provider to fetch the latest secret values and updates the mounted volume. Setting this value below the kubelet syncFrequency (default: 1 minute) has no additional effect on the actual rotation cadence. Must be at least 1 second and no more than 31560000 seconds (~1 year). When omitted, this means no opinion and the platform is left to choose a reasonable default, which is subject to change over time.",
+ }
+ 
+ func (CustomSecretRotation) SwaggerDoc() map[string]string {
+diff --git a/payload-manifests/crds/0000_50_csi-driver_01_clustercsidrivers-CustomNoUpgrade.crd.yaml b/payload-manifests/crds/0000_50_csi-driver_01_clustercsidrivers-CustomNoUpgrade.crd.yaml
+index 02b95f82fe7..6c5120e1a69 100644
+--- a/payload-manifests/crds/0000_50_csi-driver_01_clustercsidrivers-CustomNoUpgrade.crd.yaml
++++ b/payload-manifests/crds/0000_50_csi-driver_01_clustercsidrivers-CustomNoUpgrade.crd.yaml
+@@ -278,11 +278,15 @@ spec:
+                               Only valid when type is "Custom".
+                             minProperties: 1
+                             properties:
+-                              rotationPollIntervalSeconds:
++                              minimumRefreshAge:
+                                 description: |-
+-                                  rotationPollIntervalSeconds is the minimum time in seconds between secret
+-                                  rotation attempts. The driver skips provider calls if less than this interval
+-                                  has elapsed since the last successful rotation.
++                                  minimumRefreshAge is the minimum time in seconds between secret
++                                  rotation attempts. Each time kubelet calls NodePublishVolume, the driver
++                                  checks whether this interval has elapsed since the last successful provider
++                                  call. If it has, the driver contacts the secret provider to fetch the latest
++                                  secret values and updates the mounted volume.
++                                  Setting this value below the kubelet syncFrequency (default: 1 minute)
++                                  has no additional effect on the actual rotation cadence.
+                                   Must be at least 1 second and no more than 31560000 seconds (~1 year).
+                                   When omitted, this means no opinion and the platform is left to choose a
+                                   reasonable default, which is subject to change over time.
+diff --git a/payload-manifests/crds/0000_50_csi-driver_01_clustercsidrivers-Default.crd.yaml b/payload-manifests/crds/0000_50_csi-driver_01_clustercsidrivers-Default.crd.yaml
+index 56859fc15a4..2ea91955ba9 100644
+--- a/payload-manifests/crds/0000_50_csi-driver_01_clustercsidrivers-Default.crd.yaml
++++ b/payload-manifests/crds/0000_50_csi-driver_01_clustercsidrivers-Default.crd.yaml
+@@ -278,11 +278,15 @@ spec:
+                               Only valid when type is "Custom".
+                             minProperties: 1
+                             properties:
+-                              rotationPollIntervalSeconds:
++                              minimumRefreshAge:
+                                 description: |-
+-                                  rotationPollIntervalSeconds is the minimum time in seconds between secret
+-                                  rotation attempts. The driver skips provider calls if less than this interval
+-                                  has elapsed since the last successful rotation.
++                                  minimumRefreshAge is the minimum time in seconds between secret
++                                  rotation attempts. Each time kubelet calls NodePublishVolume, the driver
++                                  checks whether this interval has elapsed since the last successful provider
++                                  call. If it has, the driver contacts the secret provider to fetch the latest
++                                  secret values and updates the mounted volume.
++                                  Setting this value below the kubelet syncFrequency (default: 1 minute)
++                                  has no additional effect on the actual rotation cadence.
+                                   Must be at least 1 second and no more than 31560000 seconds (~1 year).
+                                   When omitted, this means no opinion and the platform is left to choose a
+                                   reasonable default, which is subject to change over time.
+diff --git a/payload-manifests/crds/0000_50_csi-driver_01_clustercsidrivers-DevPreviewNoUpgrade.crd.yaml b/payload-manifests/crds/0000_50_csi-driver_01_clustercsidrivers-DevPreviewNoUpgrade.crd.yaml
+index f2be3b2eebc..d30ab1abe92 100644
+--- a/payload-manifests/crds/0000_50_csi-driver_01_clustercsidrivers-DevPreviewNoUpgrade.crd.yaml
++++ b/payload-manifests/crds/0000_50_csi-driver_01_clustercsidrivers-DevPreviewNoUpgrade.crd.yaml
+@@ -278,11 +278,15 @@ spec:
+                               Only valid when type is "Custom".
+                             minProperties: 1
+                             properties:
+-                              rotationPollIntervalSeconds:
++                              minimumRefreshAge:
+                                 description: |-
+-                                  rotationPollIntervalSeconds is the minimum time in seconds between secret
+-                                  rotation attempts. The driver skips provider calls if less than this interval
+-                                  has elapsed since the last successful rotation.
++                                  minimumRefreshAge is the minimum time in seconds between secret
++                                  rotation attempts. Each time kubelet calls NodePublishVolume, the driver
++                                  checks whether this interval has elapsed since the last successful provider
++                                  call. If it has, the driver contacts the secret provider to fetch the latest
++                                  secret values and updates the mounted volume.
++                                  Setting this value below the kubelet syncFrequency (default: 1 minute)
++                                  has no additional effect on the actual rotation cadence.
+                                   Must be at least 1 second and no more than 31560000 seconds (~1 year).
+                                   When omitted, this means no opinion and the platform is left to choose a
+                                   reasonable default, which is subject to change over time.
+diff --git a/payload-manifests/crds/0000_50_csi-driver_01_clustercsidrivers-OKD.crd.yaml b/payload-manifests/crds/0000_50_csi-driver_01_clustercsidrivers-OKD.crd.yaml
+index de5190a522f..118bcd135df 100644
+--- a/payload-manifests/crds/0000_50_csi-driver_01_clustercsidrivers-OKD.crd.yaml
++++ b/payload-manifests/crds/0000_50_csi-driver_01_clustercsidrivers-OKD.crd.yaml
+@@ -278,11 +278,15 @@ spec:
+                               Only valid when type is "Custom".
+                             minProperties: 1
+                             properties:
+-                              rotationPollIntervalSeconds:
++                              minimumRefreshAge:
+                                 description: |-
+-                                  rotationPollIntervalSeconds is the minimum time in seconds between secret
+-                                  rotation attempts. The driver skips provider calls if less than this interval
+-                                  has elapsed since the last successful rotation.
++                                  minimumRefreshAge is the minimum time in seconds between secret
++                                  rotation attempts. Each time kubelet calls NodePublishVolume, the driver
++                                  checks whether this interval has elapsed since the last successful provider
++                                  call. If it has, the driver contacts the secret provider to fetch the latest
++                                  secret values and updates the mounted volume.
++                                  Setting this value below the kubelet syncFrequency (default: 1 minute)
++                                  has no additional effect on the actual rotation cadence.
+                                   Must be at least 1 second and no more than 31560000 seconds (~1 year).
+                                   When omitted, this means no opinion and the platform is left to choose a
+                                   reasonable default, which is subject to change over time.
+diff --git a/payload-manifests/crds/0000_50_csi-driver_01_clustercsidrivers-TechPreviewNoUpgrade.crd.yaml b/payload-manifests/crds/0000_50_csi-driver_01_clustercsidrivers-TechPreviewNoUpgrade.crd.yaml
+index 51ffcfd9741..bd6f1a14d85 100644
+--- a/payload-manifests/crds/0000_50_csi-driver_01_clustercsidrivers-TechPreviewNoUpgrade.crd.yaml
++++ b/payload-manifests/crds/0000_50_csi-driver_01_clustercsidrivers-TechPreviewNoUpgrade.crd.yaml
+@@ -278,11 +278,15 @@ spec:
+                               Only valid when type is "Custom".
+                             minProperties: 1
+                             properties:
+-                              rotationPollIntervalSeconds:
++                              minimumRefreshAge:
+                                 description: |-
+-                                  rotationPollIntervalSeconds is the minimum time in seconds between secret
+-                                  rotation attempts. The driver skips provider calls if less than this interval
+-                                  has elapsed since the last successful rotation.
++                                  minimumRefreshAge is the minimum time in seconds between secret
++                                  rotation attempts. Each time kubelet calls NodePublishVolume, the driver
++                                  checks whether this interval has elapsed since the last successful provider
++                                  call. If it has, the driver contacts the secret provider to fetch the latest
++                                  secret values and updates the mounted volume.
++                                  Setting this value below the kubelet syncFrequency (default: 1 minute)
++                                  has no additional effect on the actual rotation cadence.
+                                   Must be at least 1 second and no more than 31560000 seconds (~1 year).
+                                   When omitted, this means no opinion and the platform is left to choose a
+                                   reasonable default, which is subject to change over time.

@@ -1,0 +1,206 @@
+diff --git a/bindata/network/ovn-kubernetes/managed/ovnkube-node.yaml b/bindata/network/ovn-kubernetes/managed/ovnkube-node.yaml
+index f26e34709e..ef4d1df21a 100644
+--- a/bindata/network/ovn-kubernetes/managed/ovnkube-node.yaml
++++ b/bindata/network/ovn-kubernetes/managed/ovnkube-node.yaml
+@@ -535,11 +535,11 @@ spec:
+             cpu: 10m
+             memory: 600Mi
+             {{ if and (.MgmtPortResourceName) (or (eq .OVN_NODE_MODE "smart-nic") (eq .OVN_NODE_MODE "dpu-host")) }}
+-            {{ .MgmtPortResourceName }}: '1'
++            {{ .MgmtPortResourceName }}: '{{ .MgmtPortResourceCount }}'
+             {{ end }}
+           {{ if and (.MgmtPortResourceName) (or (eq .OVN_NODE_MODE "smart-nic") (eq .OVN_NODE_MODE "dpu-host")) }}
+           limits:
+-            {{ .MgmtPortResourceName }}: '1'
++            {{ .MgmtPortResourceName }}: '{{ .MgmtPortResourceCount }}'
+           {{ end }}
+         lifecycle:
+           preStop:
+diff --git a/bindata/network/ovn-kubernetes/self-hosted/ovnkube-node.yaml b/bindata/network/ovn-kubernetes/self-hosted/ovnkube-node.yaml
+index 18f52c983c..9043e96693 100644
+--- a/bindata/network/ovn-kubernetes/self-hosted/ovnkube-node.yaml
++++ b/bindata/network/ovn-kubernetes/self-hosted/ovnkube-node.yaml
+@@ -559,11 +559,11 @@ spec:
+             cpu: 10m
+             memory: 600Mi
+             {{ if and (.MgmtPortResourceName) (or (eq .OVN_NODE_MODE "smart-nic") (eq .OVN_NODE_MODE "dpu-host")) }}
+-            {{ .MgmtPortResourceName }}: '1'
++            {{ .MgmtPortResourceName }}: '{{ .MgmtPortResourceCount }}'
+             {{ end }}
+           {{ if and (.MgmtPortResourceName) (or (eq .OVN_NODE_MODE "smart-nic") (eq .OVN_NODE_MODE "dpu-host")) }}
+           limits:
+-            {{ .MgmtPortResourceName }}: '1'
++            {{ .MgmtPortResourceName }}: '{{ .MgmtPortResourceCount }}'
+           {{ end }}
+         lifecycle:
+           preStop:
+diff --git a/pkg/bootstrap/types.go b/pkg/bootstrap/types.go
+index 2df2153acc..881210aa1e 100644
+--- a/pkg/bootstrap/types.go
++++ b/pkg/bootstrap/types.go
+@@ -42,6 +42,7 @@ type OVNConfigBoostrapResult struct {
+ 	SmartNicModeNodes         []string
+ 	SmartNicModeValue         string
+ 	MgmtPortResourceName      string
++	MgmtPortResourceCount     int64
+ 	DpuNodeLeaseRenewInterval int
+ 	DpuNodeLeaseDuration      int
+ 	// ConfigOverrides contains the overrides for the OVN Kubernetes configuration
+diff --git a/pkg/network/ovn_kubernetes.go b/pkg/network/ovn_kubernetes.go
+index 3467c702a4..a96f6d1640 100644
+--- a/pkg/network/ovn_kubernetes.go
++++ b/pkg/network/ovn_kubernetes.go
+@@ -237,6 +237,7 @@ func renderOVNKubernetes(conf *operv1.NetworkSpec, bootstrapResult *bootstrap.Bo
+ 	data.Data["SmartNicModeLabel"] = bootstrapResult.OVN.OVNKubernetesConfig.SmartNicModeLabel
+ 	data.Data["SmartNicModeValue"] = bootstrapResult.OVN.OVNKubernetesConfig.SmartNicModeValue
+ 	data.Data["MgmtPortResourceName"] = bootstrapResult.OVN.OVNKubernetesConfig.MgmtPortResourceName
++	data.Data["MgmtPortResourceCount"] = strconv.FormatInt(bootstrapResult.OVN.OVNKubernetesConfig.MgmtPortResourceCount, 10)
+ 	data.Data["DpuNodeLeaseRenewInterval"] = strconv.Itoa(bootstrapResult.OVN.OVNKubernetesConfig.DpuNodeLeaseRenewInterval)
+ 	data.Data["DpuNodeLeaseDuration"] = strconv.Itoa(bootstrapResult.OVN.OVNKubernetesConfig.DpuNodeLeaseDuration)
+ 	data.Data["OVN_CONTROLLER_INACTIVITY_PROBE"] = os.Getenv("OVN_CONTROLLER_INACTIVITY_PROBE")
+@@ -1067,6 +1068,21 @@ func bootstrapOVNConfig(conf *operv1.Network, kubeClient cnoclient.Client, hc *h
+ 		mgmtPortresourceName, exists := cm.Data["mgmt-port-resource-name"]
+ 		if exists {
+ 			ovnConfigResult.MgmtPortResourceName = mgmtPortresourceName
++			ovnConfigResult.MgmtPortResourceCount = 1
++		}
++
++		mgmtPortResourceCount, exists := cm.Data["mgmt-port-resource-count"]
++		if exists && ovnConfigResult.MgmtPortResourceName == "" {
++			klog.Warningf("mgmt-port-resource-count is set but mgmt-port-resource-name is not; count will be ignored")
++		} else if exists {
++			count, err := strconv.ParseInt(mgmtPortResourceCount, 10, 64)
++			if err != nil {
++				return nil, fmt.Errorf("invalid mgmt-port-resource-count value %q: %w", mgmtPortResourceCount, err)
++			}
++			if count <= 0 {
++				return nil, fmt.Errorf("invalid mgmt-port-resource-count value %q: must be > 0", mgmtPortResourceCount)
++			}
++			ovnConfigResult.MgmtPortResourceCount = count
+ 		}
+ 
+ 		if val, exists := cm.Data["dpu-node-lease-renew-interval"]; exists {
+diff --git a/pkg/network/ovn_kubernetes_dpu_host_test.go b/pkg/network/ovn_kubernetes_dpu_host_test.go
+index dc2fac195c..484fe2c186 100644
+--- a/pkg/network/ovn_kubernetes_dpu_host_test.go
++++ b/pkg/network/ovn_kubernetes_dpu_host_test.go
+@@ -447,3 +447,119 @@ func TestOVNKubernetesNodeSelectorOperator(t *testing.T) {
+ 		}
+ 	}
+ }
++
++func TestDpuHostModeResourceCount(t *testing.T) {
++	templates := []struct {
++		name         string
++		templatePath string
++	}{
++		{
++			name:         "managed",
++			templatePath: "../../bindata/network/ovn-kubernetes/managed/ovnkube-node.yaml",
++		},
++		{
++			name:         "self-hosted",
++			templatePath: "../../bindata/network/ovn-kubernetes/self-hosted/ovnkube-node.yaml",
++		},
++	}
++
++	tests := []struct {
++		name                  string
++		ovnNodeMode           string
++		mgmtPortResourceName  string
++		mgmtPortResourceCount string
++		expectResource        bool
++		expectedCount         string
++	}{
++		{
++			name:                  "dpu-host with resource count 8",
++			ovnNodeMode:           "dpu-host",
++			mgmtPortResourceName:  "openshift.io/mgmtvf",
++			mgmtPortResourceCount: "8",
++			expectResource:        true,
++			expectedCount:         "8",
++		},
++		{
++			name:                  "dpu-host with resource count 16",
++			ovnNodeMode:           "dpu-host",
++			mgmtPortResourceName:  "openshift.io/mgmtvf",
++			mgmtPortResourceCount: "16",
++			expectResource:        true,
++			expectedCount:         "16",
++		},
++		{
++			name:                  "dpu-host without resource name",
++			ovnNodeMode:           "dpu-host",
++			mgmtPortResourceName:  "",
++			mgmtPortResourceCount: "0",
++			expectResource:        false,
++		},
++		{
++			name:                  "smart-nic with resource - should use configured count",
++			ovnNodeMode:           "smart-nic",
++			mgmtPortResourceName:  "openshift.io/mgmtvf",
++			mgmtPortResourceCount: "8",
++			expectResource:        true,
++			expectedCount:         "8",
++		},
++		{
++			name:                  "full mode - no resource set",
++			ovnNodeMode:           "full",
++			mgmtPortResourceName:  "openshift.io/mgmtvf",
++			mgmtPortResourceCount: "8",
++			expectResource:        false,
++		},
++	}
++
++	for _, template := range templates {
++		for _, tc := range tests {
++			testName := template.name + "_" + tc.name
++			t.Run(testName, func(t *testing.T) {
++				g := NewGomegaWithT(t)
++
++				data := createTestRenderData(tc.ovnNodeMode)
++				data.Data["MgmtPortResourceName"] = tc.mgmtPortResourceName
++				data.Data["MgmtPortResourceCount"] = tc.mgmtPortResourceCount
++
++				objs, err := render.RenderTemplate(template.templatePath, &data)
++				g.Expect(err).NotTo(HaveOccurred())
++				g.Expect(objs).To(HaveLen(1))
++
++				yamlBytes, err := yaml.Marshal(objs[0])
++				g.Expect(err).NotTo(HaveOccurred())
++
++				ds := &appsv1.DaemonSet{}
++				err = yaml.Unmarshal(yamlBytes, ds)
++				g.Expect(err).NotTo(HaveOccurred())
++
++				// Find the ovnkube-controller container
++				var ovnkubeController *corev1.Container
++				for i := range ds.Spec.Template.Spec.Containers {
++					if ds.Spec.Template.Spec.Containers[i].Name == "ovnkube-controller" {
++						ovnkubeController = &ds.Spec.Template.Spec.Containers[i]
++						break
++					}
++				}
++				g.Expect(ovnkubeController).NotTo(BeNil(), "ovnkube-controller container should exist")
++
++				resourceName := corev1.ResourceName(tc.mgmtPortResourceName)
++				if tc.expectResource {
++					reqQty, found := ovnkubeController.Resources.Requests[resourceName]
++					g.Expect(found).To(BeTrue(), "resource request should be set")
++					g.Expect(reqQty.String()).To(Equal(tc.expectedCount))
++
++					limQty, found := ovnkubeController.Resources.Limits[resourceName]
++					g.Expect(found).To(BeTrue(), "resource limit should be set")
++					g.Expect(limQty.String()).To(Equal(tc.expectedCount))
++				} else {
++					if tc.mgmtPortResourceName != "" {
++						_, found := ovnkubeController.Resources.Requests[resourceName]
++						g.Expect(found).To(BeFalse(), "resource request should not be set")
++						_, found = ovnkubeController.Resources.Limits[resourceName]
++						g.Expect(found).To(BeFalse(), "resource limit should not be set")
++					}
++				}
++			})
++		}
++	}
++}

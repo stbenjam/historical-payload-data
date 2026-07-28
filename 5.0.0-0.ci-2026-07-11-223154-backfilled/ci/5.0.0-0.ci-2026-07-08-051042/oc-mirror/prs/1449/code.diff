@@ -1,0 +1,401 @@
+diff --git a/tests/integration/helpers_test.go b/tests/integration/helpers_test.go
+index cf2c0df5f..f7c2f24fc 100644
+--- a/tests/integration/helpers_test.go
++++ b/tests/integration/helpers_test.go
+@@ -243,7 +243,117 @@ func expectRepositoriesExist(registry registry.Registry, expected []string) {
+ 	}
+ }
+ 
+-// expectEmptyRegistry verifies that no non-catalog repos have tags remaining after a delete operation.
++// expectNoSignaturesInRegistry verifies that no .sig tags exist in the registry.
++func expectNoSignaturesInRegistry(reg registry.Registry) {
++	repos, err := reg.ListRepositories(ctx)
++	Expect(err).NotTo(HaveOccurred())
++
++	for _, repo := range repos {
++		tags, err := reg.ListTags(ctx, repo)
++		Expect(err).NotTo(HaveOccurred())
++		for _, tag := range tags {
++			Expect(tag).NotTo(HaveSuffix(".sig"),
++				"repo %q has unexpected signature tag %q when --remove-signatures=true", repo, tag)
++		}
++	}
++}
++
++// expectNonCatalogSignaturesDeleted verifies that after delete with --delete-signatures,
++// no .sig tags remain in repos that don't contain a catalog image.
++// Catalog signatures are never deleted by design.
++func expectNonCatalogSignaturesDeleted(reg registry.Registry) {
++	repos, err := reg.ListRepositories(ctx)
++	Expect(err).NotTo(HaveOccurred())
++
++	for _, repo := range repos {
++		tags, err := reg.ListTags(ctx, repo)
++		Expect(err).NotTo(HaveOccurred())
++
++		hasCatalog := false
++		hasSigTag := false
++		for _, tag := range tags {
++			if strings.HasSuffix(tag, ".sig") {
++				hasSigTag = true
++				continue
++			}
++			if !hasCatalog {
++				isCatalog, err := reg.IsCatalog(ctx, repo, tag)
++				Expect(err).NotTo(HaveOccurred())
++				hasCatalog = isCatalog
++			}
++		}
++
++		if hasSigTag {
++			Expect(hasCatalog).To(BeTrue(),
++				"repo %q has .sig tags remaining but contains no catalog image", repo)
++		}
++	}
++}
++
++// expectSignaturesInRegistry verifies that every non-catalog image in the registry
++// has a corresponding .sig tag.
++func expectSignaturesInRegistry(reg registry.Registry) {
++	repos, err := reg.ListRepositories(ctx)
++	Expect(err).NotTo(HaveOccurred())
++
++	sigCount := 0
++	for _, repo := range repos {
++		tags, err := reg.ListTags(ctx, repo)
++		Expect(err).NotTo(HaveOccurred())
++
++		tagSet := make(map[string]struct{})
++		for _, t := range tags {
++			tagSet[t] = struct{}{}
++		}
++
++		for _, tag := range tags {
++			if strings.HasSuffix(tag, ".sig") {
++				continue
++			}
++
++			ref, err := name.NewTag(fmt.Sprintf("%s/%s:%s", reg.Endpoint(), repo, tag), name.Insecure)
++			Expect(err).NotTo(HaveOccurred())
++
++			desc, err := remote.Get(ref, remote.WithAuth(authn.Anonymous), remote.WithContext(ctx))
++			Expect(err).NotTo(HaveOccurred())
++
++			sigTag := strings.Replace(desc.Digest.String(), ":", "-", 1) + ".sig"
++			_, hasSig := tagSet[sigTag]
++			Expect(hasSig).To(BeTrue(),
++				"image %s/%s:%s (digest %s) has no signature tag %s", reg.Endpoint(), repo, tag, desc.Digest, sigTag)
++			sigCount++
++		}
++	}
++	Expect(sigCount).To(BeNumerically(">", 0), "no images with signatures found in registry")
++}
++
++// expectOnlySignatureTagsRemain verifies that after a delete without --delete-signatures,
++// non-catalog repos only have .sig tags remaining, and at least one .sig tag exists.
++func expectOnlySignatureTagsRemain(reg registry.Registry) {
++	repos, err := reg.ListRepositories(ctx)
++	Expect(err).NotTo(HaveOccurred())
++
++	foundSigTag := false
++	for _, repo := range repos {
++		tags, err := reg.ListTags(ctx, repo)
++		Expect(err).NotTo(HaveOccurred())
++		if len(tags) == 0 {
++			continue
++		}
++		for _, tag := range tags {
++			if strings.HasSuffix(tag, ".sig") {
++				foundSigTag = true
++				continue
++			}
++			isCatalog, err := reg.IsCatalog(ctx, repo, tag)
++			Expect(err).NotTo(HaveOccurred())
++			Expect(isCatalog).To(BeTrue(),
++				"non-catalog repo %q has non-signature tag %q after delete", repo, tag)
++		}
++	}
++	Expect(foundSigTag).To(BeTrue(), "expected at least one .sig tag to remain after delete")
++}
++
+ func expectEmptyRegistry(reg registry.Registry) {
+ 	repos, err := reg.ListRepositories(ctx)
+ 	Expect(err).NotTo(HaveOccurred())
+@@ -408,7 +518,7 @@ func setupWorkDir() string {
+ 
+ 	var sigFiles []string
+ 	for _, entry := range entries {
+-		if !entry.IsDir() && entry.Name() != releasePublicKeyFile {
++		if !entry.IsDir() && entry.Name() != releasePublicKeyFile && !strings.HasPrefix(entry.Name(), "cosign") {
+ 			sigFiles = append(sigFiles, entry.Name())
+ 		}
+ 	}
+diff --git a/tests/integration/image-builders/generate-cosign-keys.sh b/tests/integration/image-builders/generate-cosign-keys.sh
+new file mode 100755
+index 000000000..7f53b7bb6
+--- /dev/null
++++ b/tests/integration/image-builders/generate-cosign-keys.sh
+@@ -0,0 +1,20 @@
++#!/usr/bin/env bash
++set -euo pipefail
++
++command -v cosign >/dev/null || {
++	echo "cosign is required" >&2
++	exit 1
++}
++
++KEYS_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/../testdata/keys" && pwd)"
++
++if [[ -f "${KEYS_DIR}/cosign.key" && -f "${KEYS_DIR}/cosign.pub" ]]; then
++	echo "Cosign keys already exist in ${KEYS_DIR}/"
++	echo "Delete them first if you want to regenerate."
++	exit 0
++fi
++
++COSIGN_PASSWORD="" cosign generate-key-pair --output-key-prefix="${KEYS_DIR}/cosign"
++
++echo "Wrote ${KEYS_DIR}/cosign.key"
++echo "Wrote ${KEYS_DIR}/cosign.pub"
+diff --git a/tests/integration/image-builders/operator/Makefile b/tests/integration/image-builders/operator/Makefile
+index 7a91b2bd2..1be277138 100644
+--- a/tests/integration/image-builders/operator/Makefile
++++ b/tests/integration/image-builders/operator/Makefile
+@@ -1,6 +1,7 @@
+ REGISTRY ?= quay.io/oc-mirror/oc-mirror-dev
+ RUNTIME ?= podman
+ OUTPUT = _output
++COSIGN_KEY ?= ../../testdata/keys/cosign.key
+ 
+ CATALOGDIRS := $(foreach DIR,$(shell find catalogs -maxdepth 1 -mindepth 1 -type d),$(subst catalogs/,,$(DIR)))
+ CATALOG_TARGETS := $(addprefix build-catalog.,$(CATALOGDIRS))
+@@ -46,6 +47,32 @@ $(CATALOG_PUSH_TARGETS): push-catalog.%:
+ 	$(RUNTIME) push --format=docker "$(REGISTRY):$*"
+ .PHONY: push-catalogs
+ 
++sign: sign-bundles sign-related sign-catalogs
++.PHONY: sign
++
++sign-bundles:
++	@for dir in bundles/*/*-bundle-v*/; do \
++		tag=$$(basename "$$dir"); \
++		echo "Signing bundle $$tag"; \
++		COSIGN_PASSWORD="" cosign sign --key $(COSIGN_KEY) --tlog-upload=false "$(REGISTRY):$$tag"; \
++	done
++.PHONY: sign-bundles
++
++sign-related:
++	@for dir in bundles/*/*-bundle-v*/; do \
++		bundle_tag=$$(basename "$$dir"); \
++		tag=$$(echo "$$bundle_tag" | sed 's/-bundle//'); \
++		echo "Signing related image $$tag"; \
++		COSIGN_PASSWORD="" cosign sign --key $(COSIGN_KEY) --tlog-upload=false "$(REGISTRY):$$tag"; \
++	done
++.PHONY: sign-related
++
++sign-catalogs: $(addprefix sign-catalog.,$(CATALOGDIRS))
++$(addprefix sign-catalog.,$(CATALOGDIRS)): sign-catalog.%:
++	@echo "Signing catalog $*"
++	COSIGN_PASSWORD="" cosign sign --key $(COSIGN_KEY) --tlog-upload=false "$(REGISTRY):$*"
++.PHONY: sign-catalogs
++
+ clean:
+ 	rm -rf $(OUTPUT)
+ .PHONY: clean
+diff --git a/tests/integration/image-builders/release/Makefile b/tests/integration/image-builders/release/Makefile
+index c507c7d41..3460fb238 100755
+--- a/tests/integration/image-builders/release/Makefile
++++ b/tests/integration/image-builders/release/Makefile
+@@ -1,8 +1,10 @@
+-.PHONY: all test build clean
++.PHONY: all build clean
+ 
+-all: clean test build
++COSIGN_KEY ?= ../../testdata/keys/cosign.key
+ 
+-build: 
++all: clean build
++
++build:
+ 	mkdir -p bin
+ 	go build -a -gcflags=all="-l -B -wb=false" -ldflags="-w -s" -o bin ./...
+ 
+@@ -18,3 +20,9 @@ digest:
+ 
+ push:
+ 	podman push quay.io/oc-mirror/release/test-image:v0.0.1 --authfile=$(AUTHFILE)
++
++sign:
++	COSIGN_PASSWORD="" cosign sign --key $(COSIGN_KEY) --tlog-upload=false quay.io/oc-mirror/release/test-image:v0.0.1
++	COSIGN_PASSWORD="" cosign sign --key $(COSIGN_KEY) --tlog-upload=false quay.io/oc-mirror/release/test-release-index:v0.0.1
++.PHONY: sign
++
+diff --git a/tests/integration/image-builders/release/create-release.sh b/tests/integration/image-builders/release/create-release.sh
+index b2a25ab82..e22512103 100755
+--- a/tests/integration/image-builders/release/create-release.sh
++++ b/tests/integration/image-builders/release/create-release.sh
+@@ -48,4 +48,3 @@ rm -rf ../config/tmp_index.json ../config/final_index.json
+ cd ../../
+ rm -rf artifacts/staging/*
+ 
+-
+diff --git a/tests/integration/m2d_d2m_test.go b/tests/integration/m2d_d2m_test.go
+index 17ca49d7d..c449fce48 100644
+--- a/tests/integration/m2d_d2m_test.go
++++ b/tests/integration/m2d_d2m_test.go
+@@ -61,4 +61,5 @@ var _ = Describe("mirrorToDisk + diskToMirror", func() {
+ 			expectEmptyRegistry(*testRegistry)
+ 		})
+ 	})
++
+ })
+diff --git a/tests/integration/signature_test.go b/tests/integration/signature_test.go
+new file mode 100644
+index 000000000..0dcc5bee8
+--- /dev/null
++++ b/tests/integration/signature_test.go
+@@ -0,0 +1,89 @@
++package integration_test
++
++import (
++	"path/filepath"
++
++	. "github.com/onsi/ginkgo/v2"
++)
++
++var _ = Describe("signatures", func() {
++	var workDir string
++
++	iscSignatures := filepath.Join("signatures", "isc-signatures.yaml")
++	discSignatures := filepath.Join("signatures", "disc-signatures.yaml")
++
++	BeforeEach(func() {
++		workDir = setupWorkDir()
++	})
++
++	AfterEach(func() {
++		cleanupWorkDir(workDir)
++	})
++
++	It("should not mirror signatures when using --remove-signatures=true", func() {
++		By("running mirrorToDisk with --remove-signatures=true")
++		result, err := runner.MirrorToDisk(ctx, filepath.Join(iscDir, iscSignatures), workDir, "--remove-signatures=true")
++		expectOcMirrorCommandSuccess(result, err)
++
++		By("running diskToMirror with --remove-signatures=true")
++		result, err = runner.DiskToMirror(ctx, filepath.Join(iscDir, iscSignatures), workDir, testRegistry.Endpoint(),
++			"--remove-signatures=true", "--dest-tls-verify=false")
++		expectOcMirrorCommandSuccess(result, err)
++
++		By("verifying no signatures are present in the local registry")
++		expectNoSignaturesInRegistry(*testRegistry)
++	})
++
++	It("should mirror with signatures preserved and delete them", func() {
++		deleteYaml := filepath.Join(workDir, "working-dir", "delete", "delete-images.yaml")
++
++		By("running mirrorToDisk")
++		result, err := runner.MirrorToDisk(ctx, filepath.Join(iscDir, iscSignatures), workDir)
++		expectOcMirrorCommandSuccess(result, err)
++
++		By("running diskToMirror")
++		result, err = runner.DiskToMirror(ctx, filepath.Join(iscDir, iscSignatures), workDir, testRegistry.Endpoint(), "--dest-tls-verify=false")
++		expectOcMirrorCommandSuccess(result, err)
++
++		By("verifying signatures are present in the local registry")
++		expectSignaturesInRegistry(*testRegistry)
++
++		By("running delete with --delete-signatures")
++		result, err = runner.DeletePhaseOne(ctx, filepath.Join(iscDir, discSignatures), workDir, "", testRegistry.Endpoint(),
++			"--delete-signatures")
++		expectOcMirrorCommandSuccess(result, err)
++
++		result, err = runner.DeletePhaseTwo(ctx, deleteYaml, testRegistry.Endpoint(),
++			"--dest-tls-verify=false")
++		expectOcMirrorCommandSuccess(result, err)
++
++		By("verifying non-catalog signatures are deleted")
++		expectNonCatalogSignaturesDeleted(*testRegistry)
++	})
++
++	It("should keep signature tags when delete does not use --delete-signatures", func() {
++		deleteYaml := filepath.Join(workDir, "working-dir", "delete", "delete-images.yaml")
++
++		By("running mirrorToDisk")
++		result, err := runner.MirrorToDisk(ctx, filepath.Join(iscDir, iscSignatures), workDir)
++		expectOcMirrorCommandSuccess(result, err)
++
++		By("running diskToMirror")
++		result, err = runner.DiskToMirror(ctx, filepath.Join(iscDir, iscSignatures), workDir, testRegistry.Endpoint(), "--dest-tls-verify=false")
++		expectOcMirrorCommandSuccess(result, err)
++
++		By("verifying signatures are present in the local registry")
++		expectSignaturesInRegistry(*testRegistry)
++
++		By("running delete without --delete-signatures")
++		result, err = runner.DeletePhaseOne(ctx, filepath.Join(iscDir, discSignatures), workDir, "", testRegistry.Endpoint())
++		expectOcMirrorCommandSuccess(result, err)
++
++		result, err = runner.DeletePhaseTwo(ctx, deleteYaml, testRegistry.Endpoint(),
++			"--dest-tls-verify=false")
++		expectOcMirrorCommandSuccess(result, err)
++
++		By("verifying signature tags are still present")
++		expectOnlySignatureTagsRemain(*testRegistry)
++	})
++})
+diff --git a/tests/integration/testdata/imagesetconfigs/signatures/disc-signatures.yaml b/tests/integration/testdata/imagesetconfigs/signatures/disc-signatures.yaml
+new file mode 100644
+index 000000000..466d99724
+--- /dev/null
++++ b/tests/integration/testdata/imagesetconfigs/signatures/disc-signatures.yaml
+@@ -0,0 +1,8 @@
++kind: DeleteImageSetConfiguration
++apiVersion: mirror.openshift.io/v2alpha1
++delete:
++  platform:
++    graph: false
++    release: quay.io/oc-mirror/release/test-release-index:v0.0.1
++  operators:
++  - catalog: quay.io/oc-mirror/oc-mirror-dev:test-catalog-latest
+diff --git a/tests/integration/testdata/imagesetconfigs/signatures/isc-signatures.yaml b/tests/integration/testdata/imagesetconfigs/signatures/isc-signatures.yaml
+new file mode 100644
+index 000000000..15420a9ac
+--- /dev/null
++++ b/tests/integration/testdata/imagesetconfigs/signatures/isc-signatures.yaml
+@@ -0,0 +1,9 @@
++kind: ImageSetConfiguration
++apiVersion: mirror.openshift.io/v2alpha1
++mirror:
++  platform:
++    graph: false
++    release: quay.io/oc-mirror/release/test-release-index:v0.0.1
++  operators:
++  - catalog: quay.io/oc-mirror/oc-mirror-dev:test-catalog-latest
++    full: true
+diff --git a/tests/integration/testdata/keys/cosign.key b/tests/integration/testdata/keys/cosign.key
+new file mode 100644
+index 000000000..8b9eebadc
+--- /dev/null
++++ b/tests/integration/testdata/keys/cosign.key
+@@ -0,0 +1,11 @@
++-----BEGIN ENCRYPTED SIGSTORE PRIVATE KEY-----
++eyJrZGYiOnsibmFtZSI6InNjcnlwdCIsInBhcmFtcyI6eyJOIjo2NTUzNiwiciI6
++OCwicCI6MX0sInNhbHQiOiI0RFNIdklzcHQ4U05oTkFQZStRdkxPWG9HdEVOU1RC
++bXhiVUN5V3V6cUdrPSJ9LCJjaXBoZXIiOnsibmFtZSI6Im5hY2wvc2VjcmV0Ym94
++Iiwibm9uY2UiOiJEcjdlSEo4ZVM0UzR4WVdyd0E0N3Y3bTZlS3huMzd0eiJ9LCJj
++aXBoZXJ0ZXh0IjoiNXBIcVduL1VKNnk0UE96d0NvVHYxK1N0NUJuUyt0MnliazdY
++V1Y5K05nQmRXa3JlRGd2TFUwdEluZHl3SmV1QU85bjM4QzdGZmZ6R3FEdld3SlZB
++aEpBU29IZkM3bkh4RTNNNlhyUmZwaVdqWVBZOXV0Y0JDNC9yYUpMSkszUVdvOU40
++d0JZVXMxakhPQUQ0THBDUldYcjBPMk11LzMrWUNPOVUrZnlrQit1Y2V1SEhXRmZ5
++ZDNOdHo3cG1udzN2ZmY0WFlDUnZ1Y1N2S2c9PSJ9
++-----END ENCRYPTED SIGSTORE PRIVATE KEY-----
+diff --git a/tests/integration/testdata/keys/cosign.pub b/tests/integration/testdata/keys/cosign.pub
+new file mode 100644
+index 000000000..f8134a46a
+--- /dev/null
++++ b/tests/integration/testdata/keys/cosign.pub
+@@ -0,0 +1,4 @@
++-----BEGIN PUBLIC KEY-----
++MFkwEwYHKoZIzj0CAQYIKoZIzj0DAQcDQgAEhkswIisjGmHmup3k/5z2uOIj1c6M
++dBznjpVeNvIIP5yU2xY0JgprisFEJ81ru0ODVQjXPQrtjtT9F+opyVj6cA==
++-----END PUBLIC KEY-----
