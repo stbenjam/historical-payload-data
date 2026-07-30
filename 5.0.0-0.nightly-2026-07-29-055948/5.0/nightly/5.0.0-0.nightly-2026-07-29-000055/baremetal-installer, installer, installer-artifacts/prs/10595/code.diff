@@ -1,0 +1,645 @@
+diff --git a/cmd/openshift-install/agent.go b/cmd/openshift-install/agent.go
+index fb19102dd2b..4fafb90e1f1 100644
+--- a/cmd/openshift-install/agent.go
++++ b/cmd/openshift-install/agent.go
+@@ -57,6 +57,7 @@ var (
+ 			&manifests.AgentManifests{},
+ 			&mirror.RegistriesConf{},
+ 			&mirror.CaBundle{},
++			&tls.SignerKeyParams{},
+ 		},
+ 	}
+ 
+diff --git a/pkg/asset/ignition/machine/arbiter_ignition_customizations_test.go b/pkg/asset/ignition/machine/arbiter_ignition_customizations_test.go
+index bf6b280849c..f54acdb0377 100644
+--- a/pkg/asset/ignition/machine/arbiter_ignition_customizations_test.go
++++ b/pkg/asset/ignition/machine/arbiter_ignition_customizations_test.go
+@@ -85,8 +85,10 @@ func TestArbiterIgnitionCustomizationsGenerate(t *testing.T) {
+ 
+ 	for _, tc := range cases {
+ 		t.Run(tc.name, func(t *testing.T) {
++			rootCAParents := asset.Parents{}
++			rootCAParents.Add(&tls.SignerKeyParams{})
+ 			rootCA := &tls.RootCA{}
+-			err := rootCA.Generate(context.Background(), nil)
++			err := rootCA.Generate(context.Background(), rootCAParents)
+ 			assert.NoError(t, err, "unexpected error generating root CA")
+ 
+ 			parents := asset.Parents{}
+diff --git a/pkg/asset/ignition/machine/arbiter_test.go b/pkg/asset/ignition/machine/arbiter_test.go
+index e69206905ec..06a75dce114 100644
+--- a/pkg/asset/ignition/machine/arbiter_test.go
++++ b/pkg/asset/ignition/machine/arbiter_test.go
+@@ -70,8 +70,10 @@ func TestArbiterGenerate(t *testing.T) {
+ 	}
+ 	for _, tc := range testCases {
+ 		t.Run(tc.description, func(t *testing.T) {
++			rootCAParents := asset.Parents{}
++			rootCAParents.Add(&tls.SignerKeyParams{})
+ 			rootCA := &tls.RootCA{}
+-			err := rootCA.Generate(context.Background(), nil)
++			err := rootCA.Generate(context.Background(), rootCAParents)
+ 			assert.NoError(t, err, "unexpected error generating root CA")
+ 
+ 			parents := asset.Parents{}
+diff --git a/pkg/asset/ignition/machine/master_ignition_customizations_test.go b/pkg/asset/ignition/machine/master_ignition_customizations_test.go
+index 5a7b1deb90c..52dc12bb8fe 100644
+--- a/pkg/asset/ignition/machine/master_ignition_customizations_test.go
++++ b/pkg/asset/ignition/machine/master_ignition_customizations_test.go
+@@ -48,8 +48,10 @@ func TestMasterIgnitionCustomizationsGenerate(t *testing.T) {
+ 					},
+ 				})
+ 
++			rootCAParents := asset.Parents{}
++			rootCAParents.Add(&tls.SignerKeyParams{})
+ 			rootCA := &tls.RootCA{}
+-			err := rootCA.Generate(context.Background(), nil)
++			err := rootCA.Generate(context.Background(), rootCAParents)
+ 			assert.NoError(t, err, "unexpected error generating root CA")
+ 
+ 			parents := asset.Parents{}
+diff --git a/pkg/asset/ignition/machine/master_test.go b/pkg/asset/ignition/machine/master_test.go
+index 23b801a1656..7672b19d39e 100644
+--- a/pkg/asset/ignition/machine/master_test.go
++++ b/pkg/asset/ignition/machine/master_test.go
+@@ -38,8 +38,10 @@ func TestMasterGenerate(t *testing.T) {
+ 			},
+ 		})
+ 
++	rootCAParents := asset.Parents{}
++	rootCAParents.Add(&tls.SignerKeyParams{})
+ 	rootCA := &tls.RootCA{}
+-	err := rootCA.Generate(context.Background(), nil)
++	err := rootCA.Generate(context.Background(), rootCAParents)
+ 	assert.NoError(t, err, "unexpected error generating root CA")
+ 
+ 	parents := asset.Parents{}
+diff --git a/pkg/asset/ignition/machine/worker_ignition_customizations_test.go b/pkg/asset/ignition/machine/worker_ignition_customizations_test.go
+index 149fe520e26..c0230e14904 100644
+--- a/pkg/asset/ignition/machine/worker_ignition_customizations_test.go
++++ b/pkg/asset/ignition/machine/worker_ignition_customizations_test.go
+@@ -48,8 +48,10 @@ func TestWorkerIgnitionCustomizationsGenerate(t *testing.T) {
+ 					},
+ 				})
+ 
++			rootCAParents := asset.Parents{}
++			rootCAParents.Add(&tls.SignerKeyParams{})
+ 			rootCA := &tls.RootCA{}
+-			err := rootCA.Generate(context.Background(), nil)
++			err := rootCA.Generate(context.Background(), rootCAParents)
+ 			assert.NoError(t, err, "unexpected error generating root CA")
+ 
+ 			parents := asset.Parents{}
+diff --git a/pkg/asset/ignition/machine/worker_test.go b/pkg/asset/ignition/machine/worker_test.go
+index 54cad763e3d..edd71b4c631 100644
+--- a/pkg/asset/ignition/machine/worker_test.go
++++ b/pkg/asset/ignition/machine/worker_test.go
+@@ -28,8 +28,10 @@ func TestWorkerGenerate(t *testing.T) {
+ 			},
+ 		})
+ 
++	rootCAParents := asset.Parents{}
++	rootCAParents.Add(&tls.SignerKeyParams{})
+ 	rootCA := &tls.RootCA{}
+-	err := rootCA.Generate(context.Background(), nil)
++	err := rootCA.Generate(context.Background(), rootCAParents)
+ 	assert.NoError(t, err, "unexpected error generating root CA")
+ 
+ 	parents := asset.Parents{}
+diff --git a/pkg/asset/store/assetcreate_test.go b/pkg/asset/store/assetcreate_test.go
+index e1c5ead3384..e2343515997 100644
+--- a/pkg/asset/store/assetcreate_test.go
++++ b/pkg/asset/store/assetcreate_test.go
+@@ -126,6 +126,7 @@ func TestCreatedAssetsAreNotDirty(t *testing.T) {
+ 				"Kubeadmin Password":                     true, // read-only
+ 				"InternalReleaseImageTLSSecret":          true, // no files when NoRegistryClusterInstall feature gate is not set
+ 				"InternalReleaseImageRegistryAuthSecret": true, // no files when NoRegistryClusterInstall feature gate is not set
++				"Signer Key Parameters":                  true, // no on-disk files; persisted via state file only
+ 			}
+ 			for _, a := range tc.targets {
+ 				name := a.Name()
+diff --git a/pkg/asset/targets/targets.go b/pkg/asset/targets/targets.go
+index 15d685ca86e..056c5e9f5b1 100644
+--- a/pkg/asset/targets/targets.go
++++ b/pkg/asset/targets/targets.go
+@@ -33,6 +33,7 @@ var (
+ 		&manifests.Manifests{},
+ 		&manifests.Openshift{},
+ 		&clusterapi.Cluster{},
++		&tls.SignerKeyParams{},
+ 	}
+ 
+ 	// ManifestTemplates are the manifest-templates targeted assets.
+diff --git a/pkg/asset/tls/adminkubeconfig.go b/pkg/asset/tls/adminkubeconfig.go
+index 17bd5f6525e..85be095f89d 100644
+--- a/pkg/asset/tls/adminkubeconfig.go
++++ b/pkg/asset/tls/adminkubeconfig.go
+@@ -15,13 +15,20 @@ type AdminKubeConfigSignerCertKey struct {
+ 
+ var _ asset.WritableAsset = (*AdminKubeConfigSignerCertKey)(nil)
+ 
+-// Dependencies returns the dependency of the root-ca, which is empty.
++// Dependencies returns SignerKeyParams. Configurable PKI requires
++// reading the PKI config from InstallConfig, but adding InstallConfig
++// as a dependency here would break codepaths that generate signer certs
++// without an install-config on disk (e.g. agent create certificates,
++// node-joiner). SignerKeyParams reads the config directly from disk
++// without triggering InstallConfig validation.
+ func (c *AdminKubeConfigSignerCertKey) Dependencies() []asset.Asset {
+-	return []asset.Asset{}
++	return []asset.Asset{&SignerKeyParams{}}
+ }
+ 
+ // Generate generates the root-ca key and cert pair.
+ func (c *AdminKubeConfigSignerCertKey) Generate(ctx context.Context, parents asset.Parents) error {
++	signerKeyParams := &SignerKeyParams{}
++	parents.Get(signerKeyParams)
+ 	cfg := &CertCfg{
+ 		Subject: pkix.Name{CommonName: "admin-kubeconfig-signer", OrganizationalUnit: []string{"openshift"}},
+ 		// KeyUsages is set by GenerateSelfSignedCertificate based on the key algorithm.
+@@ -29,7 +36,7 @@ func (c *AdminKubeConfigSignerCertKey) Generate(ctx context.Context, parents ass
+ 		IsCA:     true,
+ 	}
+ 
+-	return c.SelfSignedCertKey.Generate(ctx, cfg, "admin-kubeconfig-signer", nil)
++	return c.SelfSignedCertKey.Generate(ctx, cfg, "admin-kubeconfig-signer", signerKeyParams.PKIConfig)
+ }
+ 
+ // Load reads the asset files from disk.
+diff --git a/pkg/asset/tls/aggregator.go b/pkg/asset/tls/aggregator.go
+index 082f23d7266..e4a91b197e4 100644
+--- a/pkg/asset/tls/aggregator.go
++++ b/pkg/asset/tls/aggregator.go
+@@ -7,6 +7,7 @@ import (
+ 
+ 	"github.com/openshift/installer/pkg/asset"
+ 	"github.com/openshift/installer/pkg/asset/installconfig"
++	pkidefaults "github.com/openshift/installer/pkg/types/pki"
+ )
+ 
+ // AggregatorCA is the asset that generates the aggregator-ca key/cert pair.
+@@ -38,7 +39,7 @@ func (a *AggregatorCA) Generate(ctx context.Context, dependencies asset.Parents)
+ 		IsCA:     true,
+ 	}
+ 
+-	return a.SelfSignedCertKey.Generate(ctx, cfg, "aggregator-ca", nil)
++	return a.SelfSignedCertKey.Generate(ctx, cfg, "aggregator-ca", pkidefaults.EffectiveSignerPKIConfig(installConfig.Config))
+ }
+ 
+ // Name returns the human-friendly name of the asset.
+@@ -108,7 +109,7 @@ func (c *AggregatorSignerCertKey) Generate(ctx context.Context, parents asset.Pa
+ 		IsCA:     true,
+ 	}
+ 
+-	return c.SelfSignedCertKey.Generate(ctx, cfg, "aggregator-signer", nil)
++	return c.SelfSignedCertKey.Generate(ctx, cfg, "aggregator-signer", pkidefaults.EffectiveSignerPKIConfig(installConfig.Config))
+ }
+ 
+ // Name returns the human-friendly name of the asset.
+diff --git a/pkg/asset/tls/apiserver.go b/pkg/asset/tls/apiserver.go
+index 9078514c0cb..59412e91ee7 100644
+--- a/pkg/asset/tls/apiserver.go
++++ b/pkg/asset/tls/apiserver.go
+@@ -10,6 +10,7 @@ import (
+ 
+ 	"github.com/openshift/installer/pkg/asset"
+ 	"github.com/openshift/installer/pkg/asset/installconfig"
++	pkidefaults "github.com/openshift/installer/pkg/types/pki"
+ )
+ 
+ // KubeAPIServerToKubeletSignerCertKey is a key/cert pair that signs the kube-apiserver to kubelet client certs.
+@@ -35,7 +36,7 @@ func (c *KubeAPIServerToKubeletSignerCertKey) Generate(ctx context.Context, pare
+ 		IsCA:     true,
+ 	}
+ 
+-	return c.SelfSignedCertKey.Generate(ctx, cfg, "kube-apiserver-to-kubelet-signer", nil)
++	return c.SelfSignedCertKey.Generate(ctx, cfg, "kube-apiserver-to-kubelet-signer", pkidefaults.EffectiveSignerPKIConfig(installConfig.Config))
+ }
+ 
+ // Name returns the human-friendly name of the asset.
+@@ -116,13 +117,20 @@ type KubeAPIServerLocalhostSignerCertKey struct {
+ 
+ var _ asset.WritableAsset = (*KubeAPIServerLocalhostSignerCertKey)(nil)
+ 
+-// Dependencies returns the dependency of the root-ca, which is empty.
++// Dependencies returns SignerKeyParams. Configurable PKI requires
++// reading the PKI config from InstallConfig, but adding InstallConfig
++// as a dependency here would break codepaths that generate signer certs
++// without an install-config on disk (e.g. agent create certificates,
++// node-joiner). SignerKeyParams reads the config directly from disk
++// without triggering InstallConfig validation.
+ func (c *KubeAPIServerLocalhostSignerCertKey) Dependencies() []asset.Asset {
+-	return []asset.Asset{}
++	return []asset.Asset{&SignerKeyParams{}}
+ }
+ 
+ // Generate generates the root-ca key and cert pair.
+ func (c *KubeAPIServerLocalhostSignerCertKey) Generate(ctx context.Context, parents asset.Parents) error {
++	signerKeyParams := &SignerKeyParams{}
++	parents.Get(signerKeyParams)
+ 	cfg := &CertCfg{
+ 		Subject: pkix.Name{CommonName: "kube-apiserver-localhost-signer", OrganizationalUnit: []string{"openshift"}},
+ 		// KeyUsages is set by GenerateSelfSignedCertificate based on the key algorithm.
+@@ -130,7 +138,7 @@ func (c *KubeAPIServerLocalhostSignerCertKey) Generate(ctx context.Context, pare
+ 		IsCA:     true,
+ 	}
+ 
+-	return c.SelfSignedCertKey.Generate(ctx, cfg, "kube-apiserver-localhost-signer", nil)
++	return c.SelfSignedCertKey.Generate(ctx, cfg, "kube-apiserver-localhost-signer", signerKeyParams.PKIConfig)
+ }
+ 
+ // Load reads the asset files from disk.
+@@ -220,13 +228,20 @@ type KubeAPIServerServiceNetworkSignerCertKey struct {
+ 
+ var _ asset.WritableAsset = (*KubeAPIServerServiceNetworkSignerCertKey)(nil)
+ 
+-// Dependencies returns the dependency of the root-ca, which is empty.
++// Dependencies returns SignerKeyParams. Configurable PKI requires
++// reading the PKI config from InstallConfig, but adding InstallConfig
++// as a dependency here would break codepaths that generate signer certs
++// without an install-config on disk (e.g. agent create certificates,
++// node-joiner). SignerKeyParams reads the config directly from disk
++// without triggering InstallConfig validation.
+ func (c *KubeAPIServerServiceNetworkSignerCertKey) Dependencies() []asset.Asset {
+-	return []asset.Asset{}
++	return []asset.Asset{&SignerKeyParams{}}
+ }
+ 
+ // Generate generates the root-ca key and cert pair.
+ func (c *KubeAPIServerServiceNetworkSignerCertKey) Generate(ctx context.Context, parents asset.Parents) error {
++	signerKeyParams := &SignerKeyParams{}
++	parents.Get(signerKeyParams)
+ 	cfg := &CertCfg{
+ 		Subject: pkix.Name{CommonName: "kube-apiserver-service-network-signer", OrganizationalUnit: []string{"openshift"}},
+ 		// KeyUsages is set by GenerateSelfSignedCertificate based on the key algorithm.
+@@ -234,7 +249,7 @@ func (c *KubeAPIServerServiceNetworkSignerCertKey) Generate(ctx context.Context,
+ 		IsCA:     true,
+ 	}
+ 
+-	return c.SelfSignedCertKey.Generate(ctx, cfg, "kube-apiserver-service-network-signer", nil)
++	return c.SelfSignedCertKey.Generate(ctx, cfg, "kube-apiserver-service-network-signer", signerKeyParams.PKIConfig)
+ }
+ 
+ // Load reads the asset files from disk.
+@@ -333,13 +348,20 @@ type KubeAPIServerLBSignerCertKey struct {
+ 
+ var _ asset.WritableAsset = (*KubeAPIServerLBSignerCertKey)(nil)
+ 
+-// Dependencies returns the dependency of the root-ca, which is empty.
++// Dependencies returns SignerKeyParams. Configurable PKI requires
++// reading the PKI config from InstallConfig, but adding InstallConfig
++// as a dependency here would break codepaths that generate signer certs
++// without an install-config on disk (e.g. agent create certificates,
++// node-joiner). SignerKeyParams reads the config directly from disk
++// without triggering InstallConfig validation.
+ func (c *KubeAPIServerLBSignerCertKey) Dependencies() []asset.Asset {
+-	return []asset.Asset{}
++	return []asset.Asset{&SignerKeyParams{}}
+ }
+ 
+ // Generate generates the root-ca key and cert pair.
+ func (c *KubeAPIServerLBSignerCertKey) Generate(ctx context.Context, parents asset.Parents) error {
++	signerKeyParams := &SignerKeyParams{}
++	parents.Get(signerKeyParams)
+ 	cfg := &CertCfg{
+ 		Subject: pkix.Name{CommonName: "kube-apiserver-lb-signer", OrganizationalUnit: []string{"openshift"}},
+ 		// KeyUsages is set by GenerateSelfSignedCertificate based on the key algorithm.
+@@ -347,7 +369,7 @@ func (c *KubeAPIServerLBSignerCertKey) Generate(ctx context.Context, parents ass
+ 		IsCA:     true,
+ 	}
+ 
+-	return c.SelfSignedCertKey.Generate(ctx, cfg, "kube-apiserver-lb-signer", nil)
++	return c.SelfSignedCertKey.Generate(ctx, cfg, "kube-apiserver-lb-signer", signerKeyParams.PKIConfig)
+ }
+ 
+ // Load reads the asset files from disk.
+diff --git a/pkg/asset/tls/kubecontrolplane.go b/pkg/asset/tls/kubecontrolplane.go
+index 5834ffdb83d..d393774fb20 100644
+--- a/pkg/asset/tls/kubecontrolplane.go
++++ b/pkg/asset/tls/kubecontrolplane.go
+@@ -7,6 +7,7 @@ import (
+ 
+ 	"github.com/openshift/installer/pkg/asset"
+ 	"github.com/openshift/installer/pkg/asset/installconfig"
++	pkidefaults "github.com/openshift/installer/pkg/types/pki"
+ )
+ 
+ // KubeControlPlaneSignerCertKey is a key/cert pair that signs the kube control-plane client certs.
+@@ -32,7 +33,7 @@ func (c *KubeControlPlaneSignerCertKey) Generate(ctx context.Context, parents as
+ 		IsCA:     true,
+ 	}
+ 
+-	return c.SelfSignedCertKey.Generate(ctx, cfg, "kube-control-plane-signer", nil)
++	return c.SelfSignedCertKey.Generate(ctx, cfg, "kube-control-plane-signer", pkidefaults.EffectiveSignerPKIConfig(installConfig.Config))
+ }
+ 
+ // Name returns the human-friendly name of the asset.
+diff --git a/pkg/asset/tls/kubelet.go b/pkg/asset/tls/kubelet.go
+index acdcaec249e..a7cf404b379 100644
+--- a/pkg/asset/tls/kubelet.go
++++ b/pkg/asset/tls/kubelet.go
+@@ -7,6 +7,7 @@ import (
+ 
+ 	"github.com/openshift/installer/pkg/asset"
+ 	"github.com/openshift/installer/pkg/asset/installconfig"
++	pkidefaults "github.com/openshift/installer/pkg/types/pki"
+ )
+ 
+ // KubeletCSRSignerCertKey is a key/cert pair that signs the kubelet client certs.
+@@ -32,7 +33,7 @@ func (c *KubeletCSRSignerCertKey) Generate(ctx context.Context, parents asset.Pa
+ 		IsCA:     true,
+ 	}
+ 
+-	return c.SelfSignedCertKey.Generate(ctx, cfg, "kubelet-signer", nil)
++	return c.SelfSignedCertKey.Generate(ctx, cfg, "kubelet-signer", pkidefaults.EffectiveSignerPKIConfig(installConfig.Config))
+ }
+ 
+ // Name returns the human-friendly name of the asset.
+@@ -108,13 +109,20 @@ type KubeletBootstrapCertSigner struct {
+ 
+ var _ asset.WritableAsset = (*KubeletBootstrapCertSigner)(nil)
+ 
+-// Dependencies returns the dependency of the root-ca, which is empty.
++// Dependencies returns SignerKeyParams. Configurable PKI requires
++// reading the PKI config from InstallConfig, but adding InstallConfig
++// as a dependency here would break codepaths that generate signer certs
++// without an install-config on disk (e.g. agent create certificates,
++// node-joiner). SignerKeyParams reads the config directly from disk
++// without triggering InstallConfig validation.
+ func (c *KubeletBootstrapCertSigner) Dependencies() []asset.Asset {
+-	return []asset.Asset{}
++	return []asset.Asset{&SignerKeyParams{}}
+ }
+ 
+ // Generate generates the root-ca key and cert pair.
+ func (c *KubeletBootstrapCertSigner) Generate(ctx context.Context, parents asset.Parents) error {
++	signerKeyParams := &SignerKeyParams{}
++	parents.Get(signerKeyParams)
+ 	cfg := &CertCfg{
+ 		Subject: pkix.Name{CommonName: "kubelet-bootstrap-kubeconfig-signer", OrganizationalUnit: []string{"openshift"}},
+ 		// KeyUsages is set by GenerateSelfSignedCertificate based on the key algorithm.
+@@ -122,7 +130,7 @@ func (c *KubeletBootstrapCertSigner) Generate(ctx context.Context, parents asset
+ 		IsCA:     true,
+ 	}
+ 
+-	return c.SelfSignedCertKey.Generate(ctx, cfg, "kubelet-bootstrap-kubeconfig-signer", nil)
++	return c.SelfSignedCertKey.Generate(ctx, cfg, "kubelet-bootstrap-kubeconfig-signer", signerKeyParams.PKIConfig)
+ }
+ 
+ // Name returns the human-friendly name of the asset.
+diff --git a/pkg/asset/tls/root.go b/pkg/asset/tls/root.go
+index f64d0651b81..4984d0ca814 100644
+--- a/pkg/asset/tls/root.go
++++ b/pkg/asset/tls/root.go
+@@ -21,13 +21,20 @@ type RootCA struct {
+ 
+ var _ asset.WritableAsset = (*RootCA)(nil)
+ 
+-// Dependencies returns nothing.
++// Dependencies returns SignerKeyParams. Configurable PKI requires
++// reading the PKI config from InstallConfig, but adding InstallConfig
++// as a dependency here would break codepaths that generate signer certs
++// without an install-config on disk (e.g. agent create certificates,
++// node-joiner). SignerKeyParams reads the config directly from disk
++// without triggering InstallConfig validation.
+ func (c *RootCA) Dependencies() []asset.Asset {
+-	return []asset.Asset{}
++	return []asset.Asset{&SignerKeyParams{}}
+ }
+ 
+ // Generate generates the MCS/Ignition CA.
+ func (c *RootCA) Generate(ctx context.Context, parents asset.Parents) error {
++	signerKeyParams := &SignerKeyParams{}
++	parents.Get(signerKeyParams)
+ 	cfg := &CertCfg{
+ 		Subject: pkix.Name{CommonName: "root-ca", OrganizationalUnit: []string{"openshift"}},
+ 		// KeyUsages is set by GenerateSelfSignedCertificate based on the key algorithm.
+@@ -35,7 +42,7 @@ func (c *RootCA) Generate(ctx context.Context, parents asset.Parents) error {
+ 		IsCA:     true,
+ 	}
+ 
+-	return c.SelfSignedCertKey.Generate(ctx, cfg, "root-ca", nil)
++	return c.SelfSignedCertKey.Generate(ctx, cfg, "root-ca", signerKeyParams.PKIConfig)
+ }
+ 
+ // Name returns the human-friendly name of the asset.
+diff --git a/pkg/asset/tls/signerkey_params.go b/pkg/asset/tls/signerkey_params.go
+new file mode 100644
+index 00000000000..4b13dd7d71d
+--- /dev/null
++++ b/pkg/asset/tls/signerkey_params.go
+@@ -0,0 +1,63 @@
++package tls //nolint:revive // pre-existing package name
++
++import (
++	"context"
++
++	"github.com/openshift/installer/pkg/asset"
++	"github.com/openshift/installer/pkg/asset/installconfig"
++	"github.com/openshift/installer/pkg/types"
++	pkidefaults "github.com/openshift/installer/pkg/types/pki"
++)
++
++// SignerKeyParams resolves the effective PKI configuration for signer
++// certificates. It has no asset dependencies and reads install-config.yaml
++// directly from disk so that signer certs can be generated without triggering
++// standard InstallConfig validation. When no install-config is present (e.g.
++// agent create certificates, node-joiner add-nodes), it defaults to nil
++// PKIConfig which maps to RSA-2048.
++type SignerKeyParams struct {
++	PKIConfig *types.PKIConfig
++}
++
++var _ asset.WritableAsset = (*SignerKeyParams)(nil)
++
++// Name returns a human-friendly name for the asset.
++func (*SignerKeyParams) Name() string {
++	return "Signer Key Parameters"
++}
++
++// Dependencies returns no dependencies. See Load() for why this asset does
++// not depend on the standard InstallConfig asset.
++func (*SignerKeyParams) Dependencies() []asset.Asset {
++	return []asset.Asset{}
++}
++
++// Generate is a no-op that leaves PKIConfig as nil (RSA-2048). This is the
++// fallback when Load() finds no install-config on disk (e.g. agent flow).
++func (s *SignerKeyParams) Generate(_ context.Context, _ asset.Parents) error {
++	return nil
++}
++
++// Files returns nil — this asset has no on-disk representation.
++func (*SignerKeyParams) Files() []*asset.File {
++	return nil
++}
++
++// Load reads install-config.yaml through the standard LoadFromFile pipeline
++// (strict YAML, deprecated field conversion, defaults) and extracts the
++// effective PKI config. Returns (false, nil) when the file is missing,
++// allowing the asset store to fall back to the state file between
++// multi-step invocations (e.g. create manifests followed by create cluster).
++//
++// This asset does not depend on the InstallConfig asset because that would
++// pull platform validation and cloud API calls into codepaths that generate
++// signer certs without credentials (agent create certificates, node-joiner).
++func (s *SignerKeyParams) Load(f asset.FileFetcher) (bool, error) {
++	base := &installconfig.AssetBase{}
++	found, err := base.LoadFromFile(f)
++	if !found || err != nil {
++		return found, err
++	}
++	s.PKIConfig = pkidefaults.EffectiveSignerPKIConfig(base.Config)
++	return true, nil
++}
+diff --git a/pkg/types/pki/defaults.go b/pkg/types/pki/defaults.go
+index 951c876dccd..bae5edd9696 100644
+--- a/pkg/types/pki/defaults.go
++++ b/pkg/types/pki/defaults.go
+@@ -2,6 +2,8 @@ package pki
+ 
+ import (
+ 	configv1alpha1 "github.com/openshift/api/config/v1alpha1"
++	features "github.com/openshift/api/features"
++	"github.com/openshift/installer/pkg/types"
+ )
+ 
+ // DefaultPKIProfile returns the default PKI profile for OpenShift clusters.
+@@ -25,3 +27,37 @@ func DefaultPKIProfile() configv1alpha1.PKIProfile {
+ 		},
+ 	}
+ }
++
++// EffectiveSignerPKIConfig returns the effective PKI config for signer certificate generation.
++//   - If ConfigurablePKI feature gate is disabled, returns nil (RSA-2048 legacy path).
++//   - If user specified pki in install-config, returns that config unchanged.
++//   - If pki is nil, returns a PKIConfig derived from DefaultPKIProfile().SignerCertificates.
++func EffectiveSignerPKIConfig(ic *types.InstallConfig) *types.PKIConfig {
++	if ic == nil {
++		return nil
++	}
++
++	if !ic.Enabled(features.FeatureGateConfigurablePKI) {
++		return nil
++	}
++
++	if ic.PKI != nil {
++		return ic.PKI
++	}
++
++	profile := DefaultPKIProfile()
++	keyConfig := types.KeyConfig{
++		Algorithm: types.KeyAlgorithm(profile.SignerCertificates.Key.Algorithm),
++	}
++	switch keyConfig.Algorithm {
++	case types.KeyAlgorithmRSA:
++		keyConfig.RSA = &types.RSAKeyConfig{KeySize: profile.SignerCertificates.Key.RSA.KeySize}
++	case types.KeyAlgorithmECDSA:
++		keyConfig.ECDSA = &types.ECDSAKeyConfig{Curve: types.ECDSACurve(profile.SignerCertificates.Key.ECDSA.Curve)}
++	}
++	return &types.PKIConfig{
++		SignerCertificates: types.CertificateConfig{
++			Key: keyConfig,
++		},
++	}
++}
+diff --git a/pkg/types/pki/defaults_test.go b/pkg/types/pki/defaults_test.go
+index a5fb0810ff7..3cc00622d15 100644
+--- a/pkg/types/pki/defaults_test.go
++++ b/pkg/types/pki/defaults_test.go
+@@ -5,7 +5,9 @@ import (
+ 
+ 	"github.com/stretchr/testify/assert"
+ 
++	configv1 "github.com/openshift/api/config/v1"
+ 	configv1alpha1 "github.com/openshift/api/config/v1alpha1"
++	"github.com/openshift/installer/pkg/types"
+ )
+ 
+ func TestDefaultPKIProfile(t *testing.T) {
+@@ -16,3 +18,85 @@ func TestDefaultPKIProfile(t *testing.T) {
+ 	assert.Equal(t, configv1alpha1.KeyAlgorithmRSA, profile.SignerCertificates.Key.Algorithm)
+ 	assert.Equal(t, int32(4096), profile.SignerCertificates.Key.RSA.KeySize)
+ }
++
++func TestEffectiveSignerPKIConfig(t *testing.T) {
++	cases := []struct {
++		name        string
++		ic          *types.InstallConfig
++		expectNil   bool
++		expectAlgo  types.KeyAlgorithm
++		expectSize  int32
++		expectCurve types.ECDSACurve
++	}{
++		{
++			name: "feature gate off, pki nil",
++			ic: &types.InstallConfig{
++				FeatureSet: configv1.Default,
++			},
++			expectNil: true,
++		},
++		{
++			name: "feature gate on, pki nil - returns RSA-4096 from DefaultPKIProfile",
++			ic: &types.InstallConfig{
++				FeatureSet: configv1.TechPreviewNoUpgrade,
++			},
++			expectNil:  false,
++			expectAlgo: types.KeyAlgorithmRSA,
++			expectSize: 4096,
++		},
++		{
++			name: "feature gate on, pki specified - returns user config",
++			ic: &types.InstallConfig{
++				FeatureSet: configv1.TechPreviewNoUpgrade,
++				PKI: &types.PKIConfig{
++					SignerCertificates: types.CertificateConfig{
++						Key: types.KeyConfig{
++							Algorithm: types.KeyAlgorithmECDSA,
++							ECDSA:     &types.ECDSAKeyConfig{Curve: types.ECDSACurveP384},
++						},
++					},
++				},
++			},
++			expectNil: false,
++		},
++		{
++			name: "feature gate off, pki specified - returns nil",
++			ic: &types.InstallConfig{
++				FeatureSet: configv1.Default,
++				PKI: &types.PKIConfig{
++					SignerCertificates: types.CertificateConfig{
++						Key: types.KeyConfig{
++							Algorithm: types.KeyAlgorithmRSA,
++							RSA:       &types.RSAKeyConfig{KeySize: 4096},
++						},
++					},
++				},
++			},
++			expectNil: true,
++		},
++	}
++
++	for _, tc := range cases {
++		t.Run(tc.name, func(t *testing.T) {
++			result := EffectiveSignerPKIConfig(tc.ic)
++
++			if tc.expectNil {
++				assert.Nil(t, result)
++				return
++			}
++
++			assert.NotNil(t, result)
++
++			if tc.ic.PKI != nil {
++				assert.Equal(t, tc.ic.PKI, result)
++			} else {
++				assert.Equal(t, tc.expectAlgo, result.SignerCertificates.Key.Algorithm)
++				if tc.expectAlgo == types.KeyAlgorithmECDSA {
++					assert.Equal(t, tc.expectCurve, result.SignerCertificates.Key.ECDSA.Curve)
++				} else {
++					assert.Equal(t, tc.expectSize, result.SignerCertificates.Key.RSA.KeySize)
++				}
++			}
++		})
++	}
++}

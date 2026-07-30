@@ -1,0 +1,59 @@
+diff --git a/pkg/agenticrun/controller.go b/pkg/agenticrun/controller.go
+index 66ca7adeb..43ad38cd6 100644
+--- a/pkg/agenticrun/controller.go
++++ b/pkg/agenticrun/controller.go
+@@ -153,12 +153,14 @@ func (c *Controller) crdAvailable() bool {
+ 	}
+ 	c.crdLastChecked = time.Now()
+ 	if c.client == nil {
++		klog.V(i.Normal).Info("No AgenticRun controller client, assuming there are no AgenticRuns")
+ 		c.crdAvailableCache = false
+ 		return false
+ 	}
+ 	crd := &apiextensionsv1.CustomResourceDefinition{}
+ 	err := c.client.Get(context.Background(), ctrlruntimeclient.ObjectKey{Name: "agenticruns.agentic.openshift.io"}, crd)
+ 	c.crdAvailableCache = err == nil
++	klog.V(i.Normal).Infof("AgenticRun CustomResourceDefinition available? %t (%v)", c.crdAvailableCache, err)
+ 	return c.crdAvailableCache
+ }
+ 
+diff --git a/pkg/start/start.go b/pkg/start/start.go
+index 3f15b70b7..5339a58e9 100644
+--- a/pkg/start/start.go
++++ b/pkg/start/start.go
+@@ -16,9 +16,11 @@ import (
+ 	runtimeclient "sigs.k8s.io/controller-runtime/pkg/client"
+ 
+ 	v1 "k8s.io/api/core/v1"
++	apiextensionsv1 "k8s.io/apiextensions-apiserver/pkg/apis/apiextensions/v1"
+ 	apierrors "k8s.io/apimachinery/pkg/api/errors"
+ 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+ 	"k8s.io/apimachinery/pkg/fields"
++	"k8s.io/apimachinery/pkg/runtime"
+ 	utilruntime "k8s.io/apimachinery/pkg/util/runtime"
+ 	"k8s.io/apimachinery/pkg/util/sets"
+ 	"k8s.io/client-go/dynamic"
+@@ -35,6 +37,7 @@ import (
+ 	"k8s.io/klog/v2"
+ 
+ 	configv1 "github.com/openshift/api/config/v1"
++	operatorv1 "github.com/openshift/api/operator/v1"
+ 	clientset "github.com/openshift/client-go/config/clientset/versioned"
+ 	configinformers "github.com/openshift/client-go/config/informers/externalversions"
+ 	operatorclientset "github.com/openshift/client-go/operator/clientset/versioned"
+@@ -531,7 +534,14 @@ func (cb *ClientBuilder) DynamicClientOrDie(name string, configFns ...func(*rest
+ }
+ 
+ func (cb *ClientBuilder) RuntimeControllerClientOrDie(name string, configFns ...func(*rest.Config)) runtimeclient.Client {
+-	c, err := runtimeclient.New(rest.AddUserAgent(cb.RestConfig(configFns...), name), runtimeclient.Options{})
++	runtimeScheme := runtime.NewScheme()
++	utilruntime.Must(scheme.AddToScheme(runtimeScheme))
++	utilruntime.Must(apiextensionsv1.AddToScheme(runtimeScheme))
++	utilruntime.Must(operatorv1.AddToScheme(runtimeScheme))
++
++	c, err := runtimeclient.New(rest.AddUserAgent(cb.RestConfig(configFns...), name), runtimeclient.Options{
++		Scheme: runtimeScheme,
++	})
+ 	if err != nil {
+ 		panic(err)
+ 	}

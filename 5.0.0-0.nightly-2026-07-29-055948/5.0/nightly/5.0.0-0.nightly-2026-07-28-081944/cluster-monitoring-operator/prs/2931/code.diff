@@ -1,0 +1,234 @@
+diff --git a/assets/prometheus-operator-user-workload/cluster-role.yaml b/assets/prometheus-operator-user-workload/cluster-role.yaml
+index a17592cdf4..6b77bc3da7 100644
+--- a/assets/prometheus-operator-user-workload/cluster-role.yaml
++++ b/assets/prometheus-operator-user-workload/cluster-role.yaml
+@@ -98,15 +98,6 @@ rules:
+   - storageclasses
+   verbs:
+   - get
+-- apiGroups:
+-  - ""
+-  resources:
+-  - endpoints
+-  verbs:
+-  - get
+-  - create
+-  - update
+-  - delete
+ - apiGroups:
+   - discovery.k8s.io
+   resources:
+diff --git a/assets/prometheus-operator-user-workload/deployment.yaml b/assets/prometheus-operator-user-workload/deployment.yaml
+index 7493ac8834..34acdf966e 100644
+--- a/assets/prometheus-operator-user-workload/deployment.yaml
++++ b/assets/prometheus-operator-user-workload/deployment.yaml
+@@ -35,7 +35,7 @@ spec:
+         - --prometheus-config-reloader=quay.io/prometheus-operator/prometheus-config-reloader:v0.91.0
+         - --watch-referenced-objects-in-all-namespaces=true
+         - --disable-unmanaged-prometheus-configuration=true
+-        - --kubelet-endpoints=true
++        - --kubelet-endpoints=false
+         - --kubelet-endpointslice=true
+         - --repair-policy-for-statefulsets=evict
+         - --prometheus-instance-namespaces=openshift-user-workload-monitoring
+diff --git a/assets/prometheus-operator/cluster-role.yaml b/assets/prometheus-operator/cluster-role.yaml
+index 23594fcc1e..337106007e 100644
+--- a/assets/prometheus-operator/cluster-role.yaml
++++ b/assets/prometheus-operator/cluster-role.yaml
+@@ -98,15 +98,6 @@ rules:
+   - storageclasses
+   verbs:
+   - get
+-- apiGroups:
+-  - ""
+-  resources:
+-  - endpoints
+-  verbs:
+-  - get
+-  - create
+-  - update
+-  - delete
+ - apiGroups:
+   - discovery.k8s.io
+   resources:
+diff --git a/assets/prometheus-operator/deployment.yaml b/assets/prometheus-operator/deployment.yaml
+index 083237c725..b4646fd06a 100644
+--- a/assets/prometheus-operator/deployment.yaml
++++ b/assets/prometheus-operator/deployment.yaml
+@@ -36,7 +36,7 @@ spec:
+         - --prometheus-config-reloader=quay.io/prometheus-operator/prometheus-config-reloader:v0.91.0
+         - --watch-referenced-objects-in-all-namespaces=true
+         - --disable-unmanaged-prometheus-configuration=true
+-        - --kubelet-endpoints=true
++        - --kubelet-endpoints=false
+         - --kubelet-endpointslice=true
+         - --repair-policy-for-statefulsets=evict
+         - --prometheus-instance-namespaces=openshift-monitoring
+diff --git a/jsonnet/components/cluster-monitoring-operator.libsonnet b/jsonnet/components/cluster-monitoring-operator.libsonnet
+index e105c73427..eae26f83e0 100644
+--- a/jsonnet/components/cluster-monitoring-operator.libsonnet
++++ b/jsonnet/components/cluster-monitoring-operator.libsonnet
+@@ -287,6 +287,15 @@ function(params) {
+         resources: ['consoleplugins'],
+         verbs: ['get', 'create', 'update'],
+       },
++      // CMO deletes leftover kube-system/kubelet Endpoints after platform PO disables
++      // the legacy kubelet Endpoints controller (--kubelet-endpoints=false).
++      // Scoped to the kubelet Endpoints name only. TODO: remove in 5.1.
++      {
++        apiGroups: [''],
++        resources: ['endpoints'],
++        resourceNames: ['kubelet'],
++        verbs: ['get', 'delete'],
++      },
+     ],
+   },
+ 
+diff --git a/jsonnet/main.jsonnet b/jsonnet/main.jsonnet
+index 53aa30e7a0..5ae04b4440 100644
+--- a/jsonnet/main.jsonnet
++++ b/jsonnet/main.jsonnet
+@@ -288,6 +288,9 @@ local inCluster =
+         },
+         tlsCipherSuites: $.values.common.tlsCipherSuites,
+         repairPolicy: 'evict',
++        // Kubelet discovery uses EndpointSlice since OpenShift 4.21 (#2696).
++        // kubeletEndpointSliceEnabled defaults to true in kube-prometheus.
++        kubeletEndpointsEnabled: false,
+       },
+       thanos: {
+         image: $.values.common.images.thanos,
+@@ -485,6 +488,8 @@ local userWorkload =
+         configReloaderImage: $.values.common.images.prometheusOperatorReloader,
+         commonLabels+: $.values.common.commonLabels,
+         repairPolicy: 'evict',
++        // UWM PO strips --kubelet-service; disable kubelet Endpoints controller too.
++        kubeletEndpointsEnabled: false,
+       },
+     },
+ 
+diff --git a/manifests/0000_50_cluster-monitoring-operator_02-role.yaml b/manifests/0000_50_cluster-monitoring-operator_02-role.yaml
+index f885cbf78f..b98fe976b6 100644
+--- a/manifests/0000_50_cluster-monitoring-operator_02-role.yaml
++++ b/manifests/0000_50_cluster-monitoring-operator_02-role.yaml
+@@ -193,6 +193,15 @@ rules:
+   - get
+   - create
+   - update
++- apiGroups:
++  - ""
++  resourceNames:
++  - kubelet
++  resources:
++  - endpoints
++  verbs:
++  - get
++  - delete
+ - apiGroups:
+   - authentication.k8s.io
+   resources:
+@@ -796,15 +805,6 @@ rules:
+   - storageclasses
+   verbs:
+   - get
+-- apiGroups:
+-  - ""
+-  resources:
+-  - endpoints
+-  verbs:
+-  - get
+-  - create
+-  - update
+-  - delete
+ - apiGroups:
+   - discovery.k8s.io
+   resources:
+diff --git a/pkg/client/client.go b/pkg/client/client.go
+index 08ed3d2a64..6b0c154e97 100644
+--- a/pkg/client/client.go
++++ b/pkg/client/client.go
+@@ -889,6 +889,21 @@ func (c *Client) DeleteClusterRoleBinding(ctx context.Context, crb *rbacv1.Clust
+ 	return err
+ }
+ 
++// DeleteEndpointsByNamespaceAndName deletes the legacy Endpoints object if it exists.
++func (c *Client) DeleteEndpointsByNamespaceAndName(ctx context.Context, namespace, name string) error {
++	_, err := c.kclient.CoreV1().Endpoints(namespace).Get(ctx, name, metav1.GetOptions{})
++	if apierrors.IsNotFound(err) {
++		return nil
++	}
++
++	err = c.kclient.CoreV1().Endpoints(namespace).Delete(ctx, name, metav1.DeleteOptions{})
++	if apierrors.IsNotFound(err) {
++		return nil
++	}
++
++	return err
++}
++
+ func (c *Client) DeleteService(ctx context.Context, svc *v1.Service) error {
+ 	// Short-circuit if the resource doesn't exist (a Get is less expensive than a no-op Delete)
+ 	_, err := c.kclient.CoreV1().Services(svc.Namespace).Get(ctx, svc.GetName(), metav1.GetOptions{})
+diff --git a/pkg/tasks/prometheusoperator.go b/pkg/tasks/prometheusoperator.go
+index 38b0066c68..0152dcb2c2 100644
+--- a/pkg/tasks/prometheusoperator.go
++++ b/pkg/tasks/prometheusoperator.go
+@@ -22,6 +22,11 @@ import (
+ 	"github.com/openshift/cluster-monitoring-operator/pkg/manifests"
+ )
+ 
++const (
++	kubeletServiceNamespace = "kube-system"
++	kubeletServiceName      = "kubelet"
++)
++
+ type PrometheusOperatorTask struct {
+ 	client  *client.Client
+ 	factory *manifests.Factory
+@@ -110,6 +115,17 @@ func (t *PrometheusOperatorTask) Run(ctx context.Context) error {
+ 		return fmt.Errorf("reconciling Prometheus Operator Deployment failed: %w", err)
+ 	}
+ 
++	// Kubelet discovery was migrated to EndpointSlice in OpenShift 4.21
++	// (https://github.com/openshift/cluster-monitoring-operator/pull/2696).
++	// Prometheus Operator no longer manages the legacy kubelet Endpoints object
++	// when --kubelet-endpoints=false; delete any leftover Endpoints to avoid
++	// deprecated API warnings.
++	// TODO: remove this step in 5.1 when all clusters have upgraded.
++	err = t.client.DeleteEndpointsByNamespaceAndName(ctx, kubeletServiceNamespace, kubeletServiceName)
++	if err != nil {
++		return fmt.Errorf("deleting kubelet Endpoints failed: %w", err)
++	}
++
+ 	err = t.client.AssurePrometheusOperatorCRsExist(ctx)
+ 	if err != nil {
+ 		return fmt.Errorf("waiting for Prometheus Operator CRs to become available failed: %w", err)
+diff --git a/test/e2e/cluster_monitoring_test.go b/test/e2e/cluster_monitoring_test.go
+index de1dd8be41..c0fb64da28 100644
+--- a/test/e2e/cluster_monitoring_test.go
++++ b/test/e2e/cluster_monitoring_test.go
+@@ -710,3 +710,24 @@ func expectNodeSelector(key, value string) framework.PodAssertion {
+ 		return nil
+ 	}
+ }
++
++// TestKubeletEndpointsNotCreated verifies the legacy kube-system/kubelet Endpoints object
++// is not created by the Prometheus operator.
++func TestKubeletEndpointsNotCreated(t *testing.T) {
++	ctx := context.Background()
++	var lastGetErr error
++	err := wait.PollUntilContextTimeout(ctx, 2*time.Second, 2*time.Minute, true, func(context.Context) (bool, error) {
++		_, err := f.KubeClient.CoreV1().Endpoints("kube-system").Get(ctx, "kubelet", metav1.GetOptions{})
++		if apierrors.IsNotFound(err) {
++			return true, nil
++		}
++		if err != nil {
++			lastGetErr = err
++			return false, nil
++		}
++		return false, nil
++	})
++	if err != nil {
++		t.Fatalf("expected kube-system/kubelet Endpoints to be absent: %v (last get error: %v)", err, lastGetErr)
++	}
++}

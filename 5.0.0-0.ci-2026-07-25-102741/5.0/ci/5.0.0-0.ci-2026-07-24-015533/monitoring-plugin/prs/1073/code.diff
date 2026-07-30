@@ -1,0 +1,534 @@
+diff --git a/Dockerfile.dev-mcp b/Dockerfile.dev-mcp
+index 087b6618c..2fac28b56 100644
+--- a/Dockerfile.dev-mcp
++++ b/Dockerfile.dev-mcp
+@@ -9,12 +9,9 @@ WORKDIR /opt/app-root
+ ENV HUSKY=0
+ 
+ COPY Makefile Makefile
+-COPY scripts/update-plugin-name.sh scripts/update-plugin-name.sh
+ COPY web/ web/
+ 
+-RUN make update-plugin-name
+-
+-ENV I18N_NAMESPACE="plugin__monitoring-console-plugin"
++ENV CONSOLE_PLUGIN_NAME="monitoring-console-plugin"
+ 
+ RUN make install-frontend-ci
+ RUN make build-frontend
+diff --git a/Dockerfile.devspace b/Dockerfile.devspace
+index 7af8b0d34..37b78e362 100644
+--- a/Dockerfile.devspace
++++ b/Dockerfile.devspace
+@@ -1,4 +1,4 @@
+-FROM brew.registry.redhat.io/rh-osbs/openshift-golang-builder:rhel_9_golang_1.24 AS web-builder
++FROM brew.registry.redhat.io/rh-osbs/openshift-golang-builder:rhel_9_golang_1.26 AS web-builder
+ 
+ WORKDIR /opt/app-root
+ 
+diff --git a/Dockerfile.mcp b/Dockerfile.mcp
+index 343b18b44..411832893 100644
+--- a/Dockerfile.mcp
++++ b/Dockerfile.mcp
+@@ -11,9 +11,7 @@ RUN cd web && npm ci --legacy-peer-deps --ignore-scripts
+ 
+ COPY web/ web/
+ COPY config/ config/
+-COPY scripts/update-plugin-name.sh scripts/update-plugin-name.sh
+-RUN make update-plugin-name
+-ENV I18N_NAMESPACE="plugin__monitoring-console-plugin"
++ENV CONSOLE_PLUGIN_NAME="monitoring-console-plugin"
+ RUN make build-frontend
+ 
+ FROM registry.access.redhat.com/ubi9/go-toolset:1.26 AS go-builder
+diff --git a/Makefile b/Makefile
+index 2f86d82b8..e4c69d484 100644
+--- a/Makefile
++++ b/Makefile
+@@ -4,7 +4,8 @@ ORG         ?= openshift-observability-ui
+ PLUGIN_NAME ?=monitoring-plugin
+ IMAGE       ?= quay.io/${ORG}/${PLUGIN_NAME}:${VERSION}
+ MONITORING_FEATURES    ?=alerting,targets,legacy-dashboards,metrics
+-ALL_FEATURES    ?=$(MONITORING_FEATURES),incidents,perses-dashboards
++ALL_FEATURES    ?=$(MONITORING_FEATURES),cluster-health-analyzer,perses-dashboards
++MCP_DEVSPACE_FEATURES  ?=cluster-health-analyzer,perses-dashboards,acm-alerting
+ 
+ GOLANGCI_LINT = $(shell pwd)/_output/tools/bin/golangci-lint
+ GOLANGCI_LINT_VERSION ?= v2.11.3
+@@ -31,6 +32,10 @@ build-frontend:
+ start-frontend:
+ 	cd web && npm run start
+ 
++.PHONY: start-mcp-frontend
++start-mcp-frontend:
++	cd web && CONSOLE_PLUGIN_NAME=monitoring-console-plugin npm run start
++
+ .PHONY: start-console
+ start-console:
+ 	./scripts/start-console.sh
+@@ -75,10 +80,6 @@ build-image:
+ install:
+ 	make install-frontend && make install-backend
+ 
+-.PHONY: update-plugin-name
+-update-plugin-name:
+-	./scripts/update-plugin-name.sh
+-
+ .PHONY: deploy
+ deploy: lint-backend
+ 	PUSH=1 scripts/build-image.sh
+@@ -114,7 +115,11 @@ build-dev-mcp-image:
+ 
+ .PHONY: start-devspace-backend
+ start-devspace-backend:
+-	/opt/app-root/plugin-backend -port='9443' -cert='/var/cert/tls.crt' -key='/var/cert/tls.key' -static-path='/opt/app-root/web/dist' -config-path='/opt/app-root/config' -features='${ALL_FEATURES}'
++	/opt/app-root/plugin-backend -port='9443' -cert='/var/cert/tls.crt' -key='/var/cert/tls.key' -static-path='/opt/app-root/web/dist' -config-path='/opt/app-root/config' -features='${MONITORING_FEATURES}'
++
++.PHONY: start-devspace-mcp-backend
++start-devspace-mcp-backend:
++	/opt/app-root/plugin-backend -port='9443' -cert='/var/serving-cert/tls.crt' -key='/var/serving-cert/tls.key' -static-path='/opt/app-root/web/dist' -config-path='/opt/app-root/config' -features='${MCP_DEVSPACE_FEATURES}' -alertmanager='https://alertmanager.open-cluster-management-observability.svc:9095' -thanos-querier='https://rbac-query-proxy.open-cluster-management-observability.svc:8443'
+ 
+ .PHONY: podman-cross-build
+ podman-cross-build:
+diff --git a/README.md b/README.md
+index 456e2d51d..e86aabf4e 100644
+--- a/README.md
++++ b/README.md
+@@ -66,18 +66,31 @@ helm upgrade -i monitoring-plugin charts/openshift-console-plugin -n my-plugin-n
+ 
+ Install the [devspace](https://www.devspace.sh/docs/getting-started/installation) cli.
+ 
+-1. Install the frontend dependencies running `make install-frontend`.
+-2. Start the frontend `make start-frontend`.
+-3. Select the namespace the monitoring-plugin is located in `devspace use namespace openshift-monitoring`.
+-4. In a different terminal start the devspace sync `devspace dev`.
++Devspace works by "taking over" a pod. It does this by scaling down the original, forwarding the traffic to its own pod, copying any mounted files and directories (like certs) and then syncing changes you make locally into that pod. Our configuration works by running the go backend normally in the devspace pod, and then syncing the changes from your `web/dist` folder to the `/opt/app-root/web/dist` folder which is where the go backend serves the frontend files from.
+ 
+-When running the `devspace dev` command, the pipeline will run the `scale_down_cmo` function to prevent CMO from fighting over control of the pod. After CMO has been scaled down, devspace will "take over" the monitoring-plugin pod, grabbing all of the certificates and backend binary and configuration to run in the devspace pod. The backend will stay the same as what is built in the Dockerfile.devspace file, only the frontend changes will be reflected live in cluster.
++By running the webpack dev server locally any changes to your frontend files they will be rebuilt and then copied into the pod. You will need to disable your network cache in your dev tools to allow for overriding the previous webpack chunks and then perform a page refresh to see your changes.
+ 
+-After the pod has been "taken over" Devspace begins a sync process which will mirror changes from you local `./web/dist` folder into the `/opt/app-root/web/dist` folder in the devspace pod. You can then make changes to your frontend files locally which will trigger the locally running webpack dev server to rebuild the `./web/dist` folder, which will trigger Devspace to re-synced. You can then reload your console webpage to see your local changes running in the cluster.
++#### Monitoring Features
+ 
+-The devspace command will enable all features from a single deployment for easy development, however it does not install other needed observability signals, which will need to be created through COO.
++When running the `devspace dev` command, the pipeline will run `scale-down-cmo.sh` function to scale down the CMO deployment, which keeps it from fighting over control of the monitoring-plugin pod.
+ 
+-After development you can run `devspace purge` which will cleanup and then call the `scale_up_cmo` pipeline.
++```sh
++make start-frontend
++devspace dev # select mp
++```
++
++Running `devspace purge` and selecting `mp` will scale the CMO deployment back up
++
++#### COO Features
++
++When running the `devspace dev` command, the pipeline will run `install-coo.sh` which will attempt to install COO if it isn't already installed. It will then create a `Monitoring` type `UIPlugin` with all features enabled. Once the `monitoring-console-plugin` deployment is ready it will scale down COO to prevent it from fighting over the deployment.
++
++```sh
++make start-mcp-frontend
++devspace dev # select mcp
++```
++
++Running `devspace purge` and selecting `mcp` will scale the COO deployment back up.
+ 
+ ### Local Development
+ 
+diff --git a/devspace-deployment.yaml b/devspace-deployment.yaml
+deleted file mode 100644
+index af0b0de47..000000000
+--- a/devspace-deployment.yaml
++++ /dev/null
+@@ -1,14 +0,0 @@
+-# This is a list of `deployments` that DevSpace can create for this project
+-app:
+-  # This deployment uses `helm` but you can also define `kubectl` deployments or kustomizations
+-  helm:
+-    # We are deploying this project with the Helm chart you provided
+-    chart:
+-      name: ./charts/openshift-console-plugin
+-    # Under `values` we can define the values for this Helm chart used during `helm install/upgrade`
+-    # You may also use `valuesFiles` to load values from files, e.g. valuesFiles: ["values.yaml"]
+-    valuesFiles: ["./charts/openshift-console-plugin/values.yaml"]
+-    values:
+-      plugin:
+-        image: "quay.io/rh-ee-pyurkovi/monitoring-plugin:v4.21"
+-  namespace: ${DEVSPACE_NAMESPACE}
+diff --git a/devspace.yaml b/devspace.yaml
+index c69072ee2..bec2eba8b 100644
+--- a/devspace.yaml
++++ b/devspace.yaml
+@@ -2,47 +2,68 @@ version: v2beta1
+ name: monitoring-plugin
+ 
+ vars:
+-  USE_HELM:
+-    question: Do you want to deploy using helm? (y/[n])
+-    default: "n"
++  PLUGIN:
++    question: "Which deployment do you want to develop? (mp = monitoring-plugin/CMO, mcp = monitoring-console-plugin/COO)"
++    default: mp
+     noCache: true
++    options:
++      - mp
++      - mcp
+ 
+-functions:
+-  scale_down_cmo: |-
+-    oc patch clusterversion version --type json -p "$(cat ./web/cypress/fixtures/cmo/disable-monitoring.yaml)"
+-    kubectl scale --replicas=0 -n ${DEVSPACE_NAMESPACE} deployment/cluster-monitoring-operator
+-  scale_up_cmo: |-
+-    kubectl scale --replicas=1 -n ${DEVSPACE_NAMESPACE} deployment/cluster-monitoring-operator
+-
+-# This is a list of `pipelines` that DevSpace can execute (you can define your own)
+ pipelines:
+-  # This is the pipeline for the main command: `devspace dev` (or `devspace run-pipeline dev`)
+   dev:
+     run: |-
+-      scale_down_cmo
+-      start_dev app
++      if [ "${PLUGIN}" = "mcp" ]; then
++        echo "==> Installing COO (if not already present)..."
++        ./hack/install-coo.sh
++        echo "==> Applying UIPlugin CR with all features enabled..."
++        ./hack/create-uiplugin.sh
++        echo "==> Scaling down COO..."
++        ./hack/scale-down-coo.sh
++        start_dev app-mcp
++      else
++        echo "==> Scaling down CMO..."
++        ./hack/scale-down-cmo.sh
++        start_dev app-mp
++      fi
++
+   purge:
+     run: |-
+       stop_dev --all
+-      scale_up_cmo
+-
+-deployments: $( [ ${USE_HELM} == "y" ] && cat devspace-deployment.yaml || echo "app:")
++      if [ "${PLUGIN}" = "mp" ]; then
++        ./hack/scale-up-cmo.sh
++      else
++        ./hack/scale-up-coo.sh
++      fi
+ 
+-# This is a list of `dev` containers that are based on the containers created by your deployments
+ dev:
+-  app:
+-    # Search for the container that runs this image
++  app-mp:
++    namespace: openshift-monitoring
+     labelSelector:
+-      # Use the instance selector that CMO & helm add
+       app.kubernetes.io/component: monitoring-plugin
+-    # Replace the container image with this dev-optimized image (allows to skip image building during development)
+-    devImage: quay.io/rh-ee-pyurkovi/monitoring-plugin:v4.19-devspace
+-    # Sync files between the local filesystem and the development container
++    devImage: quay.io/openshift-observability-ui/monitoring-plugin:devspace-5.0
+     sync:
+       - path: ./web/dist:/opt/app-root/web/dist
+         startContainer: true
+     command: ["make"]
+     args: ["start-devspace-backend"]
+-    # Inject a lightweight SSH server into the container (so your IDE can connect to the remote dev env)
++    ssh:
++      enabled: true
++
++  app-mcp:
++    namespace: openshift-cluster-observability-operator
++    labelSelector:
++      app.kubernetes.io/instance: monitoring
++      app.kubernetes.io/managed-by: observability-operator
++    devImage: quay.io/openshift-observability-ui/monitoring-plugin:devspace-5.0
++    patches:
++      - op: replace
++        path: spec.containers[0].imagePullPolicy
++        value: Always
++    sync:
++      - path: ./web/dist:/opt/app-root/web/dist
++        startContainer: true
++    command: ["make"]
++    args: ["start-devspace-mcp-backend"]
+     ssh:
+       enabled: true
+diff --git a/hack/create-uiplugin.sh b/hack/create-uiplugin.sh
+new file mode 100755
+index 000000000..2bf7b8fab
+--- /dev/null
++++ b/hack/create-uiplugin.sh
+@@ -0,0 +1,29 @@
++#!/usr/bin/env bash
++set -euo pipefail
++
++echo "Applying UIPlugin CR 'monitoring'..."
++kubectl apply -f - <<EOF
++apiVersion: observability.openshift.io/v1alpha1
++kind: UIPlugin
++metadata:
++  name: monitoring
++  namespace: openshift-cluster-observability-operator
++spec:
++  type: Monitoring
++  monitoring:
++    perses:
++      enabled: true
++    clusterHealthAnalyzer:
++      enabled: true
++    acm:
++      enabled: true
++      alertmanager:
++        url: "https://alertmanager.open-cluster-management-observability.svc:9095"
++      thanosQuerier:
++        url: "https://rbac-query-proxy.open-cluster-management-observability.svc:8443"
++EOF
++
++echo "Waiting for monitoring deployment to become available..."
++kubectl rollout status deployment/monitoring \
++    -n openshift-cluster-observability-operator \
++    --timeout=300s
+diff --git a/hack/install-coo.sh b/hack/install-coo.sh
+new file mode 100755
+index 000000000..1c9de3e38
+--- /dev/null
++++ b/hack/install-coo.sh
+@@ -0,0 +1,56 @@
++#!/usr/bin/env bash
++set -euo pipefail
++
++echo "Checking if COO is already installed..."
++if kubectl get deployment -n openshift-cluster-observability-operator observability-operator \
++    >/dev/null 2>&1; then
++    echo "COO is already installed, skipping."
++    exit 0
++fi
++
++echo "Creating namespace openshift-cluster-observability-operator..."
++kubectl create namespace openshift-cluster-observability-operator --dry-run=client -o yaml | kubectl apply -f -
++
++echo "Creating OperatorGroup..."
++kubectl apply -f - <<EOF
++apiVersion: operators.coreos.com/v1
++kind: OperatorGroup
++metadata:
++  name: observability-operator-group
++  namespace: openshift-cluster-observability-operator
++spec: {}
++EOF
++
++echo "Creating Subscription..."
++kubectl apply -f - <<EOF
++apiVersion: operators.coreos.com/v1alpha1
++kind: Subscription
++metadata:
++  name: cluster-observability-operator
++  namespace: openshift-cluster-observability-operator
++spec:
++  channel: fast
++  name: cluster-observability-operator
++  source: redhat-operators
++  sourceNamespace: openshift-marketplace
++EOF
++
++echo "Waiting for COO CSV to reach Succeeded phase (timeout 5m)..."
++SECONDS_ELAPSED=0
++until \
++    CSV_NAME=$(kubectl get csv -n openshift-cluster-observability-operator \
++        -o jsonpath='{.items[?(@.spec.displayName=="Cluster Observability Operator")].metadata.name}' \
++        2>/dev/null) && \
++    [[ -n "${CSV_NAME}" ]] && \
++    kubectl get csv -n openshift-cluster-observability-operator "${CSV_NAME}" \
++        -o jsonpath='{.status.phase}' 2>/dev/null | grep -q "^Succeeded$"; do
++    if [[ ${SECONDS_ELAPSED} -ge 300 ]]; then
++        echo "ERROR: Timed out waiting for COO CSV to succeed."
++        exit 1
++    fi
++    sleep 5
++    SECONDS_ELAPSED=$((SECONDS_ELAPSED + 5))
++    echo "  Waiting... (${SECONDS_ELAPSED}s / 300s)"
++done
++
++echo "COO installed successfully."
+diff --git a/hack/scale-down-cmo.sh b/hack/scale-down-cmo.sh
+new file mode 100755
+index 000000000..2edfa67a5
+--- /dev/null
++++ b/hack/scale-down-cmo.sh
+@@ -0,0 +1,14 @@
++#!/usr/bin/env bash
++set -euo pipefail
++
++echo "Patching ClusterVersion to disable CMO management of monitoring-plugin..."
++oc patch clusterversion version --type json \
++    -p "$(cat ./web/cypress/fixtures/cmo/disable-monitoring.yaml)"
++
++echo "Scaling down cluster-monitoring-operator in openshift-monitoring..."
++kubectl scale --replicas=0 -n openshift-monitoring deployment/cluster-monitoring-operator
++
++echo "Waiting for cluster-monitoring-operator to scale down..."
++kubectl rollout status deployment/cluster-monitoring-operator \
++    -n openshift-monitoring \
++    --timeout=120s
+diff --git a/hack/scale-down-coo.sh b/hack/scale-down-coo.sh
+new file mode 100755
+index 000000000..9f66ebe89
+--- /dev/null
++++ b/hack/scale-down-coo.sh
+@@ -0,0 +1,24 @@
++#!/usr/bin/env bash
++set -euo pipefail
++
++echo "Scaling down observability-operator..."
++kubectl scale --replicas=0 -n openshift-cluster-observability-operator deployment/observability-operator
++
++echo "Waiting for observability-operator to scale down..."
++kubectl rollout status deployment/observability-operator \
++  -n openshift-cluster-observability-operator \
++  --timeout=120s
++
++echo "Re-enabling monitoring-console-plugin in Console..."
++# COO removes the plugin from the Console when scaled down — add it back so the
++# devspace container is reachable from the Console frontend.
++PLUGINS=$(oc get console.operator.openshift.io cluster -o jsonpath='{.spec.plugins}' 2>/dev/null)
++if [[ -z "${PLUGINS}" ]]; then
++  oc patch console.operator.openshift.io cluster --type=json \
++    -p '[{"op":"add","path":"/spec/plugins","value":["monitoring-console-plugin"]}]'
++elif ! echo "${PLUGINS}" | grep -q "monitoring-console-plugin"; then
++  oc patch console.operator.openshift.io cluster --type=json \
++    -p '[{"op":"add","path":"/spec/plugins/-","value":"monitoring-console-plugin"}]'
++else
++  echo "monitoring-console-plugin already enabled in Console, skipping."
++fi
+diff --git a/hack/scale-up-cmo.sh b/hack/scale-up-cmo.sh
+new file mode 100755
+index 000000000..3b587be73
+--- /dev/null
++++ b/hack/scale-up-cmo.sh
+@@ -0,0 +1,9 @@
++#!/usr/bin/env bash
++set -euo pipefail
++
++echo "Restoring ClusterVersion to re-enable CMO management of monitoring-plugin..."
++oc patch clusterversion version --type json \
++  -p '[{"op": "remove", "path": "/spec/overrides"}]'
++
++echo "Scaling up cluster-monitoring-operator in openshift-monitoring..."
++kubectl scale --replicas=1 -n openshift-monitoring deployment/cluster-monitoring-operator
+diff --git a/hack/scale-up-coo.sh b/hack/scale-up-coo.sh
+new file mode 100755
+index 000000000..8620bfa7b
+--- /dev/null
++++ b/hack/scale-up-coo.sh
+@@ -0,0 +1,5 @@
++#!/usr/bin/env bash
++set -euo pipefail
++
++echo "Scaling up observability-operator..."
++kubectl scale --replicas=1 -n openshift-cluster-observability-operator deployment/observability-operator
+diff --git a/scripts/start-console.sh b/scripts/start-console.sh
+index 5e2e65e1e..cc60d1226 100755
+--- a/scripts/start-console.sh
++++ b/scripts/start-console.sh
+@@ -6,7 +6,7 @@ CONSOLE_IMAGE=${CONSOLE_IMAGE:="quay.io/openshift/origin-console:latest"}
+ CONSOLE_PORT=${CONSOLE_PORT:=9000}
+ PLUGIN_PORT=${PLUGIN_PORT:=9443}
+ CONSOLE_IMAGE_PLATFORM=${CONSOLE_IMAGE_PLATFORM:="linux/amd64"}
+-npm_package_consolePlugin_name=${npm_package_consolePlugin_name:="monitoring-plugin"}
++npm_package_consolePlugin_name=${CONSOLE_PLUGIN_NAME:-"monitoring-plugin"}
+ 
+ echo "Starting local OpenShift console..."
+ 
+@@ -19,7 +19,7 @@ BRIDGE_K8S_MODE_OFF_CLUSTER_THANOS=$(oc -n openshift-config-managed get configma
+ BRIDGE_K8S_MODE_OFF_CLUSTER_ALERTMANAGER=$(oc -n openshift-config-managed get configmap monitoring-shared-config -o jsonpath='{.data.alertmanagerPublicURL}')
+ BRIDGE_K8S_AUTH_BEARER_TOKEN=$(oc whoami --show-token 2>/dev/null)
+ BRIDGE_USER_SETTINGS_LOCATION="localstorage"
+-BRIDGE_I18N_NAMESPACES=plugin__monitoring-plugin
++BRIDGE_I18N_NAMESPACES="plugin__${npm_package_consolePlugin_name}"
+ 
+ echo "API Server: $BRIDGE_K8S_MODE_OFF_CLUSTER_ENDPOINT"
+ echo "Console Image: $CONSOLE_IMAGE"
+diff --git a/scripts/update-plugin-name.sh b/scripts/update-plugin-name.sh
+deleted file mode 100755
+index 55cdb68a1..000000000
+--- a/scripts/update-plugin-name.sh
++++ /dev/null
+@@ -1,8 +0,0 @@
+-#!/usr/bin/env bash
+-
+-
+-# Replace the plugin name in the package.json for the custom build actions
+-sed -i 's/"name": "monitoring-plugin",/"name": "monitoring-console-plugin",/g' web/package.json
+-
+-# Rename the translation files to the correct plugin
+-cd web/locales/ && for dir in *; do if cd $dir; then  for filename in *; do mv plugin__monitoring-plugin.json plugin__monitoring-console-plugin.json; done; cd ..; fi; done && cd ../..
+diff --git a/web/cypress.config.ts b/web/cypress.config.ts
+index 7a4663c34..492d3cf81 100644
+--- a/web/cypress.config.ts
++++ b/web/cypress.config.ts
+@@ -244,7 +244,9 @@ export default defineConfig({
+         },
+         plugins: [
+           new DefinePlugin({
+-            'process.env.I18N_NAMESPACE': JSON.stringify('plugin__monitoring-plugin'),
++            'process.env.I18N_NAMESPACE': JSON.stringify(
++              `plugin__${process.env.CONSOLE_PLUGIN_NAME ?? 'monitoring-plugin'}`,
++            ),
+           }),
+           new NormalModuleReplacementPlugin(
+             /helpers\/OlsToolUIPersesWrapper/,
+diff --git a/web/webpack.config.ts b/web/webpack.config.ts
+index f9ce5504f..fa7e4d969 100644
+--- a/web/webpack.config.ts
++++ b/web/webpack.config.ts
+@@ -5,6 +5,7 @@ import { DefinePlugin, Configuration as WebpackConfiguration } from 'webpack';
+ import { Configuration as WebpackDevServerConfiguration } from 'webpack-dev-server';
+ import * as path from 'path';
+ import { ConsoleRemotePlugin } from '@openshift-console/dynamic-plugin-sdk-webpack';
++import pkg from './package.json';
+ 
+ interface Configuration extends WebpackConfiguration {
+   devServer?: WebpackDevServerConfiguration;
+@@ -92,18 +93,39 @@ const config: Configuration = {
+   },
+   plugins: [
+     new ConsoleRemotePlugin({
++      pluginMetadata: process.env.CONSOLE_PLUGIN_NAME
++        ? { ...pkg.consolePlugin, name: process.env.CONSOLE_PLUGIN_NAME }
++        : undefined,
+       validateExtensionIntegrity: false,
+       extensions: [],
+     }),
+     new CopyWebpackPlugin({
+-      patterns: [{ from: path.resolve(__dirname, 'locales'), to: 'locales' }],
++      patterns: [
++        {
++          from: path.resolve(__dirname, 'locales'),
++          to({ absoluteFilename }) {
++            if (!absoluteFilename) {
++              return 'locales/[path][name][ext]';
++            }
++            const i18nNamespace = `plugin__${process.env.CONSOLE_PLUGIN_NAME ?? 'monitoring-plugin'}`;
++            const relativePath = path.relative(
++              path.resolve(__dirname, 'locales'),
++              absoluteFilename,
++            );
++            return path.join(
++              'locales',
++              relativePath.replace('plugin__monitoring-plugin', i18nNamespace),
++            );
++          },
++        },
++      ],
+     }),
+     new DefinePlugin({
+       // Build-time injection of proxy path for config module
+       PERSES_PROXY_BASE_URL: JSON.stringify('/api/proxy/plugin/monitoring-console-plugin/perses'),
+-      'process.env.I18N_NAMESPACE': process.env.I18N_NAMESPACE
+-        ? JSON.stringify(process.env.I18N_NAMESPACE)
+-        : JSON.stringify('plugin__monitoring-plugin'),
++      'process.env.I18N_NAMESPACE': JSON.stringify(
++        `plugin__${process.env.CONSOLE_PLUGIN_NAME ?? 'monitoring-plugin'}`,
++      ),
+     }),
+   ],
+   devtool: 'source-map',

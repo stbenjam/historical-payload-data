@@ -1,0 +1,183 @@
+diff --git a/hypershift-operator/controllers/nodepool/secret_janitor.go b/hypershift-operator/controllers/nodepool/secret_janitor.go
+index df64ba1eb2e1..070ff8d0ed42 100644
+--- a/hypershift-operator/controllers/nodepool/secret_janitor.go
++++ b/hypershift-operator/controllers/nodepool/secret_janitor.go
+@@ -169,14 +169,26 @@ func (r *secretJanitor) Reconcile(ctx context.Context, req reconcile.Request) (r
+ }
+ 
+ // shouldKeepOldUserData determines if the old user data should be kept.
+-// For AWS < 4.16, we keep the old userdata Secret so old Machines during rolled out can be deleted.
+-// Otherwise, deletion fails because of https://github.com/kubernetes-sigs/cluster-api-provider-aws/pull/3805.
+-// TODO (alberto): Drop this check when support for old versions without the fix is not needed anymore.
++// KubeVirt: the Secret is shared by all VMs in the NodePool generation and must
++// survive until the rollout completes and all old VMs are gone. This is an
++// architectural requirement, not a temporary workaround.
++// AWS: deletion fails on CAPA < v2.2.0 (OCP < 4.16) because of
++// https://github.com/kubernetes-sigs/cluster-api-provider-aws/pull/3805.
++// TODO (Alberto): remove the AWS guard when OCP < 4.16 support is dropped.
+ func (r *NodePoolReconciler) shouldKeepOldUserData(ctx context.Context, hc *hyperv1.HostedCluster) (bool, error) {
+-	if hc.Spec.Platform.Type != hyperv1.AWSPlatform {
++	switch hc.Spec.Platform.Type {
++	case hyperv1.KubevirtPlatform:
++		return true, nil
++	case hyperv1.AWSPlatform:
++		return r.shouldKeepOldUserDataAWS(ctx, hc)
++	default:
+ 		return false, nil
+ 	}
++}
+ 
++// shouldKeepOldUserDataAWS checks whether the AWS hosted cluster version is old
++// enough to require preserving the previous userdata Secret during rollout.
++func (r *NodePoolReconciler) shouldKeepOldUserDataAWS(ctx context.Context, hc *hyperv1.HostedCluster) (bool, error) {
+ 	// If there's a current version in status, be conservative and assume that one is the one running CAPA.
+ 	releaseImage := hc.Spec.Release.Image
+ 	if hc.Status.Version != nil {
+diff --git a/hypershift-operator/controllers/nodepool/secret_janitor_test.go b/hypershift-operator/controllers/nodepool/secret_janitor_test.go
+index 30072c5c7ac7..9ff1f7c4272e 100644
+--- a/hypershift-operator/controllers/nodepool/secret_janitor_test.go
++++ b/hypershift-operator/controllers/nodepool/secret_janitor_test.go
+@@ -484,7 +484,7 @@ func TestShouldKeepOldUserData(t *testing.T) {
+ 		expected             bool
+ 	}{
+ 		{
+-			name: "when hosted cluster is not aws it should NOT keep old user data",
++			name: "when hosted cluster is not aws or kubevirt it should NOT keep old user data",
+ 			hc: &hyperv1.HostedCluster{
+ 				TypeMeta: metav1.TypeMeta{},
+ 				ObjectMeta: metav1.ObjectMeta{
+@@ -506,6 +506,29 @@ func TestShouldKeepOldUserData(t *testing.T) {
+ 			releaseProvider: releaseinfo.NewMockProviderWithRegistryOverrides(mockCtrl),
+ 			expected:        false,
+ 		},
++		{
++			name: "when hosted cluster is kubevirt it should keep old user data",
++			hc: &hyperv1.HostedCluster{
++				TypeMeta: metav1.TypeMeta{},
++				ObjectMeta: metav1.ObjectMeta{
++					Namespace: pullSecret.Namespace,
++				},
++				Spec: hyperv1.HostedClusterSpec{
++					PullSecret: corev1.LocalObjectReference{
++						Name: pullSecret.Name,
++					},
++					Platform: hyperv1.PlatformSpec{
++						Type: hyperv1.KubevirtPlatform,
++					},
++					Release: hyperv1.Release{
++						Image: "fake-release-image",
++					},
++				},
++				Status: hyperv1.HostedClusterStatus{},
++			},
++			releaseProvider: releaseinfo.NewMockProviderWithRegistryOverrides(mockCtrl),
++			expected:        true,
++		},
+ 		{
+ 			name: "when hosted cluster is less than 4.16 it should keep user data",
+ 			hc: &hyperv1.HostedCluster{
+diff --git a/hypershift-operator/controllers/nodepool/token.go b/hypershift-operator/controllers/nodepool/token.go
+index a7e85b272c3f..bdea68450118 100644
+--- a/hypershift-operator/controllers/nodepool/token.go
++++ b/hypershift-operator/controllers/nodepool/token.go
+@@ -187,10 +187,14 @@ func (t *Token) cleanupOutdated(ctx context.Context) error {
+ 		}
+ 	}
+ 
+-	// For AWS, we keep the old userdata Secret so old Machines during rolled out can be deleted.
+-	// Otherwise, deletion fails because of https://github.com/kubernetes-sigs/cluster-api-provider-aws/pull/3805.
+-	// TODO (Alberto): enable back deletion when the PR above gets merged.
+-	if t.nodePool.Spec.Platform.Type != hyperv1.AWSPlatform {
++	// For AWS and KubeVirt, we keep the old userdata Secret so old Machines during rollout can be deleted.
++	// AWS: deletion fails on CAPA < v2.2.0 (OCP < 4.16) because of
++	// https://github.com/kubernetes-sigs/cluster-api-provider-aws/pull/3805.
++	// TODO (Alberto): remove the AWS guard when OCP < 4.16 support is dropped.
++	// KubeVirt: the Secret is shared by all VMs in the NodePool generation and must
++	// survive until the rollout completes and all old VMs are gone. This is an
++	// architectural requirement, not a temporary workaround.
++	if t.nodePool.Spec.Platform.Type != hyperv1.AWSPlatform && t.nodePool.Spec.Platform.Type != hyperv1.KubevirtPlatform {
+ 		userDataSecret := t.outdatedUserDataSecret()
+ 		err = t.Get(ctx, client.ObjectKeyFromObject(userDataSecret), userDataSecret)
+ 		if err != nil && !apierrors.IsNotFound(err) {
+diff --git a/hypershift-operator/controllers/nodepool/token_test.go b/hypershift-operator/controllers/nodepool/token_test.go
+index ef12006a48ed..e4d464784866 100644
+--- a/hypershift-operator/controllers/nodepool/token_test.go
++++ b/hypershift-operator/controllers/nodepool/token_test.go
+@@ -434,6 +434,58 @@ func TestTokenCleanupOutdated(t *testing.T) {
+ 			},
+ 			expectedError: "",
+ 		},
++		{
++			name: "When platform is KubeVirt, outdated userdata secret should be preserved and token secret should get an expiration timestamp",
++			token: &Token{
++				ConfigGenerator: &ConfigGenerator{
++					nodePool: &hyperv1.NodePool{
++						ObjectMeta: metav1.ObjectMeta{
++							Name: nodePoolName,
++							Annotations: map[string]string{
++								nodePoolAnnotationCurrentConfigVersion: outdatedHash,
++							},
++						},
++						Spec: hyperv1.NodePoolSpec{
++							Platform: hyperv1.NodePoolPlatform{
++								Type: hyperv1.KubevirtPlatform,
++							},
++						},
++					},
++					controlplaneNamespace: controlplaneNamespace,
++				},
++			},
++			fakeObjects: []crclient.Object{
++				userdataSecret.DeepCopy(),
++				tokenSecret.DeepCopy(),
++			},
++			expectedError: "",
++		},
++		{
++			name: "When platform is AWS, outdated userdata secret should be preserved and token secret should get an expiration timestamp",
++			token: &Token{
++				ConfigGenerator: &ConfigGenerator{
++					nodePool: &hyperv1.NodePool{
++						ObjectMeta: metav1.ObjectMeta{
++							Name: nodePoolName,
++							Annotations: map[string]string{
++								nodePoolAnnotationCurrentConfigVersion: outdatedHash,
++							},
++						},
++						Spec: hyperv1.NodePoolSpec{
++							Platform: hyperv1.NodePoolPlatform{
++								Type: hyperv1.AWSPlatform,
++							},
++						},
++					},
++					controlplaneNamespace: controlplaneNamespace,
++				},
++			},
++			fakeObjects: []crclient.Object{
++				userdataSecret.DeepCopy(),
++				tokenSecret.DeepCopy(),
++			},
++			expectedError: "",
++		},
+ 	}
+ 
+ 	for _, tc := range testCases {
+@@ -451,12 +503,15 @@ func TestTokenCleanupOutdated(t *testing.T) {
+ 			}
+ 			g.Expect(err).NotTo(HaveOccurred())
+ 
+-			// user data secret should be deleted.
+ 			got := &corev1.Secret{}
+ 			err = fakeClient.Get(t.Context(), crclient.ObjectKeyFromObject(userdataSecret), got)
+-			g.Expect(apierrors.IsNotFound(err)).To(BeTrue())
++			platformType := tc.token.nodePool.Spec.Platform.Type
++			if platformType == hyperv1.AWSPlatform || platformType == hyperv1.KubevirtPlatform {
++				g.Expect(err).ToNot(HaveOccurred(), "userdata secret should be preserved for %s platform", platformType)
++			} else {
++				g.Expect(apierrors.IsNotFound(err)).To(BeTrue(), "userdata secret should be deleted for %s platform", platformType)
++			}
+ 
+-			// token secret if exists it should be have an expiration time.
+ 			got = &corev1.Secret{}
+ 			err = fakeClient.Get(t.Context(), crclient.ObjectKeyFromObject(tokenSecret), got)
+ 			if err != nil {

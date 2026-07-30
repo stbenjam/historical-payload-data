@@ -1,0 +1,1613 @@
+diff --git a/cmd/bridge/main.go b/cmd/bridge/main.go
+index ed50747d3a7..439eba73757 100644
+--- a/cmd/bridge/main.go
++++ b/cmd/bridge/main.go
+@@ -765,7 +765,7 @@ func main() {
+ 		klog.Info("HTTP/2 enabled")
+ 	}
+ 
+-	listener, err := listen(listenURL.Scheme, listenURL.Host, *fTLSCertFile, *fTLSKeyFile)
++	listener, err := listen(listenURL.Scheme, listenURL.Host, *fTLSCertFile, *fTLSKeyFile, cfg.ServingInfo.MinTLSVersion, cfg.ServingInfo.CipherSuites)
+ 	if err != nil {
+ 		klog.Fatalf("error getting listener, %v", err)
+ 	}
+@@ -804,7 +804,7 @@ func main() {
+ 	httpsrv.Serve(listener)
+ }
+ 
+-func listen(scheme, host, certFile, keyFile string) (net.Listener, error) {
++func listen(scheme, host, certFile, keyFile, minTLSVersion string, cipherSuites []string) (net.Listener, error) {
+ 	klog.Infof("Binding to %s...", host)
+ 	if scheme == "http" {
+ 		klog.Info("Not using TLS")
+@@ -822,5 +822,26 @@ func listen(scheme, host, certFile, keyFile string) (net.Listener, error) {
+ 			return &cert, nil
+ 		},
+ 	}
++
++	if minTLSVersion != "" {
++		minVersion, err := oscrypto.TLSVersion(minTLSVersion)
++		if err != nil {
++			return nil, fmt.Errorf("invalid minTLSVersion %q: %w", minTLSVersion, err)
++		}
++		tlsConfig.MinVersion = minVersion
++	}
++
++	if len(cipherSuites) > 0 {
++		ciphers := make([]uint16, 0, len(cipherSuites))
++		for _, cipherName := range cipherSuites {
++			cipher, err := oscrypto.CipherSuite(cipherName)
++			if err != nil {
++				return nil, fmt.Errorf("invalid cipher suite %q: %w", cipherName, err)
++			}
++			ciphers = append(ciphers, cipher)
++		}
++		tlsConfig.CipherSuites = ciphers
++	}
++
+ 	return tls.Listen("tcp", host, tlsConfig)
+ }
+diff --git a/go.mod b/go.mod
+index d55bb7729f0..ad6d1738aa2 100644
+--- a/go.mod
++++ b/go.mod
+@@ -15,8 +15,8 @@ require (
+ 	github.com/gorilla/sessions v1.4.0
+ 	github.com/gorilla/websocket v1.5.4-0.20250319132907-e064f32e3674
+ 	github.com/openshift/api v3.9.0+incompatible
+-	github.com/openshift/client-go v0.0.0-20260108185524-48f4ccfc4e13
+-	github.com/openshift/library-go v0.0.0-20231020125034-5a2d9fe760b3
++	github.com/openshift/client-go v0.0.0-20260317180604-743f664b82d1
++	github.com/openshift/library-go v0.0.0-20260518122146-385e91fd29b1
+ 	github.com/operator-framework/api v0.42.0
+ 	github.com/operator-framework/kubectl-operator v0.6.1-0.20250318134414-b496b1036eaf
+ 	github.com/operator-framework/operator-controller v1.2.0
+diff --git a/go.sum b/go.sum
+index 7c6b7a84597..d843bd45555 100644
+--- a/go.sum
++++ b/go.sum
+@@ -434,10 +434,10 @@ github.com/opencontainers/runtime-spec v1.3.0 h1:YZupQUdctfhpZy3TM39nN9Ika5CBWT5
+ github.com/opencontainers/runtime-spec v1.3.0/go.mod h1:jwyrGlmzljRJv/Fgzds9SsS/C5hL+LL3ko9hs6T5lQ0=
+ github.com/openshift/api v0.0.0-20260114133223-6ab113cb7368 h1:kSr3DOlq0NCrHd65HB2o/pBsks7AfRm+fkpf9RLUPoc=
+ github.com/openshift/api v0.0.0-20260114133223-6ab113cb7368/go.mod h1:d5uzF0YN2nQQFA0jIEWzzOZ+edmo6wzlGLvx5Fhz4uY=
+-github.com/openshift/client-go v0.0.0-20260108185524-48f4ccfc4e13 h1:6rd4zSo2UaWQcAPZfHK9yzKVqH0BnMv1hqMzqXZyTds=
+-github.com/openshift/client-go v0.0.0-20260108185524-48f4ccfc4e13/go.mod h1:YvOmPmV7wcJxpfhTDuFqqs2Xpb3M3ovsM6Qs/i2ptq4=
+-github.com/openshift/library-go v0.0.0-20231020125034-5a2d9fe760b3 h1:RmbS0Ea69/ejW0HqUoUjO72EfNc/biuVDjODEDl/EnE=
+-github.com/openshift/library-go v0.0.0-20231020125034-5a2d9fe760b3/go.mod h1:8UzmrBMCn7+GzouL8DVYkL9COBQTB1Ggd13/mHJQCUg=
++github.com/openshift/client-go v0.0.0-20260317180604-743f664b82d1 h1:Hr/R38eg5ZJXfbiaHumjJIN1buDZwhsm4ys4npVCXH0=
++github.com/openshift/client-go v0.0.0-20260317180604-743f664b82d1/go.mod h1:Za51LlH76ALiQ/aKGBYJXmyJNkA//IDJ+I///30CA2M=
++github.com/openshift/library-go v0.0.0-20260518122146-385e91fd29b1 h1:PV/TYEV+otsCxgXPakMaK1KXxcmtZhKPkmoSrU2tMF4=
++github.com/openshift/library-go v0.0.0-20260518122146-385e91fd29b1/go.mod h1:rYGQrSg+t1JEzeEwg6BJw3loPpXg/n3kgRygUpgxavY=
+ github.com/operator-framework/api v0.42.0 h1:rkc5V3zW8RxZMjePAe12jdL7Co/hwsYo1pLnkkhuR7s=
+ github.com/operator-framework/api v0.42.0/go.mod h1:bMEj+wl/8tGqcGNtxt38cLUYagu9chNsbYzb/5HQaUQ=
+ github.com/operator-framework/kubectl-operator v0.6.1-0.20250318134414-b496b1036eaf h1:TsqL/iEVSwf2IUx3wDqD664pYC6vYR9/d/gfVO4cgH8=
+diff --git a/pkg/serverconfig/config.go b/pkg/serverconfig/config.go
+index ca3a2abf741..a06d699fd15 100644
+--- a/pkg/serverconfig/config.go
++++ b/pkg/serverconfig/config.go
+@@ -236,14 +236,6 @@ func addServingInfo(fs *flag.FlagSet, servingInfo *ServingInfo) (err error) {
+ 		return errors.New("servingInfo.namedCertificates are not supported")
+ 	}
+ 
+-	if servingInfo.MinTLSVersion != "" {
+-		return errors.New("servingInfo.minTLSVersion is not supported")
+-	}
+-
+-	if len(servingInfo.CipherSuites) > 0 {
+-		return errors.New("servingInfo.cipherSuites is not supported")
+-	}
+-
+ 	if servingInfo.MaxRequestsInFlight != 0 {
+ 		return errors.New("servingInfo.maxRequestsInFlight is not supported")
+ 	}
+diff --git a/pkg/serverconfig/types.go b/pkg/serverconfig/types.go
+index 2fa2ca9ae6d..b74c11d9d0e 100644
+--- a/pkg/serverconfig/types.go
++++ b/pkg/serverconfig/types.go
+@@ -44,18 +44,18 @@ type ProxyService struct {
+ 
+ // ServingInfo holds configuration for serving HTTP.
+ type ServingInfo struct {
+-	BindAddress  string `yaml:"bindAddress,omitempty"`
+-	CertFile     string `yaml:"certFile,omitempty"`
+-	KeyFile      string `yaml:"keyFile,omitempty"`
+-	RedirectPort int    `yaml:"redirectPort,omitempty"`
++	BindAddress   string   `yaml:"bindAddress,omitempty"`
++	CertFile      string   `yaml:"certFile,omitempty"`
++	KeyFile       string   `yaml:"keyFile,omitempty"`
++	RedirectPort  int      `yaml:"redirectPort,omitempty"`
++	MinTLSVersion string   `yaml:"minTLSVersion,omitempty"`
++	CipherSuites  []string `yaml:"cipherSuites,omitempty"`
+ 
+ 	// These fields are defined in `HTTPServingInfo`, but are not supported for console. Fail if any are specified.
+ 	// https://github.com/openshift/api/blob/0cb4131a7636e1ada6b2769edc9118f0fe6844c8/config/v1/types.go#L7-L38
+ 	BindNetwork           string        `yaml:"bindNetwork,omitempty"`
+ 	ClientCA              string        `yaml:"clientCA,omitempty"`
+ 	NamedCertificates     []interface{} `yaml:"namedCertificates,omitempty"`
+-	MinTLSVersion         string        `yaml:"minTLSVersion,omitempty"`
+-	CipherSuites          []string      `yaml:"cipherSuites,omitempty"`
+ 	MaxRequestsInFlight   int64         `yaml:"maxRequestsInFlight,omitempty"`
+ 	RequestTimeoutSeconds int64         `yaml:"requestTimeoutSeconds,omitempty"`
+ }
+diff --git a/vendor/github.com/openshift/client-go/oauth/applyconfigurations/internal/internal.go b/vendor/github.com/openshift/client-go/oauth/applyconfigurations/internal/internal.go
+index cc686d1d1cd..d2d4836f3ce 100644
+--- a/vendor/github.com/openshift/client-go/oauth/applyconfigurations/internal/internal.go
++++ b/vendor/github.com/openshift/client-go/oauth/applyconfigurations/internal/internal.go
+@@ -23,6 +23,133 @@ func Parser() *typed.Parser {
+ var parserOnce sync.Once
+ var parser *typed.Parser
+ var schemaYAML = typed.YAMLObject(`types:
++- name: FieldsV1.v1.meta.apis.pkg.apimachinery.k8s.io
++  map:
++    elementType:
++      scalar: untyped
++      list:
++        elementType:
++          namedType: __untyped_atomic_
++        elementRelationship: atomic
++      map:
++        elementType:
++          namedType: __untyped_deduced_
++        elementRelationship: separable
++- name: ManagedFieldsEntry.v1.meta.apis.pkg.apimachinery.k8s.io
++  map:
++    fields:
++    - name: apiVersion
++      type:
++        scalar: string
++    - name: fieldsType
++      type:
++        scalar: string
++    - name: fieldsV1
++      type:
++        namedType: FieldsV1.v1.meta.apis.pkg.apimachinery.k8s.io
++    - name: manager
++      type:
++        scalar: string
++    - name: operation
++      type:
++        scalar: string
++    - name: subresource
++      type:
++        scalar: string
++    - name: time
++      type:
++        namedType: Time.v1.meta.apis.pkg.apimachinery.k8s.io
++- name: ObjectMeta.v1.meta.apis.pkg.apimachinery.k8s.io
++  map:
++    fields:
++    - name: annotations
++      type:
++        map:
++          elementType:
++            scalar: string
++    - name: creationTimestamp
++      type:
++        namedType: Time.v1.meta.apis.pkg.apimachinery.k8s.io
++    - name: deletionGracePeriodSeconds
++      type:
++        scalar: numeric
++    - name: deletionTimestamp
++      type:
++        namedType: Time.v1.meta.apis.pkg.apimachinery.k8s.io
++    - name: finalizers
++      type:
++        list:
++          elementType:
++            scalar: string
++          elementRelationship: associative
++    - name: generateName
++      type:
++        scalar: string
++    - name: generation
++      type:
++        scalar: numeric
++    - name: labels
++      type:
++        map:
++          elementType:
++            scalar: string
++    - name: managedFields
++      type:
++        list:
++          elementType:
++            namedType: ManagedFieldsEntry.v1.meta.apis.pkg.apimachinery.k8s.io
++          elementRelationship: atomic
++    - name: name
++      type:
++        scalar: string
++    - name: namespace
++      type:
++        scalar: string
++    - name: ownerReferences
++      type:
++        list:
++          elementType:
++            namedType: OwnerReference.v1.meta.apis.pkg.apimachinery.k8s.io
++          elementRelationship: associative
++          keys:
++          - uid
++    - name: resourceVersion
++      type:
++        scalar: string
++    - name: selfLink
++      type:
++        scalar: string
++    - name: uid
++      type:
++        scalar: string
++- name: OwnerReference.v1.meta.apis.pkg.apimachinery.k8s.io
++  map:
++    fields:
++    - name: apiVersion
++      type:
++        scalar: string
++      default: ""
++    - name: blockOwnerDeletion
++      type:
++        scalar: boolean
++    - name: controller
++      type:
++        scalar: boolean
++    - name: kind
++      type:
++        scalar: string
++      default: ""
++    - name: name
++      type:
++        scalar: string
++      default: ""
++    - name: uid
++      type:
++        scalar: string
++      default: ""
++    elementRelationship: atomic
++- name: Time.v1.meta.apis.pkg.apimachinery.k8s.io
++  scalar: untyped
+ - name: com.github.openshift.api.oauth.v1.ClusterRoleScopeRestriction
+   map:
+     fields:
+@@ -65,7 +192,7 @@ var schemaYAML = typed.YAMLObject(`types:
+         scalar: string
+     - name: metadata
+       type:
+-        namedType: io.k8s.apimachinery.pkg.apis.meta.v1.ObjectMeta
++        namedType: ObjectMeta.v1.meta.apis.pkg.apimachinery.k8s.io
+       default: {}
+     - name: redirectURI
+       type:
+@@ -108,7 +235,7 @@ var schemaYAML = typed.YAMLObject(`types:
+         scalar: string
+     - name: metadata
+       type:
+-        namedType: io.k8s.apimachinery.pkg.apis.meta.v1.ObjectMeta
++        namedType: ObjectMeta.v1.meta.apis.pkg.apimachinery.k8s.io
+       default: {}
+     - name: redirectURI
+       type:
+@@ -154,7 +281,7 @@ var schemaYAML = typed.YAMLObject(`types:
+         scalar: string
+     - name: metadata
+       type:
+-        namedType: io.k8s.apimachinery.pkg.apis.meta.v1.ObjectMeta
++        namedType: ObjectMeta.v1.meta.apis.pkg.apimachinery.k8s.io
+       default: {}
+     - name: redirectURIs
+       type:
+@@ -188,7 +315,7 @@ var schemaYAML = typed.YAMLObject(`types:
+         scalar: string
+     - name: metadata
+       type:
+-        namedType: io.k8s.apimachinery.pkg.apis.meta.v1.ObjectMeta
++        namedType: ObjectMeta.v1.meta.apis.pkg.apimachinery.k8s.io
+       default: {}
+     - name: scopes
+       type:
+@@ -237,7 +364,7 @@ var schemaYAML = typed.YAMLObject(`types:
+         scalar: string
+     - name: metadata
+       type:
+-        namedType: io.k8s.apimachinery.pkg.apis.meta.v1.ObjectMeta
++        namedType: ObjectMeta.v1.meta.apis.pkg.apimachinery.k8s.io
+       default: {}
+     - name: redirectURI
+       type:
+@@ -257,133 +384,6 @@ var schemaYAML = typed.YAMLObject(`types:
+     - name: userUID
+       type:
+         scalar: string
+-- name: io.k8s.apimachinery.pkg.apis.meta.v1.FieldsV1
+-  map:
+-    elementType:
+-      scalar: untyped
+-      list:
+-        elementType:
+-          namedType: __untyped_atomic_
+-        elementRelationship: atomic
+-      map:
+-        elementType:
+-          namedType: __untyped_deduced_
+-        elementRelationship: separable
+-- name: io.k8s.apimachinery.pkg.apis.meta.v1.ManagedFieldsEntry
+-  map:
+-    fields:
+-    - name: apiVersion
+-      type:
+-        scalar: string
+-    - name: fieldsType
+-      type:
+-        scalar: string
+-    - name: fieldsV1
+-      type:
+-        namedType: io.k8s.apimachinery.pkg.apis.meta.v1.FieldsV1
+-    - name: manager
+-      type:
+-        scalar: string
+-    - name: operation
+-      type:
+-        scalar: string
+-    - name: subresource
+-      type:
+-        scalar: string
+-    - name: time
+-      type:
+-        namedType: io.k8s.apimachinery.pkg.apis.meta.v1.Time
+-- name: io.k8s.apimachinery.pkg.apis.meta.v1.ObjectMeta
+-  map:
+-    fields:
+-    - name: annotations
+-      type:
+-        map:
+-          elementType:
+-            scalar: string
+-    - name: creationTimestamp
+-      type:
+-        namedType: io.k8s.apimachinery.pkg.apis.meta.v1.Time
+-    - name: deletionGracePeriodSeconds
+-      type:
+-        scalar: numeric
+-    - name: deletionTimestamp
+-      type:
+-        namedType: io.k8s.apimachinery.pkg.apis.meta.v1.Time
+-    - name: finalizers
+-      type:
+-        list:
+-          elementType:
+-            scalar: string
+-          elementRelationship: associative
+-    - name: generateName
+-      type:
+-        scalar: string
+-    - name: generation
+-      type:
+-        scalar: numeric
+-    - name: labels
+-      type:
+-        map:
+-          elementType:
+-            scalar: string
+-    - name: managedFields
+-      type:
+-        list:
+-          elementType:
+-            namedType: io.k8s.apimachinery.pkg.apis.meta.v1.ManagedFieldsEntry
+-          elementRelationship: atomic
+-    - name: name
+-      type:
+-        scalar: string
+-    - name: namespace
+-      type:
+-        scalar: string
+-    - name: ownerReferences
+-      type:
+-        list:
+-          elementType:
+-            namedType: io.k8s.apimachinery.pkg.apis.meta.v1.OwnerReference
+-          elementRelationship: associative
+-          keys:
+-          - uid
+-    - name: resourceVersion
+-      type:
+-        scalar: string
+-    - name: selfLink
+-      type:
+-        scalar: string
+-    - name: uid
+-      type:
+-        scalar: string
+-- name: io.k8s.apimachinery.pkg.apis.meta.v1.OwnerReference
+-  map:
+-    fields:
+-    - name: apiVersion
+-      type:
+-        scalar: string
+-      default: ""
+-    - name: blockOwnerDeletion
+-      type:
+-        scalar: boolean
+-    - name: controller
+-      type:
+-        scalar: boolean
+-    - name: kind
+-      type:
+-        scalar: string
+-      default: ""
+-    - name: name
+-      type:
+-        scalar: string
+-      default: ""
+-    - name: uid
+-      type:
+-        scalar: string
+-      default: ""
+-    elementRelationship: atomic
+-- name: io.k8s.apimachinery.pkg.apis.meta.v1.Time
+-  scalar: untyped
+ - name: __untyped_atomic_
+   scalar: untyped
+   list:
+diff --git a/vendor/github.com/openshift/client-go/oauth/applyconfigurations/oauth/v1/clusterrolescoperestriction.go b/vendor/github.com/openshift/client-go/oauth/applyconfigurations/oauth/v1/clusterrolescoperestriction.go
+index 692ef70516f..87405dda666 100644
+--- a/vendor/github.com/openshift/client-go/oauth/applyconfigurations/oauth/v1/clusterrolescoperestriction.go
++++ b/vendor/github.com/openshift/client-go/oauth/applyconfigurations/oauth/v1/clusterrolescoperestriction.go
+@@ -4,10 +4,15 @@ package v1
+ 
+ // ClusterRoleScopeRestrictionApplyConfiguration represents a declarative configuration of the ClusterRoleScopeRestriction type for use
+ // with apply.
++//
++// ClusterRoleScopeRestriction describes restrictions on cluster role scopes
+ type ClusterRoleScopeRestrictionApplyConfiguration struct {
+-	RoleNames       []string `json:"roleNames,omitempty"`
+-	Namespaces      []string `json:"namespaces,omitempty"`
+-	AllowEscalation *bool    `json:"allowEscalation,omitempty"`
++	// roleNames is the list of cluster roles that can referenced.  * means anything
++	RoleNames []string `json:"roleNames,omitempty"`
++	// namespaces is the list of namespaces that can be referenced.  * means any of them (including *)
++	Namespaces []string `json:"namespaces,omitempty"`
++	// allowEscalation indicates whether you can request roles and their escalating resources
++	AllowEscalation *bool `json:"allowEscalation,omitempty"`
+ }
+ 
+ // ClusterRoleScopeRestrictionApplyConfiguration constructs a declarative configuration of the ClusterRoleScopeRestriction type for use with
+diff --git a/vendor/github.com/openshift/client-go/oauth/applyconfigurations/oauth/v1/oauthaccesstoken.go b/vendor/github.com/openshift/client-go/oauth/applyconfigurations/oauth/v1/oauthaccesstoken.go
+index faf1a15b635..4063a321866 100644
+--- a/vendor/github.com/openshift/client-go/oauth/applyconfigurations/oauth/v1/oauthaccesstoken.go
++++ b/vendor/github.com/openshift/client-go/oauth/applyconfigurations/oauth/v1/oauthaccesstoken.go
+@@ -13,18 +13,40 @@ import (
+ 
+ // OAuthAccessTokenApplyConfiguration represents a declarative configuration of the OAuthAccessToken type for use
+ // with apply.
++//
++// OAuthAccessToken describes an OAuth access token.
++// The name of a token must be prefixed with a `sha256~` string, must not contain "/" or "%" characters and must be at
++// least 32 characters long.
++//
++// The name of the token is constructed from the actual token by sha256-hashing it and using URL-safe unpadded
++// base64-encoding (as described in RFC4648) on the hashed result.
++//
++// Compatibility level 1: Stable within a major release for a minimum of 12 months or 3 minor releases (whichever is longer).
+ type OAuthAccessTokenApplyConfiguration struct {
+-	metav1.TypeMetaApplyConfiguration    `json:",inline"`
++	metav1.TypeMetaApplyConfiguration `json:",inline"`
++	// metadata is the standard object's metadata.
++	// More info: https://git.k8s.io/community/contributors/devel/sig-architecture/api-conventions.md#metadata
+ 	*metav1.ObjectMetaApplyConfiguration `json:"metadata,omitempty"`
+-	ClientName                           *string  `json:"clientName,omitempty"`
+-	ExpiresIn                            *int64   `json:"expiresIn,omitempty"`
+-	Scopes                               []string `json:"scopes,omitempty"`
+-	RedirectURI                          *string  `json:"redirectURI,omitempty"`
+-	UserName                             *string  `json:"userName,omitempty"`
+-	UserUID                              *string  `json:"userUID,omitempty"`
+-	AuthorizeToken                       *string  `json:"authorizeToken,omitempty"`
+-	RefreshToken                         *string  `json:"refreshToken,omitempty"`
+-	InactivityTimeoutSeconds             *int32   `json:"inactivityTimeoutSeconds,omitempty"`
++	// clientName references the client that created this token.
++	ClientName *string `json:"clientName,omitempty"`
++	// expiresIn is the seconds from CreationTime before this token expires.
++	ExpiresIn *int64 `json:"expiresIn,omitempty"`
++	// scopes is an array of the requested scopes.
++	Scopes []string `json:"scopes,omitempty"`
++	// redirectURI is the redirection associated with the token.
++	RedirectURI *string `json:"redirectURI,omitempty"`
++	// userName is the user name associated with this token
++	UserName *string `json:"userName,omitempty"`
++	// userUID is the unique UID associated with this token
++	UserUID *string `json:"userUID,omitempty"`
++	// authorizeToken contains the token that authorized this token
++	AuthorizeToken *string `json:"authorizeToken,omitempty"`
++	// refreshToken is the value by which this token can be renewed. Can be blank.
++	RefreshToken *string `json:"refreshToken,omitempty"`
++	// inactivityTimeoutSeconds is the value in seconds, from the
++	// CreationTimestamp, after which this token can no longer be used.
++	// The value is automatically incremented when the token is used.
++	InactivityTimeoutSeconds *int32 `json:"inactivityTimeoutSeconds,omitempty"`
+ }
+ 
+ // OAuthAccessToken constructs a declarative configuration of the OAuthAccessToken type for use with
+@@ -37,29 +59,14 @@ func OAuthAccessToken(name string) *OAuthAccessTokenApplyConfiguration {
+ 	return b
+ }
+ 
+-// ExtractOAuthAccessToken extracts the applied configuration owned by fieldManager from
+-// oAuthAccessToken. If no managedFields are found in oAuthAccessToken for fieldManager, a
+-// OAuthAccessTokenApplyConfiguration is returned with only the Name, Namespace (if applicable),
+-// APIVersion and Kind populated. It is possible that no managed fields were found for because other
+-// field managers have taken ownership of all the fields previously owned by fieldManager, or because
+-// the fieldManager never owned fields any fields.
++// ExtractOAuthAccessTokenFrom extracts the applied configuration owned by fieldManager from
++// oAuthAccessToken for the specified subresource. Pass an empty string for subresource to extract
++// the main resource. Common subresources include "status", "scale", etc.
+ // oAuthAccessToken must be a unmodified OAuthAccessToken API object that was retrieved from the Kubernetes API.
+-// ExtractOAuthAccessToken provides a way to perform a extract/modify-in-place/apply workflow.
++// ExtractOAuthAccessTokenFrom provides a way to perform a extract/modify-in-place/apply workflow.
+ // Note that an extracted apply configuration will contain fewer fields than what the fieldManager previously
+ // applied if another fieldManager has updated or force applied any of the previously applied fields.
+-// Experimental!
+-func ExtractOAuthAccessToken(oAuthAccessToken *oauthv1.OAuthAccessToken, fieldManager string) (*OAuthAccessTokenApplyConfiguration, error) {
+-	return extractOAuthAccessToken(oAuthAccessToken, fieldManager, "")
+-}
+-
+-// ExtractOAuthAccessTokenStatus is the same as ExtractOAuthAccessToken except
+-// that it extracts the status subresource applied configuration.
+-// Experimental!
+-func ExtractOAuthAccessTokenStatus(oAuthAccessToken *oauthv1.OAuthAccessToken, fieldManager string) (*OAuthAccessTokenApplyConfiguration, error) {
+-	return extractOAuthAccessToken(oAuthAccessToken, fieldManager, "status")
+-}
+-
+-func extractOAuthAccessToken(oAuthAccessToken *oauthv1.OAuthAccessToken, fieldManager string, subresource string) (*OAuthAccessTokenApplyConfiguration, error) {
++func ExtractOAuthAccessTokenFrom(oAuthAccessToken *oauthv1.OAuthAccessToken, fieldManager string, subresource string) (*OAuthAccessTokenApplyConfiguration, error) {
+ 	b := &OAuthAccessTokenApplyConfiguration{}
+ 	err := managedfields.ExtractInto(oAuthAccessToken, internal.Parser().Type("com.github.openshift.api.oauth.v1.OAuthAccessToken"), fieldManager, b, subresource)
+ 	if err != nil {
+@@ -71,6 +78,21 @@ func extractOAuthAccessToken(oAuthAccessToken *oauthv1.OAuthAccessToken, fieldMa
+ 	b.WithAPIVersion("oauth.openshift.io/v1")
+ 	return b, nil
+ }
++
++// ExtractOAuthAccessToken extracts the applied configuration owned by fieldManager from
++// oAuthAccessToken. If no managedFields are found in oAuthAccessToken for fieldManager, a
++// OAuthAccessTokenApplyConfiguration is returned with only the Name, Namespace (if applicable),
++// APIVersion and Kind populated. It is possible that no managed fields were found for because other
++// field managers have taken ownership of all the fields previously owned by fieldManager, or because
++// the fieldManager never owned fields any fields.
++// oAuthAccessToken must be a unmodified OAuthAccessToken API object that was retrieved from the Kubernetes API.
++// ExtractOAuthAccessToken provides a way to perform a extract/modify-in-place/apply workflow.
++// Note that an extracted apply configuration will contain fewer fields than what the fieldManager previously
++// applied if another fieldManager has updated or force applied any of the previously applied fields.
++func ExtractOAuthAccessToken(oAuthAccessToken *oauthv1.OAuthAccessToken, fieldManager string) (*OAuthAccessTokenApplyConfiguration, error) {
++	return ExtractOAuthAccessTokenFrom(oAuthAccessToken, fieldManager, "")
++}
++
+ func (b OAuthAccessTokenApplyConfiguration) IsApplyConfiguration() {}
+ 
+ // WithKind sets the Kind field in the declarative configuration to the given value
+diff --git a/vendor/github.com/openshift/client-go/oauth/applyconfigurations/oauth/v1/oauthauthorizetoken.go b/vendor/github.com/openshift/client-go/oauth/applyconfigurations/oauth/v1/oauthauthorizetoken.go
+index ba7a4f08536..ff4f4a87272 100644
+--- a/vendor/github.com/openshift/client-go/oauth/applyconfigurations/oauth/v1/oauthauthorizetoken.go
++++ b/vendor/github.com/openshift/client-go/oauth/applyconfigurations/oauth/v1/oauthauthorizetoken.go
+@@ -13,18 +13,34 @@ import (
+ 
+ // OAuthAuthorizeTokenApplyConfiguration represents a declarative configuration of the OAuthAuthorizeToken type for use
+ // with apply.
++//
++// # OAuthAuthorizeToken describes an OAuth authorization token
++//
++// Compatibility level 1: Stable within a major release for a minimum of 12 months or 3 minor releases (whichever is longer).
+ type OAuthAuthorizeTokenApplyConfiguration struct {
+-	metav1.TypeMetaApplyConfiguration    `json:",inline"`
++	metav1.TypeMetaApplyConfiguration `json:",inline"`
++	// metadata is the standard object's metadata.
++	// More info: https://git.k8s.io/community/contributors/devel/sig-architecture/api-conventions.md#metadata
+ 	*metav1.ObjectMetaApplyConfiguration `json:"metadata,omitempty"`
+-	ClientName                           *string  `json:"clientName,omitempty"`
+-	ExpiresIn                            *int64   `json:"expiresIn,omitempty"`
+-	Scopes                               []string `json:"scopes,omitempty"`
+-	RedirectURI                          *string  `json:"redirectURI,omitempty"`
+-	State                                *string  `json:"state,omitempty"`
+-	UserName                             *string  `json:"userName,omitempty"`
+-	UserUID                              *string  `json:"userUID,omitempty"`
+-	CodeChallenge                        *string  `json:"codeChallenge,omitempty"`
+-	CodeChallengeMethod                  *string  `json:"codeChallengeMethod,omitempty"`
++	// clientName references the client that created this token.
++	ClientName *string `json:"clientName,omitempty"`
++	// expiresIn is the seconds from CreationTime before this token expires.
++	ExpiresIn *int64 `json:"expiresIn,omitempty"`
++	// scopes is an array of the requested scopes.
++	Scopes []string `json:"scopes,omitempty"`
++	// redirectURI is the redirection associated with the token.
++	RedirectURI *string `json:"redirectURI,omitempty"`
++	// state data from request
++	State *string `json:"state,omitempty"`
++	// userName is the user name associated with this token
++	UserName *string `json:"userName,omitempty"`
++	// userUID is the unique UID associated with this token. UserUID and UserName must both match
++	// for this token to be valid.
++	UserUID *string `json:"userUID,omitempty"`
++	// codeChallenge is the optional code_challenge associated with this authorization code, as described in rfc7636
++	CodeChallenge *string `json:"codeChallenge,omitempty"`
++	// codeChallengeMethod is the optional code_challenge_method associated with this authorization code, as described in rfc7636
++	CodeChallengeMethod *string `json:"codeChallengeMethod,omitempty"`
+ }
+ 
+ // OAuthAuthorizeToken constructs a declarative configuration of the OAuthAuthorizeToken type for use with
+@@ -37,29 +53,14 @@ func OAuthAuthorizeToken(name string) *OAuthAuthorizeTokenApplyConfiguration {
+ 	return b
+ }
+ 
+-// ExtractOAuthAuthorizeToken extracts the applied configuration owned by fieldManager from
+-// oAuthAuthorizeToken. If no managedFields are found in oAuthAuthorizeToken for fieldManager, a
+-// OAuthAuthorizeTokenApplyConfiguration is returned with only the Name, Namespace (if applicable),
+-// APIVersion and Kind populated. It is possible that no managed fields were found for because other
+-// field managers have taken ownership of all the fields previously owned by fieldManager, or because
+-// the fieldManager never owned fields any fields.
++// ExtractOAuthAuthorizeTokenFrom extracts the applied configuration owned by fieldManager from
++// oAuthAuthorizeToken for the specified subresource. Pass an empty string for subresource to extract
++// the main resource. Common subresources include "status", "scale", etc.
+ // oAuthAuthorizeToken must be a unmodified OAuthAuthorizeToken API object that was retrieved from the Kubernetes API.
+-// ExtractOAuthAuthorizeToken provides a way to perform a extract/modify-in-place/apply workflow.
++// ExtractOAuthAuthorizeTokenFrom provides a way to perform a extract/modify-in-place/apply workflow.
+ // Note that an extracted apply configuration will contain fewer fields than what the fieldManager previously
+ // applied if another fieldManager has updated or force applied any of the previously applied fields.
+-// Experimental!
+-func ExtractOAuthAuthorizeToken(oAuthAuthorizeToken *oauthv1.OAuthAuthorizeToken, fieldManager string) (*OAuthAuthorizeTokenApplyConfiguration, error) {
+-	return extractOAuthAuthorizeToken(oAuthAuthorizeToken, fieldManager, "")
+-}
+-
+-// ExtractOAuthAuthorizeTokenStatus is the same as ExtractOAuthAuthorizeToken except
+-// that it extracts the status subresource applied configuration.
+-// Experimental!
+-func ExtractOAuthAuthorizeTokenStatus(oAuthAuthorizeToken *oauthv1.OAuthAuthorizeToken, fieldManager string) (*OAuthAuthorizeTokenApplyConfiguration, error) {
+-	return extractOAuthAuthorizeToken(oAuthAuthorizeToken, fieldManager, "status")
+-}
+-
+-func extractOAuthAuthorizeToken(oAuthAuthorizeToken *oauthv1.OAuthAuthorizeToken, fieldManager string, subresource string) (*OAuthAuthorizeTokenApplyConfiguration, error) {
++func ExtractOAuthAuthorizeTokenFrom(oAuthAuthorizeToken *oauthv1.OAuthAuthorizeToken, fieldManager string, subresource string) (*OAuthAuthorizeTokenApplyConfiguration, error) {
+ 	b := &OAuthAuthorizeTokenApplyConfiguration{}
+ 	err := managedfields.ExtractInto(oAuthAuthorizeToken, internal.Parser().Type("com.github.openshift.api.oauth.v1.OAuthAuthorizeToken"), fieldManager, b, subresource)
+ 	if err != nil {
+@@ -71,6 +72,21 @@ func extractOAuthAuthorizeToken(oAuthAuthorizeToken *oauthv1.OAuthAuthorizeToken
+ 	b.WithAPIVersion("oauth.openshift.io/v1")
+ 	return b, nil
+ }
++
++// ExtractOAuthAuthorizeToken extracts the applied configuration owned by fieldManager from
++// oAuthAuthorizeToken. If no managedFields are found in oAuthAuthorizeToken for fieldManager, a
++// OAuthAuthorizeTokenApplyConfiguration is returned with only the Name, Namespace (if applicable),
++// APIVersion and Kind populated. It is possible that no managed fields were found for because other
++// field managers have taken ownership of all the fields previously owned by fieldManager, or because
++// the fieldManager never owned fields any fields.
++// oAuthAuthorizeToken must be a unmodified OAuthAuthorizeToken API object that was retrieved from the Kubernetes API.
++// ExtractOAuthAuthorizeToken provides a way to perform a extract/modify-in-place/apply workflow.
++// Note that an extracted apply configuration will contain fewer fields than what the fieldManager previously
++// applied if another fieldManager has updated or force applied any of the previously applied fields.
++func ExtractOAuthAuthorizeToken(oAuthAuthorizeToken *oauthv1.OAuthAuthorizeToken, fieldManager string) (*OAuthAuthorizeTokenApplyConfiguration, error) {
++	return ExtractOAuthAuthorizeTokenFrom(oAuthAuthorizeToken, fieldManager, "")
++}
++
+ func (b OAuthAuthorizeTokenApplyConfiguration) IsApplyConfiguration() {}
+ 
+ // WithKind sets the Kind field in the declarative configuration to the given value
+diff --git a/vendor/github.com/openshift/client-go/oauth/applyconfigurations/oauth/v1/oauthclient.go b/vendor/github.com/openshift/client-go/oauth/applyconfigurations/oauth/v1/oauthclient.go
+index 0f0f5e8a649..768d5312a3f 100644
+--- a/vendor/github.com/openshift/client-go/oauth/applyconfigurations/oauth/v1/oauthclient.go
++++ b/vendor/github.com/openshift/client-go/oauth/applyconfigurations/oauth/v1/oauthclient.go
+@@ -13,17 +13,50 @@ import (
+ 
+ // OAuthClientApplyConfiguration represents a declarative configuration of the OAuthClient type for use
+ // with apply.
++//
++// # OAuthClient describes an OAuth client
++//
++// Compatibility level 1: Stable within a major release for a minimum of 12 months or 3 minor releases (whichever is longer).
+ type OAuthClientApplyConfiguration struct {
+-	metav1.TypeMetaApplyConfiguration    `json:",inline"`
++	metav1.TypeMetaApplyConfiguration `json:",inline"`
++	// metadata is the standard object's metadata.
++	// More info: https://git.k8s.io/community/contributors/devel/sig-architecture/api-conventions.md#metadata
+ 	*metav1.ObjectMetaApplyConfiguration `json:"metadata,omitempty"`
+-	Secret                               *string                              `json:"secret,omitempty"`
+-	AdditionalSecrets                    []string                             `json:"additionalSecrets,omitempty"`
+-	RespondWithChallenges                *bool                                `json:"respondWithChallenges,omitempty"`
+-	RedirectURIs                         []string                             `json:"redirectURIs,omitempty"`
+-	GrantMethod                          *oauthv1.GrantHandlerType            `json:"grantMethod,omitempty"`
+-	ScopeRestrictions                    []ScopeRestrictionApplyConfiguration `json:"scopeRestrictions,omitempty"`
+-	AccessTokenMaxAgeSeconds             *int32                               `json:"accessTokenMaxAgeSeconds,omitempty"`
+-	AccessTokenInactivityTimeoutSeconds  *int32                               `json:"accessTokenInactivityTimeoutSeconds,omitempty"`
++	// secret is the unique secret associated with a client
++	Secret *string `json:"secret,omitempty"`
++	// additionalSecrets holds other secrets that may be used to identify the client.  This is useful for rotation
++	// and for service account token validation
++	AdditionalSecrets []string `json:"additionalSecrets,omitempty"`
++	// respondWithChallenges indicates whether the client wants authentication needed responses made in the form of challenges instead of redirects
++	RespondWithChallenges *bool `json:"respondWithChallenges,omitempty"`
++	// redirectURIs is the valid redirection URIs associated with a client
++	RedirectURIs []string `json:"redirectURIs,omitempty"`
++	// grantMethod is a required field which determines how to handle grants for this client.
++	// Valid grant handling methods are:
++	// - auto:   always approves grant requests, useful for trusted clients
++	// - prompt: prompts the end user for approval of grant requests, useful for third-party clients
++	GrantMethod *oauthv1.GrantHandlerType `json:"grantMethod,omitempty"`
++	// scopeRestrictions describes which scopes this client can request.  Each requested scope
++	// is checked against each restriction.  If any restriction matches, then the scope is allowed.
++	// If no restriction matches, then the scope is denied.
++	ScopeRestrictions []ScopeRestrictionApplyConfiguration `json:"scopeRestrictions,omitempty"`
++	// accessTokenMaxAgeSeconds overrides the default access token max age for tokens granted to this client.
++	// 0 means no expiration.
++	AccessTokenMaxAgeSeconds *int32 `json:"accessTokenMaxAgeSeconds,omitempty"`
++	// accessTokenInactivityTimeoutSeconds overrides the default token
++	// inactivity timeout for tokens granted to this client.
++	// The value represents the maximum amount of time that can occur between
++	// consecutive uses of the token. Tokens become invalid if they are not
++	// used within this temporal window. The user will need to acquire a new
++	// token to regain access once a token times out.
++	// This value needs to be set only if the default set in configuration is
++	// not appropriate for this client. Valid values are:
++	// - 0: Tokens for this client never time out
++	// - X: Tokens time out if there is no activity for X seconds
++	// The current minimum allowed value for X is 300 (5 minutes)
++	//
++	// WARNING: existing tokens' timeout will not be affected (lowered) by changing this value
++	AccessTokenInactivityTimeoutSeconds *int32 `json:"accessTokenInactivityTimeoutSeconds,omitempty"`
+ }
+ 
+ // OAuthClient constructs a declarative configuration of the OAuthClient type for use with
+@@ -36,29 +69,14 @@ func OAuthClient(name string) *OAuthClientApplyConfiguration {
+ 	return b
+ }
+ 
+-// ExtractOAuthClient extracts the applied configuration owned by fieldManager from
+-// oAuthClient. If no managedFields are found in oAuthClient for fieldManager, a
+-// OAuthClientApplyConfiguration is returned with only the Name, Namespace (if applicable),
+-// APIVersion and Kind populated. It is possible that no managed fields were found for because other
+-// field managers have taken ownership of all the fields previously owned by fieldManager, or because
+-// the fieldManager never owned fields any fields.
++// ExtractOAuthClientFrom extracts the applied configuration owned by fieldManager from
++// oAuthClient for the specified subresource. Pass an empty string for subresource to extract
++// the main resource. Common subresources include "status", "scale", etc.
+ // oAuthClient must be a unmodified OAuthClient API object that was retrieved from the Kubernetes API.
+-// ExtractOAuthClient provides a way to perform a extract/modify-in-place/apply workflow.
++// ExtractOAuthClientFrom provides a way to perform a extract/modify-in-place/apply workflow.
+ // Note that an extracted apply configuration will contain fewer fields than what the fieldManager previously
+ // applied if another fieldManager has updated or force applied any of the previously applied fields.
+-// Experimental!
+-func ExtractOAuthClient(oAuthClient *oauthv1.OAuthClient, fieldManager string) (*OAuthClientApplyConfiguration, error) {
+-	return extractOAuthClient(oAuthClient, fieldManager, "")
+-}
+-
+-// ExtractOAuthClientStatus is the same as ExtractOAuthClient except
+-// that it extracts the status subresource applied configuration.
+-// Experimental!
+-func ExtractOAuthClientStatus(oAuthClient *oauthv1.OAuthClient, fieldManager string) (*OAuthClientApplyConfiguration, error) {
+-	return extractOAuthClient(oAuthClient, fieldManager, "status")
+-}
+-
+-func extractOAuthClient(oAuthClient *oauthv1.OAuthClient, fieldManager string, subresource string) (*OAuthClientApplyConfiguration, error) {
++func ExtractOAuthClientFrom(oAuthClient *oauthv1.OAuthClient, fieldManager string, subresource string) (*OAuthClientApplyConfiguration, error) {
+ 	b := &OAuthClientApplyConfiguration{}
+ 	err := managedfields.ExtractInto(oAuthClient, internal.Parser().Type("com.github.openshift.api.oauth.v1.OAuthClient"), fieldManager, b, subresource)
+ 	if err != nil {
+@@ -70,6 +88,21 @@ func extractOAuthClient(oAuthClient *oauthv1.OAuthClient, fieldManager string, s
+ 	b.WithAPIVersion("oauth.openshift.io/v1")
+ 	return b, nil
+ }
++
++// ExtractOAuthClient extracts the applied configuration owned by fieldManager from
++// oAuthClient. If no managedFields are found in oAuthClient for fieldManager, a
++// OAuthClientApplyConfiguration is returned with only the Name, Namespace (if applicable),
++// APIVersion and Kind populated. It is possible that no managed fields were found for because other
++// field managers have taken ownership of all the fields previously owned by fieldManager, or because
++// the fieldManager never owned fields any fields.
++// oAuthClient must be a unmodified OAuthClient API object that was retrieved from the Kubernetes API.
++// ExtractOAuthClient provides a way to perform a extract/modify-in-place/apply workflow.
++// Note that an extracted apply configuration will contain fewer fields than what the fieldManager previously
++// applied if another fieldManager has updated or force applied any of the previously applied fields.
++func ExtractOAuthClient(oAuthClient *oauthv1.OAuthClient, fieldManager string) (*OAuthClientApplyConfiguration, error) {
++	return ExtractOAuthClientFrom(oAuthClient, fieldManager, "")
++}
++
+ func (b OAuthClientApplyConfiguration) IsApplyConfiguration() {}
+ 
+ // WithKind sets the Kind field in the declarative configuration to the given value
+diff --git a/vendor/github.com/openshift/client-go/oauth/applyconfigurations/oauth/v1/oauthclientauthorization.go b/vendor/github.com/openshift/client-go/oauth/applyconfigurations/oauth/v1/oauthclientauthorization.go
+index f1de4432913..5a3fb36760e 100644
+--- a/vendor/github.com/openshift/client-go/oauth/applyconfigurations/oauth/v1/oauthclientauthorization.go
++++ b/vendor/github.com/openshift/client-go/oauth/applyconfigurations/oauth/v1/oauthclientauthorization.go
+@@ -13,13 +13,24 @@ import (
+ 
+ // OAuthClientAuthorizationApplyConfiguration represents a declarative configuration of the OAuthClientAuthorization type for use
+ // with apply.
++//
++// # OAuthClientAuthorization describes an authorization created by an OAuth client
++//
++// Compatibility level 1: Stable within a major release for a minimum of 12 months or 3 minor releases (whichever is longer).
+ type OAuthClientAuthorizationApplyConfiguration struct {
+-	metav1.TypeMetaApplyConfiguration    `json:",inline"`
++	metav1.TypeMetaApplyConfiguration `json:",inline"`
++	// metadata is the standard object's metadata.
++	// More info: https://git.k8s.io/community/contributors/devel/sig-architecture/api-conventions.md#metadata
+ 	*metav1.ObjectMetaApplyConfiguration `json:"metadata,omitempty"`
+-	ClientName                           *string  `json:"clientName,omitempty"`
+-	UserName                             *string  `json:"userName,omitempty"`
+-	UserUID                              *string  `json:"userUID,omitempty"`
+-	Scopes                               []string `json:"scopes,omitempty"`
++	// clientName references the client that created this authorization
++	ClientName *string `json:"clientName,omitempty"`
++	// userName is the user name that authorized this client
++	UserName *string `json:"userName,omitempty"`
++	// userUID is the unique UID associated with this authorization. UserUID and UserName
++	// must both match for this authorization to be valid.
++	UserUID *string `json:"userUID,omitempty"`
++	// scopes is an array of the granted scopes.
++	Scopes []string `json:"scopes,omitempty"`
+ }
+ 
+ // OAuthClientAuthorization constructs a declarative configuration of the OAuthClientAuthorization type for use with
+@@ -32,29 +43,14 @@ func OAuthClientAuthorization(name string) *OAuthClientAuthorizationApplyConfigu
+ 	return b
+ }
+ 
+-// ExtractOAuthClientAuthorization extracts the applied configuration owned by fieldManager from
+-// oAuthClientAuthorization. If no managedFields are found in oAuthClientAuthorization for fieldManager, a
+-// OAuthClientAuthorizationApplyConfiguration is returned with only the Name, Namespace (if applicable),
+-// APIVersion and Kind populated. It is possible that no managed fields were found for because other
+-// field managers have taken ownership of all the fields previously owned by fieldManager, or because
+-// the fieldManager never owned fields any fields.
++// ExtractOAuthClientAuthorizationFrom extracts the applied configuration owned by fieldManager from
++// oAuthClientAuthorization for the specified subresource. Pass an empty string for subresource to extract
++// the main resource. Common subresources include "status", "scale", etc.
+ // oAuthClientAuthorization must be a unmodified OAuthClientAuthorization API object that was retrieved from the Kubernetes API.
+-// ExtractOAuthClientAuthorization provides a way to perform a extract/modify-in-place/apply workflow.
++// ExtractOAuthClientAuthorizationFrom provides a way to perform a extract/modify-in-place/apply workflow.
+ // Note that an extracted apply configuration will contain fewer fields than what the fieldManager previously
+ // applied if another fieldManager has updated or force applied any of the previously applied fields.
+-// Experimental!
+-func ExtractOAuthClientAuthorization(oAuthClientAuthorization *oauthv1.OAuthClientAuthorization, fieldManager string) (*OAuthClientAuthorizationApplyConfiguration, error) {
+-	return extractOAuthClientAuthorization(oAuthClientAuthorization, fieldManager, "")
+-}
+-
+-// ExtractOAuthClientAuthorizationStatus is the same as ExtractOAuthClientAuthorization except
+-// that it extracts the status subresource applied configuration.
+-// Experimental!
+-func ExtractOAuthClientAuthorizationStatus(oAuthClientAuthorization *oauthv1.OAuthClientAuthorization, fieldManager string) (*OAuthClientAuthorizationApplyConfiguration, error) {
+-	return extractOAuthClientAuthorization(oAuthClientAuthorization, fieldManager, "status")
+-}
+-
+-func extractOAuthClientAuthorization(oAuthClientAuthorization *oauthv1.OAuthClientAuthorization, fieldManager string, subresource string) (*OAuthClientAuthorizationApplyConfiguration, error) {
++func ExtractOAuthClientAuthorizationFrom(oAuthClientAuthorization *oauthv1.OAuthClientAuthorization, fieldManager string, subresource string) (*OAuthClientAuthorizationApplyConfiguration, error) {
+ 	b := &OAuthClientAuthorizationApplyConfiguration{}
+ 	err := managedfields.ExtractInto(oAuthClientAuthorization, internal.Parser().Type("com.github.openshift.api.oauth.v1.OAuthClientAuthorization"), fieldManager, b, subresource)
+ 	if err != nil {
+@@ -66,6 +62,21 @@ func extractOAuthClientAuthorization(oAuthClientAuthorization *oauthv1.OAuthClie
+ 	b.WithAPIVersion("oauth.openshift.io/v1")
+ 	return b, nil
+ }
++
++// ExtractOAuthClientAuthorization extracts the applied configuration owned by fieldManager from
++// oAuthClientAuthorization. If no managedFields are found in oAuthClientAuthorization for fieldManager, a
++// OAuthClientAuthorizationApplyConfiguration is returned with only the Name, Namespace (if applicable),
++// APIVersion and Kind populated. It is possible that no managed fields were found for because other
++// field managers have taken ownership of all the fields previously owned by fieldManager, or because
++// the fieldManager never owned fields any fields.
++// oAuthClientAuthorization must be a unmodified OAuthClientAuthorization API object that was retrieved from the Kubernetes API.
++// ExtractOAuthClientAuthorization provides a way to perform a extract/modify-in-place/apply workflow.
++// Note that an extracted apply configuration will contain fewer fields than what the fieldManager previously
++// applied if another fieldManager has updated or force applied any of the previously applied fields.
++func ExtractOAuthClientAuthorization(oAuthClientAuthorization *oauthv1.OAuthClientAuthorization, fieldManager string) (*OAuthClientAuthorizationApplyConfiguration, error) {
++	return ExtractOAuthClientAuthorizationFrom(oAuthClientAuthorization, fieldManager, "")
++}
++
+ func (b OAuthClientAuthorizationApplyConfiguration) IsApplyConfiguration() {}
+ 
+ // WithKind sets the Kind field in the declarative configuration to the given value
+diff --git a/vendor/github.com/openshift/client-go/oauth/applyconfigurations/oauth/v1/scoperestriction.go b/vendor/github.com/openshift/client-go/oauth/applyconfigurations/oauth/v1/scoperestriction.go
+index bbeb90273f3..f73cb181471 100644
+--- a/vendor/github.com/openshift/client-go/oauth/applyconfigurations/oauth/v1/scoperestriction.go
++++ b/vendor/github.com/openshift/client-go/oauth/applyconfigurations/oauth/v1/scoperestriction.go
+@@ -4,8 +4,12 @@ package v1
+ 
+ // ScopeRestrictionApplyConfiguration represents a declarative configuration of the ScopeRestriction type for use
+ // with apply.
++//
++// ScopeRestriction describe one restriction on scopes.  Exactly one option must be non-nil.
+ type ScopeRestrictionApplyConfiguration struct {
+-	ExactValues []string                                       `json:"literals,omitempty"`
++	// ExactValues means the scope has to match a particular set of strings exactly
++	ExactValues []string `json:"literals,omitempty"`
++	// clusterRole describes a set of restrictions for cluster role scoping.
+ 	ClusterRole *ClusterRoleScopeRestrictionApplyConfiguration `json:"clusterRole,omitempty"`
+ }
+ 
+diff --git a/vendor/github.com/openshift/client-go/oauth/applyconfigurations/oauth/v1/useroauthaccesstoken.go b/vendor/github.com/openshift/client-go/oauth/applyconfigurations/oauth/v1/useroauthaccesstoken.go
+index 902e026c2ab..110e9e92fcc 100644
+--- a/vendor/github.com/openshift/client-go/oauth/applyconfigurations/oauth/v1/useroauthaccesstoken.go
++++ b/vendor/github.com/openshift/client-go/oauth/applyconfigurations/oauth/v1/useroauthaccesstoken.go
+@@ -13,18 +13,34 @@ import (
+ 
+ // UserOAuthAccessTokenApplyConfiguration represents a declarative configuration of the UserOAuthAccessToken type for use
+ // with apply.
++//
++// UserOAuthAccessToken is a virtual resource to mirror OAuthAccessTokens to
++// the user the access token was issued for
+ type UserOAuthAccessTokenApplyConfiguration struct {
+-	metav1.TypeMetaApplyConfiguration    `json:",inline"`
++	metav1.TypeMetaApplyConfiguration `json:",inline"`
++	// metadata is the standard object's metadata.
++	// More info: https://git.k8s.io/community/contributors/devel/sig-architecture/api-conventions.md#metadata
+ 	*metav1.ObjectMetaApplyConfiguration `json:"metadata,omitempty"`
+-	ClientName                           *string  `json:"clientName,omitempty"`
+-	ExpiresIn                            *int64   `json:"expiresIn,omitempty"`
+-	Scopes                               []string `json:"scopes,omitempty"`
+-	RedirectURI                          *string  `json:"redirectURI,omitempty"`
+-	UserName                             *string  `json:"userName,omitempty"`
+-	UserUID                              *string  `json:"userUID,omitempty"`
+-	AuthorizeToken                       *string  `json:"authorizeToken,omitempty"`
+-	RefreshToken                         *string  `json:"refreshToken,omitempty"`
+-	InactivityTimeoutSeconds             *int32   `json:"inactivityTimeoutSeconds,omitempty"`
++	// clientName references the client that created this token.
++	ClientName *string `json:"clientName,omitempty"`
++	// expiresIn is the seconds from CreationTime before this token expires.
++	ExpiresIn *int64 `json:"expiresIn,omitempty"`
++	// scopes is an array of the requested scopes.
++	Scopes []string `json:"scopes,omitempty"`
++	// redirectURI is the redirection associated with the token.
++	RedirectURI *string `json:"redirectURI,omitempty"`
++	// userName is the user name associated with this token
++	UserName *string `json:"userName,omitempty"`
++	// userUID is the unique UID associated with this token
++	UserUID *string `json:"userUID,omitempty"`
++	// authorizeToken contains the token that authorized this token
++	AuthorizeToken *string `json:"authorizeToken,omitempty"`
++	// refreshToken is the value by which this token can be renewed. Can be blank.
++	RefreshToken *string `json:"refreshToken,omitempty"`
++	// inactivityTimeoutSeconds is the value in seconds, from the
++	// CreationTimestamp, after which this token can no longer be used.
++	// The value is automatically incremented when the token is used.
++	InactivityTimeoutSeconds *int32 `json:"inactivityTimeoutSeconds,omitempty"`
+ }
+ 
+ // UserOAuthAccessToken constructs a declarative configuration of the UserOAuthAccessToken type for use with
+@@ -37,29 +53,14 @@ func UserOAuthAccessToken(name string) *UserOAuthAccessTokenApplyConfiguration {
+ 	return b
+ }
+ 
+-// ExtractUserOAuthAccessToken extracts the applied configuration owned by fieldManager from
+-// userOAuthAccessToken. If no managedFields are found in userOAuthAccessToken for fieldManager, a
+-// UserOAuthAccessTokenApplyConfiguration is returned with only the Name, Namespace (if applicable),
+-// APIVersion and Kind populated. It is possible that no managed fields were found for because other
+-// field managers have taken ownership of all the fields previously owned by fieldManager, or because
+-// the fieldManager never owned fields any fields.
++// ExtractUserOAuthAccessTokenFrom extracts the applied configuration owned by fieldManager from
++// userOAuthAccessToken for the specified subresource. Pass an empty string for subresource to extract
++// the main resource. Common subresources include "status", "scale", etc.
+ // userOAuthAccessToken must be a unmodified UserOAuthAccessToken API object that was retrieved from the Kubernetes API.
+-// ExtractUserOAuthAccessToken provides a way to perform a extract/modify-in-place/apply workflow.
++// ExtractUserOAuthAccessTokenFrom provides a way to perform a extract/modify-in-place/apply workflow.
+ // Note that an extracted apply configuration will contain fewer fields than what the fieldManager previously
+ // applied if another fieldManager has updated or force applied any of the previously applied fields.
+-// Experimental!
+-func ExtractUserOAuthAccessToken(userOAuthAccessToken *oauthv1.UserOAuthAccessToken, fieldManager string) (*UserOAuthAccessTokenApplyConfiguration, error) {
+-	return extractUserOAuthAccessToken(userOAuthAccessToken, fieldManager, "")
+-}
+-
+-// ExtractUserOAuthAccessTokenStatus is the same as ExtractUserOAuthAccessToken except
+-// that it extracts the status subresource applied configuration.
+-// Experimental!
+-func ExtractUserOAuthAccessTokenStatus(userOAuthAccessToken *oauthv1.UserOAuthAccessToken, fieldManager string) (*UserOAuthAccessTokenApplyConfiguration, error) {
+-	return extractUserOAuthAccessToken(userOAuthAccessToken, fieldManager, "status")
+-}
+-
+-func extractUserOAuthAccessToken(userOAuthAccessToken *oauthv1.UserOAuthAccessToken, fieldManager string, subresource string) (*UserOAuthAccessTokenApplyConfiguration, error) {
++func ExtractUserOAuthAccessTokenFrom(userOAuthAccessToken *oauthv1.UserOAuthAccessToken, fieldManager string, subresource string) (*UserOAuthAccessTokenApplyConfiguration, error) {
+ 	b := &UserOAuthAccessTokenApplyConfiguration{}
+ 	err := managedfields.ExtractInto(userOAuthAccessToken, internal.Parser().Type("com.github.openshift.api.oauth.v1.UserOAuthAccessToken"), fieldManager, b, subresource)
+ 	if err != nil {
+@@ -71,6 +72,21 @@ func extractUserOAuthAccessToken(userOAuthAccessToken *oauthv1.UserOAuthAccessTo
+ 	b.WithAPIVersion("oauth.openshift.io/v1")
+ 	return b, nil
+ }
++
++// ExtractUserOAuthAccessToken extracts the applied configuration owned by fieldManager from
++// userOAuthAccessToken. If no managedFields are found in userOAuthAccessToken for fieldManager, a
++// UserOAuthAccessTokenApplyConfiguration is returned with only the Name, Namespace (if applicable),
++// APIVersion and Kind populated. It is possible that no managed fields were found for because other
++// field managers have taken ownership of all the fields previously owned by fieldManager, or because
++// the fieldManager never owned fields any fields.
++// userOAuthAccessToken must be a unmodified UserOAuthAccessToken API object that was retrieved from the Kubernetes API.
++// ExtractUserOAuthAccessToken provides a way to perform a extract/modify-in-place/apply workflow.
++// Note that an extracted apply configuration will contain fewer fields than what the fieldManager previously
++// applied if another fieldManager has updated or force applied any of the previously applied fields.
++func ExtractUserOAuthAccessToken(userOAuthAccessToken *oauthv1.UserOAuthAccessToken, fieldManager string) (*UserOAuthAccessTokenApplyConfiguration, error) {
++	return ExtractUserOAuthAccessTokenFrom(userOAuthAccessToken, fieldManager, "")
++}
++
+ func (b UserOAuthAccessTokenApplyConfiguration) IsApplyConfiguration() {}
+ 
+ // WithKind sets the Kind field in the declarative configuration to the given value
+diff --git a/vendor/github.com/openshift/library-go/pkg/crypto/crypto.go b/vendor/github.com/openshift/library-go/pkg/crypto/crypto.go
+index c585a65b3f8..bff6155c2f1 100644
+--- a/vendor/github.com/openshift/library-go/pkg/crypto/crypto.go
++++ b/vendor/github.com/openshift/library-go/pkg/crypto/crypto.go
+@@ -110,15 +110,6 @@ func DefaultTLSVersion() uint16 {
+ 	return tls.VersionTLS12
+ }
+ 
+-// ciphersTLS13 copies golang 1.13 implementation, where TLS1.3 suites are not
+-// configurable (cipherSuites field is ignored for TLS1.3 flows and all of the
+-// below three - and none other - are used)
+-var ciphersTLS13 = map[string]uint16{
+-	"TLS_AES_128_GCM_SHA256":       tls.TLS_AES_128_GCM_SHA256,
+-	"TLS_AES_256_GCM_SHA384":       tls.TLS_AES_256_GCM_SHA384,
+-	"TLS_CHACHA20_POLY1305_SHA256": tls.TLS_CHACHA20_POLY1305_SHA256,
+-}
+-
+ var ciphers = map[string]uint16{
+ 	"TLS_RSA_WITH_RC4_128_SHA":                      tls.TLS_RSA_WITH_RC4_128_SHA,
+ 	"TLS_RSA_WITH_3DES_EDE_CBC_SHA":                 tls.TLS_RSA_WITH_3DES_EDE_CBC_SHA,
+@@ -144,15 +135,18 @@ var ciphers = map[string]uint16{
+ 	"TLS_ECDHE_ECDSA_WITH_CHACHA20_POLY1305":        tls.TLS_ECDHE_ECDSA_WITH_CHACHA20_POLY1305_SHA256,
+ 	"TLS_ECDHE_RSA_WITH_CHACHA20_POLY1305_SHA256":   tls.TLS_ECDHE_RSA_WITH_CHACHA20_POLY1305_SHA256,
+ 	"TLS_ECDHE_ECDSA_WITH_CHACHA20_POLY1305_SHA256": tls.TLS_ECDHE_ECDSA_WITH_CHACHA20_POLY1305_SHA256,
++	"TLS_AES_128_GCM_SHA256":                        tls.TLS_AES_128_GCM_SHA256,
++	"TLS_AES_256_GCM_SHA384":                        tls.TLS_AES_256_GCM_SHA384,
++	"TLS_CHACHA20_POLY1305_SHA256":                  tls.TLS_CHACHA20_POLY1305_SHA256,
+ }
+ 
+ // openSSLToIANACiphersMap maps OpenSSL cipher suite names to IANA names
+ // ref: https://www.iana.org/assignments/tls-parameters/tls-parameters.xml
+ var openSSLToIANACiphersMap = map[string]string{
+ 	// TLS 1.3 ciphers - not configurable in go 1.13, all of them are used in TLSv1.3 flows
+-	//	"TLS_AES_128_GCM_SHA256":       "TLS_AES_128_GCM_SHA256",       // 0x13,0x01
+-	//	"TLS_AES_256_GCM_SHA384":       "TLS_AES_256_GCM_SHA384",       // 0x13,0x02
+-	//	"TLS_CHACHA20_POLY1305_SHA256": "TLS_CHACHA20_POLY1305_SHA256", // 0x13,0x03
++	"TLS_AES_128_GCM_SHA256":       "TLS_AES_128_GCM_SHA256",       // 0x13,0x01
++	"TLS_AES_256_GCM_SHA384":       "TLS_AES_256_GCM_SHA384",       // 0x13,0x02
++	"TLS_CHACHA20_POLY1305_SHA256": "TLS_CHACHA20_POLY1305_SHA256", // 0x13,0x03
+ 
+ 	// TLS 1.2
+ 	"ECDHE-ECDSA-AES128-GCM-SHA256": "TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256",       // 0xC0,0x2B
+@@ -223,10 +217,6 @@ func CipherSuite(cipherName string) (uint16, error) {
+ 		return cipher, nil
+ 	}
+ 
+-	if _, ok := ciphersTLS13[cipherName]; ok {
+-		return 0, fmt.Errorf("all golang TLSv1.3 ciphers are always used for TLSv1.3 flows")
+-	}
+-
+ 	return 0, fmt.Errorf("unknown cipher name %q", cipherName)
+ }
+ 
+@@ -252,35 +242,44 @@ func ValidCipherSuites() []string {
+ 	sort.Strings(validCipherSuites)
+ 	return validCipherSuites
+ }
++
++// DefaultCiphers returns the default cipher suites for TLS connections.
++//
++// RECOMMENDATION: Instead of relying on this function directly, consumers should respect
++// TLSSecurityProfile settings from one of the OpenShift API configuration resources:
++//   - For API servers: Use apiserver.config.openshift.io/cluster Spec.TLSSecurityProfile
++//   - For ingress controllers: Use operator.openshift.io/v1 IngressController Spec.TLSSecurityProfile
++//   - For kubelet: Use machineconfiguration.openshift.io/v1 KubeletConfig Spec.TLSSecurityProfile
++//
++// These API resources allow cluster administrators to choose between Old, Intermediate,
++// Modern, or Custom TLS profiles. Components should observe these settings.
+ func DefaultCiphers() []uint16 {
+-	// HTTP/2 mandates TLS 1.2 or higher with an AEAD cipher
+-	// suite (GCM, Poly1305) and ephemeral key exchange (ECDHE, DHE) for
+-	// perfect forward secrecy. Servers may provide additional cipher
+-	// suites for backwards compatibility with HTTP/1.1 clients.
+-	// See RFC7540, section 9.2 (Use of TLS Features) and Appendix A
+-	// (TLS 1.2 Cipher Suite Black List).
++	// Aligned with intermediate profile of the 5.7 version of the Mozilla Server
++	// Side TLS guidelines found at: https://ssl-config.mozilla.org/guidelines/5.7.json
++	//
++	// Latest guidelines: https://ssl-config.mozilla.org/guidelines/latest.json
++	//
++	// This profile provides strong security with wide compatibility.
++	// It requires TLS 1.2+ and uses only AEAD cipher suites (GCM, ChaCha20-Poly1305)
++	// with ECDHE key exchange for perfect forward secrecy.
++	//
++	// All CBC-mode ciphers have been removed due to padding oracle vulnerabilities.
++	// All RSA key exchange ciphers have been removed due to lack of perfect forward secrecy.
++	//
++	// HTTP/2 compliance: All ciphers are compliant with RFC7540, section 9.2.
+ 	return []uint16{
++		// TLS 1.2 cipher suites with ECDHE + AEAD
+ 		tls.TLS_ECDHE_ECDSA_WITH_CHACHA20_POLY1305_SHA256,
+ 		tls.TLS_ECDHE_RSA_WITH_CHACHA20_POLY1305_SHA256,
+ 		tls.TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256,
+-		tls.TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256, // required by http/2
++		tls.TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256, // required by HTTP/2
+ 		tls.TLS_ECDHE_ECDSA_WITH_AES_256_GCM_SHA384,
+ 		tls.TLS_ECDHE_RSA_WITH_AES_256_GCM_SHA384,
+-		tls.TLS_ECDHE_ECDSA_WITH_AES_128_CBC_SHA256, // forbidden by http/2, not flagged by http2isBadCipher() in go1.8
+-		tls.TLS_ECDHE_RSA_WITH_AES_128_CBC_SHA256,   // forbidden by http/2, not flagged by http2isBadCipher() in go1.8
+-		tls.TLS_ECDHE_ECDSA_WITH_AES_128_CBC_SHA,    // forbidden by http/2
+-		tls.TLS_ECDHE_ECDSA_WITH_AES_256_CBC_SHA,    // forbidden by http/2
+-		tls.TLS_ECDHE_RSA_WITH_AES_128_CBC_SHA,      // forbidden by http/2
+-		tls.TLS_ECDHE_RSA_WITH_AES_256_CBC_SHA,      // forbidden by http/2
+-		tls.TLS_RSA_WITH_AES_128_GCM_SHA256,         // forbidden by http/2
+-		tls.TLS_RSA_WITH_AES_256_GCM_SHA384,         // forbidden by http/2
+-		// the next one is in the intermediate suite, but go1.8 http2isBadCipher() complains when it is included at the recommended index
+-		// because it comes after ciphers forbidden by the http/2 spec
+-		// tls.TLS_RSA_WITH_AES_128_CBC_SHA256,
+-		// tls.TLS_ECDHE_RSA_WITH_3DES_EDE_CBC_SHA, // forbidden by http/2, disabled to mitigate SWEET32 attack
+-		// tls.TLS_RSA_WITH_3DES_EDE_CBC_SHA,       // forbidden by http/2, disabled to mitigate SWEET32 attack
+-		tls.TLS_RSA_WITH_AES_128_CBC_SHA, // forbidden by http/2
+-		tls.TLS_RSA_WITH_AES_256_CBC_SHA, // forbidden by http/2
++
++		// TLS 1.3 cipher suites (negotiated automatically, not configurable)
++		tls.TLS_AES_128_GCM_SHA256,
++		tls.TLS_AES_256_GCM_SHA384,
++		tls.TLS_CHACHA20_POLY1305_SHA256,
+ 	}
+ }
+ 
+@@ -371,7 +370,7 @@ func (c *TLSCertificateConfig) GetPEMBytes() ([]byte, []byte, error) {
+ 	if err != nil {
+ 		return nil, nil, err
+ 	}
+-	keyBytes, err := encodeKey(c.Key)
++	keyBytes, err := EncodeKey(c.Key)
+ 	if err != nil {
+ 		return nil, nil, err
+ 	}
+@@ -393,7 +392,7 @@ func GetTLSCertificateConfig(certFile, keyFile string) (*TLSCertificateConfig, e
+ 	}
+ 	certs, err := cert.ParseCertsPEM(certPEMBlock)
+ 	if err != nil {
+-		return nil, fmt.Errorf("Error reading %s: %s", certFile, err)
++		return nil, fmt.Errorf("error reading %s: %s", certFile, err)
+ 	}
+ 
+ 	keyPEMBlock, err := os.ReadFile(keyFile)
+@@ -419,7 +418,7 @@ func GetTLSCertificateConfigFromBytes(certBytes, keyBytes []byte) (*TLSCertifica
+ 
+ 	certs, err := cert.ParseCertsPEM(certBytes)
+ 	if err != nil {
+-		return nil, fmt.Errorf("Error reading cert: %s", err)
++		return nil, fmt.Errorf("error reading cert: %s", err)
+ 	}
+ 
+ 	keyPairCert, err := tls.X509KeyPair(certBytes, keyBytes)
+@@ -432,8 +431,8 @@ func GetTLSCertificateConfigFromBytes(certBytes, keyBytes []byte) (*TLSCertifica
+ }
+ 
+ const (
+-	DefaultCertificateLifetimeInDays   = 365 * 2 // 2 years
+-	DefaultCACertificateLifetimeInDays = 365 * 5 // 5 years
++	DefaultCertificateLifetimeDuration   = time.Hour * 24 * 365 * 2 // 2 years
++	DefaultCACertificateLifetimeDuration = time.Hour * 24 * 365 * 5 // 5 years
+ 
+ 	// Default keys are 2048 bits
+ 	keyBits = 2048
+@@ -553,11 +552,11 @@ func randomSerialNumber() int64 {
+ 
+ // EnsureCA returns a CA, whether it was created (as opposed to pre-existing), and any error
+ // if serialFile is empty, a RandomSerialGenerator will be used
+-func EnsureCA(certFile, keyFile, serialFile, name string, expireDays int) (*CA, bool, error) {
++func EnsureCA(certFile, keyFile, serialFile, name string, lifetime time.Duration) (*CA, bool, error) {
+ 	if ca, err := GetCA(certFile, keyFile, serialFile); err == nil {
+ 		return ca, false, err
+ 	}
+-	ca, err := MakeSelfSignedCA(certFile, keyFile, serialFile, name, expireDays)
++	ca, err := MakeSelfSignedCA(certFile, keyFile, serialFile, name, lifetime)
+ 	return ca, true, err
+ }
+ 
+@@ -597,10 +596,10 @@ func GetCAFromBytes(certBytes, keyBytes []byte) (*CA, error) {
+ }
+ 
+ // if serialFile is empty, a RandomSerialGenerator will be used
+-func MakeSelfSignedCA(certFile, keyFile, serialFile, name string, expireDays int) (*CA, error) {
++func MakeSelfSignedCA(certFile, keyFile, serialFile, name string, lifetime time.Duration) (*CA, error) {
+ 	klog.V(2).Infof("Generating new CA for %s cert, and key in %s, %s", name, certFile, keyFile)
+ 
+-	caConfig, err := MakeSelfSignedCAConfig(name, expireDays)
++	caConfig, err := MakeSelfSignedCAConfig(name, lifetime)
+ 	if err != nil {
+ 		return nil, err
+ 	}
+@@ -628,31 +627,34 @@ func MakeSelfSignedCA(certFile, keyFile, serialFile, name string, expireDays int
+ 	}, nil
+ }
+ 
+-func MakeSelfSignedCAConfig(name string, expireDays int) (*TLSCertificateConfig, error) {
++func MakeSelfSignedCAConfig(name string, lifetime time.Duration) (*TLSCertificateConfig, error) {
+ 	subject := pkix.Name{CommonName: name}
+-	return MakeSelfSignedCAConfigForSubject(subject, expireDays)
++	return MakeSelfSignedCAConfigForSubject(subject, lifetime)
+ }
+ 
+-func MakeSelfSignedCAConfigForSubject(subject pkix.Name, expireDays int) (*TLSCertificateConfig, error) {
+-	var caLifetimeInDays = DefaultCACertificateLifetimeInDays
+-	if expireDays > 0 {
+-		caLifetimeInDays = expireDays
++func MakeSelfSignedCAConfigForSubject(subject pkix.Name, lifetime time.Duration) (*TLSCertificateConfig, error) {
++	if lifetime <= 0 {
++		lifetime = DefaultCACertificateLifetimeDuration
++		fmt.Fprintf(os.Stderr, "Validity period of the certificate for %q is unset, resetting to %s!\n", subject.CommonName, lifetime.String())
+ 	}
+ 
+-	if caLifetimeInDays > DefaultCACertificateLifetimeInDays {
+-		warnAboutCertificateLifeTime(subject.CommonName, DefaultCACertificateLifetimeInDays)
++	if lifetime > DefaultCACertificateLifetimeDuration {
++		warnAboutCertificateLifeTime(subject.CommonName, DefaultCACertificateLifetimeDuration)
+ 	}
+-
+-	caLifetime := time.Duration(caLifetimeInDays) * 24 * time.Hour
+-	return makeSelfSignedCAConfigForSubjectAndDuration(subject, caLifetime)
++	return makeSelfSignedCAConfigForSubjectAndDuration(subject, time.Now, lifetime)
+ }
+ 
+ func MakeSelfSignedCAConfigForDuration(name string, caLifetime time.Duration) (*TLSCertificateConfig, error) {
+ 	subject := pkix.Name{CommonName: name}
+-	return makeSelfSignedCAConfigForSubjectAndDuration(subject, caLifetime)
++	return makeSelfSignedCAConfigForSubjectAndDuration(subject, time.Now, caLifetime)
++}
++
++func UnsafeMakeSelfSignedCAConfigForDurationAtTime(name string, currentTime func() time.Time, caLifetime time.Duration) (*TLSCertificateConfig, error) {
++	subject := pkix.Name{CommonName: name}
++	return makeSelfSignedCAConfigForSubjectAndDuration(subject, currentTime, caLifetime)
+ }
+ 
+-func makeSelfSignedCAConfigForSubjectAndDuration(subject pkix.Name, caLifetime time.Duration) (*TLSCertificateConfig, error) {
++func makeSelfSignedCAConfigForSubjectAndDuration(subject pkix.Name, currentTime func() time.Time, caLifetime time.Duration) (*TLSCertificateConfig, error) {
+ 	// Create CA cert
+ 	rootcaPublicKey, rootcaPrivateKey, publicKeyHash, err := newKeyPairWithHash()
+ 	if err != nil {
+@@ -661,7 +663,7 @@ func makeSelfSignedCAConfigForSubjectAndDuration(subject pkix.Name, caLifetime t
+ 	// AuthorityKeyId and SubjectKeyId should match for a self-signed CA
+ 	authorityKeyId := publicKeyHash
+ 	subjectKeyId := publicKeyHash
+-	rootcaTemplate := newSigningCertificateTemplateForDuration(subject, caLifetime, time.Now, authorityKeyId, subjectKeyId)
++	rootcaTemplate := newSigningCertificateTemplateForDuration(subject, caLifetime, currentTime, authorityKeyId, subjectKeyId)
+ 	rootcaCert, err := signCertificate(rootcaTemplate, rootcaPublicKey, rootcaTemplate, rootcaPrivateKey)
+ 	if err != nil {
+ 		return nil, err
+@@ -682,7 +684,7 @@ func MakeCAConfigForDuration(name string, caLifetime time.Duration, issuer *CA)
+ 	authorityKeyId := issuer.Config.Certs[0].SubjectKeyId
+ 	subjectKeyId := publicKeyHash
+ 	signerTemplate := newSigningCertificateTemplateForDuration(pkix.Name{CommonName: name}, caLifetime, time.Now, authorityKeyId, subjectKeyId)
+-	signerCert, err := issuer.signCertificate(signerTemplate, signerPublicKey)
++	signerCert, err := issuer.SignCertificate(signerTemplate, signerPublicKey)
+ 	if err != nil {
+ 		return nil, err
+ 	}
+@@ -697,21 +699,21 @@ func MakeCAConfigForDuration(name string, caLifetime time.Duration, issuer *CA)
+ // (as opposed to pre-existing), and any error that might occur during the subCA
+ // creation.
+ // If serialFile is an empty string, a RandomSerialGenerator will be used.
+-func (ca *CA) EnsureSubCA(certFile, keyFile, serialFile, name string, expireDays int) (*CA, bool, error) {
++func (ca *CA) EnsureSubCA(certFile, keyFile, serialFile, name string, lifetime time.Duration) (*CA, bool, error) {
+ 	if subCA, err := GetCA(certFile, keyFile, serialFile); err == nil {
+ 		return subCA, false, err
+ 	}
+-	subCA, err := ca.MakeAndWriteSubCA(certFile, keyFile, serialFile, name, expireDays)
++	subCA, err := ca.MakeAndWriteSubCA(certFile, keyFile, serialFile, name, lifetime)
+ 	return subCA, true, err
+ }
+ 
+ // MakeAndWriteSubCA returns a new sub-CA configuration. New cert/key pair is generated
+ // while using this function.
+ // If serialFile is an empty string, a RandomSerialGenerator will be used.
+-func (ca *CA) MakeAndWriteSubCA(certFile, keyFile, serialFile, name string, expireDays int) (*CA, error) {
++func (ca *CA) MakeAndWriteSubCA(certFile, keyFile, serialFile, name string, lifetime time.Duration) (*CA, error) {
+ 	klog.V(4).Infof("Generating sub-CA certificate in %s, key in %s, serial in %s", certFile, keyFile, serialFile)
+ 
+-	subCAConfig, err := MakeCAConfigForDuration(name, time.Duration(expireDays)*time.Hour*24, ca)
++	subCAConfig, err := MakeCAConfigForDuration(name, lifetime, ca)
+ 	if err != nil {
+ 		return nil, err
+ 	}
+@@ -741,24 +743,24 @@ func (ca *CA) MakeAndWriteSubCA(certFile, keyFile, serialFile, name string, expi
+ 	}, nil
+ }
+ 
+-func (ca *CA) EnsureServerCert(certFile, keyFile string, hostnames sets.String, expireDays int) (*TLSCertificateConfig, bool, error) {
++func (ca *CA) EnsureServerCert(certFile, keyFile string, hostnames sets.Set[string], lifetime time.Duration) (*TLSCertificateConfig, bool, error) {
+ 	certConfig, err := GetServerCert(certFile, keyFile, hostnames)
+ 	if err != nil {
+-		certConfig, err = ca.MakeAndWriteServerCert(certFile, keyFile, hostnames, expireDays)
++		certConfig, err = ca.MakeAndWriteServerCert(certFile, keyFile, hostnames, lifetime)
+ 		return certConfig, true, err
+ 	}
+ 
+ 	return certConfig, false, nil
+ }
+ 
+-func GetServerCert(certFile, keyFile string, hostnames sets.String) (*TLSCertificateConfig, error) {
++func GetServerCert(certFile, keyFile string, hostnames sets.Set[string]) (*TLSCertificateConfig, error) {
+ 	server, err := GetTLSCertificateConfig(certFile, keyFile)
+ 	if err != nil {
+ 		return nil, err
+ 	}
+ 
+ 	cert := server.Certs[0]
+-	certNames := sets.NewString()
++	certNames := sets.New[string]()
+ 	for _, ip := range cert.IPAddresses {
+ 		certNames.Insert(ip.String())
+ 	}
+@@ -768,13 +770,13 @@ func GetServerCert(certFile, keyFile string, hostnames sets.String) (*TLSCertifi
+ 		return server, nil
+ 	}
+ 
+-	return nil, fmt.Errorf("Existing server certificate in %s does not match required hostnames.", certFile)
++	return nil, fmt.Errorf("existing server certificate in %s does not match required hostnames", certFile)
+ }
+ 
+-func (ca *CA) MakeAndWriteServerCert(certFile, keyFile string, hostnames sets.String, expireDays int) (*TLSCertificateConfig, error) {
++func (ca *CA) MakeAndWriteServerCert(certFile, keyFile string, hostnames sets.Set[string], lifetime time.Duration) (*TLSCertificateConfig, error) {
+ 	klog.V(4).Infof("Generating server certificate in %s, key in %s", certFile, keyFile)
+ 
+-	server, err := ca.MakeServerCert(hostnames, expireDays)
++	server, err := ca.MakeServerCert(hostnames, lifetime)
+ 	if err != nil {
+ 		return nil, err
+ 	}
+@@ -788,17 +790,17 @@ func (ca *CA) MakeAndWriteServerCert(certFile, keyFile string, hostnames sets.St
+ // if the extension attempt failed.
+ type CertificateExtensionFunc func(*x509.Certificate) error
+ 
+-func (ca *CA) MakeServerCert(hostnames sets.String, expireDays int, fns ...CertificateExtensionFunc) (*TLSCertificateConfig, error) {
++func (ca *CA) MakeServerCert(hostnames sets.Set[string], lifetime time.Duration, fns ...CertificateExtensionFunc) (*TLSCertificateConfig, error) {
+ 	serverPublicKey, serverPrivateKey, publicKeyHash, _ := newKeyPairWithHash()
+ 	authorityKeyId := ca.Config.Certs[0].SubjectKeyId
+ 	subjectKeyId := publicKeyHash
+-	serverTemplate := newServerCertificateTemplate(pkix.Name{CommonName: hostnames.List()[0]}, hostnames.List(), expireDays, time.Now, authorityKeyId, subjectKeyId)
++	serverTemplate := newServerCertificateTemplate(pkix.Name{CommonName: sets.List(hostnames)[0]}, sets.List(hostnames), lifetime, time.Now, authorityKeyId, subjectKeyId)
+ 	for _, fn := range fns {
+ 		if err := fn(serverTemplate); err != nil {
+ 			return nil, err
+ 		}
+ 	}
+-	serverCrt, err := ca.signCertificate(serverTemplate, serverPublicKey)
++	serverCrt, err := ca.SignCertificate(serverTemplate, serverPublicKey)
+ 	if err != nil {
+ 		return nil, err
+ 	}
+@@ -809,17 +811,17 @@ func (ca *CA) MakeServerCert(hostnames sets.String, expireDays int, fns ...Certi
+ 	return server, nil
+ }
+ 
+-func (ca *CA) MakeServerCertForDuration(hostnames sets.String, lifetime time.Duration, fns ...CertificateExtensionFunc) (*TLSCertificateConfig, error) {
++func (ca *CA) MakeServerCertForDuration(hostnames sets.Set[string], lifetime time.Duration, fns ...CertificateExtensionFunc) (*TLSCertificateConfig, error) {
+ 	serverPublicKey, serverPrivateKey, publicKeyHash, _ := newKeyPairWithHash()
+ 	authorityKeyId := ca.Config.Certs[0].SubjectKeyId
+ 	subjectKeyId := publicKeyHash
+-	serverTemplate := newServerCertificateTemplateForDuration(pkix.Name{CommonName: hostnames.List()[0]}, hostnames.List(), lifetime, time.Now, authorityKeyId, subjectKeyId)
++	serverTemplate := newServerCertificateTemplateForDuration(pkix.Name{CommonName: sets.List(hostnames)[0]}, sets.List(hostnames), lifetime, time.Now, authorityKeyId, subjectKeyId)
+ 	for _, fn := range fns {
+ 		if err := fn(serverTemplate); err != nil {
+ 			return nil, err
+ 		}
+ 	}
+-	serverCrt, err := ca.signCertificate(serverTemplate, serverPublicKey)
++	serverCrt, err := ca.SignCertificate(serverTemplate, serverPublicKey)
+ 	if err != nil {
+ 		return nil, err
+ 	}
+@@ -830,10 +832,10 @@ func (ca *CA) MakeServerCertForDuration(hostnames sets.String, lifetime time.Dur
+ 	return server, nil
+ }
+ 
+-func (ca *CA) EnsureClientCertificate(certFile, keyFile string, u user.Info, expireDays int) (*TLSCertificateConfig, bool, error) {
++func (ca *CA) EnsureClientCertificate(certFile, keyFile string, u user.Info, lifetime time.Duration) (*TLSCertificateConfig, bool, error) {
+ 	certConfig, err := GetClientCertificate(certFile, keyFile, u)
+ 	if err != nil {
+-		certConfig, err = ca.MakeClientCertificate(certFile, keyFile, u, expireDays)
++		certConfig, err = ca.MakeClientCertificate(certFile, keyFile, u, lifetime)
+ 		return certConfig, true, err // true indicates we wrote the files.
+ 	}
+ 	return certConfig, false, nil
+@@ -845,7 +847,7 @@ func GetClientCertificate(certFile, keyFile string, u user.Info) (*TLSCertificat
+ 		return nil, err
+ 	}
+ 
+-	if subject := certConfig.Certs[0].Subject; subjectChanged(subject, userToSubject(u)) {
++	if subject := certConfig.Certs[0].Subject; subjectChanged(subject, UserToSubject(u)) {
+ 		return nil, fmt.Errorf("existing client certificate in %s was issued for a different Subject (%s)",
+ 			certFile, subject)
+ 	}
+@@ -862,7 +864,7 @@ func subjectChanged(existing, expected pkix.Name) bool {
+ 		!reflect.DeepEqual(existing.Organization, expected.Organization)
+ }
+ 
+-func (ca *CA) MakeClientCertificate(certFile, keyFile string, u user.Info, expireDays int) (*TLSCertificateConfig, error) {
++func (ca *CA) MakeClientCertificate(certFile, keyFile string, u user.Info, lifetime time.Duration) (*TLSCertificateConfig, error) {
+ 	klog.V(4).Infof("Generating client cert in %s and key in %s", certFile, keyFile)
+ 	// ensure parent dirs
+ 	if err := os.MkdirAll(filepath.Dir(certFile), os.FileMode(0755)); err != nil {
+@@ -873,8 +875,8 @@ func (ca *CA) MakeClientCertificate(certFile, keyFile string, u user.Info, expir
+ 	}
+ 
+ 	clientPublicKey, clientPrivateKey, _ := NewKeyPair()
+-	clientTemplate := newClientCertificateTemplate(userToSubject(u), expireDays, time.Now)
+-	clientCrt, err := ca.signCertificate(clientTemplate, clientPublicKey)
++	clientTemplate := NewClientCertificateTemplate(UserToSubject(u), lifetime, time.Now)
++	clientCrt, err := ca.SignCertificate(clientTemplate, clientPublicKey)
+ 	if err != nil {
+ 		return nil, err
+ 	}
+@@ -883,7 +885,7 @@ func (ca *CA) MakeClientCertificate(certFile, keyFile string, u user.Info, expir
+ 	if err != nil {
+ 		return nil, err
+ 	}
+-	keyData, err := encodeKey(clientPrivateKey)
++	keyData, err := EncodeKey(clientPrivateKey)
+ 	if err != nil {
+ 		return nil, err
+ 	}
+@@ -900,8 +902,8 @@ func (ca *CA) MakeClientCertificate(certFile, keyFile string, u user.Info, expir
+ 
+ func (ca *CA) MakeClientCertificateForDuration(u user.Info, lifetime time.Duration) (*TLSCertificateConfig, error) {
+ 	clientPublicKey, clientPrivateKey, _ := NewKeyPair()
+-	clientTemplate := newClientCertificateTemplateForDuration(userToSubject(u), lifetime, time.Now)
+-	clientCrt, err := ca.signCertificate(clientTemplate, clientPublicKey)
++	clientTemplate := NewClientCertificateTemplateForDuration(UserToSubject(u), lifetime, time.Now)
++	clientCrt, err := ca.SignCertificate(clientTemplate, clientPublicKey)
+ 	if err != nil {
+ 		return nil, err
+ 	}
+@@ -910,7 +912,7 @@ func (ca *CA) MakeClientCertificateForDuration(u user.Info, lifetime time.Durati
+ 	if err != nil {
+ 		return nil, err
+ 	}
+-	keyData, err := encodeKey(clientPrivateKey)
++	keyData, err := EncodeKey(clientPrivateKey)
+ 	if err != nil {
+ 		return nil, err
+ 	}
+@@ -935,7 +937,7 @@ func (s sortedForDER) Less(i, j int) bool {
+ 	return l1 < l2
+ }
+ 
+-func userToSubject(u user.Info) pkix.Name {
++func UserToSubject(u user.Info) pkix.Name {
+ 	// Ok we are going to order groups in a peculiar way here to workaround a
+ 	// 2 bugs, 1 in golang (https://github.com/golang/go/issues/24254) which
+ 	// incorrectly encodes Multivalued RDNs and another in GNUTLS clients
+@@ -961,7 +963,7 @@ func userToSubject(u user.Info) pkix.Name {
+ 	}
+ }
+ 
+-func (ca *CA) signCertificate(template *x509.Certificate, requestKey crypto.PublicKey) (*x509.Certificate, error) {
++func (ca *CA) SignCertificate(template *x509.Certificate, requestKey crypto.PublicKey) (*x509.Certificate, error) {
+ 	// Increment and persist serial
+ 	serial, err := ca.SerialGenerator.Next(template)
+ 	if err != nil {
+@@ -1019,18 +1021,16 @@ func newSigningCertificateTemplateForDuration(subject pkix.Name, caLifetime time
+ }
+ 
+ // Can be used for ListenAndServeTLS
+-func newServerCertificateTemplate(subject pkix.Name, hosts []string, expireDays int, currentTime func() time.Time, authorityKeyId, subjectKeyId []byte) *x509.Certificate {
+-	var lifetimeInDays = DefaultCertificateLifetimeInDays
+-	if expireDays > 0 {
+-		lifetimeInDays = expireDays
++func newServerCertificateTemplate(subject pkix.Name, hosts []string, lifetime time.Duration, currentTime func() time.Time, authorityKeyId, subjectKeyId []byte) *x509.Certificate {
++	if lifetime <= 0 {
++		lifetime = DefaultCertificateLifetimeDuration
++		fmt.Fprintf(os.Stderr, "Validity period of the certificate for %q is unset, resetting to %s!\n", subject.CommonName, lifetime.String())
+ 	}
+ 
+-	if lifetimeInDays > DefaultCertificateLifetimeInDays {
+-		warnAboutCertificateLifeTime(subject.CommonName, DefaultCertificateLifetimeInDays)
++	if lifetime > DefaultCertificateLifetimeDuration {
++		warnAboutCertificateLifeTime(subject.CommonName, DefaultCertificateLifetimeDuration)
+ 	}
+ 
+-	lifetime := time.Duration(lifetimeInDays) * 24 * time.Hour
+-
+ 	return newServerCertificateTemplateForDuration(subject, hosts, lifetime, currentTime, authorityKeyId, subjectKeyId)
+ }
+ 
+@@ -1102,29 +1102,27 @@ func CertsFromPEM(pemCerts []byte) ([]*x509.Certificate, error) {
+ 	}
+ 
+ 	if !ok {
+-		return certs, errors.New("Could not read any certificates")
++		return certs, errors.New("could not read any certificates")
+ 	}
+ 	return certs, nil
+ }
+ 
+ // Can be used as a certificate in http.Transport TLSClientConfig
+-func newClientCertificateTemplate(subject pkix.Name, expireDays int, currentTime func() time.Time) *x509.Certificate {
+-	var lifetimeInDays = DefaultCertificateLifetimeInDays
+-	if expireDays > 0 {
+-		lifetimeInDays = expireDays
++func NewClientCertificateTemplate(subject pkix.Name, lifetime time.Duration, currentTime func() time.Time) *x509.Certificate {
++	if lifetime <= 0 {
++		lifetime = DefaultCertificateLifetimeDuration
++		fmt.Fprintf(os.Stderr, "Validity period of the certificate for %q is unset, resetting to %s!\n", subject.CommonName, lifetime.String())
+ 	}
+ 
+-	if lifetimeInDays > DefaultCertificateLifetimeInDays {
+-		warnAboutCertificateLifeTime(subject.CommonName, DefaultCertificateLifetimeInDays)
++	if lifetime > DefaultCertificateLifetimeDuration {
++		warnAboutCertificateLifeTime(subject.CommonName, DefaultCertificateLifetimeDuration)
+ 	}
+ 
+-	lifetime := time.Duration(lifetimeInDays) * 24 * time.Hour
+-
+-	return newClientCertificateTemplateForDuration(subject, lifetime, currentTime)
++	return NewClientCertificateTemplateForDuration(subject, lifetime, currentTime)
+ }
+ 
+ // Can be used as a certificate in http.Transport TLSClientConfig
+-func newClientCertificateTemplateForDuration(subject pkix.Name, lifetime time.Duration, currentTime func() time.Time) *x509.Certificate {
++func NewClientCertificateTemplateForDuration(subject pkix.Name, lifetime time.Duration, currentTime func() time.Time) *x509.Certificate {
+ 	return &x509.Certificate{
+ 		Subject: subject,
+ 
+@@ -1140,8 +1138,8 @@ func newClientCertificateTemplateForDuration(subject pkix.Name, lifetime time.Du
+ 	}
+ }
+ 
+-func warnAboutCertificateLifeTime(name string, defaultLifetimeInDays int) {
+-	defaultLifetimeInYears := defaultLifetimeInDays / 365
++func warnAboutCertificateLifeTime(name string, defaultLifetimeDuration time.Duration) {
++	defaultLifetimeInYears := defaultLifetimeDuration / 365 / 24
+ 	fmt.Fprintf(os.Stderr, "WARNING: Validity period of the certificate for %q is greater than %d years!\n", name, defaultLifetimeInYears)
+ 	fmt.Fprintln(os.Stderr, "WARNING: By security reasons it is strongly recommended to change this period and make it smaller!")
+ }
+@@ -1156,7 +1154,7 @@ func signCertificate(template *x509.Certificate, requestKey crypto.PublicKey, is
+ 		return nil, err
+ 	}
+ 	if len(certs) != 1 {
+-		return nil, errors.New("Expected a single certificate")
++		return nil, errors.New("expected a single certificate")
+ 	}
+ 	return certs[0], nil
+ }
+@@ -1170,7 +1168,7 @@ func EncodeCertificates(certs ...*x509.Certificate) ([]byte, error) {
+ 	}
+ 	return b.Bytes(), nil
+ }
+-func encodeKey(key crypto.PrivateKey) ([]byte, error) {
++func EncodeKey(key crypto.PrivateKey) ([]byte, error) {
+ 	b := bytes.Buffer{}
+ 	switch key := key.(type) {
+ 	case *ecdsa.PrivateKey:
+@@ -1186,7 +1184,7 @@ func encodeKey(key crypto.PrivateKey) ([]byte, error) {
+ 			return []byte{}, err
+ 		}
+ 	default:
+-		return []byte{}, errors.New("Unrecognized key type")
++		return []byte{}, errors.New("unrecognized key type")
+ 
+ 	}
+ 	return b.Bytes(), nil
+@@ -1204,7 +1202,7 @@ func writeCertificates(f io.Writer, certs ...*x509.Certificate) error {
+ 	return nil
+ }
+ func writeKeyFile(f io.Writer, key crypto.PrivateKey) error {
+-	bytes, err := encodeKey(key)
++	bytes, err := EncodeKey(key)
+ 	if err != nil {
+ 		return err
+ 	}
+diff --git a/vendor/modules.txt b/vendor/modules.txt
+index 2d0ad266f82..353f902cde0 100644
+--- a/vendor/modules.txt
++++ b/vendor/modules.txt
+@@ -656,14 +656,14 @@ github.com/openshift/api/image/v1
+ github.com/openshift/api/oauth/v1
+ github.com/openshift/api/operator/v1
+ github.com/openshift/api/route/v1
+-# github.com/openshift/client-go v0.0.0-20260108185524-48f4ccfc4e13
+-## explicit; go 1.24.0
++# github.com/openshift/client-go v0.0.0-20260317180604-743f664b82d1
++## explicit; go 1.25.0
+ github.com/openshift/client-go/oauth/applyconfigurations/internal
+ github.com/openshift/client-go/oauth/applyconfigurations/oauth/v1
+ github.com/openshift/client-go/oauth/clientset/versioned/scheme
+ github.com/openshift/client-go/oauth/clientset/versioned/typed/oauth/v1
+-# github.com/openshift/library-go v0.0.0-20231020125034-5a2d9fe760b3
+-## explicit; go 1.20
++# github.com/openshift/library-go v0.0.0-20260518122146-385e91fd29b1
++## explicit; go 1.24.0
+ github.com/openshift/library-go/pkg/crypto
+ # github.com/operator-framework/api v0.42.0
+ ## explicit; go 1.25.7

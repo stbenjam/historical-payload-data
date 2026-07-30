@@ -1,0 +1,395 @@
+diff --git a/test/extended-priv/inside_node_containers.go b/test/extended-priv/inside_node_containers.go
+index 6d63ecc2ad..cf93642836 100644
+--- a/test/extended-priv/inside_node_containers.go
++++ b/test/extended-priv/inside_node_containers.go
+@@ -1,6 +1,7 @@
+ package extended
+ 
+ import (
++	"errors"
+ 	"fmt"
+ 	"net/url"
+ 	"path/filepath"
+@@ -36,22 +37,68 @@ func (b *OsImageBuilderInNode) sanitizeCommand(cmd string) string {
+ 	return strings.NewReplacer(oldnew...).Replace(cmd)
+ }
+ 
+-// OsImageBuilderInNode encapsulates the functionality to build custom osImages inside a cluster node
++func logAndError(format string, args ...interface{}) error {
++	msg := fmt.Sprintf(format, args...)
++	logger.Errorf("%s", msg)
++	return errors.New(msg)
++}
++
++// OsImageBuilderInNode encapsulates the functionality to build custom osImages inside a cluster node.
++// Use NewOsImageBuilder() to create one, then call CreateAndDigestOsImage() and CleanUp().
+ type OsImageBuilderInNode struct {
+-	node *Node
+-	baseImage,
+-	osImage,
+-	dockerFileCommands, // Full docker file but the "FROM basOsImage..." that will be calculated
+-	dockerConfig,
+-	httpProxy,
+-	httpsProxy,
+-	noProxy,
+-	tmpDir,
+-	remoteTmpDir,
+-	remoteDockerConfig,
+-	remoteDockerfile string
+-	UseInternalRegistry,
+-	BuildAsManifest bool // If true, build as manifest; if false, build as single image
++	// Required — set via NewOsImageBuilder()
++	node               *Node
++	dockerFileCommands string
++
++	// Options — set via WithInternalRegistry(), WithManifestBuild()
++	useInternalRegistry bool
++	buildAsManifest     bool
++
++	// Resolved by prepareEnvironment()
++	baseImage          string
++	osImage            string
++	dockerConfig       string
++	tmpDir             string
++	remoteTmpDir       string
++	remoteDockerConfig string
++	remoteDockerfile   string
++	httpProxy          string
++	httpsProxy         string
++	noProxy            string
++}
++
++// BuildOption configures optional behavior for OsImageBuilderInNode.
++type BuildOption func(*OsImageBuilderInNode)
++
++// WithInternalRegistry configures the builder to push images to the cluster's internal registry.
++func WithInternalRegistry() BuildOption {
++	return func(b *OsImageBuilderInNode) { b.useInternalRegistry = true }
++}
++
++// WithManifestBuild configures the builder to produce a manifest list instead of a single image.
++func WithManifestBuild() BuildOption {
++	return func(b *OsImageBuilderInNode) { b.buildAsManifest = true }
++}
++
++// NewOsImageBuilder creates a new OsImageBuilderInNode for the given node and Dockerfile commands.
++func NewOsImageBuilder(node *Node, dockerFileCommands string, opts ...BuildOption) *OsImageBuilderInNode {
++	b := &OsImageBuilderInNode{
++		node:               node,
++		dockerFileCommands: dockerFileCommands,
++	}
++	for _, o := range opts {
++		o(b)
++	}
++	return b
++}
++
++func (b *OsImageBuilderInNode) suppressOCOutput() func() {
++	b.node.GetOC().NotShowInfo()
++	return func() { b.node.GetOC().SetShowInfo() }
++}
++
++func (b *OsImageBuilderInNode) proxyEnvPrefix() string {
++	return "NO_PROXY=" + b.noProxy + " HTTPS_PROXY=" + b.httpsProxy + " HTTP_PROXY=" + b.httpProxy
+ }
+ 
+ // prepareEnvironment sets up the build environment on the node by performing the following tasks:
+@@ -86,12 +133,8 @@ func (b *OsImageBuilderInNode) prepareEnvironment() error {
+ 		return fmt.Errorf("error creating tmp dir %s in node %s. Error: %s", b.remoteTmpDir, b.node.GetName(), err)
+ 	}
+ 
+-	if b.remoteDockerConfig == "" {
+-		b.remoteDockerConfig = filepath.Join(b.remoteTmpDir, ".dockerconfigjson")
+-	}
+-	if b.remoteDockerfile == "" {
+-		b.remoteDockerfile = filepath.Join(b.remoteTmpDir, "Dockerfile")
+-	}
++	b.remoteDockerConfig = filepath.Join(b.remoteTmpDir, ".dockerconfigjson")
++	b.remoteDockerfile = filepath.Join(b.remoteTmpDir, "Dockerfile")
+ 
+ 	exutil.By("Prepare remote docker config file")
+ 	logger.Infof("Copy cluster config.json file")
+@@ -122,7 +165,7 @@ func (b *OsImageBuilderInNode) prepareEnvironment() error {
+ 		return err
+ 	}
+ 
+-	if b.UseInternalRegistry {
++	if b.useInternalRegistry {
+ 		// The images must be created inside the MCO namespace or MCO will not have permissions to pull them
+ 		b.osImage = fmt.Sprintf("%s/%s/%s:%s", InternalRegistrySvcURL, MachineConfigNamespace, "layering", uniqueTag)
+ 		if err := b.preparePushToInternalRegistry(); err != nil {
+@@ -193,9 +236,8 @@ func (b *OsImageBuilderInNode) preparePushToInternalRegistry() error {
+ 	}
+ 	logger.Infof("OK!\n")
+ 
+-	logger.Infof("Loging as registry admin to internal registry")
+-	b.node.GetOC().NotShowInfo()
+-	defer b.node.GetOC().SetShowInfo()
++	logger.Infof("Logging as registry admin to internal registry")
++	defer b.suppressOCOutput()()
+ 	loginOut, loginErr := b.node.DebugNodeWithChroot("podman", "login", InternalRegistrySvcURL, "-u", layeringRegistryAdminSAName, "-p", saToken, "--authfile", b.remoteDockerConfig)
+ 	if loginErr != nil {
+ 		return fmt.Errorf("error trying to login to internal registry:\nOutput:%s\nError:%s", loginOut, loginErr)
+@@ -208,7 +250,15 @@ func (b *OsImageBuilderInNode) preparePushToInternalRegistry() error {
+ // CleanUp will clean up all the helper resources created by the builder
+ func (b *OsImageBuilderInNode) CleanUp() error {
+ 	logger.Infof("Cleanup image builder resources")
+-	if b.UseInternalRegistry {
++
++	if b.remoteTmpDir != "" {
++		logger.Infof("Removing remote temp directory %s from node %s", b.remoteTmpDir, b.node.GetName())
++		if _, err := b.node.DebugNodeWithChroot("rm", "-rf", b.remoteTmpDir); err != nil {
++			logger.Errorf("Error removing remote tmp dir %s: %s", b.remoteTmpDir, err)
++		}
++	}
++
++	if b.useInternalRegistry {
+ 		logger.Infof("Removing namespace %s", layeringTestsTmpNamespace)
+ 		err := b.node.oc.Run("delete").Args("namespace", layeringTestsTmpNamespace, "--ignore-not-found").Execute()
+ 		if err != nil {
+@@ -258,23 +308,20 @@ func (b *OsImageBuilderInNode) buildImage() error {
+ 		return err
+ 	}
+ 
+-	var buildCommand string
+-	if b.BuildAsManifest {
+-		buildCommand = "NO_PROXY=" + b.noProxy + " HTTPS_PROXY=" + b.httpsProxy + " HTTP_PROXY=" + b.httpProxy + " podman build  --network host " + buildPath + " --manifest " + b.osImage + " --authfile " + b.remoteDockerConfig
+-		logger.Infof("Building as manifest")
+-	} else {
+-		buildCommand = "NO_PROXY=" + b.noProxy + " HTTPS_PROXY=" + b.httpsProxy + " HTTP_PROXY=" + b.httpProxy + " podman build  --network host " + buildPath + " --tag " + b.osImage + " --authfile " + b.remoteDockerConfig
+-		logger.Infof("Building as single image")
++	imageFlag := "--tag"
++	logLabel := "single image"
++	if b.buildAsManifest {
++		imageFlag = "--manifest"
++		logLabel = "manifest"
+ 	}
++	logger.Infof("Building as %s", logLabel)
++	buildCommand := b.proxyEnvPrefix() + " podman build --network host " + buildPath + " " + imageFlag + " " + b.osImage + " --authfile " + b.remoteDockerConfig
+ 	logger.Infof("Executing build command: %s", b.sanitizeCommand(buildCommand))
+ 
+-	b.node.GetOC().NotShowInfo()
+-	defer b.node.GetOC().SetShowInfo()
++	defer b.suppressOCOutput()()
+ 	output, err := b.node.DebugNodeWithChroot("bash", "-c", buildCommand)
+ 	if err != nil {
+-		msg := fmt.Sprintf("Podman failed building image %s:\n%s\n%s", b.osImage, output, err)
+-		logger.Errorf(msg)
+-		return fmt.Errorf("%s", msg)
++		return logAndError("Podman failed building image %s:\n%s\n%s", b.osImage, output, err)
+ 	}
+ 
+ 	logger.Debugf(output)
+@@ -291,30 +338,25 @@ func (b *OsImageBuilderInNode) buildImage() error {
+ func (b *OsImageBuilderInNode) pushImage() error {
+ 	exutil.By("Push osImage")
+ 	var pushCommand string
+-	if b.BuildAsManifest {
+-		pushCommand = "NO_PROXY=" + b.noProxy + " HTTPS_PROXY=" + b.httpsProxy + " HTTP_PROXY=" + b.httpProxy + " podman manifest push " + b.osImage + " docker://" + b.osImage + " --authfile " + b.remoteDockerConfig
++	if b.buildAsManifest {
++		pushCommand = b.proxyEnvPrefix() + " podman manifest push " + b.osImage + " docker://" + b.osImage + " --authfile " + b.remoteDockerConfig
+ 		logger.Infof("Pushing as manifest")
+ 	} else {
+-		pushCommand = "NO_PROXY=" + b.noProxy + " HTTPS_PROXY=" + b.httpsProxy + " HTTP_PROXY=" + b.httpProxy + " podman push " + b.osImage + " --authfile " + b.remoteDockerConfig
++		pushCommand = b.proxyEnvPrefix() + " podman push " + b.osImage + " --authfile " + b.remoteDockerConfig
+ 		logger.Infof("Pushing as single image")
+ 	}
+ 	logger.Infof("Executing push command: %s", b.sanitizeCommand(pushCommand))
+ 
+-	b.node.GetOC().NotShowInfo()
+-	defer b.node.GetOC().SetShowInfo()
++	defer b.suppressOCOutput()()
+ 	output, err := b.node.DebugNodeWithChroot("bash", "-c", pushCommand)
+ 	if err != nil {
+-		msg := fmt.Sprintf("Podman failed pushing image %s:\n%s\n%s", b.osImage, output, err)
+-		logger.Errorf(msg)
+-		return fmt.Errorf("%s", msg)
++		return logAndError("Podman failed pushing image %s:\n%s\n%s", b.osImage, output, err)
+ 	}
+ 
+ 	// If we don't have permissions to push the image, the `oc debug` command will not return an error
+ 	//  so we need to check manually that there is no unauthorized error
+ 	if strings.Contains(output, "unauthorized: access to the requested resource is not authorized") {
+-		msg := fmt.Sprintf("Podman was not authorized to push the image %s:\n%s\n", b.osImage, output)
+-		logger.Errorf(msg)
+-		return fmt.Errorf("%s", msg)
++		return logAndError("Podman was not authorized to push the image %s:\n%s\n", b.osImage, output)
+ 	}
+ 
+ 	logger.Debugf(output)
+@@ -327,7 +369,7 @@ func (b *OsImageBuilderInNode) removeImage() error {
+ 	exutil.By("Remove osImage")
+ 	var rmOutput string
+ 	var err error
+-	if b.BuildAsManifest {
++	if b.buildAsManifest {
+ 		logger.Infof("Removing manifest")
+ 		rmOutput, err = b.node.DebugNodeWithChroot("podman", "manifest", "rm", b.osImage)
+ 	} else {
+@@ -335,9 +377,7 @@ func (b *OsImageBuilderInNode) removeImage() error {
+ 		rmOutput, err = b.node.DebugNodeWithChroot("podman", "rmi", b.osImage)
+ 	}
+ 	if err != nil {
+-		msg := fmt.Sprintf("Podman failed removing image %s:\n%s\n%s", b.osImage, rmOutput, err)
+-		logger.Errorf(msg)
+-		return fmt.Errorf("%s", msg)
++		return logAndError("Podman failed removing image %s:\n%s\n%s", b.osImage, rmOutput, err)
+ 	}
+ 
+ 	logger.Debugf(rmOutput)
+@@ -348,16 +388,13 @@ func (b *OsImageBuilderInNode) removeImage() error {
+ // digestImage inspects the pushed image and returns its digest reference
+ func (b *OsImageBuilderInNode) digestImage() (string, error) {
+ 	exutil.By("Digest osImage")
+-	skopeoCommand := "NO_PROXY=" + b.noProxy + " HTTPS_PROXY=" + b.httpsProxy + " HTTP_PROXY=" + b.httpProxy + " skopeo inspect docker://" + b.osImage + " --authfile " + b.remoteDockerConfig
++	skopeoCommand := b.proxyEnvPrefix() + " skopeo inspect docker://" + b.osImage + " --authfile " + b.remoteDockerConfig
+ 	logger.Infof("Executing skopeo command: %s", b.sanitizeCommand(skopeoCommand))
+ 
+-	b.node.GetOC().NotShowInfo()
+-	defer b.node.GetOC().SetShowInfo()
++	defer b.suppressOCOutput()()
+ 	inspectInfo, _, err := b.node.DebugNodeWithChrootStd("bash", "-c", skopeoCommand)
+ 	if err != nil {
+-		msg := fmt.Sprintf("Skopeo failed inspecting image %s:\n%s\n%s", b.osImage, inspectInfo, err)
+-		logger.Errorf(msg)
+-		return "", fmt.Errorf("%s", msg)
++		return "", logAndError("Skopeo failed inspecting image %s:\n%s\n%s", b.osImage, inspectInfo, err)
+ 	}
+ 
+ 	logger.Debugf(inspectInfo)
+diff --git a/test/extended-priv/mco_alerts.go b/test/extended-priv/mco_alerts.go
+index cded1542cf..c79a4ad04b 100644
+--- a/test/extended-priv/mco_alerts.go
++++ b/test/extended-priv/mco_alerts.go
+@@ -132,7 +132,7 @@ var _ = g.Describe("[sig-mco][Suite:openshift/machine-config-operator/longdurati
+ 
+ 		// Build a new osImage that we will use to force a rebase in the broken node
+ 		exutil.By("Build new OSImage")
+-		osImageBuilder := OsImageBuilderInNode{node: node, dockerFileCommands: dockerFileCommands}
++		osImageBuilder := NewOsImageBuilder(node, dockerFileCommands)
+ 		digestedImage, err := osImageBuilder.CreateAndDigestOsImage()
+ 		o.Expect(err).NotTo(o.HaveOccurred(),
+ 			"Error creating the new osImage")
+diff --git a/test/extended-priv/mco_daemon.go b/test/extended-priv/mco_daemon.go
+index 062fe4131b..0358292c28 100644
+--- a/test/extended-priv/mco_daemon.go
++++ b/test/extended-priv/mco_daemon.go
+@@ -453,10 +453,7 @@ ExecStartPre=/bin/bash -c "echo 'exec start pre'; /bin/sleep 15; echo 'exec star
+ 		logger.Infof("OK!\n")
+ 
+ 		// Build the new osImage
+-		osImageBuilder := OsImageBuilderInNode{
+-			node:               node,
+-			dockerFileCommands: dockerFileCommands,
+-		}
++		osImageBuilder := NewOsImageBuilder(node, dockerFileCommands)
+ 		digestedImage, err := osImageBuilder.CreateAndDigestOsImage()
+ 		o.Expect(err).NotTo(o.HaveOccurred(),
+ 			"Error creating the new osImage")
+diff --git a/test/extended-priv/mco_layering.go b/test/extended-priv/mco_layering.go
+index 2cdb6e7113..408a0f3338 100644
+--- a/test/extended-priv/mco_layering.go
++++ b/test/extended-priv/mco_layering.go
+@@ -67,7 +67,7 @@ RUN update-ca-trust && \
+ 		logger.Infof("OK\n")
+ 
+ 		// Build the new osImage
+-		osImageBuilder := OsImageBuilderInNode{node: node, dockerFileCommands: dockerFileCommands}
++		osImageBuilder := NewOsImageBuilder(node, dockerFileCommands)
+ 		digestedImage, err := osImageBuilder.CreateAndDigestOsImage()
+ 		o.Expect(err).NotTo(o.HaveOccurred(),
+ 			"Error creating the new osImage")
+@@ -233,7 +233,7 @@ RUN update-ca-trust && \
+ RUN echo "echo 'Hello world! '$(whoami)" > /usr/bin/tc_54159_rpm_and_osimage && chmod 1755 /usr/bin/tc_54159_rpm_and_osimage
+ `
+ 		// Build the new osImage
+-		osImageBuilder := OsImageBuilderInNode{node: node, dockerFileCommands: dockerFileCommands}
++		osImageBuilder := NewOsImageBuilder(node, dockerFileCommands)
+ 		digestedImage, berr := osImageBuilder.CreateAndDigestOsImage()
+ 		o.Expect(berr).NotTo(o.HaveOccurred(),
+ 			"Error creating the new osImage")
+@@ -473,7 +473,7 @@ RUN printf '[baseos]\nname=CentOS-$releasever - Base\nbaseurl=http://mirror.stre
+ 		defer wMcp.WaitForUpdatedStatus()
+ 
+ 		// Build the new osImage
+-		osImageBuilder := OsImageBuilderInNode{node: workerNode, dockerFileCommands: dockerFileCommands}
++		osImageBuilder := NewOsImageBuilder(workerNode, dockerFileCommands)
+ 		defer func() { _ = osImageBuilder.CleanUp() }()
+ 		digestedImage, err := osImageBuilder.CreateAndDigestOsImage()
+ 		o.Expect(err).NotTo(o.HaveOccurred(),
+@@ -781,7 +781,7 @@ RUN printf '[baseos]\nname=CentOS-$releasever - Base\nbaseurl=http://mirror.stre
+ 
+ 		// Build the new osImage
+ 		g.By("Build a custom osImage")
+-		osImageBuilder := OsImageBuilderInNode{node: workerNode, dockerFileCommands: dockerFileCommands}
++		osImageBuilder := NewOsImageBuilder(workerNode, dockerFileCommands)
+ 		digestedImage, err := osImageBuilder.CreateAndDigestOsImage()
+ 		o.Expect(err).NotTo(o.HaveOccurred(),
+ 			"Error creating the new osImage")
+@@ -973,7 +973,7 @@ RUN printf '[baseos]\nname=CentOS-$releasever - Base\nbaseurl=http://mirror.stre
+ 
+ 		// Build the new osImage
+ 		g.By("Build a custom osImage")
+-		osImageBuilder := OsImageBuilderInNode{node: workerNode, dockerFileCommands: dockerFileCommands}
++		osImageBuilder := NewOsImageBuilder(workerNode, dockerFileCommands)
+ 		digestedImage, err := osImageBuilder.CreateAndDigestOsImage()
+ 		o.Expect(err).NotTo(o.HaveOccurred(),
+ 			"Error creating the new osImage")
+@@ -1097,8 +1097,7 @@ RUN touch %s
+ 		logger.Infof("Using pool %s and node %s for testing", mcp.GetName(), node.GetName())
+ 
+ 		// Build the new osImage
+-		osImageBuilder := OsImageBuilderInNode{node: node, dockerFileCommands: dockerFileCommands}
+-		osImageBuilder.UseInternalRegistry = true
++		osImageBuilder := NewOsImageBuilder(node, dockerFileCommands, WithInternalRegistry())
+ 		defer func() { _ = osImageBuilder.CleanUp() }()
+ 		digestedImage, err := osImageBuilder.CreateAndDigestOsImage()
+ 		o.Expect(err).NotTo(o.HaveOccurred(),
+@@ -1185,7 +1184,7 @@ RUN printf '[baseos]\nname=CentOS-$releasever - Base\nbaseurl=http://mirror.stre
+ 
+ 		// Build the new osImage
+ 		g.By("Build a custom osImage")
+-		osImageBuilder := OsImageBuilderInNode{node: node, dockerFileCommands: dockerFileCommands}
++		osImageBuilder := NewOsImageBuilder(node, dockerFileCommands)
+ 		digestedImage, err := osImageBuilder.CreateAndDigestOsImage()
+ 		o.Expect(err).NotTo(o.HaveOccurred(),
+ 			"Error creating the new osImage")
+@@ -1281,8 +1280,7 @@ RUN echo '%s' > %s && chmod 0644 %s && ostree container commit
+ 		logger.Infof("OK!\n")
+ 
+ 		g.By("Build a new osImage as a manifest")
+-		osImageBuilder := OsImageBuilderInNode{node: node, dockerFileCommands: dockerFileCommands}
+-		osImageBuilder.BuildAsManifest = true
++		osImageBuilder := NewOsImageBuilder(node, dockerFileCommands, WithManifestBuild())
+ 		digestedImage, err := osImageBuilder.CreateAndDigestOsImage()
+ 		o.Expect(err).NotTo(o.HaveOccurred(),
+ 			"Error creating the new osImage as manifest")
+diff --git a/test/extended-priv/mco_ocb.go b/test/extended-priv/mco_ocb.go
+index 56341264ff..3c5fb25924 100644
+--- a/test/extended-priv/mco_ocb.go
++++ b/test/extended-priv/mco_ocb.go
+@@ -230,10 +230,7 @@ var _ = g.Describe("[sig-mco][Suite:openshift/machine-config-operator/disruptive
+ 		onClusterRF := NewRemoteFile(node, onClusterFile)
+ 
+ 		exutil.By("Build a custom OS image for off-cluster layering")
+-		osImageBuilder := OsImageBuilderInNode{
+-			node:               node,
+-			dockerFileCommands: fmt.Sprintf("RUN echo \"off-cluster layering %s\" > %s\nRUN ostree container commit", testID, offClusterFile),
+-		}
++		osImageBuilder := NewOsImageBuilder(node, fmt.Sprintf("RUN echo \"off-cluster layering %s\" > %s\nRUN ostree container commit", testID, offClusterFile))
+ 		digestedImage, err := osImageBuilder.CreateAndDigestOsImage()
+ 		o.Expect(err).NotTo(o.HaveOccurred(), "Error creating the custom osImage for off-cluster layering")
+ 		logger.Infof("Built custom OS image: %s", digestedImage)
+diff --git a/test/extended-priv/mco_osimagestream.go b/test/extended-priv/mco_osimagestream.go
+index 407df31cfc..7f0a76f07a 100644
+--- a/test/extended-priv/mco_osimagestream.go
++++ b/test/extended-priv/mco_osimagestream.go
+@@ -199,7 +199,7 @@ var _ = g.Describe("[sig-mco][Suite:openshift/machine-config-operator/disruptive
+ 
+ 		exutil.By("Build a custom OS image to use as osImageURL")
+ 		node = mcp.GetSortedNodesOrFail()[0]
+-		osImageBuilder := OsImageBuilderInNode{node: node, dockerFileCommands: "RUN ostree container commit"}
++		osImageBuilder := NewOsImageBuilder(node, "RUN ostree container commit")
+ 		digestedImage, err := osImageBuilder.CreateAndDigestOsImage()
+ 		o.Expect(err).NotTo(o.HaveOccurred(),
+ 			"Error creating the custom osImage")

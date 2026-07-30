@@ -1,0 +1,227 @@
+diff --git a/go.mod b/go.mod
+index fe1ad91b3..84b983a8b 100644
+--- a/go.mod
++++ b/go.mod
+@@ -13,7 +13,7 @@ require (
+ 	github.com/openshift/api v0.0.0-20260715165912-72066cc9718b
+ 	github.com/openshift/build-machinery-go v0.0.0-20251023084048-5d77c1a5e5af
+ 	github.com/openshift/client-go v0.0.0-20260715172546-dac61734e0ec
+-	github.com/openshift/library-go v0.0.0-20260720185249-0595e37fe20f
++	github.com/openshift/library-go v0.0.0-20260721103755-0c9fbc9f043a
+ 	github.com/spf13/cobra v1.10.2
+ 	github.com/stretchr/testify v1.11.1
+ 	k8s.io/api v0.36.2
+diff --git a/go.sum b/go.sum
+index ac6e61f34..fa3d2bedd 100644
+--- a/go.sum
++++ b/go.sum
+@@ -197,8 +197,8 @@ github.com/openshift/build-machinery-go v0.0.0-20251023084048-5d77c1a5e5af h1:Ui
+ github.com/openshift/build-machinery-go v0.0.0-20251023084048-5d77c1a5e5af/go.mod h1:8jcm8UPtg2mCAsxfqKil1xrmRMI3a+XU2TZ9fF8A7TE=
+ github.com/openshift/client-go v0.0.0-20260715172546-dac61734e0ec h1:UDjX+mot5IVLpcChyBqLXG1oSB29s4UkqFmgNb0Xsqc=
+ github.com/openshift/client-go v0.0.0-20260715172546-dac61734e0ec/go.mod h1:iMHec0APKVjOH8GfL/RxddX8DuiuSvPlRe+s7KDqlyA=
+-github.com/openshift/library-go v0.0.0-20260720185249-0595e37fe20f h1:NdSEtKB+vvHlGELA+jX/c+TALNwe8iSsJAQYvMabgHQ=
+-github.com/openshift/library-go v0.0.0-20260720185249-0595e37fe20f/go.mod h1:iWcB6wgeOhsByZAZGhmzBtEnrLQzABL0s3aeou8AmSI=
++github.com/openshift/library-go v0.0.0-20260721103755-0c9fbc9f043a h1:86Mj1eP0RtYtwPRpdkGbzf6h1Tn+uuYiR6XKZXsWWn8=
++github.com/openshift/library-go v0.0.0-20260721103755-0c9fbc9f043a/go.mod h1:iWcB6wgeOhsByZAZGhmzBtEnrLQzABL0s3aeou8AmSI=
+ github.com/openshift/onsi-ginkgo/v2 v2.6.1-0.20260303184444-1cc650aa0565 h1:3/q8qM4HbFa+Een8wgzpwO8W6mO7Po+MwY6uxiXi/ac=
+ github.com/openshift/onsi-ginkgo/v2 v2.6.1-0.20260303184444-1cc650aa0565/go.mod h1:ArE1D/XhNXBXCBkKOLkbsb2c81dQHCRcF5zwn/ykDRo=
+ github.com/orisano/pixelmatch v0.0.0-20220722002657-fb0b55479cde/go.mod h1:nZgzbfBr3hhjoZnS66nKrHmduYNpc34ny7RK4z5/HM0=
+diff --git a/pkg/operator/workload/workload_openshiftapiserver_v311_00_sync.go b/pkg/operator/workload/workload_openshiftapiserver_v311_00_sync.go
+index 97bb069e3..f3384c2e0 100644
+--- a/pkg/operator/workload/workload_openshiftapiserver_v311_00_sync.go
++++ b/pkg/operator/workload/workload_openshiftapiserver_v311_00_sync.go
+@@ -479,7 +479,7 @@ func manageOpenShiftAPIServerDeployment_v311_00_to_latest(
+ 	}
+ 	required.Spec.Replicas = masterNodeCount
+ 
+-	if err := kmspluginlifecycle.AddKMSPluginSidecarToPodSpec(
++	if err := kmspluginlifecycle.EnsureKMSPluginSidecarInPodSpec(
+ 		ctx,
+ 		&required.Spec.Template.Spec,
+ 		"openshift-apiserver",
+@@ -489,7 +489,7 @@ func manageOpenShiftAPIServerDeployment_v311_00_to_latest(
+ 		operatorImagePullSpec,
+ 		kubeClient.CoreV1(),
+ 		featureGateAccessor); err != nil {
+-		return nil, false, fmt.Errorf("failed to add KMS plugin to pod spec: %w", err)
++		return nil, false, fmt.Errorf("failed to ensure KMS plugin in pod spec: %w", err)
+ 	}
+ 
+ 	return resourceapply.ApplyDeployment(ctx, client, recorder, required, resourcemerge.ExpectedDeploymentGeneration(required, generationStatus))
+diff --git a/test/e2e-encryption-kms/encryption_kms_2.go b/test/e2e-encryption-kms/encryption_kms_2.go
+index da7f81f11..42db5c3e3 100644
+--- a/test/e2e-encryption-kms/encryption_kms_2.go
++++ b/test/e2e-encryption-kms/encryption_kms_2.go
+@@ -51,7 +51,13 @@ func testKMSEncryptionKMSToKMSMigration(ctx context.Context, t testing.TB) {
+ 		CreateResourceFunc: func(t testing.TB, _ library.ClientSet, namespace string) runtime.Object {
+ 			return library.CreateAndStoreWellKnownRouteOfLife(context.TODO(), t, library.GetClients(t), ns)
+ 		},
+-		AssertResourceEncryptedFunc:    library.AssertWellKnownRouteOfLifeEncrypted,
++		AssertResourceEncryptedFunc: func(t testing.TB, clientSet library.ClientSet, resource runtime.Object) {
++			library.AssertWellKnownRouteOfLifeEncrypted(t, clientSet, resource)
++			library.AssertWellKnownRouteOfLifeEncryptedWithKMS(t, clientSet,
++				operatorclient.GlobalMachineSpecifiedConfigNamespace,
++				"encryption.apiserver.operator.openshift.io/component="+operatorclient.TargetNamespace,
++				resource)
++		},
+ 		AssertResourceNotEncryptedFunc: library.AssertWellKnownRouteOfLifeNotEncrypted,
+ 		ResourceFunc:                   func(t testing.TB, _ string) runtime.Object { return library.WellKnownRouteOfLife(t, ns) },
+ 		ResourceName:                   "RouteOfLife",
+diff --git a/vendor/github.com/openshift/library-go/pkg/operator/encryption/kms/pluginlifecycle/builder.go b/vendor/github.com/openshift/library-go/pkg/operator/encryption/kms/pluginlifecycle/builder.go
+index 1dc322788..ce7d4f24a 100644
+--- a/vendor/github.com/openshift/library-go/pkg/operator/encryption/kms/pluginlifecycle/builder.go
++++ b/vendor/github.com/openshift/library-go/pkg/operator/encryption/kms/pluginlifecycle/builder.go
+@@ -107,6 +107,10 @@ func (b *KMSPluginBuilder) Apply(ctx context.Context, podSpec *corev1.PodSpec, c
+ 	if err != nil {
+ 		return fmt.Errorf("failed to get KMS configurations: %w", err)
+ 	}
++
++	// Strip all existing KMS-related resources before re-adding exactly what the current encryption config requires.
++	removeAllKMSManagedResources(podSpec, containerName)
++
+ 	if len(kmsConfigurations) == 0 {
+ 		klog.V(4).Infof("skipping KMS sidecar injection: no KMS plugins found in EncryptionConfiguration")
+ 		return nil
+diff --git a/vendor/github.com/openshift/library-go/pkg/operator/encryption/kms/pluginlifecycle/sidecar.go b/vendor/github.com/openshift/library-go/pkg/operator/encryption/kms/pluginlifecycle/sidecar.go
+index 86a047b06..5e5796495 100644
+--- a/vendor/github.com/openshift/library-go/pkg/operator/encryption/kms/pluginlifecycle/sidecar.go
++++ b/vendor/github.com/openshift/library-go/pkg/operator/encryption/kms/pluginlifecycle/sidecar.go
+@@ -3,10 +3,12 @@ package pluginlifecycle
+ import (
+ 	"context"
+ 	"fmt"
++	"strings"
+ 
+ 	configv1 "github.com/openshift/api/config/v1"
+ 	"github.com/openshift/api/features"
+ 	"github.com/openshift/library-go/pkg/operator/configobserver/featuregates"
++	"github.com/openshift/library-go/pkg/operator/encryption/kms/health"
+ 	corev1 "k8s.io/api/core/v1"
+ 	"k8s.io/apimachinery/pkg/api/equality"
+ 	corev1client "k8s.io/client-go/kubernetes/typed/core/v1"
+@@ -25,6 +27,11 @@ const (
+ 	kmsPluginSocketMountPath  = "/var/run/kmsplugin"
+ )
+ 
++const (
++	vaultSidecarPrefix = "vault-kms-plugin"
++	healthReporterName = "kms-health-reporter"
++)
++
+ // sidecarProvider abstracts the construction of a KMS plugin sidecar container for a specific provider (e.g. Vault).
+ type sidecarProvider interface {
+ 	// Name returns the identifier used to name the sidecar container and locate its volume mounts.
+@@ -38,13 +45,15 @@ type sidecarProvider interface {
+ func newSidecarProvider(keyID string, udsPath string, pluginConfig configv1.KMSPluginConfig, refData *referenceDataResolver) (sidecarProvider, error) {
+ 	switch pluginConfig.Type {
+ 	case configv1.VaultKMSProvider:
+-		return newVaultSidecarProvider("vault-kms-plugin", keyID, udsPath, pluginConfig.Vault, refData)
++		return newVaultSidecarProvider(vaultSidecarPrefix, keyID, udsPath, pluginConfig.Vault, refData)
+ 	default:
+ 		return nil, fmt.Errorf("unsupported KMS plugin configuration")
+ 	}
+ }
+ 
+-// AddKMSPluginSidecarToStaticPodSpec injects KMS plugin sidecar containers into a kube-apiserver static pod spec.
++// EnsureKMSPluginSidecarInStaticPodSpec reconciles KMS plugin sidecar containers in a kube-apiserver static pod spec.
++// It removes all KMS-managed resources (sidecars, volumes, volume mounts) and then re-adds exactly what the
++// current encryption config requires, ensuring stale resources from a previous configuration are pruned.
+ //
+ // Static pods access KMS plugin data through the resource-dir volume, which the static pod revision controller
+ // populates on disk from the encryption-config Secret. Because those files are owned by root, each sidecar
+@@ -52,7 +61,7 @@ func newSidecarProvider(keyID string, udsPath string, pluginConfig configv1.KMSP
+ //
+ // It is a no-op when the KMSEncryption feature gate is not enabled or the encryption-config secret does not exist.
+ // The secretClient should be uncached to avoid injecting sidecars based on a stale encryption configuration.
+-func AddKMSPluginSidecarToStaticPodSpec(ctx context.Context, podSpec *corev1.PodSpec, containerName string, encryptionConfigNamespace string, encryptionConfigSecretName string, diskSecretName string, operatorBinary string, operatorImage string, secretClient corev1client.SecretsGetter, featureGateAccessor featuregates.FeatureGateAccess) error {
++func EnsureKMSPluginSidecarInStaticPodSpec(ctx context.Context, podSpec *corev1.PodSpec, containerName string, encryptionConfigNamespace string, encryptionConfigSecretName string, diskSecretName string, operatorBinary string, operatorImage string, secretClient corev1client.SecretsGetter, featureGateAccessor featuregates.FeatureGateAccess) error {
+ 	if !featureGateAccessor.AreInitialFeatureGatesObserved() {
+ 		return nil
+ 	}
+@@ -72,11 +81,13 @@ func AddKMSPluginSidecarToStaticPodSpec(ctx context.Context, podSpec *corev1.Pod
+ 		Apply(ctx, podSpec, containerName)
+ }
+ 
+-// AddKMSPluginSidecarToPodSpec injects KMS plugin sidecar containers into an aggregated API server pod spec (e.g., openshift-apiserver, oauth-apiserver).
++// EnsureKMSPluginSidecarInPodSpec reconciles KMS plugin sidecar containers in an aggregated API server pod spec (e.g., openshift-apiserver, oauth-apiserver).
++// It removes all KMS-managed resources (sidecars, volumes, volume mounts) and then re-adds exactly what the
++// current encryption config requires, ensuring stale resources from a previous configuration are pruned.
+ //
+ // It is a no-op when the KMSEncryption feature gate is not enabled or the encryption-config secret does not exist.
+ // The secretClient should be uncached to avoid injecting sidecars based on a stale encryption configuration.
+-func AddKMSPluginSidecarToPodSpec(ctx context.Context, podSpec *corev1.PodSpec, containerName string, encryptionConfigNamespace string, encryptionConfigSecretName string, operatorBinary string, operatorImage string, secretClient corev1client.SecretsGetter, featureGateAccessor featuregates.FeatureGateAccess) error {
++func EnsureKMSPluginSidecarInPodSpec(ctx context.Context, podSpec *corev1.PodSpec, containerName string, encryptionConfigNamespace string, encryptionConfigSecretName string, operatorBinary string, operatorImage string, secretClient corev1client.SecretsGetter, featureGateAccessor featuregates.FeatureGateAccess) error {
+ 	if !featureGateAccessor.AreInitialFeatureGatesObserved() {
+ 		return nil
+ 	}
+@@ -172,6 +183,57 @@ func ensureReferenceDataVolume(podSpec *corev1.PodSpec, secretName string) error
+ 	return ensureVolume(podSpec, volume)
+ }
+ 
++func isKMSManagedContainer(name string) bool {
++	// Check if this is the KMS health reporter sidecar
++	if name == health.Subcommand {
++		return true
++	}
++	// Check if this is a Vault KMS plugin sidecar
++	if strings.HasPrefix(name, vaultSidecarPrefix+"-") {
++		return true
++	}
++	return false
++}
++
++func isKMSManagedVolume(name string) bool {
++	return name == kmsPluginSocketVolumeName || name == referenceDataVolumeName
++}
++
++// removeAllKMSManagedResources removes all KMS-managed initContainers, volumes, and volume mounts from the pod spec.
++// IMPORTANT: When adding new KMS resource types (e.g., ephemeral containers, config maps), update this function
++// and the corresponding isKMSManaged* helper functions. Failure to do so breaks the pre-ready revision checks
++// that rely on this Ensure function to achieve the desired state.
++func removeAllKMSManagedResources(podSpec *corev1.PodSpec, containerName string) {
++	filtered := podSpec.InitContainers[:0]
++	for _, c := range podSpec.InitContainers {
++		if !isKMSManagedContainer(c.Name) {
++			filtered = append(filtered, c)
++		}
++	}
++	podSpec.InitContainers = filtered
++
++	filteredVolumes := podSpec.Volumes[:0]
++	for _, v := range podSpec.Volumes {
++		if !isKMSManagedVolume(v.Name) {
++			filteredVolumes = append(filteredVolumes, v)
++		}
++	}
++	podSpec.Volumes = filteredVolumes
++
++	for i, c := range podSpec.Containers {
++		if c.Name == containerName {
++			mounts := c.VolumeMounts[:0]
++			for _, m := range c.VolumeMounts {
++				if m.Name != kmsPluginSocketVolumeName {
++					mounts = append(mounts, m)
++				}
++			}
++			podSpec.Containers[i].VolumeMounts = mounts
++			break
++		}
++	}
++}
++
+ // setRunAsRoot sets RunAsUser=0 on the named container.
+ // The resource-dir files are owned by root and protected by SELinux, so the sidecar needs
+ // uid 0 and the proper SELinux label (indirectly obtained via host network) to read them.
+diff --git a/vendor/modules.txt b/vendor/modules.txt
+index 6c4497543..a017400e6 100644
+--- a/vendor/modules.txt
++++ b/vendor/modules.txt
+@@ -429,7 +429,7 @@ github.com/openshift/client-go/operatorcontrolplane/informers/externalversions/i
+ github.com/openshift/client-go/operatorcontrolplane/informers/externalversions/operatorcontrolplane
+ github.com/openshift/client-go/operatorcontrolplane/informers/externalversions/operatorcontrolplane/v1alpha1
+ github.com/openshift/client-go/operatorcontrolplane/listers/operatorcontrolplane/v1alpha1
+-# github.com/openshift/library-go v0.0.0-20260720185249-0595e37fe20f
++# github.com/openshift/library-go v0.0.0-20260721103755-0c9fbc9f043a
+ ## explicit; go 1.26.0
+ github.com/openshift/library-go/pkg/apiserver/jsonpatch
+ github.com/openshift/library-go/pkg/apps/deployment

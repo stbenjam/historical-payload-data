@@ -1,0 +1,3884 @@
+diff --git a/.tekton/lib/README.md b/.tekton/lib/README.md
+new file mode 100644
+index 000000000000..b609cbab9ac7
+--- /dev/null
++++ b/.tekton/lib/README.md
+@@ -0,0 +1,94 @@
++# .tekton/lib - Pipeline Helper Library
++
++Python modules shared across Tekton pipeline tasks in this repository.
++
++## Why this exists
++
++The `ho-release-gate` pipeline contains non-trivial logic: triggering and polling
++Prow jobs via the Gangway API, building Slack Block Kit payloads, evaluating gate
++verdicts. Keeping this logic inline in YAML task scripts makes the pipeline hard
++to read, review, and maintain.
++
++This library extracts reusable functions into Python modules so that each task's
++inline script is a short orchestration stub (~10-25 lines) rather than a wall of
++bash (~100-300 lines per task).
++
++## Runtime environment
++
++Pipeline tasks run in the **appstudio-utils** container image
++(`quay.io/konflux-ci/appstudio-utils:latest`), managed by the Konflux team. This
++image includes:
++
++- Python 3 with the full **standard library**
++- CLI tools: `oc`, `git`, `jq`, `curl`, etc.
++
++The image does **not** include third-party Python packages such as `requests`,
++`kubernetes`, `pyyaml`, or any pip-installed library.
++
++## stdlib-only constraint
++
++All modules in this directory use **only the Python standard library** (`urllib.request`, `urllib.parse`,
++`json`, `subprocess`, `time`, `os`, `datetime`). This is a deliberate design choice:
++
++1. **No `pip install` at runtime.** Konflux discourages runtime package installation
++   to maintain hermetic, reproducible builds. Installing packages at runtime introduces
++   network dependencies, version drift, and supply-chain risk.
++2. **No custom container image.** Building and maintaining a custom image for a few
++   helper functions adds CI/CD overhead (image builds, vulnerability scanning, registry
++   management) disproportionate to the benefit.
++3. **stdlib is sufficient.** `urllib.request` covers all our HTTP needs (Gangway API,
++   Slack webhooks). `json` replaces `jq`. `subprocess` handles `oc` CLI calls.
++
++If future requirements demand third-party libraries, the recommended path is to build
++a custom image and update the task `image:` references.
++
++## Module architecture
++
++```
++http_utils.py              (no deps, stdlib only)
++    Low-level HTTP wrapper around urllib.request with retry logic.
++
++prow_utils.py              -> http_utils
++    Gangway API interactions: trigger jobs, resolve URLs, poll status.
++
++slack_utils.py             -> http_utils
++    Slack webhook: send messages, build Block Kit payloads.
++
++kubearchive_utils.py       -> http_utils
++    KubeArchive REST API: fetch historical PipelineRuns for stale
++    promotion detection.
++
++ho_release_gate.py         -> prow_utils, slack_utils, kubearchive_utils
++    Pipeline-specific orchestration for the HO release gate:
++    image extraction, job triggering/polling, gate evaluation,
++    notifications (gate result, error, stale promotion alert).
++
++tests/                     (unittest + unittest.mock, stdlib only)
++    Unit tests for all modules. Run with:
++    cd .tekton/lib && python3 -m unittest discover tests/ -v
++
++mock/                      (test utilities)
++    Drop-in mock functions for integration testing the pipeline
++    without hitting real Gangway/KubeArchive APIs. Not used in
++    production; temporarily swapped in during pipeline test runs.
++```
++
++## How the library reaches the tasks
++
++The library is delivered to pipeline tasks via a **Tekton Workspace** backed by an
++ephemeral PVC:
++
++1. A `clone-lib` task runs first. It performs a sparse git checkout of only
++   `.tekton/lib/` from `openshift/hypershift:main` and copies the files into the
++   shared workspace.
++2. Each subsequent task mounts the same workspace and adds it to `sys.path`:
++   ```python
++   import sys
++   sys.path.insert(0, "$(workspaces.shared.path)")
++   from prow_utils import trigger_prow_job
++   ```
++3. `finally` tasks also have access to the workspace (Tekton guarantees workspace
++   availability in finally tasks).
++
++The PVC is ephemeral (created per PipelineRun, deleted when the run completes) and
++requires only ~10Mi of storage.
+diff --git a/.tekton/lib/ho_release_gate.py b/.tekton/lib/ho_release_gate.py
+new file mode 100644
+index 000000000000..82239cae4902
+--- /dev/null
++++ b/.tekton/lib/ho_release_gate.py
+@@ -0,0 +1,709 @@
++"""Pipeline-specific logic for the HO Release Gate."""
++
++import json
++import re
++import time
++from datetime import datetime, timezone
++
++from kubearchive_utils import fetch_pipelineruns, build_pipelinerun_url
++from prow_utils import (trigger_prow_job, resolve_prow_url,
++                        get_prow_job_status, short_name)
++from slack_utils import build_slack_payload, mrkdwn_section, fields_section, divider
++
++__all__ = ["extract_component_image",
++           "trigger_all_jobs", "resolve_all_urls", "poll_until_complete",
++           "print_run_summary", "build_results_json", "evaluate_gate",
++           "build_gate_notification", "build_error_notification",
++           "check_failure_streak", "build_stale_notification",
++           "check_and_build_stale_payload"]
++
++
++def extract_component_image(snapshot_json_str,
++                            component_name="hypershift-operator-main"):
++    """Extract container image reference from a Konflux Snapshot JSON.
++
++    Parses the Snapshot, locates the named component, and returns its
++    container image along with the sha256 digest and git revision.
++
++    Args:
++        snapshot_json_str: Raw JSON string of the Konflux Snapshot.
++        component_name: Name of the component to extract (default:
++            hypershift-operator-main).
++
++    Returns:
++        Dict with keys: image, digest, revision.
++
++    Raises:
++        ValueError: If the JSON is invalid, the component is not found,
++            or the containerImage field is missing/empty.
++    """
++    try:
++        snapshot = json.loads(snapshot_json_str)
++    except (json.JSONDecodeError, TypeError) as e:
++        raise ValueError(f"SNAPSHOT JSON is not valid: {e}")
++
++    for comp in snapshot.get("components", []):
++        if comp.get("name") == component_name:
++            image = comp.get("containerImage", "")
++            if not image:
++                raise ValueError(
++                    f"Component '{component_name}' has no containerImage")
++
++            match = re.search(r"sha256:[a-f0-9]+", image)
++            digest = match.group(0) if match else "N/A"
++
++            revision = (comp.get("source", {})
++                        .get("git", {})
++                        .get("revision", "N/A"))
++
++            return {"image": image, "digest": digest, "revision": revision}
++
++    raise ValueError(f"Component '{component_name}' not found in SNAPSHOT")
++
++
++def trigger_all_jobs(blocking_names, informing_names, gangway_url, token,
++                     env_overrides, trigger_delay=60, rate_limit_backoff=120,
++                     max_retries=3):
++    """Trigger all blocking and informing Prow jobs sequentially.
++
++    Iterates through blocking jobs first, then informing, with a delay
++    between each trigger to respect Gangway rate limits. Raises
++    ValueError if blocking_names is empty.
++
++    Args:
++        blocking_names: List of blocking Prow periodic job name strings.
++            At least one is required.
++        informing_names: List of informing Prow periodic job name strings.
++            May be empty.
++        gangway_url: Base URL of the Gangway executions endpoint.
++        token: Bearer token for Gangway authentication.
++        env_overrides: Dict of environment variables injected into each
++            Prow job's PodSpec (e.g. HO image override).
++        trigger_delay: Seconds to wait between triggering consecutive jobs.
++        rate_limit_backoff: Seconds to wait on 429/5xx before retrying
++            a single trigger (passed through to trigger_prow_job).
++        max_retries: Maximum trigger attempts per job on retryable errors.
++
++    Returns:
++        List of job dicts, each with keys: name, type, job_id, url, result.
++        Jobs that failed to trigger have job_id=None and result="error".
++    """
++    if not blocking_names:
++        raise ValueError("e2e-blocking-job-names is empty"
++                         " - at least one blocking job is required")
++
++    num_blocking = len(blocking_names)
++    num_informing = len(informing_names)
++    print(f"Blocking: {num_blocking} | Informing: {num_informing}"
++          f" | Total: {num_blocking + num_informing}", flush=True)
++    print(f"Trigger delay: {trigger_delay}s"
++          f" | Rate limit backoff: {rate_limit_backoff}s"
++          f" | Max retries: {max_retries}", flush=True)
++
++    jobs = []
++
++    print(f"\n=== run-e2e: triggering {num_blocking} blocking job(s) ===",
++          flush=True)
++    for i, name in enumerate(blocking_names):
++        job = _trigger_single(name, "blocking", gangway_url, token,
++                              env_overrides, max_retries, rate_limit_backoff)
++        jobs.append(job)
++        if i < num_blocking - 1 or num_informing > 0:
++            time.sleep(trigger_delay)
++
++    if num_informing > 0:
++        print(f"\n=== run-e2e: triggering {num_informing} informing job(s) ===",
++              flush=True)
++        for i, name in enumerate(informing_names):
++            job = _trigger_single(name, "informing", gangway_url, token,
++                                  env_overrides, max_retries, rate_limit_backoff)
++            jobs.append(job)
++            if i < num_informing - 1:
++                time.sleep(trigger_delay)
++
++    return jobs
++
++
++def _trigger_single(name, job_type, gangway_url, token, env_overrides,
++                    max_retries, backoff):
++    """Trigger a single Prow job and return a job dict.
++
++    Args:
++        name: Full Prow periodic job name.
++        job_type: "blocking" or "informing" (used for logging and result type).
++        gangway_url: Base URL of the Gangway executions endpoint.
++        token: Bearer token for Gangway authentication.
++        env_overrides: Dict of environment variables for the Prow job.
++        max_retries: Maximum trigger attempts on retryable errors.
++        backoff: Seconds to wait between retry attempts.
++
++    Returns:
++        Job dict with keys: name, type, job_id, url, result.
++    """
++    sn = short_name(name)
++    print(f"\n--- [{job_type}] Triggering [{sn}] ---", flush=True)
++    print(f"  Full name: {name}", flush=True)
++
++    job_id = trigger_prow_job(gangway_url, token, name, env_overrides,
++                              max_retries=max_retries, backoff=backoff)
++
++    job = {
++        "name": name,
++        "type": job_type,
++        "job_id": job_id,
++        "url": "",
++        "result": "pending" if job_id else "error"
++    }
++
++    if job_id:
++        print(f"  Job ID: {job_id}", flush=True)
++    else:
++        print(f"  ERROR: Trigger failed after {max_retries} attempts", flush=True)
++
++    return job
++
++
++def resolve_all_urls(jobs, gangway_url, token, max_attempts=10, delay=15):
++    """Resolve Prow UI URLs for all successfully triggered jobs.
++
++    Skips jobs with job_id=None (trigger failures). Updates each job
++    dict in-place with the resolved URL.
++
++    Args:
++        jobs: List of job dicts (as returned by trigger_all_jobs).
++        gangway_url: Base URL of the Gangway executions endpoint.
++        token: Bearer token for Gangway authentication.
++        max_attempts: Maximum polling attempts per job for URL resolution.
++        delay: Seconds to wait between polling attempts per job.
++    """
++    print("\n=== run-e2e: resolving Prow URLs ===", flush=True)
++    for job in jobs:
++        if job["job_id"] is None:
++            continue
++        url = resolve_prow_url(gangway_url, token, job["job_id"],
++                               max_attempts=max_attempts, delay=delay)
++        job["url"] = url
++        sn = short_name(job["name"])
++        if url:
++            print(f"  [{job['type']}] [{sn}] {url}", flush=True)
++        else:
++            print(f"  [{job['type']}] [{sn}] WARN: could not resolve URL",
++                  flush=True)
++
++
++def poll_until_complete(jobs, gangway_url, token, initial_delay=2700,
++                        poll_interval=600, poll_stagger=30, timeout=14400):
++    """Poll all pending jobs until every job completes or the timeout expires.
++
++    Waits initial_delay seconds before the first poll cycle. Each cycle
++    iterates over pending jobs with poll_stagger seconds between individual
++    status checks. Rate-limited responses (429/5xx) skip the job for the
++    current cycle. Jobs still pending after the timeout are marked as error.
++
++    Args:
++        jobs: List of job dicts (as returned by trigger_all_jobs).
++        gangway_url: Base URL of the Gangway executions endpoint.
++        token: Bearer token for Gangway authentication.
++        initial_delay: Seconds to wait before the first poll cycle
++            (gives Prow time to schedule and start the jobs).
++        poll_interval: Seconds to wait between poll cycles.
++        poll_stagger: Seconds to wait between polling individual jobs
++            within a single cycle (avoids Gangway rate limits).
++        timeout: Total seconds (including initial_delay) after which
++            remaining pending jobs are marked as error.
++    """
++    print(f"\nPoll interval: {poll_interval}s | Timeout: {timeout}s", flush=True)
++    print(f"Initial delay: {initial_delay}s | Poll stagger: {poll_stagger}s",
++          flush=True)
++
++    print(f"\n=== run-e2e: waiting {initial_delay}s before first poll ===",
++          flush=True)
++    start_time = time.monotonic()
++    time.sleep(initial_delay)
++
++    print("=== run-e2e: polling all jobs ===", flush=True)
++    poll_count = 0
++
++    while (time.monotonic() - start_time) < timeout:
++        pending = [j for j in jobs if j["result"] == "pending"]
++        if not pending:
++            break
++
++        poll_count += 1
++        elapsed = int(time.monotonic() - start_time)
++        ts = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
++        print(f"\n[{ts}] Poll #{poll_count} ({elapsed}s)"
++              f" - {len(pending)} job(s) pending", flush=True)
++
++        poll_idx = 0
++        for job in jobs:
++            if job["result"] != "pending" or job["job_id"] is None:
++                continue
++
++            if poll_idx > 0:
++                time.sleep(poll_stagger)
++            poll_idx += 1
++
++            sn = short_name(job["name"])
++            mapped, raw = get_prow_job_status(gangway_url, token, job["job_id"])
++
++            if mapped == "rate_limited":
++                print(f"  [{job['type']}] [{sn}] HTTP {raw.split()[1] if ' ' in raw else raw}"
++                      f" - rate limited, will retry next cycle", flush=True)
++                continue
++            elif mapped == "error":
++                print(f"  [{job['type']}] [{sn}] {raw}", flush=True)
++                job["result"] = "error"
++                continue
++
++            print(f"  [{job['type']}] [{sn}] {raw}", flush=True)
++
++            if mapped == "passed":
++                job["result"] = "passed"
++                print(f"  [{job['type']}] [{sn}] PASSED", flush=True)
++            elif mapped == "failed":
++                job["result"] = "failed"
++                print(f"  [{job['type']}] [{sn}] FAILED ({raw})", flush=True)
++
++        pending_after = sum(1 for j in jobs if j["result"] == "pending")
++        if pending_after == 0:
++            break
++
++        time.sleep(poll_interval)
++
++    for job in jobs:
++        if job["result"] == "pending":
++            job["result"] = "error"
++            sn = short_name(job["name"])
++            print(f"  [{job['type']}] [{sn}] TIMEOUT", flush=True)
++
++
++def print_run_summary(jobs):
++    """Print a short results summary to stdout after polling completes.
++
++    Groups results by type (blocking, informing) and prints each job's
++    short name, result, and Prow URL.
++
++    Args:
++        jobs: List of job dicts (as returned by trigger_all_jobs).
++    """
++    print("\n=== run-e2e: results summary ===\n", flush=True)
++    blocking = [j for j in jobs if j["type"] == "blocking"]
++    informing = [j for j in jobs if j["type"] == "informing"]
++
++    print("--- BLOCKING TESTS ---", flush=True)
++    for j in blocking:
++        sn = short_name(j["name"])
++        print(f"  {sn}: {j['result']} ({j['url']})", flush=True)
++
++    if informing:
++        print("\n--- INFORMING TESTS ---", flush=True)
++        for j in informing:
++            sn = short_name(j["name"])
++            print(f"  {sn}: {j['result']} ({j['url']})", flush=True)
++
++
++def build_results_json(jobs):
++    """Serialize job results into a compact JSON string for Tekton results.
++
++    The output format is a JSON array of objects with keys:
++    job (full name), result, url, type. Uses compact separators
++    to minimize size (Tekton results have a 4KB limit).
++
++    Args:
++        jobs: List of job dicts (as returned by trigger_all_jobs).
++
++    Returns:
++        Compact JSON string, e.g. '[{"job":"...","result":"passed",...}]'.
++    """
++    results = []
++    for job in jobs:
++        results.append({
++            "job": job["name"],
++            "result": job["result"],
++            "url": job["url"],
++            "type": job["type"]
++        })
++    return json.dumps(results, separators=(",", ":"))
++
++
++def evaluate_gate(results_json_str):
++    """Evaluate the release gate verdict and print a formatted summary.
++
++    Gate logic: all blocking tests must have result=="passed" (AND).
++    Informing tests are reported but do not affect the verdict.
++    Prints a formatted table of results and the verdict to stdout.
++
++    Args:
++        results_json_str: JSON string as produced by build_results_json.
++
++    Returns:
++        True if the gate passed (all blocking tests passed), False otherwise.
++        Returns False if results_json_str is not valid JSON.
++    """
++    try:
++        results = json.loads(results_json_str)
++    except (json.JSONDecodeError, TypeError):
++        print("ERROR: results JSON is invalid or truncated, failing gate",
++              flush=True)
++        return False
++
++    blocking = [r for r in results if r["type"] == "blocking"]
++    informing = [r for r in results if r["type"] == "informing"]
++
++    if not blocking:
++        print("ERROR: no blocking tests found in results"
++              " - at least one blocking test is required", flush=True)
++        return False
++
++    print(f"--- BLOCKING TESTS ({len(blocking)}) ---", flush=True)
++    print(f"{'JOB':<50} {'RESULT':<10} URL", flush=True)
++    print(f"{'---':<50} {'------':<10} ---", flush=True)
++
++    gate_passed = True
++    for r in blocking:
++        job = short_name(r["job"])
++        print(f"{job:<50} {r['result']:<10} {r.get('url', '')}", flush=True)
++        if r["result"] != "passed":
++            gate_passed = False
++
++    if informing:
++        print(f"\n--- INFORMING TESTS ({len(informing)}) ---", flush=True)
++        print(f"{'JOB':<50} {'RESULT':<10} URL", flush=True)
++        print(f"{'---':<50} {'------':<10} ---", flush=True)
++        warnings = 0
++        for r in informing:
++            job = short_name(r["job"])
++            print(f"{job:<50} {r['result']:<10} {r.get('url', '')}", flush=True)
++            if r["result"] != "passed":
++                warnings += 1
++        if warnings > 0:
++            print(f"\nWARN: {warnings} informing test(s) failed"
++                  " (does not affect gate verdict)", flush=True)
++
++    verdict = "true" if gate_passed else "false"
++    print(f"\nGate verdict: {verdict} ({len(blocking)} blocking, AND logic)",
++          flush=True)
++
++    if gate_passed:
++        print("\n=== GATE PASSED - create-release will create the Release CR ===",
++              flush=True)
++    else:
++        print("\n=== GATE FAILED - image will NOT be promoted ===", flush=True)
++
++    return gate_passed
++
++
++def build_gate_notification(gate_passed, gate_label, results_json_str,
++                            release_name, snapshot, pipeline_run,
++                            konflux_base_url):
++    """Build the Slack Block Kit payload for a gate result notification.
++
++    Handles three visual states:
++    - Green (#2E7D32): gate passed and Release CR was created.
++    - Orange (#F57C00): gate passed but Release creation failed.
++    - Red (#D32F2F): gate failed (one or more blocking tests failed).
++
++    Args:
++        gate_passed: Boolean gate verdict from evaluate_gate.
++        gate_label: Human-readable gate label (e.g. "ARO HCP").
++        results_json_str: JSON string as produced by build_results_json.
++        release_name: Name of the created Release CR, or "N/A" if none.
++        snapshot: Konflux Snapshot name.
++        pipeline_run: Tekton PipelineRun name.
++        konflux_base_url: Base URL of the Konflux UI for building links.
++
++    Returns:
++        Dict payload ready to be passed to send_slack_message.
++    """
++    if release_name and release_name != "N/A":
++        release_field = (f"<{konflux_base_url}/releases/{release_name}/"
++                         f"|{release_name}>")
++    else:
++        release_field = "N/A"
++
++    if gate_passed and (release_name == "N/A" or not release_name):
++        color = "#F57C00"
++        header = (f":warning: *HO Release Gate [{gate_label}] PASSED"
++                  f" - Release creation failed*")
++    elif gate_passed:
++        color = "#2E7D32"
++        header = f":white_check_mark: *HO Release Gate [{gate_label}] PASSED*"
++    else:
++        color = "#D32F2F"
++        header = f":x: *HO Release Gate [{gate_label}] FAILED*"
++
++    result_lines = _format_test_results(results_json_str)
++
++    pr_link = (f"<{konflux_base_url}/pipelineruns/{pipeline_run}/"
++               f"|{pipeline_run}>")
++
++    blocks = [
++        mrkdwn_section(header),
++        fields_section([
++            f"*Gate:*\n{gate_label}",
++            f"*Snapshot:*\n{snapshot}",
++            f"*PipelineRun:*\n{pr_link}",
++            f"*Release:*\n{release_field}"
++        ]),
++        divider(),
++        mrkdwn_section(result_lines)
++    ]
++
++    return build_slack_payload(color, blocks)
++
++
++def _format_test_results(results_json_str):
++    """Format test results as Slack mrkdwn text for the notification body.
++
++    Groups results by type (blocking, informing) with emoji indicators
++    and Prow links.
++
++    Args:
++        results_json_str: JSON string as produced by build_results_json.
++
++    Returns:
++        Slack mrkdwn string with newline-separated result lines.
++    """
++    try:
++        results = json.loads(results_json_str)
++    except (json.JSONDecodeError, TypeError):
++        return ("\n:x: Pipeline failed before tests started."
++                " Check PipelineRun logs.")
++
++    def _format_group(group, header):
++        if not group:
++            return []
++        parts = [f"\n*{header}:*"]
++        for r in group:
++            job = short_name(r["job"])
++            emoji = (":white_check_mark:" if r["result"] == "passed"
++                     else ":red_circle:")
++            url = r.get("url", "")
++            if url:
++                parts.append(f"{emoji} `{job}` - {r['result']} (<{url}|Prow>)")
++            else:
++                parts.append(f"{emoji} `{job}` - {r['result']}")
++        return parts
++
++    parts = []
++    parts.extend(_format_group(
++        [r for r in results if r["type"] == "blocking"], "Blocking Tests"))
++    parts.extend(_format_group(
++        [r for r in results if r["type"] == "informing"], "Informing Tests"))
++
++    return "\n".join(parts) if parts else "\n:x: No test results available."
++
++
++def build_error_notification(pipeline_run, konflux_base_url, gate_label):
++    """Build the Slack Block Kit payload for a pipeline DAG failure.
++
++    Used by the notify-slack-error finally task, which fires only when
++    create-release was never reached (status=None). Always red (#D32F2F).
++
++    Args:
++        pipeline_run: Tekton PipelineRun name.
++        konflux_base_url: Base URL of the Konflux UI for building links.
++        gate_label: Human-readable gate label (e.g. "ARO HCP").
++
++    Returns:
++        Dict payload ready to be passed to send_slack_message.
++    """
++    pr_link = (f"<{konflux_base_url}/pipelineruns/{pipeline_run}/"
++               f"|{pipeline_run}>")
++
++    blocks = [
++        mrkdwn_section(
++            f":x: *HO Release Gate [{gate_label}] PIPELINE ERROR*\n"
++            "Pipeline failed before reaching the evaluation phase."
++            " Check PipelineRun logs."
++        ),
++        mrkdwn_section(f"*PipelineRun:*\n{pr_link}")
++    ]
++
++    return build_slack_payload("#D32F2F", blocks)
++
++
++def check_failure_streak(runs):
++    """Extract the consecutive failure streak from a list of PipelineRuns.
++
++    Iterates from the most recent run forward, collecting runs whose
++    ``status`` field is False. Stops at the first successful run.
++
++    Args:
++        runs: List of run dicts from fetch_pipelineruns, sorted
++            most-recent-first. Each dict has keys: name, created,
++            status, reason.
++
++    Returns:
++        List of consecutive failed run dicts (most-recent-first).
++        Empty if the most recent run succeeded or if runs is empty.
++    """
++    streak = []
++    for run in runs:
++        if run.get("status", False):
++            break
++        streak.append(run)
++    return streak
++
++
++def build_stale_notification(streak, gate_label, threshold_days,
++                             current_run_name, konflux_base_url,
++                             streak_days):
++    """Build the Slack Block Kit payload for a stale promotion alert.
++
++    Replaces the normal failure notification when the failure streak
++    exceeds the configured threshold. Includes links to the current
++    PipelineRun and all historical failed runs in the streak.
++
++    Args:
++        streak: List of consecutive failed run dicts from
++            check_failure_streak (most-recent-first). Each dict has
++            keys: name, created, status, reason.
++        gate_label: Human-readable gate label (e.g. "ARO HCP").
++        threshold_days: Configured stale threshold in days.
++        current_run_name: Name of the currently running PipelineRun.
++        konflux_base_url: Base URL of the Konflux UI for building links.
++        streak_days: Number of days spanned by the failure streak
++            (pre-calculated by the caller).
++
++    Returns:
++        Dict payload ready to be passed to send_slack_message.
++    """
++    total_runs = len(streak) + 1
++    today_str = datetime.now(timezone.utc).strftime("%Y-%m-%d")
++
++    pr_link = build_pipelinerun_url(current_run_name, konflux_base_url)
++
++    header = (
++        f":alert-siren: *HO Release Gate"
++        f" - Stale Promotion Alert [{gate_label}]*\n"
++        f"No successful promotion in the last {streak_days} day(s)"
++        f" ({total_runs} consecutive failed run(s))."
++    )
++
++    max_displayed = 10  # Slack mrkdwn_section text limit is 3000 chars
++    history_lines = [
++        f"`{today_str}` <{pr_link}|{current_run_name}>"
++        f" (current)"
++    ]
++    displayed = streak[:max_displayed]
++    remaining = len(streak) - len(displayed)
++
++    for run in displayed:
++        run_date = run["created"][:10] if run["created"] else "N/A"
++        run_link = build_pipelinerun_url(run["name"], konflux_base_url)
++        history_lines.append(
++            f"`{run_date}` <{run_link}|{run['name']}>:"
++            f" {run['reason']}"
++        )
++
++    if remaining > 0:
++        oldest_date = streak[-1]["created"][:10] if streak[-1]["created"] else "N/A"
++        history_lines.append(
++            f"... and {remaining} other failed"
++            f" run(s) since {oldest_date}"
++        )
++
++    blocks = [
++        mrkdwn_section(header),
++        fields_section([
++            f"*Gate:*\n{gate_label}",
++            f"*Threshold:*\n{threshold_days} day(s)",
++            f"*Streak:*\n{streak_days} day(s)",
++            f"*Current PipelineRun:*\n<{pr_link}|{current_run_name}>",
++        ]),
++        divider(),
++        mrkdwn_section("\n".join(history_lines)),
++        divider(),
++        mrkdwn_section(
++            "Check the failing tests for persistent infrastructure"
++            " issues or test regressions. If the streak continues,"
++            " consider investigating the promotion pipeline"
++            " and escalating."
++        ),
++    ]
++
++    return build_slack_payload("#D32F2F", blocks)
++
++
++def check_and_build_stale_payload(token, its_scenario, threshold_days,
++                                  current_run_name, konflux_base_url,
++                                  namespace, gate_label,
++                                  kubearchive_api_base):
++    """Check for a stale promotion streak and build the alert payload.
++
++    Queries KubeArchive for historical PipelineRuns matching the ITS
++    scenario label, evaluates the consecutive failure streak in days,
++    and returns a stale alert payload if the streak exceeds the
++    threshold. Called by both notify-slack and notify-slack-error
++    inline scripts.
++
++    Args:
++        token: Bearer token for KubeArchive authentication.
++        its_scenario: Integration Test Scenario name used as the
++            KubeArchive label selector value.
++        threshold_days: Number of consecutive failure days before
++            triggering the stale alert.
++        current_run_name: Name of the currently running PipelineRun.
++        konflux_base_url: Base URL of the Konflux UI for building links.
++        namespace: Kubernetes namespace for the KubeArchive query.
++        gate_label: Human-readable gate label (e.g. "ARO HCP").
++        kubearchive_api_base: Base URL of the KubeArchive API server.
++
++    Returns:
++        Dict payload for send_slack_message if stale (streak days >=
++        threshold), or None if the streak does not meet the threshold.
++    """
++    label_selector = (
++        f"test.appstudio.openshift.io/scenario={its_scenario}")
++
++    print("\n=== Stale promotion check ===", flush=True)
++    print(f"  ITS scenario:    {its_scenario}", flush=True)
++    print(f"  Label selector:  {label_selector}", flush=True)
++    print(f"  Threshold:       {threshold_days} day(s)", flush=True)
++
++    runs = fetch_pipelineruns(token, namespace, label_selector,
++                              kubearchive_api_base)
++    runs = [r for r in runs if r["name"] != current_run_name]
++    if not runs:
++        print("  No historical runs found - skipping stale check",
++              flush=True)
++        return None
++
++    streak = check_failure_streak(runs)
++    if not streak:
++        print("  Most recent run succeeded - no failure streak",
++              flush=True)
++        return None
++
++    oldest_created = streak[-1]["created"]
++    if not oldest_created:
++        print("  WARN: oldest run has no creation timestamp"
++              " - skipping stale check", flush=True)
++        return None
++
++    try:
++        oldest_dt = datetime.fromisoformat(
++            oldest_created.replace("Z", "+00:00"))
++    except ValueError:
++        print(f"  WARN: cannot parse timestamp '{oldest_created}'"
++              " - skipping stale check", flush=True)
++        return None
++    streak_days = (datetime.now(timezone.utc) - oldest_dt).days + 1
++
++    print(f"  Failure streak: {len(streak)} run(s)"
++          f" over {streak_days} day(s)", flush=True)
++
++    if streak_days < threshold_days:
++        print(f"  Streak ({streak_days}d) < threshold"
++              f" ({threshold_days}d) - normal notification",
++              flush=True)
++        return None
++
++    print(f"  Streak ({streak_days}d) >= threshold"
++          f" ({threshold_days}d) - STALE ALERT", flush=True)
++
++    return build_stale_notification(
++        streak, gate_label, threshold_days,
++        current_run_name, konflux_base_url, streak_days)
+diff --git a/.tekton/lib/http_utils.py b/.tekton/lib/http_utils.py
+new file mode 100644
+index 000000000000..3065a024fddb
+--- /dev/null
++++ b/.tekton/lib/http_utils.py
+@@ -0,0 +1,102 @@
++"""HTTP utilities using only Python stdlib (urllib.request)."""
++
++import json
++import time
++from urllib.request import Request, urlopen
++from urllib.error import HTTPError, URLError
++
++__all__ = ["http_request", "http_request_with_retry"]
++
++
++def http_request(url, method="GET", headers=None, body=None, timeout=120):
++    """Perform a single HTTP request using urllib.request.
++
++    Args:
++        url: Full URL to request.
++        method: HTTP method (GET, POST, etc.).
++        headers: Dict of HTTP headers. If body is a dict/list and
++            Content-Type is not set, it defaults to application/json.
++        body: Request body. Accepts dict/list (auto-serialized to JSON),
++            str (encoded to UTF-8), or bytes (sent as-is).
++        timeout: Socket timeout in seconds for the HTTP connection.
++
++    Returns:
++        Tuple (status_code, response_body_str).
++        On connection failure, status_code is 0 and response_body_str
++        contains the error reason.
++    """
++    if headers is None:
++        headers = {}
++
++    data = None
++    if body is not None:
++        if isinstance(body, (dict, list)):
++            data = json.dumps(body).encode("utf-8")
++            headers.setdefault("Content-Type", "application/json")
++        elif isinstance(body, str):
++            data = body.encode("utf-8")
++        else:
++            data = body
++
++    req = Request(url, data=data, headers=headers, method=method)
++
++    try:
++        with urlopen(req, timeout=timeout) as resp:
++            return resp.status, resp.read().decode("utf-8")
++    except HTTPError as e:
++        body_text = ""
++        try:
++            body_text = e.read().decode("utf-8")
++        except Exception:
++            pass
++        return e.code, body_text
++    except URLError as e:
++        print(f"  ERROR: connection failed: {e.reason}", flush=True)
++        return 0, str(e.reason)
++
++
++def http_request_with_retry(url, method="GET", headers=None, body=None,
++                            retries=3, backoff=10, should_retry=None,
++                            timeout=120):
++    """Perform an HTTP request with configurable retry logic.
++
++    Retries the request when the response status matches the retry
++    condition, sleeping backoff seconds between attempts.
++
++    Args:
++        url: Full URL to request.
++        method: HTTP method (GET, POST, etc.).
++        headers: Dict of HTTP headers (forwarded to http_request).
++        body: Request body (forwarded to http_request).
++        retries: Maximum number of attempts before giving up.
++        backoff: Seconds to wait between retry attempts.
++        timeout: Socket timeout in seconds (forwarded to http_request).
++        should_retry: Callable(status_code) -> bool that decides whether
++            a given status code should trigger a retry. Defaults to
++            retrying on 429 (rate limit), 5xx (server error), and
++            0 (connection failure).
++
++    Returns:
++        Tuple (status_code, response_body_str) from the last attempt.
++    """
++    if should_retry is None:
++        def should_retry(s):
++            return s == 0 or s == 429 or 500 <= s < 600
++
++    status, response = 0, ""
++    for attempt in range(1, retries + 1):
++        status, response = http_request(url, method, headers, body,
++                                        timeout=timeout)
++
++        if not should_retry(status):
++            return status, response
++
++        if attempt < retries:
++            print(f"  WARN: HTTP {status} (attempt {attempt}/{retries})"
++                  f" - retrying in {backoff}s", flush=True)
++            time.sleep(backoff)
++        else:
++            print(f"  WARN: HTTP {status} (attempt {attempt}/{retries})"
++                  f" - no retries left", flush=True)
++
++    return status, response
+diff --git a/.tekton/lib/kubearchive_utils.py b/.tekton/lib/kubearchive_utils.py
+new file mode 100644
+index 000000000000..f7a48505bf1d
+--- /dev/null
++++ b/.tekton/lib/kubearchive_utils.py
+@@ -0,0 +1,111 @@
++"""KubeArchive REST API utilities (stdlib only)."""
++
++import json
++from datetime import datetime, timezone, timedelta
++from urllib.parse import quote
++
++from http_utils import http_request_with_retry
++
++__all__ = ["fetch_pipelineruns", "build_pipelinerun_url"]
++
++# KubeArchive does not guarantee server-side sort order, so the first
++# page of results may contain arbitrarily old runs rather than the most
++# recent ones.  We use a time filter + high limit to ensure all recent
++# runs fit in a single response without pagination.
++# Stale promotion is a condition that should be resolved within days,
++# so 60 days is deliberately oversized to never cut off relevant data.
++STALE_LOOKBACK_DAYS = 60
++STALE_QUERY_LIMIT = STALE_LOOKBACK_DAYS * 2  # ~1 run/day + margin for retriggers
++
++
++def fetch_pipelineruns(token, namespace, label_selector,
++                       kubearchive_api_base):
++    """Fetch PipelineRun records from the KubeArchive REST API.
++
++    Queries the KubeArchive API for PipelineRuns matching the given
++    label selector in the specified namespace. Returns a simplified
++    list of dicts sorted by creation time (most recent first).
++
++    Args:
++        token: Bearer token for KubeArchive authentication
++            (typically from ``oc whoami -t``).
++        namespace: Kubernetes namespace to query.
++        label_selector: Kubernetes label selector string
++            (e.g. ``test.appstudio.openshift.io/scenario=my-its``).
++        kubearchive_api_base: Base URL of the KubeArchive API server.
++
++    Returns:
++        List of dicts with keys: name, created, status, reason.
++        ``created`` is an ISO 8601 string from creationTimestamp.
++        ``status`` is a boolean derived from the condition's status
++        field (True when the Kubernetes condition status=="True").
++        ``reason`` is the condition reason string for display
++        (e.g. "Completed", "Failed", "PipelineRunTimeout").
++        Sorted most-recent-first.
++        Returns an empty list on any error (non-200, parse failure).
++    """
++    cutoff = (datetime.now(timezone.utc)
++              - timedelta(days=STALE_LOOKBACK_DAYS))
++    cutoff_ts = cutoff.strftime("%Y-%m-%dT00:00:00Z")
++
++    url = (f"{kubearchive_api_base}/apis/tekton.dev/v1"
++           f"/namespaces/{namespace}"
++           f"/pipelineruns?labelSelector={quote(label_selector)}"
++           f"&limit={STALE_QUERY_LIMIT}"
++           f"&creationTimestampAfter={quote(cutoff_ts)}")
++
++    headers = {"Authorization": f"Bearer {token}"}
++
++    print(f"  KubeArchive: fetching PipelineRuns"
++          f" (namespace={namespace})", flush=True)
++    print(f"  Label selector: {label_selector}", flush=True)
++
++    status, body = http_request_with_retry(
++        url, headers=headers, retries=3, backoff=10, timeout=30)
++
++    if status != 200:
++        print(f"  WARN: KubeArchive returned HTTP {status}"
++              f" - skipping stale check", flush=True)
++        return []
++
++    try:
++        data = json.loads(body)
++    except (json.JSONDecodeError, TypeError) as e:
++        print(f"  WARN: KubeArchive response is not valid JSON: {e}"
++              f" - skipping stale check", flush=True)
++        return []
++
++    items = data.get("items", [])
++    runs = []
++    for item in items:
++        name = item.get("metadata", {}).get("name", "")
++        created = item.get("metadata", {}).get("creationTimestamp", "")
++        conditions = (item.get("status", {})
++                      .get("conditions", []))
++        last_cond = conditions[-1] if conditions else {}
++        if not isinstance(last_cond, dict):
++            last_cond = {}
++        reason = last_cond.get("reason", "Unknown")
++        cond_status = last_cond.get("status", "False")
++
++        runs.append({"name": name, "created": created,
++                     "status": cond_status == "True", "reason": reason})
++
++    runs.sort(key=lambda r: r["created"], reverse=True)
++
++    print(f"  KubeArchive: found {len(runs)} PipelineRun(s)", flush=True)
++    return runs
++
++
++def build_pipelinerun_url(pipelinerun_name, konflux_base_url):
++    """Build a Konflux UI URL for a PipelineRun.
++
++    Args:
++        pipelinerun_name: Name of the Tekton PipelineRun.
++        konflux_base_url: Base URL of the Konflux UI application page
++            (e.g. ``https://konflux-ui.../ns/.../applications/...``).
++
++    Returns:
++        Full URL string pointing to the PipelineRun in the Konflux UI.
++    """
++    return f"{konflux_base_url}/pipelineruns/{pipelinerun_name}/"
+diff --git a/.tekton/lib/mock/__init__.py b/.tekton/lib/mock/__init__.py
+new file mode 100644
+index 000000000000..e69de29bb2d1
+diff --git a/.tekton/lib/mock/test_util_mock.py b/.tekton/lib/mock/test_util_mock.py
+new file mode 100644
+index 000000000000..13c3513ae33c
+--- /dev/null
++++ b/.tekton/lib/mock/test_util_mock.py
+@@ -0,0 +1,383 @@
++"""Mock utilities for HO release gate pipeline integration testing.
++
++This module provides drop-in replacements for functions that call
++external services (Gangway for Prow job triggering, KubeArchive for
++PipelineRun history). It allows running the full Tekton pipeline
++end-to-end without hitting real infrastructure, while still exercising
++the gate evaluation logic, Slack notifications, and stale promotion
++alerting.
++
++Each mock function name carries a suffix that describes its behavior,
++making substitutions easy to spot in diffs and code review. All output
++is prefixed with ``[MOCK]`` in PipelineRun logs for easy identification.
++
++Usage:
++    To use these mocks, temporarily change the imports and function
++    calls in the pipeline inline scripts. For example, in run-e2e::
++
++        # Real:
++        from ho_release_gate import trigger_all_jobs, poll_until_complete
++        jobs = trigger_all_jobs(blocking, informing, ...)
++        poll_until_complete(jobs, ...)
++
++        # Mock (gate failure path):
++        from mock.test_util_mock import trigger_all_jobs_mock_test_fail
++        from mock.test_util_mock import poll_until_complete_mock
++        jobs = trigger_all_jobs_mock_test_fail(blocking, informing, ...)
++        poll_until_complete_mock(jobs, ...)
++
++    For the stale check in notify-slack / notify-slack-error, patch
++    the module-level reference before calling check_and_build_stale_payload::
++
++        # Real: check_and_build_stale_payload calls fetch_pipelineruns internally.
++        # Mock (stale alert path):
++        import ho_release_gate
++        from mock.test_util_mock import fetch_pipelineruns_mock_stale
++        ho_release_gate.fetch_pipelineruns = fetch_pipelineruns_mock_stale
++
++Test scenarios:
++    1. Gate failed, real KubeArchive, no stale (notify-slack path):
++       Use trigger_all_jobs_mock_test_fail in run-e2e.
++       No mock on fetch_pipelineruns (real KubeArchive call).
++       gate-label: "WIP: TEST 1 - notify-slack, real KA, no stale"
++
++    2. Gate failed, real KubeArchive, no stale (notify-slack-error path):
++       Use trigger_all_jobs_mock_error in run-e2e.
++       No mock on fetch_pipelineruns (real KubeArchive call).
++       gate-label: "WIP: TEST 2 - notify-slack-error, real KA, no stale"
++
++    3. Gate failed, mock KubeArchive, stale alert (notify-slack path):
++       Use trigger_all_jobs_mock_test_fail in run-e2e.
++       Patch fetch_pipelineruns with fetch_pipelineruns_mock_stale.
++       gate-label: "WIP: TEST 3 - notify-slack, mock KA, stale alert"
++
++    4. Gate failed, mock KubeArchive, stale alert (notify-slack-error path):
++       Use trigger_all_jobs_mock_error in run-e2e.
++       Patch fetch_pipelineruns with fetch_pipelineruns_mock_stale.
++       gate-label: "WIP: TEST 4 - notify-slack-error, mock KA, stale alert"
++
++Side effects:
++    Every test PipelineRun is archived in KubeArchive with the same
++    ITS scenario label as production runs. Failed test runs therefore
++    contribute to the real streak history. The first successful
++    nightly run after testing resets the streak automatically.
++"""
++
++import os
++import sys
++from datetime import datetime, timezone, timedelta
++
++from prow_utils import short_name
++
++__all__ = [
++    "trigger_all_jobs_mock_test_fail",
++    "trigger_all_jobs_mock_error",
++    "poll_until_complete_mock",
++    "fetch_pipelineruns_mock_empty",
++    "fetch_pipelineruns_mock_stale",
++    "fetch_pipelineruns_mock_stale_long",
++]
++
++
++# ---------------------------------------------------------------------------
++# Gangway / Prow mocks (used in run-e2e task)
++# ---------------------------------------------------------------------------
++
++def trigger_all_jobs_mock_test_fail(blocking_names, informing_names,
++                                    gangway_url, token, env_overrides,
++                                    trigger_delay=60, rate_limit_backoff=120,
++                                    max_retries=3):
++    """Mock replacement for ho_release_gate.trigger_all_jobs.
++
++    Simulates a gate failure without calling Gangway. Returns all
++    jobs with result="failed" and job_id=None. Since job_id is None,
++    resolve_all_urls will skip every job automatically (no Gangway
++    polling needed).
++
++    Use this when testing the notify-slack path: run-e2e completes
++    (exit 0), evaluate-gate sees all blocking tests failed, gate
++    verdict is false, and the notify-slack finally task fires.
++
++    Same signature as the real function so it can be swapped in
++    without changing the call site.
++
++    Args:
++        blocking_names: List of blocking Prow job name strings.
++        informing_names: List of informing Prow job name strings.
++        gangway_url: Ignored (no API calls made).
++        token: Ignored (no API calls made).
++        env_overrides: Ignored (no API calls made).
++        trigger_delay: Ignored (no delays).
++        rate_limit_backoff: Ignored (no retries).
++        max_retries: Ignored (no retries).
++
++    Returns:
++        List of job dicts with result="failed", job_id=None, url="".
++
++    Raises:
++        ValueError: If blocking_names is empty (same guard as real).
++    """
++    if not blocking_names:
++        raise ValueError("e2e-blocking-job-names is empty"
++                         " - at least one blocking job is required")
++
++    print("[MOCK] trigger_all_jobs_mock_test_fail"
++          " - returning all jobs as failed", flush=True)
++
++    jobs = []
++
++    for name in blocking_names:
++        sn = short_name(name)
++        print(f"  [MOCK] [blocking] [{sn}] -> failed", flush=True)
++        jobs.append({
++            "name": name,
++            "type": "blocking",
++            "job_id": None,
++            "url": "",
++            "result": "failed",
++        })
++
++    for name in informing_names:
++        sn = short_name(name)
++        print(f"  [MOCK] [informing] [{sn}] -> failed", flush=True)
++        jobs.append({
++            "name": name,
++            "type": "informing",
++            "job_id": None,
++            "url": "",
++            "result": "failed",
++        })
++
++    return jobs
++
++
++def trigger_all_jobs_mock_error(blocking_names, informing_names,
++                                gangway_url, token, env_overrides,
++                                trigger_delay=60, rate_limit_backoff=120,
++                                max_retries=3):
++    """Mock replacement for ho_release_gate.trigger_all_jobs.
++
++    Simulates a DAG-level crash by calling sys.exit(1). This causes
++    the run-e2e task to fail with a non-zero exit code, which means
++    downstream DAG tasks (evaluate-gate, create-release) are never
++    reached. The notify-slack-error finally task fires instead of
++    notify-slack.
++
++    Use this when testing the notify-slack-error path.
++
++    Same signature as the real function so it can be swapped in
++    without changing the call site.
++
++    Args:
++        blocking_names: Ignored (crash happens before processing).
++        informing_names: Ignored.
++        gangway_url: Ignored.
++        token: Ignored.
++        env_overrides: Ignored.
++        trigger_delay: Ignored.
++        rate_limit_backoff: Ignored.
++        max_retries: Ignored.
++
++    Raises:
++        SystemExit: Always (exit code 1).
++    """
++    print("[MOCK] trigger_all_jobs_mock_error"
++          " - simulating DAG-level crash (sys.exit(1))", flush=True)
++    sys.exit(1)
++
++
++def poll_until_complete_mock(jobs, gangway_url, token, initial_delay=2700,
++                             poll_interval=600, poll_stagger=30,
++                             timeout=14400):
++    """Mock replacement for ho_release_gate.poll_until_complete.
++
++    No-op. When used with trigger_all_jobs_mock_test_fail, all jobs
++    already have final results (result="failed"), so there is nothing
++    to poll. This avoids the real function's initial_delay (45 min)
++    and all subsequent poll cycles, making the test run complete in
++    seconds instead of hours.
++
++    Same signature as the real function so it can be swapped in
++    without changing the call site.
++
++    Args:
++        jobs: List of job dicts (already have final results).
++        gangway_url: Ignored.
++        token: Ignored.
++        initial_delay: Ignored (no waiting).
++        poll_interval: Ignored (no polling).
++        poll_stagger: Ignored (no polling).
++        timeout: Ignored (no polling).
++    """
++    pending = [j for j in jobs if j["result"] == "pending"]
++    print(f"[MOCK] poll_until_complete_mock: {len(pending)} pending"
++          f" job(s), skipping all delays and polling", flush=True)
++
++
++# ---------------------------------------------------------------------------
++# KubeArchive mocks (used in notify-slack / notify-slack-error tasks)
++# ---------------------------------------------------------------------------
++
++def fetch_pipelineruns_mock_empty(token, namespace, label_selector):
++    """Mock replacement for kubearchive_utils.fetch_pipelineruns.
++
++    Returns an empty list, simulating a scenario where KubeArchive
++    has no historical PipelineRuns for the given label selector.
++    This means check_and_build_stale_payload will find no streak
++    and will skip the stale alert, producing a normal failure
++    notification instead.
++
++    Use this when testing the notification path without stale
++    alerting (tests 1 and 2). Alternatively, leave the real
++    fetch_pipelineruns in place to query actual KubeArchive data.
++
++    Same signature as the real function so it can be patched in::
++
++        import ho_release_gate
++        from mock.test_util_mock import fetch_pipelineruns_mock_empty
++        ho_release_gate.fetch_pipelineruns = fetch_pipelineruns_mock_empty
++
++    Args:
++        token: Ignored (no API calls made).
++        namespace: Ignored (no API calls made).
++        label_selector: Ignored (no API calls made).
++
++    Returns:
++        Empty list.
++    """
++    print("[MOCK] fetch_pipelineruns_mock_empty"
++          " - returning empty run list (no streak)", flush=True)
++    return []
++
++
++def fetch_pipelineruns_mock_stale(token, namespace, label_selector):
++    """Mock replacement for kubearchive_utils.fetch_pipelineruns.
++
++    Generates a synthetic list of failed PipelineRuns that spans
++    enough days to trigger the stale promotion alert. The number
++    of days is derived from the STALE_THRESHOLD_DAYS environment
++    variable, which is already set in the pipeline tasks as part
++    of the stale alert configuration. The generated streak covers
++    threshold_days + 1 days to guarantee the stale condition is met
++    (streak_days >= threshold_days).
++
++    Each generated run is spaced one day apart, with the most recent
++    run placed yesterday (relative to now) and the oldest run placed
++    threshold_days + 1 days ago. All runs have status=False and
++    reason="Failed".
++
++    Use this when testing the stale alert notification (tests 3 and 4).
++    Patch into ho_release_gate before calling check_and_build_stale_payload::
++
++        import ho_release_gate
++        from mock.test_util_mock import fetch_pipelineruns_mock_stale
++        ho_release_gate.fetch_pipelineruns = fetch_pipelineruns_mock_stale
++
++    Args:
++        token: Ignored (no API calls made).
++        namespace: Ignored (no API calls made).
++        label_selector: Ignored (no API calls made).
++
++    Returns:
++        List of run dicts sorted most-recent-first, each with keys
++        name, created (ISO 8601), status (bool), reason (str).
++        The list spans threshold_days + 1 days to ensure the stale
++        alert triggers.
++
++    Note:
++        Reads STALE_THRESHOLD_DAYS from the environment (set by the
++        pipeline, default 3). This is NOT a mock-specific env var;
++        it is the same threshold the production stale check uses.
++    """
++    threshold = int(os.environ.get("STALE_THRESHOLD_DAYS", "3"))
++    num_runs = threshold + 1
++    now = datetime.now(timezone.utc)
++
++    failure_reasons = ["Failed", "PipelineRunTimeout", "CouldntGetPipeline"]
++
++    runs = []
++    for i in range(num_runs):
++        days_ago = i + 1
++        ts = (now - timedelta(days=days_ago)).strftime(
++            "%Y-%m-%dT%H:%M:%SZ")
++        runs.append({
++            "name": f"mock-failed-run-{num_runs - i}",
++            "created": ts,
++            "status": False,
++            "reason": failure_reasons[i % len(failure_reasons)],
++        })
++
++    print(f"[MOCK] fetch_pipelineruns_mock_stale: generating"
++          f" {num_runs} failed run(s) over {threshold + 1} day(s)"
++          f" (STALE_THRESHOLD_DAYS={threshold})", flush=True)
++    for r in runs:
++        print(f"  [MOCK] {r['name']}"
++              f" | {r['created']}"
++              f" | {r['status']}", flush=True)
++
++    return runs
++
++
++def fetch_pipelineruns_mock_stale_long(token, namespace, label_selector):
++    """Mock replacement for kubearchive_utils.fetch_pipelineruns.
++
++    Generates a large list of failed PipelineRuns spanning 15 days,
++    with multiple runs on some days, to test the history truncation
++    logic in build_stale_notification. The list includes all three
++    failure reason types (Failed, PipelineRunTimeout, CouldntGetPipeline)
++    distributed across the runs.
++
++    The generated runs simulate a realistic pattern where some days
++    have a single nightly run while others have retries or re-triggers.
++
++    Use this when testing the stale alert with history truncation
++    (test 5). Patch into ho_release_gate before calling
++    check_and_build_stale_payload::
++
++        import ho_release_gate
++        from mock.test_util_mock import fetch_pipelineruns_mock_stale_long
++        ho_release_gate.fetch_pipelineruns = fetch_pipelineruns_mock_stale_long
++
++    Args:
++        token: Ignored (no API calls made).
++        namespace: Ignored (no API calls made).
++        label_selector: Ignored (no API calls made).
++
++    Returns:
++        List of 18 run dicts sorted most-recent-first, spanning 15
++        days, with varied reasons and multiple runs on some days.
++    """
++    now = datetime.now(timezone.utc)
++    failure_reasons = ["Failed", "PipelineRunTimeout", "CouldntGetPipeline"]
++
++    day_pattern = [
++        (1, 1), (2, 1), (3, 2), (4, 1), (5, 1),
++        (6, 2), (7, 1), (8, 1), (9, 2), (10, 1),
++        (11, 1), (12, 1), (13, 1), (14, 1), (15, 1),
++    ]
++
++    runs = []
++    run_idx = 0
++    for days_ago, count in day_pattern:
++        for j in range(count):
++            hour = 3 + j * 4
++            ts = (now - timedelta(days=days_ago, hours=-hour)).strftime(
++                "%Y-%m-%dT%H:%M:%SZ")
++            run_idx += 1
++            runs.append({
++                "name": f"mock-long-run-{run_idx}",
++                "created": ts,
++                "status": False,
++                "reason": failure_reasons[run_idx % len(failure_reasons)],
++            })
++
++    runs.sort(key=lambda r: r["created"], reverse=True)
++
++    print(f"[MOCK] fetch_pipelineruns_mock_stale_long: generating"
++          f" {len(runs)} failed run(s) over 15 day(s)", flush=True)
++    for r in runs:
++        print(f"  [MOCK] {r['name']}"
++              f" | {r['created']}"
++              f" | {r['reason']}", flush=True)
++
++    return runs
+diff --git a/.tekton/lib/prow_utils.py b/.tekton/lib/prow_utils.py
+new file mode 100644
+index 000000000000..ae5d43cddc3e
+--- /dev/null
++++ b/.tekton/lib/prow_utils.py
+@@ -0,0 +1,181 @@
++"""Prow / Gangway API utilities (stdlib only)."""
++
++import json
++import re
++import time
++from http_utils import http_request, http_request_with_retry
++
++__all__ = ["short_name", "trigger_prow_job",
++           "resolve_prow_url", "get_prow_job_status"]
++
++_JOB_RE = re.compile(
++    r"periodic-ci-openshift-hypershift-release-(\d+\.\d+)-periodics-(.*)")
++
++
++def short_name(job_name):
++    """Extract a compact version/test label from a Prow job name.
++
++    Args:
++        job_name: Full Prow periodic job name.
++
++    Returns:
++        ``"<version>/<test>"`` (e.g. ``"5.0/e2e-aks"``), or the
++        original name if the pattern does not match.
++    """
++    m = _JOB_RE.match(job_name)
++    if m:
++        return f"{m.group(1)}/{m.group(2)}"
++    return job_name
++
++
++def trigger_prow_job(gangway_url, token, job_name, env_overrides,
++                     max_retries=3, backoff=120):
++    """Trigger a single Prow periodic job via the Gangway API.
++
++    Sends a POST to Gangway with the job name and environment variable
++    overrides. Retries on 429 and 5xx responses.
++
++    Args:
++        gangway_url: Base URL of the Gangway executions endpoint.
++        token: Bearer token for Gangway authentication.
++        job_name: Full Prow periodic job name to trigger.
++        env_overrides: Dict of environment variables injected into the
++            Prow job's PodSpec (e.g. image overrides).
++        max_retries: Maximum trigger attempts on retryable errors.
++        backoff: Seconds to wait between retry attempts.
++
++    Returns:
++        Job ID string on success, or None if the trigger failed.
++    """
++    payload = {
++        "job_name": job_name,
++        "job_execution_type": "1",
++        "pod_spec_options": {
++            "envs": env_overrides
++        }
++    }
++
++    headers = {
++        "Authorization": f"Bearer {token}",
++        "Content-Type": "application/json"
++    }
++
++    def should_retry(status):
++        return status == 0 or status == 429 or 500 <= status < 600
++
++    status, body = http_request_with_retry(
++        gangway_url, method="POST", headers=headers, body=payload,
++        retries=max_retries, backoff=backoff, should_retry=should_retry
++    )
++
++    if status != 200:
++        print(f"  ERROR: Trigger failed - HTTP {status}", flush=True)
++        if body:
++            print(f"  Raw response: {body}", flush=True)
++        return None
++
++    try:
++        data = json.loads(body)
++    except (json.JSONDecodeError, TypeError):
++        print("  ERROR: Response is not valid JSON", flush=True)
++        print(f"  Raw response: {body}", flush=True)
++        return None
++
++    job_id = data.get("id")
++    if job_id is None:
++        print("  ERROR: Failed to parse job ID", flush=True)
++        print(f"  Raw response: {body}", flush=True)
++        return None
++
++    return str(job_id)
++
++
++def resolve_prow_url(gangway_url, token, job_id, max_attempts=10, delay=15):
++    """Resolve the Prow UI URL for a triggered job.
++
++    Polls the Gangway execution endpoint until the job_url field is
++    populated, or max_attempts is reached.
++
++    Args:
++        gangway_url: Base URL of the Gangway executions endpoint.
++        token: Bearer token for Gangway authentication.
++        job_id: Job execution ID returned by trigger_prow_job.
++        max_attempts: Maximum number of polling attempts.
++        delay: Seconds to wait between polling attempts.
++
++    Returns:
++        Prow URL string, or empty string if resolution failed.
++    """
++    headers = {"Authorization": f"Bearer {token}"}
++
++    for attempt in range(1, max_attempts + 1):
++        status, body = http_request(
++            f"{gangway_url}/{job_id}", method="GET", headers=headers
++        )
++        if status == 200:
++            try:
++                data = json.loads(body)
++                url = data.get("job_url", "")
++                if url:
++                    return url
++            except (json.JSONDecodeError, TypeError):
++                pass
++        elif status in (401, 403):
++            print(f"  WARN: URL resolve got HTTP {status} - auth error, "
++                  f"aborting", flush=True)
++            return ""
++        elif status != 0:
++            print(f"  WARN: URL resolve got HTTP {status} "
++                  f"(attempt {attempt}/{max_attempts})", flush=True)
++        if attempt < max_attempts:
++            time.sleep(delay)
++
++    return ""
++
++
++def get_prow_job_status(gangway_url, token, job_id):
++    """Get current status of a single Prow job execution.
++
++    Performs a single GET to the Gangway execution endpoint (no retry).
++    Maps the Gangway job_status to a simplified status string.
++
++    Args:
++        gangway_url: Base URL of the Gangway executions endpoint.
++        token: Bearer token for Gangway authentication.
++        job_id: Job execution ID returned by trigger_prow_job.
++
++    Returns:
++        Tuple (mapped_status, raw_info) where:
++        - mapped_status: one of "pending", "passed", "failed",
++          "error", "rate_limited"
++        - raw_info: the raw Gangway job_status string (e.g. "SUCCESS",
++          "FAILURE", "TRIGGERED") or an error description
++    """
++    headers = {"Authorization": f"Bearer {token}"}
++
++    status, body = http_request(
++        f"{gangway_url}/{job_id}", method="GET", headers=headers
++    )
++
++    if status == 0 or status == 429 or (500 <= status < 600):
++        return "rate_limited", f"HTTP {status}"
++
++    if status != 200:
++        msg = f"HTTP {status} - auth error or unexpected failure"
++        if body:
++            print(f"  Raw response: {body}", flush=True)
++        return "error", msg
++
++    try:
++        data = json.loads(body)
++    except (json.JSONDecodeError, TypeError):
++        return "error", "response is not valid JSON"
++
++    raw = data.get("job_status", "")
++
++    if raw == "SUCCESS":
++        return "passed", raw
++    elif raw in ("FAILURE", "ABORTED", "ERROR"):
++        return "failed", raw
++    else:
++        return "pending", raw
+diff --git a/.tekton/lib/slack_utils.py b/.tekton/lib/slack_utils.py
+new file mode 100644
+index 000000000000..33874e1f8e91
+--- /dev/null
++++ b/.tekton/lib/slack_utils.py
+@@ -0,0 +1,104 @@
++"""Slack webhook utilities (stdlib only)."""
++
++import time
++from http_utils import http_request
++
++__all__ = ["send_slack_message", "build_slack_payload", "mrkdwn_section",
++           "fields_section", "divider"]
++
++
++def send_slack_message(webhook_url, payload, retries=3, delay=10):
++    """POST a JSON payload to a Slack incoming webhook with retry.
++
++    Retries on 429 (rate limit), 5xx (server error), and connection
++    failures. Fails fast on 4xx client errors (e.g. bad payload).
++
++    Args:
++        webhook_url: Full Slack incoming webhook URL.
++        payload: Dict to serialize as JSON and send as the request body.
++        retries: Maximum number of send attempts.
++        delay: Seconds to wait between retry attempts.
++
++    Returns:
++        True if the message was sent successfully, False otherwise.
++    """
++    for attempt in range(1, retries + 1):
++        status, response = http_request(
++            webhook_url, method="POST", body=payload
++        )
++
++        if status == 200:
++            print(f"Slack notification sent (attempt {attempt})", flush=True)
++            return True
++
++        if status == 0:
++            print(f"  ERROR: connection failed (attempt {attempt}/{retries})",
++                  flush=True)
++        elif 400 <= status < 500 and status != 429:
++            print(f"  ERROR: Slack returned HTTP {status} - not retrying",
++                  flush=True)
++            if response:
++                print(f"  response: {response}", flush=True)
++            return False
++        else:
++            print(f"  WARN: Slack returned HTTP {status}"
++                  f" (attempt {attempt}/{retries})", flush=True)
++            if response:
++                print(f"  response: {response}", flush=True)
++
++        if attempt < retries:
++            print(f"  retrying in {delay}s...", flush=True)
++            time.sleep(delay)
++
++    return False
++
++
++def build_slack_payload(color, blocks):
++    """Build a Slack webhook payload with a single colored attachment.
++
++    Args:
++        color: Hex color string for the attachment sidebar (e.g. "#2E7D32").
++        blocks: List of Slack Block Kit block dicts.
++
++    Returns:
++        Dict ready to be passed to send_slack_message.
++    """
++    return {"attachments": [{"color": color, "blocks": blocks}]}
++
++
++def mrkdwn_section(text):
++    """Build a Slack Block Kit section with mrkdwn text.
++
++    Args:
++        text: Slack mrkdwn-formatted string.
++
++    Returns:
++        Block Kit section dict.
++    """
++    return {"type": "section", "text": {"type": "mrkdwn", "text": text}}
++
++
++def fields_section(field_texts):
++    """Build a Slack Block Kit section with multiple mrkdwn fields.
++
++    Fields are rendered side-by-side in the Slack UI (up to 2 per row).
++
++    Args:
++        field_texts: List of Slack mrkdwn-formatted strings, one per field.
++
++    Returns:
++        Block Kit section dict with fields array.
++    """
++    return {
++        "type": "section",
++        "fields": [{"type": "mrkdwn", "text": t} for t in field_texts]
++    }
++
++
++def divider():
++    """Build a Slack Block Kit divider block.
++
++    Returns:
++        Block Kit divider dict.
++    """
++    return {"type": "divider"}
+diff --git a/.tekton/lib/tests/__init__.py b/.tekton/lib/tests/__init__.py
+new file mode 100644
+index 000000000000..e69de29bb2d1
+diff --git a/.tekton/lib/tests/test_ho_release_gate.py b/.tekton/lib/tests/test_ho_release_gate.py
+new file mode 100644
+index 000000000000..a8ada9f62d29
+--- /dev/null
++++ b/.tekton/lib/tests/test_ho_release_gate.py
+@@ -0,0 +1,743 @@
++"""Tests for ho_release_gate module."""
++
++import json
++import sys
++import os
++import unittest
++from datetime import datetime, timezone, timedelta
++from unittest.mock import patch, MagicMock, call
++
++sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
++
++from ho_release_gate import (
++    extract_component_image,
++    trigger_all_jobs, resolve_all_urls, poll_until_complete,
++    print_run_summary, build_results_json, evaluate_gate,
++    build_gate_notification, build_error_notification,
++    check_failure_streak, build_stale_notification,
++    check_and_build_stale_payload,
++)
++
++
++# ---------------------------------------------------------------------------
++# Helpers
++# ---------------------------------------------------------------------------
++
++def _snapshot_json(components):
++    return json.dumps({"components": components})
++
++
++def _component(name="hypershift-operator-main",
++               image="quay.io/img@sha256:abc123",
++               revision="deadbeef"):
++    comp = {"name": name, "containerImage": image}
++    if revision:
++        comp["source"] = {"git": {"revision": revision}}
++    return comp
++
++
++def _job(name="job-a", job_type="blocking", job_id="1",
++         url="https://prow/1", result="pending"):
++    return {"name": name, "type": job_type, "job_id": job_id,
++            "url": url, "result": result}
++
++
++def _results_json(jobs_data):
++    results = []
++    for j in jobs_data:
++        results.append({
++            "job": j.get("name", "job"),
++            "result": j.get("result", "passed"),
++            "url": j.get("url", ""),
++            "type": j.get("type", "blocking"),
++        })
++    return json.dumps(results, separators=(",", ":"))
++
++
++# ---------------------------------------------------------------------------
++# extract_component_image
++# ---------------------------------------------------------------------------
++
++class TestExtractComponentImage(unittest.TestCase):
++    """Tests for extract_component_image."""
++
++    def test_valid_snapshot(self):
++        snap = _snapshot_json([_component()])
++        result = extract_component_image(snap)
++
++        self.assertEqual(result["image"], "quay.io/img@sha256:abc123")
++        self.assertEqual(result["digest"], "sha256:abc123")
++        self.assertEqual(result["revision"], "deadbeef")
++
++    def test_component_not_found(self):
++        snap = _snapshot_json([_component(name="other")])
++
++        with self.assertRaises(ValueError) as ctx:
++            extract_component_image(snap)
++        self.assertIn("not found", str(ctx.exception))
++
++    def test_empty_container_image(self):
++        snap = _snapshot_json([_component(image="")])
++
++        with self.assertRaises(ValueError) as ctx:
++            extract_component_image(snap)
++        self.assertIn("no containerImage", str(ctx.exception))
++
++    def test_invalid_json(self):
++        with self.assertRaises(ValueError) as ctx:
++            extract_component_image("not json{")
++        self.assertIn("not valid", str(ctx.exception))
++
++    def test_image_without_digest(self):
++        snap = _snapshot_json([_component(image="quay.io/img:latest")])
++        result = extract_component_image(snap)
++
++        self.assertEqual(result["digest"], "N/A")
++
++    def test_custom_component_name(self):
++        comp = _component(name="custom-comp", image="img@sha256:fff")
++        snap = _snapshot_json([comp])
++
++        result = extract_component_image(snap, component_name="custom-comp")
++        self.assertEqual(result["image"], "img@sha256:fff")
++
++    def test_missing_source_revision(self):
++        comp = {"name": "hypershift-operator-main",
++                "containerImage": "img@sha256:abc"}
++        snap = _snapshot_json([comp])
++        result = extract_component_image(snap)
++
++        self.assertEqual(result["revision"], "N/A")
++
++
++# ---------------------------------------------------------------------------
++# trigger_all_jobs
++# ---------------------------------------------------------------------------
++
++class TestTriggerAllJobs(unittest.TestCase):
++    """Tests for trigger_all_jobs."""
++
++    @patch("ho_release_gate.time.sleep")
++    @patch("ho_release_gate.trigger_prow_job")
++    def test_blocking_only(self, mock_trigger, mock_sleep):
++        mock_trigger.return_value = "id-1"
++
++        jobs = trigger_all_jobs(
++            ["blocking-job"], [], "https://gangway", "tok", {},
++            trigger_delay=0)
++
++        self.assertEqual(len(jobs), 1)
++        self.assertEqual(jobs[0]["type"], "blocking")
++        self.assertEqual(jobs[0]["job_id"], "id-1")
++        self.assertEqual(jobs[0]["result"], "pending")
++
++    @patch("ho_release_gate.time.sleep")
++    @patch("ho_release_gate.trigger_prow_job")
++    def test_blocking_and_informing(self, mock_trigger, mock_sleep):
++        mock_trigger.return_value = "id-1"
++
++        jobs = trigger_all_jobs(
++            ["block-1"], ["inform-1"], "https://gangway", "tok", {},
++            trigger_delay=0)
++
++        self.assertEqual(len(jobs), 2)
++        self.assertEqual(jobs[0]["type"], "blocking")
++        self.assertEqual(jobs[1]["type"], "informing")
++
++    def test_empty_blocking_raises(self):
++        with self.assertRaises(ValueError):
++            trigger_all_jobs([], ["inform"], "https://gangway", "tok", {})
++
++    @patch("ho_release_gate.time.sleep")
++    @patch("ho_release_gate.trigger_prow_job")
++    def test_trigger_failure(self, mock_trigger, mock_sleep):
++        mock_trigger.return_value = None
++
++        jobs = trigger_all_jobs(
++            ["block-1"], [], "https://gangway", "tok", {},
++            trigger_delay=0)
++
++        self.assertEqual(jobs[0]["job_id"], None)
++        self.assertEqual(jobs[0]["result"], "error")
++
++
++# ---------------------------------------------------------------------------
++# resolve_all_urls
++# ---------------------------------------------------------------------------
++
++class TestResolveAllUrls(unittest.TestCase):
++    """Tests for resolve_all_urls."""
++
++    @patch("ho_release_gate.resolve_prow_url")
++    def test_resolves_url(self, mock_resolve):
++        mock_resolve.return_value = "https://prow/view/1"
++        jobs = [_job(job_id="1", url="")]
++
++        resolve_all_urls(jobs, "https://gangway", "tok")
++
++        self.assertEqual(jobs[0]["url"], "https://prow/view/1")
++
++    @patch("ho_release_gate.resolve_prow_url")
++    def test_skips_none_job_id(self, mock_resolve):
++        jobs = [_job(job_id=None, url="")]
++
++        resolve_all_urls(jobs, "https://gangway", "tok")
++
++        mock_resolve.assert_not_called()
++
++
++# ---------------------------------------------------------------------------
++# poll_until_complete
++# ---------------------------------------------------------------------------
++
++class TestPollUntilComplete(unittest.TestCase):
++    """Tests for poll_until_complete."""
++
++    @patch("ho_release_gate.time.sleep")
++    @patch("ho_release_gate.time.monotonic")
++    @patch("ho_release_gate.get_prow_job_status")
++    def test_all_pass(self, mock_status, mock_mono, mock_sleep):
++        mock_mono.side_effect = [0, 0, 100]
++        mock_status.return_value = ("passed", "SUCCESS")
++
++        jobs = [_job(result="pending")]
++        poll_until_complete(
++            jobs, "https://gangway", "tok",
++            initial_delay=0, poll_interval=0, timeout=300)
++
++        self.assertEqual(jobs[0]["result"], "passed")
++
++    @patch("ho_release_gate.time.sleep")
++    @patch("ho_release_gate.time.monotonic")
++    @patch("ho_release_gate.get_prow_job_status")
++    def test_mixed_results(self, mock_status, mock_mono, mock_sleep):
++        mock_mono.side_effect = [0, 0, 100]
++        mock_status.side_effect = [
++            ("passed", "SUCCESS"),
++            ("failed", "FAILURE"),
++        ]
++
++        jobs = [_job(name="a", result="pending"),
++                _job(name="b", result="pending")]
++        poll_until_complete(
++            jobs, "https://gangway", "tok",
++            initial_delay=0, poll_interval=0, poll_stagger=0, timeout=300)
++
++        self.assertEqual(jobs[0]["result"], "passed")
++        self.assertEqual(jobs[1]["result"], "failed")
++
++    @patch("ho_release_gate.time.sleep")
++    @patch("ho_release_gate.time.monotonic")
++    @patch("ho_release_gate.get_prow_job_status")
++    def test_timeout(self, mock_status, mock_mono, mock_sleep):
++        mock_mono.side_effect = [0, 0, 50, 99999]
++        mock_status.return_value = ("pending", "TRIGGERED")
++
++        jobs = [_job(result="pending")]
++        poll_until_complete(
++            jobs, "https://gangway", "tok",
++            initial_delay=0, poll_interval=0, timeout=100)
++
++        self.assertEqual(jobs[0]["result"], "error")
++
++    @patch("ho_release_gate.time.sleep")
++    @patch("ho_release_gate.time.monotonic")
++    @patch("ho_release_gate.get_prow_job_status")
++    def test_rate_limited_skips(self, mock_status, mock_mono, mock_sleep):
++        mock_mono.side_effect = [0, 0, 10, 100, 110]
++        mock_status.side_effect = [
++            ("rate_limited", "HTTP 429"),
++            ("passed", "SUCCESS"),
++        ]
++
++        jobs = [_job(result="pending")]
++        poll_until_complete(
++            jobs, "https://gangway", "tok",
++            initial_delay=0, poll_interval=0, poll_stagger=0, timeout=500)
++
++        self.assertEqual(jobs[0]["result"], "passed")
++
++
++# ---------------------------------------------------------------------------
++# print_run_summary
++# ---------------------------------------------------------------------------
++
++class TestPrintRunSummary(unittest.TestCase):
++    """Tests for print_run_summary."""
++
++    def test_no_crash(self):
++        jobs = [
++            _job(name="block-1", job_type="blocking", result="passed"),
++            _job(name="inform-1", job_type="informing", result="failed"),
++        ]
++        print_run_summary(jobs)
++
++
++# ---------------------------------------------------------------------------
++# build_results_json
++# ---------------------------------------------------------------------------
++
++class TestBuildResultsJson(unittest.TestCase):
++    """Tests for build_results_json."""
++
++    def test_compact_json(self):
++        jobs = [_job(name="j1", url="https://prow/1", result="passed")]
++        result = build_results_json(jobs)
++
++        parsed = json.loads(result)
++        self.assertEqual(len(parsed), 1)
++        self.assertEqual(parsed[0]["job"], "j1")
++        self.assertEqual(parsed[0]["result"], "passed")
++        self.assertEqual(parsed[0]["url"], "https://prow/1")
++        self.assertEqual(parsed[0]["type"], "blocking")
++        self.assertNotIn(" ", result)
++
++
++# ---------------------------------------------------------------------------
++# evaluate_gate
++# ---------------------------------------------------------------------------
++
++class TestEvaluateGate(unittest.TestCase):
++    """Tests for evaluate_gate."""
++
++    def test_all_blocking_passed(self):
++        rj = _results_json([{"name": "b1", "result": "passed", "type": "blocking"}])
++        self.assertTrue(evaluate_gate(rj))
++
++    def test_one_blocking_failed(self):
++        rj = _results_json([
++            {"name": "b1", "result": "passed", "type": "blocking"},
++            {"name": "b2", "result": "failed", "type": "blocking"},
++        ])
++        self.assertFalse(evaluate_gate(rj))
++
++    def test_empty_blocking(self):
++        rj = _results_json([{"name": "i1", "result": "passed", "type": "informing"}])
++        self.assertFalse(evaluate_gate(rj))
++
++    def test_invalid_json(self):
++        self.assertFalse(evaluate_gate("not json"))
++
++    def test_informing_failure_does_not_affect(self):
++        rj = _results_json([
++            {"name": "b1", "result": "passed", "type": "blocking"},
++            {"name": "i1", "result": "failed", "type": "informing"},
++        ])
++        self.assertTrue(evaluate_gate(rj))
++
++
++# ---------------------------------------------------------------------------
++# build_gate_notification
++# ---------------------------------------------------------------------------
++
++class TestBuildGateNotification(unittest.TestCase):
++    """Tests for build_gate_notification."""
++
++    def _call(self, gate_passed=True, release="rel-1"):
++        rj = _results_json([{"name": "b1", "result": "passed", "type": "blocking"}])
++        return build_gate_notification(
++            gate_passed, "ARO HCP", rj,
++            release, "snap-1", "pr-1",
++            "https://konflux-ui.example.com/ns/t/applications/app")
++
++    def test_passed_with_release_green(self):
++        payload = self._call(gate_passed=True, release="rel-1")
++        self.assertEqual(payload["attachments"][0]["color"], "#2E7D32")
++
++    def test_passed_no_release_orange(self):
++        payload = self._call(gate_passed=True, release="N/A")
++        self.assertEqual(payload["attachments"][0]["color"], "#F57C00")
++
++    def test_failed_red(self):
++        payload = self._call(gate_passed=False, release="N/A")
++        self.assertEqual(payload["attachments"][0]["color"], "#D32F2F")
++
++    def test_payload_has_blocks(self):
++        payload = self._call()
++        self.assertIn("blocks", payload["attachments"][0])
++        self.assertGreater(len(payload["attachments"][0]["blocks"]), 0)
++
++
++# ---------------------------------------------------------------------------
++# build_error_notification
++# ---------------------------------------------------------------------------
++
++class TestBuildErrorNotification(unittest.TestCase):
++    """Tests for build_error_notification."""
++
++    def test_always_red(self):
++        payload = build_error_notification(
++            "pr-1", "https://konflux-ui.example.com/ns/t/applications/app",
++            "ARO HCP")
++
++        self.assertEqual(payload["attachments"][0]["color"], "#D32F2F")
++
++    def test_contains_pipelinerun_link(self):
++        payload = build_error_notification(
++            "pr-1", "https://konflux-ui.example.com/ns/t/applications/app",
++            "ARO HCP")
++
++        blocks_text = json.dumps(payload["attachments"][0]["blocks"])
++        self.assertIn("pr-1", blocks_text)
++
++    def test_contains_gate_label(self):
++        payload = build_error_notification(
++            "pr-1", "https://konflux-ui.example.com/ns/t/applications/app",
++            "ARO HCP")
++
++        blocks_text = json.dumps(payload["attachments"][0]["blocks"])
++        self.assertIn("ARO HCP", blocks_text)
++
++
++# ---------------------------------------------------------------------------
++# check_failure_streak
++# ---------------------------------------------------------------------------
++
++class TestCheckFailureStreak(unittest.TestCase):
++    """Tests for check_failure_streak."""
++
++    def test_all_failed(self):
++        runs = [
++            {"name": "r1", "created": "2026-07-05", "status": False, "reason": "Failed"},
++            {"name": "r2", "created": "2026-07-04", "status": False, "reason": "Failed"},
++            {"name": "r3", "created": "2026-07-03", "status": False, "reason": "Failed"},
++        ]
++        streak = check_failure_streak(runs)
++        self.assertEqual(len(streak), 3)
++
++    def test_first_completed(self):
++        runs = [
++            {"name": "r1", "created": "2026-07-05", "status": True, "reason": "Completed"},
++            {"name": "r2", "created": "2026-07-04", "status": False, "reason": "Failed"},
++        ]
++        streak = check_failure_streak(runs)
++        self.assertEqual(len(streak), 0)
++
++    def test_first_succeeded(self):
++        runs = [
++            {"name": "r1", "created": "2026-07-05", "status": True, "reason": "Succeeded"},
++            {"name": "r2", "created": "2026-07-04", "status": False, "reason": "Failed"},
++        ]
++        streak = check_failure_streak(runs)
++        self.assertEqual(len(streak), 0)
++
++    def test_mixed_streak(self):
++        runs = [
++            {"name": "r1", "created": "2026-07-05", "status": False, "reason": "Failed"},
++            {"name": "r2", "created": "2026-07-04", "status": False, "reason": "Failed"},
++            {"name": "r3", "created": "2026-07-03", "status": False, "reason": "Failed"},
++            {"name": "r4", "created": "2026-07-02", "status": True, "reason": "Completed"},
++            {"name": "r5", "created": "2026-07-01", "status": False, "reason": "Failed"},
++        ]
++        streak = check_failure_streak(runs)
++        self.assertEqual(len(streak), 3)
++        self.assertEqual(streak[0]["name"], "r1")
++        self.assertEqual(streak[2]["name"], "r3")
++
++    def test_empty_list(self):
++        self.assertEqual(check_failure_streak([]), [])
++
++    def test_single_succeeded(self):
++        runs = [{"name": "r1", "created": "2026-07-05", "status": True, "reason": "Succeeded"}]
++        self.assertEqual(check_failure_streak(runs), [])
++
++    def test_single_failed(self):
++        runs = [{"name": "r1", "created": "2026-07-05", "status": False, "reason": "Failed"}]
++        streak = check_failure_streak(runs)
++        self.assertEqual(len(streak), 1)
++
++    def test_timeout_reason(self):
++        runs = [
++            {"name": "r1", "created": "2026-07-05", "status": False, "reason": "PipelineRunTimeout"},
++            {"name": "r2", "created": "2026-07-04", "status": True, "reason": "Completed"},
++        ]
++        streak = check_failure_streak(runs)
++        self.assertEqual(len(streak), 1)
++
++    def test_couldnt_get_pipeline_reason(self):
++        runs = [
++            {"name": "r1", "created": "2026-07-05", "status": False, "reason": "CouldntGetPipeline"},
++            {"name": "r2", "created": "2026-07-04", "status": False, "reason": "Failed"},
++            {"name": "r3", "created": "2026-07-03", "status": True, "reason": "Completed"},
++        ]
++        streak = check_failure_streak(runs)
++        self.assertEqual(len(streak), 2)
++
++    def test_mixed_failure_reasons_in_streak(self):
++        runs = [
++            {"name": "r1", "created": "2026-07-05", "status": False, "reason": "Failed"},
++            {"name": "r2", "created": "2026-07-04", "status": False, "reason": "PipelineRunTimeout"},
++            {"name": "r3", "created": "2026-07-03", "status": False, "reason": "CouldntGetPipeline"},
++        ]
++        streak = check_failure_streak(runs)
++        self.assertEqual(len(streak), 3)
++
++
++# ---------------------------------------------------------------------------
++# build_stale_notification
++# ---------------------------------------------------------------------------
++
++class TestBuildStaleNotification(unittest.TestCase):
++    """Tests for build_stale_notification."""
++
++    def _call(self, streak_days=5, streak_len=3):
++        streak = [
++            {"name": f"run-{i}", "created": f"2026-07-0{i}T10:00:00Z",
++             "status": False, "reason": "Failed"}
++            for i in range(1, streak_len + 1)
++        ]
++        return build_stale_notification(
++            streak, "ARO HCP", 3,
++            "current-run", "https://konflux-ui.example.com/base",
++            streak_days)
++
++    def test_color_red(self):
++        payload = self._call()
++        self.assertEqual(payload["attachments"][0]["color"], "#D32F2F")
++
++    def test_header_contains_gate_and_days(self):
++        payload = self._call(streak_days=5)
++        blocks = payload["attachments"][0]["blocks"]
++        header_text = blocks[0]["text"]["text"]
++        self.assertIn("ARO HCP", header_text)
++        self.assertIn("5 day(s)", header_text)
++
++    def test_four_fields(self):
++        payload = self._call()
++        blocks = payload["attachments"][0]["blocks"]
++        fields_block = blocks[1]
++        self.assertEqual(len(fields_block["fields"]), 4)
++
++    def test_history_current_first(self):
++        payload = self._call()
++        blocks = payload["attachments"][0]["blocks"]
++        history_text = blocks[3]["text"]["text"]
++        lines = history_text.split("\n")
++        self.assertIn("(current)", lines[0])
++
++    def test_history_shows_reason_and_run_name(self):
++        streak = [
++            {"name": "run-1", "created": "2026-07-05T10:00:00Z",
++             "status": False, "reason": "PipelineRunTimeout"},
++        ]
++        payload = build_stale_notification(
++            streak, "ARO HCP", 3,
++            "current-run", "https://konflux-ui.example.com/base", 5)
++        blocks = payload["attachments"][0]["blocks"]
++        history_text = blocks[3]["text"]["text"]
++        self.assertIn("PipelineRunTimeout", history_text)
++        self.assertIn("run-1", history_text)
++
++    def test_footer_present(self):
++        payload = self._call()
++        blocks = payload["attachments"][0]["blocks"]
++        footer_text = blocks[-1]["text"]["text"]
++        self.assertIn("investigating", footer_text.lower())
++
++    def test_streak_days_parameter_used(self):
++        payload = self._call(streak_days=99)
++        blocks = payload["attachments"][0]["blocks"]
++        header_text = blocks[0]["text"]["text"]
++        self.assertIn("99 day(s)", header_text)
++
++    def test_truncation_at_max_displayed(self):
++        streak = [
++            {"name": f"run-{i}", "created": f"2026-07-{i:02d}T10:00:00Z",
++             "status": False, "reason": "Failed"}
++            for i in range(1, 15)
++        ]
++        payload = build_stale_notification(
++            streak, "ARO HCP", 3,
++            "current-run", "https://konflux-ui.example.com/base", 16)
++        blocks = payload["attachments"][0]["blocks"]
++        history_text = blocks[3]["text"]["text"]
++        lines = history_text.split("\n")
++        self.assertIn("(current)", lines[0])
++        self.assertIn("other failed", lines[-1])
++        self.assertIn("4", lines[-1])
++
++    def test_no_truncation_when_within_limit(self):
++        payload = self._call(streak_len=4)
++        blocks = payload["attachments"][0]["blocks"]
++        history_text = blocks[3]["text"]["text"]
++        self.assertNotIn("other failed", history_text)
++
++
++# ---------------------------------------------------------------------------
++# check_and_build_stale_payload
++# ---------------------------------------------------------------------------
++
++class TestCheckAndBuildStalePayload(unittest.TestCase):
++    """Tests for check_and_build_stale_payload."""
++
++    def _common_args(self):
++        return {
++            "token": "tok",
++            "its_scenario": "my-its",
++            "current_run_name": "current-run",
++            "konflux_base_url": "https://konflux-ui.example.com/base",
++            "namespace": "ns",
++            "gate_label": "ARO HCP",
++            "kubearchive_api_base": "https://kubearchive.example.com",
++        }
++
++    def _make_run(self, name, created, status=False, reason="Failed"):
++        return {"name": name, "created": created,
++                "status": status, "reason": reason}
++
++    @patch("ho_release_gate.datetime")
++    @patch("ho_release_gate.fetch_pipelineruns")
++    def test_streak_below_threshold(self, mock_fetch, mock_dt):
++        now = datetime(2026, 7, 8, 12, 0, 0, tzinfo=timezone.utc)
++        mock_dt.now.return_value = now
++        mock_dt.fromisoformat = datetime.fromisoformat
++        mock_dt.side_effect = lambda *a, **kw: datetime(*a, **kw)
++
++        mock_fetch.return_value = [
++            self._make_run("run-1", "2026-07-07T10:00:00Z"),
++        ]
++
++        result = check_and_build_stale_payload(
++            threshold_days=3, **self._common_args())
++
++        self.assertIsNone(result)
++
++    @patch("ho_release_gate.datetime")
++    @patch("ho_release_gate.fetch_pipelineruns")
++    def test_streak_below_threshold_verifies_days(self, mock_fetch, mock_dt):
++        """1 run from yesterday: streak_days = 1+1 = 2, below threshold 3."""
++        now = datetime(2026, 7, 8, 12, 0, 0, tzinfo=timezone.utc)
++        mock_dt.now.return_value = now
++        mock_dt.fromisoformat = datetime.fromisoformat
++        mock_dt.side_effect = lambda *a, **kw: datetime(*a, **kw)
++
++        mock_fetch.return_value = [
++            self._make_run("run-1", "2026-07-07T10:00:00Z"),
++        ]
++
++        result = check_and_build_stale_payload(
++            threshold_days=3, **self._common_args())
++
++        self.assertIsNone(result)
++
++    @patch("ho_release_gate.datetime")
++    @patch("ho_release_gate.fetch_pipelineruns")
++    def test_streak_equals_threshold(self, mock_fetch, mock_dt):
++        """2 runs spanning Jul 6-7, now=Jul 8: streak_days = 2+1 = 3 = threshold."""
++        now = datetime(2026, 7, 8, 12, 0, 0, tzinfo=timezone.utc)
++        mock_dt.now.return_value = now
++        mock_dt.fromisoformat = datetime.fromisoformat
++        mock_dt.side_effect = lambda *a, **kw: datetime(*a, **kw)
++
++        mock_fetch.return_value = [
++            self._make_run("run-2", "2026-07-07T10:00:00Z"),
++            self._make_run("run-1", "2026-07-06T10:00:00Z"),
++        ]
++
++        result = check_and_build_stale_payload(
++            threshold_days=3, **self._common_args())
++
++        self.assertIsNotNone(result)
++        self.assertIn("attachments", result)
++        blocks = result["attachments"][0]["blocks"]
++        header_text = blocks[0]["text"]["text"]
++        self.assertIn("3 day(s)", header_text)
++
++    @patch("ho_release_gate.datetime")
++    @patch("ho_release_gate.fetch_pipelineruns")
++    def test_streak_above_threshold(self, mock_fetch, mock_dt):
++        """5 runs spanning Jul 3-7, now=Jul 8: streak_days = 5+1 = 6."""
++        now = datetime(2026, 7, 8, 12, 0, 0, tzinfo=timezone.utc)
++        mock_dt.now.return_value = now
++        mock_dt.fromisoformat = datetime.fromisoformat
++        mock_dt.side_effect = lambda *a, **kw: datetime(*a, **kw)
++
++        mock_fetch.return_value = [
++            self._make_run("run-5", "2026-07-07T10:00:00Z"),
++            self._make_run("run-4", "2026-07-06T10:00:00Z"),
++            self._make_run("run-3", "2026-07-05T10:00:00Z"),
++            self._make_run("run-2", "2026-07-04T10:00:00Z"),
++            self._make_run("run-1", "2026-07-03T10:00:00Z"),
++        ]
++
++        result = check_and_build_stale_payload(
++            threshold_days=3, **self._common_args())
++
++        self.assertIsNotNone(result)
++        blocks = result["attachments"][0]["blocks"]
++        header_text = blocks[0]["text"]["text"]
++        self.assertIn("6 day(s)", header_text)
++
++    @patch("ho_release_gate.datetime")
++    @patch("ho_release_gate.fetch_pipelineruns")
++    def test_streak_days_includes_today(self, mock_fetch, mock_dt):
++        """Oldest failure 4 days ago + today = 5 days total."""
++        now = datetime(2026, 7, 8, 12, 0, 0, tzinfo=timezone.utc)
++        mock_dt.now.return_value = now
++        mock_dt.fromisoformat = datetime.fromisoformat
++        mock_dt.side_effect = lambda *a, **kw: datetime(*a, **kw)
++
++        mock_fetch.return_value = [
++            self._make_run("run-4", "2026-07-07T10:00:00Z"),
++            self._make_run("run-3", "2026-07-06T10:00:00Z"),
++            self._make_run("run-2", "2026-07-05T10:00:00Z"),
++            self._make_run("run-1", "2026-07-04T10:00:00Z"),
++        ]
++
++        result = check_and_build_stale_payload(
++            threshold_days=3, **self._common_args())
++
++        self.assertIsNotNone(result)
++        blocks = result["attachments"][0]["blocks"]
++        header_text = blocks[0]["text"]["text"]
++        self.assertIn("5 day(s)", header_text)
++
++    @patch("ho_release_gate.fetch_pipelineruns")
++    def test_no_runs(self, mock_fetch):
++        mock_fetch.return_value = []
++
++        result = check_and_build_stale_payload(
++            threshold_days=3, **self._common_args())
++
++        self.assertIsNone(result)
++
++    @patch("ho_release_gate.fetch_pipelineruns")
++    def test_most_recent_succeeded(self, mock_fetch):
++        mock_fetch.return_value = [
++            self._make_run("run-2", "2026-07-07T10:00:00Z",
++                           status=True, reason="Completed"),
++            self._make_run("run-1", "2026-07-06T10:00:00Z"),
++        ]
++
++        result = check_and_build_stale_payload(
++            threshold_days=3, **self._common_args())
++
++        self.assertIsNone(result)
++
++    @patch("ho_release_gate.fetch_pipelineruns")
++    def test_current_run_filtered_out(self, mock_fetch):
++        mock_fetch.return_value = [
++            self._make_run("current-run", "2026-07-08T10:00:00Z"),
++            self._make_run("run-1", "2026-07-07T10:00:00Z",
++                           status=True, reason="Completed"),
++        ]
++
++        result = check_and_build_stale_payload(
++            threshold_days=3, **self._common_args())
++
++        self.assertIsNone(result)
++
++    @patch("ho_release_gate.fetch_pipelineruns")
++    def test_empty_created_timestamp(self, mock_fetch):
++        mock_fetch.return_value = [
++            self._make_run("run-1", ""),
++        ]
++
++        result = check_and_build_stale_payload(
++            threshold_days=3, **self._common_args())
++
++        self.assertIsNone(result)
++
++
++if __name__ == "__main__":
++    unittest.main()
+diff --git a/.tekton/lib/tests/test_http_utils.py b/.tekton/lib/tests/test_http_utils.py
+new file mode 100644
+index 000000000000..276cdf5a57b6
+--- /dev/null
++++ b/.tekton/lib/tests/test_http_utils.py
+@@ -0,0 +1,203 @@
++"""Tests for http_utils module."""
++
++import io
++import json
++import sys
++import os
++import time
++import unittest
++from unittest.mock import patch, MagicMock
++from urllib.error import HTTPError, URLError
++
++sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
++
++from http_utils import http_request, http_request_with_retry
++
++
++class TestHttpRequest(unittest.TestCase):
++    """Tests for http_request."""
++
++    @patch("http_utils.urlopen")
++    def test_get_success(self, mock_urlopen):
++        resp = MagicMock()
++        resp.status = 200
++        resp.read.return_value = b"OK"
++        resp.__enter__ = lambda s: s
++        resp.__exit__ = MagicMock(return_value=False)
++        mock_urlopen.return_value = resp
++
++        status, body = http_request("https://example.com/api")
++
++        self.assertEqual(status, 200)
++        self.assertEqual(body, "OK")
++        mock_urlopen.assert_called_once()
++
++    @patch("http_utils.urlopen")
++    def test_post_with_dict_body(self, mock_urlopen):
++        resp = MagicMock()
++        resp.status = 200
++        resp.read.return_value = b'{"ok":true}'
++        resp.__enter__ = lambda s: s
++        resp.__exit__ = MagicMock(return_value=False)
++        mock_urlopen.return_value = resp
++
++        payload = {"key": "value"}
++        status, body = http_request("https://example.com/api",
++                                    method="POST", body=payload)
++
++        self.assertEqual(status, 200)
++        req = mock_urlopen.call_args[0][0]
++        self.assertEqual(req.data, json.dumps(payload).encode("utf-8"))
++        self.assertEqual(req.get_header("Content-type"), "application/json")
++
++    @patch("http_utils.urlopen")
++    def test_post_with_string_body(self, mock_urlopen):
++        resp = MagicMock()
++        resp.status = 200
++        resp.read.return_value = b"ok"
++        resp.__enter__ = lambda s: s
++        resp.__exit__ = MagicMock(return_value=False)
++        mock_urlopen.return_value = resp
++
++        status, body = http_request("https://example.com/api",
++                                    method="POST", body="raw text")
++
++        self.assertEqual(status, 200)
++        req = mock_urlopen.call_args[0][0]
++        self.assertEqual(req.data, b"raw text")
++
++    @patch("http_utils.urlopen")
++    def test_http_error(self, mock_urlopen):
++        error = HTTPError("https://example.com", 404, "Not Found",
++                          {}, io.BytesIO(b"not found"))
++        mock_urlopen.side_effect = error
++
++        status, body = http_request("https://example.com/api")
++
++        self.assertEqual(status, 404)
++        self.assertEqual(body, "not found")
++
++    @patch("http_utils.urlopen")
++    def test_url_error(self, mock_urlopen):
++        mock_urlopen.side_effect = URLError("Connection refused")
++
++        status, body = http_request("https://example.com/api")
++
++        self.assertEqual(status, 0)
++        self.assertIn("Connection refused", body)
++
++    @patch("http_utils.urlopen")
++    def test_custom_headers(self, mock_urlopen):
++        resp = MagicMock()
++        resp.status = 200
++        resp.read.return_value = b""
++        resp.__enter__ = lambda s: s
++        resp.__exit__ = MagicMock(return_value=False)
++        mock_urlopen.return_value = resp
++
++        http_request("https://example.com/api",
++                     headers={"Authorization": "Bearer tok123"})
++
++        req = mock_urlopen.call_args[0][0]
++        self.assertEqual(req.get_header("Authorization"), "Bearer tok123")
++
++    @patch("http_utils.urlopen")
++    def test_post_dict_body_does_not_override_content_type(self, mock_urlopen):
++        resp = MagicMock()
++        resp.status = 200
++        resp.read.return_value = b""
++        resp.__enter__ = lambda s: s
++        resp.__exit__ = MagicMock(return_value=False)
++        mock_urlopen.return_value = resp
++
++        http_request("https://example.com/api", method="POST",
++                     headers={"Content-Type": "text/plain"},
++                     body={"key": "value"})
++
++        req = mock_urlopen.call_args[0][0]
++        self.assertEqual(req.get_header("Content-type"), "text/plain")
++
++
++class TestHttpRequestWithRetry(unittest.TestCase):
++    """Tests for http_request_with_retry."""
++
++    @patch("http_utils.http_request")
++    def test_success_first_try(self, mock_req):
++        mock_req.return_value = (200, "OK")
++
++        status, body = http_request_with_retry("https://example.com/api")
++
++        self.assertEqual(status, 200)
++        self.assertEqual(body, "OK")
++        self.assertEqual(mock_req.call_count, 1)
++
++    @patch("http_utils.time.sleep")
++    @patch("http_utils.http_request")
++    def test_retry_on_429(self, mock_req, mock_sleep):
++        mock_req.side_effect = [(429, "rate limited"), (200, "OK")]
++
++        status, body = http_request_with_retry(
++            "https://example.com/api", retries=3, backoff=5)
++
++        self.assertEqual(status, 200)
++        self.assertEqual(mock_req.call_count, 2)
++        mock_sleep.assert_called_once_with(5)
++
++    @patch("http_utils.time.sleep")
++    @patch("http_utils.http_request")
++    def test_retry_on_500(self, mock_req, mock_sleep):
++        mock_req.side_effect = [(500, "error"), (200, "OK")]
++
++        status, body = http_request_with_retry(
++            "https://example.com/api", retries=3, backoff=5)
++
++        self.assertEqual(status, 200)
++        self.assertEqual(mock_req.call_count, 2)
++
++    @patch("http_utils.time.sleep")
++    @patch("http_utils.http_request")
++    def test_all_retries_fail(self, mock_req, mock_sleep):
++        mock_req.return_value = (503, "unavailable")
++
++        status, body = http_request_with_retry(
++            "https://example.com/api", retries=3, backoff=1)
++
++        self.assertEqual(status, 503)
++        self.assertEqual(body, "unavailable")
++        self.assertEqual(mock_req.call_count, 3)
++
++    @patch("http_utils.http_request")
++    def test_no_retry_on_client_error(self, mock_req):
++        mock_req.return_value = (400, "bad request")
++
++        status, body = http_request_with_retry(
++            "https://example.com/api", retries=3)
++
++        self.assertEqual(status, 400)
++        self.assertEqual(mock_req.call_count, 1)
++
++    @patch("http_utils.time.sleep")
++    @patch("http_utils.http_request")
++    def test_retry_on_connection_failure(self, mock_req, mock_sleep):
++        mock_req.side_effect = [(0, "Connection refused"), (200, "OK")]
++
++        status, body = http_request_with_retry(
++            "https://example.com/api", retries=3, backoff=2)
++
++        self.assertEqual(status, 200)
++        self.assertEqual(mock_req.call_count, 2)
++
++    @patch("http_utils.http_request")
++    def test_custom_should_retry(self, mock_req):
++        mock_req.return_value = (418, "teapot")
++
++        status, body = http_request_with_retry(
++            "https://example.com/api", retries=2,
++            should_retry=lambda s: s == 418)
++
++        self.assertEqual(status, 418)
++        self.assertEqual(mock_req.call_count, 2)
++
++
++if __name__ == "__main__":
++    unittest.main()
+diff --git a/.tekton/lib/tests/test_kubearchive_utils.py b/.tekton/lib/tests/test_kubearchive_utils.py
+new file mode 100644
+index 000000000000..b1b8558840f6
+--- /dev/null
++++ b/.tekton/lib/tests/test_kubearchive_utils.py
+@@ -0,0 +1,197 @@
++"""Tests for kubearchive_utils module."""
++
++import json
++import sys
++import os
++import unittest
++from unittest.mock import patch
++
++sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
++
++from kubearchive_utils import (fetch_pipelineruns, build_pipelinerun_url,
++                               STALE_QUERY_LIMIT)
++
++
++class TestFetchPipelineruns(unittest.TestCase):
++    """Tests for fetch_pipelineruns."""
++
++    def _make_item(self, name, created, reason="Succeeded",
++                   cond_status="True"):
++        return {
++            "metadata": {
++                "name": name,
++                "creationTimestamp": created,
++            },
++            "status": {
++                "conditions": [{"reason": reason, "status": cond_status}],
++            },
++        }
++
++    @patch("kubearchive_utils.http_request_with_retry")
++    def test_valid_response(self, mock_req):
++        items = [
++            self._make_item("run-a", "2026-07-01T10:00:00Z",
++                            "Completed", "True"),
++            self._make_item("run-b", "2026-07-03T10:00:00Z",
++                            "Failed", "False"),
++        ]
++        mock_req.return_value = (200, json.dumps({"items": items}))
++
++        result = fetch_pipelineruns("tok", "ns", "label=val", "https://kubearchive.example.com")
++
++        self.assertEqual(len(result), 2)
++        self.assertEqual(result[0]["name"], "run-b")
++        self.assertEqual(result[1]["name"], "run-a")
++        self.assertFalse(result[0]["status"])
++        self.assertTrue(result[1]["status"])
++        self.assertEqual(result[0]["reason"], "Failed")
++        self.assertEqual(result[1]["reason"], "Completed")
++
++    @patch("kubearchive_utils.http_request_with_retry")
++    def test_succeeded_reason(self, mock_req):
++        items = [
++            self._make_item("run-old", "2026-06-18T10:00:00Z",
++                            "Succeeded", "True"),
++        ]
++        mock_req.return_value = (200, json.dumps({"items": items}))
++
++        result = fetch_pipelineruns("tok", "ns", "label=val", "https://kubearchive.example.com")
++
++        self.assertTrue(result[0]["status"])
++        self.assertEqual(result[0]["reason"], "Succeeded")
++
++    @patch("kubearchive_utils.http_request_with_retry")
++    def test_pipeline_run_timeout(self, mock_req):
++        items = [
++            self._make_item("run-timeout", "2026-07-04T03:15:14Z",
++                            "PipelineRunTimeout", "False"),
++        ]
++        mock_req.return_value = (200, json.dumps({"items": items}))
++
++        result = fetch_pipelineruns("tok", "ns", "label=val", "https://kubearchive.example.com")
++
++        self.assertFalse(result[0]["status"])
++        self.assertEqual(result[0]["reason"], "PipelineRunTimeout")
++
++    @patch("kubearchive_utils.http_request_with_retry")
++    def test_couldnt_get_pipeline(self, mock_req):
++        items = [
++            self._make_item("run-no-pipe", "2026-06-18T15:59:32Z",
++                            "CouldntGetPipeline", "False"),
++        ]
++        mock_req.return_value = (200, json.dumps({"items": items}))
++
++        result = fetch_pipelineruns("tok", "ns", "label=val", "https://kubearchive.example.com")
++
++        self.assertFalse(result[0]["status"])
++        self.assertEqual(result[0]["reason"], "CouldntGetPipeline")
++
++    @patch("kubearchive_utils.http_request_with_retry")
++    def test_empty_items(self, mock_req):
++        mock_req.return_value = (200, json.dumps({"items": []}))
++
++        result = fetch_pipelineruns("tok", "ns", "label=val", "https://kubearchive.example.com")
++
++        self.assertEqual(result, [])
++
++    @patch("kubearchive_utils.http_request_with_retry")
++    def test_non_200_response(self, mock_req):
++        mock_req.return_value = (503, "unavailable")
++
++        result = fetch_pipelineruns("tok", "ns", "label=val", "https://kubearchive.example.com")
++
++        self.assertEqual(result, [])
++
++    @patch("kubearchive_utils.http_request_with_retry")
++    def test_malformed_json(self, mock_req):
++        mock_req.return_value = (200, "not json at all")
++
++        result = fetch_pipelineruns("tok", "ns", "label=val", "https://kubearchive.example.com")
++
++        self.assertEqual(result, [])
++
++    @patch("kubearchive_utils.http_request_with_retry")
++    def test_missing_conditions(self, mock_req):
++        item = {
++            "metadata": {"name": "run-x", "creationTimestamp": "2026-07-01T00:00:00Z"},
++            "status": {},
++        }
++        mock_req.return_value = (200, json.dumps({"items": [item]}))
++
++        result = fetch_pipelineruns("tok", "ns", "label=val", "https://kubearchive.example.com")
++
++        self.assertEqual(len(result), 1)
++        self.assertFalse(result[0]["status"])
++        self.assertEqual(result[0]["reason"], "Unknown")
++
++    @patch("kubearchive_utils.http_request_with_retry")
++    def test_missing_metadata_fields(self, mock_req):
++        item = {"metadata": {}, "status": {"conditions": [
++            {"reason": "OK", "status": "True"}]}}
++        mock_req.return_value = (200, json.dumps({"items": [item]}))
++
++        result = fetch_pipelineruns("tok", "ns", "label=val", "https://kubearchive.example.com")
++
++        self.assertEqual(len(result), 1)
++        self.assertEqual(result[0]["name"], "")
++        self.assertEqual(result[0]["created"], "")
++
++    @patch("kubearchive_utils.http_request_with_retry")
++    def test_non_dict_condition(self, mock_req):
++        item = {
++            "metadata": {"name": "run-x", "creationTimestamp": "2026-07-01T00:00:00Z"},
++            "status": {"conditions": ["not-a-dict"]},
++        }
++        mock_req.return_value = (200, json.dumps({"items": [item]}))
++
++        result = fetch_pipelineruns("tok", "ns", "label=val", "https://kubearchive.example.com")
++
++        self.assertFalse(result[0]["status"])
++        self.assertEqual(result[0]["reason"], "Unknown")
++
++    @patch("kubearchive_utils.http_request_with_retry")
++    def test_query_includes_limit_and_time_filter(self, mock_req):
++        mock_req.return_value = (200, json.dumps({"items": []}))
++
++        fetch_pipelineruns("tok", "ns", "label=val", "https://kubearchive.example.com")
++
++        url = mock_req.call_args[0][0]
++        self.assertIn(f"limit={STALE_QUERY_LIMIT}", url)
++        self.assertIn("creationTimestampAfter=", url)
++
++    @patch("kubearchive_utils.http_request_with_retry")
++    def test_sort_order(self, mock_req):
++        items = [
++            self._make_item("oldest", "2026-07-01T00:00:00Z"),
++            self._make_item("newest", "2026-07-05T00:00:00Z"),
++            self._make_item("middle", "2026-07-03T00:00:00Z"),
++        ]
++        mock_req.return_value = (200, json.dumps({"items": items}))
++
++        result = fetch_pipelineruns("tok", "ns", "label=val", "https://kubearchive.example.com")
++
++        self.assertEqual(result[0]["name"], "newest")
++        self.assertEqual(result[1]["name"], "middle")
++        self.assertEqual(result[2]["name"], "oldest")
++
++
++class TestBuildPipelinerunUrl(unittest.TestCase):
++    """Tests for build_pipelinerun_url."""
++
++    def test_basic_url(self):
++        url = build_pipelinerun_url(
++            "run-abc",
++            "https://konflux-ui.example.com/ns/test/applications/app")
++
++        self.assertEqual(
++            url,
++            "https://konflux-ui.example.com/ns/test/applications/app"
++            "/pipelineruns/run-abc/")
++
++    def test_trailing_slash(self):
++        url = build_pipelinerun_url("run-x", "https://example.com/base")
++        self.assertTrue(url.endswith("/"))
++
++
++if __name__ == "__main__":
++    unittest.main()
+diff --git a/.tekton/lib/tests/test_prow_utils.py b/.tekton/lib/tests/test_prow_utils.py
+new file mode 100644
+index 000000000000..bbc0ec444d20
+--- /dev/null
++++ b/.tekton/lib/tests/test_prow_utils.py
+@@ -0,0 +1,262 @@
++"""Tests for prow_utils module."""
++
++import json
++import sys
++import os
++import unittest
++from unittest.mock import patch, MagicMock
++
++sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
++
++from prow_utils import (short_name, trigger_prow_job,
++                         resolve_prow_url, get_prow_job_status)
++
++
++class TestShortName(unittest.TestCase):
++    """Tests for short_name."""
++
++    def test_short_name_correctly_processes_job_names(self):
++        cases = [
++            ("periodic-ci-openshift-hypershift-release-5.0-periodics-e2e-aks", "5.0/e2e-aks"),
++            ("periodic-ci-openshift-hypershift-release-5.0-periodics-hcm-azure-e2e-aks-upgrade-minor", "5.0/hcm-azure-e2e-aks-upgrade-minor"),
++            ("periodic-ci-openshift-hypershift-release-5.0-periodics-e2e-aks-multi-x-ax", "5.0/e2e-aks-multi-x-ax"),
++            ("periodic-ci-openshift-hypershift-release-4.22-periodics-e2e-aks-multi-x-ax", "4.22/e2e-aks-multi-x-ax"),
++            ("periodic-ci-openshift-hypershift-release-4.21-periodics-e2e-aks-multi-x-ax", "4.21/e2e-aks-multi-x-ax"),
++            ("periodic-ci-openshift-hypershift-release-4.20-periodics-e2e-aks-multi-x-ax", "4.20/e2e-aks-multi-x-ax"),
++            ("periodic-ci-openshift-hypershift-release-4.22-periodics-hcm-azure-e2e-aks-upgrade-from-zero", "4.22/hcm-azure-e2e-aks-upgrade-from-zero"),
++            ("periodic-ci-openshift-hypershift-release-4.21-periodics-hcm-azure-e2e-aks-upgrade-from-zero", "4.21/hcm-azure-e2e-aks-upgrade-from-zero"),
++            ("periodic-ci-openshift-hypershift-release-4.20-periodics-hcm-azure-e2e-aks-upgrade-from-zero", "4.20/hcm-azure-e2e-aks-upgrade-from-zero"),
++            ("periodic-ci-openshift-hypershift-release-5.0-periodics-e2e-azure-aks-ovn-conformance", "5.0/e2e-azure-aks-ovn-conformance"),
++        ]
++        for job_name, expected in cases:
++            with self.subTest(job=job_name):
++                self.assertEqual(short_name(job_name), expected)
++
++    def test_short_name_no_match_returns_original(self):
++        self.assertEqual(short_name("other-job-name"), "other-job-name")
++
++    def test_short_name_empty_string(self):
++        self.assertEqual(short_name(""), "")
++
++
++class TestTriggerProwJob(unittest.TestCase):
++    """Tests for trigger_prow_job."""
++
++    @patch("prow_utils.http_request_with_retry")
++    def test_success(self, mock_req):
++        mock_req.return_value = (200, json.dumps({"id": "12345"}))
++
++        job_id = trigger_prow_job(
++            "https://gangway.example.com/v1/executions",
++            "tok", "periodic-job", {"IMAGE": "quay.io/test"})
++
++        self.assertEqual(job_id, "12345")
++
++    @patch("prow_utils.http_request_with_retry")
++    def test_numeric_id_returned_as_string(self, mock_req):
++        mock_req.return_value = (200, json.dumps({"id": 99}))
++
++        job_id = trigger_prow_job(
++            "https://gangway.example.com/v1/executions",
++            "tok", "periodic-job", {})
++
++        self.assertEqual(job_id, "99")
++
++    @patch("prow_utils.http_request_with_retry")
++    def test_http_failure(self, mock_req):
++        mock_req.return_value = (503, "unavailable")
++
++        job_id = trigger_prow_job(
++            "https://gangway.example.com/v1/executions",
++            "tok", "periodic-job", {})
++
++        self.assertIsNone(job_id)
++
++    @patch("prow_utils.http_request_with_retry")
++    def test_invalid_json_response(self, mock_req):
++        mock_req.return_value = (200, "not json")
++
++        job_id = trigger_prow_job(
++            "https://gangway.example.com/v1/executions",
++            "tok", "periodic-job", {})
++
++        self.assertIsNone(job_id)
++
++    @patch("prow_utils.http_request_with_retry")
++    def test_missing_id_field(self, mock_req):
++        mock_req.return_value = (200, json.dumps({"status": "ok"}))
++
++        job_id = trigger_prow_job(
++            "https://gangway.example.com/v1/executions",
++            "tok", "periodic-job", {})
++
++        self.assertIsNone(job_id)
++
++    @patch("prow_utils.http_request_with_retry")
++    def test_passes_correct_payload(self, mock_req):
++        mock_req.return_value = (200, json.dumps({"id": "1"}))
++
++        trigger_prow_job(
++            "https://gangway.example.com/v1/executions",
++            "tok", "periodic-job", {"K": "V"}, max_retries=5, backoff=60)
++
++        _, kwargs = mock_req.call_args
++        self.assertEqual(kwargs["retries"], 5)
++        self.assertEqual(kwargs["backoff"], 60)
++        body = kwargs["body"]
++        self.assertEqual(body["job_name"], "periodic-job")
++        self.assertEqual(body["pod_spec_options"]["envs"], {"K": "V"})
++
++
++class TestResolveProwUrl(unittest.TestCase):
++    """Tests for resolve_prow_url."""
++
++    @patch("prow_utils.time.sleep")
++    @patch("prow_utils.http_request")
++    def test_url_available_immediately(self, mock_req, mock_sleep):
++        mock_req.return_value = (
++            200, json.dumps({"job_url": "https://prow.ci/view/123"}))
++
++        url = resolve_prow_url(
++            "https://gangway.example.com/v1/executions",
++            "tok", "123")
++
++        self.assertEqual(url, "https://prow.ci/view/123")
++        mock_sleep.assert_not_called()
++
++    @patch("prow_utils.time.sleep")
++    @patch("prow_utils.http_request")
++    def test_url_available_after_polls(self, mock_req, mock_sleep):
++        mock_req.side_effect = [
++            (200, json.dumps({"job_url": ""})),
++            (200, json.dumps({"job_url": "https://prow.ci/view/123"})),
++        ]
++
++        url = resolve_prow_url(
++            "https://gangway.example.com/v1/executions",
++            "tok", "123", max_attempts=5, delay=1)
++
++        self.assertEqual(url, "https://prow.ci/view/123")
++        self.assertEqual(mock_req.call_count, 2)
++
++    @patch("prow_utils.time.sleep")
++    @patch("prow_utils.http_request")
++    def test_max_attempts_exceeded(self, mock_req, mock_sleep):
++        mock_req.return_value = (200, json.dumps({"job_url": ""}))
++
++        url = resolve_prow_url(
++            "https://gangway.example.com/v1/executions",
++            "tok", "123", max_attempts=3, delay=1)
++
++        self.assertEqual(url, "")
++        self.assertEqual(mock_req.call_count, 3)
++
++    @patch("prow_utils.time.sleep")
++    @patch("prow_utils.http_request")
++    def test_auth_error_aborts(self, mock_req, mock_sleep):
++        mock_req.return_value = (401, "unauthorized")
++
++        url = resolve_prow_url(
++            "https://gangway.example.com/v1/executions",
++            "tok", "123", max_attempts=5)
++
++        self.assertEqual(url, "")
++        self.assertEqual(mock_req.call_count, 1)
++
++
++class TestGetProwJobStatus(unittest.TestCase):
++    """Tests for get_prow_job_status."""
++
++    @patch("prow_utils.http_request")
++    def test_success(self, mock_req):
++        mock_req.return_value = (
++            200, json.dumps({"job_status": "SUCCESS"}))
++
++        mapped, raw = get_prow_job_status(
++            "https://gangway.example.com/v1/executions", "tok", "123")
++
++        self.assertEqual(mapped, "passed")
++        self.assertEqual(raw, "SUCCESS")
++
++    @patch("prow_utils.http_request")
++    def test_failure(self, mock_req):
++        mock_req.return_value = (
++            200, json.dumps({"job_status": "FAILURE"}))
++
++        mapped, raw = get_prow_job_status(
++            "https://gangway.example.com/v1/executions", "tok", "123")
++
++        self.assertEqual(mapped, "failed")
++        self.assertEqual(raw, "FAILURE")
++
++    @patch("prow_utils.http_request")
++    def test_aborted(self, mock_req):
++        mock_req.return_value = (
++            200, json.dumps({"job_status": "ABORTED"}))
++
++        mapped, raw = get_prow_job_status(
++            "https://gangway.example.com/v1/executions", "tok", "123")
++
++        self.assertEqual(mapped, "failed")
++
++    @patch("prow_utils.http_request")
++    def test_pending(self, mock_req):
++        mock_req.return_value = (
++            200, json.dumps({"job_status": "TRIGGERED"}))
++
++        mapped, raw = get_prow_job_status(
++            "https://gangway.example.com/v1/executions", "tok", "123")
++
++        self.assertEqual(mapped, "pending")
++        self.assertEqual(raw, "TRIGGERED")
++
++    @patch("prow_utils.http_request")
++    def test_rate_limited_429(self, mock_req):
++        mock_req.return_value = (429, "rate limited")
++
++        mapped, raw = get_prow_job_status(
++            "https://gangway.example.com/v1/executions", "tok", "123")
++
++        self.assertEqual(mapped, "rate_limited")
++        self.assertIn("429", raw)
++
++    @patch("prow_utils.http_request")
++    def test_rate_limited_5xx(self, mock_req):
++        mock_req.return_value = (503, "unavailable")
++
++        mapped, raw = get_prow_job_status(
++            "https://gangway.example.com/v1/executions", "tok", "123")
++
++        self.assertEqual(mapped, "rate_limited")
++
++    @patch("prow_utils.http_request")
++    def test_connection_failure_is_retryable(self, mock_req):
++        mock_req.return_value = (0, "Connection refused")
++
++        mapped, raw = get_prow_job_status(
++            "https://gangway.example.com/v1/executions", "tok", "123")
++
++        self.assertEqual(mapped, "rate_limited")
++        self.assertIn("0", raw)
++
++    @patch("prow_utils.http_request")
++    def test_auth_error(self, mock_req):
++        mock_req.return_value = (401, "unauthorized")
++
++        mapped, raw = get_prow_job_status(
++            "https://gangway.example.com/v1/executions", "tok", "123")
++
++        self.assertEqual(mapped, "error")
++
++    @patch("prow_utils.http_request")
++    def test_invalid_json(self, mock_req):
++        mock_req.return_value = (200, "not json")
++
++        mapped, raw = get_prow_job_status(
++            "https://gangway.example.com/v1/executions", "tok", "123")
++
++        self.assertEqual(mapped, "error")
++
++
++if __name__ == "__main__":
++    unittest.main()
+diff --git a/.tekton/lib/tests/test_slack_utils.py b/.tekton/lib/tests/test_slack_utils.py
+new file mode 100644
+index 000000000000..a67249b6c99e
+--- /dev/null
++++ b/.tekton/lib/tests/test_slack_utils.py
+@@ -0,0 +1,139 @@
++"""Tests for slack_utils module."""
++
++import sys
++import os
++import unittest
++from unittest.mock import patch, MagicMock
++
++sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
++
++from slack_utils import (send_slack_message, build_slack_payload,
++                          mrkdwn_section, fields_section, divider)
++
++
++class TestSendSlackMessage(unittest.TestCase):
++    """Tests for send_slack_message."""
++
++    @patch("slack_utils.http_request")
++    def test_success(self, mock_req):
++        mock_req.return_value = (200, "ok")
++
++        result = send_slack_message(
++            "https://hooks.slack.com/test", {"text": "hello"})
++
++        self.assertTrue(result)
++        self.assertEqual(mock_req.call_count, 1)
++
++    @patch("slack_utils.http_request")
++    def test_client_error_no_retry(self, mock_req):
++        mock_req.return_value = (400, "invalid_payload")
++
++        result = send_slack_message(
++            "https://hooks.slack.com/test", {"text": "hello"}, retries=3)
++
++        self.assertFalse(result)
++        self.assertEqual(mock_req.call_count, 1)
++
++    @patch("slack_utils.http_request")
++    def test_403_no_retry(self, mock_req):
++        mock_req.return_value = (403, "forbidden")
++
++        result = send_slack_message(
++            "https://hooks.slack.com/test", {"text": "hello"}, retries=3)
++
++        self.assertFalse(result)
++        self.assertEqual(mock_req.call_count, 1)
++
++    @patch("slack_utils.time.sleep")
++    @patch("slack_utils.http_request")
++    def test_429_retries(self, mock_req, mock_sleep):
++        mock_req.side_effect = [
++            (429, "rate limited"),
++            (429, "rate limited"),
++            (429, "rate limited"),
++        ]
++
++        result = send_slack_message(
++            "https://hooks.slack.com/test", {"text": "hello"},
++            retries=3, delay=1)
++
++        self.assertFalse(result)
++        self.assertEqual(mock_req.call_count, 3)
++
++    @patch("slack_utils.time.sleep")
++    @patch("slack_utils.http_request")
++    def test_500_retries_then_succeeds(self, mock_req, mock_sleep):
++        mock_req.side_effect = [(500, "error"), (200, "ok")]
++
++        result = send_slack_message(
++            "https://hooks.slack.com/test", {"text": "hello"},
++            retries=3, delay=1)
++
++        self.assertTrue(result)
++        self.assertEqual(mock_req.call_count, 2)
++
++    @patch("slack_utils.time.sleep")
++    @patch("slack_utils.http_request")
++    def test_connection_failure_retries(self, mock_req, mock_sleep):
++        mock_req.side_effect = [
++            (0, "Connection refused"),
++            (200, "ok"),
++        ]
++
++        result = send_slack_message(
++            "https://hooks.slack.com/test", {"text": "hello"},
++            retries=3, delay=1)
++
++        self.assertTrue(result)
++        self.assertEqual(mock_req.call_count, 2)
++
++
++class TestBuildSlackPayload(unittest.TestCase):
++    """Tests for build_slack_payload."""
++
++    def test_structure(self):
++        blocks = [{"type": "section", "text": {"type": "mrkdwn", "text": "hi"}}]
++        payload = build_slack_payload("#2E7D32", blocks)
++
++        self.assertIn("attachments", payload)
++        self.assertEqual(len(payload["attachments"]), 1)
++        self.assertEqual(payload["attachments"][0]["color"], "#2E7D32")
++        self.assertEqual(payload["attachments"][0]["blocks"], blocks)
++
++
++class TestMrkdwnSection(unittest.TestCase):
++    """Tests for mrkdwn_section."""
++
++    def test_structure(self):
++        result = mrkdwn_section("hello *bold*")
++
++        self.assertEqual(result["type"], "section")
++        self.assertEqual(result["text"]["type"], "mrkdwn")
++        self.assertEqual(result["text"]["text"], "hello *bold*")
++
++
++class TestFieldsSection(unittest.TestCase):
++    """Tests for fields_section."""
++
++    def test_structure(self):
++        result = fields_section(["*A:*\nval1", "*B:*\nval2"])
++
++        self.assertEqual(result["type"], "section")
++        self.assertEqual(len(result["fields"]), 2)
++        self.assertEqual(result["fields"][0]["type"], "mrkdwn")
++        self.assertEqual(result["fields"][0]["text"], "*A:*\nval1")
++
++    def test_four_fields(self):
++        result = fields_section(["a", "b", "c", "d"])
++        self.assertEqual(len(result["fields"]), 4)
++
++
++class TestDivider(unittest.TestCase):
++    """Tests for divider."""
++
++    def test_structure(self):
++        self.assertEqual(divider(), {"type": "divider"})
++
++
++if __name__ == "__main__":
++    unittest.main()
+diff --git a/.tekton/pipelines/ho-release-gate-run.yaml b/.tekton/pipelines/ho-release-gate-run.yaml
+new file mode 100644
+index 000000000000..e2da9c60d318
+--- /dev/null
++++ b/.tekton/pipelines/ho-release-gate-run.yaml
+@@ -0,0 +1,29 @@
++apiVersion: tekton.dev/v1
++kind: PipelineRun
++metadata:
++  name: ho-release-gate-run
++spec:
++  timeouts:
++    pipeline: "7h0m0s"
++    tasks: "5h30m0s"
++    finally: "30m0s"
++  taskRunSpecs:
++    - pipelineTaskName: create-release
++      serviceAccountName: nightly-promotion-sa
++  workspaces:
++  - name: shared
++    volumeClaimTemplate:
++      spec:
++        accessModes: ["ReadWriteOnce"]
++        resources:
++          requests:
++            storage: 10Mi
++  pipelineRef:
++    resolver: git
++    params:
++      - name: url
++        value: https://github.com/openshift/hypershift
++      - name: revision
++        value: main
++      - name: pathInRepo
++        value: .tekton/pipelines/ho-release-gate.yaml
+diff --git a/.tekton/pipelines/ho-release-gate.yaml b/.tekton/pipelines/ho-release-gate.yaml
+new file mode 100644
+index 000000000000..bba81503d953
+--- /dev/null
++++ b/.tekton/pipelines/ho-release-gate.yaml
+@@ -0,0 +1,537 @@
++apiVersion: tekton.dev/v1
++kind: Pipeline
++metadata:
++  name: ho-release-gate
++spec:
++  params:
++  - name: SNAPSHOT
++    type: string
++    description: JSON payload of the Konflux Snapshot (injected by Integration Service)
++  - name: e2e-blocking-job-names
++    type: string
++    description: JSON array of blocking Prow periodic job names (gate fails if any fail)
++    default: '[]'
++  - name: e2e-informing-job-names
++    type: string
++    description: JSON array of informing Prow periodic job names (reported but do not block the gate)
++    default: '[]'
++  - name: gate-label
++    type: string
++    description: Label identifying which service release gate this is (e.g. ARO HCP)
++    default: "ARO HCP"
++  - name: release-plan-name
++    type: string
++    description: Name of the ReleasePlan to reference when creating the Release CR
++  - name: stale-threshold-days
++    type: string
++    description: Number of consecutive failure days before triggering a stale promotion alert
++    default: "3"
++  - name: gangway-url
++    type: string
++    description: Base URL of the Gangway executions endpoint
++    default: "https://gangway-ci.apps.ci.l2s4.p1.openshiftapps.com/v1/executions"
++  - name: kubearchive-api-base
++    type: string
++    description: Base URL of the KubeArchive API server
++    default: "https://kubearchive-api-server-product-kubearchive.apps.stone-prd-rh01.pg1f.p1.openshiftapps.com"
++
++  workspaces:
++  - name: shared
++
++  tasks:
++  - name: clone-lib
++    taskSpec:
++      workspaces:
++      - name: shared
++      steps:
++      - name: clone
++        image: quay.io/konflux-ci/appstudio-utils:latest@sha256:32cda04122ee0a5d5b4307e121d192d1265c3bff727c9d894f36b6772da53d8c
++        script: |
++          #!/bin/bash
++          set -euo pipefail
++          echo "=== clone-lib ==="
++          echo "Running as: $(oc whoami)"
++          REPO_URL="https://github.com/openshift/hypershift.git"
++          BRANCH="main"
++          DEST="$(workspaces.shared.path)"
++
++          git clone --depth 1 --filter=blob:none --sparse \
++            --branch "${BRANCH}" "${REPO_URL}" /tmp/repo
++          cd /tmp/repo
++          git sparse-checkout set .tekton/lib
++
++          cp -r .tekton/lib/* "${DEST}/"
++          echo "Library files copied to workspace:"
++          ls -la "${DEST}/"
++          echo "=== clone-lib: done ==="
++    workspaces:
++    - name: shared
++      workspace: shared
++
++  - name: extract-image
++    runAfter: [clone-lib]
++    taskSpec:
++      params:
++      - name: SNAPSHOT
++        type: string
++      workspaces:
++      - name: shared
++      results:
++      - name: ho-image
++        description: Validated HO image reference
++      - name: snapshot-name
++        description: Snapshot name (from PipelineRun label)
++      steps:
++      - name: validate
++        image: quay.io/konflux-ci/appstudio-utils:latest@sha256:32cda04122ee0a5d5b4307e121d192d1265c3bff727c9d894f36b6772da53d8c
++        env:
++        - name: HOME
++          value: /tekton/home
++        - name: SNAPSHOT_JSON
++          value: $(params.SNAPSHOT)
++        - name: SNAPSHOT_NAME
++          valueFrom:
++            fieldRef:
++              fieldPath: metadata.labels['appstudio.openshift.io/snapshot']
++        script: |
++          #!/usr/bin/env python3
++          import os, subprocess, sys
++
++          sys.path.insert(0, "$(workspaces.shared.path)")
++          from ho_release_gate import extract_component_image
++
++          with open("$(results.ho-image.path)", "w") as f:
++              f.write("unknown")
++          with open("$(results.snapshot-name.path)", "w") as f:
++              f.write("unknown")
++
++          print("=== extract-image ===", flush=True)
++          whoami = subprocess.run(["oc", "whoami"], capture_output=True, text=True)
++          print(f"Running as: {whoami.stdout.strip()}", flush=True)
++
++          snapshot_name = os.environ.get("SNAPSHOT_NAME", "")
++          if not snapshot_name:
++              print("ERROR: snapshot-name is empty", flush=True)
++              sys.exit(1)
++          print(f"Snapshot:  {snapshot_name}", flush=True)
++
++          result = extract_component_image(os.environ["SNAPSHOT_JSON"])
++          print(f"HO image:  {result['image']}", flush=True)
++          print(f"Digest:    {result['digest']}", flush=True)
++          print(f"Commit:    {result['revision']}", flush=True)
++          print("=== validation passed ===", flush=True)
++
++          with open("$(results.ho-image.path)", "w") as f:
++              f.write(result["image"])
++          with open("$(results.snapshot-name.path)", "w") as f:
++              f.write(snapshot_name)
++    params:
++    - name: SNAPSHOT
++      value: $(params.SNAPSHOT)
++    workspaces:
++    - name: shared
++      workspace: shared
++
++  - name: run-e2e
++    runAfter: [extract-image, clone-lib]
++    timeout: "5h30m0s"
++    taskSpec:
++      params:
++      - name: ho-image
++        type: string
++      - name: e2e-blocking-job-names
++        type: string
++      - name: e2e-informing-job-names
++        type: string
++      - name: gangway-url
++        type: string
++      workspaces:
++      - name: shared
++      steps:
++      - name: trigger-and-poll
++        image: quay.io/konflux-ci/appstudio-utils:latest@sha256:32cda04122ee0a5d5b4307e121d192d1265c3bff727c9d894f36b6772da53d8c
++        env:
++        - name: GANGWAY_TOKEN
++          valueFrom:
++            secretKeyRef:
++              name: gangway-token
++              key: token
++        - name: GANGWAY_URL
++          value: $(params.gangway-url)
++        - name: HO_IMAGE
++          value: $(params.ho-image)
++        - name: BLOCKING_JSON
++          value: $(params.e2e-blocking-job-names)
++        - name: INFORMING_JSON
++          value: $(params.e2e-informing-job-names)
++        script: |
++          #!/usr/bin/env python3
++          import json, os, subprocess, sys
++
++          sys.path.insert(0, "$(workspaces.shared.path)")
++          from ho_release_gate import (trigger_all_jobs, resolve_all_urls,
++                                       poll_until_complete, print_run_summary,
++                                       build_results_json)
++
++          print("=== run-e2e ===", flush=True)
++          whoami = subprocess.run(["oc", "whoami"], capture_output=True, text=True)
++          print(f"Running as: {whoami.stdout.strip()}", flush=True)
++
++          results_file = "$(workspaces.shared.path)/results.json"
++          with open(results_file, "w") as f:
++              f.write("[]")
++
++          gangway_url = os.environ["GANGWAY_URL"]
++          token = os.environ["GANGWAY_TOKEN"]
++          ho_image = os.environ["HO_IMAGE"]
++          blocking = json.loads(os.environ["BLOCKING_JSON"])
++          informing = json.loads(os.environ["INFORMING_JSON"])
++
++          if not blocking:
++              print("ERROR: e2e-blocking-job-names is empty - at least one blocking job is required", flush=True)
++              sys.exit(1)
++
++          print(f"HO image:       {ho_image}", flush=True)
++          print(f"Blocking jobs:  {blocking}", flush=True)
++          print(f"Informing jobs: {informing}", flush=True)
++
++          # :latest for hypershift-tests is intentional: the test image is built
++          # by OpenShift CI, not Konflux, so it is not part of the Snapshot and
++          # there is no straightforward way to extract a matching version.
++          env_overrides = {
++              "MULTISTAGE_PARAM_OVERRIDE_OVERRIDE_HYPERSHIFT_OPERATOR_IMAGE": ho_image,
++              "OVERRIDE_IMAGE_HYPERSHIFT_TESTS": "registry.ci.openshift.org/hypershift/hypershift-tests:latest"
++          }
++
++          jobs = trigger_all_jobs(blocking, informing, gangway_url, token, env_overrides)
++          resolve_all_urls(jobs, gangway_url, token)
++          poll_until_complete(jobs, gangway_url, token)
++          print_run_summary(jobs)
++
++          print("\n=== run-e2e: building results JSON ===", flush=True)
++          results = build_results_json(jobs)
++          print(f"Results JSON: {results}", flush=True)
++          with open(results_file, "w") as f:
++              f.write(results)
++    params:
++    - name: ho-image
++      value: $(tasks.extract-image.results.ho-image)
++    - name: e2e-blocking-job-names
++      value: $(params.e2e-blocking-job-names)
++    - name: e2e-informing-job-names
++      value: $(params.e2e-informing-job-names)
++    - name: gangway-url
++      value: $(params.gangway-url)
++    workspaces:
++    - name: shared
++      workspace: shared
++
++  - name: evaluate-results
++    runAfter: [run-e2e]
++    taskSpec:
++      workspaces:
++      - name: shared
++      results:
++      - name: gate-passed
++        description: Whether the release gate passed (true/false)
++      steps:
++      - name: evaluate
++        image: quay.io/konflux-ci/appstudio-utils:latest@sha256:32cda04122ee0a5d5b4307e121d192d1265c3bff727c9d894f36b6772da53d8c
++        script: |
++          #!/usr/bin/env python3
++          import subprocess, sys
++
++          sys.path.insert(0, "$(workspaces.shared.path)")
++          from ho_release_gate import evaluate_gate
++
++          with open("$(results.gate-passed.path)", "w") as f:
++              f.write("false")
++
++          print("=== evaluate-results ===", flush=True)
++          whoami = subprocess.run(["oc", "whoami"], capture_output=True, text=True)
++          print(f"Running as: {whoami.stdout.strip()}", flush=True)
++          print(flush=True)
++
++          with open("$(workspaces.shared.path)/results.json") as f:
++              results_json = f.read()
++          gate_passed = evaluate_gate(results_json)
++
++          with open("$(results.gate-passed.path)", "w") as f:
++              f.write("true" if gate_passed else "false")
++    workspaces:
++    - name: shared
++      workspace: shared
++
++  - name: create-release
++    runAfter: [evaluate-results]
++    taskSpec:
++      params:
++      - name: gate-passed
++        type: string
++      - name: snapshot-name
++        type: string
++      - name: release-plan-name
++        type: string
++      results:
++      - name: release-name
++        description: Name of the created Release CR (or N/A if gate failed)
++      steps:
++      - name: create
++        image: quay.io/konflux-ci/appstudio-utils:latest@sha256:32cda04122ee0a5d5b4307e121d192d1265c3bff727c9d894f36b6772da53d8c
++        script: |
++          #!/bin/bash
++          set -euo pipefail
++
++          echo -n "N/A" > $(results.release-name.path)
++
++          GATE_PASSED="$(params.gate-passed)"
++          SNAPSHOT="$(params.snapshot-name)"
++          RELEASE_PLAN="$(params.release-plan-name)"
++
++          if [[ "${GATE_PASSED}" != "true" ]]; then
++            echo "=== create-release: gate did not pass - skipping ==="
++            echo -n "N/A" > $(results.release-name.path)
++            exit 1
++          fi
++
++          echo "=== create-release ==="
++          echo "Running as: $(oc whoami)"
++          echo "Snapshot:     ${SNAPSHOT}"
++          echo "ReleasePlan:  ${RELEASE_PLAN}"
++
++          set +e
++          RELEASE_NAME=$(oc create -f - -o jsonpath='{.metadata.name}' <<EOFRELEASE
++          apiVersion: appstudio.redhat.com/v1alpha1
++          kind: Release
++          metadata:
++            generateName: ${RELEASE_PLAN}-
++            labels:
++              release.appstudio.openshift.io/author: nightly-promotion-sa
++          spec:
++            releasePlan: ${RELEASE_PLAN}
++            snapshot: ${SNAPSHOT}
++          EOFRELEASE
++          )
++          CREATE_RC=$?
++          set -e
++
++          if [[ ${CREATE_RC} -ne 0 ]]; then
++            echo "ERROR: Failed to create Release CR (exit code ${CREATE_RC})"
++            echo -n "N/A" > $(results.release-name.path)
++            exit 1
++          fi
++
++          echo "Release created: ${RELEASE_NAME}"
++          echo -n "${RELEASE_NAME}" > $(results.release-name.path)
++    params:
++    - name: gate-passed
++      value: $(tasks.evaluate-results.results.gate-passed)
++    - name: snapshot-name
++      value: $(tasks.extract-image.results.snapshot-name)
++    - name: release-plan-name
++      value: $(params.release-plan-name)
++
++  # Finally tasks: notify-slack and notify-slack-error are mutually exclusive.
++  # Tekton skips a finally task whose param bindings reference results from
++  # a task that was skipped (unresolved results).
++  # - notify-slack binds params to results of create-release,
++  #   evaluate-results, and extract-image. It fires only when all ran.
++  # - notify-slack-error uses a when clause (create-release.status == None)
++  #   and fires when create-release was skipped, meaning a task before
++  #   evaluate-results failed.
++  finally:
++  - name: notify-slack
++    taskSpec:
++      params:
++      - name: snapshot-name
++        type: string
++      - name: gate-passed
++        type: string
++      - name: gate-label
++        type: string
++      - name: release-name
++        type: string
++      - name: stale-threshold-days
++        type: string
++      - name: kubearchive-api-base
++        type: string
++      workspaces:
++      - name: shared
++      steps:
++      - name: send-notification
++        image: quay.io/konflux-ci/appstudio-utils:latest@sha256:32cda04122ee0a5d5b4307e121d192d1265c3bff727c9d894f36b6772da53d8c
++        env:
++        - name: SLACK_WEBHOOK_URL
++          valueFrom:
++            secretKeyRef:
++              name: slack-webhook
++              key: url
++        - name: KUBEARCHIVE_API_BASE
++          value: $(params.kubearchive-api-base)
++        - name: SNAPSHOT_NAME
++          value: $(params.snapshot-name)
++        - name: GATE_PASSED
++          value: $(params.gate-passed)
++        - name: GATE_LABEL
++          value: $(params.gate-label)
++        - name: RELEASE_NAME
++          value: $(params.release-name)
++        - name: STALE_THRESHOLD_DAYS
++          value: $(params.stale-threshold-days)
++        - name: ITS_SCENARIO
++          valueFrom:
++            fieldRef:
++              fieldPath: metadata.labels['test.appstudio.openshift.io/scenario']
++        script: |
++          #!/usr/bin/env python3
++          import os, subprocess, sys
++
++          sys.path.insert(0, "$(workspaces.shared.path)")
++          from slack_utils import send_slack_message
++          from ho_release_gate import (build_gate_notification,
++                                       check_and_build_stale_payload)
++
++          snapshot = os.environ["SNAPSHOT_NAME"]
++          gate_passed = os.environ["GATE_PASSED"] == "true"
++          gate_label = os.environ["GATE_LABEL"]
++          release_name = os.environ["RELEASE_NAME"]
++          pipeline_run = "$(context.pipelineRun.name)"
++          with open("$(workspaces.shared.path)/results.json") as f:
++              results_json = f.read()
++          webhook_url = os.environ["SLACK_WEBHOOK_URL"]
++          konflux_base = "https://konflux-ui.apps.stone-prd-rh01.pg1f.p1.openshiftapps.com/ns/crt-redhat-acm-tenant/applications/hypershift-operator"
++
++          print("=== notify-slack ===", flush=True)
++          whoami = subprocess.run(["oc", "whoami"], capture_output=True, text=True)
++          print(f"Running as: {whoami.stdout.strip()}", flush=True)
++          print(f"Snapshot:     {snapshot}", flush=True)
++          print(f"PipelineRun:  {pipeline_run}", flush=True)
++          print(f"Gate passed:  {gate_passed}", flush=True)
++          print(f"Gate label:   {gate_label}", flush=True)
++          print(f"Release:      {release_name}", flush=True)
++
++          if not gate_passed:
++              its_scenario = os.environ["ITS_SCENARIO"]
++              token_result = subprocess.run(
++                  ["oc", "whoami", "-t"], capture_output=True, text=True)
++              token = token_result.stdout.strip()
++              threshold = int(os.environ["STALE_THRESHOLD_DAYS"])
++              kubearchive_api_base = os.environ["KUBEARCHIVE_API_BASE"]
++              stale = check_and_build_stale_payload(
++                  token, its_scenario, threshold, pipeline_run,
++                  konflux_base, "crt-redhat-acm-tenant", gate_label,
++                  kubearchive_api_base)
++              if stale:
++                  payload = stale
++              else:
++                  payload = build_gate_notification(
++                      gate_passed, gate_label, results_json,
++                      release_name, snapshot, pipeline_run, konflux_base)
++          else:
++              payload = build_gate_notification(
++                  gate_passed, gate_label, results_json,
++                  release_name, snapshot, pipeline_run, konflux_base)
++
++          success = send_slack_message(webhook_url, payload)
++          if not success:
++              print("ERROR: Slack notification failed after all retries", flush=True)
++          print("=== notify-slack: done ===", flush=True)
++    params:
++    - name: snapshot-name
++      value: $(tasks.extract-image.results.snapshot-name)
++    - name: gate-passed
++      value: $(tasks.evaluate-results.results.gate-passed)
++    - name: gate-label
++      value: $(params.gate-label)
++    - name: release-name
++      value: $(tasks.create-release.results.release-name)
++    - name: stale-threshold-days
++      value: $(params.stale-threshold-days)
++    - name: kubearchive-api-base
++      value: $(params.kubearchive-api-base)
++    workspaces:
++    - name: shared
++      workspace: shared
++
++  - name: notify-slack-error
++    when:
++    - input: $(tasks.create-release.status)
++      operator: in
++      values: ["None"]
++    taskSpec:
++      params:
++      - name: gate-label
++        type: string
++      - name: stale-threshold-days
++        type: string
++      - name: kubearchive-api-base
++        type: string
++      workspaces:
++      - name: shared
++      steps:
++      - name: send-error-notification
++        image: quay.io/konflux-ci/appstudio-utils:latest@sha256:32cda04122ee0a5d5b4307e121d192d1265c3bff727c9d894f36b6772da53d8c
++        env:
++        - name: SLACK_WEBHOOK_URL
++          valueFrom:
++            secretKeyRef:
++              name: slack-webhook
++              key: url
++        - name: KUBEARCHIVE_API_BASE
++          value: $(params.kubearchive-api-base)
++        - name: GATE_LABEL
++          value: $(params.gate-label)
++        - name: STALE_THRESHOLD_DAYS
++          value: $(params.stale-threshold-days)
++        - name: ITS_SCENARIO
++          valueFrom:
++            fieldRef:
++              fieldPath: metadata.labels['test.appstudio.openshift.io/scenario']
++        script: |
++          #!/usr/bin/env python3
++          import os, subprocess, sys
++
++          sys.path.insert(0, "$(workspaces.shared.path)")
++          from slack_utils import send_slack_message
++          from ho_release_gate import (build_error_notification,
++                                       check_and_build_stale_payload)
++
++          pipeline_run = "$(context.pipelineRun.name)"
++          webhook_url = os.environ["SLACK_WEBHOOK_URL"]
++          gate_label = os.environ["GATE_LABEL"]
++          konflux_base = "https://konflux-ui.apps.stone-prd-rh01.pg1f.p1.openshiftapps.com/ns/crt-redhat-acm-tenant/applications/hypershift-operator"
++
++          print("=== notify-slack-error ===", flush=True)
++          whoami = subprocess.run(["oc", "whoami"], capture_output=True, text=True)
++          print(f"Running as: {whoami.stdout.strip()}", flush=True)
++          print("Pipeline failed before reaching the release gate evaluation.", flush=True)
++          print(f"PipelineRun: {pipeline_run}", flush=True)
++          print(f"Gate label:  {gate_label}", flush=True)
++
++          its_scenario = os.environ["ITS_SCENARIO"]
++          token_result = subprocess.run(
++              ["oc", "whoami", "-t"], capture_output=True, text=True)
++          token = token_result.stdout.strip()
++          threshold = int(os.environ["STALE_THRESHOLD_DAYS"])
++          kubearchive_api_base = os.environ["KUBEARCHIVE_API_BASE"]
++          stale = check_and_build_stale_payload(
++              token, its_scenario, threshold, pipeline_run,
++              konflux_base, "crt-redhat-acm-tenant", gate_label,
++              kubearchive_api_base)
++          payload = stale if stale else build_error_notification(
++              pipeline_run, konflux_base, gate_label)
++
++          success = send_slack_message(webhook_url, payload)
++          if not success:
++              print("ERROR: Slack error notification failed after all retries", flush=True)
++          print("=== notify-slack-error: done ===", flush=True)
++    params:
++    - name: gate-label
++      value: $(params.gate-label)
++    - name: stale-threshold-days
++      value: $(params.stale-threshold-days)
++    - name: kubearchive-api-base
++      value: $(params.kubearchive-api-base)
++    workspaces:
++    - name: shared
++      workspace: shared

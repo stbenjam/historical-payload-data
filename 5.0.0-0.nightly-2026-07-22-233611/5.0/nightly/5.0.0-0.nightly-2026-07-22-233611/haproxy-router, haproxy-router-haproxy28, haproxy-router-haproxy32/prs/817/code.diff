@@ -1,0 +1,1827 @@
+diff --git a/hack/Makefile.debug b/hack/Makefile.debug
+index 638f4d4f5..d0d1c0e34 100644
+--- a/hack/Makefile.debug
++++ b/hack/Makefile.debug
+@@ -1,7 +1,6 @@
+ # -*- mode: makefile -*-
+ 
+ export GOOS=linux
+-export GOARCH ?= amd64
+ 
+ REGISTRY ?= quay.io
+ IMAGE ?= openshift/openshift-router
+@@ -12,8 +11,8 @@ REMOTE_IMAGE ?= $(REGISTRY)/$(IMAGE):$(TAG)
+ OPENSHIFT_ENDPOINT ?= $(shell oc config view --minify --template '{{(index .clusters 0).cluster.server}}' | grep -o '//[^ :]*' | sed 's/^..//')
+ 
+ new-openshift-router-image:
+-	GO111MODULE=on CGO_ENABLED=0 GOOS=$(GOOS) GOARCH=$(GOARCH) GOFLAGS=-mod=vendor go build -o openshift-router -gcflags=all="-N -l" ./cmd/openshift-router
+-	$(IMAGEBUILDER) build --arch $(GOARCH) -t $(LOCAL_IMAGE) -f hack/Dockerfile.debug .
++	GO111MODULE=on CGO_ENABLED=0 GOFLAGS=-mod=vendor go build -o openshift-router -gcflags=all="-N -l" ./cmd/openshift-router
++	$(IMAGEBUILDER) build -t $(LOCAL_IMAGE) -f hack/Dockerfile.debug .
+ 
+ push:
+ 	$(IMAGEBUILDER) tag $(LOCAL_IMAGE) $(REMOTE_IMAGE)
+diff --git a/pkg/cmd/infra/router/clientcmd.go b/pkg/cmd/infra/router/clientcmd.go
+index ddad1f314..d3d59135c 100644
+--- a/pkg/cmd/infra/router/clientcmd.go
++++ b/pkg/cmd/infra/router/clientcmd.go
+@@ -60,13 +60,6 @@ func (cfg *Config) KubeConfig() (*restclient.Config, string, error) {
+ 	if err != nil {
+ 		return nil, "", err
+ 	}
+-
+-	// Increase client-side rate limiting to support higher throughput during
+-	// router startup, especially when many external certificate routes are
+-	// present.
+-	clientConfig.QPS = 50
+-	clientConfig.Burst = 100
+-
+ 	return clientConfig, namespace, nil
+ }
+ 
+diff --git a/pkg/cmd/infra/router/template.go b/pkg/cmd/infra/router/template.go
+index 53ee92fef..72748583c 100644
+--- a/pkg/cmd/infra/router/template.go
++++ b/pkg/cmd/infra/router/template.go
+@@ -36,13 +36,13 @@ import (
+ 	routelisters "github.com/openshift/client-go/route/listers/route/v1"
+ 	"github.com/openshift/library-go/pkg/crypto"
+ 	"github.com/openshift/library-go/pkg/proc"
++	"github.com/openshift/library-go/pkg/route/secretmanager"
+ 
+ 	"github.com/openshift/router/pkg/router"
+ 	"github.com/openshift/router/pkg/router/client"
+ 	"github.com/openshift/router/pkg/router/controller"
+ 	"github.com/openshift/router/pkg/router/metrics"
+ 	"github.com/openshift/router/pkg/router/metrics/haproxy"
+-	"github.com/openshift/router/pkg/router/routeapihelpers"
+ 	"github.com/openshift/router/pkg/router/shutdown"
+ 	templateplugin "github.com/openshift/router/pkg/router/template"
+ 	haproxyconfigmanager "github.com/openshift/router/pkg/router/template/configmanager/haproxy"
+@@ -769,7 +769,7 @@ func (o *TemplateRouterOptions) Run(stopCh <-chan struct{}) error {
+ 		return err
+ 	}
+ 
+-	secretManager := controller.NewSharedSecretManager(kc, nil)
++	secretManager := secretmanager.NewManager(kc, nil)
+ 
+ 	pluginCfg := templateplugin.TemplatePluginConfig{
+ 		AppCtx:                        ctx,
+@@ -815,7 +815,7 @@ func (o *TemplateRouterOptions) Run(stopCh <-chan struct{}) error {
+ 	informer := factory.CreateRoutesSharedInformer()
+ 	routeLister := routelisters.NewRouteLister(informer.GetIndexer())
+ 	if o.UpdateStatus {
+-		lease := writerlease.New(time.Minute, 3*time.Second, routeapihelpers.MaxConcurrentSARChecks)
++		lease := writerlease.New(time.Minute, 3*time.Second)
+ 		go lease.Run(stopCh)
+ 		tracker := controller.NewSimpleContentionTracker(informer, o.RouterName, o.ResyncInterval/10)
+ 		tracker.SetConflictMessage(fmt.Sprintf("The router detected another process is writing conflicting updates to route status with name %q. Please ensure that the configuration of all routers is consistent. Route status will not be updated as long as conflicts are detected.", o.RouterName))
+diff --git a/pkg/router/controller/contention.go b/pkg/router/controller/contention.go
+index 21ec86c51..42aa32b9d 100644
+--- a/pkg/router/controller/contention.go
++++ b/pkg/router/controller/contention.go
+@@ -46,7 +46,6 @@ var (
+ 		ExtCrtStatusReasonSecretRecreated,
+ 		ExtCrtStatusReasonSecretUpdated,
+ 		ExtCrtStatusReasonSecretDeleted,
+-		ExtCrtStatusReasonSARCompleted,
+ 	)
+ )
+ 
+@@ -295,10 +294,8 @@ func ingressConditionsEqual(a, b []routev1.RouteIngressCondition) bool {
+ 
+ // conditionsEqual compares two RouteIngressConditions, ignoring LastTransitionTime and any reason in ignoreIngressConditionReason.
+ func conditionsEqual(a, b *routev1.RouteIngressCondition) bool {
+-	if a.Type == b.Type && a.Status == b.Status {
+-		if ignoreIngressConditionReason.Has(a.Reason) || ignoreIngressConditionReason.Has(b.Reason) {
+-			return true
+-		}
++	if ignoreIngressConditionReason.Has(a.Reason) || ignoreIngressConditionReason.Has(b.Reason) {
++		return true
+ 	}
+ 	return a.Type == b.Type &&
+ 		a.Status == b.Status &&
+diff --git a/pkg/router/controller/route_secret_manager.go b/pkg/router/controller/route_secret_manager.go
+index b63d0d90e..6aa3d2639 100644
+--- a/pkg/router/controller/route_secret_manager.go
++++ b/pkg/router/controller/route_secret_manager.go
+@@ -25,7 +25,6 @@ const (
+ 	ExtCrtStatusReasonSecretUpdated    = "ExternalCertificateSecretUpdated"
+ 	ExtCrtStatusReasonSecretDeleted    = "ExternalCertificateSecretDeleted"
+ 	ExtCrtStatusReasonGetFailed        = "ExternalCertificateGetFailed"
+-	ExtCrtStatusReasonSARCompleted     = "ExternalCertificateSARCompleted"
+ )
+ 
+ // RouteSecretManager implements the router.Plugin interface to register
+@@ -158,7 +157,7 @@ func (p *RouteSecretManager) HandleRoute(eventType watch.EventType, route *route
+ 				// Therefore, it is essential to re-sync the secret to ensure the plugin chain correctly handles the route.
+ 
+ 				log.V(4).Info("Re-validating existing external certificate", "namespace", route.Namespace, "secret", oldSecret, "route", route.Name)
+-				// re-validate (synchronous, throttled by semaphore)
++				// re-validate
+ 				if err := p.validate(route); err != nil {
+ 					return err
+ 				}
+@@ -166,7 +165,6 @@ func (p *RouteSecretManager) HandleRoute(eventType watch.EventType, route *route
+ 				if err := p.populateRouteTLSFromSecret(route); err != nil {
+ 					return err
+ 				}
+-
+ 			}
+ 
+ 		case newHasExt && !oldHadExt:
+@@ -200,24 +198,13 @@ func (p *RouteSecretManager) HandleRoute(eventType watch.EventType, route *route
+ 	}
+ 
+ 	// call next plugin
+-	err := p.plugin.HandleRoute(eventType, route)
+-
+-	// If the route was accepted by the downstream plugin chain and it has an external certificate
+-	// that we successfully validated in this pass, emit the SARCompleted status.
+-	// This ensures we do not prematurely mark structurally invalid routes as Admitted=True
+-	// before the ExtendedValidator has checked the cert/key contents.
+-	if err == nil && hasExternalCertificate(route) && (eventType == watch.Added || eventType == watch.Modified) {
+-		msg := fmt.Sprintf("SAR check and secret load completed for secret %q", route.Spec.TLS.ExternalCertificate.Name)
+-		p.recorder.RecordRouteUpdate(route, ExtCrtStatusReasonSARCompleted, msg)
+-	}
+-
+-	return err
++	return p.plugin.HandleRoute(eventType, route)
+ }
+ 
+ // validateAndRegister validates the route's externalCertificate configuration and registers it with the secret manager.
+ // It also updates the in-memory TLS certificate and key after reading from secret informer's cache.
+ func (p *RouteSecretManager) validateAndRegister(route *routev1.Route) error {
+-	// validate (synchronous, throttled by semaphore)
++	// validate
+ 	if err := p.validate(route); err != nil {
+ 		return err
+ 	}
+@@ -226,7 +213,6 @@ func (p *RouteSecretManager) validateAndRegister(route *routev1.Route) error {
+ 	if err := p.secretManager.RegisterRoute(context.TODO(), route.Namespace, route.Name, route.Spec.TLS.ExternalCertificate.Name, handler); err != nil {
+ 		return fmt.Errorf("failed to register router: %w", err)
+ 	}
+-
+ 	// read referenced secret and update TLS certificate and key
+ 	if err := p.populateRouteTLSFromSecret(route); err != nil {
+ 		return err
+@@ -274,7 +260,6 @@ func (p *RouteSecretManager) generateSecretHandler(namespace, routeName string)
+ 		AddFunc: func(obj interface{}) {
+ 			secret := obj.(*kapi.Secret)
+ 			log.V(4).Info("Secret added for route", "namespace", namespace, "secret", secret.Name, "route", routeName)
+-			routeapihelpers.InvalidateAsyncSARCache(namespace, secret.Name)
+ 
+ 			// Secret re-creation scenario
+ 			// Check if the route key exists in the deletedSecrets map, indicating that the secret was previously deleted for this route.
+@@ -304,7 +289,6 @@ func (p *RouteSecretManager) generateSecretHandler(namespace, routeName string)
+ 			secretNew := new.(*kapi.Secret)
+ 			key := generateKey(namespace, routeName)
+ 			log.V(4).Info("Secret updated for route", "namespace", namespace, "secret", secretNew.Name, "oldSecretVersion", secretOld.ResourceVersion, "newSecretVersion", secretNew.ResourceVersion, "route", routeName)
+-			routeapihelpers.InvalidateAsyncSARCache(namespace, secretNew.Name)
+ 
+ 			// Ensure fetching the updated route
+ 			route, err := p.routelister.Routes(namespace).Get(routeName)
+@@ -325,23 +309,10 @@ func (p *RouteSecretManager) generateSecretHandler(namespace, routeName string)
+ 		},
+ 
+ 		DeleteFunc: func(obj interface{}) {
+-			secret, ok := obj.(*kapi.Secret)
+-			if !ok {
+-				tombstone, ok := obj.(cache.DeletedFinalStateUnknown)
+-				if !ok {
+-					log.Error(nil, "Couldn't get object from tombstone", "type", fmt.Sprintf("%T", obj))
+-					return
+-				}
+-				secret, ok = tombstone.Obj.(*kapi.Secret)
+-				if !ok {
+-					log.Error(nil, "Tombstone contained object that is not a secret", "type", fmt.Sprintf("%T", tombstone.Obj))
+-					return
+-				}
+-			}
++			secret := obj.(*kapi.Secret)
+ 			key := generateKey(namespace, routeName)
+ 			msg := fmt.Sprintf("secret %q deleted for route %q", secret.Name, key)
+ 			log.V(4).Info(msg)
+-			routeapihelpers.InvalidateAsyncSARCache(namespace, secret.Name)
+ 
+ 			// keep the secret monitor active and mark the secret as deleted for this route.
+ 			p.deletedSecrets.Store(key, true)
+@@ -363,14 +334,10 @@ func (p *RouteSecretManager) generateSecretHandler(namespace, routeName string)
+ // If the validation fails, it records the route rejection and triggers
+ // the deletion of the route by calling the HandleRoute method with a watch.Deleted event.
+ //
+-// This function is synchronous: it blocks until the SAR check completes.
+-// Concurrency is throttled by the semaphore in ValidateTLSExternalCertificate.
+-//
+ // NOTE: TLS data validation and sanitization are handled by the next plugin `ExtendedValidator`,
+ // by reading the "tls.crt" and "tls.key" added by populateRouteTLSFromSecret.
+ func (p *RouteSecretManager) validate(route *routev1.Route) error {
+ 	fldPath := field.NewPath("spec").Child("tls").Child("externalCertificate")
+-
+ 	if err := routeapihelpers.ValidateTLSExternalCertificate(route, fldPath, p.sarClient, p.secretsGetter).ToAggregate(); err != nil {
+ 		log.Error(err, "skipping route due to invalid externalCertificate configuration", "namespace", route.Namespace, "route", route.Name)
+ 		p.recorder.RecordRouteRejection(route, ExtCrtStatusReasonValidationFailed, err.Error())
+@@ -385,9 +352,7 @@ func (p *RouteSecretManager) validate(route *routev1.Route) error {
+ // the deletion of the route by calling the HandleRoute method with a watch.Deleted event.
+ // Note: This function performs an in-place update of the route. The caller should be aware that the route's TLS configuration will be modified directly.
+ func (p *RouteSecretManager) populateRouteTLSFromSecret(route *routev1.Route) error {
+-	// read referenced secret from the informer cache.
+-	// GetSecret attempts to read from the cache and falls back to a direct API
+-	// call if the cache is not synced or the secret is not found.
++	// read referenced secret
+ 	secret, err := p.secretManager.GetSecret(context.TODO(), route.Namespace, route.Name)
+ 	if err != nil {
+ 		log.Error(err, "failed to get referenced secret")
+diff --git a/pkg/router/controller/route_secret_manager_test.go b/pkg/router/controller/route_secret_manager_test.go
+index 3c644a9b2..e9e42e7f0 100644
+--- a/pkg/router/controller/route_secret_manager_test.go
++++ b/pkg/router/controller/route_secret_manager_test.go
+@@ -3,20 +3,25 @@ package controller
+ import (
+ 	"context"
+ 	"fmt"
++	"os"
+ 	"reflect"
+-	"sync"
+ 	"testing"
+ 
+ 	"github.com/openshift/library-go/pkg/route/secretmanager/fake"
+-	"github.com/openshift/router/pkg/router/routeapihelpers"
++	"github.com/openshift/router/pkg/router"
+ 
+ 	routev1 "github.com/openshift/api/route/v1"
+ 	authorizationv1 "k8s.io/api/authorization/v1"
+ 	corev1 "k8s.io/api/core/v1"
+ 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
++	"k8s.io/apimachinery/pkg/fields"
++	"k8s.io/apimachinery/pkg/runtime"
++	"k8s.io/apimachinery/pkg/util/sets"
+ 	"k8s.io/apimachinery/pkg/watch"
++	"k8s.io/client-go/features"
+ 	testclient "k8s.io/client-go/kubernetes/fake"
+ 	corev1client "k8s.io/client-go/kubernetes/typed/core/v1"
++	"k8s.io/client-go/tools/cache"
+ )
+ 
+ const testRouterName = "test-router"
+@@ -45,6 +50,30 @@ func (t *testSecretGetter) Secrets(_ string) corev1client.SecretInterface {
+ 	return testclient.NewSimpleClientset(t.secret).CoreV1().Secrets(t.namespace)
+ }
+ 
++// fakeSecretInformer will list/watch only one secret inside a namespace
++func fakeSecretInformer(fakeKubeClient *testclient.Clientset, namespace, name string) cache.SharedInformer {
++	// WatchListClient featuregate is enabled by default since v0.35. Fake client does not support
++	// initializing its cache from Watch, so falling back to use List instead. The envvar below
++	// configures the featuregate state.
++	os.Setenv("KUBE_FEATURE_"+string(features.WatchListClient), "False")
++
++	fieldSelector := fields.OneTermEqualSelector("metadata.name", name).String()
++	return cache.NewSharedInformer(
++		&cache.ListWatch{
++			ListFunc: func(options metav1.ListOptions) (runtime.Object, error) {
++				options.FieldSelector = fieldSelector
++				return fakeKubeClient.CoreV1().Secrets(namespace).List(context.TODO(), options)
++			},
++			WatchFunc: func(options metav1.ListOptions) (watch.Interface, error) {
++				options.FieldSelector = fieldSelector
++				return fakeKubeClient.CoreV1().Secrets(namespace).Watch(context.TODO(), options)
++			},
++		},
++		&corev1.Secret{},
++		0,
++	)
++}
++
+ func fakeSecret(namespace, name string, secretType corev1.SecretType, data map[string][]byte) *corev1.Secret {
+ 	return &corev1.Secret{
+ 		ObjectMeta: metav1.ObjectMeta{
+@@ -56,55 +85,60 @@ func fakeSecret(namespace, name string, secretType corev1.SecretType, data map[s
+ 	}
+ }
+ 
++type fakePluginDone struct {
++	eventType watch.EventType
++	route     *routev1.Route
++	err       error
++	doneCh    chan struct{}
++}
++
++func (p *fakePluginDone) HandleRoute(eventType watch.EventType, route *routev1.Route) error {
++	defer close(p.doneCh)
++	p.eventType, p.route = eventType, route
++	return p.err
++}
++func (p *fakePluginDone) HandleNode(t watch.EventType, node *corev1.Node) error {
++	return fmt.Errorf("not expected")
++}
++func (p *fakePluginDone) HandleEndpoints(watch.EventType, *corev1.Endpoints) error {
++	return fmt.Errorf("not expected")
++}
++func (p *fakePluginDone) HandleNamespaces(namespaces sets.String) error {
++	return fmt.Errorf("not expected")
++}
++func (p *fakePluginDone) Commit() error {
++	return p.err
++}
++
++var _ router.Plugin = &fakePluginDone{}
++
+ type statusRecorder struct {
+-	sync.Mutex
+ 	rejections                 []string
+ 	updates                    []string
+ 	unservableInFutureVersions map[string]string
++	doneCh                     chan struct{}
+ }
+ 
+ func (r *statusRecorder) routeKey(route *routev1.Route) string {
+ 	return route.Namespace + "-" + route.Name
+ }
+ func (r *statusRecorder) RecordRouteRejection(route *routev1.Route, reason, message string) {
+-	r.Lock()
+-	defer r.Unlock()
++	defer close(r.doneCh)
+ 	r.rejections = append(r.rejections, fmt.Sprintf("%s:%s", r.routeKey(route), reason))
+ }
+ 
+ func (r *statusRecorder) RecordRouteUpdate(route *routev1.Route, reason, message string) {
+-	r.Lock()
+-	defer r.Unlock()
++	defer close(r.doneCh)
+ 	r.updates = append(r.updates, fmt.Sprintf("%s:%s", r.routeKey(route), reason))
+ }
+ 
+ func (r *statusRecorder) RecordRouteUnservableInFutureVersionsClear(route *routev1.Route) {
+-	r.Lock()
+-	defer r.Unlock()
+ 	delete(r.unservableInFutureVersions, r.routeKey(route))
+ }
+ func (r *statusRecorder) RecordRouteUnservableInFutureVersions(route *routev1.Route, reason, message string) {
+-	r.Lock()
+-	defer r.Unlock()
+ 	r.unservableInFutureVersions[r.routeKey(route)] = reason
+ }
+ 
+-func (r *statusRecorder) GetRejections() []string {
+-	r.Lock()
+-	defer r.Unlock()
+-	var res []string
+-	res = append(res, r.rejections...)
+-	return res
+-}
+-
+-func (r *statusRecorder) GetUpdates() []string {
+-	r.Lock()
+-	defer r.Unlock()
+-	var res []string
+-	res = append(res, r.updates...)
+-	return res
+-}
+-
+ var _ RouteStatusRecorder = &statusRecorder{}
+ 
+ func TestRouteSecretManager(t *testing.T) {
+@@ -118,7 +152,6 @@ func TestRouteSecretManager(t *testing.T) {
+ 		expectedRoute      *routev1.Route
+ 		expectedEventType  watch.EventType
+ 		expectedRejections []string
+-		expectedUpdates    []string
+ 		expectedError      bool
+ 	}{
+ 		// scenarios when route is added
+@@ -304,9 +337,6 @@ func TestRouteSecretManager(t *testing.T) {
+ 				},
+ 			},
+ 			expectedEventType: watch.Added,
+-			expectedUpdates: []string{
+-				"sandbox-route-test:ExternalCertificateSARCompleted",
+-			},
+ 		},
+ 		{
+ 			name: "route added without externalCertificate",
+@@ -525,9 +555,6 @@ func TestRouteSecretManager(t *testing.T) {
+ 				},
+ 			},
+ 			expectedEventType: watch.Modified,
+-			expectedUpdates: []string{
+-				"sandbox-route-test:ExternalCertificateSARCompleted",
+-			},
+ 		},
+ 
+ 		// scenarios when route is updated (old route with externalCertificate, new route with same externalCertificate)
+@@ -749,9 +776,6 @@ func TestRouteSecretManager(t *testing.T) {
+ 				},
+ 			},
+ 			expectedEventType: watch.Modified,
+-			expectedUpdates: []string{
+-				"sandbox-route-test:ExternalCertificateSARCompleted",
+-			},
+ 		},
+ 
+ 		// scenarios when route is updated (old route with externalCertificate, new route with different externalCertificate)
+@@ -956,9 +980,6 @@ func TestRouteSecretManager(t *testing.T) {
+ 				},
+ 			},
+ 			expectedEventType: watch.Modified,
+-			expectedUpdates: []string{
+-				"sandbox-route-test:ExternalCertificateSARCompleted",
+-			},
+ 		},
+ 
+ 		// scenarios when route is updated (old route with externalCertificate, new route without externalCertificate)
+@@ -1110,13 +1131,13 @@ func TestRouteSecretManager(t *testing.T) {
+ 
+ 	for _, s := range scenarios {
+ 		t.Run(s.name, func(t *testing.T) {
+-			routeapihelpers.ClearAsyncSARCacheForTest()
+ 			p := &fakePlugin{}
+-			recorder := &statusRecorder{}
+-			rsm := NewRouteSecretManager(p, recorder, &s.secretManager, testRouterName, &testSecretGetter{namespace: s.route.Namespace, secret: s.secretManager.Secret}, &routeLister{items: []*routev1.Route{s.route}}, &testSARCreator{allow: s.allow})
++			recorder := &statusRecorder{
++				doneCh: make(chan struct{}),
++			}
++			rsm := NewRouteSecretManager(p, recorder, &s.secretManager, testRouterName, &testSecretGetter{namespace: s.route.Namespace, secret: s.secretManager.Secret}, &routeLister{}, &testSARCreator{allow: s.allow})
+ 
+ 			gotErr := rsm.HandleRoute(s.eventType, s.route)
+-
+ 			if (gotErr != nil) != s.expectedError {
+ 				t.Fatalf("expected error to be %t, but got %t", s.expectedError, gotErr != nil)
+ 			}
+@@ -1126,11 +1147,8 @@ func TestRouteSecretManager(t *testing.T) {
+ 			if s.expectedEventType != p.t {
+ 				t.Fatalf("expected %s event for next plugin, but got %s", s.expectedEventType, p.t)
+ 			}
+-			if !reflect.DeepEqual(s.expectedRejections, recorder.GetRejections()) {
+-				t.Fatalf("expected rejections %v, but got %v", s.expectedRejections, recorder.GetRejections())
+-			}
+-			if !reflect.DeepEqual(s.expectedUpdates, recorder.GetUpdates()) {
+-				t.Fatalf("expected updates %v, but got %v", s.expectedUpdates, recorder.GetUpdates())
++			if !reflect.DeepEqual(s.expectedRejections, recorder.rejections) {
++				t.Fatalf("expected rejections %v, but got %v", s.expectedRejections, recorder.rejections)
+ 			}
+ 			if _, exists := rsm.deletedSecrets.Load(generateKey(s.route.Namespace, s.route.Name)); exists {
+ 				t.Fatalf("expected deletedSecrets to not have %q key", generateKey(s.route.Namespace, s.route.Name))
+@@ -1237,15 +1255,26 @@ func TestSecretUpdate(t *testing.T) {
+ 
+ 	for _, s := range scenarios {
+ 		t.Run(s.name, func(t *testing.T) {
+-			recorder := &statusRecorder{}
++			recorder := &statusRecorder{
++				doneCh: make(chan struct{}),
++			}
+ 			lister := &routeLister{items: []*routev1.Route{s.route}}
+ 			rsm := NewRouteSecretManager(&fakePlugin{}, recorder, &fake.SecretManager{}, testRouterName, &testSecretGetter{}, lister, &testSARCreator{})
+ 
+-			// Create a fakeSecret
++			// Create a fakeSecret and start an informer for it
+ 			secret := fakeSecret("sandbox", "tls-secret", corev1.SecretTypeTLS, map[string][]byte{})
++			kubeClient := testclient.NewSimpleClientset(secret)
++			informer := fakeSecretInformer(kubeClient, "sandbox", "tls-secret")
++			go informer.Run(context.TODO().Done())
++
++			// wait for informer to start
++			if !cache.WaitForCacheSync(context.TODO().Done(), informer.HasSynced) {
++				t.Fatal("cache not synced yet")
++			}
+ 
+-			// Get the handler
+-			handler := rsm.generateSecretHandler(s.route.Namespace, s.route.Name)
++			if _, err := informer.AddEventHandler(rsm.generateSecretHandler(s.route.Namespace, s.route.Name)); err != nil {
++				t.Fatalf("failed to add handler: %v", err)
++			}
+ 
+ 			// update the secret
+ 			updatedSecret := secret.DeepCopy()
+@@ -1253,22 +1282,24 @@ func TestSecretUpdate(t *testing.T) {
+ 				"tls.crt": []byte("my-crt"),
+ 				"tls.key": []byte("my-key"),
+ 			}
++			if _, err := kubeClient.CoreV1().Secrets(s.route.Namespace).Update(context.TODO(), updatedSecret, metav1.UpdateOptions{}); err != nil {
++				t.Fatalf("failed to update secret: %v", err)
++			}
+ 
+-			// Call the handler directly (synchronous)
+-			handler.UpdateFunc(secret, updatedSecret)
++			// wait until route's status is updated
++			<-recorder.doneCh
+ 
+ 			expectedStatus := []string{"sandbox-route-test:ExternalCertificateSecretUpdated"}
+-			expectedRejectionsOnUpdate := []string{"sandbox-route-test:ExternalCertificateSecretUpdated"}
+ 
+ 			if s.isRouteAdmittedTrue {
+ 				// RecordRouteUpdate will be called if `Admitted=True`
+-				if !reflect.DeepEqual(expectedStatus, recorder.GetUpdates()) {
+-					t.Fatalf("expected status %v, but got %v", expectedStatus, recorder.GetUpdates())
++				if !reflect.DeepEqual(expectedStatus, recorder.updates) {
++					t.Fatalf("expected status %v, but got %v", expectedStatus, recorder.updates)
+ 				}
+ 			} else {
+ 				// RecordRouteRejection will be called if `Admitted=False`
+-				if !reflect.DeepEqual(expectedRejectionsOnUpdate, recorder.GetRejections()) {
+-					t.Fatalf("expected status %v, but got %v", expectedRejectionsOnUpdate, recorder.GetRejections())
++				if !reflect.DeepEqual(expectedStatus, recorder.rejections) {
++					t.Fatalf("expected status %v, but got %v", expectedStatus, recorder.rejections)
+ 				}
+ 			}
+ 
+@@ -1295,26 +1326,39 @@ func TestSecretDelete(t *testing.T) {
+ 			},
+ 		},
+ 	}
+-	recorder := &statusRecorder{}
++	recorder := &statusRecorder{
++		doneCh: make(chan struct{}),
++	}
+ 	lister := &routeLister{items: []*routev1.Route{route}}
+ 	rsm := NewRouteSecretManager(&fakePlugin{}, recorder, &fake.SecretManager{}, testRouterName, &testSecretGetter{}, lister, &testSARCreator{})
+ 
+-	// Create a fakeSecret
++	// Create a fakeSecret and start an informer for it
+ 	secret := fakeSecret("sandbox", "tls-secret", corev1.SecretTypeTLS, map[string][]byte{})
++	kubeClient := testclient.NewSimpleClientset(secret)
++	informer := fakeSecretInformer(kubeClient, "sandbox", "tls-secret")
++	go informer.Run(context.TODO().Done())
+ 
+-	// Get the handler
+-	handler := rsm.generateSecretHandler(route.Namespace, route.Name)
++	// wait for informer to start
++	if !cache.WaitForCacheSync(context.TODO().Done(), informer.HasSynced) {
++		t.Fatal("cache not synced yet")
++	}
+ 
+-	// delete the secret by calling the handler directly
+-	handler.DeleteFunc(secret)
++	if _, err := informer.AddEventHandler(rsm.generateSecretHandler(route.Namespace, route.Name)); err != nil {
++		t.Fatalf("failed to add handler: %v", err)
++	}
+ 
+-	expectedRejections := []string{
+-		"sandbox-route-test:ExternalCertificateSecretDeleted",
++	// delete the secret
++	if err := kubeClient.CoreV1().Secrets(route.Namespace).Delete(context.TODO(), secret.Name, metav1.DeleteOptions{}); err != nil {
++		t.Fatalf("failed to delete secret: %v", err)
+ 	}
++
++	<-recorder.doneCh // wait until the route's status is updated
++
++	expectedRejections := []string{"sandbox-route-test:ExternalCertificateSecretDeleted"}
+ 	expectedDeletedSecrets := true
+ 
+-	if !reflect.DeepEqual(expectedRejections, recorder.GetRejections()) {
+-		t.Fatalf("expected rejections %v, but got %v", expectedRejections, recorder.GetRejections())
++	if !reflect.DeepEqual(expectedRejections, recorder.rejections) {
++		t.Fatalf("expected rejections %v, but got %v", expectedRejections, recorder.rejections)
+ 	}
+ 
+ 	if val, _ := rsm.deletedSecrets.Load(generateKey(route.Namespace, route.Name)); !reflect.DeepEqual(val, expectedDeletedSecrets) {
+@@ -1336,28 +1380,48 @@ func TestSecretRecreation(t *testing.T) {
+ 			},
+ 		},
+ 	}
+-	recorder := &statusRecorder{}
++	recorder := &statusRecorder{
++		doneCh: make(chan struct{}),
++	}
+ 	lister := &routeLister{items: []*routev1.Route{route}}
+ 	rsm := NewRouteSecretManager(&fakePlugin{}, recorder, &fake.SecretManager{}, testRouterName, &testSecretGetter{}, lister, &testSARCreator{})
+ 
+-	// Create a fakeSecret
++	// Create a fakeSecret and start an informer for it
+ 	secret := fakeSecret("sandbox", "tls-secret", corev1.SecretTypeTLS, map[string][]byte{})
++	kubeClient := testclient.NewSimpleClientset(secret)
++	informer := fakeSecretInformer(kubeClient, "sandbox", "tls-secret")
++	go informer.Run(context.TODO().Done())
+ 
+-	// Get the handler
+-	handler := rsm.generateSecretHandler(route.Namespace, route.Name)
++	// wait for informer to start
++	if !cache.WaitForCacheSync(context.TODO().Done(), informer.HasSynced) {
++		t.Fatal("cache not synced yet")
++	}
+ 
+-	// 1. delete the secret
+-	handler.DeleteFunc(secret)
++	if _, err := informer.AddEventHandler(rsm.generateSecretHandler(route.Namespace, route.Name)); err != nil {
++		t.Fatalf("failed to add handler: %v", err)
++	}
++
++	// delete the secret
++	if err := kubeClient.CoreV1().Secrets(route.Namespace).Delete(context.TODO(), secret.Name, metav1.DeleteOptions{}); err != nil {
++		t.Fatalf("failed to delete secret: %v", err)
++	}
++
++	<-recorder.doneCh // wait until the route's status is updated (deletion)
++
++	// re-create the secret
++	recorder.doneCh = make(chan struct{}) // need a new doneCh for re-creation
++	if _, err := kubeClient.CoreV1().Secrets(route.Namespace).Create(context.TODO(), secret, metav1.CreateOptions{}); err != nil {
++		t.Fatalf("failed to create secret: %v", err)
++	}
+ 
+-	// 2. re-create the secret
+-	handler.AddFunc(secret)
++	<-recorder.doneCh // wait until the route's status is updated (re-creation)
+ 
+ 	expectedRejections := []string{
+ 		"sandbox-route-test:ExternalCertificateSecretDeleted",
+ 		"sandbox-route-test:ExternalCertificateSecretRecreated",
+ 	}
+-	if !reflect.DeepEqual(expectedRejections, recorder.GetRejections()) {
+-		t.Fatalf("expected rejections %v, but got %v", expectedRejections, recorder.GetRejections())
++	if !reflect.DeepEqual(expectedRejections, recorder.rejections) {
++		t.Fatalf("expected rejections %v, but got %v", expectedRejections, recorder.rejections)
+ 	}
+ 	if _, exists := rsm.deletedSecrets.Load(generateKey(route.Namespace, route.Name)); exists {
+ 		t.Fatalf("expected deletedSecrets to not have %q key", generateKey(route.Namespace, route.Name))
+diff --git a/pkg/router/controller/shared_secret_manager.go b/pkg/router/controller/shared_secret_manager.go
+deleted file mode 100644
+index a8d4b284d..000000000
+--- a/pkg/router/controller/shared_secret_manager.go
++++ /dev/null
+@@ -1,300 +0,0 @@
+-package controller
+-
+-import (
+-	"context"
+-	"fmt"
+-	"strings"
+-	"sync"
+-
+-	corev1 "k8s.io/api/core/v1"
+-	apierrors "k8s.io/apimachinery/pkg/api/errors"
+-	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+-	"k8s.io/apimachinery/pkg/fields"
+-	"k8s.io/apimachinery/pkg/types"
+-	"k8s.io/client-go/kubernetes"
+-	"k8s.io/client-go/tools/cache"
+-	"k8s.io/client-go/util/workqueue"
+-	"k8s.io/klog/v2"
+-)
+-
+-type informerState struct {
+-	informer cache.SharedIndexInformer
+-	cancel   context.CancelFunc
+-}
+-
+-// SharedSecretManager implements secretmanager.SecretManager using per-namespace SharedIndexInformers.
+-// This prevents creating a new API watch for every individual route/secret combination.
+-// It uses a hybrid strategy: it attempts to watch all secrets in a namespace (Fast Path),
+-// but falls back to watching specific secrets by name if RBAC is restricted (Safe Path).
+-type SharedSecretManager struct {
+-	kubeClient kubernetes.Interface
+-	queue      workqueue.RateLimitingInterface
+-
+-	lock      sync.RWMutex
+-	informers map[types.NamespacedName]*informerState // Namespace is always set, Name is empty for Fast Path, or secretName for Safe Path
+-
+-	// restrictedNamespaces tracks namespaces where we don't have permission to list all secrets.
+-	// value is true if restricted, false if not restricted.
+-	restrictedNamespaces map[string]bool
+-
+-	// registeredRoutes maps "namespace/routeName" -> referencedSecret
+-	registeredRoutes map[string]referencedSecret
+-}
+-
+-type referencedSecret struct {
+-	secretName string
+-	handler    cache.ResourceEventHandlerFuncs
+-	restricted bool // indicates if this route is using a restricted (per-secret) informer
+-}
+-
+-func NewSharedSecretManager(kubeClient kubernetes.Interface, queue workqueue.RateLimitingInterface) *SharedSecretManager {
+-	return &SharedSecretManager{
+-		kubeClient:           kubeClient,
+-		queue:                queue,
+-		informers:            make(map[types.NamespacedName]*informerState),
+-		restrictedNamespaces: make(map[string]bool),
+-		registeredRoutes:     make(map[string]referencedSecret),
+-	}
+-}
+-
+-func (m *SharedSecretManager) Queue() workqueue.RateLimitingInterface {
+-	return m.queue
+-}
+-
+-func (m *SharedSecretManager) RegisterRoute(ctx context.Context, namespace string, routeName string, secretName string, handler cache.ResourceEventHandlerFuncs) error {
+-	m.lock.Lock()
+-	key := namespace + "/" + routeName
+-	if ref, exists := m.registeredRoutes[key]; exists {
+-		if ref.secretName == secretName {
+-			// Already registered for the same secret, just update the handler and return success.
+-			m.registeredRoutes[key] = referencedSecret{
+-				secretName: secretName,
+-				handler:    handler,
+-				restricted: ref.restricted,
+-			}
+-			m.lock.Unlock()
+-			return nil
+-		}
+-		m.lock.Unlock()
+-		return fmt.Errorf("route already registered with key %s", key)
+-	}
+-
+-	// Determine if this namespace is restricted (e.g. resourceNames used in RBAC).
+-	// Restricted namespaces require per-secret informers using FieldSelectors.
+-	restricted, known := m.restrictedNamespaces[namespace]
+-	if !known {
+-		// Release lock during API probe to avoid blocking other registrations.
+-		m.lock.Unlock()
+-		// We use a metadata-only List check to see if we have namespace-wide permissions.
+-		_, err := m.kubeClient.CoreV1().Secrets(namespace).List(ctx, metav1.ListOptions{Limit: 1})
+-		m.lock.Lock()
+-
+-		// Re-check if someone else probed while we were unlocked.
+-		if restricted, known = m.restrictedNamespaces[namespace]; !known {
+-			restricted = (err != nil && apierrors.IsForbidden(err))
+-			m.restrictedNamespaces[namespace] = restricted
+-			if restricted {
+-				klog.V(2).Infof("namespace %s is restricted (RBAC), falling back to per-secret informers for routes", namespace)
+-			}
+-		}
+-	}
+-
+-	m.registeredRoutes[key] = referencedSecret{
+-		secretName: secretName,
+-		handler:    handler,
+-		restricted: restricted,
+-	}
+-
+-	infKey := m.getInformerKey(namespace, secretName, restricted)
+-	infState, exists := m.informers[infKey]
+-	if !exists {
+-		var selector fields.Selector
+-		if restricted {
+-			// Safe Path: Watch only this specific secret by name.
+-			selector = fields.OneTermEqualSelector("metadata.name", secretName)
+-		} else {
+-			// Fast Path: Watch all secrets in the namespace.
+-			selector = fields.Everything()
+-		}
+-
+-		inf := cache.NewSharedIndexInformer(
+-			cache.NewListWatchFromClient(
+-				m.kubeClient.CoreV1().RESTClient(),
+-				"secrets",
+-				namespace,
+-				selector,
+-			),
+-			&corev1.Secret{},
+-			0,
+-			cache.Indexers{},
+-		)
+-
+-		if _, err := inf.AddEventHandler(cache.ResourceEventHandlerFuncs{
+-			AddFunc: func(obj interface{}) {
+-				m.notify(namespace, obj, "Add", nil)
+-			},
+-			UpdateFunc: func(oldObj, newObj interface{}) {
+-				m.notify(namespace, newObj, "Update", oldObj)
+-			},
+-			DeleteFunc: func(obj interface{}) {
+-				m.notify(namespace, obj, "Delete", nil)
+-			},
+-		}); err != nil {
+-			delete(m.registeredRoutes, key)
+-			m.lock.Unlock()
+-			return fmt.Errorf("failed to add secret informer handler for key %s: %w", infKey, err)
+-		}
+-
+-		ctx, cancel := context.WithCancel(context.Background())
+-		infState = &informerState{
+-			informer: inf,
+-			cancel:   cancel,
+-		}
+-		m.informers[infKey] = infState
+-
+-		// Start the informer
+-		go inf.Run(ctx.Done())
+-	}
+-	m.lock.Unlock()
+-
+-	klog.V(4).Infof("secret manager registered route for key %s with secret %s (restricted=%v)", key, secretName, restricted)
+-	return nil
+-}
+-
+-func (m *SharedSecretManager) getInformerKey(namespace, secretName string, restricted bool) types.NamespacedName {
+-	if restricted {
+-		return types.NamespacedName{Namespace: namespace, Name: secretName}
+-	}
+-	return types.NamespacedName{Namespace: namespace}
+-}
+-
+-func (m *SharedSecretManager) notify(namespace string, obj interface{}, eventType string, oldObj interface{}) {
+-	var secret *corev1.Secret
+-	switch t := obj.(type) {
+-	case *corev1.Secret:
+-		secret = t
+-	case cache.DeletedFinalStateUnknown:
+-		secret, _ = t.Obj.(*corev1.Secret)
+-	}
+-
+-	if secret == nil {
+-		return
+-	}
+-
+-	// Find all routes in this namespace that reference this secret
+-	var handlers []cache.ResourceEventHandlerFuncs
+-	prefix := namespace + "/"
+-
+-	m.lock.RLock()
+-	for key, ref := range m.registeredRoutes {
+-		if ref.secretName == secret.Name && strings.HasPrefix(key, prefix) {
+-			handlers = append(handlers, ref.handler)
+-		}
+-	}
+-	m.lock.RUnlock()
+-
+-	for _, h := range handlers {
+-		switch eventType {
+-		case "Add":
+-			if h.AddFunc != nil {
+-				h.AddFunc(obj)
+-			}
+-		case "Update":
+-			if h.UpdateFunc != nil {
+-				h.UpdateFunc(oldObj, obj)
+-			}
+-		case "Delete":
+-			if h.DeleteFunc != nil {
+-				h.DeleteFunc(obj)
+-			}
+-		}
+-	}
+-}
+-
+-func (m *SharedSecretManager) UnregisterRoute(namespace string, routeName string) error {
+-	m.lock.Lock()
+-	defer m.lock.Unlock()
+-
+-	key := namespace + "/" + routeName
+-	ref, exists := m.registeredRoutes[key]
+-	if !exists {
+-		return fmt.Errorf("no handler registered with key %s", key)
+-	}
+-
+-	delete(m.registeredRoutes, key)
+-
+-	// Check if there are any remaining routes using the same informer (same namespace and same secret if restricted).
+-	infKey := m.getInformerKey(namespace, ref.secretName, ref.restricted)
+-	hasRoutesForInformer := false
+-	for k, r := range m.registeredRoutes {
+-		// Only check routes in the same namespace
+-		if !strings.HasPrefix(k, namespace+"/") {
+-			continue
+-		}
+-		if m.getInformerKey(namespace, r.secretName, r.restricted) == infKey {
+-			hasRoutesForInformer = true
+-			break
+-		}
+-	}
+-
+-	// If no routes remain for this informer, stop it and clean up.
+-	if !hasRoutesForInformer {
+-		if infState, exists := m.informers[infKey]; exists {
+-			infState.cancel()
+-			delete(m.informers, infKey)
+-			klog.V(4).Infof("secret manager shut down informer for key %s", infKey)
+-		}
+-	}
+-
+-	klog.V(4).Infof("secret manager unregistered route for key %s", key)
+-	return nil
+-}
+-
+-// GetSecret returns the secret from the informer cache or falls back to an API call.
+-// WARNING: To maintain high throughput and reduce GC pressure during route syncs,
+-// the returned Secret is a direct pointer to the shared informer cache object.
+-// Callers MUST NOT mutate the returned Secret. If mutation is required, the caller
+-// must explicitly call secret.DeepCopy() first.
+-func (m *SharedSecretManager) GetSecret(ctx context.Context, namespace string, routeName string) (*corev1.Secret, error) {
+-	m.lock.RLock()
+-	key := namespace + "/" + routeName
+-	ref, exists := m.registeredRoutes[key]
+-	if !exists {
+-		m.lock.RUnlock()
+-		return nil, fmt.Errorf("no handler registered with key %s", key)
+-	}
+-
+-	infKey := m.getInformerKey(namespace, ref.secretName, ref.restricted)
+-	inf, infExists := m.informers[infKey]
+-	m.lock.RUnlock()
+-
+-	if !infExists {
+-		return nil, fmt.Errorf("no informer for key %s", infKey)
+-	}
+-
+-	// Try to get from cache first
+-	if inf.informer.HasSynced() {
+-		obj, exists, err := inf.informer.GetStore().GetByKey(namespace + "/" + ref.secretName)
+-		if err == nil && exists {
+-			return obj.(*corev1.Secret), nil
+-		}
+-	}
+-
+-	// Fallback to direct API call if cache is not synced or object is missing
+-	secret, err := m.kubeClient.CoreV1().Secrets(namespace).Get(ctx, ref.secretName, metav1.GetOptions{})
+-	if err != nil {
+-		return nil, err
+-	}
+-	return secret, nil
+-}
+-
+-func (m *SharedSecretManager) LookupRouteSecret(namespace string, routeName string) (string, bool) {
+-	m.lock.RLock()
+-	defer m.lock.RUnlock()
+-	key := namespace + "/" + routeName
+-	ref, exists := m.registeredRoutes[key]
+-	if !exists {
+-		return "", false
+-	}
+-	return ref.secretName, true
+-}
+diff --git a/pkg/router/controller/shared_secret_manager_test.go b/pkg/router/controller/shared_secret_manager_test.go
+deleted file mode 100644
+index d92d5e60c..000000000
+--- a/pkg/router/controller/shared_secret_manager_test.go
++++ /dev/null
+@@ -1,143 +0,0 @@
+-package controller
+-
+-import (
+-	"context"
+-	"fmt"
+-	"testing"
+-
+-	apierrors "k8s.io/apimachinery/pkg/api/errors"
+-	"k8s.io/apimachinery/pkg/runtime"
+-	"k8s.io/apimachinery/pkg/runtime/schema"
+-	"k8s.io/apimachinery/pkg/types"
+-	"k8s.io/client-go/kubernetes/fake"
+-	testing2 "k8s.io/client-go/testing"
+-	"k8s.io/client-go/tools/cache"
+-)
+-
+-func TestSharedSecretManagerHybrid(t *testing.T) {
+-	scenarios := []struct {
+-		name               string
+-		namespace          string
+-		allowList          bool
+-		expectedKey        types.NamespacedName
+-		expectedRestricted bool
+-	}{
+-		{
+-			name:               "unrestricted namespace uses namespace key",
+-			namespace:          "unrestricted",
+-			allowList:          true,
+-			expectedKey:        types.NamespacedName{Namespace: "unrestricted"},
+-			expectedRestricted: false,
+-		},
+-		{
+-			name:               "restricted namespace uses per-secret key",
+-			namespace:          "restricted",
+-			allowList:          false,
+-			expectedKey:        types.NamespacedName{Namespace: "restricted", Name: "my-secret"},
+-			expectedRestricted: true,
+-		},
+-	}
+-
+-	for _, s := range scenarios {
+-		t.Run(s.name, func(t *testing.T) {
+-			client := fake.NewSimpleClientset()
+-			if !s.allowList {
+-				client.PrependReactor("list", "secrets", func(action testing2.Action) (handled bool, ret runtime.Object, err error) {
+-					return true, nil, apierrors.NewForbidden(schema.GroupResource{Resource: "secrets"}, "", fmt.Errorf("restricted"))
+-				})
+-			}
+-
+-			mgr := NewSharedSecretManager(client, nil)
+-			ctx := context.Background()
+-			routeName := "my-route"
+-			secretName := "my-secret"
+-			handler := cache.ResourceEventHandlerFuncs{}
+-
+-			err := mgr.RegisterRoute(ctx, s.namespace, routeName, secretName, handler)
+-			if err != nil {
+-				t.Fatalf("unexpected error: %v", err)
+-			}
+-
+-			mgr.lock.RLock()
+-			infKey := mgr.getInformerKey(s.namespace, secretName, s.expectedRestricted)
+-			if infKey != s.expectedKey {
+-				t.Errorf("expected informer key %q, got %q", s.expectedKey, infKey)
+-			}
+-
+-			if _, exists := mgr.informers[infKey]; !exists {
+-				t.Errorf("expected informer with key %q to exist", infKey)
+-			}
+-
+-			ref, exists := mgr.registeredRoutes[s.namespace+"/"+routeName]
+-			if !exists {
+-				t.Fatalf("route not registered")
+-			}
+-			if ref.restricted != s.expectedRestricted {
+-				t.Errorf("expected restricted=%v, got %v", s.expectedRestricted, ref.restricted)
+-			}
+-			mgr.lock.RUnlock()
+-
+-			// Test Unregister
+-			err = mgr.UnregisterRoute(s.namespace, routeName)
+-			if err != nil {
+-				t.Fatalf("unexpected error during unregister: %v", err)
+-			}
+-
+-			mgr.lock.RLock()
+-			if _, exists := mgr.informers[infKey]; exists {
+-				t.Errorf("expected informer with key %q to be removed", infKey)
+-			}
+-			mgr.lock.RUnlock()
+-		})
+-	}
+-}
+-
+-func TestSharedSecretManagerMultiRoute(t *testing.T) {
+-	client := fake.NewSimpleClientset()
+-	mgr := NewSharedSecretManager(client, nil)
+-	ctx := context.Background()
+-	ns := "test-ns"
+-	secretName := "shared-secret"
+-
+-	// Register first route
+-	err := mgr.RegisterRoute(ctx, ns, "route1", secretName, cache.ResourceEventHandlerFuncs{})
+-	if err != nil {
+-		t.Fatal(err)
+-	}
+-
+-	// Register second route
+-	err = mgr.RegisterRoute(ctx, ns, "route2", secretName, cache.ResourceEventHandlerFuncs{})
+-	if err != nil {
+-		t.Fatal(err)
+-	}
+-
+-	mgr.lock.RLock()
+-	if len(mgr.informers) != 1 {
+-		t.Errorf("expected 1 informer, got %d", len(mgr.informers))
+-	}
+-	mgr.lock.RUnlock()
+-
+-	// Unregister first route
+-	err = mgr.UnregisterRoute(ns, "route1")
+-	if err != nil {
+-		t.Fatal(err)
+-	}
+-
+-	mgr.lock.RLock()
+-	if len(mgr.informers) != 1 {
+-		t.Errorf("expected informer to persist because route2 still exists")
+-	}
+-	mgr.lock.RUnlock()
+-
+-	// Unregister second route
+-	err = mgr.UnregisterRoute(ns, "route2")
+-	if err != nil {
+-		t.Fatal(err)
+-	}
+-
+-	mgr.lock.RLock()
+-	if len(mgr.informers) != 0 {
+-		t.Errorf("expected informer to be removed")
+-	}
+-	mgr.lock.RUnlock()
+-}
+diff --git a/pkg/router/controller/status.go b/pkg/router/controller/status.go
+index 5ad869eb2..985e3cd56 100644
+--- a/pkg/router/controller/status.go
++++ b/pkg/router/controller/status.go
+@@ -83,6 +83,7 @@ type StatusAdmitter struct {
+ // with differing configurations are writing updates at the same time.
+ func NewStatusAdmitter(plugin router.Plugin, client client.RoutesGetter, lister routelisters.RouteLister, name, hostName string, lease writerlease.Lease, tracker ContentionTracker) *StatusAdmitter {
+ 	return &StatusAdmitter{
++		lock:   sync.Mutex{},
+ 		plugin: plugin,
+ 		client: client,
+ 		lister: lister,
+@@ -106,6 +107,8 @@ var nowFn = getRfc3339Timestamp
+ 
+ // HandleRoute attempts to admit the provided route on watch add / modifications.
+ func (a *StatusAdmitter) HandleRoute(eventType watch.EventType, route *routev1.Route) error {
++	a.lock.Lock()
++	defer a.lock.Unlock()
+ 	log.V(10).Info("HandleRoute: StatusAdmitter")
+ 	switch eventType {
+ 	case watch.Added, watch.Modified:
+@@ -302,11 +305,10 @@ func handleRouteStatusUpdate(ctx context.Context, action string, oc client.Route
+ 		log.V(4).Info("route was deleted before we could update status", "action", action, "namespace", route.Namespace, "name", route.Name)
+ 		return writerlease.Release, false
+ 	case errors.IsConflict(err):
+-		// A write conflict is expected under high concurrency.
+-		// Return None instead of Release to prevent this router from dropping its leader lease,
+-		// which would otherwise cause a 60-second delay for subsequent routes.
+-		log.V(4).Info("updating route status failed due to write conflict, retrying", "action", action, "namespace", route.Namespace, "name", route.Name)
+-		return writerlease.None, true
++		// just follow the normal process, and retry when we receive the update notification due to
++		// the other entity updating the route.
++		log.V(4).Info("updating route status failed due to write conflict", "action", action, "namespace", route.Namespace, "name", route.Name)
++		return writerlease.Release, true
+ 	default:
+ 		utilruntime.HandleError(fmt.Errorf("Unable to write router status for %s/%s: %v", route.Namespace, route.Name, err))
+ 		return writerlease.Release, true
+@@ -337,14 +339,6 @@ func recordIngressCondition(route *routev1.Route, name, hostName string, conditi
+ 		existingCondition := findCondition(existing, condition.Type)
+ 		if existingCondition != nil {
+ 			condition.LastTransitionTime = existingCondition.LastTransitionTime
+-
+-			// Protect meaningful 'ignored' reasons from being overwritten by empty reasons (e.g., from HandleRoute's standard reconciliation).
+-			// This prevents status flapping while allowing legitimate transitions like SecretUpdated -> SARCompleted to be persisted.
+-			if condition.Reason == "" && ignoreIngressConditionReason.Has(existingCondition.Reason) && existingCondition.Status == condition.Status {
+-				condition.Reason = existingCondition.Reason
+-				condition.Message = existingCondition.Message
+-			}
+-
+ 			if *existingCondition != condition {
+ 				changed = true
+ 			}
+diff --git a/pkg/router/controller/status_test.go b/pkg/router/controller/status_test.go
+index 4321577a1..8c16e1d22 100644
+--- a/pkg/router/controller/status_test.go
++++ b/pkg/router/controller/status_test.go
+@@ -1499,43 +1499,6 @@ func Test_recordIngressCondition(t *testing.T) {
+ 			expectChanged: false,
+ 			expectCreated: false,
+ 		},
+-		{
+-			name:                    "do not overwrite existing ignored reason with empty reason",
+-			routerName:              "foo",
+-			routerCanonicalHostname: "router-foo.foo.local",
+-			route: &routev1.Route{
+-				Spec: routev1.RouteSpec{Host: "foo.foo.local"},
+-				Status: routev1.RouteStatus{Ingress: []routev1.RouteIngress{{
+-					Host:                    "foo.foo.local",
+-					RouterName:              "foo",
+-					RouterCanonicalHostname: "router-foo.foo.local",
+-					Conditions: []routev1.RouteIngressCondition{{
+-						Type:   routev1.RouteAdmitted,
+-						Status: corev1.ConditionTrue,
+-						Reason: ExtCrtStatusReasonSARCompleted,
+-					}}},
+-				}},
+-			},
+-			condition: routev1.RouteIngressCondition{
+-				Type:   routev1.RouteAdmitted,
+-				Status: corev1.ConditionTrue,
+-			},
+-			expectedRoute: &routev1.Route{
+-				Spec: routev1.RouteSpec{Host: "foo.foo.local"},
+-				Status: routev1.RouteStatus{Ingress: []routev1.RouteIngress{{
+-					Host:                    "foo.foo.local",
+-					RouterName:              "foo",
+-					RouterCanonicalHostname: "router-foo.foo.local",
+-					Conditions: []routev1.RouteIngressCondition{{
+-						Type:   routev1.RouteAdmitted,
+-						Status: corev1.ConditionTrue,
+-						Reason: ExtCrtStatusReasonSARCompleted,
+-					}}},
+-				}},
+-			},
+-			expectChanged: false,
+-			expectCreated: false,
+-		},
+ 		{
+ 			name:                    "add new condition to existing ingress with existing condition",
+ 			routerName:              "foo",
+diff --git a/pkg/router/routeapihelpers/validation.go b/pkg/router/routeapihelpers/validation.go
+index 65da27dd4..9cadee238 100644
+--- a/pkg/router/routeapihelpers/validation.go
++++ b/pkg/router/routeapihelpers/validation.go
+@@ -9,12 +9,13 @@ import (
+ 	"crypto/x509"
+ 	"encoding/pem"
+ 	"fmt"
+-	"sync"
+-	"time"
++	"strings"
+ 
++	"k8s.io/apiserver/pkg/authentication/user"
+ 	"k8s.io/client-go/util/cert"
+ 
+ 	routev1 "github.com/openshift/api/route/v1"
++	"github.com/openshift/library-go/pkg/authorization/authorizationutil"
+ 
+ 	authorizationv1 "k8s.io/api/authorization/v1"
+ 	kapi "k8s.io/api/core/v1"
+@@ -251,6 +252,13 @@ func ExtendedValidateRoute(route *routev1.Route) field.ErrorList {
+ 			if len(keyBytes) == 0 {
+ 				result = append(result, field.Invalid(tlsFieldPath.Child("key"), "", "no key specified"))
+ 			} else {
++				// Validate that final key contains only private key, and cert contains only public keys
++				if err := validatePEMContent(keyBytes, "PRIVATE KEY"); err != nil {
++					result = append(result, field.Invalid(tlsFieldPath.Child("key"), "redacted key data", err.Error()))
++				}
++				if err := validatePEMContent(certBytes, "CERTIFICATE"); err != nil {
++					result = append(result, field.Invalid(tlsFieldPath.Child("certificate"), "redacted certificate data", err.Error()))
++				}
+ 				// Validate if the keypair is valid (eg.: the leaf certificate should be the first on certBytes)
+ 				if _, err := tls.X509KeyPair(certBytes, keyBytes); err != nil {
+ 					result = append(result, field.Invalid(tlsFieldPath.Child("key"), "redacted key data", err.Error()))
+@@ -282,6 +290,31 @@ func ExtendedValidateRoute(route *routev1.Route) field.ErrorList {
+ 	return result
+ }
+ 
++// validatePEMContent takes content and pemType, PEM decodes content and
++// validates that the first block matches the expected pemType. This validation
++// 1. Ensures that the required pemType is first in the order
++// 2. Blocks attempts of passing certificates where keys should be used, and
++// 3. Blocks attempts of passing keys where certificates should be used.
++// Passing an out of order certificate, or key as certificate, or certificate as key
++// breaks HAProxy.  Note that the match of content and pemType is not exact, but
++// content must CONTAIN the expected pemType.
++func validatePEMContent(content []byte, pemType string) error {
++	if len(content) == 0 {
++		return fmt.Errorf("the PEM content cannot be null")
++	}
++	for len(content) > 0 {
++		var pemBlock *pem.Block
++		pemBlock, content = pem.Decode(content)
++		if pemBlock == nil {
++			break
++		}
++		if !strings.Contains(pemBlock.Type, pemType) {
++			return fmt.Errorf("field contains invalid types %s, expecting only %s", pemBlock.Type, pemType)
++		}
++	}
++	return nil
++}
++
+ // validateTLS tests fields for different types of TLS combinations are set.  Called
+ // by ValidateRoute.
+ func validateTLS(route *routev1.Route, fldPath *field.Path) field.ErrorList {
+@@ -482,163 +515,56 @@ func UpgradeRouteValidation(route *routev1.Route) field.ErrorList {
+ 	return nil
+ }
+ 
+-// MaxConcurrentSARChecks limits the number of simultaneous SubjectAccessReview
+-// API calls to avoid overwhelming the API server during router startup with
+-// many externalCertificate routes.
+-const MaxConcurrentSARChecks = 50
+-
+-var sarSemaphore = make(chan struct{}, MaxConcurrentSARChecks)
+-
+-// sarCacheEntry holds a cached successful SAR validation result.
+-type sarCacheEntry struct {
+-	errs      field.ErrorList
+-	createdAt time.Time
+-}
+-
+-// sarCacheTTL determines how long successful SAR results are cached before
+-// revalidation. This ensures eventual consistency when RBAC permissions change.
+-const sarCacheTTL = 2 * time.Minute
+-
+-// sarCache stores successful SAR validation results keyed by "namespace/secretName".
+-// Only successful validations are cached; failures always trigger fresh checks.
+-var sarCache sync.Map
+-
+-// InvalidateAsyncSARCache removes the cached result for a specific secret,
+-// forcing revalidation on the next route event. Called when the secret is
+-// created, updated, or deleted.
+-func InvalidateAsyncSARCache(namespace, secretName string) {
+-	sarCache.Delete(namespace + "/" + secretName)
+-}
+-
+-// ClearAsyncSARCacheForTest clears the global SAR cache for testing purposes.
+-func ClearAsyncSARCacheForTest() {
+-	sarCache = sync.Map{}
+-}
+-
+-// checkSARCache returns the cached SAR result if it exists and hasn't expired.
+-// Returns nil if there is no valid cache entry.
+-func checkSARCache(cacheKey string) *sarCacheEntry {
+-	if raw, ok := sarCache.Load(cacheKey); ok {
+-		entry := raw.(*sarCacheEntry)
+-		if time.Since(entry.createdAt) > sarCacheTTL {
+-			sarCache.Delete(cacheKey)
+-			return nil
+-		}
+-		return entry
+-	}
+-	return nil
+-}
+-
+-// ValidateTLSExternalCertificate validates that the router service account has
+-// the required RBAC permissions to access the referenced secret and that the
+-// secret exists and is of type kubernetes.io/tls.
+-//
+-// This function is synchronous and throttled: it blocks on a semaphore to limit
+-// the number of concurrent SAR API calls, preventing API server overload during
+-// startup with many externalCertificate routes. Successful results are cached
+-// with a 2-minute TTL to avoid redundant API calls on subsequent route events.
++// ValidateTLSExternalCertificate tests different pre-conditions required for
++// using externalCertificate.
+ func ValidateTLSExternalCertificate(route *routev1.Route, fldPath *field.Path, sarc authorizationclient.SubjectAccessReviewInterface, secretsGetter corev1client.SecretsGetter) field.ErrorList {
+ 	tls := route.Spec.TLS
+-	if tls == nil || tls.ExternalCertificate == nil || tls.ExternalCertificate.Name == "" {
+-		return nil
+-	}
+-
+-	secretName := tls.ExternalCertificate.Name
+-	cacheKey := route.Namespace + "/" + secretName
+-
+-	// Fast path: return cached successful result.
+-	if entry := checkSARCache(cacheKey); entry != nil {
+-		return entry.errs
+-	}
+-
+-	// For tests where dependencies might be mocked/nil, avoid panic.
+-	if sarc == nil || secretsGetter == nil {
+-		return field.ErrorList{
+-			field.InternalError(fldPath, fmt.Errorf("external certificate validation dependencies are not configured")),
+-		}
+-	}
+-
+-	// Acquire semaphore slot — blocks if all slots are in use.
+-	// This throttles concurrent SAR API calls to MaxConcurrentSARChecks.
+-	sarSemaphore <- struct{}{}
+-	defer func() { <-sarSemaphore }()
+-
+-	// Double-check cache after acquiring semaphore — another goroutine
+-	// may have cached the result while we were waiting.
+-	if entry := checkSARCache(cacheKey); entry != nil {
+-		return entry.errs
+-	}
+ 
+-	// Perform SAR checks synchronously.
+ 	errs := field.ErrorList{}
+-
+-	timeoutCtx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+-	defer cancel()
+-
+-	sarGet := &authorizationv1.SubjectAccessReview{
+-		Spec: authorizationv1.SubjectAccessReviewSpec{
+-			User: routerServiceAccount,
+-			ResourceAttributes: &authorizationv1.ResourceAttributes{
+-				Namespace: route.Namespace, Verb: "get", Resource: "secrets", Name: secretName,
+-			},
+-		},
+-	}
+-	resp, err := sarc.Create(timeoutCtx, sarGet, metav1.CreateOptions{})
+-	if err != nil {
+-		errs = append(errs, field.InternalError(fldPath, fmt.Errorf("failed to check 'get' permission for secret %q: %v", secretName, err)))
+-	} else if !resp.Status.Allowed {
++	// The router serviceaccount must have permission to get/list/watch the referenced secret.
++	// The role and rolebinding to provide this access must be provided by the user.
++	if err := authorizationutil.Authorize(sarc, &user.DefaultInfo{Name: routerServiceAccount},
++		&authorizationv1.ResourceAttributes{
++			Namespace: route.Namespace,
++			Verb:      "get",
++			Resource:  "secrets",
++			Name:      tls.ExternalCertificate.Name,
++		}); err != nil {
+ 		errs = append(errs, field.Forbidden(fldPath, "router serviceaccount does not have permission to get this secret"))
+ 	}
+ 
+-	sarWatch := &authorizationv1.SubjectAccessReview{
+-		Spec: authorizationv1.SubjectAccessReviewSpec{
+-			User: routerServiceAccount,
+-			ResourceAttributes: &authorizationv1.ResourceAttributes{
+-				Namespace: route.Namespace, Verb: "watch", Resource: "secrets", Name: secretName,
+-			},
+-		},
+-	}
+-	resp, err = sarc.Create(timeoutCtx, sarWatch, metav1.CreateOptions{})
+-	if err != nil {
+-		errs = append(errs, field.InternalError(fldPath, fmt.Errorf("failed to check 'watch' permission for secret %q: %v", secretName, err)))
+-	} else if !resp.Status.Allowed {
++	if err := authorizationutil.Authorize(sarc, &user.DefaultInfo{Name: routerServiceAccount},
++		&authorizationv1.ResourceAttributes{
++			Namespace: route.Namespace,
++			Verb:      "watch",
++			Resource:  "secrets",
++			Name:      tls.ExternalCertificate.Name,
++		}); err != nil {
+ 		errs = append(errs, field.Forbidden(fldPath, "router serviceaccount does not have permission to watch this secret"))
+ 	}
+ 
+-	sarList := &authorizationv1.SubjectAccessReview{
+-		Spec: authorizationv1.SubjectAccessReviewSpec{
+-			User: routerServiceAccount,
+-			ResourceAttributes: &authorizationv1.ResourceAttributes{
+-				Namespace: route.Namespace, Verb: "list", Resource: "secrets", Name: secretName,
+-			},
+-		},
+-	}
+-	resp, err = sarc.Create(timeoutCtx, sarList, metav1.CreateOptions{})
+-	if err != nil {
+-		errs = append(errs, field.InternalError(fldPath, fmt.Errorf("failed to check 'list' permission for secret %q: %v", secretName, err)))
+-	} else if !resp.Status.Allowed {
++	if err := authorizationutil.Authorize(sarc, &user.DefaultInfo{Name: routerServiceAccount},
++		&authorizationv1.ResourceAttributes{
++			Namespace: route.Namespace,
++			Verb:      "list",
++			Resource:  "secrets",
++			Name:      tls.ExternalCertificate.Name,
++		}); err != nil {
+ 		errs = append(errs, field.Forbidden(fldPath, "router serviceaccount does not have permission to list this secret"))
+ 	}
+ 
+-	secret, err := secretsGetter.Secrets(route.Namespace).Get(timeoutCtx, secretName, metav1.GetOptions{})
++	// The secret should be in the same namespace as that of the route.
++	secret, err := secretsGetter.Secrets(route.Namespace).Get(context.TODO(), tls.ExternalCertificate.Name, metav1.GetOptions{})
+ 	if err != nil {
+ 		if apierrors.IsNotFound(err) {
+-			errs = append(errs, field.NotFound(fldPath, err.Error()))
+-		} else {
+-			errs = append(errs, field.InternalError(fldPath, err))
++			return append(errs, field.NotFound(fldPath, err.Error()))
+ 		}
+-	} else if secret.Type != kapi.SecretTypeTLS {
+-		errs = append(errs, field.Invalid(fldPath, secretName, fmt.Sprintf("secret of type %q required", kapi.SecretTypeTLS)))
+-	}
+-
+-	// Cache only successful validations. Failures trigger a fresh check
+-	// on the next route event, matching the original synchronous validation
+-	// behavior where every event retried if the route wasn't yet admitted.
+-	if len(errs) == 0 {
+-		sarCache.Store(cacheKey, &sarCacheEntry{
+-			errs:      errs,
+-			createdAt: time.Now(),
+-		})
++		return append(errs, field.InternalError(fldPath, err))
++	}
++
++	// The secret should be of type kubernetes.io/tls
++	if secret.Type != kapi.SecretTypeTLS {
++		errs = append(errs, field.Invalid(fldPath, tls.ExternalCertificate.Name, fmt.Sprintf("secret of type %q required", kapi.SecretTypeTLS)))
+ 	}
+ 
+ 	return errs
+diff --git a/pkg/router/routeapihelpers/validation_test.go b/pkg/router/routeapihelpers/validation_test.go
+index ef8d7f74e..e26847474 100644
+--- a/pkg/router/routeapihelpers/validation_test.go
++++ b/pkg/router/routeapihelpers/validation_test.go
+@@ -2509,8 +2509,8 @@ func TestExtendedValidateRoute(t *testing.T) {
+ 			expectedErrors: 1,
+ 		},
+ 		{
+-			// Private key containing the CA chain is allowed
+-			name: "A key field containing Public Key/certificate attributes should be allowed",
++			// Private key containing the CA chain should be rejected
++			name: "A key field containing Public Key/certificate attributes should be rejected",
+ 			route: &routev1.Route{
+ 				Spec: routev1.RouteSpec{
+ 					TLS: &routev1.TLSConfig{
+@@ -2520,7 +2520,7 @@ func TestExtendedValidateRoute(t *testing.T) {
+ 					},
+ 				},
+ 			},
+-			expectedErrors: 0,
++			expectedErrors: 1,
+ 		},
+ 		{
+ 			// A certificate field that contains bundled private and public key should be allowed
+@@ -2578,7 +2578,7 @@ func TestExtendedValidateRoute(t *testing.T) {
+ 					},
+ 				},
+ 			},
+-			expectedErrors: 2,
++			expectedErrors: 3,
+ 		},
+ 		{
+ 			// A cert with valid paylod but wrong PEM header should be denied
+@@ -2592,7 +2592,7 @@ func TestExtendedValidateRoute(t *testing.T) {
+ 					},
+ 				},
+ 			},
+-			expectedErrors: 2,
++			expectedErrors: 3,
+ 		},
+ 		{
+ 			name: "When both Certificate and Key are empty, should not report an error",
+diff --git a/pkg/router/router_test.go b/pkg/router/router_test.go
+index bc63dd3b1..12a686476 100644
+--- a/pkg/router/router_test.go
++++ b/pkg/router/router_test.go
+@@ -94,7 +94,7 @@ func TestMain(m *testing.M) {
+ 	factory := routerSelection.NewFactory(routeClient, projectClient.ProjectV1().Projects(), client)
+ 	informer := factory.CreateRoutesSharedInformer()
+ 	routeLister := routelisters.NewRouteLister(informer.GetIndexer())
+-	lease := writerlease.New(time.Minute, 3*time.Second, 1)
++	lease := writerlease.New(time.Minute, 3*time.Second)
+ 	go lease.Run(wait.NeverStop)
+ 	tracker := controller.NewSimpleContentionTracker(informer, namespace, 60*time.Second)
+ 	tracker.SetConflictMessage(fmt.Sprintf("The router detected another process is writing conflicting updates to route status with name %q. Please ensure that the configuration of all routers is consistent. Route status will not be updated as long as conflicts are detected.", namespace))
+diff --git a/pkg/router/template/configmanager/haproxy/testing/haproxy.go b/pkg/router/template/configmanager/haproxy/testing/haproxy.go
+index fcb51c4cb..c1cfbefec 100644
+--- a/pkg/router/template/configmanager/haproxy/testing/haproxy.go
++++ b/pkg/router/template/configmanager/haproxy/testing/haproxy.go
+@@ -46,7 +46,7 @@ type fakeHAProxy struct {
+ }
+ 
+ func startFakeHAProxyServer(prefix string) (*fakeHAProxy, error) {
+-	f, err := os.CreateTemp("", prefix)
++	f, err := os.CreateTemp(os.TempDir(), prefix)
+ 	if err != nil {
+ 		return nil, err
+ 	}
+@@ -107,10 +107,10 @@ func (p *fakeHAProxy) Commands() []string {
+ 
+ func (p *fakeHAProxy) Start() {
+ 	started := make(chan bool)
+-	go func() {
++	go func() error {
+ 		listener, err := net.Listen("unix", p.socketFile)
+ 		if err != nil {
+-			panic(fmt.Sprintf("fakeHAProxy Start failed to listen on %s: %v", p.socketFile, err))
++			return err
+ 		}
+ 
+ 		started <- true
+@@ -119,11 +119,11 @@ func (p *fakeHAProxy) Start() {
+ 			shutdown := p.shutdown
+ 			p.lock.Unlock()
+ 			if shutdown {
+-				return
++				return nil
+ 			}
+ 			conn, err := listener.Accept()
+ 			if err != nil {
+-				return
++				return err
+ 			}
+ 			go p.process(conn)
+ 		}
+diff --git a/pkg/router/writerlease/writerlease.go b/pkg/router/writerlease/writerlease.go
+index 14591912a..67244c5c9 100644
+--- a/pkg/router/writerlease/writerlease.go
++++ b/pkg/router/writerlease/writerlease.go
+@@ -98,13 +98,11 @@ type WriterLease struct {
+ 	state   State
+ 	expires time.Time
+ 	tick    int
+-
+-	workers int
+ }
+ 
+ // New creates a new Lease. Specify the duration to hold leases for and the retry
+ // interval on requests that fail.
+-func New(leaseDuration, retryInterval time.Duration, workers int) *WriterLease {
++func New(leaseDuration, retryInterval time.Duration) *WriterLease {
+ 	backoff := wait.Backoff{
+ 		Duration: 20 * time.Millisecond,
+ 		Factor:   4,
+@@ -112,10 +110,6 @@ func New(leaseDuration, retryInterval time.Duration, workers int) *WriterLease {
+ 		Jitter:   0.5,
+ 	}
+ 
+-	if workers < 1 {
+-		workers = 1
+-	}
+-
+ 	return &WriterLease{
+ 		name:          fmt.Sprintf("%08d", rand.Int31()),
+ 		backoff:       backoff,
+@@ -126,18 +120,12 @@ func New(leaseDuration, retryInterval time.Duration, workers int) *WriterLease {
+ 		queued: make(map[WorkKey]*work),
+ 		queue:  workqueue.NewDelayingQueue(),
+ 		once:   make(chan struct{}),
+-
+-		workers: workers,
+ 	}
+ }
+ 
+ // NewWithBackoff creates a new Lease. Specify the duration to hold leases for and the retry
+ // interval on requests that fail.
+-func NewWithBackoff(name string, leaseDuration, retryInterval time.Duration, backoff wait.Backoff, workers int) *WriterLease {
+-	if workers < 1 {
+-		workers = 1
+-	}
+-
++func NewWithBackoff(name string, leaseDuration, retryInterval time.Duration, backoff wait.Backoff) *WriterLease {
+ 	return &WriterLease{
+ 		name:          name,
+ 		backoff:       backoff,
+@@ -148,29 +136,21 @@ func NewWithBackoff(name string, leaseDuration, retryInterval time.Duration, bac
+ 		queued: make(map[WorkKey]*work),
+ 		queue:  workqueue.NewNamedDelayingQueue(name),
+ 		once:   make(chan struct{}),
+-
+-		workers: workers,
+ 	}
+ }
+ 
+ func (l *WriterLease) Run(stopCh <-chan struct{}) {
+ 	defer utilruntime.HandleCrash()
++	defer l.queue.ShutDown()
+ 
+-	var wg sync.WaitGroup
+-	for i := 0; i < l.workers; i++ {
+-		wg.Add(1)
+-		go func(workerID int) {
+-			defer utilruntime.HandleCrash()
+-			defer wg.Done()
+-			for l.work() {
+-			}
+-			log.V(4).Info("worker stopped", "worker", l.name, "workerID", workerID)
+-		}(i)
+-	}
++	go func() {
++		defer utilruntime.HandleCrash()
++		for l.work() {
++		}
++		log.V(4).Info("worker stopped", "worker", l.name)
++	}()
+ 
+ 	<-stopCh
+-	l.queue.ShutDown()
+-	wg.Wait()
+ }
+ 
+ func (l *WriterLease) Expire() {
+@@ -270,8 +250,9 @@ func (l *WriterLease) work() bool {
+ 	if leaseState == Follower {
+ 		// if we are following, continue to defer work until the lease expires
+ 		if remaining := leaseExpires.Sub(l.nowFn()); remaining > 0 {
+-			log.V(4).Info("follower awaiting lease expiration, requeueing", "worker", l.name, "key", key, "leaseTimeRemaining", remaining)
+-			l.queue.AddAfter(key, remaining)
++			log.V(4).Info("follower awaiting lease expiration", "worker", l.name, "key", key, "leaseTimeRemaining", remaining)
++			time.Sleep(remaining)
++			l.queue.Add(key)
+ 			l.queue.Done(key)
+ 			return true
+ 		}
+diff --git a/pkg/router/writerlease/writerlease_test.go b/pkg/router/writerlease/writerlease_test.go
+index 0cb990a23..14fd3baeb 100644
+--- a/pkg/router/writerlease/writerlease_test.go
++++ b/pkg/router/writerlease/writerlease_test.go
+@@ -6,7 +6,7 @@ import (
+ )
+ 
+ func TestWaitForLeader(t *testing.T) {
+-	l := New(0, 0, 1)
++	l := New(0, 0)
+ 	defer func() {
+ 		if len(l.queued) > 0 {
+ 			t.Fatalf("queue was not empty on shutdown: %#v", l.queued)
+@@ -30,7 +30,7 @@ func TestWaitForLeader(t *testing.T) {
+ }
+ 
+ func TestBecomeLeaderAfterRetry(t *testing.T) {
+-	l := New(0, 0, 1)
++	l := New(0, 0)
+ 	ch := make(chan struct{})
+ 	defer close(ch)
+ 	go l.Run(ch)
+@@ -50,7 +50,7 @@ func TestBecomeLeaderAfterRetry(t *testing.T) {
+ }
+ 
+ func TestBecomeFollowerAfterRetry(t *testing.T) {
+-	l := New(0, 0, 1)
++	l := New(0, 0)
+ 	l.backoff.Steps = 0
+ 	l.backoff.Duration = 0
+ 	ch := make(chan struct{})
+@@ -72,7 +72,7 @@ func TestBecomeFollowerAfterRetry(t *testing.T) {
+ }
+ 
+ func TestRunOverlappingWork(t *testing.T) {
+-	l := New(0, 0, 1)
++	l := New(0, 0)
+ 	l.backoff.Steps = 0
+ 	l.backoff.Duration = 0
+ 	done := make(chan struct{})
+@@ -112,7 +112,7 @@ func TestRunOverlappingWork(t *testing.T) {
+ }
+ 
+ func TestExtend(t *testing.T) {
+-	l := New(10*time.Millisecond, 0, 1)
++	l := New(10*time.Millisecond, 0)
+ 	l.nowFn = func() time.Time { return time.Unix(0, 0) }
+ 	l.backoff.Steps = 0
+ 	l.backoff.Duration = 2 * time.Millisecond
+diff --git a/vendor/github.com/openshift/library-go/pkg/authorization/authorizationutil/subject.go b/vendor/github.com/openshift/library-go/pkg/authorization/authorizationutil/subject.go
+new file mode 100644
+index 000000000..74c179e68
+--- /dev/null
++++ b/vendor/github.com/openshift/library-go/pkg/authorization/authorizationutil/subject.go
+@@ -0,0 +1,56 @@
++package authorizationutil
++
++import (
++	rbacv1 "k8s.io/api/rbac/v1"
++	"k8s.io/apiserver/pkg/authentication/serviceaccount"
++)
++
++func BuildRBACSubjects(users, groups []string) []rbacv1.Subject {
++	subjects := []rbacv1.Subject{}
++
++	for _, user := range users {
++		saNamespace, saName, err := serviceaccount.SplitUsername(user)
++		if err == nil {
++			subjects = append(subjects, rbacv1.Subject{Kind: rbacv1.ServiceAccountKind, Namespace: saNamespace, Name: saName})
++		} else {
++			subjects = append(subjects, rbacv1.Subject{Kind: rbacv1.UserKind, APIGroup: rbacv1.GroupName, Name: user})
++		}
++	}
++
++	for _, group := range groups {
++		subjects = append(subjects, rbacv1.Subject{Kind: rbacv1.GroupKind, APIGroup: rbacv1.GroupName, Name: group})
++	}
++
++	return subjects
++}
++
++func RBACSubjectsToUsersAndGroups(subjects []rbacv1.Subject, defaultNamespace string) (users []string, groups []string) {
++	for _, subject := range subjects {
++
++		switch {
++		case subject.APIGroup == rbacv1.GroupName && subject.Kind == rbacv1.GroupKind:
++			groups = append(groups, subject.Name)
++		case subject.APIGroup == rbacv1.GroupName && subject.Kind == rbacv1.UserKind:
++			users = append(users, subject.Name)
++		case subject.APIGroup == "" && subject.Kind == rbacv1.ServiceAccountKind:
++			// default the namespace to namespace we're working in if
++			// it's available. This allows rolebindings that reference
++			// SAs in the local namespace to avoid having to qualify
++			// them.
++			ns := defaultNamespace
++			if len(subject.Namespace) > 0 {
++				ns = subject.Namespace
++			}
++			if len(ns) > 0 {
++				name := serviceaccount.MakeUsername(ns, subject.Name)
++				users = append(users, name)
++			} else {
++				// maybe error?  this fails safe at any rate
++			}
++		default:
++			// maybe error?  This fails safe at any rate
++		}
++	}
++
++	return users, groups
++}
+diff --git a/vendor/github.com/openshift/library-go/pkg/authorization/authorizationutil/util.go b/vendor/github.com/openshift/library-go/pkg/authorization/authorizationutil/util.go
+new file mode 100644
+index 000000000..040d0f643
+--- /dev/null
++++ b/vendor/github.com/openshift/library-go/pkg/authorization/authorizationutil/util.go
+@@ -0,0 +1,50 @@
++package authorizationutil
++
++import (
++	"context"
++	"errors"
++
++	authorizationv1 "k8s.io/api/authorization/v1"
++	kerrors "k8s.io/apimachinery/pkg/api/errors"
++	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
++	"k8s.io/apimachinery/pkg/runtime/schema"
++	"k8s.io/apiserver/pkg/authentication/user"
++	authorizationclient "k8s.io/client-go/kubernetes/typed/authorization/v1"
++)
++
++// AddUserToSAR adds the requisite user information to a SubjectAccessReview.
++// It returns the modified SubjectAccessReview.
++func AddUserToSAR(user user.Info, sar *authorizationv1.SubjectAccessReview) *authorizationv1.SubjectAccessReview {
++	sar.Spec.User = user.GetName()
++	// reminiscent of the bad old days of C.  Copies copy the min number of elements of both source and dest
++	sar.Spec.Groups = make([]string, len(user.GetGroups()))
++	copy(sar.Spec.Groups, user.GetGroups())
++	sar.Spec.Extra = map[string]authorizationv1.ExtraValue{}
++
++	for k, v := range user.GetExtra() {
++		sar.Spec.Extra[k] = authorizationv1.ExtraValue(v)
++	}
++
++	return sar
++}
++
++// Authorize verifies that a given user is permitted to carry out a given
++// action.  If this cannot be determined, or if the user is not permitted, an
++// error is returned.
++func Authorize(sarClient authorizationclient.SubjectAccessReviewInterface, user user.Info, resourceAttributes *authorizationv1.ResourceAttributes) error {
++	sar := AddUserToSAR(user, &authorizationv1.SubjectAccessReview{
++		Spec: authorizationv1.SubjectAccessReviewSpec{
++			ResourceAttributes: resourceAttributes,
++		},
++	})
++
++	resp, err := sarClient.Create(context.TODO(), sar, metav1.CreateOptions{})
++	if err == nil && resp != nil && resp.Status.Allowed {
++		return nil
++	}
++
++	if err == nil {
++		err = errors.New(resp.Status.Reason)
++	}
++	return kerrors.NewForbidden(schema.GroupResource{Group: resourceAttributes.Group, Resource: resourceAttributes.Resource}, resourceAttributes.Name, err)
++}
+diff --git a/vendor/modules.txt b/vendor/modules.txt
+index 034d20645..08837174c 100644
+--- a/vendor/modules.txt
++++ b/vendor/modules.txt
+@@ -251,6 +251,7 @@ github.com/openshift/client-go/route/clientset/versioned/typed/route/v1/fake
+ github.com/openshift/client-go/route/listers/route/v1
+ # github.com/openshift/library-go v0.0.0-20260713143403-795ac1a480b5
+ ## explicit; go 1.25.0
++github.com/openshift/library-go/pkg/authorization/authorizationutil
+ github.com/openshift/library-go/pkg/crypto
+ github.com/openshift/library-go/pkg/proc
+ github.com/openshift/library-go/pkg/route/secretmanager

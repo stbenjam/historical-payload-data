@@ -1,0 +1,852 @@
+diff --git a/contrib/self-managed-azure/setup_all.sh b/contrib/self-managed-azure/setup_all.sh
+index 0df45029b1e5..e8740e1cd3bf 100755
+--- a/contrib/self-managed-azure/setup_all.sh
++++ b/contrib/self-managed-azure/setup_all.sh
+@@ -27,4 +27,9 @@ fi
+ "${SCRIPT_DIR}/setup_hypershift_operator.sh"
+ "${SCRIPT_DIR}/create_hosted_cluster.sh"
+ 
++# Optional: etcd backup infrastructure (only when --setup-backup flag is provided)
++if [[ "$*" == *"--setup-backup"* ]]; then
++  "${SCRIPT_DIR}/setup_backup.sh"
++fi
++
+ set +x
+\ No newline at end of file
+diff --git a/contrib/self-managed-azure/setup_backup.sh b/contrib/self-managed-azure/setup_backup.sh
+new file mode 100755
+index 000000000000..d53409b1711d
+--- /dev/null
++++ b/contrib/self-managed-azure/setup_backup.sh
+@@ -0,0 +1,170 @@
++#!/bin/bash
++set -eo pipefail
++
++SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
++source "${SCRIPT_DIR}/vars.sh"
++
++echo "Setting up etcd backup infrastructure for self-managed Azure..."
++
++# Verify required variables
++BACKUP_STORAGE_ACCOUNT_NAME=${BACKUP_STORAGE_ACCOUNT_NAME:?"Provide backup storage account name"}
++BACKUP_CONTAINER_NAME=${BACKUP_CONTAINER_NAME:?"Provide backup container name"}
++BACKUP_MI_NAME=${BACKUP_MI_NAME:?"Provide backup managed identity name"}
++
++# Verify Azure CLI session exists
++if ! az account show >/dev/null 2>&1; then
++    echo "Error: Azure CLI is not logged in. Run 'az login' first."
++    exit 1
++fi
++
++# Determine management cluster OIDC issuer URL
++if [[ -n "${MGMT_OIDC_ISSUER_URL:-}" ]]; then
++    echo "Using provided management cluster OIDC issuer URL: ${MGMT_OIDC_ISSUER_URL}"
++elif [[ -n "${AKS_CLUSTER_NAME:-}" && -n "${AKS_RG:-}" ]]; then
++    echo "Detecting OIDC issuer URL from AKS cluster ${AKS_CLUSTER_NAME}..."
++    MGMT_OIDC_ISSUER_URL=$(az aks show \
++        --name "${AKS_CLUSTER_NAME}" \
++        --resource-group "${AKS_RG}" \
++        --query oidcIssuerProfile.issuerUrl -o tsv)
++    if [[ -z "${MGMT_OIDC_ISSUER_URL}" ]]; then
++        echo "Error: AKS cluster ${AKS_CLUSTER_NAME} does not have OIDC issuer enabled."
++        echo "Re-create the AKS cluster with --enable-oidc-issuer --enable-workload-identity"
++        exit 1
++    fi
++    echo "Detected OIDC issuer URL: ${MGMT_OIDC_ISSUER_URL}"
++else
++    echo "Error: Cannot determine management cluster OIDC issuer URL."
++    echo "Set MGMT_OIDC_ISSUER_URL or provide AKS_CLUSTER_NAME and AKS_RG."
++    exit 1
++fi
++
++# Create storage account for etcd backups
++echo "Creating storage account: ${BACKUP_STORAGE_ACCOUNT_NAME}"
++if ! az storage account show --name "${BACKUP_STORAGE_ACCOUNT_NAME}" --resource-group "${PERSISTENT_RG_NAME}" >/dev/null 2>&1; then
++    az storage account create \
++        --name "${BACKUP_STORAGE_ACCOUNT_NAME}" \
++        --resource-group "${PERSISTENT_RG_NAME}" \
++        --location "${LOCATION}" \
++        --sku Standard_LRS \
++        --kind StorageV2 \
++        --min-tls-version TLS1_2 \
++        --allow-blob-public-access false
++    echo "Storage account created"
++else
++    echo "Storage account ${BACKUP_STORAGE_ACCOUNT_NAME} already exists"
++fi
++
++# Create blob container for etcd snapshots
++echo "Creating blob container: ${BACKUP_CONTAINER_NAME}"
++if ! output=$(az storage container create \
++    --name "${BACKUP_CONTAINER_NAME}" \
++    --account-name "${BACKUP_STORAGE_ACCOUNT_NAME}" 2>&1); then
++    if echo "${output}" | grep -q "ContainerAlreadyExists"; then
++        echo "Container ${BACKUP_CONTAINER_NAME} already exists"
++    else
++        echo "Error creating container: ${output}"
++        exit 1
++    fi
++fi
++
++# Create managed identity for etcd backup
++echo "Creating managed identity: ${BACKUP_MI_NAME}"
++if ! az identity show --name "${BACKUP_MI_NAME}" --resource-group "${PERSISTENT_RG_NAME}" >/dev/null 2>&1; then
++    az identity create \
++        --name "${BACKUP_MI_NAME}" \
++        --resource-group "${PERSISTENT_RG_NAME}" \
++        --location "${LOCATION}"
++    echo "Managed identity created"
++else
++    echo "Managed identity ${BACKUP_MI_NAME} already exists"
++fi
++
++BACKUP_MI_CLIENT_ID=$(az identity show \
++    --name "${BACKUP_MI_NAME}" \
++    --resource-group "${PERSISTENT_RG_NAME}" \
++    --query clientId -o tsv)
++BACKUP_MI_PRINCIPAL_ID=$(az identity show \
++    --name "${BACKUP_MI_NAME}" \
++    --resource-group "${PERSISTENT_RG_NAME}" \
++    --query principalId -o tsv)
++
++echo "Backup MI Client ID: ${BACKUP_MI_CLIENT_ID}"
++
++# Create federated credential for etcd-backup-job ServiceAccount
++BACKUP_FED_CRED_NAME="${PREFIX}-etcd-backup-fed-cred"
++HO_NAMESPACE="${HO_NAMESPACE:-hypershift}"
++echo "Creating federated credential: ${BACKUP_FED_CRED_NAME}"
++if ! az identity federated-credential show \
++    --name "${BACKUP_FED_CRED_NAME}" \
++    --identity-name "${BACKUP_MI_NAME}" \
++    --resource-group "${PERSISTENT_RG_NAME}" >/dev/null 2>&1; then
++    az identity federated-credential create \
++        --name "${BACKUP_FED_CRED_NAME}" \
++        --identity-name "${BACKUP_MI_NAME}" \
++        --resource-group "${PERSISTENT_RG_NAME}" \
++        --issuer "${MGMT_OIDC_ISSUER_URL}" \
++        --subject "system:serviceaccount:${HO_NAMESPACE}:etcd-backup-job" \
++        --audiences "api://AzureADTokenExchange"
++    echo "Federated credential created"
++else
++    echo "Federated credential ${BACKUP_FED_CRED_NAME} already exists"
++fi
++
++# Assign Storage Blob Data Contributor role on the storage account
++STORAGE_ACCOUNT_ID=$(az storage account show \
++    --name "${BACKUP_STORAGE_ACCOUNT_NAME}" \
++    --resource-group "${PERSISTENT_RG_NAME}" \
++    --query id -o tsv)
++
++echo "Assigning Storage Blob Data Contributor role..."
++if ! output=$(az role assignment create \
++    --assignee-object-id "${BACKUP_MI_PRINCIPAL_ID}" \
++    --assignee-principal-type ServicePrincipal \
++    --role "Storage Blob Data Contributor" \
++    --scope "${STORAGE_ACCOUNT_ID}" 2>&1); then
++    if echo "${output}" | grep -q "RoleAssignmentExists"; then
++        echo "Role assignment already exists"
++    else
++        echo "Error creating role assignment: ${output}"
++        exit 1
++    fi
++fi
++
++# Create credential Secret in the HO namespace
++echo "Creating credential Secret in ${HO_NAMESPACE} namespace..."
++BACKUP_SECRET_NAME="${BACKUP_SECRET_NAME:-etcd-backup-azure-credentials}"
++
++kubectl create secret generic "${BACKUP_SECRET_NAME}" \
++    --namespace "${HO_NAMESPACE}" \
++    --from-literal=cloud="AZURE_SUBSCRIPTION_ID=${SUBSCRIPTION_ID}
++AZURE_TENANT_ID=${TENANT_ID}
++AZURE_CLIENT_ID=${BACKUP_MI_CLIENT_ID}
++AZURE_RESOURCE_GROUP=${PERSISTENT_RG_NAME}
++AZURE_CLOUD_NAME=AzurePublicCloud" \
++    --dry-run=client -o yaml | kubectl apply -f -
++
++echo ""
++echo "=== Etcd backup infrastructure setup complete ==="
++echo ""
++echo "Storage Account:  ${BACKUP_STORAGE_ACCOUNT_NAME}"
++echo "Container:        ${BACKUP_CONTAINER_NAME}"
++echo "Managed Identity: ${BACKUP_MI_NAME} (Client ID: ${BACKUP_MI_CLIENT_ID})"
++echo "Secret:           ${BACKUP_SECRET_NAME} (namespace: ${HO_NAMESPACE})"
++echo "OIDC Issuer:      ${MGMT_OIDC_ISSUER_URL}"
++echo ""
++echo "To create a backup, apply an HCPEtcdBackup CR:"
++echo ""
++echo "  apiVersion: hypershift.openshift.io/v1beta1"
++echo "  kind: HCPEtcdBackup"
++echo "  metadata:"
++echo "    name: my-backup"
++echo "    namespace: <HCP_NAMESPACE>"
++echo "  spec:"
++echo "    storage:"
++echo "      storageType: AzureBlob"
++echo "      azureBlob:"
++echo "        container: ${BACKUP_CONTAINER_NAME}"
++echo "        storageAccount: ${BACKUP_STORAGE_ACCOUNT_NAME}"
++echo "        keyPrefix: etcd-backups"
++echo "        credentials:"
++echo "          name: ${BACKUP_SECRET_NAME}"
+diff --git a/contrib/self-managed-azure/vars.sh b/contrib/self-managed-azure/vars.sh
+index 370e5726df75..847e3f7a222c 100755
+--- a/contrib/self-managed-azure/vars.sh
++++ b/contrib/self-managed-azure/vars.sh
+@@ -71,4 +71,22 @@ export CCOCTL_BINARY_PATH="${CCOCTL_BINARY_PATH:-${HOME}/cloud-credential-operat
+ # File paths
+ export AZURE_CREDS="${AZURE_CREDS:-${HOME}/.azure/credentials}"
+ export PULL_SECRET="${PULL_SECRET:-${HOME}/all-the-pull-secrets.json}"
+-export WORKLOAD_IDENTITIES_FILE="${WORKLOAD_IDENTITIES_FILE:-./workload-identities.json}"
+\ No newline at end of file
++export WORKLOAD_IDENTITIES_FILE="${WORKLOAD_IDENTITIES_FILE:-./workload-identities.json}"
++
++# Etcd backup configuration
++_backup_prefix="${PREFIX//[^a-z0-9]/}"
++export BACKUP_STORAGE_ACCOUNT_NAME="${_backup_prefix:0:18}backup"
++if [[ ${#BACKUP_STORAGE_ACCOUNT_NAME} -lt 3 || ${#BACKUP_STORAGE_ACCOUNT_NAME} -gt 24 ]]; then
++    echo "Error: BACKUP_STORAGE_ACCOUNT_NAME '${BACKUP_STORAGE_ACCOUNT_NAME}' must be 3-24 lowercase alphanumeric characters" >&2
++    exit 1
++fi
++_backup_container_prefix="${PREFIX,,}"
++_backup_container_prefix="${_backup_container_prefix//[^a-z0-9-]/}"
++export BACKUP_CONTAINER_NAME="${_backup_container_prefix}-etcd-backups"
++if [[ ! "${BACKUP_CONTAINER_NAME}" =~ ^[a-z0-9][a-z0-9-]{1,61}[a-z0-9]$ ]]; then
++    echo "Error: BACKUP_CONTAINER_NAME '${BACKUP_CONTAINER_NAME}' must be 3-63 chars, lowercase alphanumeric and hyphens only" >&2
++    exit 1
++fi
++export BACKUP_MI_NAME="${PREFIX}-etcd-backup-mi"
++export BACKUP_SECRET_NAME="etcd-backup-azure-credentials"
++export HO_NAMESPACE="${HO_NAMESPACE:-hypershift}"
+\ No newline at end of file
+diff --git a/docs/content/how-to/azure/backup-and-restore-etcd-snapshot.md b/docs/content/how-to/azure/backup-and-restore-etcd-snapshot.md
+new file mode 100644
+index 000000000000..6a8f0fa4ebfd
+--- /dev/null
++++ b/docs/content/how-to/azure/backup-and-restore-etcd-snapshot.md
+@@ -0,0 +1,269 @@
++# Etcd Snapshot Backup for Self-Managed Azure
++
++!!! warning "Tech Preview"
++
++    This feature requires the `HCPEtcdBackup` feature gate enabled in the HyperShift Operator.
++
++    **Standalone HyperShift Operator**: pass `--feature-gate HCPEtcdBackup=true` to the `hypershift install` command.
++
++    **MCE/ACM-managed HyperShift Operator**: use the `hypershift-operator-install-flags` ConfigMap to pass the feature gate flag. See [Overriding HyperShift Operator Install Flags](../../recipes/common/acm-mce-hypershift-operator-overrides.md#overriding-hypershift-operator-install-flags) for details.
++
++    **Verify the feature gate is active** by checking that the `HCPEtcdBackup` CRD exists (it is only installed when the feature gate is enabled):
++
++    ```bash
++    kubectl get crd hcpetcdbackups.hypershift.openshift.io
++    ```
++
++    If the CRD is not found, the feature gate is not active.
++
++This guide describes how to set up and use etcd snapshot backups with Azure Blob Storage for self-managed Azure HCP environments using Azure Workload Identity.
++
++## Overview
++
++The `HCPEtcdBackup` controller automatically detects the authentication mode from the credential Secret. For self-managed Azure, three authentication modes are supported:
++
++| Mode | When to Use | Secret Format |
++|------|-------------|---------------|
++| **Workload Identity** | Production (recommended) | `cloud` key with `AZURE_CLIENT_ID=...` |
++| **Client Secret** | Development/testing | `credentials` key with JSON (`clientId`/`clientSecret`/`tenantId`) |
++| **Managed Identity** | ARO HCP only | Certificate-based via CSI mount |
++
++This guide covers the **Workload Identity** setup. For credential format details and auto-detection logic, see [Managed Services Credentials](../disaster-recovery/etcd-snapshot-backup/managed-services-credentials.md).
++
++## Prerequisites
++
++- A self-managed Azure management cluster with HyperShift Operator installed
++- Azure CLI (`az`) configured
++- `kubectl` or `oc` CLI
++- The management cluster must have an OIDC issuer configured:
++    - **AKS**: Created with `--enable-oidc-issuer --enable-workload-identity`
++    - **OCP on Azure**: Configured via Cloud Credential Operator with Workload Identity
++
++## Setup
++
++### Step 1: Create a Storage Account and Container
++
++Create an Azure Storage Account and blob container for etcd snapshots:
++
++```bash
++PERSISTENT_RG_NAME="os4-common"   # Your persistent resource group
++LOCATION="eastus"
++BACKUP_STORAGE_ACCOUNT="mybackupstorage"  # 3-24 chars, lowercase alphanumeric only
++BACKUP_CONTAINER="etcd-backups"
++
++# Create storage account
++az storage account create \
++    --name $BACKUP_STORAGE_ACCOUNT \
++    --resource-group $PERSISTENT_RG_NAME \
++    --location $LOCATION \
++    --sku Standard_LRS \
++    --kind StorageV2 \
++    --min-tls-version TLS1_2 \
++    --allow-blob-public-access false
++
++# Create blob container
++# Note: --auth-mode login requires the caller to have Storage Blob Data Contributor
++# on the storage account. If you get a 403, assign the role to your user first or
++# omit --auth-mode to use storage account keys.
++az storage container create \
++    --name $BACKUP_CONTAINER \
++    --account-name $BACKUP_STORAGE_ACCOUNT \
++    --auth-mode login
++```
++
++### Step 2: Create a Managed Identity
++
++Create a User-Assigned Managed Identity for the backup Job:
++
++```bash
++BACKUP_MI_NAME="etcd-backup-mi"
++
++az identity create \
++    --name $BACKUP_MI_NAME \
++    --resource-group $PERSISTENT_RG_NAME \
++    --location $LOCATION
++
++# Save the client ID for later
++BACKUP_MI_CLIENT_ID=$(az identity show \
++    --name $BACKUP_MI_NAME \
++    --resource-group $PERSISTENT_RG_NAME \
++    --query clientId -o tsv)
++```
++
++### Step 3: Create a Federated Credential
++
++Create a federated credential that trusts the `etcd-backup-job` ServiceAccount on the management cluster:
++
++```bash
++HO_NAMESPACE="hypershift"  # HyperShift Operator namespace
++
++# Get the management cluster's OIDC issuer URL
++# For AKS: if you used contrib/self-managed-azure/setup_all.sh, these are already
++# exported. Otherwise, set them to your AKS cluster name and resource group.
++AKS_CLUSTER_NAME="${AKS_CLUSTER_NAME:-<your-aks-cluster-name>}"
++AKS_RG="${AKS_RG:-<your-aks-resource-group>}"
++
++MGMT_OIDC_ISSUER=$(az aks show \
++    --name $AKS_CLUSTER_NAME \
++    --resource-group $AKS_RG \
++    --query oidcIssuerProfile.issuerUrl -o tsv)
++
++# Create federated credential
++az identity federated-credential create \
++    --name etcd-backup-fedcred \
++    --identity-name $BACKUP_MI_NAME \
++    --resource-group $PERSISTENT_RG_NAME \
++    --issuer "$MGMT_OIDC_ISSUER" \
++    --subject "system:serviceaccount:${HO_NAMESPACE}:etcd-backup-job" \
++    --audiences "api://AzureADTokenExchange"
++```
++
++!!! important
++
++    The `--issuer` must be the **management cluster's** OIDC issuer URL, not the hosted cluster's OIDC issuer. The backup Job runs on the management cluster.
++
++### Step 4: Assign Storage Permissions
++
++Grant the managed identity `Storage Blob Data Contributor` role on the storage account:
++
++```bash
++BACKUP_MI_PRINCIPAL_ID=$(az identity show \
++    --name $BACKUP_MI_NAME \
++    --resource-group $PERSISTENT_RG_NAME \
++    --query principalId -o tsv)
++
++STORAGE_ACCOUNT_ID=$(az storage account show \
++    --name $BACKUP_STORAGE_ACCOUNT \
++    --resource-group $PERSISTENT_RG_NAME \
++    --query id -o tsv)
++
++az role assignment create \
++    --assignee-object-id $BACKUP_MI_PRINCIPAL_ID \
++    --assignee-principal-type ServicePrincipal \
++    --role "Storage Blob Data Contributor" \
++    --scope $STORAGE_ACCOUNT_ID
++```
++
++### Step 5: Create the Credential Secret
++
++Create the credential Secret in the HyperShift Operator namespace:
++
++```bash
++SUBSCRIPTION_ID=$(az account show --query id -o tsv)
++TENANT_ID=$(az account show --query tenantId -o tsv)
++
++kubectl create secret generic etcd-backup-azure-credentials \
++    --namespace $HO_NAMESPACE \
++    --from-literal=cloud="AZURE_SUBSCRIPTION_ID=${SUBSCRIPTION_ID}
++AZURE_TENANT_ID=${TENANT_ID}
++AZURE_CLIENT_ID=${BACKUP_MI_CLIENT_ID}
++AZURE_RESOURCE_GROUP=${PERSISTENT_RG_NAME}
++AZURE_CLOUD_NAME=AzurePublicCloud"
++```
++
++The controller auto-detects Workload Identity mode when the Secret has a `cloud` key containing `AZURE_CLIENT_ID=...`.
++
++## Creating a Backup
++
++Create an `HCPEtcdBackup` CR in the HostedControlPlane namespace:
++
++```yaml
++apiVersion: hypershift.openshift.io/v1beta1
++kind: HCPEtcdBackup
++metadata:
++  name: my-backup
++  namespace: <HCP_NAMESPACE>
++spec:
++  storage:
++    storageType: AzureBlob
++    azureBlob:
++      container: etcd-backups
++      storageAccount: mybackupstorage
++      keyPrefix: etcd-backups
++      credentials:
++        name: etcd-backup-azure-credentials
++```
++
++Replace `<HCP_NAMESPACE>` with the namespace of your HostedControlPlane (e.g., `clusters-my-cluster`).
++
++## Verification
++
++Monitor the backup progress:
++
++```bash
++# Check HCPEtcdBackup status
++kubectl get hcpetcdbackup my-backup -n <HCP_NAMESPACE> -o yaml
++
++# Watch for the backup Job
++kubectl get jobs -n $HO_NAMESPACE -l app=etcd-backup
++
++# Check Job logs
++kubectl logs -n $HO_NAMESPACE -l app=etcd-backup --tail=50
++```
++
++When the backup completes, the `HCPEtcdBackup` status will show:
++
++- `BackupCompleted` condition set to `True`
++- `snapshotURL` containing the Azure Blob URL of the snapshot
++
++## Using Client Secret Mode (Alternative)
++
++For development and testing, you can use a Service Principal with client secret instead of Workload Identity:
++
++```bash
++# Create (or update) the credential Secret with JSON format
++kubectl create secret generic etcd-backup-azure-credentials \
++    --namespace $HO_NAMESPACE \
++    --from-literal=credentials='{
++  "subscriptionId": "'$SUBSCRIPTION_ID'",
++  "tenantId": "'$TENANT_ID'",
++  "clientId": "'$CLIENT_ID'",
++  "clientSecret": "'$CLIENT_SECRET'"
++}' \
++    --dry-run=client -o yaml | kubectl apply -f -
++```
++
++The Service Principal needs `Storage Blob Data Contributor` role on the storage account.
++
++## Automation with contrib Scripts
++
++The `contrib/self-managed-azure/setup_backup.sh` script automates Steps 1-5:
++
++```bash
++cd dev/
++source user-vars.sh
++source ../contrib/self-managed-azure/vars.sh
++../contrib/self-managed-azure/setup_backup.sh
++```
++
++Or include it in the full setup:
++
++```bash
++../contrib/self-managed-azure/setup_all.sh --setup-backup
++```
++
++## Cleanup
++
++To remove backup infrastructure:
++
++```bash
++# Delete the credential Secret
++kubectl delete secret etcd-backup-azure-credentials -n $HO_NAMESPACE
++
++# Delete the managed identity (also removes federated credentials)
++az identity delete \
++    --name $BACKUP_MI_NAME \
++    --resource-group $PERSISTENT_RG_NAME
++
++# Delete the storage account and container
++az storage account delete \
++    --name $BACKUP_STORAGE_ACCOUNT \
++    --resource-group $PERSISTENT_RG_NAME \
++    --yes
++```
++
++## See Also
++
++- [Etcd Snapshot Backup Overview](../disaster-recovery/etcd-snapshot-backup/index.md) - Architecture and backup flow
++- [Managed Services Credentials](../disaster-recovery/etcd-snapshot-backup/managed-services-credentials.md) - Credential auto-detection and formats
++- [Self-Managed Azure Overview](self-managed-azure-index.md) - Self-managed Azure architecture
+diff --git a/docs/content/how-to/azure/self-managed-azure-index.md b/docs/content/how-to/azure/self-managed-azure-index.md
+index afdf2bc053dc..c04dd93c2e09 100644
+--- a/docs/content/how-to/azure/self-managed-azure-index.md
++++ b/docs/content/how-to/azure/self-managed-azure-index.md
+@@ -170,6 +170,7 @@ Begin your self-managed Azure HyperShift deployment by following the guides in o
+ 3. **[Create a Self-Managed Azure HostedCluster](create-self-managed-azure-cluster.md)** - Deploy your first hosted cluster
+ 4. **[Deploy Azure Private Clusters](deploy-azure-private-clusters.md)** (Optional) - Configure private endpoint access with Azure Private Link
+ 5. **[Autoscaling](autoscaling-self-managed.md)** - Configure node pool and cluster autoscaling
++6. **[Etcd Snapshot Backup](backup-and-restore-etcd-snapshot.md)** (Optional) - Configure etcd backup with Azure Blob Storage
+ 
+ Each guide includes sections for both DNS approaches - simply follow the sections that match your choice.
+ 
+diff --git a/docs/content/how-to/disaster-recovery/etcd-snapshot-backup/managed-services-credentials.md b/docs/content/how-to/disaster-recovery/etcd-snapshot-backup/managed-services-credentials.md
+index 492b32634997..54659c333d7a 100644
+--- a/docs/content/how-to/disaster-recovery/etcd-snapshot-backup/managed-services-credentials.md
++++ b/docs/content/how-to/disaster-recovery/etcd-snapshot-backup/managed-services-credentials.md
+@@ -263,6 +263,16 @@ When the controller detects Azure Workload Identity mode:
+     - Environment variables `AZURE_CLIENT_ID`, `AZURE_TENANT_ID`, `AZURE_FEDERATED_TOKEN_FILE`, `AZURE_AUTHORITY_HOST`
+ 4. No credentials file is mounted and no `--azure-auth-type` flag is passed — the Azure SDK uses the injected federated token
+ 
++## Self-Managed Azure
++
++Self-managed Azure uses the same Workload Identity mechanism as ARO HCP. The credential Secret format, auto-detection logic, and runtime behavior are identical. The differences are in infrastructure setup:
++
++- The managed identity and federated credential are created manually (or via `contrib/self-managed-azure/setup_backup.sh`)
++- The OIDC issuer URL comes from the management cluster (AKS or OCP), not from an ARO HCP environment
++- The storage account is provisioned independently
++
++For a complete step-by-step guide, see [Etcd Snapshot Backup for Self-Managed Azure](../../azure/backup-and-restore-etcd-snapshot.md).
++
+ ## OADP Plugin Integration
+ 
+ The OADP HyperShift plugin handles credential propagation automatically for both ROSA HCP and ARO HCP. No manual Secret creation or copying is required. The plugin copies the `cloud-credentials` Secret from the OADP namespace to the HyperShift Operator namespace, performing key remapping as described in the [OADP Plugin Secret Flow](#oadp-plugin-secret-flow) section above. The controller then auto-detects the credential mode from the destination Secret content.
+diff --git a/docs/content/reference/aggregated-docs.md b/docs/content/reference/aggregated-docs.md
+index de1859fa71d5..b4af4806fad9 100644
+--- a/docs/content/reference/aggregated-docs.md
++++ b/docs/content/reference/aggregated-docs.md
+@@ -10318,6 +10318,281 @@ spec:
+ - Scale-from-zero (`autoScaling.min: 0`) is not supported on Azure. The minimum must be >= 1.
+ 
+ 
++---
++
++## Source: docs/content/how-to/azure/backup-and-restore-etcd-snapshot.md
++
++# Etcd Snapshot Backup for Self-Managed Azure
++
++!!! warning "Tech Preview"
++
++    This feature requires the `HCPEtcdBackup` feature gate enabled in the HyperShift Operator.
++
++    **Standalone HyperShift Operator**: pass `--feature-gate HCPEtcdBackup=true` to the `hypershift install` command.
++
++    **MCE/ACM-managed HyperShift Operator**: use the `hypershift-operator-install-flags` ConfigMap to pass the feature gate flag. See Overriding HyperShift Operator Install Flags for details.
++
++    **Verify the feature gate is active** by checking that the `HCPEtcdBackup` CRD exists (it is only installed when the feature gate is enabled):
++
++    ```bash
++    kubectl get crd hcpetcdbackups.hypershift.openshift.io
++    ```
++
++    If the CRD is not found, the feature gate is not active.
++
++This guide describes how to set up and use etcd snapshot backups with Azure Blob Storage for self-managed Azure HCP environments using Azure Workload Identity.
++
++## Overview
++
++The `HCPEtcdBackup` controller automatically detects the authentication mode from the credential Secret. For self-managed Azure, three authentication modes are supported:
++
++| Mode | When to Use | Secret Format |
++|------|-------------|---------------|
++| **Workload Identity** | Production (recommended) | `cloud` key with `AZURE_CLIENT_ID=...` |
++| **Client Secret** | Development/testing | `credentials` key with JSON (`clientId`/`clientSecret`/`tenantId`) |
++| **Managed Identity** | ARO HCP only | Certificate-based via CSI mount |
++
++This guide covers the **Workload Identity** setup. For credential format details and auto-detection logic, see Managed Services Credentials.
++
++## Prerequisites
++
++- A self-managed Azure management cluster with HyperShift Operator installed
++- Azure CLI (`az`) configured
++- `kubectl` or `oc` CLI
++- The management cluster must have an OIDC issuer configured:
++    - **AKS**: Created with `--enable-oidc-issuer --enable-workload-identity`
++    - **OCP on Azure**: Configured via Cloud Credential Operator with Workload Identity
++
++## Setup
++
++### Step 1: Create a Storage Account and Container
++
++Create an Azure Storage Account and blob container for etcd snapshots:
++
++```bash
++PERSISTENT_RG_NAME="os4-common"   # Your persistent resource group
++LOCATION="eastus"
++BACKUP_STORAGE_ACCOUNT="mybackupstorage"  # 3-24 chars, lowercase alphanumeric only
++BACKUP_CONTAINER="etcd-backups"
++
++# Create storage account
++az storage account create \
++    --name $BACKUP_STORAGE_ACCOUNT \
++    --resource-group $PERSISTENT_RG_NAME \
++    --location $LOCATION \
++    --sku Standard_LRS \
++    --kind StorageV2 \
++    --min-tls-version TLS1_2 \
++    --allow-blob-public-access false
++
++# Create blob container
++# Note: --auth-mode login requires the caller to have Storage Blob Data Contributor
++# on the storage account. If you get a 403, assign the role to your user first or
++# omit --auth-mode to use storage account keys.
++az storage container create \
++    --name $BACKUP_CONTAINER \
++    --account-name $BACKUP_STORAGE_ACCOUNT \
++    --auth-mode login
++```
++
++### Step 2: Create a Managed Identity
++
++Create a User-Assigned Managed Identity for the backup Job:
++
++```bash
++BACKUP_MI_NAME="etcd-backup-mi"
++
++az identity create \
++    --name $BACKUP_MI_NAME \
++    --resource-group $PERSISTENT_RG_NAME \
++    --location $LOCATION
++
++# Save the client ID for later
++BACKUP_MI_CLIENT_ID=$(az identity show \
++    --name $BACKUP_MI_NAME \
++    --resource-group $PERSISTENT_RG_NAME \
++    --query clientId -o tsv)
++```
++
++### Step 3: Create a Federated Credential
++
++Create a federated credential that trusts the `etcd-backup-job` ServiceAccount on the management cluster:
++
++```bash
++HO_NAMESPACE="hypershift"  # HyperShift Operator namespace
++
++# Get the management cluster's OIDC issuer URL
++# For AKS: if you used contrib/self-managed-azure/setup_all.sh, these are already
++# exported. Otherwise, set them to your AKS cluster name and resource group.
++AKS_CLUSTER_NAME="${AKS_CLUSTER_NAME:-<your-aks-cluster-name>}"
++AKS_RG="${AKS_RG:-<your-aks-resource-group>}"
++
++MGMT_OIDC_ISSUER=$(az aks show \
++    --name $AKS_CLUSTER_NAME \
++    --resource-group $AKS_RG \
++    --query oidcIssuerProfile.issuerUrl -o tsv)
++
++# Create federated credential
++az identity federated-credential create \
++    --name etcd-backup-fedcred \
++    --identity-name $BACKUP_MI_NAME \
++    --resource-group $PERSISTENT_RG_NAME \
++    --issuer "$MGMT_OIDC_ISSUER" \
++    --subject "system:serviceaccount:${HO_NAMESPACE}:etcd-backup-job" \
++    --audiences "api://AzureADTokenExchange"
++```
++
++!!! important
++
++    The `--issuer` must be the **management cluster's** OIDC issuer URL, not the hosted cluster's OIDC issuer. The backup Job runs on the management cluster.
++
++### Step 4: Assign Storage Permissions
++
++Grant the managed identity `Storage Blob Data Contributor` role on the storage account:
++
++```bash
++BACKUP_MI_PRINCIPAL_ID=$(az identity show \
++    --name $BACKUP_MI_NAME \
++    --resource-group $PERSISTENT_RG_NAME \
++    --query principalId -o tsv)
++
++STORAGE_ACCOUNT_ID=$(az storage account show \
++    --name $BACKUP_STORAGE_ACCOUNT \
++    --resource-group $PERSISTENT_RG_NAME \
++    --query id -o tsv)
++
++az role assignment create \
++    --assignee-object-id $BACKUP_MI_PRINCIPAL_ID \
++    --assignee-principal-type ServicePrincipal \
++    --role "Storage Blob Data Contributor" \
++    --scope $STORAGE_ACCOUNT_ID
++```
++
++### Step 5: Create the Credential Secret
++
++Create the credential Secret in the HyperShift Operator namespace:
++
++```bash
++SUBSCRIPTION_ID=$(az account show --query id -o tsv)
++TENANT_ID=$(az account show --query tenantId -o tsv)
++
++kubectl create secret generic etcd-backup-azure-credentials \
++    --namespace $HO_NAMESPACE \
++    --from-literal=cloud="AZURE_SUBSCRIPTION_ID=${SUBSCRIPTION_ID}
++AZURE_TENANT_ID=${TENANT_ID}
++AZURE_CLIENT_ID=${BACKUP_MI_CLIENT_ID}
++AZURE_RESOURCE_GROUP=${PERSISTENT_RG_NAME}
++AZURE_CLOUD_NAME=AzurePublicCloud"
++```
++
++The controller auto-detects Workload Identity mode when the Secret has a `cloud` key containing `AZURE_CLIENT_ID=...`.
++
++## Creating a Backup
++
++Create an `HCPEtcdBackup` CR in the HostedControlPlane namespace:
++
++```yaml
++apiVersion: hypershift.openshift.io/v1beta1
++kind: HCPEtcdBackup
++metadata:
++  name: my-backup
++  namespace: <HCP_NAMESPACE>
++spec:
++  storage:
++    storageType: AzureBlob
++    azureBlob:
++      container: etcd-backups
++      storageAccount: mybackupstorage
++      keyPrefix: etcd-backups
++      credentials:
++        name: etcd-backup-azure-credentials
++```
++
++Replace `<HCP_NAMESPACE>` with the namespace of your HostedControlPlane (e.g., `clusters-my-cluster`).
++
++## Verification
++
++Monitor the backup progress:
++
++```bash
++# Check HCPEtcdBackup status
++kubectl get hcpetcdbackup my-backup -n <HCP_NAMESPACE> -o yaml
++
++# Watch for the backup Job
++kubectl get jobs -n $HO_NAMESPACE -l app=etcd-backup
++
++# Check Job logs
++kubectl logs -n $HO_NAMESPACE -l app=etcd-backup --tail=50
++```
++
++When the backup completes, the `HCPEtcdBackup` status will show:
++
++- `BackupCompleted` condition set to `True`
++- `snapshotURL` containing the Azure Blob URL of the snapshot
++
++## Using Client Secret Mode (Alternative)
++
++For development and testing, you can use a Service Principal with client secret instead of Workload Identity:
++
++```bash
++# Create (or update) the credential Secret with JSON format
++kubectl create secret generic etcd-backup-azure-credentials \
++    --namespace $HO_NAMESPACE \
++    --from-literal=credentials='{
++  "subscriptionId": "'$SUBSCRIPTION_ID'",
++  "tenantId": "'$TENANT_ID'",
++  "clientId": "'$CLIENT_ID'",
++  "clientSecret": "'$CLIENT_SECRET'"
++}' \
++    --dry-run=client -o yaml | kubectl apply -f -
++```
++
++The Service Principal needs `Storage Blob Data Contributor` role on the storage account.
++
++## Automation with contrib Scripts
++
++The `contrib/self-managed-azure/setup_backup.sh` script automates Steps 1-5:
++
++```bash
++cd dev/
++source user-vars.sh
++source ../contrib/self-managed-azure/vars.sh
++../contrib/self-managed-azure/setup_backup.sh
++```
++
++Or include it in the full setup:
++
++```bash
++../contrib/self-managed-azure/setup_all.sh --setup-backup
++```
++
++## Cleanup
++
++To remove backup infrastructure:
++
++```bash
++# Delete the credential Secret
++kubectl delete secret etcd-backup-azure-credentials -n $HO_NAMESPACE
++
++# Delete the managed identity (also removes federated credentials)
++az identity delete \
++    --name $BACKUP_MI_NAME \
++    --resource-group $PERSISTENT_RG_NAME
++
++# Delete the storage account and container
++az storage account delete \
++    --name $BACKUP_STORAGE_ACCOUNT \
++    --resource-group $PERSISTENT_RG_NAME \
++    --yes
++```
++
++## See Also
++
++- Etcd Snapshot Backup Overview - Architecture and backup flow
++- Managed Services Credentials - Credential auto-detection and formats
++- Self-Managed Azure Overview - Self-managed Azure architecture
++
++
+ ---
+ 
+ ## Source: docs/content/how-to/azure/create-azure-cluster-on-aks.md
+@@ -13167,6 +13442,7 @@ Begin your self-managed Azure HyperShift deployment by following the guides in o
+ 3. **Create a Self-Managed Azure HostedCluster** - Deploy your first hosted cluster
+ 4. **Deploy Azure Private Clusters** (Optional) - Configure private endpoint access with Azure Private Link
+ 5. **Autoscaling** - Configure node pool and cluster autoscaling
++6. **Etcd Snapshot Backup** (Optional) - Configure etcd backup with Azure Blob Storage
+ 
+ Each guide includes sections for both DNS approaches - simply follow the sections that match your choice.
+ 
+@@ -21162,6 +21438,16 @@ When the controller detects Azure Workload Identity mode:
+     - Environment variables `AZURE_CLIENT_ID`, `AZURE_TENANT_ID`, `AZURE_FEDERATED_TOKEN_FILE`, `AZURE_AUTHORITY_HOST`
+ 4. No credentials file is mounted and no `--azure-auth-type` flag is passed — the Azure SDK uses the injected federated token
+ 
++## Self-Managed Azure
++
++Self-managed Azure uses the same Workload Identity mechanism as ARO HCP. The credential Secret format, auto-detection logic, and runtime behavior are identical. The differences are in infrastructure setup:
++
++- The managed identity and federated credential are created manually (or via `contrib/self-managed-azure/setup_backup.sh`)
++- The OIDC issuer URL comes from the management cluster (AKS or OCP), not from an ARO HCP environment
++- The storage account is provisioned independently
++
++For a complete step-by-step guide, see Etcd Snapshot Backup for Self-Managed Azure.
++
+ ## OADP Plugin Integration
+ 
+ The OADP HyperShift plugin handles credential propagation automatically for both ROSA HCP and ARO HCP. No manual Secret creation or copying is required. The plugin copies the `cloud-credentials` Secret from the OADP namespace to the HyperShift Operator namespace, performing key remapping as described in the OADP Plugin Secret Flow section above. The controller then auto-detects the credential mode from the destination Secret content.
+diff --git a/docs/mkdocs.yml b/docs/mkdocs.yml
+index 275e2a6a2e59..bb8460904e62 100644
+--- a/docs/mkdocs.yml
++++ b/docs/mkdocs.yml
+@@ -186,6 +186,7 @@ nav:
+         - how-to/azure/create-infra-separately.md
+         - how-to/azure/deploy-azure-private-clusters.md
+         - how-to/azure/setup-management-cluster.md
++        - how-to/azure/backup-and-restore-etcd-snapshot.md
+       - 'Troubleshooting':
+         - how-to/azure/troubleshooting/index.md
+         - how-to/azure/troubleshooting/debug-nodes.md

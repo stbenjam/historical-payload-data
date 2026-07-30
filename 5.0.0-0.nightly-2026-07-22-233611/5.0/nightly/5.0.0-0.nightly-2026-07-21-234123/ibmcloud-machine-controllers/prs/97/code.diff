@@ -1,0 +1,172 @@
+diff --git a/pkg/actuators/client/client.go b/pkg/actuators/client/client.go
+index 6c14a5bb3..bcdb19bfc 100644
+--- a/pkg/actuators/client/client.go
++++ b/pkg/actuators/client/client.go
+@@ -387,17 +387,35 @@ func (c *ibmCloudClient) InstanceCreate(machineName string, machineProviderConfi
+ 	}
+ 
+ 	// Configure machine's boot volume, if necessary.
+-	if machineProviderConfig.BootVolume.EncryptionKey != "" {
+-		instancePrototypeObj.BootVolumeAttachment = &vpcv1.VolumeAttachmentPrototypeInstanceByImageContext{
+-			Volume: &vpcv1.VolumePrototypeInstanceByImageContext{
+-				EncryptionKey: &vpcv1.EncryptionKeyIdentity{
+-					CRN: &machineProviderConfig.BootVolume.EncryptionKey,
+-				},
+-				Profile: &vpcv1.VolumeProfileIdentity{
+-					Name: pointer.String(ibmcloudutil.BootVolumeDefaultProfile),
+-				},
++	bootVolumeConfig := machineProviderConfig.BootVolume
++	if bootVolumeConfig != (ibmcloudproviderv1.IBMCloudMachineBootVolume{}) {
++		bootVolume := &vpcv1.VolumePrototypeInstanceByImageContext{
++			Profile: &vpcv1.VolumeProfileIdentity{
++				Name: pointer.String(ibmcloudutil.BootVolumeDefaultProfile),
+ 			},
+ 		}
++		if bootVolumeConfig.Profile != "" {
++			bootVolume.Profile = &vpcv1.VolumeProfileIdentity{
++				Name: &bootVolumeConfig.Profile,
++			}
++		}
++		if bootVolumeConfig.SizeGiB != 0 {
++			bootVolume.Capacity = &bootVolumeConfig.SizeGiB
++		}
++		if bootVolumeConfig.Iops != 0 {
++			bootVolume.Iops = &bootVolumeConfig.Iops
++		}
++		if bootVolumeConfig.Bandwidth != 0 {
++			bootVolume.Bandwidth = &bootVolumeConfig.Bandwidth
++		}
++		if bootVolumeConfig.EncryptionKey != "" {
++			bootVolume.EncryptionKey = &vpcv1.EncryptionKeyIdentity{
++				CRN: &bootVolumeConfig.EncryptionKey,
++			}
++		}
++		instancePrototypeObj.BootVolumeAttachment = &vpcv1.VolumeAttachmentPrototypeInstanceByImageContext{
++			Volume: bootVolume,
++		}
+ 	}
+ 
+ 	// Get Dedicated Host ID if needed
+diff --git a/pkg/apis/ibmcloudprovider/v1/ibmcloudproviderconfig_types.go b/pkg/apis/ibmcloudprovider/v1/ibmcloudproviderconfig_types.go
+index fdc2be6b1..0665103db 100644
+--- a/pkg/apis/ibmcloudprovider/v1/ibmcloudproviderconfig_types.go
++++ b/pkg/apis/ibmcloudprovider/v1/ibmcloudproviderconfig_types.go
+@@ -92,10 +92,39 @@ type IBMCloudMachineProviderSpec struct {
+ }
+ 
+ // IBMCloudMachineBootVolume contains details for the machine's boot volume.
++// The boot volume configuration is only applied when the instance is created,
++// changes to the fields of an existing instance's boot volume are not reconciled.
+ type IBMCloudMachineBootVolume struct {
+ 	// EncryptionKey is the IBM Cloud encryption key CRN to use when encrypting the boot volume.
+ 	// CRN's for IBM Cloud Key Protect keys or IBM Cloud Hyper Protect keys are accepted.
+ 	EncryptionKey string `json:"encryptionKey"`
++
++	// Profile is the volume profile for the boot volume, refer
++	// https://cloud.ibm.com/docs/vpc?topic=vpc-block-storage-profiles for more information.
++	// Accepted values are `general-purpose`, `5iops-tier`, `10iops-tier`, `custom` and the
++	// second-generation `sdp` profile.
++	// When omitted, `general-purpose` is used.
++	// (optional)
++	Profile string `json:"profile,omitempty"`
++
++	// SizeGiB is the size of the boot volume in GiB.
++	// The specified value must be at least the image's minimum provisioned size, at most
++	// 250 GiB for first-generation volume profiles and at most 32,000 GiB for the `sdp` profile.
++	// When omitted, IBM Cloud's default boot volume capacity is used.
++	// (optional)
++	SizeGiB int64 `json:"sizeGiB,omitempty"`
++
++	// Iops is the maximum I/O operations per second (IOPS) to use for the boot volume. Applicable
++	// only to volumes using the `custom` profile or the second-generation `sdp` profile.
++	// When omitted, the IOPS is determined by the volume profile.
++	// (optional)
++	Iops int64 `json:"iops,omitempty"`
++
++	// Bandwidth is the maximum bandwidth (in megabits per second) for the boot volume. Applicable
++	// only to volumes using the second-generation `sdp` profile.
++	// When omitted, it will be computed from the volume's iops and capacity.
++	// (optional)
++	Bandwidth int64 `json:"bandwidth,omitempty"`
+ }
+ 
+ // NetworkInterface struct
+diff --git a/pkg/apis/ibmcloudprovider/v1/register_test.go b/pkg/apis/ibmcloudprovider/v1/register_test.go
+index 3a8ad6e31..dc06d763b 100644
+--- a/pkg/apis/ibmcloudprovider/v1/register_test.go
++++ b/pkg/apis/ibmcloudprovider/v1/register_test.go
+@@ -49,6 +49,37 @@ var (
+ 	}
+ 	expectedRawProviderSpec = `{"metadata":{},"vpc":"test-vpc","bootVolume":{"encryptionKey":""},"image":"test-instance-image","profile":"bx2d-32x128","dedicatedHost":"dedicated-host-name","region":"us-east","zone":"us-east-1","resourceGroup":"aaab-bbbc-cccd-zzzz-xxxx","primaryNetworkInterface":{"subnet":"test-subnet","securityGroups":["test-security-group-1","test-security-group-2"]},"userDataSecret":{"name":"userData"},"credentialsSecret":{"name":"credentialKey"}}`
+ 
++	expectedProviderSpecWithBootVolume = IBMCloudMachineProviderSpec{
++		VPC:           "test-vpc",
++		Image:         "test-instance-image",
++		Profile:       "bx2d-32x128",
++		DedicatedHost: "dedicated-host-name",
++		Zone:          "us-east-1",
++		Region:        "us-east",
++		ResourceGroup: "aaab-bbbc-cccd-zzzz-xxxx",
++		BootVolume: IBMCloudMachineBootVolume{
++			EncryptionKey: "crn:v1:bluemix:public:kms:us-east:a/key",
++			Profile:       "sdp",
++			SizeGiB:       100,
++			Iops:          3000,
++			Bandwidth:     1000,
++		},
++		UserDataSecret: &corev1.LocalObjectReference{
++			Name: "userData",
++		},
++		CredentialsSecret: &corev1.LocalObjectReference{
++			Name: "credentialKey",
++		},
++		PrimaryNetworkInterface: NetworkInterface{
++			Subnet: "test-subnet",
++			SecurityGroups: []string{
++				"test-security-group-1",
++				"test-security-group-2",
++			},
++		},
++	}
++	expectedRawProviderSpecWithBootVolume = `{"metadata":{},"vpc":"test-vpc","bootVolume":{"encryptionKey":"crn:v1:bluemix:public:kms:us-east:a/key","profile":"sdp","sizeGiB":100,"iops":3000,"bandwidth":1000},"image":"test-instance-image","profile":"bx2d-32x128","dedicatedHost":"dedicated-host-name","region":"us-east","zone":"us-east-1","resourceGroup":"aaab-bbbc-cccd-zzzz-xxxx","primaryNetworkInterface":{"subnet":"test-subnet","securityGroups":["test-security-group-1","test-security-group-2"]},"userDataSecret":{"name":"userData"},"credentialsSecret":{"name":"credentialKey"}}`
++
+ 	instanceID             = "test-instance-id"
+ 	instanceState          = "running"
+ 	expectedProviderStatus = IBMCloudMachineProviderStatus{
+@@ -68,6 +99,16 @@ func TestRawExtensionFromProviderSpec(t *testing.T) {
+ 	}
+ }
+ 
++func TestRawExtensionFromProviderSpecWithBootVolume(t *testing.T) {
++	rawExtension, err := RawExtensionFromProviderSpec(&expectedProviderSpecWithBootVolume)
++	if err != nil {
++		t.Errorf("Unexpected error: %v", err)
++	}
++	if string(rawExtension.Raw) != expectedRawProviderSpecWithBootVolume {
++		t.Errorf("Expected: %s, got: %s", expectedRawProviderSpecWithBootVolume, string(rawExtension.Raw))
++	}
++}
++
+ func TestRawExtensionFromProviderStatus(t *testing.T) {
+ 	rawExtension, err := RawExtensionFromProviderStatus(&expectedProviderStatus)
+ 	if err != nil {
+@@ -91,6 +132,19 @@ func TestProviderSpecFromRawExtension(t *testing.T) {
+ 	}
+ }
+ 
++func TestProviderSpecFromRawExtensionWithBootVolume(t *testing.T) {
++	rawExtension := runtime.RawExtension{
++		Raw: []byte(expectedRawProviderSpecWithBootVolume),
++	}
++	providerSpec, err := ProviderSpecFromRawExtension(&rawExtension)
++	if err != nil {
++		t.Errorf("Unexpected error: %v", err)
++	}
++	if !reflect.DeepEqual(*providerSpec, expectedProviderSpecWithBootVolume) {
++		t.Errorf("Expected: %v, got: %v", expectedProviderSpecWithBootVolume, *providerSpec)
++	}
++}
++
+ func TestProviderStatusFromRawExtension(t *testing.T) {
+ 	rawExtension := runtime.RawExtension{
+ 		Raw: []byte(expectedRawProviderStatus),

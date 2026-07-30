@@ -1,0 +1,479 @@
+diff --git a/ignition-server/controllers/local_ignitionprovider.go b/ignition-server/controllers/local_ignitionprovider.go
+index 09efbed64c3a..a0862154950a 100644
+--- a/ignition-server/controllers/local_ignitionprovider.go
++++ b/ignition-server/controllers/local_ignitionprovider.go
+@@ -97,6 +97,66 @@ var _ IgnitionProvider = (*LocalIgnitionProvider)(nil)
+ // at which we regenerate a new certificate. This ensures we never serve an expired cert.
+ const mcsCertRefreshMargin = 1 * time.Hour
+ 
++const maxMCSLogBytes = 8 << 10 // 8 KiB
++
++// syncBuffer is a thread-safe buffer for capturing MCS process stdout/stderr
++// while the polling loop reads snapshots for error logging.
++type syncBuffer struct {
++	mu  sync.Mutex
++	buf bytes.Buffer
++}
++
++func (b *syncBuffer) Write(p []byte) (int, error) {
++	b.mu.Lock()
++	defer b.mu.Unlock()
++	return b.buf.Write(p)
++}
++
++func (b *syncBuffer) String() string {
++	b.mu.Lock()
++	defer b.mu.Unlock()
++	return truncateTail(b.buf.String(), maxMCSLogBytes)
++}
++
++func truncateTail(s string, max int) string {
++	if len(s) <= max {
++		return s
++	}
++	return s[len(s)-max:]
++}
++
++// fetchMCSIgnitionPayload performs a single HTTP request to the MCS endpoint.
++// It returns the payload on HTTP 200, nil with ok=false for retryable failures,
++// or a non-nil error for fatal errors that should stop polling.
++func fetchMCSIgnitionPayload(ctx context.Context, httpclient *http.Client, url string, mcsLogFn func() string) (payload []byte, ok bool, err error) {
++	log := ctrl.Log.WithName("get-payload")
++	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
++	if err != nil {
++		return nil, false, fmt.Errorf("error building http request: %w", err)
++	}
++	req.Header.Add("Accept", "application/vnd.coreos.ignition+json;version=3.2.0, */*;q=0.1")
++	res, err := httpclient.Do(req)
++	if err != nil {
++		log.Error(err, "mcs request failed")
++		return nil, false, nil
++	}
++	defer func() {
++		if err := res.Body.Close(); err != nil {
++			log.Error(err, "failed to close mcs response body")
++		}
++	}()
++	if res.StatusCode != http.StatusOK {
++		log.Info("mcs returned unexpected response code", "code", res.StatusCode, "mcsOutput", mcsLogFn())
++		return nil, false, nil
++	}
++	body, err := io.ReadAll(res.Body)
++	if err != nil {
++		log.Error(err, "failed to read mcs response body")
++		return nil, false, nil
++	}
++	return body, true, nil
++}
++
+ // getOrGenerateMCSCert returns cached PEM-encoded MCS TLS certificate and key,
+ // generating a new self-signed certificate if the cache is empty, partially
+ // populated, or the cached certificate is about to expire. This avoids redundant
+@@ -565,55 +625,54 @@ func (p *LocalIgnitionProvider) runMCSAndFetchPayload(ctx context.Context, dirs
+ 		)
+ 	}
+ 
+-	// Spin up the MCS process and ensure it's signaled to terminate when the function returns
++	// Spin up the MCS process and ensure it's signaled to terminate when the function returns.
++	// Output is captured in a buffer so it can be included in error messages for troubleshooting.
+ 	mcsCtx, cancel := context.WithCancel(ctx)
+ 	defer cancel()
+ 	cmd := exec.CommandContext(mcsCtx, filepath.Join(dirs.binDir, "machine-config-server"), args...)
++	cmd.WaitDelay = 10 * time.Second
++
++	var mcsOutput syncBuffer
++	cmd.Stdout = &mcsOutput
++	cmd.Stderr = &mcsOutput
++
++	if err := cmd.Start(); err != nil {
++		return nil, fmt.Errorf("failed to start machine-config-server: %w", err)
++	}
++
++	mcsDone := make(chan error, 1)
+ 	go func() {
+-		out, err := cmd.CombinedOutput()
+-		log.Info("machine-config-server process exited", "output", string(out), "error", err)
++		mcsDone <- cmd.Wait()
+ 	}()
+ 
+ 	httpclient := &http.Client{
+ 		Timeout: 5 * time.Second,
+ 	}
+ 	var payload []byte
+-	// Try connecting to the server until we get a response or the context is closed
++	// Try connecting to the server until we get a response or the context is closed.
++	// We pass expected Headers to return the right config version.
++	// https://www.iana.org/assignments/media-types/application/vnd.coreos.ignition+json
++	// https://github.com/coreos/ignition/blob/0cbe33fee45d012515479a88f0fe94ef58d5102b/internal/resource/url.go#L61-L64
++	// https://github.com/openshift/machine-config-operator/blob/9c6c2bfd7ed498bfbc296d530d1839bd6a177b0b/pkg/server/api.go#L269
+ 	err = wait.PollUntilContextCancel(ctx, 1*time.Second, true, func(ctx context.Context) (bool, error) {
+-		req, err := http.NewRequestWithContext(ctx, http.MethodGet, "http://localhost:22626/config/master", nil)
+-		if err != nil {
+-			return false, fmt.Errorf("error building http request: %w", err)
++		body, ok, pollErr := fetchMCSIgnitionPayload(ctx, httpclient, "http://localhost:22626/config/master", mcsOutput.String)
++		if ok {
++			payload = body
++			log.Info("got mcs payload", "time", time.Since(start).Round(time.Second).String())
+ 		}
+-		// We pass expected Headers to return the right config version.
+-		// https://www.iana.org/assignments/media-types/application/vnd.coreos.ignition+json
+-		// https://github.com/coreos/ignition/blob/0cbe33fee45d012515479a88f0fe94ef58d5102b/internal/resource/url.go#L61-L64
+-		// https://github.com/openshift/machine-config-operator/blob/9c6c2bfd7ed498bfbc296d530d1839bd6a177b0b/pkg/server/api.go#L269
+-		req.Header.Add("Accept", "application/vnd.coreos.ignition+json;version=3.2.0, */*;q=0.1")
+-		res, err := httpclient.Do(req)
+-		if err != nil {
+-			log.Error(err, "mcs request failed")
+-			return false, nil
+-		}
+-		if res.StatusCode != http.StatusOK {
+-			log.Error(err, "mcs returned unexpected response code", "code", res.StatusCode)
+-			return false, nil
+-		}
+-
+-		defer func() {
+-			if err := res.Body.Close(); err != nil {
+-				log.Error(err, "failed to close mcs response body")
+-			}
+-		}()
+-		body, err := io.ReadAll(res.Body)
+-		if err != nil {
+-			log.Error(err, "failed to read mcs response body")
+-			return false, nil
+-		}
+-		payload = body
+-		log.Info("got mcs payload", "time", time.Since(start).Round(time.Second).String())
+-		return true, nil
++		return ok, pollErr
+ 	})
+-	return payload, err
++
++	// Stop MCS and wait for process exit so all output is flushed to the buffer.
++	cancel()
++	mcsErr := <-mcsDone
++	log.Info("machine-config-server process exited", "output", mcsOutput.String(), "error", mcsErr)
++
++	if err != nil {
++		return nil, fmt.Errorf("mcs logs: %s: %w", mcsOutput.String(), err)
++	}
++
++	return payload, nil
+ }
+ 
+ func (p *LocalIgnitionProvider) GetPayload(ctx context.Context, releaseImage, customConfig, pullSecretHash, additionalTrustBundleHash, hcConfigurationHash, osStream, cloudConfigHash string) ([]byte, error) {
+diff --git a/ignition-server/controllers/local_ignitionprovider_test.go b/ignition-server/controllers/local_ignitionprovider_test.go
+index 95fc76d6953d..f693795f4001 100644
+--- a/ignition-server/controllers/local_ignitionprovider_test.go
++++ b/ignition-server/controllers/local_ignitionprovider_test.go
+@@ -6,6 +6,8 @@ import (
+ 	"encoding/pem"
+ 	"fmt"
+ 	"io"
++	"net/http"
++	"net/http/httptest"
+ 	"os"
+ 	"path"
+ 	"path/filepath"
+@@ -1422,6 +1424,303 @@ func TestWriteOSImageStreamManifest(t *testing.T) {
+ 	}
+ }
+ 
++func TestTruncateTail(t *testing.T) {
++	t.Parallel()
++
++	tests := []struct {
++		name   string
++		input  string
++		max    int
++		expect string
++	}{
++		{
++			name:   "When input is shorter than max, it should return the full string",
++			input:  "short",
++			max:    100,
++			expect: "short",
++		},
++		{
++			name:   "When input is exactly max length, it should return the full string",
++			input:  "exact",
++			max:    5,
++			expect: "exact",
++		},
++		{
++			name:   "When input is longer than max, it should return the tail",
++			input:  "abcdefghij",
++			max:    4,
++			expect: "ghij",
++		},
++		{
++			name:   "When input is empty, it should return empty string",
++			input:  "",
++			max:    10,
++			expect: "",
++		},
++		{
++			name:   "When max is zero, it should return empty string",
++			input:  "anything",
++			max:    0,
++			expect: "",
++		},
++	}
++
++	for _, tt := range tests {
++		t.Run(tt.name, func(t *testing.T) {
++			t.Parallel()
++			g := NewWithT(t)
++			g.Expect(truncateTail(tt.input, tt.max)).To(Equal(tt.expect))
++		})
++	}
++}
++
++func TestSyncBuffer(t *testing.T) {
++	t.Parallel()
++
++	t.Run("When writing data, it should be readable via String", func(t *testing.T) {
++		t.Parallel()
++		g := NewWithT(t)
++
++		var b syncBuffer
++		n, err := b.Write([]byte("hello "))
++		g.Expect(err).NotTo(HaveOccurred())
++		g.Expect(n).To(Equal(6))
++
++		n, err = b.Write([]byte("world"))
++		g.Expect(err).NotTo(HaveOccurred())
++		g.Expect(n).To(Equal(5))
++
++		g.Expect(b.String()).To(Equal("hello world"))
++	})
++
++	t.Run("When data exceeds maxMCSLogBytes, String should return truncated tail", func(t *testing.T) {
++		t.Parallel()
++		g := NewWithT(t)
++
++		var b syncBuffer
++		// Write more than maxMCSLogBytes (8 KiB)
++		large := make([]byte, maxMCSLogBytes+100)
++		for i := range large {
++			large[i] = byte('a' + (i % 26))
++		}
++		_, err := b.Write(large)
++		g.Expect(err).NotTo(HaveOccurred())
++
++		result := b.String()
++		g.Expect(len(result)).To(Equal(maxMCSLogBytes))
++		g.Expect(result).To(Equal(string(large[100:])))
++	})
++
++	t.Run("When writing from multiple goroutines, it should not panic", func(t *testing.T) {
++		t.Parallel()
++		g := NewWithT(t)
++
++		var b syncBuffer
++		done := make(chan struct{})
++		for i := 0; i < 10; i++ {
++			go func() {
++				defer func() { done <- struct{}{} }()
++				for j := 0; j < 100; j++ {
++					_, _ = b.Write([]byte("x"))
++					_ = b.String()
++				}
++			}()
++		}
++		for i := 0; i < 10; i++ {
++			<-done
++		}
++		g.Expect(len(b.String())).To(BeNumerically("<=", maxMCSLogBytes))
++	})
++}
++
++type roundTripFunc func(*http.Request) (*http.Response, error)
++
++func (f roundTripFunc) RoundTrip(req *http.Request) (*http.Response, error) { return f(req) }
++
++type errReader struct{ err error }
++
++func (r errReader) Read([]byte) (int, error) { return 0, r.err }
++
++func TestFetchMCSIgnitionPayload(t *testing.T) {
++	t.Parallel()
++
++	tests := []struct {
++		name          string
++		handler       http.HandlerFunc
++		mcsOutputData string
++		overrideURL   string
++		expectPayload []byte
++		expectOk      bool
++		expectError   bool
++	}{
++		{
++			name: "When MCS returns 200 with payload, it should return the payload",
++			handler: func(w http.ResponseWriter, r *http.Request) {
++				w.WriteHeader(http.StatusOK)
++				if _, err := w.Write([]byte(`{"ignition":{"version":"3.2.0"}}`)); err != nil {
++					return
++				}
++			},
++			expectPayload: []byte(`{"ignition":{"version":"3.2.0"}}`),
++			expectOk:      true,
++		},
++		{
++			name: "When MCS returns non-200 status, it should signal retry",
++			handler: func(w http.ResponseWriter, r *http.Request) {
++				w.WriteHeader(http.StatusServiceUnavailable)
++			},
++			mcsOutputData: "mcs startup log line",
++			expectOk:      false,
++		},
++		{
++			name: "When MCS returns 500, it should signal retry",
++			handler: func(w http.ResponseWriter, r *http.Request) {
++				w.WriteHeader(http.StatusInternalServerError)
++				if _, err := w.Write([]byte("internal error")); err != nil {
++					return
++				}
++			},
++			expectOk: false,
++		},
++		{
++			name: "When request succeeds, the correct Accept header should be sent",
++			handler: func(w http.ResponseWriter, r *http.Request) {
++				if r.Header.Get("Accept") != "application/vnd.coreos.ignition+json;version=3.2.0, */*;q=0.1" {
++					w.WriteHeader(http.StatusBadRequest)
++					return
++				}
++				w.WriteHeader(http.StatusOK)
++				if _, err := w.Write([]byte("payload")); err != nil {
++					return
++				}
++			},
++			expectPayload: []byte("payload"),
++			expectOk:      true,
++		},
++		{
++			name:        "When URL contains invalid characters, it should return a fatal error",
++			handler:     func(w http.ResponseWriter, r *http.Request) {},
++			overrideURL: "http://local\x00host/config/master",
++			expectError: true,
++		},
++	}
++
++	for _, tt := range tests {
++		t.Run(tt.name, func(t *testing.T) {
++			t.Parallel()
++			g := NewWithT(t)
++
++			server := httptest.NewServer(tt.handler)
++			defer server.Close()
++
++			httpclient := server.Client()
++			mcsLogFn := func() string { return "" }
++			if tt.mcsOutputData != "" {
++				mcsLogFn = func() string { return tt.mcsOutputData }
++			}
++
++			targetURL := server.URL
++			if tt.overrideURL != "" {
++				targetURL = tt.overrideURL
++			}
++
++			payload, ok, err := fetchMCSIgnitionPayload(t.Context(), httpclient, targetURL, mcsLogFn)
++			if tt.expectError {
++				g.Expect(err).To(HaveOccurred())
++				return
++			}
++			g.Expect(err).NotTo(HaveOccurred())
++			g.Expect(ok).To(Equal(tt.expectOk))
++			if tt.expectPayload != nil {
++				g.Expect(payload).To(Equal(tt.expectPayload))
++			} else {
++				g.Expect(payload).To(BeNil())
++			}
++		})
++	}
++
++	t.Run("When MCS connection fails, it should signal retry without error", func(t *testing.T) {
++		t.Parallel()
++		g := NewWithT(t)
++
++		server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {}))
++		serverURL := server.URL
++		server.Close()
++
++		httpclient := &http.Client{Timeout: 1 * time.Second}
++
++		payload, ok, err := fetchMCSIgnitionPayload(t.Context(), httpclient, serverURL, func() string { return "" })
++		g.Expect(err).NotTo(HaveOccurred())
++		g.Expect(ok).To(BeFalse())
++		g.Expect(payload).To(BeNil())
++	})
++
++	t.Run("When MCS returns non-200, the mcsLogFn output should be readable for logging", func(t *testing.T) {
++		t.Parallel()
++		g := NewWithT(t)
++
++		server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
++			w.WriteHeader(http.StatusServiceUnavailable)
++		}))
++		defer server.Close()
++
++		httpclient := server.Client()
++		var mcsOutput syncBuffer
++		_, err := mcsOutput.Write([]byte("starting MCS process...\nlistening on port 22626"))
++		g.Expect(err).NotTo(HaveOccurred())
++
++		payload, ok, err := fetchMCSIgnitionPayload(t.Context(), httpclient, server.URL, mcsOutput.String)
++		g.Expect(err).NotTo(HaveOccurred())
++		g.Expect(ok).To(BeFalse())
++		g.Expect(payload).To(BeNil())
++
++		g.Expect(mcsOutput.String()).To(ContainSubstring("starting MCS process"))
++	})
++
++	t.Run("When response body cannot be read, it should signal retry without error", func(t *testing.T) {
++		t.Parallel()
++		g := NewWithT(t)
++
++		httpclient := &http.Client{
++			Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
++				return &http.Response{
++					StatusCode: http.StatusOK,
++					Body:       io.NopCloser(errReader{err: fmt.Errorf("simulated body read failure")}),
++					Header:     make(http.Header),
++				}, nil
++			}),
++		}
++
++		payload, ok, err := fetchMCSIgnitionPayload(t.Context(), httpclient, "http://localhost:22626/config/master", func() string { return "" })
++		g.Expect(err).NotTo(HaveOccurred())
++		g.Expect(ok).To(BeFalse())
++		g.Expect(payload).To(BeNil())
++	})
++
++	t.Run("When context is canceled before request completes, it should signal retry without error", func(t *testing.T) {
++		t.Parallel()
++		g := NewWithT(t)
++
++		ctx, cancel := context.WithCancel(context.Background())
++		cancel()
++
++		server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
++			w.WriteHeader(http.StatusOK)
++			if _, err := w.Write([]byte("payload")); err != nil {
++				return
++			}
++		}))
++		defer server.Close()
++
++		httpclient := server.Client()
++
++		payload, ok, err := fetchMCSIgnitionPayload(ctx, httpclient, server.URL, func() string { return "" })
++		g.Expect(err).NotTo(HaveOccurred())
++		g.Expect(ok).To(BeFalse())
++		g.Expect(payload).To(BeNil())
++	})
++}
++
+ func TestCopyMCOOutputToMCCMixedContent(t *testing.T) {
+ 	t.Parallel()
+ 

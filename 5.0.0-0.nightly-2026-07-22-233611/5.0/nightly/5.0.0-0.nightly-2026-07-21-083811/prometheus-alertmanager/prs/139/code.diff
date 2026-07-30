@@ -1,0 +1,182 @@
+diff --git a/.github/workflows/build-release-branch.yml b/.github/workflows/build-release-branch.yml
+new file mode 100644
+index 0000000000..5342c37960
+--- /dev/null
++++ b/.github/workflows/build-release-branch.yml
+@@ -0,0 +1,27 @@
++---
++name: Build release branch
++on:  # yamllint disable-line rule:truthy
++  push:
++    branches:
++      - release-*
++  workflow_dispatch:
++permissions:
++  contents: read
++
++jobs:
++  ci:
++    name: Run ci
++    uses: ./.github/workflows/ci.yml
++
++  build:
++    name: Build Alertmanager for all architectures
++    runs-on: ubuntu-latest
++    strategy:
++      matrix:
++        thread: [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11]
++    needs: ci
++    steps:
++      - uses: prometheus/promci/build@13941414d409d227afd67544e5d306827db5a1a2 # v0.8.5
++        with:
++          parallelism: 12
++          thread: ${{ matrix.thread }}
+diff --git a/CHANGELOG.md b/CHANGELOG.md
+index b6785cdc76..5467d1072f 100644
+--- a/CHANGELOG.md
++++ b/CHANGELOG.md
+@@ -4,6 +4,18 @@
+ * [FEATURE] ...
+ * [ENHANCEMENT] ...
+ 
++## 0.33.1 / 2026-07-04
++
++* [BUGFIX] doc: fix missing `notification_reason` field in webhook documentation (#5329)
++* [BUGFIX] silences: fix silences snapshot missing legacy matchers field. This caused a bug that prevented older alertmanager versions from reading newer snapshots unnecessarily. (#5330)
++* [BUGFIX] silence with no matchers should populate an empty array in API response (#5331)
++
++## 0.32.3 / 2026-07-04
++
++* [BUGFIX] doc: fix missing `notification_reason` field in webhook documentation (#5329)
++* [BUGFIX] silences: fix silences snapshot missing legacy matchers field. This caused a bug that prevented older alertmanager versions from reading newer snapshots unnecessarily. (#5330)
++* [BUGFIX] silence with no matchers should populate an empty array in API response (#5331)
++
+ ## 0.33.0 / 2026-06-12
+ 
+ * [CHANGE] The '--enable-feature=auto-gomaxprocs' option has been removed. This flag had no effect since v0.29 and was deprecated in v0.32. It can be safely removed from any startup scripts. #5090, #5251
+diff --git a/VERSION b/VERSION
+index be386c9ede..8df3f4592f 100644
+--- a/VERSION
++++ b/VERSION
+@@ -1 +1 @@
+-0.33.0
++0.33.1
+diff --git a/api/v2/compat.go b/api/v2/compat.go
+index cb5560af05..5db1a9cad1 100644
+--- a/api/v2/compat.go
++++ b/api/v2/compat.go
+@@ -38,6 +38,7 @@ func GettableSilenceFromProto(s *silencepb.Silence) (open_api_models.GettableSil
+ 		Silence: open_api_models.Silence{
+ 			StartsAt:    &start,
+ 			EndsAt:      &end,
++			Matchers:    open_api_models.Matchers{},
+ 			Comment:     &s.Comment,
+ 			CreatedBy:   &s.CreatedBy,
+ 			Annotations: s.Annotations,
+diff --git a/docs/configuration.md b/docs/configuration.md
+index 5d79af0c0a..0433e7e5de 100644
+--- a/docs/configuration.md
++++ b/docs/configuration.md
+@@ -1944,6 +1944,7 @@ endpoint:
+   "commonLabels": <object>,
+   "commonAnnotations": <object>,
+   "externalURL": <string>,           // backlink to the Alertmanager.
++  "notification_reason": <string>,   // string represent the reason this notification was generated
+   "alerts": [
+     {
+       "status": "<resolved|firing>",
+diff --git a/silence/silence.go b/silence/silence.go
+index d2fd4f10ee..27016e20b6 100644
+--- a/silence/silence.go
++++ b/silence/silence.go
+@@ -1359,9 +1359,11 @@ func (s state) MarshalBinary() ([]byte, error) {
+ 	var buf bytes.Buffer
+ 
+ 	for _, e := range s {
+-		if _, err := protodelim.MarshalTo(&buf, e); err != nil {
++		b, err := marshalMeshSilence(e)
++		if err != nil {
+ 			return nil, err
+ 		}
++		buf.Write(b)
+ 	}
+ 	return buf.Bytes(), nil
+ }
+@@ -1392,7 +1394,9 @@ func decodeState(r io.Reader) (state, error) {
+ // the first matcher set to the matchers field for backward compatibility with
+ // older alertmanager versions.
+ func prepareSilenceForMarshalling(sil *pb.Silence) {
+-	if len(sil.MatcherSets) > 0 {
++	// The nil check is here because of rare cases where this function
++	// is called on a nil silence. It's up to the caller to decide if it's a bug
++	if sil != nil && len(sil.MatcherSets) > 0 {
+ 		sil.Matchers = sil.MatcherSets[0].Matchers
+ 	}
+ }
+diff --git a/silence/state_test.go b/silence/state_test.go
+index e194336a8e..42eee2dbef 100644
+--- a/silence/state_test.go
++++ b/silence/state_test.go
+@@ -13,10 +13,17 @@
+ package silence
+ 
+ import (
++	"bufio"
++	"bytes"
+ 	"testing"
+ 	"time"
+ 
+ 	"github.com/stretchr/testify/require"
++	"google.golang.org/protobuf/encoding/protodelim"
++	"google.golang.org/protobuf/proto"
++	"google.golang.org/protobuf/types/known/timestamppb"
++
++	pb "github.com/prometheus/alertmanager/silence/silencepb"
+ )
+ 
+ func TestCurrentState(t *testing.T) {
+@@ -37,3 +44,44 @@ func TestCurrentState(t *testing.T) {
+ 	expected = CurrentState(pastStartTime, pastEndTime)
+ 	require.Equal(t, SilenceStateExpired, expected)
+ }
++
++// TestStateMarshalBinaryPopulatesLegacyMatchers asserts that snapshots and
++// cluster local-state payloads written by state.MarshalBinary include the
++// deprecated Silence.Matchers field, so that older Alertmanagers that don't
++// understand MatcherSets still see the silence's first matcher set.
++func TestStateMarshalBinaryPopulatesLegacyMatchers(t *testing.T) {
++	now := time.Now()
++	matchers := []*pb.Matcher{
++		{Name: "alertname", Pattern: "Foo", Type: pb.Matcher_EQUAL},
++		{Name: "severity", Pattern: "warn|crit", Type: pb.Matcher_REGEXP},
++	}
++	sil := &pb.Silence{
++		Id:          "abc",
++		MatcherSets: []*pb.MatcherSet{{Matchers: matchers}},
++		StartsAt:    timestamppb.New(now),
++		EndsAt:      timestamppb.New(now.Add(time.Hour)),
++	}
++	st := state{sil.Id: &pb.MeshSilence{
++		Silence:   sil,
++		ExpiresAt: timestamppb.New(now.Add(2 * time.Hour)),
++	}}
++
++	b, err := st.MarshalBinary()
++	require.NoError(t, err)
++
++	require.Nil(t, sil.Matchers, "MarshalBinary must not mutate in-memory silences")
++
++	// Decode directly via protodelim, bypassing decodeState — decodeState
++	// strips the legacy field, but we want to observe the on-the-wire shape.
++	var got pb.MeshSilence
++	require.NoError(t, protodelim.UnmarshalFrom(bufio.NewReader(bytes.NewReader(b)), &got))
++
++	require.Len(t, got.Silence.MatcherSets, 1)
++	require.Len(t, got.Silence.Matchers, len(matchers))
++	for i, m := range matchers {
++		require.True(t, proto.Equal(m, got.Silence.Matchers[i]),
++			"legacy Matchers[%d] mismatch", i)
++		require.True(t, proto.Equal(m, got.Silence.MatcherSets[0].Matchers[i]),
++			"MatcherSets[0].Matchers[%d] mismatch", i)
++	}
++}

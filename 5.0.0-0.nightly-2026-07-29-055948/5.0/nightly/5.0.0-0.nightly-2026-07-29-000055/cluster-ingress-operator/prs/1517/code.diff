@@ -1,0 +1,407 @@
+diff --git a/cmd/ingress-operator/start.go b/cmd/ingress-operator/start.go
+index 96fedf4541..dfa5a805df 100644
+--- a/cmd/ingress-operator/start.go
++++ b/cmd/ingress-operator/start.go
+@@ -56,6 +56,8 @@ type StartOptions struct {
+ 	HAProxyImages map[string]string
+ 	// DefaultHAProxyVersion is the default HAProxy version.
+ 	DefaultHAProxyVersion string
++	// DeprecatedHAProxyVersion is the list of HAProxy versions blocking upgrade.
++	DeprecatedHAProxyVersion []string
+ 	// CanaryImage is the pullspec of the ingress operator image
+ 	CanaryImage string
+ 	// ReleaseVersion is the cluster version which the operator will converge to.
+@@ -89,6 +91,7 @@ func NewStartCommand() *cobra.Command {
+ 	cmd.Flags().StringVarP(&options.IngressControllerImage, "image", "i", "", "image of the ingress controller the operator will manage (required)")
+ 	cmd.Flags().StringToStringVarP(&options.HAProxyImages, "haproxy-image", "", nil, "HAProxy images as version=pullspec (optional)")
+ 	cmd.Flags().StringVarP(&options.DefaultHAProxyVersion, "default-haproxy-version", "", "", "defines the default HAProxy version, required if --haproxy-image is also provided (optional)")
++	cmd.Flags().StringSliceVarP(&options.DeprecatedHAProxyVersion, "deprecated-haproxy-version", "", []string{string(operatorv1.HAProxyVersion28)}, "defines the HAProxy version blocking upgrade if used (optional)")
+ 	cmd.Flags().StringVarP(&options.CanaryImage, "canary-image", "c", "", "image of the canary container that the operator will manage (optional)")
+ 	cmd.Flags().StringVarP(&options.ReleaseVersion, "release-version", "", statuscontroller.UnknownVersionValue, "the release version the operator should converge to (required)")
+ 	cmd.Flags().StringVarP(&options.MetricsListenAddr, "metrics-listen-addr", "", "127.0.0.1:60000", "metrics endpoint listen address (required)")
+@@ -162,12 +165,21 @@ func start(opts *StartOptions) error {
+ 		}
+ 	}
+ 
++	if len(haproxyImages) > 0 {
++		for _, version := range opts.DeprecatedHAProxyVersion {
++			if _, found := haproxyImages[operatorv1.HAProxyVersion(version)]; !found {
++				return fmt.Errorf("deprecated HAProxy version %q not found in --haproxy-image", version)
++			}
++		}
++	}
++
+ 	operatorConfig := operatorconfig.Config{
+ 		OperatorReleaseVersion:    opts.ReleaseVersion,
+ 		Namespace:                 opts.OperatorNamespace,
+ 		IngressControllerImage:    opts.IngressControllerImage,
+ 		HAProxyImages:             haproxyImages,
+ 		DefaultHAProxyVersion:     defaultHAProxyVersion,
++		DeprecatedHAProxyVersion:  opts.DeprecatedHAProxyVersion,
+ 		CanaryImage:               opts.CanaryImage,
+ 		GatewayAPIOperatorCatalog: opts.GatewayAPIOperatorCatalog,
+ 		GatewayAPIOperatorChannel: opts.GatewayAPIOperatorChannel,
+diff --git a/manifests/02-deployment-ibm-cloud-managed.yaml b/manifests/02-deployment-ibm-cloud-managed.yaml
+index 3d2e7b560c..7f346c0558 100644
+--- a/manifests/02-deployment-ibm-cloud-managed.yaml
++++ b/manifests/02-deployment-ibm-cloud-managed.yaml
+@@ -37,6 +37,8 @@ spec:
+         - 3.2=$(HAPROXY_32_IMAGE)
+         - --default-haproxy-version
+         - $(DEFAULT_HAPROXY_VERSION)
++        - --deprecated-haproxy-version
++        - $(DEPRECATED_HAPROXY_VERSION)
+         - --canary-image
+         - $(CANARY_IMAGE)
+         - --release-version
+@@ -64,6 +66,8 @@ spec:
+           value: openshift/origin-haproxy:v3.2
+         - name: DEFAULT_HAPROXY_VERSION
+           value: "3.2"
++        - name: DEPRECATED_HAPROXY_VERSION
++          value: "2.8"
+         - name: CANARY_IMAGE
+           value: openshift/origin-cluster-ingress-operator:latest
+         - name: GATEWAY_API_OPERATOR_CATALOG
+diff --git a/manifests/02-deployment.yaml b/manifests/02-deployment.yaml
+index 53b938d054..5889414dfd 100644
+--- a/manifests/02-deployment.yaml
++++ b/manifests/02-deployment.yaml
+@@ -66,6 +66,8 @@ spec:
+           - "3.2=$(HAPROXY_32_IMAGE)"
+           - --default-haproxy-version
+           - "$(DEFAULT_HAPROXY_VERSION)"
++          - --deprecated-haproxy-version
++          - "$(DEPRECATED_HAPROXY_VERSION)"
+           - --canary-image
+           - "$(CANARY_IMAGE)"
+           - --release-version
+@@ -93,6 +95,8 @@ spec:
+               value: openshift/origin-haproxy:v3.2
+             - name: DEFAULT_HAPROXY_VERSION
+               value: "3.2"
++            - name: DEPRECATED_HAPROXY_VERSION
++              value: "2.8"
+             - name: CANARY_IMAGE
+               value: openshift/origin-cluster-ingress-operator:latest
+             - name: GATEWAY_API_OPERATOR_CATALOG
+diff --git a/pkg/operator/config/config.go b/pkg/operator/config/config.go
+index f437621e09..34c01a1c29 100644
+--- a/pkg/operator/config/config.go
++++ b/pkg/operator/config/config.go
+@@ -22,6 +22,9 @@ type Config struct {
+ 	// DefaultHAProxyVersion defines the default HAProxy version.
+ 	DefaultHAProxyVersion operatorv1.HAProxyVersion
+ 
++	// DeprecatedHAProxyVersion defines the HAProxy versions blocking upgrade.
++	DeprecatedHAProxyVersion []string
++
+ 	// CanaryImage is the ingress operator image, which runs a canary command.
+ 	CanaryImage string
+ 
+diff --git a/pkg/operator/controller/ingress/controller.go b/pkg/operator/controller/ingress/controller.go
+index 2f502775d8..dd554bd05d 100644
+--- a/pkg/operator/controller/ingress/controller.go
++++ b/pkg/operator/controller/ingress/controller.go
+@@ -255,6 +255,7 @@ type Config struct {
+ 	IngressControllerImage      string
+ 	HAProxyImages               map[operatorv1.HAProxyVersion]string
+ 	DefaultHAProxyVersion       operatorv1.HAProxyVersion
++	DeprecatedHAProxyVersion    []string
+ 	IngressControllerDCMEnabled bool
+ 	FeatureMultiHAProxyEnabled  bool
+ }
+diff --git a/pkg/operator/controller/ingress/deployment_test.go b/pkg/operator/controller/ingress/deployment_test.go
+index 3a963c7322..22030dc672 100644
+--- a/pkg/operator/controller/ingress/deployment_test.go
++++ b/pkg/operator/controller/ingress/deployment_test.go
+@@ -41,6 +41,11 @@ const (
+ 	routerServiceAccountVolumeName = "kube-api-access"
+ )
+ 
++const (
++	defaultHAProxyVersion   = operatorv1.HAProxyVersion32
++	alternateHAProxyVersion = operatorv1.HAProxyVersion28
++)
++
+ var toleration = corev1.Toleration{
+ 	Key:      "foo",
+ 	Value:    "bar",
+@@ -900,8 +905,6 @@ func hasDesiredRouterDeploymentSpecTemplate(t *testing.T, ic *operatorv1.Ingress
+ }
+ 
+ func TestDesiredRouterDeploymentSpecHAProxyVersion(t *testing.T) {
+-	const defaultHAProxyVersion = operatorv1.HAProxyVersion32
+-
+ 	var haproxyImages = map[operatorv1.HAProxyVersion]string{
+ 		operatorv1.HAProxyVersion28: "quay.io/openshift/haproxy:2.8",
+ 		operatorv1.HAProxyVersion32: "quay.io/openshift/haproxy:3.2",
+diff --git a/pkg/operator/controller/ingress/status.go b/pkg/operator/controller/ingress/status.go
+index 6c4dd06518..1b4885f62f 100644
+--- a/pkg/operator/controller/ingress/status.go
++++ b/pkg/operator/controller/ingress/status.go
+@@ -122,7 +122,7 @@ func (r *reconciler) syncIngressControllerStatus(ic *operatorv1.IngressControlle
+ 	errs = append(errs, err)
+ 	updated.Status.Conditions = MergeConditions(updated.Status.Conditions, computeIngressProgressingCondition(updated.Status.Conditions))
+ 	updated.Status.Conditions = MergeConditions(updated.Status.Conditions, degradedCondition)
+-	updated.Status.Conditions = MergeConditions(updated.Status.Conditions, computeIngressUpgradeableCondition(ic, deploymentRef, service, platformStatus, secret))
++	updated.Status.Conditions = MergeConditions(updated.Status.Conditions, computeIngressUpgradeableCondition(updated, r.config, deploymentRef, service, platformStatus, secret))
+ 	updated.Status.Conditions = MergeConditions(updated.Status.Conditions, computeIngressEvaluationConditionsDetectedCondition(ic, service))
+ 
+ 	updated.Status.Conditions = PruneConditions(updated.Status.Conditions)
+@@ -719,11 +719,13 @@ func computeIngressDegradedCondition(conditions []operatorv1.OperatorCondition,
+ }
+ 
+ // computeIngressUpgradeableCondition computes the IngressController's "Upgradeable" status condition.
+-func computeIngressUpgradeableCondition(ic *operatorv1.IngressController, deploymentRef metav1.OwnerReference, service *corev1.Service, platform *configv1.PlatformStatus, secret *corev1.Secret) operatorv1.OperatorCondition {
++func computeIngressUpgradeableCondition(ic *operatorv1.IngressController, config Config, deploymentRef metav1.OwnerReference, service *corev1.Service, platform *configv1.PlatformStatus, secret *corev1.Secret) operatorv1.OperatorCondition {
+ 	var errs []error
+ 
+ 	errs = append(errs, checkDefaultCertificate(secret, "*."+ic.Status.Domain))
+ 
++	errs = append(errs, checkDeprecatedHAProxyVersion(ic, config.DeprecatedHAProxyVersion))
++
+ 	if service != nil {
+ 		errs = append(errs, loadBalancerServiceIsUpgradeable(ic, deploymentRef, service, platform))
+ 	}
+@@ -812,6 +814,15 @@ func checkDefaultCertificate(secret *corev1.Secret, domain string) error {
+ 	return nil
+ }
+ 
++// checkDeprecatedHAProxyVersion returns an error if the provided IngressController
++// resource references a HAProxy version unsupported in the next release.
++func checkDeprecatedHAProxyVersion(ic *operatorv1.IngressController, deprecatedHAProxyVersion []string) error {
++	if version := string(ic.Status.EffectiveHAProxyVersion); slices.Contains(deprecatedHAProxyVersion, version) {
++		return fmt.Errorf("haproxy %q is being removed in the next release; update or unset spec.haproxyVersion before upgrading", version)
++	}
++	return nil
++}
++
+ func formatConditions(conditions []*operatorv1.OperatorCondition) string {
+ 	var formatted string
+ 	if len(conditions) == 0 {
+diff --git a/pkg/operator/controller/ingress/status_test.go b/pkg/operator/controller/ingress/status_test.go
+index 759c6b4efd..2c87c1430b 100644
+--- a/pkg/operator/controller/ingress/status_test.go
++++ b/pkg/operator/controller/ingress/status_test.go
+@@ -3753,34 +3753,34 @@ func Test_computeIngressUpgradeableCondition(t *testing.T) {
+ 	)
+ 	testCases := []struct {
+ 		description string
+-		mutate      func(*corev1.Service)
++		mutate      func(*operatorv1.IngressController, *corev1.Service)
+ 		secret      *corev1.Secret
+ 		expect      bool
+ 	}{
+ 		{
+ 			description: "if the service.beta.kubernetes.io/aws-load-balancer-additional-resource-tags stays the same",
+-			mutate: func(svc *corev1.Service) {
++			mutate: func(_ *operatorv1.IngressController, svc *corev1.Service) {
+ 				svc.Annotations[awsLBAdditionalResourceTags] = "Key1=Value1"
+ 			},
+ 			expect: true,
+ 		},
+ 		{
+ 			description: "if the service.beta.kubernetes.io/aws-load-balancer-additional-resource-tags annotation changes not by ingress controller",
+-			mutate: func(svc *corev1.Service) {
++			mutate: func(_ *operatorv1.IngressController, svc *corev1.Service) {
+ 				svc.Annotations[awsLBAdditionalResourceTags] = "Key2=Value2"
+ 			},
+ 			expect: false,
+ 		},
+ 		{
+ 			description: "if the service.beta.kubernetes.io/load-balancer-source-ranges is set",
+-			mutate: func(svc *corev1.Service) {
++			mutate: func(_ *operatorv1.IngressController, svc *corev1.Service) {
+ 				svc.Annotations[corev1.AnnotationLoadBalancerSourceRangesKey] = "127.0.0.0/8"
+ 			},
+ 			expect: true,
+ 		},
+ 		{
+ 			description: "if the LoadBalancerSourceRanges is set when AllowedSourceRanges is empty",
+-			mutate: func(svc *corev1.Service) {
++			mutate: func(_ *operatorv1.IngressController, svc *corev1.Service) {
+ 				svc.Spec.LoadBalancerSourceRanges = []string{"127.0.0.0/8"}
+ 			},
+ 			expect: true,
+@@ -3795,6 +3795,27 @@ func Test_computeIngressUpgradeableCondition(t *testing.T) {
+ 			secret:      makeDefaultCertificateSecret(wildcardDomain, []string{}),
+ 			expect:      false,
+ 		},
++		{
++			description: "if the HAProxy version is unsupported",
++			mutate: func(ic *operatorv1.IngressController, _ *corev1.Service) {
++				ic.Status.EffectiveHAProxyVersion = alternateHAProxyVersion
++			},
++			expect: false,
++		},
++		{
++			description: "if the HAProxy version is empty",
++			mutate: func(ic *operatorv1.IngressController, _ *corev1.Service) {
++				ic.Status.EffectiveHAProxyVersion = ""
++			},
++			expect: true,
++		},
++		{
++			description: "if the HAProxy version is supported",
++			mutate: func(ic *operatorv1.IngressController, _ *corev1.Service) {
++				ic.Status.EffectiveHAProxyVersion = defaultHAProxyVersion
++			},
++			expect: true,
++		},
+ 	}
+ 	for _, tc := range testCases {
+ 		t.Run(tc.description, func(t *testing.T) {
+@@ -3838,7 +3859,7 @@ func Test_computeIngressUpgradeableCondition(t *testing.T) {
+ 				return
+ 			}
+ 			if tc.mutate != nil {
+-				tc.mutate(service)
++				tc.mutate(ic, service)
+ 			}
+ 			secret := tc.secret
+ 			if secret == nil {
+@@ -3850,7 +3871,11 @@ func Test_computeIngressUpgradeableCondition(t *testing.T) {
+ 				expectedStatus = operatorv1.ConditionTrue
+ 			}
+ 
+-			actual := computeIngressUpgradeableCondition(ic, deploymentRef, service, platformStatus, secret)
++			config := Config{
++				DeprecatedHAProxyVersion: []string{string(alternateHAProxyVersion)},
++			}
++
++			actual := computeIngressUpgradeableCondition(ic, config, deploymentRef, service, platformStatus, secret)
+ 			if actual.Status != expectedStatus {
+ 				t.Errorf("expected Upgradeable to be %q, got %q", expectedStatus, actual.Status)
+ 			}
+diff --git a/pkg/operator/operator.go b/pkg/operator/operator.go
+index 3990db23c9..3ed188709e 100644
+--- a/pkg/operator/operator.go
++++ b/pkg/operator/operator.go
+@@ -186,6 +186,7 @@ func New(config operatorconfig.Config, kubeConfig *rest.Config) (*Operator, erro
+ 		IngressControllerImage:      config.IngressControllerImage,
+ 		HAProxyImages:               config.HAProxyImages,
+ 		DefaultHAProxyVersion:       config.DefaultHAProxyVersion,
++		DeprecatedHAProxyVersion:    config.DeprecatedHAProxyVersion,
+ 		IngressControllerDCMEnabled: ingressControllerDCMEnabled,
+ 		FeatureMultiHAProxyEnabled:  featureMultiHAProxyEnabled,
+ 	}); err != nil {
+diff --git a/test/e2e/all_test.go b/test/e2e/all_test.go
+index 6da5bcd87f..5421716c5f 100644
+--- a/test/e2e/all_test.go
++++ b/test/e2e/all_test.go
+@@ -146,6 +146,11 @@ func TestAll(t *testing.T) {
+ 		// Serializing the test ensures it runs in isolation with other tests,
+ 		// preventing any impact of the mutating webhook on pod creation in the cluster
+ 		t.Run("TestGatewayAPI", TestGatewayAPI)
++		// TestMultiHAProxyUpgradeableCondition checks a ClusterOperator resource condition,
++		// its state could be changed by other parallel tests. Isolating the test ensures that
++		// the ClusterOperator/ingress resource reports only "default" ingress and the ingress
++		// resource being tested.
++		t.Run("TestMultiHAProxyUpgradeableCondition", TestMultiHAProxyUpgradeableCondition)
+ 		t.Run("TestIngressControllerConditionsMetricAfterRestart", TestIngressControllerConditionsMetricAfterRestart)
+ 		// TestIngressControllerCustomEndpoints must run last because
+ 		// modifying Infrastructure.spec.platformSpec.aws.serviceEndpoints
+diff --git a/test/e2e/multi_haproxy_test.go b/test/e2e/multi_haproxy_test.go
+new file mode 100644
+index 0000000000..9f6927df07
+--- /dev/null
++++ b/test/e2e/multi_haproxy_test.go
+@@ -0,0 +1,97 @@
++//go:build e2e
++// +build e2e
++
++package e2e
++
++import (
++	"context"
++	"testing"
++	"time"
++
++	"github.com/stretchr/testify/assert"
++	"github.com/stretchr/testify/require"
++	"k8s.io/apimachinery/pkg/types"
++	"k8s.io/apiserver/pkg/storage/names"
++
++	configv1 "github.com/openshift/api/config/v1"
++	"github.com/openshift/api/features"
++	operatorv1 "github.com/openshift/api/operator/v1"
++)
++
++func TestMultiHAProxyUpgradeableCondition(t *testing.T) {
++	enabled, err := isFeatureGateEnabled(features.FeatureGateIngressControllerMultipleHAProxyVersions)
++	require.NoError(t, err)
++	if !enabled {
++		t.Skip("Skipping TestMultiHAProxyUpgradeableCondition as FeatureGateIngressControllerMultipleHAProxyVersions is disabled")
++	}
++
++	ctx := context.Background()
++
++	testCases := map[string]struct {
++		haproxyVersion operatorv1.HAProxyVersion
++		expectedStatus bool
++	}{
++		"should block upgrade on deprecated version": {
++			haproxyVersion: operatorv1.HAProxyVersion28,
++			expectedStatus: false,
++		},
++		"should allow upgrade on supported version": {
++			haproxyVersion: operatorv1.HAProxyVersion32,
++			expectedStatus: true,
++		},
++		"should allow upgrade on default version": {
++			haproxyVersion: "",
++			expectedStatus: true,
++		},
++	}
++
++	icStatus := map[bool]operatorv1.ConditionStatus{false: operatorv1.ConditionFalse, true: operatorv1.ConditionTrue}
++	coStatus := map[bool]configv1.ConditionStatus{false: configv1.ConditionFalse, true: configv1.ConditionTrue}
++
++	for name, test := range testCases {
++		t.Run(name, func(t *testing.T) {
++			name := types.NamespacedName{
++				Namespace: defaultName.Namespace,
++				Name:      names.SimpleNameGenerator.GenerateName("e2e-multi-haproxy-"),
++			}
++			ic := newPrivateController(name, name.Name+".router.local")
++			ic.Spec.HAProxyVersion = test.haproxyVersion
++
++			err := createWithRetryOnError(t, ctx, ic, DefaultRetryTimeout)
++			require.NoError(t, err, "error creating ingress controller")
++
++			// icCleanup deletes ingress controller and waits for the cluster operator to report Upgradeable as True
++			icCleanup := func() {
++				assertIngressControllerDeleted(t, kclient, ic)
++				err := waitForClusterOperatorConditions(t, kclient, configv1.ClusterOperatorStatusCondition{
++					Type:   configv1.OperatorUpgradeable,
++					Status: configv1.ConditionTrue,
++				})
++				assert.NoError(t, err)
++			}
++			t.Cleanup(icCleanup)
++
++			// wait for the ingress controller to be ready
++			err = waitForIngressControllerCondition(t, kclient, 5*time.Minute, name, availableConditionsForPrivateIngressController...)
++			require.NoError(t, err)
++
++			// wait for the ingress controller to report Upgradeable in the expected status
++			err = waitForIngressControllerCondition(t, kclient, time.Minute, name, operatorv1.OperatorCondition{
++				Type:   operatorv1.OperatorStatusTypeUpgradeable,
++				Status: icStatus[test.expectedStatus],
++			})
++			assert.NoError(t, err)
++
++			// wait for the cluster operator to report Upgradeable in the expected status
++			err = waitForClusterOperatorConditions(t, kclient, configv1.ClusterOperatorStatusCondition{
++				Type:   configv1.OperatorUpgradeable,
++				Status: coStatus[test.expectedStatus],
++			})
++			assert.NoError(t, err)
++
++			// clean up ingress controller before finishing the test
++			icCleanup()
++		})
++	}
++
++}

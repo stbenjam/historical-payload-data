@@ -1,0 +1,287 @@
+diff --git a/OWNERS b/OWNERS
+index 67894788f..b76d948db 100644
+--- a/OWNERS
++++ b/OWNERS
+@@ -1,12 +1,6 @@
+ reviewers:
+-  - jgbernalp
+-  - zhuje
+-  - peteryurkovich
+-  - etmurasaki
++  - observability-ui-devs
+ approvers:
+   - jan--f
+-  - jgbernalp
+   - kyoto
+-  - zhuje
+-  - peteryurkovich
+-  - etmurasaki
++  - observability-ui
+diff --git a/OWNERS_ALIASES b/OWNERS_ALIASES
+new file mode 100644
+index 000000000..61fda0338
+--- /dev/null
++++ b/OWNERS_ALIASES
+@@ -0,0 +1,10 @@
++aliases:
++  observability-ui-devs:
++    - jgbernalp
++    - zhuje
++    - peteryurkovich
++  observability-ui:
++    - jgbernalp
++    - zhuje
++    - peteryurkovich
++    - etmurasaki
+diff --git a/web/cypress/OWNERS b/web/cypress/OWNERS
+new file mode 100644
+index 000000000..0ffffd0bd
+--- /dev/null
++++ b/web/cypress/OWNERS
+@@ -0,0 +1,11 @@
++reviewers:
++  - etmurasaki
++  - DavidRajnoha
++  - jgbernalp
++  - peteryurkovich
++approvers:
++  - etmurasaki
++  - DavidRajnoha
++  - jgbernalp
++  - peteryurkovich
++  - zhuje
+diff --git a/web/eslint-rules/require-feature-owners.spec.ts b/web/eslint-rules/require-feature-owners.spec.ts
+new file mode 100644
+index 000000000..8763e4c49
+--- /dev/null
++++ b/web/eslint-rules/require-feature-owners.spec.ts
+@@ -0,0 +1,74 @@
++import type { Rule } from 'eslint';
++import { RuleTester } from 'eslint';
++import { createRequireFeatureOwners } from './require-feature-owners';
++
++const ruleTester = new RuleTester({
++  languageOptions: { ecmaVersion: 2021, sourceType: 'module' },
++});
++
++ruleTester.run(
++  'require-feature-owners (OWNERS present)',
++  createRequireFeatureOwners(() => true),
++  {
++    valid: [
++      { code: '', filename: '/repo/web/src/features/alerts/components/AlertList.tsx' },
++      { code: '', filename: '/repo/web/src/features/metrics/pages/MetricsPage.tsx' },
++      { code: '', filename: '/repo/web/src/features/alerts/index.ts' },
++      { code: '', filename: '/repo/web/src/shared/utils/format.ts' },
++      { code: '', filename: '/repo/web/src/shared/hooks/useAlerts.ts' },
++    ],
++    invalid: [],
++  },
++);
++
++ruleTester.run(
++  'require-feature-owners (OWNERS absent)',
++  createRequireFeatureOwners(() => false),
++  {
++    // Not in features folder
++    valid: [
++      { code: '', filename: '/repo/web/src/shared/utils/format.ts' },
++      { code: '', filename: '/repo/web/src/shared/hooks/useAlerts.ts' },
++    ],
++    invalid: [
++      {
++        code: '',
++        filename: '/repo/web/src/features/alerts/components/AlertList.tsx',
++        errors: [{ messageId: 'missingOwners', data: { feature: 'alerts' } }],
++      },
++      {
++        code: '',
++        filename: '/repo/web/src/features/new-feature/NewFeature.tsx',
++        errors: [{ messageId: 'missingOwners', data: { feature: 'new-feature' } }],
++      },
++    ],
++  },
++);
++
++describe('require-feature-owners (stale cache regression)', () => {
++  it('re-checks existsSync on each invocation instead of reusing a cached result', () => {
++    let ownersExists = false;
++    const rule = createRequireFeatureOwners(() => ownersExists);
++
++    const reports: Rule.ReportDescriptor[] = [];
++    const makeContext = (filename: string) =>
++      ({
++        filename,
++        report: (descriptor: Rule.ReportDescriptor) => reports.push(descriptor),
++      }) as unknown as Rule.RuleContext;
++
++    const filename = '/repo/web/src/features/alerts/AlertList.tsx';
++
++    // First invocation: OWNERS missing — expect one report.
++    rule.create(makeContext(filename));
++    expect(reports).toHaveLength(1);
++
++    // OWNERS file now exists (e.g. created mid watch-mode session).
++    ownersExists = true;
++    reports.length = 0;
++
++    // Second invocation with the same rule instance — must not return a stale result.
++    rule.create(makeContext(filename));
++    expect(reports).toHaveLength(0);
++  });
++});
+diff --git a/web/eslint-rules/require-feature-owners.ts b/web/eslint-rules/require-feature-owners.ts
+new file mode 100644
+index 000000000..d7abea731
+--- /dev/null
++++ b/web/eslint-rules/require-feature-owners.ts
+@@ -0,0 +1,50 @@
++import fs from 'node:fs';
++import path from 'node:path';
++import type { Rule } from 'eslint';
++
++const FEATURES_MARKER = path.join('src', 'features') + path.sep;
++
++export function createRequireFeatureOwners(
++  existsSync: (p: string) => boolean = fs.existsSync,
++): Rule.RuleModule {
++  return {
++    meta: {
++      type: 'problem',
++      docs: {
++        description:
++          'Require an OWNERS file in the root of every feature directory under src/features/',
++      },
++      schema: [],
++      messages: {
++        missingOwners:
++          'Feature directory "src/features/{{feature}}" is missing an OWNERS file. ' +
++          'Add an OWNERS file to define reviewers and approvers for this feature.',
++      },
++    },
++    create(context) {
++      const filename = context.filename;
++      const markerIndex = filename.indexOf(FEATURES_MARKER);
++
++      if (markerIndex === -1) {
++        return {};
++      }
++
++      const afterMarker = filename.slice(markerIndex + FEATURES_MARKER.length);
++      const feature = afterMarker.split(path.sep)[0];
++      const featureDir = filename.slice(0, markerIndex + FEATURES_MARKER.length + feature.length);
++      const ownersPath = path.join(featureDir, 'OWNERS');
++
++      if (!existsSync(ownersPath)) {
++        context.report({
++          loc: { line: 1, column: 0 },
++          messageId: 'missingOwners',
++          data: { feature },
++        });
++      }
++
++      return {};
++    },
++  };
++}
++
++export const requireFeatureOwners = createRequireFeatureOwners();
+diff --git a/web/eslint.config.ts b/web/eslint.config.ts
+index fb5d17dc9..e2447a037 100644
+--- a/web/eslint.config.ts
++++ b/web/eslint.config.ts
+@@ -12,6 +12,7 @@ import { FlatCompat } from '@eslint/eslintrc';
+ import importPlugin from 'eslint-plugin-import';
+ import { importBoundaryZones } from './eslint-rules/import-boundary-zones';
+ import { fileNaming } from './eslint-rules/file-naming';
++import { requireFeatureOwners } from './eslint-rules/require-feature-owners';
+ 
+ const __filename = fileURLToPath(import.meta.url);
+ const __dirname = path.dirname(__filename);
+@@ -183,10 +184,13 @@ export default defineConfig([
+     files: ['src/**/*.ts', 'src/**/*.tsx'],
+     ignores: ['cypress/**', 'src/**/*.d.ts'],
+     plugins: {
+-      'local-rules': { rules: { 'file-naming': fileNaming } } as any,
++      'local-rules': {
++        rules: { 'file-naming': fileNaming, 'require-feature-owners': requireFeatureOwners },
++      } as any,
+     },
+     rules: {
+       'local-rules/file-naming': 'error',
++      'local-rules/require-feature-owners': 'error',
+     },
+   },
+   {
+diff --git a/web/src/features/alerts/OWNERS b/web/src/features/alerts/OWNERS
+new file mode 100644
+index 000000000..9a685050f
+--- /dev/null
++++ b/web/src/features/alerts/OWNERS
+@@ -0,0 +1,4 @@
++reviewers:
++  - observability-ui-devs
++approvers:
++  - observability-ui
+diff --git a/web/src/features/incidents/OWNERS b/web/src/features/incidents/OWNERS
+new file mode 100644
+index 000000000..6a6373468
+--- /dev/null
++++ b/web/src/features/incidents/OWNERS
+@@ -0,0 +1,6 @@
++reviewers:
++  - observability-ui-devs
++  - DavidRajnoha
++approvers:
++  - observability-ui
++  - DavidRajnoha
+diff --git a/web/src/features/legacy-dashboards/OWNERS b/web/src/features/legacy-dashboards/OWNERS
+new file mode 100644
+index 000000000..9a685050f
+--- /dev/null
++++ b/web/src/features/legacy-dashboards/OWNERS
+@@ -0,0 +1,4 @@
++reviewers:
++  - observability-ui-devs
++approvers:
++  - observability-ui
+diff --git a/web/src/features/metrics/OWNERS b/web/src/features/metrics/OWNERS
+new file mode 100644
+index 000000000..9a685050f
+--- /dev/null
++++ b/web/src/features/metrics/OWNERS
+@@ -0,0 +1,4 @@
++reviewers:
++  - observability-ui-devs
++approvers:
++  - observability-ui
+diff --git a/web/src/features/perses-dashboards/OWNERS b/web/src/features/perses-dashboards/OWNERS
+new file mode 100644
+index 000000000..9a685050f
+--- /dev/null
++++ b/web/src/features/perses-dashboards/OWNERS
+@@ -0,0 +1,4 @@
++reviewers:
++  - observability-ui-devs
++approvers:
++  - observability-ui
+diff --git a/web/src/features/targets/OWNERS b/web/src/features/targets/OWNERS
+new file mode 100644
+index 000000000..9a685050f
+--- /dev/null
++++ b/web/src/features/targets/OWNERS
+@@ -0,0 +1,4 @@
++reviewers:
++  - observability-ui-devs
++approvers:
++  - observability-ui
+diff --git a/web/src/shared/OWNERS b/web/src/shared/OWNERS
+new file mode 100644
+index 000000000..9a685050f
+--- /dev/null
++++ b/web/src/shared/OWNERS
+@@ -0,0 +1,4 @@
++reviewers:
++  - observability-ui-devs
++approvers:
++  - observability-ui

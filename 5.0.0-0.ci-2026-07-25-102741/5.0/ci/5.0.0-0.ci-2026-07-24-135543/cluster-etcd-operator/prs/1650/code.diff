@@ -1,0 +1,993 @@
+diff --git a/jsonnet/jsonnetfile.lock.json b/jsonnet/jsonnetfile.lock.json
+index 36ce0ca370..fe26c9d5c4 100644
+--- a/jsonnet/jsonnetfile.lock.json
++++ b/jsonnet/jsonnetfile.lock.json
+@@ -8,7 +8,7 @@
+           "subdir": "contrib/mixin"
+         }
+       },
+-      "version": "9a2b574b70e69eb1f47dfc896b2f63245f1873f6",
++      "version": "1f63a3ef3adb2fb0c285403b4bf2916edf18f96d",
+       "sum": "XmXkOCriQIZmXwlIIFhqlJMa0e6qGWdxZD+ZDYaN0Po="
+     },
+     {
+@@ -18,7 +18,7 @@
+           "subdir": "gen/grafonnet-v10.0.0"
+         }
+       },
+-      "version": "7380c9c64fb973f34c3ec46265621a2b0dee0058",
++      "version": "41e6bfcbe4ef1054298ffff8664f1354c897dd2d",
+       "sum": "xdcrJPJlpkq4+5LpGwN4tPAuheNNLXZjE6tDcyvFjr0="
+     },
+     {
+@@ -28,7 +28,7 @@
+           "subdir": "doc-util"
+         }
+       },
+-      "version": "6ac6c69685b8c29c54515448eaca583da2d88150",
++      "version": "bf6f08ae02a51c48bdcec4629b1c1a5a62c6f803",
+       "sum": "BrAL/k23jq+xy9oA7TWIhUx07dsA/QLm3g7ktCwe//U="
+     },
+     {
+diff --git a/jsonnet/main.jsonnet b/jsonnet/main.jsonnet
+index 7e1ed0b6c8..caf75cc10f 100644
+--- a/jsonnet/main.jsonnet
++++ b/jsonnet/main.jsonnet
+@@ -1,5 +1,6 @@
+ local etcdMixin = (import 'github.com/etcd-io/etcd/contrib/mixin/mixin.libsonnet');
+ local openshiftRules = (import 'custom.libsonnet');
++local tnfRules = (import 'tnf-alerts.libsonnet');
+ 
+ local alertingRules = if std.objectHasAll(etcdMixin, 'prometheusAlerts') then etcdMixin.prometheusAlerts.groups else [];
+ local promRules = if std.objectHasAll(etcdMixin, 'prometheusRules') then etcdMixin.prometheusRules.groups else [];
+@@ -29,7 +30,7 @@ local alertingRulesWithRunbooks = std.flattenArrays(std.map(
+         group.rules
+       )
+     ),
+-  excludeRules + openshiftRules.prometheusRules.groups
++  excludeRules + openshiftRules.prometheusRules.groups + tnfRules.prometheusRules.groups
+ ));
+ 
+ local modifiedRules = std.map(function(group) group {
+@@ -39,7 +40,7 @@ local modifiedRules = std.map(function(group) group {
+                    },
+                  } else rule,
+                  super.rules),
+-}, excludeRules + openshiftRules.prometheusRules.groups);
++}, excludeRules + openshiftRules.prometheusRules.groups + tnfRules.prometheusRules.groups);
+ 
+ {
+   apiVersion: 'monitoring.coreos.com/v1',
+diff --git a/jsonnet/tnf-alerts.libsonnet b/jsonnet/tnf-alerts.libsonnet
+new file mode 100644
+index 0000000000..2208af1391
+--- /dev/null
++++ b/jsonnet/tnf-alerts.libsonnet
+@@ -0,0 +1,170 @@
++{
++  prometheusRules:: {
++    groups: [
++      {
++        name: 'tnf-pacemaker.rules',
++        rules: [
++          // Cluster-level alerts
++          {
++            alert: 'TNFNodeCountMismatch',
++            expr: 'tnf_cluster_node_count_as_expected == 0',
++            'for': '5m',
++            labels: {
++              severity: 'critical',
++            },
++            annotations: {
++              summary: 'TNF cluster node count does not match expected topology.',
++              description: 'The TNF cluster reports an unexpected number of nodes. This may indicate a node was added or removed outside the expected two-node topology, potentially breaking quorum assumptions.',
++              runbook_url: 'https://github.com/openshift/runbooks/blob/master/alerts/cluster-etcd-operator/TNFNodeCountMismatch.md',
++            },
++          },
++          {
++            alert: 'TNFClusterInMaintenance',
++            expr: 'tnf_cluster_in_service == 0',
++            'for': '2m',
++            labels: {
++              severity: 'warning',
++            },
++            annotations: {
++              summary: 'TNF cluster is in maintenance mode.',
++              description: 'The TNF Pacemaker cluster has been placed into maintenance mode. Automated failover and fencing are disabled. The cluster will not recover from failures until maintenance mode is cleared.',
++              runbook_url: 'https://github.com/openshift/runbooks/blob/master/alerts/cluster-etcd-operator/TNFClusterInMaintenance.md',
++            },
++          },
++          // Node-level alerts
++          {
++            alert: 'TNFNodeOffline',
++            expr: 'tnf_node_online == 0',
++            'for': '2m',
++            labels: {
++              severity: 'critical',
++            },
++            annotations: {
++              summary: 'TNF node {{ $labels.node }} is offline.',
++              description: 'TNF node {{ $labels.node }} has been offline for more than 2 minutes. This may indicate a node failure, reboot, or network partition. The cluster is operating in a degraded single-node state.',
++              runbook_url: 'https://github.com/openshift/runbooks/blob/master/alerts/cluster-etcd-operator/TNFNodeOffline.md',
++            },
++          },
++          {
++            alert: 'TNFNodeFencingUnavailable',
++            expr: 'tnf_node_fencing_available == 0',
++            'for': '5m',
++            labels: {
++              severity: 'critical',
++            },
++            annotations: {
++              summary: 'Fencing is unavailable for TNF node {{ $labels.node }}.',
++              description: 'No fencing devices are available for TNF node {{ $labels.node }}. Without fencing, the cluster cannot safely recover from a split-brain scenario. Check BMC reachability and credentials.',
++              runbook_url: 'https://github.com/openshift/runbooks/blob/master/alerts/cluster-etcd-operator/TNFNodeFencingUnavailable.md',
++            },
++          },
++          {
++            alert: 'TNFNodeFencingDegraded',
++            expr: 'tnf_node_fencing_healthy == 0 and tnf_node_fencing_available == 1 and on(node) tnf_node_in_service == 1',
++            'for': '10m',
++            labels: {
++              severity: 'warning',
++            },
++            annotations: {
++              summary: 'Fencing is degraded for TNF node {{ $labels.node }}.',
++              description: 'Fencing devices for TNF node {{ $labels.node }} are available but not fully healthy. Fencing can still operate but with reduced redundancy. Investigate fence device health.',
++              runbook_url: 'https://github.com/openshift/runbooks/blob/master/alerts/cluster-etcd-operator/TNFNodeFencingDegraded.md',
++            },
++          },
++          {
++            alert: 'TNFNodeUnclean',
++            expr: 'tnf_node_clean == 0',
++            'for': '5m',
++            labels: {
++              severity: 'critical',
++            },
++            annotations: {
++              summary: 'TNF node {{ $labels.node }} is in an unclean state.',
++              description: 'TNF node {{ $labels.node }} is marked unclean by Pacemaker. This indicates a fencing, communication, or configuration issue that must be resolved before the node can rejoin the cluster.',
++              runbook_url: 'https://github.com/openshift/runbooks/blob/master/alerts/cluster-etcd-operator/TNFNodeUnclean.md',
++            },
++          },
++          {
++            alert: 'TNFNodeInMaintenance',
++            expr: 'tnf_node_in_service == 0 and tnf_cluster_in_service == 1',
++            'for': '2m',
++            labels: {
++              severity: 'warning',
++            },
++            annotations: {
++              summary: 'TNF node {{ $labels.node }} is in maintenance mode.',
++              description: 'TNF node {{ $labels.node }} has been placed into maintenance mode. Resources on this node will not be managed by Pacemaker until maintenance mode is cleared.',
++              runbook_url: 'https://github.com/openshift/runbooks/blob/master/alerts/cluster-etcd-operator/TNFNodeInMaintenance.md',
++            },
++          },
++          {
++            alert: 'TNFNodeStandby',
++            expr: 'tnf_node_active == 0',
++            'for': '5m',
++            labels: {
++              severity: 'warning',
++            },
++            annotations: {
++              summary: 'TNF node {{ $labels.node }} is in standby mode.',
++              description: 'TNF node {{ $labels.node }} is in standby mode and not actively running resources. This reduces cluster capacity. Remove standby mode to restore full capacity.',
++              runbook_url: 'https://github.com/openshift/runbooks/blob/master/alerts/cluster-etcd-operator/TNFNodeStandby.md',
++            },
++          },
++          // Resource-level alerts
++          {
++            alert: 'TNFResourceStopped',
++            expr: 'tnf_resource_started == 0 and on(node) tnf_node_active == 1',
++            'for': '5m',
++            labels: {
++              severity: 'critical',
++            },
++            annotations: {
++              summary: 'TNF resource {{ $labels.resource }} is stopped on node {{ $labels.node }}.',
++              description: 'TNF resource {{ $labels.resource }} on node {{ $labels.node }} has been stopped for more than 5 minutes. This may indicate quorum loss or a failed resource action.',
++              runbook_url: 'https://github.com/openshift/runbooks/blob/master/alerts/cluster-etcd-operator/TNFResourceStopped.md',
++            },
++          },
++          {
++            alert: 'TNFResourceFailed',
++            expr: 'tnf_resource_operational == 0 and on(node) tnf_node_active == 1',
++            'for': '2m',
++            labels: {
++              severity: 'critical',
++            },
++            annotations: {
++              summary: 'TNF resource {{ $labels.resource }} has failed on node {{ $labels.node }}.',
++              description: 'TNF resource {{ $labels.resource }} on node {{ $labels.node }} is not operational. This may indicate a resource agent failure or configuration error requiring immediate investigation.',
++              runbook_url: 'https://github.com/openshift/runbooks/blob/master/alerts/cluster-etcd-operator/TNFResourceFailed.md',
++            },
++          },
++          {
++            alert: 'TNFResourceUnmanaged',
++            expr: 'tnf_resource_managed == 0 and on(node) tnf_node_in_service == 1 and on(node) tnf_node_active == 1',
++            'for': '5m',
++            labels: {
++              severity: 'warning',
++            },
++            annotations: {
++              summary: 'TNF resource {{ $labels.resource }} is unmanaged on node {{ $labels.node }}.',
++              description: 'TNF resource {{ $labels.resource }} on node {{ $labels.node }} has been placed in unmanaged mode. Pacemaker will not monitor or recover this resource until it is re-managed.',
++              runbook_url: 'https://github.com/openshift/runbooks/blob/master/alerts/cluster-etcd-operator/TNFResourceUnmanaged.md',
++            },
++          },
++          {
++            alert: 'TNFResourceDisabled',
++            expr: 'tnf_resource_enabled == 0 and on(node) tnf_node_active == 1',
++            'for': '5m',
++            labels: {
++              severity: 'warning',
++            },
++            annotations: {
++              summary: 'TNF resource {{ $labels.resource }} is disabled on node {{ $labels.node }}.',
++              description: 'TNF resource {{ $labels.resource }} on node {{ $labels.node }} has been disabled. The resource will not be started by Pacemaker until it is re-enabled.',
++              runbook_url: 'https://github.com/openshift/runbooks/blob/master/alerts/cluster-etcd-operator/TNFResourceDisabled.md',
++            },
++          },
++        ],
++      },
++    ],
++  },
++}
+diff --git a/manifests/0000_90_etcd-operator_03_prometheusrule.yaml b/manifests/0000_90_etcd-operator_03_prometheusrule.yaml
+index 5156f7b2ae..3cb3a7d154 100644
+--- a/manifests/0000_90_etcd-operator_03_prometheusrule.yaml
++++ b/manifests/0000_90_etcd-operator_03_prometheusrule.yaml
+@@ -213,3 +213,113 @@ spec:
+       for: 1h
+       labels:
+         severity: critical
++  - name: tnf-pacemaker.rules
++    rules:
++    - alert: TNFNodeCountMismatch
++      annotations:
++        description: The TNF cluster reports an unexpected number of nodes. This may indicate a node was added or removed outside the expected two-node topology, potentially breaking quorum assumptions.
++        runbook_url: https://github.com/openshift/runbooks/blob/master/alerts/cluster-etcd-operator/TNFNodeCountMismatch.md
++        summary: TNF cluster node count does not match expected topology.
++      expr: tnf_cluster_node_count_as_expected == 0
++      for: 5m
++      labels:
++        severity: critical
++    - alert: TNFClusterInMaintenance
++      annotations:
++        description: The TNF Pacemaker cluster has been placed into maintenance mode. Automated failover and fencing are disabled. The cluster will not recover from failures until maintenance mode is cleared.
++        runbook_url: https://github.com/openshift/runbooks/blob/master/alerts/cluster-etcd-operator/TNFClusterInMaintenance.md
++        summary: TNF cluster is in maintenance mode.
++      expr: tnf_cluster_in_service == 0
++      for: 2m
++      labels:
++        severity: warning
++    - alert: TNFNodeOffline
++      annotations:
++        description: TNF node {{ $labels.node }} has been offline for more than 2 minutes. This may indicate a node failure, reboot, or network partition. The cluster is operating in a degraded single-node state.
++        runbook_url: https://github.com/openshift/runbooks/blob/master/alerts/cluster-etcd-operator/TNFNodeOffline.md
++        summary: TNF node {{ $labels.node }} is offline.
++      expr: tnf_node_online == 0
++      for: 2m
++      labels:
++        severity: critical
++    - alert: TNFNodeFencingUnavailable
++      annotations:
++        description: No fencing devices are available for TNF node {{ $labels.node }}. Without fencing, the cluster cannot safely recover from a split-brain scenario. Check BMC reachability and credentials.
++        runbook_url: https://github.com/openshift/runbooks/blob/master/alerts/cluster-etcd-operator/TNFNodeFencingUnavailable.md
++        summary: Fencing is unavailable for TNF node {{ $labels.node }}.
++      expr: tnf_node_fencing_available == 0
++      for: 5m
++      labels:
++        severity: critical
++    - alert: TNFNodeFencingDegraded
++      annotations:
++        description: Fencing devices for TNF node {{ $labels.node }} are available but not fully healthy. Fencing can still operate but with reduced redundancy. Investigate fence device health.
++        runbook_url: https://github.com/openshift/runbooks/blob/master/alerts/cluster-etcd-operator/TNFNodeFencingDegraded.md
++        summary: Fencing is degraded for TNF node {{ $labels.node }}.
++      expr: tnf_node_fencing_healthy == 0 and tnf_node_fencing_available == 1 and on(node) tnf_node_in_service == 1
++      for: 10m
++      labels:
++        severity: warning
++    - alert: TNFNodeUnclean
++      annotations:
++        description: TNF node {{ $labels.node }} is marked unclean by Pacemaker. This indicates a fencing, communication, or configuration issue that must be resolved before the node can rejoin the cluster.
++        runbook_url: https://github.com/openshift/runbooks/blob/master/alerts/cluster-etcd-operator/TNFNodeUnclean.md
++        summary: TNF node {{ $labels.node }} is in an unclean state.
++      expr: tnf_node_clean == 0
++      for: 5m
++      labels:
++        severity: critical
++    - alert: TNFNodeInMaintenance
++      annotations:
++        description: TNF node {{ $labels.node }} has been placed into maintenance mode. Resources on this node will not be managed by Pacemaker until maintenance mode is cleared.
++        runbook_url: https://github.com/openshift/runbooks/blob/master/alerts/cluster-etcd-operator/TNFNodeInMaintenance.md
++        summary: TNF node {{ $labels.node }} is in maintenance mode.
++      expr: tnf_node_in_service == 0 and tnf_cluster_in_service == 1
++      for: 2m
++      labels:
++        severity: warning
++    - alert: TNFNodeStandby
++      annotations:
++        description: TNF node {{ $labels.node }} is in standby mode and not actively running resources. This reduces cluster capacity. Remove standby mode to restore full capacity.
++        runbook_url: https://github.com/openshift/runbooks/blob/master/alerts/cluster-etcd-operator/TNFNodeStandby.md
++        summary: TNF node {{ $labels.node }} is in standby mode.
++      expr: tnf_node_active == 0
++      for: 5m
++      labels:
++        severity: warning
++    - alert: TNFResourceStopped
++      annotations:
++        description: TNF resource {{ $labels.resource }} on node {{ $labels.node }} has been stopped for more than 5 minutes. This may indicate quorum loss or a failed resource action.
++        runbook_url: https://github.com/openshift/runbooks/blob/master/alerts/cluster-etcd-operator/TNFResourceStopped.md
++        summary: TNF resource {{ $labels.resource }} is stopped on node {{ $labels.node }}.
++      expr: tnf_resource_started == 0 and on(node) tnf_node_active == 1
++      for: 5m
++      labels:
++        severity: critical
++    - alert: TNFResourceFailed
++      annotations:
++        description: TNF resource {{ $labels.resource }} on node {{ $labels.node }} is not operational. This may indicate a resource agent failure or configuration error requiring immediate investigation.
++        runbook_url: https://github.com/openshift/runbooks/blob/master/alerts/cluster-etcd-operator/TNFResourceFailed.md
++        summary: TNF resource {{ $labels.resource }} has failed on node {{ $labels.node }}.
++      expr: tnf_resource_operational == 0 and on(node) tnf_node_active == 1
++      for: 2m
++      labels:
++        severity: critical
++    - alert: TNFResourceUnmanaged
++      annotations:
++        description: TNF resource {{ $labels.resource }} on node {{ $labels.node }} has been placed in unmanaged mode. Pacemaker will not monitor or recover this resource until it is re-managed.
++        runbook_url: https://github.com/openshift/runbooks/blob/master/alerts/cluster-etcd-operator/TNFResourceUnmanaged.md
++        summary: TNF resource {{ $labels.resource }} is unmanaged on node {{ $labels.node }}.
++      expr: tnf_resource_managed == 0 and on(node) tnf_node_in_service == 1 and on(node) tnf_node_active == 1
++      for: 5m
++      labels:
++        severity: warning
++    - alert: TNFResourceDisabled
++      annotations:
++        description: TNF resource {{ $labels.resource }} on node {{ $labels.node }} has been disabled. The resource will not be started by Pacemaker until it is re-enabled.
++        runbook_url: https://github.com/openshift/runbooks/blob/master/alerts/cluster-etcd-operator/TNFResourceDisabled.md
++        summary: TNF resource {{ $labels.resource }} is disabled on node {{ $labels.node }}.
++      expr: tnf_resource_enabled == 0 and on(node) tnf_node_active == 1
++      for: 5m
++      labels:
++        severity: warning
+diff --git a/pkg/tnf/pkg/pacemaker/disruption.go b/pkg/tnf/pkg/pacemaker/disruption.go
+new file mode 100644
+index 0000000000..6f492cbbce
+--- /dev/null
++++ b/pkg/tnf/pkg/pacemaker/disruption.go
+@@ -0,0 +1,82 @@
++package pacemaker
++
++import (
++	"sync"
++
++	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
++	"k8s.io/component-base/metrics"
++	"k8s.io/component-base/metrics/legacyregistry"
++	"k8s.io/klog/v2"
++
++	pacmkrv1 "github.com/openshift/api/etcd/v1"
++)
++
++var resourceDisruptionCounter = metrics.NewCounterVec(
++	&metrics.CounterOpts{
++		Namespace:      "tnf",
++		Subsystem:      "resource",
++		Name:           "disruption_total",
++		Help:           "Number of started-to-stopped transitions observed for a TNF resource",
++		StabilityLevel: metrics.ALPHA,
++	},
++	[]string{"node", "resource"},
++)
++
++type resourceKey struct {
++	node     string
++	resource string
++}
++
++var registerDisruptionCounter sync.Once
++
++// DisruptionTracker detects started-to-stopped resource transitions and
++// increments an in-memory Prometheus counter. The counter survives API
++// outages (lives in the CEO pod) so Prometheus can detect disruptions
++// retrospectively via rate(tnf_resource_disruption_total[10m]) > 0.
++type DisruptionTracker struct {
++	mu          sync.Mutex
++	lastStarted map[resourceKey]bool
++}
++
++func NewDisruptionTracker() *DisruptionTracker {
++	registerDisruptionCounter.Do(func() {
++		legacyregistry.MustRegister(resourceDisruptionCounter)
++	})
++	return &DisruptionTracker{
++		lastStarted: make(map[resourceKey]bool),
++	}
++}
++
++// TrackResourceStates compares current resource states against previously
++// observed states. For each started→stopped transition, the disruption
++// counter is incremented. On the first call (no prior state), states are
++// recorded without incrementing.
++func (dt *DisruptionTracker) TrackResourceStates(nodes *[]pacmkrv1.PacemakerClusterNodeStatus) {
++	if nodes == nil {
++		return
++	}
++
++	dt.mu.Lock()
++	defer dt.mu.Unlock()
++
++	for _, node := range *nodes {
++		for _, resource := range node.Resources {
++			key := resourceKey{
++				node:     node.NodeName,
++				resource: string(resource.Name),
++			}
++
++			startedCondition := FindCondition(resource.Conditions, pacmkrv1.ResourceStartedConditionType)
++			currentlyStarted := startedCondition != nil && startedCondition.Status == metav1.ConditionTrue
++
++			previouslyStarted, tracked := dt.lastStarted[key]
++
++			if tracked && previouslyStarted && !currentlyStarted {
++				resourceDisruptionCounter.WithLabelValues(node.NodeName, string(resource.Name)).Inc()
++				klog.Infof("Resource disruption detected: %s on %s transitioned from started to stopped", resource.Name, node.NodeName)
++			}
++
++			dt.lastStarted[key] = currentlyStarted
++		}
++	}
++}
+diff --git a/pkg/tnf/pkg/pacemaker/disruption_test.go b/pkg/tnf/pkg/pacemaker/disruption_test.go
+new file mode 100644
+index 0000000000..ef3827448a
+--- /dev/null
++++ b/pkg/tnf/pkg/pacemaker/disruption_test.go
+@@ -0,0 +1,286 @@
++package pacemaker
++
++import (
++	"testing"
++
++	"github.com/stretchr/testify/require"
++	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
++	"k8s.io/component-base/metrics/testutil"
++
++	pacmkrv1 "github.com/openshift/api/etcd/v1"
++)
++
++func newTestDisruptionTracker() *DisruptionTracker {
++	return NewDisruptionTracker()
++}
++
++func makeNodeStatus(nodeName string, resources []pacmkrv1.PacemakerClusterResourceStatus) pacmkrv1.PacemakerClusterNodeStatus {
++	return pacmkrv1.PacemakerClusterNodeStatus{
++		NodeName:  nodeName,
++		Resources: resources,
++	}
++}
++
++func makeResource(name string, started bool) pacmkrv1.PacemakerClusterResourceStatus {
++	status := metav1.ConditionFalse
++	reason := pacmkrv1.ResourceStartedReasonStopped
++	if started {
++		status = metav1.ConditionTrue
++		reason = pacmkrv1.ResourceStartedReasonStarted
++	}
++	return pacmkrv1.PacemakerClusterResourceStatus{
++		Name: pacmkrv1.PacemakerClusterResourceName(name),
++		Conditions: []metav1.Condition{
++			{
++				Type:   pacmkrv1.ResourceStartedConditionType,
++				Status: status,
++				Reason: reason,
++			},
++		},
++	}
++}
++
++func getDisruptionCount(t *testing.T, node, resource string) float64 {
++	t.Helper()
++	val, err := testutil.GetCounterMetricValue(resourceDisruptionCounter.WithLabelValues(node, resource))
++	require.NoError(t, err, "failed to read disruption counter for node=%s resource=%s", node, resource)
++	return val
++}
++
++func TestDisruptionTracker_NilNodes(t *testing.T) {
++	dt := newTestDisruptionTracker()
++	dt.TrackResourceStates(nil)
++	require.Empty(t, dt.lastStarted, "nil input should not add any tracked state")
++}
++
++func TestDisruptionTracker_FirstCallRecordsStateOnly(t *testing.T) {
++	dt := newTestDisruptionTracker()
++	nodes := &[]pacmkrv1.PacemakerClusterNodeStatus{
++		makeNodeStatus("node-a", []pacmkrv1.PacemakerClusterResourceStatus{
++			makeResource("Etcd", true),
++		}),
++	}
++
++	before := getDisruptionCount(t, "node-a", "Etcd")
++	dt.TrackResourceStates(nodes)
++	after := getDisruptionCount(t, "node-a", "Etcd")
++
++	require.Equal(t, before, after, "first observation should not increment counter")
++	require.True(t, dt.lastStarted[resourceKey{node: "node-a", resource: "Etcd"}],
++		"should record started=true")
++}
++
++func TestDisruptionTracker_FirstCallStoppedResource(t *testing.T) {
++	dt := newTestDisruptionTracker()
++	nodes := &[]pacmkrv1.PacemakerClusterNodeStatus{
++		makeNodeStatus("node-b", []pacmkrv1.PacemakerClusterResourceStatus{
++			makeResource("Etcd", false),
++		}),
++	}
++
++	before := getDisruptionCount(t, "node-b", "Etcd")
++	dt.TrackResourceStates(nodes)
++	after := getDisruptionCount(t, "node-b", "Etcd")
++
++	require.Equal(t, before, after, "first observation of stopped resource should not increment")
++	require.False(t, dt.lastStarted[resourceKey{node: "node-b", resource: "Etcd"}],
++		"should record started=false")
++}
++
++func TestDisruptionTracker_StartedToStopped(t *testing.T) {
++	dt := newTestDisruptionTracker()
++	node := "disruption-node-1"
++	resource := "disruption-res-1"
++
++	started := &[]pacmkrv1.PacemakerClusterNodeStatus{
++		makeNodeStatus(node, []pacmkrv1.PacemakerClusterResourceStatus{
++			makeResource(resource, true),
++		}),
++	}
++	stopped := &[]pacmkrv1.PacemakerClusterNodeStatus{
++		makeNodeStatus(node, []pacmkrv1.PacemakerClusterResourceStatus{
++			makeResource(resource, false),
++		}),
++	}
++
++	dt.TrackResourceStates(started)
++	before := getDisruptionCount(t, node, resource)
++
++	dt.TrackResourceStates(stopped)
++	after := getDisruptionCount(t, node, resource)
++
++	require.Equal(t, before+1, after, "started→stopped should increment counter by 1")
++}
++
++func TestDisruptionTracker_StoppedToStartedNoIncrement(t *testing.T) {
++	dt := newTestDisruptionTracker()
++	node := "recovery-node"
++	resource := "recovery-res"
++
++	stopped := &[]pacmkrv1.PacemakerClusterNodeStatus{
++		makeNodeStatus(node, []pacmkrv1.PacemakerClusterResourceStatus{
++			makeResource(resource, false),
++		}),
++	}
++	started := &[]pacmkrv1.PacemakerClusterNodeStatus{
++		makeNodeStatus(node, []pacmkrv1.PacemakerClusterResourceStatus{
++			makeResource(resource, true),
++		}),
++	}
++
++	dt.TrackResourceStates(stopped)
++	before := getDisruptionCount(t, node, resource)
++
++	dt.TrackResourceStates(started)
++	after := getDisruptionCount(t, node, resource)
++
++	require.Equal(t, before, after, "stopped→started (recovery) should not increment counter")
++}
++
++func TestDisruptionTracker_NoChangeNoIncrement(t *testing.T) {
++	dt := newTestDisruptionTracker()
++	node := "stable-node"
++
++	startedRes := "stable-started"
++	stoppedRes := "stable-stopped"
++
++	nodes := &[]pacmkrv1.PacemakerClusterNodeStatus{
++		makeNodeStatus(node, []pacmkrv1.PacemakerClusterResourceStatus{
++			makeResource(startedRes, true),
++			makeResource(stoppedRes, false),
++		}),
++	}
++
++	dt.TrackResourceStates(nodes)
++	beforeStarted := getDisruptionCount(t, node, startedRes)
++	beforeStopped := getDisruptionCount(t, node, stoppedRes)
++
++	dt.TrackResourceStates(nodes)
++	afterStarted := getDisruptionCount(t, node, startedRes)
++	afterStopped := getDisruptionCount(t, node, stoppedRes)
++
++	require.Equal(t, beforeStarted, afterStarted, "started→started should not increment")
++	require.Equal(t, beforeStopped, afterStopped, "stopped→stopped should not increment")
++}
++
++func TestDisruptionTracker_MultipleResources(t *testing.T) {
++	dt := newTestDisruptionTracker()
++	node := "multi-res-node"
++
++	initial := &[]pacmkrv1.PacemakerClusterNodeStatus{
++		makeNodeStatus(node, []pacmkrv1.PacemakerClusterResourceStatus{
++			makeResource("Etcd", true),
++			makeResource("Kubelet", true),
++		}),
++	}
++	dt.TrackResourceStates(initial)
++
++	etcdBefore := getDisruptionCount(t, node, "Etcd")
++	kubeletBefore := getDisruptionCount(t, node, "Kubelet")
++
++	onlyEtcdStopped := &[]pacmkrv1.PacemakerClusterNodeStatus{
++		makeNodeStatus(node, []pacmkrv1.PacemakerClusterResourceStatus{
++			makeResource("Etcd", false),
++			makeResource("Kubelet", true),
++		}),
++	}
++	dt.TrackResourceStates(onlyEtcdStopped)
++
++	etcdAfter := getDisruptionCount(t, node, "Etcd")
++	kubeletAfter := getDisruptionCount(t, node, "Kubelet")
++
++	require.Equal(t, etcdBefore+1, etcdAfter, "Etcd should increment")
++	require.Equal(t, kubeletBefore, kubeletAfter, "Kubelet should not increment")
++}
++
++func TestDisruptionTracker_MultipleNodes(t *testing.T) {
++	dt := newTestDisruptionTracker()
++	nodeA := "multi-node-a"
++	nodeB := "multi-node-b"
++	res := "multi-node-res"
++
++	initial := &[]pacmkrv1.PacemakerClusterNodeStatus{
++		makeNodeStatus(nodeA, []pacmkrv1.PacemakerClusterResourceStatus{
++			makeResource(res, true),
++		}),
++		makeNodeStatus(nodeB, []pacmkrv1.PacemakerClusterResourceStatus{
++			makeResource(res, true),
++		}),
++	}
++	dt.TrackResourceStates(initial)
++
++	aBefore := getDisruptionCount(t, nodeA, res)
++	bBefore := getDisruptionCount(t, nodeB, res)
++
++	onlyAStopped := &[]pacmkrv1.PacemakerClusterNodeStatus{
++		makeNodeStatus(nodeA, []pacmkrv1.PacemakerClusterResourceStatus{
++			makeResource(res, false),
++		}),
++		makeNodeStatus(nodeB, []pacmkrv1.PacemakerClusterResourceStatus{
++			makeResource(res, true),
++		}),
++	}
++	dt.TrackResourceStates(onlyAStopped)
++
++	aAfter := getDisruptionCount(t, nodeA, res)
++	bAfter := getDisruptionCount(t, nodeB, res)
++
++	require.Equal(t, aBefore+1, aAfter, "node-a should increment")
++	require.Equal(t, bBefore, bAfter, "node-b should not increment")
++}
++
++func TestDisruptionTracker_MissingStartedCondition(t *testing.T) {
++	dt := newTestDisruptionTracker()
++	node := "no-condition-node"
++	res := "no-condition-res"
++
++	startedFirst := &[]pacmkrv1.PacemakerClusterNodeStatus{
++		makeNodeStatus(node, []pacmkrv1.PacemakerClusterResourceStatus{
++			makeResource(res, true),
++		}),
++	}
++	dt.TrackResourceStates(startedFirst)
++
++	before := getDisruptionCount(t, node, res)
++
++	noCondition := &[]pacmkrv1.PacemakerClusterNodeStatus{
++		makeNodeStatus(node, []pacmkrv1.PacemakerClusterResourceStatus{
++			{
++				Name:       pacmkrv1.PacemakerClusterResourceName(res),
++				Conditions: []metav1.Condition{},
++			},
++		}),
++	}
++	dt.TrackResourceStates(noCondition)
++	after := getDisruptionCount(t, node, res)
++
++	require.Equal(t, before+1, after,
++		"missing Started condition treated as not-started, should increment from previously-started")
++}
++
++func TestDisruptionTracker_ConsecutiveDisruptions(t *testing.T) {
++	dt := newTestDisruptionTracker()
++	node := "bounce-node"
++	res := "bounce-res"
++
++	started := &[]pacmkrv1.PacemakerClusterNodeStatus{
++		makeNodeStatus(node, []pacmkrv1.PacemakerClusterResourceStatus{
++			makeResource(res, true),
++		}),
++	}
++	stopped := &[]pacmkrv1.PacemakerClusterNodeStatus{
++		makeNodeStatus(node, []pacmkrv1.PacemakerClusterResourceStatus{
++			makeResource(res, false),
++		}),
++	}
++
++	dt.TrackResourceStates(started)
++	baseline := getDisruptionCount(t, node, res)
++
++	dt.TrackResourceStates(stopped) // disruption 1
++	dt.TrackResourceStates(started) // recovery
++	dt.TrackResourceStates(stopped) // disruption 2
++
++	final := getDisruptionCount(t, node, res)
++	require.Equal(t, baseline+2, final, "two started→stopped transitions should increment counter twice")
++}
+diff --git a/pkg/tnf/pkg/pacemaker/healthcheck.go b/pkg/tnf/pkg/pacemaker/healthcheck.go
+index 684f9ee540..ca78e097d7 100644
+--- a/pkg/tnf/pkg/pacemaker/healthcheck.go
++++ b/pkg/tnf/pkg/pacemaker/healthcheck.go
+@@ -111,6 +111,16 @@ type HealthStatus struct {
+ 	CRLastUpdated time.Time
+ }
+ 
++// pacemakerListWatch wraps cache.ListWatch to opt out of WatchList semantics.
++// The OCP apiextensions-apiserver does not enable the server-side WatchList gate,
++// so the reflector's sendInitialEvents request is rejected. This wrapper tells
++// the reflector to skip watchList() and use list+watch directly.
++type pacemakerListWatch struct {
++	cache.ListWatch
++}
++
++func (pacemakerListWatch) IsWatchListSemanticsUnSupported() bool { return true }
++
+ // HealthCheck monitors pacemaker status in ExternalEtcd topology clusters
+ type HealthCheck struct {
+ 	operatorClient    v1helpers.StaticPodOperatorClient
+@@ -126,6 +136,12 @@ type HealthCheck struct {
+ 	// Only updated when status is non-Unknown, so CRLastUpdated reflects the last valid CR timestamp.
+ 	previousMu sync.Mutex
+ 	previous   *HealthStatus
++
++	disruptionTracker *DisruptionTracker
++
++	// crNodes holds the PacemakerCluster node statuses retrieved during getPacemakerStatus.
++	// Used by trackResourceDisruptions to avoid a redundant informer store lookup.
++	crNodes *[]pacmkrv1.PacemakerClusterNodeStatus
+ }
+ 
+ // NewHealthCheck creates a new HealthCheck for monitoring pacemaker status
+@@ -152,7 +168,7 @@ func NewHealthCheck(
+ 	// Create informer for PacemakerCluster
+ 	klog.Infof("Creating PacemakerCluster informer for group %s, resource %s", pacmkrv1.SchemeGroupVersion.String(), PacemakerResourceName)
+ 	informer := cache.NewSharedIndexInformer(
+-		&cache.ListWatch{
++		&pacemakerListWatch{cache.ListWatch{
+ 			ListFunc: func(options metav1.ListOptions) (runtime.Object, error) {
+ 				klog.V(4).Infof("PacemakerCluster informer ListFunc called for resource %s", PacemakerResourceName)
+ 				result := &pacmkrv1.PacemakerClusterList{}
+@@ -179,7 +195,7 @@ func NewHealthCheck(
+ 				}
+ 				return watcher, err
+ 			},
+-		},
++		}},
+ 		&pacmkrv1.PacemakerCluster{},
+ 		HealthCheckResyncInterval,
+ 		cache.Indexers{cache.NamespaceIndex: cache.MetaNamespaceIndexFunc},
+@@ -191,6 +207,7 @@ func NewHealthCheck(
+ 		eventRecorder:     eventRecorder,
+ 		pacemakerInformer: informer,
+ 		recordedEvents:    make(map[string]time.Time),
++		disruptionTracker: NewDisruptionTracker(),
+ 		// previous starts as nil - first sync will be treated as "from Unknown"
+ 	}
+ 
+@@ -235,6 +252,8 @@ func (c *HealthCheck) sync(ctx context.Context, syncCtx factory.SyncContext) err
+ 		return nil
+ 	}
+ 
++	c.trackResourceDisruptions()
++
+ 	// Log the determined status for visibility
+ 	klog.V(2).Infof("Pacemaker health status: %s (errors: %d, warnings: %d)",
+ 		currentStatus.OverallStatus, len(currentStatus.Errors), len(currentStatus.Warnings))
+@@ -253,6 +272,7 @@ func (c *HealthCheck) sync(ctx context.Context, syncCtx factory.SyncContext) err
+ // Returns (nil, nil, nil) if the CR hasn't changed since last sync (same lastUpdated timestamp).
+ // For Unknown status, previous is not updated (preserves last valid status for grace period).
+ func (c *HealthCheck) getPacemakerStatus(ctx context.Context) (*HealthStatus, *HealthStatus, error) {
++	c.crNodes = nil
+ 	klog.V(4).Infof("Retrieving pacemaker status from CR...")
+ 
+ 	// Read previous status
+@@ -287,6 +307,7 @@ func (c *HealthCheck) getPacemakerStatus(ctx context.Context) (*HealthStatus, *H
+ 			Errors:        []string{"Failed to convert cached item to PacemakerCluster"},
+ 		}, previous, nil
+ 	}
++	c.crNodes = pacemakerCR.Status.Nodes
+ 
+ 	// Check if status is populated (LastUpdated is zero means status was never set)
+ 	if pacemakerCR.Status.LastUpdated.IsZero() {
+@@ -892,3 +913,10 @@ func (c *HealthCheck) recordErrorEvent(errorMsg string) {
+ 	eventReason := getEventReasonForError(errorMsg)
+ 	c.eventRecorder.Warningf(eventReason, msgPacemakerError, errorMsg)
+ }
++
++func (c *HealthCheck) trackResourceDisruptions() {
++	if c.crNodes == nil {
++		return
++	}
++	c.disruptionTracker.TrackResourceStates(c.crNodes)
++}
+diff --git a/pkg/tnf/pkg/pacemaker/prometheusrule_test.go b/pkg/tnf/pkg/pacemaker/prometheusrule_test.go
+new file mode 100644
+index 0000000000..8f80e2605c
+--- /dev/null
++++ b/pkg/tnf/pkg/pacemaker/prometheusrule_test.go
+@@ -0,0 +1,142 @@
++package pacemaker
++
++import (
++	"os"
++	"path/filepath"
++	"runtime"
++	"testing"
++
++	"github.com/stretchr/testify/require"
++	"gopkg.in/yaml.v3"
++)
++
++type prometheusRuleManifest struct {
++	Spec struct {
++		Groups []ruleGroup `yaml:"groups"`
++	} `yaml:"spec"`
++}
++
++type ruleGroup struct {
++	Name  string `yaml:"name"`
++	Rules []rule `yaml:"rules"`
++}
++
++type rule struct {
++	Alert       string            `yaml:"alert"`
++	Expr        string            `yaml:"expr"`
++	For         string            `yaml:"for"`
++	Labels      map[string]string `yaml:"labels"`
++	Annotations map[string]string `yaml:"annotations"`
++}
++
++func repoRoot() string {
++	_, thisFile, _, _ := runtime.Caller(0)
++	return filepath.Join(filepath.Dir(thisFile), "..", "..", "..", "..")
++}
++
++func loadTNFAlertGroup(t *testing.T) []rule {
++	t.Helper()
++	manifestPath := filepath.Join(repoRoot(), "manifests", "0000_90_etcd-operator_03_prometheusrule.yaml")
++
++	data, err := os.ReadFile(manifestPath)
++	require.NoError(t, err, "should read PrometheusRule manifest")
++
++	var manifest prometheusRuleManifest
++	require.NoError(t, yaml.Unmarshal(data, &manifest), "should parse YAML")
++
++	for _, g := range manifest.Spec.Groups {
++		if g.Name == "tnf-pacemaker.rules" {
++			return g.Rules
++		}
++	}
++	t.Fatal("tnf-pacemaker.rules group not found in generated PrometheusRule manifest")
++	return nil
++}
++
++type expectedAlert struct {
++	Name     string
++	Expr     string
++	For      string
++	Severity string
++}
++
++var expectedAlerts = []expectedAlert{
++	{"TNFNodeCountMismatch", "tnf_cluster_node_count_as_expected == 0", "5m", "critical"},
++	{"TNFClusterInMaintenance", "tnf_cluster_in_service == 0", "2m", "warning"},
++	{"TNFNodeOffline", "tnf_node_online == 0", "2m", "critical"},
++	{"TNFNodeFencingUnavailable", "tnf_node_fencing_available == 0", "5m", "critical"},
++	{"TNFNodeFencingDegraded", "tnf_node_fencing_healthy == 0 and tnf_node_fencing_available == 1 and on(node) tnf_node_in_service == 1", "10m", "warning"},
++	{"TNFNodeUnclean", "tnf_node_clean == 0", "5m", "critical"},
++	{"TNFNodeInMaintenance", "tnf_node_in_service == 0 and tnf_cluster_in_service == 1", "2m", "warning"},
++	{"TNFNodeStandby", "tnf_node_active == 0", "5m", "warning"},
++	{"TNFResourceStopped", "tnf_resource_started == 0 and on(node) tnf_node_active == 1", "5m", "critical"},
++	{"TNFResourceFailed", "tnf_resource_operational == 0 and on(node) tnf_node_active == 1", "2m", "critical"},
++	{"TNFResourceUnmanaged", "tnf_resource_managed == 0 and on(node) tnf_node_in_service == 1 and on(node) tnf_node_active == 1", "5m", "warning"},
++	{"TNFResourceDisabled", "tnf_resource_enabled == 0 and on(node) tnf_node_active == 1", "5m", "warning"},
++}
++
++func TestTNFAlerts_Count(t *testing.T) {
++	rules := loadTNFAlertGroup(t)
++	require.Len(t, rules, 12, "tnf-pacemaker.rules should contain exactly 12 alerts")
++}
++
++func TestTNFAlerts_Definitions(t *testing.T) {
++	rules := loadTNFAlertGroup(t)
++
++	rulesByName := make(map[string]rule, len(rules))
++	for _, r := range rules {
++		rulesByName[r.Alert] = r
++	}
++
++	for _, exp := range expectedAlerts {
++		t.Run(exp.Name, func(t *testing.T) {
++			r, ok := rulesByName[exp.Name]
++			require.True(t, ok, "alert %s should exist", exp.Name)
++			require.Equal(t, exp.Expr, r.Expr, "expression mismatch")
++			require.Equal(t, exp.For, r.For, "for duration mismatch")
++			require.Equal(t, exp.Severity, r.Labels["severity"], "severity mismatch")
++		})
++	}
++}
++
++func TestTNFAlerts_SeverityCounts(t *testing.T) {
++	rules := loadTNFAlertGroup(t)
++
++	var critical, warning int
++	for _, r := range rules {
++		switch r.Labels["severity"] {
++		case "critical":
++			critical++
++		case "warning":
++			warning++
++		default:
++			t.Errorf("unexpected severity %q on alert %s", r.Labels["severity"], r.Alert)
++		}
++	}
++
++	require.Equal(t, 6, critical, "should have 6 critical alerts")
++	require.Equal(t, 6, warning, "should have 6 warning alerts")
++}
++
++func TestTNFAlerts_Annotations(t *testing.T) {
++	rules := loadTNFAlertGroup(t)
++
++	for _, r := range rules {
++		t.Run(r.Alert, func(t *testing.T) {
++			require.NotEmpty(t, r.Annotations["summary"], "should have summary annotation")
++			require.NotEmpty(t, r.Annotations["description"], "should have description annotation")
++			require.NotEmpty(t, r.Annotations["runbook_url"], "should have runbook_url annotation")
++			require.Contains(t, r.Annotations["runbook_url"],
++				"https://github.com/openshift/runbooks/blob/master/alerts/cluster-etcd-operator/"+r.Alert+".md",
++				"runbook_url should point to correct alert runbook")
++		})
++	}
++}
++
++func TestTNFAlerts_AllNamesStartWithTNF(t *testing.T) {
++	rules := loadTNFAlertGroup(t)
++
++	for _, r := range rules {
++		require.Regexp(t, `^TNF[A-Z]`, r.Alert, "alert names should start with TNF prefix")
++	}
++}
+diff --git a/pkg/tnf/pkg/pacemaker/testdata/cluster_maintenance.xml b/pkg/tnf/pkg/pacemaker/testdata/cluster_maintenance.xml
+index 124f9b0978..cbe69830c1 100644
+--- a/pkg/tnf/pkg/pacemaker/testdata/cluster_maintenance.xml
++++ b/pkg/tnf/pkg/pacemaker/testdata/cluster_maintenance.xml
+@@ -3,8 +3,8 @@
+     <cluster_options maintenance-mode="true"/>
+   </summary>
+   <nodes>
+-    <node name="master-0" id="1" online="true" type="member"/>
+-    <node name="master-1" id="2" online="true" type="member"/>
++    <node name="master-0" id="1" online="true" maintenance="true" type="member"/>
++    <node name="master-1" id="2" online="true" maintenance="true" type="member"/>
+   </nodes>
+   <resources/>
+   <node_attributes/>

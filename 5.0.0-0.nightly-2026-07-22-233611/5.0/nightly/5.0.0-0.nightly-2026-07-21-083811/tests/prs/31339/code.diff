@@ -1,0 +1,3562 @@
+diff --git a/test/extended/imagepolicy/imagepolicy.go b/test/extended/imagepolicy/imagepolicy.go
+index eff805a06057..65284f7e5567 100644
+--- a/test/extended/imagepolicy/imagepolicy.go
++++ b/test/extended/imagepolicy/imagepolicy.go
+@@ -216,8 +216,7 @@ func updateImageConfig(oc *exutil.CLI, allowedRegistries []string) {
+ 		return err
+ 	})
+ 	o.Expect(err).NotTo(o.HaveOccurred(), "error updating image config")
+-	WaitForMCPConfigSpecChangeAndUpdated(oc, workerPool, initialWorkerSpec)
+-	WaitForMCPConfigSpecChangeAndUpdated(oc, masterPool, initialMasterSpec)
++	WaitForMCPsConfigSpecChangeAndUpdated(oc, initialWorkerSpec, initialMasterSpec)
+ }
+ 
+ func cleanupImageConfig(oc *exutil.CLI) error {
+@@ -238,8 +237,7 @@ func cleanupImageConfig(oc *exutil.CLI) error {
+ 		return err
+ 	})
+ 	o.Expect(err).NotTo(o.HaveOccurred(), "error cleaning up image config")
+-	WaitForMCPConfigSpecChangeAndUpdated(oc, workerPool, initialWorkerSpec)
+-	WaitForMCPConfigSpecChangeAndUpdated(oc, masterPool, initialMasterSpec)
++	WaitForMCPsConfigSpecChangeAndUpdated(oc, initialWorkerSpec, initialMasterSpec)
+ 	return nil
+ }
+ 
+@@ -285,8 +283,7 @@ func createClusterImagePolicy(oc *exutil.CLI, policy configv1.ClusterImagePolicy
+ 	_, err := oc.AdminConfigClient().ConfigV1().ClusterImagePolicies().Create(context.TODO(), &policy, metav1.CreateOptions{})
+ 	o.Expect(err).NotTo(o.HaveOccurred())
+ 
+-	WaitForMCPConfigSpecChangeAndUpdated(oc, workerPool, initialWorkerSpec)
+-	WaitForMCPConfigSpecChangeAndUpdated(oc, masterPool, initialMasterSpec)
++	WaitForMCPsConfigSpecChangeAndUpdated(oc, initialWorkerSpec, initialMasterSpec)
+ }
+ 
+ func deleteClusterImagePolicy(oc *exutil.CLI, policyName string) error {
+@@ -296,8 +293,7 @@ func deleteClusterImagePolicy(oc *exutil.CLI, policyName string) error {
+ 	if err := oc.AdminConfigClient().ConfigV1().ClusterImagePolicies().Delete(context.TODO(), policyName, metav1.DeleteOptions{}); err != nil && !errors.IsNotFound(err) {
+ 		return fmt.Errorf("failed to delete cluster image policy %s: %v", policyName, err)
+ 	}
+-	WaitForMCPConfigSpecChangeAndUpdated(oc, workerPool, initialWorkerSpec)
+-	WaitForMCPConfigSpecChangeAndUpdated(oc, masterPool, initialMasterSpec)
++	WaitForMCPsConfigSpecChangeAndUpdated(oc, initialWorkerSpec, initialMasterSpec)
+ 	return nil
+ }
+ 
+@@ -312,8 +308,7 @@ func createImagePolicy(oc *exutil.CLI, policy configv1.ImagePolicy, namespace st
+ 
+ 	// Wait until each pool's Spec.Configuration.Name changes from the initial value
+ 	// and the pool reports Updated=true
+-	WaitForMCPConfigSpecChangeAndUpdated(oc, workerPool, initialWorkerSpec)
+-	WaitForMCPConfigSpecChangeAndUpdated(oc, masterPool, initialMasterSpec)
++	WaitForMCPsConfigSpecChangeAndUpdated(oc, initialWorkerSpec, initialMasterSpec)
+ }
+ 
+ func deleteImagePolicy(oc *exutil.CLI, policyName string, namespace string) error {
+@@ -323,8 +318,7 @@ func deleteImagePolicy(oc *exutil.CLI, policyName string, namespace string) erro
+ 	if err := oc.AdminConfigClient().ConfigV1().ImagePolicies(namespace).Delete(context.TODO(), policyName, metav1.DeleteOptions{}); err != nil && !errors.IsNotFound(err) {
+ 		return fmt.Errorf("failed to delete image policy %s in namespace %s: %v", policyName, namespace, err)
+ 	}
+-	WaitForMCPConfigSpecChangeAndUpdated(oc, workerPool, initialWorkerSpec)
+-	WaitForMCPConfigSpecChangeAndUpdated(oc, masterPool, initialMasterSpec)
++	WaitForMCPsConfigSpecChangeAndUpdated(oc, initialWorkerSpec, initialMasterSpec)
+ 	return nil
+ }
+ 
+@@ -707,7 +701,42 @@ func WaitForMCPConfigSpecChangeAndUpdated(oc *exutil.CLI, pool string, initialSp
+ 			return false
+ 		}
+ 		return machineconfighelper.IsMachineConfigPoolConditionTrue(mcp.Status.Conditions, mcfgv1.MachineConfigPoolUpdated)
+-	}, 20*time.Minute, 10*time.Second).Should(o.BeTrue())
++	}, 15*time.Minute, 10*time.Second).Should(o.BeTrue())
++}
++
++func WaitForMCPsConfigSpecChangeAndUpdated(oc *exutil.CLI, workerInitialSpec, masterInitialSpec string) {
++	e2e.Logf("Waiting for worker and master pools to complete")
++	clientSet, err := machineconfigclient.NewForConfig(oc.KubeFramework().ClientConfig())
++	o.Expect(err).NotTo(o.HaveOccurred())
++
++	o.Eventually(func() bool {
++		workerMCP, err := clientSet.MachineconfigurationV1().MachineConfigPools().Get(context.TODO(), "worker", metav1.GetOptions{})
++		if err != nil {
++			return false
++		}
++		masterMCP, err := clientSet.MachineconfigurationV1().MachineConfigPools().Get(context.TODO(), "master", metav1.GetOptions{})
++		if err != nil {
++			return false
++		}
++
++		workerReady := workerMCP.Status.Configuration.Name != workerInitialSpec &&
++			workerMCP.Spec.Configuration.Name == workerMCP.Status.Configuration.Name &&
++			machineconfighelper.IsMachineConfigPoolConditionTrue(workerMCP.Status.Conditions, mcfgv1.MachineConfigPoolUpdated)
++
++		masterReady := masterMCP.Status.Configuration.Name != masterInitialSpec &&
++			masterMCP.Spec.Configuration.Name == masterMCP.Status.Configuration.Name &&
++			machineconfighelper.IsMachineConfigPoolConditionTrue(masterMCP.Status.Conditions, mcfgv1.MachineConfigPoolUpdated)
++
++		if !workerReady {
++			e2e.Logf("Worker MCP not ready yet")
++		}
++		if !masterReady {
++			e2e.Logf("Master MCP not ready yet")
++		}
++
++		return workerReady && masterReady
++	}, 15*time.Minute, 10*time.Second).Should(o.BeTrue())
++	e2e.Logf("Both worker and master pools completed successfully")
+ }
+ 
+ func isDisconnectedCluster(oc *exutil.CLI) bool {
+diff --git a/test/extended/node/additional_storage_api.go b/test/extended/node/additional_storage_api.go
+index f19bae497ef0..9044e06368c7 100644
+--- a/test/extended/node/additional_storage_api.go
++++ b/test/extended/node/additional_storage_api.go
+@@ -8,14 +8,48 @@ import (
+ 	g "github.com/onsi/ginkgo/v2"
+ 	o "github.com/onsi/gomega"
+ 
+-	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+-	"k8s.io/kubernetes/test/e2e/framework"
+-
++	configv1 "github.com/openshift/api/config/v1"
+ 	machineconfigv1 "github.com/openshift/api/machineconfiguration/v1"
+ 	mcclient "github.com/openshift/client-go/machineconfiguration/clientset/versioned"
+ 	exutil "github.com/openshift/origin/test/extended/util"
++	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
++	"k8s.io/kubernetes/test/e2e/framework"
+ )
+ 
++// IsAdditionalStorageConfigEnabled checks whether the AdditionalStorageConfig
++// feature gate is enabled on the cluster and the platform is supported.
++// Returns false with a reason string if the test should be skipped.
++func IsAdditionalStorageConfigEnabled(ctx context.Context, oc *exutil.CLI) (bool, string) {
++	isMicroShift, err := exutil.IsMicroShiftCluster(oc.AdminKubeClient())
++	if err != nil {
++		return false, fmt.Sprintf("cannot verify cluster type: %v", err)
++	}
++	if isMicroShift {
++		return false, "MicroShift cluster - MachineConfig resources are not available"
++	}
++
++	infra, err := oc.AdminConfigClient().ConfigV1().Infrastructures().Get(ctx, "cluster", metav1.GetOptions{})
++	if err != nil {
++		return false, fmt.Sprintf("cannot verify platform type: %v", err)
++	}
++	if infra.Status.PlatformStatus != nil && infra.Status.PlatformStatus.Type == configv1.AzurePlatformType {
++		return false, "Microsoft Azure cluster"
++	}
++
++	fgs, err := oc.AdminConfigClient().ConfigV1().FeatureGates().Get(ctx, "cluster", metav1.GetOptions{})
++	if err != nil {
++		return false, fmt.Sprintf("cannot verify FeatureGate: %v", err)
++	}
++	for _, fg := range fgs.Status.FeatureGates {
++		for _, enabledFG := range fg.Enabled {
++			if enabledFG.Name == "AdditionalStorageConfig" {
++				return true, ""
++			}
++		}
++	}
++	return false, "AdditionalStorageConfig feature gate is not enabled"
++}
++
+ // API validation tests - use DryRun to avoid triggering MCO reconciliation
+ var _ = g.Describe("[apigroup:config.openshift.io][apigroup:machineconfiguration.openshift.io][Jira:Node/CRI-O][sig-node][Feature:AdditionalStorageSupport][OCPFeatureGate:AdditionalStorageConfig][Suite:openshift/conformance/parallel] Additional Storage API Validation", func() {
+ 	defer g.GinkgoRecover()
+@@ -23,7 +57,9 @@ var _ = g.Describe("[apigroup:config.openshift.io][apigroup:machineconfiguration
+ 	var oc = exutil.NewCLI("additional-storage-api")
+ 
+ 	g.BeforeEach(func(ctx context.Context) {
+-		skipUnlessAdditionalStorageConfigEnabled(ctx, oc)
++		if enabled, reason := IsAdditionalStorageConfigEnabled(ctx, oc); !enabled {
++			g.Skip(reason)
++		}
+ 	})
+ 
+ 	// ========================================================================
+diff --git a/test/extended/node/criocredentialprovider.go b/test/extended/node/criocredentialprovider.go
+index 0d4bd4a44cf1..17f6f4376f62 100644
+--- a/test/extended/node/criocredentialprovider.go
++++ b/test/extended/node/criocredentialprovider.go
+@@ -194,8 +194,7 @@ func updateCRIOCredentialProviderConfig(oc *exutil.CLI, matchImages []string, ex
+ 		return
+ 	}
+ 
+-	imagepolicy.WaitForMCPConfigSpecChangeAndUpdated(oc, workerPool, initialWorkerSpec)
+-	imagepolicy.WaitForMCPConfigSpecChangeAndUpdated(oc, masterPool, initialMasterSpec)
++	imagepolicy.WaitForMCPsConfigSpecChangeAndUpdated(oc, initialWorkerSpec, initialMasterSpec)
+ }
+ 
+ func getWorkerNodes(oc *exutil.CLI) ([]corev1.Node, error) {
+@@ -288,8 +287,7 @@ func createIDMSResources(oc *exutil.CLI) {
+ 
+ 	e2e.Logf("Created ImageDigestMirrorSet %q", idms.Name)
+ 
+-	imagepolicy.WaitForMCPConfigSpecChangeAndUpdated(oc, workerPool, initialWorkerSpec)
+-	imagepolicy.WaitForMCPConfigSpecChangeAndUpdated(oc, masterPool, initialMasterSpec)
++	imagepolicy.WaitForMCPsConfigSpecChangeAndUpdated(oc, initialWorkerSpec, initialMasterSpec)
+ }
+ 
+ func cleanupIDMSResources(oc *exutil.CLI) {
+@@ -301,8 +299,7 @@ func cleanupIDMSResources(oc *exutil.CLI) {
+ 
+ 	e2e.Logf("Deleted ImageDigestMirrorSet %q", "digest-mirror")
+ 
+-	imagepolicy.WaitForMCPConfigSpecChangeAndUpdated(oc, workerPool, initialWorkerSpec)
+-	imagepolicy.WaitForMCPConfigSpecChangeAndUpdated(oc, masterPool, initialMasterSpec)
++	imagepolicy.WaitForMCPsConfigSpecChangeAndUpdated(oc, initialWorkerSpec, initialMasterSpec)
+ }
+ 
+ func createNamespaceRBAC(f *e2e.Framework, namespace string) {
+diff --git a/test/extended/node/dra/example/example_dra.go b/test/extended/node/dra/example/example_dra.go
+index 7ba9ea6cc3bc..7744c2bd3fc4 100644
+--- a/test/extended/node/dra/example/example_dra.go
++++ b/test/extended/node/dra/example/example_dra.go
+@@ -20,6 +20,7 @@ import (
+ 	e2epod "k8s.io/kubernetes/test/e2e/framework/pod"
+ 	admissionapi "k8s.io/pod-security-admission/api"
+ 
++	nodeutils "github.com/openshift/origin/test/extended/node"
+ 	dracommon "github.com/openshift/origin/test/extended/node/dra/common"
+ 	exutil "github.com/openshift/origin/test/extended/util"
+ 	"github.com/openshift/origin/test/extended/util/image"
+@@ -43,11 +44,7 @@ var _ = g.Describe("[sig-scheduling][Feature:DRA-Example][Suite:openshift/dra-ex
+ 	)
+ 
+ 	g.BeforeEach(func(ctx context.Context) {
+-		isMicroShift, err := exutil.IsMicroShiftCluster(oc.AdminKubeClient())
+-		o.Expect(err).NotTo(o.HaveOccurred())
+-		if isMicroShift {
+-			g.Skip("Skipping DRA example driver tests on MicroShift cluster")
+-		}
++		nodeutils.SkipOnMicroShift(oc)
+ 
+ 		validator = NewDeviceValidator(oc.KubeFramework())
+ 		builder = dracommon.NewResourceBuilder(oc.Namespace(), dracommon.DriverConfig{
+diff --git a/test/extended/node/image_volume.go b/test/extended/node/image_volume.go
+index dea55d4e1a2f..6a1a7163a127 100644
+--- a/test/extended/node/image_volume.go
++++ b/test/extended/node/image_volume.go
+@@ -66,13 +66,9 @@ func describeImageVolumeTests(config imageVolumeTestConfig) bool {
+ 			podName = config.frameworkName + "-test"
+ 		)
+ 
+-		g.BeforeEach(func() {
+-			// Microshift doesn't inherit OCP feature gates, and ImageVolume won't work either
+-			isMicroshift, err := exutil.IsMicroShiftCluster(oc.AdminKubeClient())
+-			o.Expect(err).NotTo(o.HaveOccurred())
+-			if isMicroshift {
+-				g.Skip("Not supported on Microshift")
+-			}
++		g.BeforeEach(func(ctx context.Context) {
++			SkipOnMicroShift(oc)
++			EnsureNodesReady(ctx, oc)
+ 		})
+ 
+ 		g.It("should succeed with pod and pull policy of Always", func(ctx context.Context) {
+diff --git a/test/extended/node/kubelet_secret_pulled_images.go b/test/extended/node/kubelet_secret_pulled_images.go
+index af1c74c9b527..5b9903db5d29 100644
+--- a/test/extended/node/kubelet_secret_pulled_images.go
++++ b/test/extended/node/kubelet_secret_pulled_images.go
+@@ -43,15 +43,13 @@ var _ = g.Describe("[sig-node][Suite:openshift/disruptive-longrunning][Disruptiv
+ 		pullSecret   []byte
+ 	)
+ 
++	g.BeforeEach(func() {
++		SkipOnMicroShift(oc)
++	})
++
+ 	// Setup: import a private image into the internal registry so all tests
+ 	// can use it without hardcoded credentials or external accounts.
+ 	g.BeforeAll(func() {
+-		// Skip on MicroShift clusters
+-		isMicroShift, err := exutil.IsMicroShiftCluster(oc.AdminKubeClient())
+-		o.Expect(err).NotTo(o.HaveOccurred())
+-		if isMicroShift {
+-			g.Skip("Skipping test on MicroShift cluster")
+-		}
+ 
+ 		if !exutil.IsNoUpgradeFeatureSet(oc) {
+ 			g.Skip("requires TechPreviewNoUpgrade or CustomNoUpgrade feature set")
+@@ -107,8 +105,8 @@ var _ = g.Describe("[sig-node][Suite:openshift/disruptive-longrunning][Disruptiv
+ 		tenantB := "cred-verify-tenant-b"
+ 		credVerifyEnsureNamespace(ctx, oc, tenantA)
+ 		credVerifyEnsureNamespace(ctx, oc, tenantB)
+-		g.DeferCleanup(credVerifyDeleteNamespace, ctx, oc, tenantA)
+-		g.DeferCleanup(credVerifyDeleteNamespace, ctx, oc, tenantB)
++		g.DeferCleanup(credVerifyDeleteNamespace, context.Background(), oc, tenantA)
++		g.DeferCleanup(credVerifyDeleteNamespace, context.Background(), oc, tenantB)
+ 
+ 		// Only tenant-a gets pull permission and a pull secret
+ 		credVerifyGrantImagePuller(oc, sourceNS, tenantA)
+@@ -133,7 +131,7 @@ var _ = g.Describe("[sig-node][Suite:openshift/disruptive-longrunning][Disruptiv
+ 	g.It("Case 2: Credential rotation", func() {
+ 		ns := "cred-verify-rotation"
+ 		credVerifyEnsureNamespace(ctx, oc, ns)
+-		g.DeferCleanup(credVerifyDeleteNamespace, ctx, oc, ns)
++		g.DeferCleanup(credVerifyDeleteNamespace, context.Background(), oc, ns)
+ 
+ 		credVerifyGrantImagePuller(oc, sourceNS, ns)
+ 		credVerifyCreateSecret(ctx, oc, ns, "secret-v1", pullSecret)
+@@ -171,7 +169,7 @@ var _ = g.Describe("[sig-node][Suite:openshift/disruptive-longrunning][Disruptiv
+ 	g.It("Case 3: ImagePullPolicy scenarios", func() {
+ 		ns := "cred-verify-pullpolicy"
+ 		credVerifyEnsureNamespace(ctx, oc, ns)
+-		g.DeferCleanup(credVerifyDeleteNamespace, ctx, oc, ns)
++		g.DeferCleanup(credVerifyDeleteNamespace, context.Background(), oc, ns)
+ 
+ 		credVerifyGrantImagePuller(oc, sourceNS, ns)
+ 		credVerifyCreateSecret(ctx, oc, ns, "pull-secret", pullSecret)
+@@ -196,7 +194,7 @@ var _ = g.Describe("[sig-node][Suite:openshift/disruptive-longrunning][Disruptiv
+ 		kcName := "cred-verify-policy"
+ 		ns := "cred-verify-policy"
+ 		credVerifyEnsureNamespace(ctx, oc, ns)
+-		g.DeferCleanup(credVerifyDeleteNamespace, ctx, oc, ns)
++		g.DeferCleanup(credVerifyDeleteNamespace, context.Background(), oc, ns)
+ 
+ 		mcClient, err := mcclient.NewForConfig(oc.AdminConfig())
+ 		o.Expect(err).NotTo(o.HaveOccurred())
+@@ -205,8 +203,8 @@ var _ = g.Describe("[sig-node][Suite:openshift/disruptive-longrunning][Disruptiv
+ 		credVerifyCreateSecret(ctx, oc, ns, "pull-secret", pullSecret)
+ 
+ 		g.DeferCleanup(func() {
+-			_ = deleteKC(oc, kcName)
+-			_ = waitForMCP(ctx, mcClient, "worker", 30*time.Minute)
++			cleanupCtx := context.Background()
++			_ = CleanupKubeletConfig(cleanupCtx, mcClient, kcName, "worker")
+ 		})
+ 
+ 		g.By("Pre-caching private image on the node with a valid secret")
+@@ -215,7 +213,7 @@ var _ = g.Describe("[sig-node][Suite:openshift/disruptive-longrunning][Disruptiv
+ 		g.By("Applying NeverVerify policy and waiting for MCO rollout")
+ 		credVerifyApplyPolicy(ctx, mcClient, kcName, `{"imagePullCredentialsVerificationPolicy":"NeverVerify"}`)
+ 		credVerifyWaitForMCPUpdating(ctx, mcClient, "worker")
+-		err = waitForMCP(ctx, mcClient, "worker", 30*time.Minute)
++		err = WaitForMCP(ctx, mcClient, "worker", 15*time.Minute)
+ 		o.Expect(err).NotTo(o.HaveOccurred())
+ 
+ 		g.By("Verifying NeverVerify policy allows pod without secret to use cached image")
+@@ -224,7 +222,7 @@ var _ = g.Describe("[sig-node][Suite:openshift/disruptive-longrunning][Disruptiv
+ 		g.By("Switching to AlwaysVerify policy and waiting for MCO rollout")
+ 		credVerifyApplyPolicy(ctx, mcClient, kcName, `{"imagePullCredentialsVerificationPolicy":"AlwaysVerify"}`)
+ 		credVerifyWaitForMCPUpdating(ctx, mcClient, "worker")
+-		err = waitForMCP(ctx, mcClient, "worker", 30*time.Minute)
++		err = WaitForMCP(ctx, mcClient, "worker", 15*time.Minute)
+ 		o.Expect(err).NotTo(o.HaveOccurred())
+ 
+ 		// This pod also re-caches the image after MCO rollout since pull records are cleared
+@@ -241,7 +239,7 @@ var _ = g.Describe("[sig-node][Suite:openshift/disruptive-longrunning][Disruptiv
+ 	g.It("Case 5: Registry availability", func() {
+ 		ns := "cred-verify-registry"
+ 		credVerifyEnsureNamespace(ctx, oc, ns)
+-		g.DeferCleanup(credVerifyDeleteNamespace, ctx, oc, ns)
++		g.DeferCleanup(credVerifyDeleteNamespace, context.Background(), oc, ns)
+ 
+ 		credVerifyGrantImagePuller(oc, sourceNS, ns)
+ 		credVerifyCreateSecret(ctx, oc, ns, "pull-secret", pullSecret)
+@@ -411,34 +409,15 @@ func credVerifyApplyPolicy(ctx context.Context, mcClient *mcclient.Clientset, na
+ 		},
+ 	}
+ 
+-	existing, err := mcClient.MachineconfigurationV1().KubeletConfigs().Get(ctx, name, metav1.GetOptions{})
+-	if apierrors.IsNotFound(err) {
+-		_, err = mcClient.MachineconfigurationV1().KubeletConfigs().Create(ctx, kc, metav1.CreateOptions{})
+-		o.Expect(err).NotTo(o.HaveOccurred())
+-		return
+-	}
+-	o.Expect(err).NotTo(o.HaveOccurred())
+-	existing.Spec = kc.Spec
+-	_, err = mcClient.MachineconfigurationV1().KubeletConfigs().Update(ctx, existing, metav1.UpdateOptions{})
++	_, err := CreateOrUpdateKubeletConfig(ctx, mcClient, kc)
+ 	o.Expect(err).NotTo(o.HaveOccurred())
+ }
+ 
+ // credVerifyWaitForMCPUpdating waits for the MCP to start updating, avoiding a race
+ // where waitForMCP returns immediately before the MCO picks up a KubeletConfig change.
+ func credVerifyWaitForMCPUpdating(ctx context.Context, mcClient *mcclient.Clientset, poolName string) {
+-	o.Eventually(func() bool {
+-		mcp, err := mcClient.MachineconfigurationV1().MachineConfigPools().Get(ctx, poolName, metav1.GetOptions{})
+-		if err != nil {
+-			e2e.Logf("Error getting MCP %s: %v", poolName, err)
+-			return false
+-		}
+-		for _, condition := range mcp.Status.Conditions {
+-			if condition.Type == "Updating" && condition.Status == corev1.ConditionTrue {
+-				return true
+-			}
+-		}
+-		return false
+-	}, 2*time.Minute, 10*time.Second).Should(o.BeTrue(), fmt.Sprintf("MCP %s should start updating", poolName))
++	err := WaitForMCPUpdating(ctx, mcClient, poolName, 2*time.Minute)
++	o.Expect(err).NotTo(o.HaveOccurred(), "MCP %s should start updating", poolName)
+ }
+ 
+ func credVerifyPod(namespace, name, image, nodeName string, pullPolicy corev1.PullPolicy, secretName ...string) *corev1.Pod {
+diff --git a/test/extended/node/kubeletconfig_features.go b/test/extended/node/kubeletconfig_features.go
+index 5c7aa20f1fb4..f1dcc847d73f 100644
+--- a/test/extended/node/kubeletconfig_features.go
++++ b/test/extended/node/kubeletconfig_features.go
+@@ -11,10 +11,10 @@ import (
+ 	o "github.com/onsi/gomega"
+ 
+ 	osconfigv1 "github.com/openshift/api/config/v1"
++	machineconfigclient "github.com/openshift/client-go/machineconfiguration/clientset/versioned"
+ 	exutil "github.com/openshift/origin/test/extended/util"
+ 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+ 
+-	"k8s.io/apimachinery/pkg/labels"
+ 	"k8s.io/client-go/kubernetes"
+ 	"k8s.io/kubernetes/test/e2e/framework"
+ 	e2eskipper "k8s.io/kubernetes/test/e2e/framework/skipper"
+@@ -32,96 +32,75 @@ var (
+ var _ = g.Describe("[Suite:openshift/disruptive-longrunning][sig-node][Disruptive]", func() {
+ 	defer g.GinkgoRecover()
+ 	var (
+-		NodeMachineConfigPoolBaseDir = exutil.FixturePath("testdata", "node", "machineconfigpool")
+-		NodeKubeletConfigBaseDir     = exutil.FixturePath("testdata", "node", "kubeletconfig")
+-
+-		customMCPFixture       = filepath.Join(NodeMachineConfigPoolBaseDir, "customMCP.yaml")
+-		customLoggingKCFixture = filepath.Join(NodeKubeletConfigBaseDir, "loggingKC.yaml")
++		NodeKubeletConfigBaseDir = exutil.FixturePath("testdata", "node", "kubeletconfig")
++		customLoggingKCFixture   = filepath.Join(NodeKubeletConfigBaseDir, "loggingKC.yaml")
+ 
+ 		oc = exutil.NewCLIWithoutNamespace("node-kubeletconfig")
+ 	)
+ 
+ 	// This test is also considered `Slow` because it takes longer than 5 minutes to run.
+-	g.It("[Slow]should apply KubeletConfig with logging verbosity to custom pool [apigroup:machineconfiguration.openshift.io]", func() {
++	g.It("[Slow]should apply KubeletConfig with logging verbosity to custom pool [apigroup:machineconfiguration.openshift.io]", func(ctx context.Context) {
+ 		// Skip this test on single node and two-node platforms since custom MCPs are not supported
+ 		// for clusters with only a master MCP
+ 		skipOnSingleNodeTopology(oc)
+ 		skipOnTwoNodeTopology(oc)
+ 
+-		// Get the MCP and KubeletConfig fixtures needed for this test
+-		mcpFixture := customMCPFixture
+ 		kcFixture := customLoggingKCFixture
+ 
+-		// Create kube client for test
+ 		kubeClient, err := kubernetes.NewForConfig(oc.KubeFramework().ClientConfig())
+ 		o.Expect(err).NotTo(o.HaveOccurred(), fmt.Sprintf("Error getting kube client: %v", err))
+ 
+-		// Create custom MCP
+-		defer deleteMCP(oc, "custom")
+-		err = oc.Run("apply").Args("-f", mcpFixture).Execute()
+-		o.Expect(err).NotTo(o.HaveOccurred(), fmt.Sprintf("Error creating MCP `custom`: %v", err))
+-
+-		// Add node to custom MCP & wait for the node to be ready in the MCP
+-		optedNodes, err := addWorkerNodesToCustomPool(oc, kubeClient, 1, "custom")
+-		o.Expect(err).NotTo(o.HaveOccurred(), fmt.Sprintf("Error adding node to `custom` MCP: %v", err))
+-		defer waitTillNodeReadyWithConfig(kubeClient, optedNodes[0], workerConfigPrefix)
+-		defer unlabelNode(oc, optedNodes[0])
+-		framework.Logf("Waiting for `%v` node to be ready in `custom` MCP.", optedNodes[0])
+-		waitTillNodeReadyWithConfig(kubeClient, optedNodes[0], customConfigPrefix)
+-
+-		// Get the current config before applying KubeletConfig
+-		node, err := kubeClient.CoreV1().Nodes().Get(context.TODO(), optedNodes[0], metav1.GetOptions{})
++		testNode := GetFirstReadyWorkerNode(oc)
++
++		mcClient, err := machineconfigclient.NewForConfig(oc.KubeFramework().ClientConfig())
++		o.Expect(err).NotTo(o.HaveOccurred(), "Error creating machine config client")
++
++		var mcpConfig *CustomMCPConfig
++		g.DeferCleanup(func() {
++			cleanupCtx := context.Background()
++			if err := CleanupCustomMCP(cleanupCtx, mcpConfig); err != nil {
++				framework.Logf("Warning: cleanup had errors: %v", err)
++			}
++		})
++
++		mcpConfig, err = CreateCustomMCPForNode(ctx, oc, mcClient, "custom", testNode)
++		o.Expect(err).NotTo(o.HaveOccurred(), "Error creating custom MCP")
++
++		framework.Logf("Waiting for node %s to be ready in custom MCP", testNode)
++		waitTillNodeReadyWithConfig(kubeClient, testNode, customConfigPrefix)
++
++		node, err := kubeClient.CoreV1().Nodes().Get(ctx, testNode, metav1.GetOptions{})
+ 		o.Expect(err).NotTo(o.HaveOccurred(), fmt.Sprintf("Error getting node: %v", err))
+ 		originalConfig := node.Annotations["machineconfiguration.openshift.io/currentConfig"]
+-		framework.Logf("Node '%v' has original config: %v", optedNodes[0], originalConfig)
++		framework.Logf("Node %s has original config: %s", testNode, originalConfig)
+ 
+ 		// Apply KubeletConfig with logging verbosity
+-		defer deleteKC(oc, "custom-logging-config")
++		g.DeferCleanup(func() {
++			cleanupCtx := context.Background()
++			if err := CleanupKubeletConfig(cleanupCtx, mcClient, "custom-logging-config", ""); err != nil {
++				framework.Logf("Warning: KubeletConfig cleanup failed: %v", err)
++			}
++		})
+ 		err = oc.Run("apply").Args("-f", kcFixture).Execute()
+ 		o.Expect(err).NotTo(o.HaveOccurred(), fmt.Sprintf("Error applying KubeletConfig: %v", err))
+ 
+ 		// Wait for the node to reboot after applying KubeletConfig
+ 		// KubeletConfig changes require a node reboot to take effect
+-		framework.Logf("Waiting for node '%v' to reboot after applying KubeletConfig", optedNodes[0])
+-		waitForReboot(kubeClient, optedNodes[0])
++		framework.Logf("Waiting for node %s to reboot after applying KubeletConfig", testNode)
++		waitForReboot(kubeClient, testNode)
+ 
+ 		// Verify the node has been updated with new config
+-		framework.Logf("Verifying node '%v' has updated config after reboot", optedNodes[0])
+-		node, err = kubeClient.CoreV1().Nodes().Get(context.TODO(), optedNodes[0], metav1.GetOptions{})
++		framework.Logf("Verifying node %s has updated config after reboot", testNode)
++		node, err = kubeClient.CoreV1().Nodes().Get(ctx, testNode, metav1.GetOptions{})
+ 		o.Expect(err).NotTo(o.HaveOccurred(), fmt.Sprintf("Error getting node after update: %v", err))
+ 		o.Expect(node.Annotations["machineconfiguration.openshift.io/state"]).To(o.Equal("Done"), "Node should be in Done state after reboot")
+ 		newConfig := node.Annotations["machineconfiguration.openshift.io/currentConfig"]
+-		o.Expect(newConfig).NotTo(o.Equal(originalConfig), "Node config should have changed from %v to %v", originalConfig, newConfig)
++		o.Expect(newConfig).NotTo(o.Equal(originalConfig), "Node config should have changed from %s to %s", originalConfig, newConfig)
+ 
+-		framework.Logf("Successfully applied KubeletConfig with logging verbosity to node '%v', config changed from '%v' to '%v'", optedNodes[0], originalConfig, newConfig)
++		framework.Logf("Successfully applied KubeletConfig with logging verbosity to node %s, config changed from %s to %s", testNode, originalConfig, newConfig)
+ 	})
+ })
+ 
+-// `addWorkerNodesToCustomPool` labels the desired number of worker nodes with the MCP role
+-// selector so that the nodes become part of the desired custom MCP
+-func addWorkerNodesToCustomPool(oc *exutil.CLI, kubeClient *kubernetes.Clientset, numberOfNodes int, customMCP string) ([]string, error) {
+-	// Get the worker nodes
+-	nodes, err := kubeClient.CoreV1().Nodes().List(context.TODO(), metav1.ListOptions{LabelSelector: labels.SelectorFromSet(labels.Set{"node-role.kubernetes.io/worker": ""}).String()})
+-	if err != nil {
+-		return nil, err
+-	}
+-	// Return an error if there are less worker nodes in the cluster than the desired number of nodes to add to the custom MCP
+-	if len(nodes.Items) < numberOfNodes {
+-		return nil, fmt.Errorf("Node in Worker MCP %d < Number of nodes needed in %d MCP", len(nodes.Items), numberOfNodes)
+-	}
+-
+-	// Label the nodes with the custom MCP role selector
+-	var optedNodes []string
+-	for node_i := 0; node_i < numberOfNodes; node_i++ {
+-		err = oc.AsAdmin().Run("label").Args("node", nodes.Items[node_i].Name, fmt.Sprintf("node-role.kubernetes.io/%s=", customMCP)).Execute()
+-		if err != nil {
+-			return nil, err
+-		}
+-		optedNodes = append(optedNodes, nodes.Items[node_i].Name)
+-	}
+-	return optedNodes, nil
+-}
+-
+ // `waitForReboot` waits for up to 5 minutes for the input node to start a reboot and then up to 15
+ // minutes for the node to complete its reboot.
+ func waitForReboot(kubeClient *kubernetes.Clientset, nodeName string) {
+@@ -136,7 +115,7 @@ func waitForReboot(kubeClient *kubernetes.Clientset, nodeName string) {
+ 			return true
+ 		}
+ 		return false
+-	}, 5*time.Minute, 10*time.Second).Should(o.BeTrue(), "Timed out waiting for Node '%s' to start reboot.", nodeName)
++	}, 10*time.Minute, 10*time.Second).Should(o.BeTrue(), "Timed out waiting for Node '%s' to start reboot.", nodeName)
+ 
+ 	o.Eventually(func() bool {
+ 		node, err := kubeClient.CoreV1().Nodes().Get(context.TODO(), nodeName, metav1.GetOptions{})
+@@ -169,23 +148,7 @@ func waitTillNodeReadyWithConfig(kubeClient *kubernetes.Clientset, nodeName, cur
+ 		}
+ 		framework.Logf("Node '%s' has is not yet ready and has the current config `%v`", nodeName, currentConfig)
+ 		return false
+-	}, 5*time.Minute, 10*time.Second).Should(o.BeTrue(), "Timed out waiting for Node '%s' to have rendered-worker config.", nodeName)
+-}
+-
+-// `unlabelNode` removes the `node-role.kubernetes.io/custom` label from the node with the input
+-// name. This triggers the node's removal from the custom MCP named `custom`.
+-func unlabelNode(oc *exutil.CLI, name string) error {
+-	return oc.AsAdmin().Run("label").Args("node", name, "node-role.kubernetes.io/custom-").Execute()
+-}
+-
+-// `deleteKC` deletes the KubeletConfig with the input name
+-func deleteKC(oc *exutil.CLI, name string) error {
+-	return oc.Run("delete").Args("kubeletconfig", name).Execute()
+-}
+-
+-// `deleteMCP` deletes the MachineConfigPool with the input name
+-func deleteMCP(oc *exutil.CLI, name string) error {
+-	return oc.Run("delete").Args("mcp", name).Execute()
++	}, 10*time.Minute, 10*time.Second).Should(o.BeTrue(), "Timed out waiting for Node '%s' to have rendered-worker config.", nodeName)
+ }
+ 
+ // `skipOnSingleNodeTopology` skips the test if the cluster is using single-node topology
+diff --git a/test/extended/node/kubeletconfig_tls.go b/test/extended/node/kubeletconfig_tls.go
+index 369cccda386f..b761251c6464 100644
+--- a/test/extended/node/kubeletconfig_tls.go
++++ b/test/extended/node/kubeletconfig_tls.go
+@@ -3,7 +3,6 @@ package node
+ import (
+ 	"context"
+ 	"fmt"
+-	"strings"
+ 	"time"
+ 
+ 	g "github.com/onsi/ginkgo/v2"
+@@ -13,12 +12,7 @@ import (
+ 	mcfgv1 "github.com/openshift/api/machineconfiguration/v1"
+ 	machineconfigclient "github.com/openshift/client-go/machineconfiguration/clientset/versioned"
+ 	exutil "github.com/openshift/origin/test/extended/util"
+-	corev1 "k8s.io/api/core/v1"
+-	apierrors "k8s.io/apimachinery/pkg/api/errors"
+ 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+-	"k8s.io/apimachinery/pkg/types"
+-	"k8s.io/apimachinery/pkg/util/wait"
+-
+ 	"k8s.io/kubernetes/test/e2e/framework"
+ )
+ 
+@@ -31,7 +25,6 @@ var _ = g.Describe("[Suite:openshift/disruptive-longrunning][sig-node][Disruptiv
+ 		oc                = exutil.NewCLIWithoutNamespace("node-kubeletconfig-tls")
+ 		kubeletConfigName = "tls13-kubelet-config"
+ 		testMCPName       = "kubelet-tls-test"
+-		testNodeMCPLabel  = fmt.Sprintf("node-role.kubernetes.io/%s", testMCPName)
+ 	)
+ 
+ 	skipUnsupportedTopologies := func() {
+@@ -74,93 +67,18 @@ var _ = g.Describe("[Suite:openshift/disruptive-longrunning][sig-node][Disruptiv
+ 			framework.Failf("Unexpected default TLS version %q, expected VersionTLS12 or empty (cluster default)", defaultTLSVersion)
+ 		}
+ 
+-		g.By(fmt.Sprintf("Creating custom MachineConfigPool %s", testMCPName))
+-		testMCP := &mcfgv1.MachineConfigPool{
+-			ObjectMeta: metav1.ObjectMeta{
+-				Name: testMCPName,
+-				Labels: map[string]string{
+-					"machineconfiguration.openshift.io/pool": testMCPName,
+-				},
+-			},
+-			Spec: mcfgv1.MachineConfigPoolSpec{
+-				MachineConfigSelector: &metav1.LabelSelector{
+-					MatchExpressions: []metav1.LabelSelectorRequirement{
+-						{
+-							Key:      "machineconfiguration.openshift.io/role",
+-							Operator: metav1.LabelSelectorOpIn,
+-							Values:   []string{"worker", testMCPName},
+-						},
+-					},
+-				},
+-				NodeSelector: &metav1.LabelSelector{
+-					MatchLabels: map[string]string{
+-						testNodeMCPLabel: "",
+-					},
+-				},
+-			},
+-		}
+-
+-		_, err = mcClient.MachineconfigurationV1().MachineConfigPools().Create(ctx, testMCP, metav1.CreateOptions{})
+-		o.Expect(err).NotTo(o.HaveOccurred(), "Failed to create custom MachineConfigPool %s", testMCPName)
+-
+-		cleanupMCP := func() {
+-			framework.Logf("Cleanup: deleting MachineConfigPool %s", testMCPName)
++		// Register cleanup BEFORE MCP creation so it always runs
++		var mcpConfig *CustomMCPConfig
++		g.DeferCleanup(func() {
+ 			cleanupCtx := context.Background()
+-			deleteErr := mcClient.MachineconfigurationV1().MachineConfigPools().Delete(cleanupCtx, testMCPName, metav1.DeleteOptions{})
+-			if apierrors.IsNotFound(deleteErr) {
+-				return
+-			}
+-			if deleteErr != nil {
+-				framework.Logf("Failed to delete MachineConfigPool %s: %v", testMCPName, deleteErr)
++			if err := CleanupCustomMCP(cleanupCtx, mcpConfig); err != nil {
++				framework.Logf("Warning: cleanup had errors: %v", err)
+ 			}
+-		}
+-		// DeferCleanup runs in LIFO order. Registering MCP first ensures it
+-		// is deleted last, after the node label is removed and the node has
+-		// transitioned back to the worker pool.
+-		g.DeferCleanup(cleanupMCP)
+-
+-		g.By(fmt.Sprintf("Labeling node %s with %s", testNode, testNodeMCPLabel))
+-		patchData := []byte(fmt.Sprintf(`{"metadata":{"labels":{%q:""}}}`, testNodeMCPLabel))
+-		_, err = oc.AdminKubeClient().CoreV1().Nodes().Patch(ctx, testNode, types.MergePatchType, patchData, metav1.PatchOptions{})
+-		o.Expect(err).NotTo(o.HaveOccurred(), "Failed to label node %s", testNode)
+-
+-		cleanupNodeLabel := func() {
+-			framework.Logf("Cleanup: removing label %s from node %s", testNodeMCPLabel, testNode)
+-			cleanupCtx := context.Background()
+-			removePatch := []byte(fmt.Sprintf(`{"metadata":{"labels":{%q:null}}}`, testNodeMCPLabel))
+-			_, patchErr := oc.AdminKubeClient().CoreV1().Nodes().Patch(cleanupCtx, testNode, types.MergePatchType, removePatch, metav1.PatchOptions{})
+-			if apierrors.IsNotFound(patchErr) {
+-				return
+-			}
+-			if patchErr != nil {
+-				framework.Logf("Failed to remove label from node %s: %v", testNode, patchErr)
+-				return
+-			}
+-
+-			framework.Logf("Cleanup: waiting for node %s to transition back to worker pool", testNode)
+-			o.Eventually(func() bool {
+-				currentNode, getErr := oc.AdminKubeClient().CoreV1().Nodes().Get(cleanupCtx, testNode, metav1.GetOptions{})
+-				if getErr != nil {
+-					framework.Logf("Error getting node: %v", getErr)
+-					return false
+-				}
+-				currentConfig := currentNode.Annotations["machineconfiguration.openshift.io/currentConfig"]
+-				desiredConfig := currentNode.Annotations["machineconfiguration.openshift.io/desiredConfig"]
+-				isWorkerConfig := currentConfig != "" && !strings.Contains(currentConfig, testMCPName) && currentConfig == desiredConfig
+-				if isWorkerConfig {
+-					framework.Logf("Node %s transitioned back to worker config: %s", testNode, currentConfig)
+-				} else {
+-					framework.Logf("Node %s still transitioning: current=%s, desired=%s", testNode, currentConfig, desiredConfig)
+-				}
+-				return isWorkerConfig
+-			}, 15*time.Minute, 15*time.Second).Should(o.BeTrue(),
+-				"Node %s should transition back to worker pool", testNode)
+-		}
+-		g.DeferCleanup(cleanupNodeLabel)
++		})
+ 
+-		framework.Logf("Waiting for custom MachineConfigPool %s to be ready", testMCPName)
+-		err = waitForMCP(ctx, mcClient, testMCPName, 10*time.Minute)
+-		o.Expect(err).NotTo(o.HaveOccurred(), "Custom MachineConfigPool %s did not become ready", testMCPName)
++		// Create custom MCP for the node
++		mcpConfig, err = CreateCustomMCPForNode(ctx, oc, mcClient, testMCPName, testNode)
++		o.Expect(err).NotTo(o.HaveOccurred(), "Should create custom MCP")
+ 
+ 		g.By(fmt.Sprintf("Creating KubeletConfig with Modern TLS profile (TLS 1.3) targeting pool %s", testMCPName))
+ 		kubeletConfig := &mcfgv1.KubeletConfig{
+@@ -179,50 +97,15 @@ var _ = g.Describe("[Suite:openshift/disruptive-longrunning][sig-node][Disruptiv
+ 			},
+ 		}
+ 
+-		cleanupKubeletConfig := func() {
+-			framework.Logf("Cleanup: deleting KubeletConfig %s", kubeletConfigName)
++		g.DeferCleanup(func() {
+ 			cleanupCtx := context.Background()
+-			deleteErr := mcClient.MachineconfigurationV1().KubeletConfigs().Delete(cleanupCtx, kubeletConfigName, metav1.DeleteOptions{})
+-			if apierrors.IsNotFound(deleteErr) {
+-				return
+-			}
+-			o.Expect(deleteErr).NotTo(o.HaveOccurred(), "Cleanup: failed to delete KubeletConfig %s", kubeletConfigName)
+-
+-			framework.Logf("Cleanup: waiting for MCP %s to become ready after KubeletConfig deletion", testMCPName)
+-			waitErr := waitForMCP(cleanupCtx, mcClient, testMCPName, 15*time.Minute)
+-			if apierrors.IsNotFound(waitErr) {
+-				return
+-			}
+-			o.Expect(waitErr).NotTo(o.HaveOccurred(),
+-				"Cleanup: MCP %s did not become ready after KubeletConfig deletion", testMCPName)
+-		}
+-		g.DeferCleanup(cleanupKubeletConfig)
+-
+-		_, err = mcClient.MachineconfigurationV1().KubeletConfigs().Create(ctx, kubeletConfig, metav1.CreateOptions{})
+-		o.Expect(err).NotTo(o.HaveOccurred(), "Error creating KubeletConfig with TLS 1.3")
+-
+-		g.By(fmt.Sprintf("Waiting for MachineConfigPool %s to begin updating", testMCPName))
+-		err = wait.PollUntilContextTimeout(ctx, 15*time.Second, 5*time.Minute, true, func(ctx context.Context) (bool, error) {
+-			mcp, getErr := mcClient.MachineconfigurationV1().MachineConfigPools().Get(ctx, testMCPName, metav1.GetOptions{})
+-			if getErr != nil {
+-				framework.Logf("Error getting MCP %s: %v", testMCPName, getErr)
+-				return false, nil
+-			}
+-			for _, condition := range mcp.Status.Conditions {
+-				if condition.Type == "Updating" && condition.Status == corev1.ConditionTrue {
+-					framework.Logf("MCP %s has started updating", testMCPName)
+-					return true, nil
+-				}
+-			}
+-			return false, nil
++			err := CleanupKubeletConfig(cleanupCtx, mcClient, kubeletConfigName, testMCPName)
++			o.Expect(err).NotTo(o.HaveOccurred(), "Cleanup: failed to delete KubeletConfig %s", kubeletConfigName)
+ 		})
+-		o.Expect(err).NotTo(o.HaveOccurred(),
+-			"Timed out waiting for MachineConfigPool %q to start updating", testMCPName)
+ 
+-		g.By(fmt.Sprintf("Waiting for MachineConfigPool %s to complete rollout", testMCPName))
+-		err = waitForMCP(ctx, mcClient, testMCPName, 30*time.Minute)
+-		o.Expect(err).NotTo(o.HaveOccurred(), "Error waiting for MachineConfigPool %q to become ready", testMCPName)
+-		framework.Logf("MachineConfigPool %s has completed rollout", testMCPName)
++		g.By("Applying KubeletConfig and waiting for MCP rollout")
++		err = ApplyKubeletConfigAndWaitForMCP(ctx, mcClient, kubeletConfig, testMCPName, 15*time.Minute)
++		o.Expect(err).NotTo(o.HaveOccurred(), "Should apply KubeletConfig and complete MCP rollout")
+ 
+ 		g.By(fmt.Sprintf("Verifying node %s is Ready and Done after rollout", testNode))
+ 		updatedNode, err := oc.AdminKubeClient().CoreV1().Nodes().Get(ctx, testNode, metav1.GetOptions{})
+diff --git a/test/extended/node/node_e2e/container_runtime_config.go b/test/extended/node/node_e2e/container_runtime_config.go
+index dc9c0d39fb1a..9288f93c1179 100644
+--- a/test/extended/node/node_e2e/container_runtime_config.go
++++ b/test/extended/node/node_e2e/container_runtime_config.go
+@@ -2,7 +2,6 @@ package node
+ 
+ import (
+ 	"context"
+-	"fmt"
+ 	"strings"
+ 	"time"
+ 
+@@ -10,11 +9,11 @@ import (
+ 	o "github.com/onsi/gomega"
+ 
+ 	mcfgv1 "github.com/openshift/api/machineconfiguration/v1"
++	machineconfigclient "github.com/openshift/client-go/machineconfiguration/clientset/versioned"
+ 	"github.com/openshift/origin/test/extended/imagepolicy"
+ 	apierrors "k8s.io/apimachinery/pkg/api/errors"
+ 	"k8s.io/apimachinery/pkg/api/resource"
+ 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+-	"k8s.io/apimachinery/pkg/types"
+ 	"k8s.io/apimachinery/pkg/util/wait"
+ 	e2e "k8s.io/kubernetes/test/e2e/framework"
+ 	"k8s.io/utils/ptr"
+@@ -28,12 +27,9 @@ var _ = g.Describe("[Suite:openshift/disruptive-longrunning][sig-node][Disruptiv
+ 		oc = exutil.NewCLIWithoutNamespace("ctrcfg")
+ 	)
+ 
+-	g.BeforeEach(func() {
+-		isMicroShift, err := exutil.IsMicroShiftCluster(oc.AdminKubeClient())
+-		o.Expect(err).NotTo(o.HaveOccurred(), "failed to detect MicroShift cluster")
+-		if isMicroShift {
+-			g.Skip("Skipping test on MicroShift cluster - MachineConfig resources are not available")
+-		}
++	g.BeforeEach(func(ctx context.Context) {
++		nodeutils.SkipOnMicroShift(oc)
++		nodeutils.EnsureNodesReady(ctx, oc)
+ 	})
+ 
+ 	// Validates that ContainerRuntimeConfig pidsLimit setting is correctly applied
+@@ -45,35 +41,41 @@ var _ = g.Describe("[Suite:openshift/disruptive-longrunning][sig-node][Disruptiv
+ 		mcpName := "ctrcfg-pids"
+ 
+ 		g.By("Get a ready worker node")
+-		workers, err := exutil.GetReadySchedulableWorkerNodes(ctx, oc.AdminKubeClient())
+-		o.Expect(err).NotTo(o.HaveOccurred(), "failed to get ready schedulable worker nodes")
+-		o.Expect(workers).NotTo(o.BeEmpty(), "No Ready worker nodes found")
+-		workerNode := workers[0].Name
++		workerNode := nodeutils.GetFirstReadyWorkerNode(oc)
++		o.Expect(workerNode).NotTo(o.BeEmpty(), "no ready worker node found")
++		err := nodeutils.EnsureNodeHasNoCustomRole(ctx, oc, workerNode)
++		o.Expect(err).NotTo(o.HaveOccurred())
+ 
+ 		g.By("Make a manual change to crio.conf on worker node")
+-		_, err = nodeutils.ExecOnNodeWithChroot(oc, workerNode,
++		_, err = nodeutils.ExecOnNodeWithChroot(ctx, oc, workerNode,
+ 			"/bin/bash", "-c", `sed -i '/^\[crio\.runtime\]/a log_level = "debug"' /etc/crio/crio.conf`)
+ 		o.Expect(err).NotTo(o.HaveOccurred(), "failed to edit crio.conf on node %s", workerNode)
+ 
+ 		g.By("Verify the manual crio.conf edit took effect")
+-		editedConf, err := nodeutils.ExecOnNodeWithChroot(oc, workerNode, "cat", "/etc/crio/crio.conf")
++		editedConf, err := nodeutils.ExecOnNodeWithChroot(ctx, oc, workerNode, "cat", "/etc/crio/crio.conf")
+ 		o.Expect(err).NotTo(o.HaveOccurred(), "failed to read crio.conf on node %s", workerNode)
+ 		o.Expect(editedConf).To(o.ContainSubstring(`log_level = "debug"`),
+ 			"sed edit did not apply: expected log_level = debug in crio.conf")
+ 
+-		createSingleNodeMCP(ctx, oc, mcpName, workerNode)
++		mcClient, err := machineconfigclient.NewForConfig(oc.KubeFramework().ClientConfig())
++		o.Expect(err).NotTo(o.HaveOccurred(), "failed to create machine config client")
+ 
++		var mcpConfig *nodeutils.CustomMCPConfig
+ 		g.DeferCleanup(func() {
+-			g.By("Cleanup: delete ContainerRuntimeConfig")
++			cleanupCtx := context.Background()
+ 			delErr := oc.MachineConfigurationClient().MachineconfigurationV1().ContainerRuntimeConfigs().Delete(
+-				ctx, ctrcfgName, metav1.DeleteOptions{})
+-			if !apierrors.IsNotFound(delErr) {
+-				o.Expect(delErr).NotTo(o.HaveOccurred(),
+-					"cleanup failed: could not delete ContainerRuntimeConfig %s", ctrcfgName)
++				cleanupCtx, ctrcfgName, metav1.DeleteOptions{})
++			if delErr != nil && !apierrors.IsNotFound(delErr) {
++				e2e.Logf("Warning: failed to delete ContainerRuntimeConfig %s: %v", ctrcfgName, delErr)
++			}
++			if err := nodeutils.CleanupCustomMCP(cleanupCtx, mcpConfig); err != nil {
++				e2e.Logf("WARNING: cleanup had errors: %v", err)
+ 			}
+-			cleanupSingleNodeMCP(ctx, oc, mcpName, workerNode)
+ 		})
+ 
++		mcpConfig, err = nodeutils.CreateCustomMCPForNode(ctx, oc, mcClient, mcpName, workerNode)
++		o.Expect(err).NotTo(o.HaveOccurred(), "failed to create custom MCP")
++
+ 		initialSpec := imagepolicy.GetMCPCurrentSpecConfigName(oc, mcpName)
+ 
+ 		g.By("Create ContainerRuntimeConfig with pidsLimit 2048")
+@@ -100,7 +102,7 @@ var _ = g.Describe("[Suite:openshift/disruptive-longrunning][sig-node][Disruptiv
+ 		var crioConfig string
+ 		o.Eventually(func() error {
+ 			var execErr error
+-			crioConfig, execErr = nodeutils.ExecOnNodeWithChroot(oc, workerNode,
++			crioConfig, execErr = nodeutils.ExecOnNodeWithChroot(ctx, oc, workerNode,
+ 				"/bin/bash", "-c", "crio config 2>/dev/null")
+ 			return execErr
+ 		}, 30*time.Second, 5*time.Second).Should(o.Succeed(), "failed to get crio config on node %s", workerNode)
+@@ -121,24 +123,30 @@ var _ = g.Describe("[Suite:openshift/disruptive-longrunning][sig-node][Disruptiv
+ 		overlaySize := "9G"
+ 
+ 		g.By("Get a ready worker node")
+-		workers, err := exutil.GetReadySchedulableWorkerNodes(ctx, oc.AdminKubeClient())
+-		o.Expect(err).NotTo(o.HaveOccurred(), "failed to get ready schedulable worker nodes")
+-		o.Expect(workers).NotTo(o.BeEmpty(), "No Ready worker nodes found")
+-		workerNode := workers[0].Name
++		workerNode := nodeutils.GetFirstReadyWorkerNode(oc)
++		o.Expect(workerNode).NotTo(o.BeEmpty(), "no ready worker node found")
++		err := nodeutils.EnsureNodeHasNoCustomRole(ctx, oc, workerNode)
++		o.Expect(err).NotTo(o.HaveOccurred())
+ 
+-		createSingleNodeMCP(ctx, oc, mcpName, workerNode)
++		mcClient, err := machineconfigclient.NewForConfig(oc.KubeFramework().ClientConfig())
++		o.Expect(err).NotTo(o.HaveOccurred(), "failed to create machine config client")
+ 
++		var mcpConfig *nodeutils.CustomMCPConfig
+ 		g.DeferCleanup(func() {
+-			g.By("Cleanup: delete ContainerRuntimeConfig")
++			cleanupCtx := context.Background()
+ 			delErr := oc.MachineConfigurationClient().MachineconfigurationV1().ContainerRuntimeConfigs().Delete(
+-				ctx, ctrcfgName, metav1.DeleteOptions{})
+-			if !apierrors.IsNotFound(delErr) {
+-				o.Expect(delErr).NotTo(o.HaveOccurred(),
+-					"cleanup failed: could not delete ContainerRuntimeConfig %s", ctrcfgName)
++				cleanupCtx, ctrcfgName, metav1.DeleteOptions{})
++			if delErr != nil && !apierrors.IsNotFound(delErr) {
++				e2e.Logf("Warning: failed to delete ContainerRuntimeConfig %s: %v", ctrcfgName, delErr)
++			}
++			if err := nodeutils.CleanupCustomMCP(cleanupCtx, mcpConfig); err != nil {
++				e2e.Logf("WARNING: cleanup had errors: %v", err)
+ 			}
+-			cleanupSingleNodeMCP(ctx, oc, mcpName, workerNode)
+ 		})
+ 
++		mcpConfig, err = nodeutils.CreateCustomMCPForNode(ctx, oc, mcClient, mcpName, workerNode)
++		o.Expect(err).NotTo(o.HaveOccurred(), "failed to create custom MCP")
++
+ 		initialSpec := imagepolicy.GetMCPCurrentSpecConfigName(oc, mcpName)
+ 
+ 		g.By("Create ContainerRuntimeConfig with overlaySize " + overlaySize)
+@@ -163,7 +171,7 @@ var _ = g.Describe("[Suite:openshift/disruptive-longrunning][sig-node][Disruptiv
+ 		e2e.Logf("Worker node rolled out successfully")
+ 
+ 		g.By("Check overlaySize takes effect in storage.conf on worker node")
+-		storageConf, err := nodeutils.ExecOnNodeWithChroot(oc, workerNode,
++		storageConf, err := nodeutils.ExecOnNodeWithChroot(ctx, oc, workerNode,
+ 			"/bin/bash", "-c", "head -n 7 /etc/containers/storage.conf | grep size")
+ 		o.Expect(err).NotTo(o.HaveOccurred(), "failed to read storage.conf on node %s", workerNode)
+ 		e2e.Logf("storage.conf size line: %s", storageConf)
+@@ -205,83 +213,3 @@ var _ = g.Describe("[Suite:openshift/disruptive-longrunning][sig-node][Disruptiv
+ 			"overlay filesystem should show %s, got: %s", overlaySize, actualSize)
+ 	})
+ })
+-
+-// createSingleNodeMCP creates a custom MachineConfigPool that targets exactly one worker node.
+-// It labels the node to move it into the custom pool and waits until the pool reports 1 node.
+-func createSingleNodeMCP(ctx context.Context, oc *exutil.CLI, mcpName, workerNode string) {
+-	nodeLabel := "node-role.kubernetes.io/" + mcpName
+-
+-	g.By("Create a custom MachineConfigPool targeting a single worker node")
+-	mcp := &mcfgv1.MachineConfigPool{
+-		ObjectMeta: metav1.ObjectMeta{
+-			Name:   mcpName,
+-			Labels: map[string]string{"machineconfiguration.openshift.io/pool": mcpName},
+-		},
+-		Spec: mcfgv1.MachineConfigPoolSpec{
+-			MachineConfigSelector: &metav1.LabelSelector{
+-				MatchExpressions: []metav1.LabelSelectorRequirement{
+-					{
+-						Key:      "machineconfiguration.openshift.io/role",
+-						Operator: metav1.LabelSelectorOpIn,
+-						Values:   []string{"worker", mcpName},
+-					},
+-				},
+-			},
+-			NodeSelector: &metav1.LabelSelector{
+-				MatchLabels: map[string]string{nodeLabel: ""},
+-			},
+-		},
+-	}
+-	_, err := oc.MachineConfigurationClient().MachineconfigurationV1().MachineConfigPools().Create(ctx, mcp, metav1.CreateOptions{})
+-	o.Expect(err).NotTo(o.HaveOccurred(), "failed to create custom MachineConfigPool %s", mcpName)
+-
+-	g.By("Label worker node to move it into the custom MCP")
+-	patch := []byte(fmt.Sprintf(`{"metadata":{"labels":{%q:""}}}`, nodeLabel))
+-	_, err = oc.AdminKubeClient().CoreV1().Nodes().Patch(ctx, workerNode, types.MergePatchType, patch, metav1.PatchOptions{})
+-	o.Expect(err).NotTo(o.HaveOccurred(), "failed to label node %s", workerNode)
+-
+-	g.By("Wait for the custom MCP to report the node")
+-	o.Eventually(func() int {
+-		pool, getErr := oc.MachineConfigurationClient().MachineconfigurationV1().MachineConfigPools().Get(ctx, mcpName, metav1.GetOptions{})
+-		if getErr != nil {
+-			return 0
+-		}
+-		return int(pool.Status.MachineCount)
+-	}, 2*time.Minute, 10*time.Second).Should(o.Equal(1), "custom MCP %s should have 1 node", mcpName)
+-}
+-
+-// cleanupSingleNodeMCP removes the node label, waits for the node to transition back to the
+-// worker pool config, and then deletes the custom MCP.
+-func cleanupSingleNodeMCP(ctx context.Context, oc *exutil.CLI, mcpName, workerNode string) {
+-	nodeLabel := "node-role.kubernetes.io/" + mcpName
+-
+-	g.By("Cleanup: remove node label to move node back to worker pool")
+-	patch := []byte(fmt.Sprintf(`{"metadata":{"labels":{%q:null}}}`, nodeLabel))
+-	_, err := oc.AdminKubeClient().CoreV1().Nodes().Patch(ctx, workerNode, types.MergePatchType, patch, metav1.PatchOptions{})
+-	if err != nil && !apierrors.IsNotFound(err) {
+-		e2e.Logf("WARNING: failed to remove label from node %s: %v", workerNode, err)
+-	}
+-
+-	g.By("Cleanup: wait for node to transition back to worker config")
+-	o.Eventually(func() bool {
+-		node, getErr := oc.AdminKubeClient().CoreV1().Nodes().Get(ctx, workerNode, metav1.GetOptions{})
+-		if getErr != nil {
+-			e2e.Logf("Error getting node: %v", getErr)
+-			return false
+-		}
+-		currentConfig := node.Annotations["machineconfiguration.openshift.io/currentConfig"]
+-		desiredConfig := node.Annotations["machineconfiguration.openshift.io/desiredConfig"]
+-		isWorkerConfig := currentConfig != "" && !strings.Contains(currentConfig, mcpName) && currentConfig == desiredConfig
+-		if !isWorkerConfig {
+-			e2e.Logf("Node %s still transitioning: current=%s, desired=%s", workerNode, currentConfig, desiredConfig)
+-		}
+-		return isWorkerConfig
+-	}, 15*time.Minute, 15*time.Second).Should(o.BeTrue(),
+-		"node %s should transition back to worker pool config", workerNode)
+-
+-	g.By("Cleanup: delete custom MachineConfigPool")
+-	delErr := oc.MachineConfigurationClient().MachineconfigurationV1().MachineConfigPools().Delete(ctx, mcpName, metav1.DeleteOptions{})
+-	if !apierrors.IsNotFound(delErr) && delErr != nil {
+-		e2e.Logf("WARNING: failed to delete MachineConfigPool %s: %v", mcpName, delErr)
+-	}
+-}
+diff --git a/test/extended/node/node_e2e/image_mirror_set.go b/test/extended/node/node_e2e/image_mirror_set.go
+index c4a2502dafb6..45ce099cfbad 100644
+--- a/test/extended/node/node_e2e/image_mirror_set.go
++++ b/test/extended/node/node_e2e/image_mirror_set.go
+@@ -31,7 +31,6 @@ import (
+ // do not wait on the full worker and master pools.
+ type mirrorTestPool struct {
+ 	oc        *exutil.CLI
+-	ctx       context.Context
+ 	mcClient  *machineconfigclient.Clientset
+ 	PoolName  string
+ 	NodeName  string
+@@ -47,6 +46,8 @@ func newMirrorTestPool(oc *exutil.CLI, ctx context.Context) *mirrorTestPool {
+ 
+ 	nodeName := nodeutils.GetFirstReadyWorkerNode(oc)
+ 	o.Expect(nodeName).NotTo(o.BeEmpty(), "no ready worker node found for custom MCP")
++	err = nodeutils.EnsureNodeHasNoCustomRole(ctx, oc, nodeName)
++	o.Expect(err).NotTo(o.HaveOccurred())
+ 
+ 	testMCP := &mcfgv1.MachineConfigPool{
+ 		ObjectMeta: metav1.ObjectMeta{
+@@ -81,7 +82,6 @@ func newMirrorTestPool(oc *exutil.CLI, ctx context.Context) *mirrorTestPool {
+ 
+ 	pool := &mirrorTestPool{
+ 		oc:        oc,
+-		ctx:       ctx,
+ 		mcClient:  mcClient,
+ 		PoolName:  poolName,
+ 		NodeName:  nodeName,
+@@ -103,36 +103,47 @@ func (p *mirrorTestPool) waitForRollout(initialSpec string) {
+ 	imagepolicy.WaitForMCPConfigSpecChangeAndUpdated(p.oc, p.PoolName, initialSpec)
+ }
+ 
+-func (p *mirrorTestPool) readRegistriesConf() string {
+-	registriesConf, err := nodeutils.ExecOnNodeWithChroot(p.oc, p.NodeName, "cat", "/etc/containers/registries.conf")
++func (p *mirrorTestPool) readRegistriesConf(ctx context.Context) string {
++	registriesConf, err := nodeutils.ExecOnNodeWithChroot(ctx, p.oc, p.NodeName, "cat", "/etc/containers/registries.conf")
+ 	o.Expect(err).NotTo(o.HaveOccurred(), "failed to read registries.conf from node %s", p.NodeName)
+ 	return registriesConf
+ }
+ 
+ func (p *mirrorTestPool) Teardown() {
++	ctx := context.Background()
++
+ 	e2e.Logf("Teardown: removing label %s from node %s", p.nodeLabel, p.NodeName)
+ 	removePatch := []byte(fmt.Sprintf(`{"metadata":{"labels":{%q:null}}}`, p.nodeLabel))
+-	_, patchErr := p.oc.AdminKubeClient().CoreV1().Nodes().Patch(p.ctx, p.NodeName, types.MergePatchType, removePatch, metav1.PatchOptions{})
++	_, patchErr := p.oc.AdminKubeClient().CoreV1().Nodes().Patch(ctx, p.NodeName, types.MergePatchType, removePatch, metav1.PatchOptions{})
+ 	if patchErr != nil && !apierrors.IsNotFound(patchErr) {
+ 		e2e.Logf("Warning: failed to remove label from node %s: %v", p.NodeName, patchErr)
+ 	}
+ 
+ 	e2e.Logf("Teardown: waiting for node %s to transition back to worker pool", p.NodeName)
+-	o.Eventually(func() bool {
+-		currentNode, getErr := p.oc.AdminKubeClient().CoreV1().Nodes().Get(p.ctx, p.NodeName, metav1.GetOptions{})
++	waitErr := wait.PollUntilContextTimeout(ctx, 15*time.Second, 15*time.Minute, true, func(ctx context.Context) (bool, error) {
++		currentNode, getErr := p.oc.AdminKubeClient().CoreV1().Nodes().Get(ctx, p.NodeName, metav1.GetOptions{})
+ 		if getErr != nil {
+-			return false
++			return false, nil
+ 		}
+ 		currentConfig := currentNode.Annotations["machineconfiguration.openshift.io/currentConfig"]
+ 		desiredConfig := currentNode.Annotations["machineconfiguration.openshift.io/desiredConfig"]
+-		return currentConfig != "" && !strings.Contains(currentConfig, p.PoolName) && currentConfig == desiredConfig
+-	}, 15*time.Minute, 15*time.Second).Should(o.BeTrue(),
+-		"node %s should transition back to worker pool", p.NodeName)
++		return currentConfig != "" && !strings.Contains(currentConfig, p.PoolName) && currentConfig == desiredConfig, nil
++	})
++	if waitErr != nil {
++		e2e.Logf("Warning: node %s did not transition back to worker pool: %v", p.NodeName, waitErr)
++	}
+ 
+-	deleteErr := p.mcClient.MachineconfigurationV1().MachineConfigPools().Delete(p.ctx, p.PoolName, metav1.DeleteOptions{})
++	deleteErr := p.mcClient.MachineconfigurationV1().MachineConfigPools().Delete(ctx, p.PoolName, metav1.DeleteOptions{})
+ 	if deleteErr != nil && !apierrors.IsNotFound(deleteErr) {
+ 		e2e.Logf("Warning: failed to delete MachineConfigPool %s: %v", p.PoolName, deleteErr)
+ 	}
++
++	if deleteErr == nil || apierrors.IsNotFound(deleteErr) {
++		e2e.Logf("Teardown: waiting for worker MCP to stabilize")
++		if stabilizeErr := nodeutils.WaitForMCP(ctx, p.mcClient, "worker", 10*time.Minute); stabilizeErr != nil {
++			e2e.Logf("Warning: worker MCP did not stabilize: %v", stabilizeErr)
++		}
++	}
+ }
+ 
+ // waitForMirrorTestMCPReady waits for a custom MCP to finish its initial bootstrap.
+@@ -194,19 +205,15 @@ func pollMCPSpecUnchanged(oc *exutil.CLI, pool, baselineSpec string, duration ti
+ // author: asahay@redhat.com
+ var _ = g.Describe("[sig-node][Suite:openshift/disruptive-longrunning][Disruptive][Serial] ImageTagMirrorSet and ImageDigestMirrorSet", func() {
+ 	var (
+-		oc  = exutil.NewCLIWithoutNamespace("image-mirror-set")
+-		ctx = context.Background()
++		oc = exutil.NewCLIWithoutNamespace("image-mirror-set")
+ 	)
+ 
+-	g.BeforeEach(func() {
+-		isMicroShift, err := exutil.IsMicroShiftCluster(oc.AdminKubeClient())
+-		o.Expect(err).NotTo(o.HaveOccurred())
+-		if isMicroShift {
+-			g.Skip("Skipping test on MicroShift cluster - MachineConfig resources are not available")
+-		}
++	g.BeforeEach(func(ctx context.Context) {
++		nodeutils.SkipOnMicroShift(oc)
++		nodeutils.EnsureNodesReady(ctx, oc)
+ 	})
+ 
+-	g.It("[OTP] Create ImageDigestMirrorSet and ImageTagMirrorSet and verify registries.conf [OCP-57401]", func() {
++	g.It("[OTP] Create ImageDigestMirrorSet and ImageTagMirrorSet and verify registries.conf [OCP-57401]", func(ctx context.Context) {
+ 		configClient := oc.AdminConfigClient().ConfigV1()
+ 		suffix := utilrand.String(5)
+ 		idmsName := fmt.Sprintf("digest-mirror-%s", suffix)
+@@ -247,12 +254,14 @@ var _ = g.Describe("[sig-node][Suite:openshift/disruptive-longrunning][Disruptiv
+ 		e2e.Logf("ImageDigestMirrorSet %q created successfully", createdIDMS.Name)
+ 
+ 		g.DeferCleanup(func() {
++			cleanupCtx, cancel := context.WithTimeout(context.Background(), 10*time.Minute)
++			defer cancel()
+ 			g.By("Cleanup: Delete IDMS and ITMS resources")
+ 			cleanupSpec := pool.currentSpec()
+-			if delErr := configClient.ImageTagMirrorSets().Delete(ctx, itmsName, metav1.DeleteOptions{}); delErr != nil {
++			if delErr := configClient.ImageTagMirrorSets().Delete(cleanupCtx, itmsName, metav1.DeleteOptions{}); delErr != nil {
+ 				e2e.Logf("Warning: failed to delete ImageTagMirrorSet: %v", delErr)
+ 			}
+-			if delErr := configClient.ImageDigestMirrorSets().Delete(ctx, idmsName, metav1.DeleteOptions{}); delErr != nil {
++			if delErr := configClient.ImageDigestMirrorSets().Delete(cleanupCtx, idmsName, metav1.DeleteOptions{}); delErr != nil {
+ 				e2e.Logf("Warning: failed to delete ImageDigestMirrorSet: %v", delErr)
+ 			}
+ 			pool.waitForRollout(cleanupSpec)
+@@ -298,7 +307,7 @@ var _ = g.Describe("[sig-node][Suite:openshift/disruptive-longrunning][Disruptiv
+ 		e2e.Logf("Custom MCP %s finished rolling out after ITMS creation", pool.PoolName)
+ 
+ 		g.By("Step 4: Verify /etc/containers/registries.conf on the custom pool node")
+-		registriesConf := pool.readRegistriesConf()
++		registriesConf := pool.readRegistriesConf(ctx)
+ 		e2e.Logf("registries.conf on %s: read %d bytes, asserting expected entries", pool.NodeName, len(registriesConf))
+ 
+ 		g.By("Verify IDMS entries (digest-only mirrors)")
+@@ -329,7 +338,7 @@ var _ = g.Describe("[sig-node][Suite:openshift/disruptive-longrunning][Disruptiv
+ 	})
+ 
+ 	// author: asahay@redhat.com
+-	g.It("[OTP] ICSP and IDMS/ITMS can coexist in cluster [OCP-70203]", ote.Informing(), func() {
++	g.It("[OTP] ICSP and IDMS/ITMS can coexist in cluster [OCP-70203]", ote.Informing(), func(ctx context.Context) {
+ 		configClient := oc.AdminConfigClient().ConfigV1()
+ 		operatorClient := oc.AdminOperatorClient().OperatorV1alpha1()
+ 		suffix := utilrand.String(5)
+@@ -373,13 +382,15 @@ var _ = g.Describe("[sig-node][Suite:openshift/disruptive-longrunning][Disruptiv
+ 		e2e.Logf("ICSP %s created successfully", icspName1)
+ 
+ 		g.DeferCleanup(func() {
++			cleanupCtx, cancel := context.WithTimeout(context.Background(), 10*time.Minute)
++			defer cancel()
+ 			g.By("Cleanup: Delete any remaining test resources and wait for custom MCP to settle")
+ 			cleanupSpec := pool.currentSpec()
+ 			toDelete := false
+ 
+ 			for _, name := range []string{icspName1, icspName2} {
+-				if _, getErr := operatorClient.ImageContentSourcePolicies().Get(ctx, name, metav1.GetOptions{}); getErr == nil {
+-					if delErr := operatorClient.ImageContentSourcePolicies().Delete(ctx, name, metav1.DeleteOptions{}); delErr == nil {
++				if _, getErr := operatorClient.ImageContentSourcePolicies().Get(cleanupCtx, name, metav1.GetOptions{}); getErr == nil {
++					if delErr := operatorClient.ImageContentSourcePolicies().Delete(cleanupCtx, name, metav1.DeleteOptions{}); delErr == nil {
+ 						e2e.Logf("Cleanup: deleted ICSP %s", name)
+ 						toDelete = true
+ 					} else {
+@@ -387,16 +398,16 @@ var _ = g.Describe("[sig-node][Suite:openshift/disruptive-longrunning][Disruptiv
+ 					}
+ 				}
+ 			}
+-			if _, getErr := configClient.ImageTagMirrorSets().Get(ctx, itmsName, metav1.GetOptions{}); getErr == nil {
+-				if delErr := configClient.ImageTagMirrorSets().Delete(ctx, itmsName, metav1.DeleteOptions{}); delErr == nil {
++			if _, getErr := configClient.ImageTagMirrorSets().Get(cleanupCtx, itmsName, metav1.GetOptions{}); getErr == nil {
++				if delErr := configClient.ImageTagMirrorSets().Delete(cleanupCtx, itmsName, metav1.DeleteOptions{}); delErr == nil {
+ 					e2e.Logf("Cleanup: deleted ITMS %s", itmsName)
+ 					toDelete = true
+ 				} else {
+ 					e2e.Logf("Cleanup: warning - failed to delete ITMS %s: %v", itmsName, delErr)
+ 				}
+ 			}
+-			if _, getErr := configClient.ImageDigestMirrorSets().Get(ctx, idmsName, metav1.GetOptions{}); getErr == nil {
+-				if delErr := configClient.ImageDigestMirrorSets().Delete(ctx, idmsName, metav1.DeleteOptions{}); delErr == nil {
++			if _, getErr := configClient.ImageDigestMirrorSets().Get(cleanupCtx, idmsName, metav1.GetOptions{}); getErr == nil {
++				if delErr := configClient.ImageDigestMirrorSets().Delete(cleanupCtx, idmsName, metav1.DeleteOptions{}); delErr == nil {
+ 					e2e.Logf("Cleanup: deleted IDMS %s", idmsName)
+ 					toDelete = true
+ 				} else {
+@@ -412,7 +423,7 @@ var _ = g.Describe("[sig-node][Suite:openshift/disruptive-longrunning][Disruptiv
+ 		pool.waitForRollout(initialSpec)
+ 		e2e.Logf("Custom MCP %s rollout complete after ICSP creation", pool.PoolName)
+ 
+-		registriesConf := pool.readRegistriesConf()
++		registriesConf := pool.readRegistriesConf(ctx)
+ 		e2e.Logf("registries.conf after ICSP creation: read %d bytes, asserting expected entries", len(registriesConf))
+ 
+ 		o.Expect(registriesConf).To(o.ContainSubstring(`location = "registry.access.redhat.com/ubi8/ubi-minimal"`),
+@@ -476,7 +487,7 @@ var _ = g.Describe("[sig-node][Suite:openshift/disruptive-longrunning][Disruptiv
+ 		e2e.Logf("Confirmed: custom MCP %s stable for 2 minutes after ICSP deletion", pool.PoolName)
+ 
+ 		g.By("Step 5: Verify registries.conf is unchanged after ICSP deletion (IDMS maintains same mirror config)")
+-		registriesConfAfterICSPDelete := pool.readRegistriesConf()
++		registriesConfAfterICSPDelete := pool.readRegistriesConf(ctx)
+ 		o.Expect(registriesConfAfterICSPDelete).To(o.Equal(registriesConf),
+ 			"registries.conf should be unchanged after ICSP deletion when IDMS covers the same mirror config")
+ 		e2e.Logf("Confirmed: registries.conf unchanged after ICSP deletion")
+@@ -509,7 +520,7 @@ var _ = g.Describe("[sig-node][Suite:openshift/disruptive-longrunning][Disruptiv
+ 		e2e.Logf("Custom MCP %s rollout complete after ITMS creation", pool.PoolName)
+ 
+ 		g.By("Step 7: Verify registries.conf updated with ITMS tag-only entries alongside IDMS digest entries")
+-		registriesConfAfterITMS := pool.readRegistriesConf()
++		registriesConfAfterITMS := pool.readRegistriesConf(ctx)
+ 		e2e.Logf("registries.conf after ITMS creation: read %d bytes, asserting expected entries", len(registriesConfAfterITMS))
+ 
+ 		o.Expect(registriesConfAfterITMS).To(o.ContainSubstring(`location = "registry.access.redhat.com/ubi9/ubi-minimal"`),
+@@ -549,7 +560,7 @@ var _ = g.Describe("[sig-node][Suite:openshift/disruptive-longrunning][Disruptiv
+ 		e2e.Logf("Custom MCP %s rollout complete after second ICSP creation", pool.PoolName)
+ 
+ 		g.By("Step 9: Verify registries.conf updated with ICSP2 entries alongside IDMS and ITMS entries")
+-		registriesConfAfterICSP2 := pool.readRegistriesConf()
++		registriesConfAfterICSP2 := pool.readRegistriesConf(ctx)
+ 		e2e.Logf("registries.conf after second ICSP creation: read %d bytes, asserting expected entries", len(registriesConfAfterICSP2))
+ 
+ 		o.Expect(registriesConfAfterICSP2).To(o.ContainSubstring(`location = "registry.example.com/example/myimage"`),
+@@ -571,7 +582,7 @@ var _ = g.Describe("[sig-node][Suite:openshift/disruptive-longrunning][Disruptiv
+ 		e2e.Logf("Custom MCP %s rollout complete after IDMS deletion", pool.PoolName)
+ 
+ 		g.By("Step 11: Verify registries.conf - IDMS entries removed, ITMS and ICSP2 entries remain")
+-		registriesConfAfterIDMSDelete := pool.readRegistriesConf()
++		registriesConfAfterIDMSDelete := pool.readRegistriesConf(ctx)
+ 		e2e.Logf("registries.conf after IDMS deletion: read %d bytes, asserting expected entries", len(registriesConfAfterIDMSDelete))
+ 
+ 		o.Expect(registriesConfAfterIDMSDelete).NotTo(o.ContainSubstring(`location = "registry.access.redhat.com/ubi8/ubi-minimal"`),
+diff --git a/test/extended/node/node_e2e/image_registry_config.go b/test/extended/node/node_e2e/image_registry_config.go
+index dcbe455a4e0c..95dace1af3f8 100644
+--- a/test/extended/node/node_e2e/image_registry_config.go
++++ b/test/extended/node/node_e2e/image_registry_config.go
+@@ -24,12 +24,9 @@ var _ = g.Describe("[Suite:openshift/disruptive-longrunning][sig-node][Disruptiv
+ 		oc = exutil.NewCLIWithoutNamespace("imgcfg")
+ 	)
+ 
+-	g.BeforeEach(func() {
+-		isMicroShift, err := exutil.IsMicroShiftCluster(oc.AdminKubeClient())
+-		o.Expect(err).NotTo(o.HaveOccurred(), "failed to detect cluster type")
+-		if isMicroShift {
+-			g.Skip("Skipping test on MicroShift cluster - MachineConfig resources are not available")
+-		}
++	g.BeforeEach(func(ctx context.Context) {
++		nodeutils.SkipOnMicroShift(oc)
++		nodeutils.EnsureNodesReady(ctx, oc)
+ 	})
+ 
+ 	// Verifies that updating image.config.openshift.io/cluster with a new search
+@@ -47,14 +44,15 @@ var _ = g.Describe("[Suite:openshift/disruptive-longrunning][sig-node][Disruptiv
+ 		initialMasterSpec := imagepolicy.GetMCPCurrentSpecConfigName(oc, "master")
+ 
+ 		g.DeferCleanup(func() {
++			cleanupCtx := context.Background()
+ 			e2e.Logf("Cleanup: restoring original image.config")
+ 			restoreErr := retry.RetryOnConflict(retry.DefaultBackoff, func() error {
+-				current, getErr := oc.AdminConfigClient().ConfigV1().Images().Get(ctx, "cluster", metav1.GetOptions{})
++				current, getErr := oc.AdminConfigClient().ConfigV1().Images().Get(cleanupCtx, "cluster", metav1.GetOptions{})
+ 				if getErr != nil {
+ 					return getErr
+ 				}
+ 				current.Spec.RegistrySources = originalImageConfig.Spec.RegistrySources
+-				_, updateErr := oc.AdminConfigClient().ConfigV1().Images().Update(ctx, current, metav1.UpdateOptions{})
++				_, updateErr := oc.AdminConfigClient().ConfigV1().Images().Update(cleanupCtx, current, metav1.UpdateOptions{})
+ 				return updateErr
+ 			})
+ 			o.Expect(restoreErr).NotTo(o.HaveOccurred(),
+@@ -66,7 +64,7 @@ var _ = g.Describe("[Suite:openshift/disruptive-longrunning][sig-node][Disruptiv
+ 			imagepolicy.WaitForMCPConfigSpecChangeAndUpdated(oc, "master", cleanupMasterSpec)
+ 
+ 			e2e.Logf("Cleanup: waiting for all cluster operators to settle")
+-			waitErr := operator.WaitForOperatorsToSettle(ctx, oc.AdminConfigClient(), 10)
++			waitErr := operator.WaitForOperatorsToSettle(cleanupCtx, oc.AdminConfigClient(), 10)
+ 			o.Expect(waitErr).NotTo(o.HaveOccurred(),
+ 				"cluster operators did not settle after restore")
+ 		})
+@@ -101,7 +99,7 @@ var _ = g.Describe("[Suite:openshift/disruptive-longrunning][sig-node][Disruptiv
+ 		var registriesConf string
+ 		o.Eventually(func() error {
+ 			var execErr error
+-			registriesConf, execErr = nodeutils.ExecOnNodeWithChroot(oc, workers[0].Name,
++			registriesConf, execErr = nodeutils.ExecOnNodeWithChroot(ctx, oc, workers[0].Name,
+ 				"cat", "/etc/containers/registries.conf.d/01-image-searchRegistries.conf")
+ 			if execErr != nil {
+ 				return execErr
+@@ -115,7 +113,7 @@ var _ = g.Describe("[Suite:openshift/disruptive-longrunning][sig-node][Disruptiv
+ 		e2e.Logf("Registries config on %s:\n%s", workers[0].Name, registriesConf)
+ 
+ 		g.By("Verify policy.json is updated with allowed registries")
+-		policyJSON, err := nodeutils.ExecOnNodeWithChroot(oc, workers[0].Name,
++		policyJSON, err := nodeutils.ExecOnNodeWithChroot(ctx, oc, workers[0].Name,
+ 			"cat", "/etc/containers/policy.json")
+ 		o.Expect(err).NotTo(o.HaveOccurred(), "failed to read policy.json on node %s", workers[0].Name)
+ 		e2e.Logf("policy.json on %s:\n%s", workers[0].Name, policyJSON)
+diff --git a/test/extended/node/node_e2e/initcontainer.go b/test/extended/node/node_e2e/initcontainer.go
+index 6e095fe222d7..9d539f722872 100644
+--- a/test/extended/node/node_e2e/initcontainer.go
++++ b/test/extended/node/node_e2e/initcontainer.go
+@@ -26,12 +26,14 @@ var _ = g.Describe("[sig-node] [Jira:Node/Kubelet] NODE initContainer policy,vol
+ 	)
+ 
+ 	// Skip all tests on MicroShift clusters as MachineConfig resources are not available
+-	g.BeforeEach(func() {
++	g.BeforeEach(func(ctx context.Context) {
+ 		isMicroShift, err := exutil.IsMicroShiftCluster(oc.AdminKubeClient())
+ 		o.Expect(err).NotTo(o.HaveOccurred())
+ 		if isMicroShift {
+ 			g.Skip("Skipping test on MicroShift cluster - MachineConfig resources are not available")
+ 		}
++
++		nodeutils.EnsureNodesReady(ctx, oc)
+ 	})
+ 
+ 	//author: bgudi@redhat.com
+@@ -127,7 +129,7 @@ var _ = g.Describe("[sig-node] [Jira:Node/Kubelet] NODE initContainer policy,vol
+ 		actualContainerID := matches[1]
+ 
+ 		g.By("Delete init container from node")
+-		output, err := nodeutils.ExecOnNodeWithChroot(oc, nodeName, "crictl", "rm", actualContainerID)
++		output, err := nodeutils.ExecOnNodeWithChroot(ctx, oc, nodeName, "crictl", "rm", actualContainerID)
+ 		o.Expect(err).NotTo(o.HaveOccurred(), "fail to delete container")
+ 		e2e.Logf("Container deletion output: %s", output)
+ 
+diff --git a/test/extended/node/node_e2e/netns_cleanup.go b/test/extended/node/node_e2e/netns_cleanup.go
+index 9fd3438ce2fa..a55d8d925a54 100644
+--- a/test/extended/node/node_e2e/netns_cleanup.go
++++ b/test/extended/node/node_e2e/netns_cleanup.go
+@@ -70,12 +70,12 @@ var _ = g.Describe("[sig-node] [Jira:Node/Kubelet] Network namespace cleanup", f
+ 		e2e.Logf("Pod is running on node: %s", nodeName)
+ 
+ 		g.By("Get pod's network namespace path")
+-		netNsPath, err := nodeutils.GetPodNetNs(oc, nodeName, podName)
++		netNsPath, err := nodeutils.GetPodNetNs(ctx, oc, nodeName, podName)
+ 		o.Expect(err).NotTo(o.HaveOccurred(), "failed to get pod NetNS")
+ 		e2e.Logf("Pod NetNS path: %s", netNsPath)
+ 
+ 		g.By("Verify NetNS file exists before pod deletion")
+-		_, err = nodeutils.ExecOnNodeWithChroot(oc, nodeName, "test", "-e", netNsPath)
++		_, err = nodeutils.ExecOnNodeWithChroot(ctx, oc, nodeName, "test", "-e", netNsPath)
+ 		o.Expect(err).NotTo(o.HaveOccurred(), "NetNS file does not exist before pod deletion")
+ 
+ 		g.By("Delete the pod")
+@@ -99,7 +99,7 @@ var _ = g.Describe("[sig-node] [Jira:Node/Kubelet] Network namespace cleanup", f
+ 		o.Expect(err).NotTo(o.HaveOccurred(), "pod was not deleted")
+ 
+ 		g.By("Verify that the NetNS file has been cleaned up on the node")
+-		err = nodeutils.CheckNetNsCleaned(oc, nodeName, netNsPath)
++		err = nodeutils.CheckNetNsCleaned(ctx, oc, nodeName, netNsPath)
+ 		o.Expect(err).NotTo(o.HaveOccurred(), "NetNS file was not cleaned up")
+ 	})
+ })
+diff --git a/test/extended/node/node_e2e/node.go b/test/extended/node/node_e2e/node.go
+index f9205b9b58fb..2b6676e93f1c 100644
+--- a/test/extended/node/node_e2e/node.go
++++ b/test/extended/node/node_e2e/node.go
+@@ -1,6 +1,7 @@
+ package node
+ 
+ import (
++	"context"
+ 	"path/filepath"
+ 	"strings"
+ 	"time"
+@@ -22,17 +23,13 @@ var _ = g.Describe("[sig-node] [Jira:Node/Kubelet] Kubelet, CRI-O, CPU manager",
+ 		podDevFuseYAML = filepath.Join(nodeE2EBaseDir, "pod-dev-fuse.yaml")
+ 	)
+ 
+-	// Skip all tests on MicroShift clusters as MachineConfig resources are not available
+-	g.BeforeEach(func() {
+-		isMicroShift, err := exutil.IsMicroShiftCluster(oc.AdminKubeClient())
+-		o.Expect(err).NotTo(o.HaveOccurred())
+-		if isMicroShift {
+-			g.Skip("Skipping test on MicroShift cluster - MachineConfig resources are not available")
+-		}
++	g.BeforeEach(func(ctx context.Context) {
++		nodeutils.SkipOnMicroShift(oc)
++		nodeutils.EnsureNodesReady(ctx, oc)
+ 	})
+ 
+ 	//author: asahay@redhat.com
+-	g.It("[OTP] validate KUBELET_LOG_LEVEL", func() {
++	g.It("[OTP] validate KUBELET_LOG_LEVEL", func(ctx context.Context) {
+ 		var kubeservice string
+ 		var kubelet string
+ 		var err error
+@@ -53,11 +50,11 @@ var _ = g.Describe("[sig-node] [Jira:Node/Kubelet] Kubelet, CRI-O, CPU manager",
+ 
+ 				if nodeStatus == "True" {
+ 					g.By("Checking KUBELET_LOG_LEVEL in kubelet.service on node " + node)
+-					kubeservice, err = nodeutils.ExecOnNodeWithChroot(oc, node, "/bin/bash", "-c", "systemctl show kubelet.service | grep KUBELET_LOG_LEVEL")
++					kubeservice, err = nodeutils.ExecOnNodeWithChroot(ctx, oc, node, "/bin/bash", "-c", "systemctl show kubelet.service | grep KUBELET_LOG_LEVEL")
+ 					o.Expect(err).NotTo(o.HaveOccurred())
+ 
+ 					g.By("Checking kubelet process for --v=2 flag on node " + node)
+-					kubelet, err = nodeutils.ExecOnNodeWithChroot(oc, node, "/bin/bash", "-c", "ps aux | grep [k]ubelet")
++					kubelet, err = nodeutils.ExecOnNodeWithChroot(ctx, oc, node, "/bin/bash", "-c", "ps aux | grep [k]ubelet")
+ 					o.Expect(err).NotTo(o.HaveOccurred())
+ 
+ 					g.By("Verifying KUBELET_LOG_LEVEL is set and kubelet is running with --v=2")
+@@ -83,7 +80,7 @@ var _ = g.Describe("[sig-node] [Jira:Node/Kubelet] Kubelet, CRI-O, CPU manager",
+ 	})
+ 
+ 	//author: cmaurya@redhat.com
+-	g.It("[OTP] validate cgroupv2 is default [OCP-80983]", func() {
++	g.It("[OTP] validate cgroupv2 is default [OCP-80983]", func(ctx context.Context) {
+ 		g.By("Check cgroup version on all Ready worker nodes")
+ 		nodeNames, err := oc.AsAdmin().WithoutNamespace().Run("get").Args("nodes", "-l", "node-role.kubernetes.io/worker", "-o=jsonpath={.items[*].metadata.name}").Output()
+ 		o.Expect(err).NotTo(o.HaveOccurred())
+@@ -97,7 +94,7 @@ var _ = g.Describe("[sig-node] [Jira:Node/Kubelet] Kubelet, CRI-O, CPU manager",
+ 				e2e.Logf("Skipping worker node %s (not Ready)", worker)
+ 				continue
+ 			}
+-			cgroupV, err := nodeutils.ExecOnNodeWithChroot(oc, worker, "/bin/bash", "-c", "stat -c %T -f /sys/fs/cgroup")
++			cgroupV, err := nodeutils.ExecOnNodeWithChroot(ctx, oc, worker, "/bin/bash", "-c", "stat -c %T -f /sys/fs/cgroup")
+ 			o.Expect(err).NotTo(o.HaveOccurred())
+ 			e2e.Logf("cgroup version on node %s: [%v]", worker, cgroupV)
+ 			o.Expect(cgroupV).To(o.ContainSubstring("cgroup2fs"), "Node %s does not have cgroupv2", worker)
+@@ -110,7 +107,7 @@ var _ = g.Describe("[sig-node] [Jira:Node/Kubelet] Kubelet, CRI-O, CPU manager",
+ 	})
+ 
+ 	//author: cmaurya@redhat.com
+-	g.It("[OTP] Allow dev fuse by default in CRI-O [OCP-70987]", func() {
++	g.It("[OTP] Allow dev fuse by default in CRI-O [OCP-70987]", func(ctx context.Context) {
+ 		podName := "pod-devfuse"
+ 		ns := "devfuse-test"
+ 
+@@ -121,7 +118,7 @@ var _ = g.Describe("[sig-node] [Jira:Node/Kubelet] Kubelet, CRI-O, CPU manager",
+ 			"nodes", "-l", "node-role.kubernetes.io/worker", "-o=jsonpath={.items[0].metadata.name}").Output()
+ 		o.Expect(err).NotTo(o.HaveOccurred())
+ 		o.Expect(node).NotTo(o.BeEmpty())
+-		runtime, err := nodeutils.ExecOnNodeWithChroot(oc, node, "/bin/bash", "-c",
++		runtime, err := nodeutils.ExecOnNodeWithChroot(ctx, oc, node, "/bin/bash", "-c",
+ 			"crio status config 2>/dev/null | awk -F'\"' '/default_runtime/{print $2}'")
+ 		o.Expect(err).NotTo(o.HaveOccurred())
+ 		if strings.TrimSpace(runtime) == "runc" {
+diff --git a/test/extended/node/node_e2e/pdb_drain.go b/test/extended/node/node_e2e/pdb_drain.go
+index dc1c95ce14d7..5e78d994624e 100644
+--- a/test/extended/node/node_e2e/pdb_drain.go
++++ b/test/extended/node/node_e2e/pdb_drain.go
+@@ -18,6 +18,7 @@ import (
+ 	e2e "k8s.io/kubernetes/test/e2e/framework"
+ 	"k8s.io/utils/ptr"
+ 
++	nodeutils "github.com/openshift/origin/test/extended/node"
+ 	exutil "github.com/openshift/origin/test/extended/util"
+ 	"github.com/openshift/origin/test/extended/util/operator"
+ )
+@@ -27,12 +28,9 @@ var _ = g.Describe("[Suite:openshift/disruptive-longrunning][sig-node][Disruptiv
+ 		oc = exutil.NewCLIWithoutNamespace("pdb-drain")
+ 	)
+ 
+-	g.BeforeEach(func() {
+-		isMicroShift, err := exutil.IsMicroShiftCluster(oc.AdminKubeClient())
+-		o.Expect(err).NotTo(o.HaveOccurred())
+-		if isMicroShift {
+-			g.Skip("Skipping test on MicroShift cluster")
+-		}
++	g.BeforeEach(func(ctx context.Context) {
++		nodeutils.SkipOnMicroShift(oc)
++		nodeutils.EnsureNodesReady(ctx, oc)
+ 	})
+ 
+ 	//author: bgudi@redhat.com
+@@ -139,7 +137,7 @@ var _ = g.Describe("[Suite:openshift/disruptive-longrunning][sig-node][Disruptiv
+ 		}
+ 		_, err = oc.KubeClient().PolicyV1().PodDisruptionBudgets(namespace).Create(ctx, pdb, metav1.CreateOptions{})
+ 		o.Expect(err).NotTo(o.HaveOccurred(), "failed to create PodDisruptionBudget")
+-		g.DeferCleanup(oc.KubeClient().PolicyV1().PodDisruptionBudgets(namespace).Delete, ctx, "pdb-drain-test", metav1.DeleteOptions{})
++		g.DeferCleanup(oc.KubeClient().PolicyV1().PodDisruptionBudgets(namespace).Delete, context.Background(), "pdb-drain-test", metav1.DeleteOptions{})
+ 
+ 		g.By("Verify all test pods are on the selected worker node")
+ 		podList, err := oc.KubeClient().CoreV1().Pods(namespace).List(ctx, metav1.ListOptions{
+@@ -174,7 +172,8 @@ var _ = g.Describe("[Suite:openshift/disruptive-longrunning][sig-node][Disruptiv
+ 
+ 		g.By("Drain the selected worker node")
+ 		g.DeferCleanup(func() {
+-			err := operator.WaitForOperatorsToSettle(ctx, oc.AdminConfigClient(), 10)
++			cleanupCtx := context.Background()
++			err := operator.WaitForOperatorsToSettle(cleanupCtx, oc.AdminConfigClient(), 10)
+ 			o.Expect(err).NotTo(o.HaveOccurred(), "cluster operators failed to return to available state after node drain")
+ 		})
+ 		g.DeferCleanup(oc.AsAdmin().WithoutNamespace().Run("adm").Args("uncordon", workerNode).Execute)
+diff --git a/test/extended/node/node_e2e/probe_termination.go b/test/extended/node/node_e2e/probe_termination.go
+index 6114cc69494b..a5fb9c02058d 100644
+--- a/test/extended/node/node_e2e/probe_termination.go
++++ b/test/extended/node/node_e2e/probe_termination.go
+@@ -27,12 +27,14 @@ var _ = g.Describe("[sig-node] Probe configuration", func() {
+ 		oc = exutil.NewCLIWithoutNamespace("probe-termination")
+ 	)
+ 
+-	g.BeforeEach(func() {
++	g.BeforeEach(func(ctx context.Context) {
+ 		isMicroShift, err := exutil.IsMicroShiftCluster(oc.AdminKubeClient())
+ 		o.Expect(err).NotTo(o.HaveOccurred())
+ 		if isMicroShift {
+ 			g.Skip("Skipping test on MicroShift cluster")
+ 		}
++
++		nodeutils.EnsureNodesReady(ctx, oc)
+ 	})
+ 
+ 	//author: bgudi@redhat.com
+diff --git a/test/extended/node/node_kc_helpers.go b/test/extended/node/node_kc_helpers.go
+new file mode 100644
+index 000000000000..c137c5ddcee2
+--- /dev/null
++++ b/test/extended/node/node_kc_helpers.go
+@@ -0,0 +1,107 @@
++package node
++
++import (
++	"context"
++	"fmt"
++	"time"
++
++	apierrors "k8s.io/apimachinery/pkg/api/errors"
++	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
++	"k8s.io/kubernetes/test/e2e/framework"
++
++	machineconfigv1 "github.com/openshift/api/machineconfiguration/v1"
++	machineconfigclient "github.com/openshift/client-go/machineconfiguration/clientset/versioned"
++)
++
++// CreateKubeletConfig creates a KubeletConfig resource.
++func CreateKubeletConfig(ctx context.Context, mcClient *machineconfigclient.Clientset, kubeletConfig *machineconfigv1.KubeletConfig) (*machineconfigv1.KubeletConfig, error) {
++	framework.Logf("Creating KubeletConfig %s", kubeletConfig.Name)
++	created, err := mcClient.MachineconfigurationV1().KubeletConfigs().Create(ctx, kubeletConfig, metav1.CreateOptions{})
++	if err != nil {
++		return nil, err
++	}
++	return created, nil
++}
++
++// CreateOrUpdateKubeletConfig creates a KubeletConfig or updates it if it already exists.
++func CreateOrUpdateKubeletConfig(ctx context.Context, mcClient *machineconfigclient.Clientset, kubeletConfig *machineconfigv1.KubeletConfig) (*machineconfigv1.KubeletConfig, error) {
++	existing, err := mcClient.MachineconfigurationV1().KubeletConfigs().Get(ctx, kubeletConfig.Name, metav1.GetOptions{})
++	if apierrors.IsNotFound(err) {
++		framework.Logf("Creating KubeletConfig %s", kubeletConfig.Name)
++		return mcClient.MachineconfigurationV1().KubeletConfigs().Create(ctx, kubeletConfig, metav1.CreateOptions{})
++	}
++	if err != nil {
++		return nil, err
++	}
++
++	framework.Logf("Updating existing KubeletConfig %s", kubeletConfig.Name)
++	existing.Spec = kubeletConfig.Spec
++	return mcClient.MachineconfigurationV1().KubeletConfigs().Update(ctx, existing, metav1.UpdateOptions{})
++}
++
++// CleanupKubeletConfig deletes a KubeletConfig. If mcpName is non-empty, waits for that MCP to stabilize.
++func CleanupKubeletConfig(ctx context.Context, mcClient *machineconfigclient.Clientset, kcName, mcpName string) error {
++	framework.Logf("Cleaning up KubeletConfig %s", kcName)
++
++	deleteErr := mcClient.MachineconfigurationV1().KubeletConfigs().Delete(ctx, kcName, metav1.DeleteOptions{})
++	if deleteErr != nil && !apierrors.IsNotFound(deleteErr) {
++		return deleteErr
++	}
++
++	if mcpName != "" && (deleteErr == nil || apierrors.IsNotFound(deleteErr)) {
++		framework.Logf("Waiting for MCP %s to become ready after KubeletConfig deletion", mcpName)
++		waitErr := WaitForMCP(ctx, mcClient, mcpName, 15*time.Minute)
++		if waitErr != nil && !apierrors.IsNotFound(waitErr) {
++			return waitErr
++		}
++	}
++
++	framework.Logf("KubeletConfig %s cleaned up successfully", kcName)
++	return nil
++}
++
++// ApplyKubeletConfigAndWaitForMCP creates a KubeletConfig and waits for the MCP rollout to complete.
++func ApplyKubeletConfigAndWaitForMCP(ctx context.Context, mcClient *machineconfigclient.Clientset, kubeletConfig *machineconfigv1.KubeletConfig, mcpName string, rolloutTimeout time.Duration) error {
++	_, err := CreateKubeletConfig(ctx, mcClient, kubeletConfig)
++	if err != nil {
++		return err
++	}
++
++	framework.Logf("Waiting for MCP %s to start updating", mcpName)
++	err = WaitForMCPUpdating(ctx, mcClient, mcpName, 5*time.Minute)
++	if err != nil {
++		return err
++	}
++
++	framework.Logf("Waiting for MCP %s to complete rollout", mcpName)
++	return WaitForMCP(ctx, mcClient, mcpName, rolloutTimeout)
++}
++
++// WaitForMCPUpdating waits for an MCP to enter the "Updating" state.
++func WaitForMCPUpdating(ctx context.Context, mcClient *machineconfigclient.Clientset, mcpName string, timeout time.Duration) error {
++	startTime := time.Now()
++	for {
++		mcp, err := mcClient.MachineconfigurationV1().MachineConfigPools().Get(ctx, mcpName, metav1.GetOptions{})
++		if err != nil {
++			if time.Since(startTime) > timeout {
++				return err
++			}
++			framework.Logf("Error getting MCP %s: %v, retrying...", mcpName, err)
++			time.Sleep(10 * time.Second)
++			continue
++		}
++
++		for _, condition := range mcp.Status.Conditions {
++			if condition.Type == "Updating" && condition.Status == "True" {
++				framework.Logf("MCP %s has started updating", mcpName)
++				return nil
++			}
++		}
++
++		if time.Since(startTime) > timeout {
++			return fmt.Errorf("timeout waiting for MCP %s to start updating", mcpName)
++		}
++
++		time.Sleep(10 * time.Second)
++	}
++}
+diff --git a/test/extended/node/node_mcp_helpers.go b/test/extended/node/node_mcp_helpers.go
+new file mode 100644
+index 000000000000..394254fe6210
+--- /dev/null
++++ b/test/extended/node/node_mcp_helpers.go
+@@ -0,0 +1,187 @@
++package node
++
++import (
++	"context"
++	"fmt"
++	"strings"
++	"time"
++
++	apierrors "k8s.io/apimachinery/pkg/api/errors"
++	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
++	"k8s.io/apimachinery/pkg/types"
++	"k8s.io/apimachinery/pkg/util/wait"
++	"k8s.io/kubernetes/test/e2e/framework"
++
++	corev1 "k8s.io/api/core/v1"
++
++	machineconfigv1 "github.com/openshift/api/machineconfiguration/v1"
++	machineconfigclient "github.com/openshift/client-go/machineconfiguration/clientset/versioned"
++	exutil "github.com/openshift/origin/test/extended/util"
++)
++
++var standardNodeRoles = map[string]bool{
++	"worker":        true,
++	"control-plane": true,
++	"master":        true,
++}
++
++func NodeHasCustomRole(node corev1.Node) (string, bool) {
++	const prefix = "node-role.kubernetes.io/"
++	for label := range node.Labels {
++		if strings.HasPrefix(label, prefix) {
++			role := strings.TrimPrefix(label, prefix)
++			if !standardNodeRoles[role] {
++				return role, true
++			}
++		}
++	}
++	return "", false
++}
++
++func EnsureNodeHasNoCustomRole(ctx context.Context, oc *exutil.CLI, nodeName string) error {
++	node, err := oc.AdminKubeClient().CoreV1().Nodes().Get(ctx, nodeName, metav1.GetOptions{})
++	if err != nil {
++		return fmt.Errorf("failed to get node %s: %w", nodeName, err)
++	}
++	if role, found := NodeHasCustomRole(*node); found {
++		return fmt.Errorf("node %s already has custom role %q; another test's MCP cleanup may not have completed", nodeName, role)
++	}
++	return nil
++}
++
++// CustomMCPConfig holds state needed to clean up a custom MCP created by CreateCustomMCPForNode.
++type CustomMCPConfig struct {
++	Name       string
++	NodeName   string
++	MCClient   *machineconfigclient.Clientset
++	KubeClient *exutil.CLI
++}
++
++// CreateCustomMCPForNode labels a node and creates a custom MCP targeting it.
++func CreateCustomMCPForNode(ctx context.Context, oc *exutil.CLI, mcClient *machineconfigclient.Clientset, mcpName, nodeName string) (*CustomMCPConfig, error) {
++	config := &CustomMCPConfig{
++		Name:       mcpName,
++		NodeName:   nodeName,
++		MCClient:   mcClient,
++		KubeClient: oc,
++	}
++
++	if err := EnsureNodeHasNoCustomRole(ctx, oc, nodeName); err != nil {
++		return nil, err
++	}
++
++	nodeLabel := fmt.Sprintf("node-role.kubernetes.io/%s", mcpName)
++
++	framework.Logf("Labeling node %s with %s", nodeName, nodeLabel)
++	patchData := []byte(fmt.Sprintf(`{"metadata":{"labels":{%q:""}}}`, nodeLabel))
++	_, err := oc.AdminKubeClient().CoreV1().Nodes().Patch(ctx, nodeName, types.MergePatchType, patchData, metav1.PatchOptions{})
++	if err != nil {
++		return nil, fmt.Errorf("failed to label node %s: %w", nodeName, err)
++	}
++
++	framework.Logf("Creating custom MachineConfigPool %s", mcpName)
++	mcp := &machineconfigv1.MachineConfigPool{
++		TypeMeta: metav1.TypeMeta{
++			APIVersion: "machineconfiguration.openshift.io/v1",
++			Kind:       "MachineConfigPool",
++		},
++		ObjectMeta: metav1.ObjectMeta{
++			Name: mcpName,
++			Labels: map[string]string{
++				"machineconfiguration.openshift.io/pool":                      mcpName,
++				"pools.operator.machineconfiguration.openshift.io/" + mcpName: "",
++			},
++		},
++		Spec: machineconfigv1.MachineConfigPoolSpec{
++			MachineConfigSelector: &metav1.LabelSelector{
++				MatchExpressions: []metav1.LabelSelectorRequirement{
++					{
++						Key:      "machineconfiguration.openshift.io/role",
++						Operator: metav1.LabelSelectorOpIn,
++						Values:   []string{"worker", mcpName},
++					},
++				},
++			},
++			NodeSelector: &metav1.LabelSelector{
++				MatchLabels: map[string]string{
++					nodeLabel: "",
++				},
++			},
++		},
++	}
++
++	_, err = mcClient.MachineconfigurationV1().MachineConfigPools().Create(ctx, mcp, metav1.CreateOptions{})
++	if err != nil {
++		framework.Logf("MCP creation failed, removing node label")
++		unlabelPatchData := []byte(fmt.Sprintf(`{"metadata":{"labels":{%q:null}}}`, nodeLabel))
++		_, _ = oc.AdminKubeClient().CoreV1().Nodes().Patch(ctx, nodeName, types.MergePatchType, unlabelPatchData, metav1.PatchOptions{})
++		return nil, fmt.Errorf("failed to create MachineConfigPool %s: %w", mcpName, err)
++	}
++
++	framework.Logf("Waiting for custom MachineConfigPool %s to be ready", mcpName)
++	err = WaitForMCP(ctx, mcClient, mcpName, 5*time.Minute)
++	if err != nil {
++		return config, fmt.Errorf("MachineConfigPool %s did not become ready: %w", mcpName, err)
++	}
++
++	framework.Logf("Custom MachineConfigPool %s created successfully", mcpName)
++	return config, nil
++}
++
++// CleanupCustomMCP removes the node label, deletes the custom MCP, and waits for the worker MCP to stabilize.
++func CleanupCustomMCP(ctx context.Context, config *CustomMCPConfig) error {
++	if config == nil {
++		return nil
++	}
++
++	nodeLabel := fmt.Sprintf("node-role.kubernetes.io/%s", config.Name)
++	var cleanupErrors []error
++
++	framework.Logf("Removing node label %s from node %s", nodeLabel, config.NodeName)
++	patchData := []byte(fmt.Sprintf(`{"metadata":{"labels":{%q:null}}}`, nodeLabel))
++	_, err := config.KubeClient.AdminKubeClient().CoreV1().Nodes().Patch(ctx, config.NodeName, types.MergePatchType, patchData, metav1.PatchOptions{})
++	if err != nil && !apierrors.IsNotFound(err) {
++		cleanupErrors = append(cleanupErrors, fmt.Errorf("failed to remove label from node %s: %w", config.NodeName, err))
++	}
++
++	if err == nil || apierrors.IsNotFound(err) {
++		framework.Logf("Waiting for node %s to transition back to worker pool", config.NodeName)
++		transitionErr := wait.PollUntilContextTimeout(ctx, 10*time.Second, 7*time.Minute, true, func(ctx context.Context) (bool, error) {
++			node, getErr := config.KubeClient.AdminKubeClient().CoreV1().Nodes().Get(ctx, config.NodeName, metav1.GetOptions{})
++			if apierrors.IsNotFound(getErr) {
++				return true, nil
++			}
++			if getErr != nil {
++				return false, nil
++			}
++			currentConfig := node.Annotations["machineconfiguration.openshift.io/currentConfig"]
++			desiredConfig := node.Annotations["machineconfiguration.openshift.io/desiredConfig"]
++			isWorkerConfig := currentConfig != "" && !strings.Contains(currentConfig, config.Name) && currentConfig == desiredConfig
++			return isWorkerConfig, nil
++		})
++		if transitionErr != nil {
++			cleanupErrors = append(cleanupErrors, fmt.Errorf("node %s did not transition back to worker pool: %w", config.NodeName, transitionErr))
++		}
++	}
++
++	framework.Logf("Deleting custom MachineConfigPool %s", config.Name)
++	deleteErr := config.MCClient.MachineconfigurationV1().MachineConfigPools().Delete(ctx, config.Name, metav1.DeleteOptions{})
++	if deleteErr != nil && !apierrors.IsNotFound(deleteErr) {
++		cleanupErrors = append(cleanupErrors, fmt.Errorf("failed to delete MachineConfigPool %s: %w", config.Name, deleteErr))
++	}
++
++	if deleteErr == nil || apierrors.IsNotFound(deleteErr) {
++		framework.Logf("Waiting for worker MCP to stabilize after custom MCP deletion")
++		waitErr := WaitForMCP(ctx, config.MCClient, "worker", 10*time.Minute)
++		if waitErr != nil && !apierrors.IsNotFound(waitErr) {
++			cleanupErrors = append(cleanupErrors, fmt.Errorf("worker MCP did not stabilize: %w", waitErr))
++		}
++	}
++
++	if len(cleanupErrors) > 0 {
++		return fmt.Errorf("cleanup completed with errors: %v", cleanupErrors)
++	}
++
++	framework.Logf("Custom MachineConfigPool %s cleaned up successfully", config.Name)
++	return nil
++}
+diff --git a/test/extended/node/node_sizing.go b/test/extended/node/node_sizing.go
+index bfba9942473d..f536ac88bb13 100644
+--- a/test/extended/node/node_sizing.go
++++ b/test/extended/node/node_sizing.go
+@@ -8,10 +8,7 @@ import (
+ 
+ 	g "github.com/onsi/ginkgo/v2"
+ 	o "github.com/onsi/gomega"
+-	corev1 "k8s.io/api/core/v1"
+-	apierrors "k8s.io/apimachinery/pkg/api/errors"
+ 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+-	"k8s.io/apimachinery/pkg/types"
+ 	"k8s.io/kubernetes/test/e2e/framework"
+ 
+ 	mcfgv1 "github.com/openshift/api/machineconfiguration/v1"
+@@ -25,12 +22,8 @@ var _ = g.Describe("[Suite:openshift/disruptive-longrunning][sig-node][Disruptiv
+ 	oc := exutil.NewCLIWithoutNamespace("node-sizing")
+ 
+ 	g.BeforeEach(func(ctx context.Context) {
+-		// Skip all tests on MicroShift clusters
+-		isMicroShift, err := exutil.IsMicroShiftCluster(oc.AdminKubeClient())
+-		o.Expect(err).NotTo(o.HaveOccurred())
+-		if isMicroShift {
+-			g.Skip("Skipping test on MicroShift cluster")
+-		}
++		SkipOnMicroShift(oc)
++		EnsureNodesReady(ctx, oc)
+ 	})
+ 
+ 	g.It("should have NODE_SIZING_ENABLED=true by default and NODE_SIZING_ENABLED=false when KubeletConfig with autoSizingReserved=false is applied", func(ctx context.Context) {
+@@ -39,7 +32,6 @@ var _ = g.Describe("[Suite:openshift/disruptive-longrunning][sig-node][Disruptiv
+ 		o.Expect(err).NotTo(o.HaveOccurred(), "Error creating MCO client")
+ 
+ 		testMCPName := "node-sizing-test"
+-		testNodeMCPLabel := fmt.Sprintf("node-role.kubernetes.io/%s", testMCPName)
+ 		kubeletConfigName := "auto-sizing-enabled"
+ 
+ 		// Verify the default state (NODE_SIZING_ENABLED=false)
+@@ -51,110 +43,25 @@ var _ = g.Describe("[Suite:openshift/disruptive-longrunning][sig-node][Disruptiv
+ 		o.Expect(err).NotTo(o.HaveOccurred(), "Should be able to list worker nodes")
+ 		o.Expect(len(nodes.Items)).To(o.BeNumerically(">", 0), "Should have at least one worker node")
+ 
+-		// Select first worker node and label it for our custom MCP
+-		// This approach is taken so that all the nodes do not restart at the same time for the test
+-		nodeName := nodes.Items[0].Name
++		pureWorkers := getPureWorkerNodes(nodes.Items)
++		o.Expect(len(pureWorkers)).To(o.BeNumerically(">", 0), "No worker nodes without custom roles found")
++		nodeName := pureWorkers[0].Name
+ 		framework.Logf("Testing on node: %s", nodeName)
+ 
+-		// Define cleanup function for node label before applying the label
+-		cleanupNodeLabel := func() {
+-			g.By(fmt.Sprintf("Removing node label %s from node %s", testNodeMCPLabel, nodeName))
+-			cleanupCtx := context.Background()
+-			// Use JSON patch to remove the label atomically
+-			patchData := []byte(fmt.Sprintf(`{"metadata":{"labels":{%q:null}}}`, testNodeMCPLabel))
+-			_, updateErr := oc.AdminKubeClient().CoreV1().Nodes().Patch(cleanupCtx, nodeName, types.MergePatchType, patchData, metav1.PatchOptions{})
+-			if apierrors.IsNotFound(updateErr) {
+-				// Node already deleted, nothing to clean up
+-			} else if updateErr != nil {
+-				framework.Logf("Failed to remove label from node %s: %v", nodeName, updateErr)
+-				return
+-			}
+-
+-			// Wait for the node to transition back to the worker pool configuration
+-			g.By(fmt.Sprintf("Waiting for node %s to transition back to worker pool", nodeName))
+-			o.Eventually(func() bool {
+-				currentNode, err := oc.AdminKubeClient().CoreV1().Nodes().Get(cleanupCtx, nodeName, metav1.GetOptions{})
+-				if err != nil {
+-					framework.Logf("Error getting node: %v", err)
+-					return false
+-				}
+-				currentConfig := currentNode.Annotations["machineconfiguration.openshift.io/currentConfig"]
+-				desiredConfig := currentNode.Annotations["machineconfiguration.openshift.io/desiredConfig"]
+-
+-				// Check if the node is using a worker config (not node-sizing-test config)
+-				isWorkerConfig := currentConfig != "" && !strings.Contains(currentConfig, testMCPName) && currentConfig == desiredConfig
+-				if isWorkerConfig {
+-					framework.Logf("Node %s successfully transitioned to worker config: %s", nodeName, currentConfig)
+-				} else {
+-					framework.Logf("Node %s still transitioning: current=%s, desired=%s", nodeName, currentConfig, desiredConfig)
+-				}
+-				return isWorkerConfig
+-			}, 7*time.Minute, 10*time.Second).Should(o.BeTrue(), fmt.Sprintf("Node %s should transition back to worker pool", nodeName))
+-		}
+-
+-		g.By(fmt.Sprintf("Labeling node %s with %s", nodeName, testNodeMCPLabel))
+-		patchData := []byte(fmt.Sprintf(`{"metadata":{"labels":{%q:""}}}`, testNodeMCPLabel))
+-		_, err = oc.AdminKubeClient().CoreV1().Nodes().Patch(ctx, nodeName, types.MergePatchType, patchData, metav1.PatchOptions{})
+-		o.Expect(err).NotTo(o.HaveOccurred(), "Should be able to label node")
+-
+-		// Register cleanup immediately after successful label application
+-		g.DeferCleanup(cleanupNodeLabel)
+-
+-		// Create custom MCP
+-		g.By(fmt.Sprintf("Creating custom MachineConfigPool %s", testMCPName))
+-		testMCP := &mcfgv1.MachineConfigPool{
+-			TypeMeta: metav1.TypeMeta{
+-				APIVersion: "machineconfiguration.openshift.io/v1",
+-				Kind:       "MachineConfigPool",
+-			},
+-			ObjectMeta: metav1.ObjectMeta{
+-				Name: testMCPName,
+-				Labels: map[string]string{
+-					"machineconfiguration.openshift.io/pool": testMCPName,
+-				},
+-			},
+-			Spec: mcfgv1.MachineConfigPoolSpec{
+-				MachineConfigSelector: &metav1.LabelSelector{
+-					MatchExpressions: []metav1.LabelSelectorRequirement{
+-						{
+-							Key:      "machineconfiguration.openshift.io/role",
+-							Operator: metav1.LabelSelectorOpIn,
+-							Values:   []string{"worker", testMCPName},
+-						},
+-					},
+-				},
+-				NodeSelector: &metav1.LabelSelector{
+-					MatchLabels: map[string]string{
+-						testNodeMCPLabel: "",
+-					},
+-				},
+-			},
+-		}
+-
+-		_, err = mcClient.MachineconfigurationV1().MachineConfigPools().Create(ctx, testMCP, metav1.CreateOptions{})
+-		o.Expect(err).NotTo(o.HaveOccurred(), "Should be able to create custom MachineConfigPool")
+-
+-		cleanupMCP := func() {
+-			g.By("Cleaning up custom MachineConfigPool")
++		// Register cleanup BEFORE MCP creation so it always runs
++		var mcpConfig *CustomMCPConfig
++		g.DeferCleanup(func() {
+ 			cleanupCtx := context.Background()
+-			deleteErr := mcClient.MachineconfigurationV1().MachineConfigPools().Delete(cleanupCtx, testMCPName, metav1.DeleteOptions{})
+-			if apierrors.IsNotFound(deleteErr) {
+-				// MachineConfigPool already deleted, nothing to clean up
+-			} else if deleteErr != nil {
+-				framework.Logf("Failed to delete MachineConfigPool %s: %v", testMCPName, deleteErr)
++			if err := CleanupCustomMCP(cleanupCtx, mcpConfig); err != nil {
++				framework.Logf("Warning: cleanup had errors: %v", err)
+ 			}
+-		}
+-
+-		// Register DeferCleanup so cleanup happens even on test failure
+-		// DeferCleanup runs in LIFO order: MCP deleted last (registered first)
+-		// Note: cleanupNodeLabel already registered immediately after node labeling
+-		g.DeferCleanup(cleanupMCP)
++		})
+ 
+-		g.By("Waiting for custom MachineConfigPool to be ready")
+-		err = waitForMCP(ctx, mcClient, testMCPName, 5*time.Minute)
+-		o.Expect(err).NotTo(o.HaveOccurred(), "Custom MachineConfigPool should become ready")
++		// Create custom MCP for the node
++		mcpConfig, err = CreateCustomMCPForNode(ctx, oc, mcClient, testMCPName, nodeName)
++		o.Expect(err).NotTo(o.HaveOccurred(), "Should create custom MCP")
+ 
+-		verifyNodeSizingEnabledFile(oc, nodeName, "true")
++		verifyNodeSizingEnabledFile(ctx, oc, nodeName, "true")
+ 
+ 		// Now apply KubeletConfig and verify NODE_SIZING_ENABLED=false
+ 
+@@ -178,78 +85,40 @@ var _ = g.Describe("[Suite:openshift/disruptive-longrunning][sig-node][Disruptiv
+ 			},
+ 		}
+ 
+-		_, err = mcClient.MachineconfigurationV1().KubeletConfigs().Create(ctx, kubeletConfig, metav1.CreateOptions{})
+-		o.Expect(err).NotTo(o.HaveOccurred(), "Should be able to create KubeletConfig")
+-
+-		cleanupKubeletConfig := func() {
+-			g.By("Cleaning up KubeletConfig")
++		g.DeferCleanup(func() {
+ 			cleanupCtx := context.Background()
+-			deleteErr := mcClient.MachineconfigurationV1().KubeletConfigs().Delete(cleanupCtx, kubeletConfigName, metav1.DeleteOptions{})
+-			if apierrors.IsNotFound(deleteErr) {
+-				// KubeletConfig already deleted, nothing to clean up
+-			} else if deleteErr != nil {
+-				framework.Logf("Failed to delete KubeletConfig %s: %v", kubeletConfigName, deleteErr)
+-			}
+-
+-			// Wait for custom MCP to be ready after cleanup
+-			g.By("Waiting for custom MCP to be ready after KubeletConfig deletion")
+-			waitErr := waitForMCP(cleanupCtx, mcClient, testMCPName, 5*time.Minute)
+-			if apierrors.IsNotFound(waitErr) {
+-				// MachineConfigPool already deleted, nothing to wait for
+-			} else if waitErr != nil {
+-				framework.Logf("Failed to wait for custom MCP to be ready: %v", waitErr)
++			if err := CleanupKubeletConfig(cleanupCtx, mcClient, kubeletConfigName, testMCPName); err != nil {
++				framework.Logf("Warning: KubeletConfig cleanup failed: %v", err)
+ 			}
+-		}
+-		g.DeferCleanup(cleanupKubeletConfig)
++		})
+ 
+-		g.By("Waiting for KubeletConfig to be created")
+-		var createdKC *mcfgv1.KubeletConfig
+-		o.Eventually(func() error {
+-			createdKC, err = mcClient.MachineconfigurationV1().KubeletConfigs().Get(ctx, kubeletConfigName, metav1.GetOptions{})
+-			return err
+-		}, 30*time.Second, 5*time.Second).Should(o.Succeed(), "KubeletConfig should be created")
++		g.By("Applying KubeletConfig and waiting for MCP rollout")
++		err = ApplyKubeletConfigAndWaitForMCP(ctx, mcClient, kubeletConfig, testMCPName, 15*time.Minute)
++		o.Expect(err).NotTo(o.HaveOccurred(), "Should apply KubeletConfig and complete MCP rollout")
+ 
++		// Verify KubeletConfig was created with correct spec
++		createdKC, err := mcClient.MachineconfigurationV1().KubeletConfigs().Get(ctx, kubeletConfigName, metav1.GetOptions{})
++		o.Expect(err).NotTo(o.HaveOccurred(), "Should be able to get KubeletConfig")
+ 		o.Expect(createdKC.Spec.AutoSizingReserved).NotTo(o.BeNil(), "AutoSizingReserved should not be nil")
+ 		o.Expect(*createdKC.Spec.AutoSizingReserved).To(o.BeFalse(), "AutoSizingReserved should be false")
+ 
+-		g.By(fmt.Sprintf("Waiting for %s MCP to start updating", testMCPName))
+-		o.Eventually(func() bool {
+-			mcp, err := mcClient.MachineconfigurationV1().MachineConfigPools().Get(ctx, testMCPName, metav1.GetOptions{})
+-			if err != nil {
+-				framework.Logf("Error getting %s MCP: %v", testMCPName, err)
+-				return false
+-			}
+-			// Check if MCP is updating (has conditions indicating update in progress)
+-			for _, condition := range mcp.Status.Conditions {
+-				if condition.Type == "Updating" && condition.Status == corev1.ConditionTrue {
+-					return true
+-				}
+-			}
+-			return false
+-		}, 2*time.Minute, 10*time.Second).Should(o.BeTrue(), fmt.Sprintf("%s MCP should start updating", testMCPName))
+-
+-		g.By(fmt.Sprintf("Waiting for %s MCP to be ready with new configuration", testMCPName))
+-		err = waitForMCP(ctx, mcClient, testMCPName, 15*time.Minute)
+-		o.Expect(err).NotTo(o.HaveOccurred(), fmt.Sprintf("%s MCP should become ready with new configuration", testMCPName))
+-
+-		verifyNodeSizingEnabledFile(oc, nodeName, "false")
++		verifyNodeSizingEnabledFile(ctx, oc, nodeName, "false")
+ 
+ 		// Explicit cleanup on success; DeferCleanup ensures cleanup also runs on failure
+-		cleanupKubeletConfig()
+-		cleanupNodeLabel()
+-		cleanupMCP()
++		CleanupKubeletConfig(ctx, mcClient, kubeletConfigName, testMCPName)
++		CleanupCustomMCP(ctx, mcpConfig)
+ 	})
+ })
+ 
+ // verifyNodeSizingEnabledFile verifies the NODE_SIZING_ENABLED value in the env file
+-func verifyNodeSizingEnabledFile(oc *exutil.CLI, nodeName, expectedValue string) {
++func verifyNodeSizingEnabledFile(ctx context.Context, oc *exutil.CLI, nodeName, expectedValue string) {
+ 	g.By("Verifying /etc/node-sizing-enabled.env file exists")
+ 
+-	output, err := ExecOnNodeWithChroot(oc, nodeName, "test", "-f", "/etc/node-sizing-enabled.env")
++	output, err := ExecOnNodeWithChroot(ctx, oc, nodeName, "test", "-f", "/etc/node-sizing-enabled.env")
+ 	o.Expect(err).NotTo(o.HaveOccurred(), fmt.Sprintf("File /etc/node-sizing-enabled.env should exist on node %s. Output: %s", nodeName, output))
+ 
+ 	g.By("Reading /etc/node-sizing-enabled.env file contents")
+-	output, err = ExecOnNodeWithChroot(oc, nodeName, "cat", "/etc/node-sizing-enabled.env")
++	output, err = ExecOnNodeWithChroot(ctx, oc, nodeName, "cat", "/etc/node-sizing-enabled.env")
+ 	o.Expect(err).NotTo(o.HaveOccurred(), "Should be able to read /etc/node-sizing-enabled.env")
+ 
+ 	framework.Logf("Contents of /etc/node-sizing-enabled.env:\n%s", output)
+diff --git a/test/extended/node/node_swap.go b/test/extended/node/node_swap.go
+index f3f0c151c0ce..ce2247b8fc05 100644
+--- a/test/extended/node/node_swap.go
++++ b/test/extended/node/node_swap.go
+@@ -11,7 +11,6 @@ import (
+ 	ote "github.com/openshift-eng/openshift-tests-extension/pkg/ginkgo"
+ 
+ 	corev1 "k8s.io/api/core/v1"
+-	apierrors "k8s.io/apimachinery/pkg/api/errors"
+ 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+ 	"k8s.io/apimachinery/pkg/runtime"
+ 	"k8s.io/apimachinery/pkg/util/wait"
+@@ -29,12 +28,8 @@ var _ = g.Describe("[Jira:Node][sig-node] Node non-cnv swap configuration", func
+ 	var oc = exutil.NewCLI("node-swap")
+ 
+ 	g.BeforeEach(func(ctx context.Context) {
+-		// Skip all tests on MicroShift clusters
+-		isMicroShift, err := exutil.IsMicroShiftCluster(oc.AdminKubeClient())
+-		o.Expect(err).NotTo(o.HaveOccurred())
+-		if isMicroShift {
+-			g.Skip("Skipping test on MicroShift cluster")
+-		}
++		SkipOnMicroShift(oc)
++		EnsureNodesReady(ctx, oc)
+ 	})
+ 
+ 	// This test validates that:
+@@ -138,12 +133,12 @@ var _ = g.Describe("[Jira:Node][sig-node] Node non-cnv swap configuration", func
+ 
+ 		g.By("Attempting to apply the KubeletConfig")
+ 		defer func() {
+-			if err := mcClient.MachineconfigurationV1().KubeletConfigs().Delete(ctx, kcName, metav1.DeleteOptions{}); err != nil && !apierrors.IsNotFound(err) {
++			if err := CleanupKubeletConfig(ctx, mcClient, kcName, ""); err != nil {
+ 				framework.Logf("cleanup failed for KubeletConfig %s: %v", kcName, err)
+ 			}
+ 		}()
+ 		framework.Logf("Creating KubeletConfig with failSwapOn=true and swapBehavior=LimitedSwap")
+-		_, err = mcClient.MachineconfigurationV1().KubeletConfigs().Create(ctx, kubeletConfig, metav1.CreateOptions{})
++		_, err = CreateKubeletConfig(ctx, mcClient, kubeletConfig)
+ 		o.Expect(err).NotTo(o.HaveOccurred(), "Failed to create KubeletConfig")
+ 
+ 		g.By("Checking KubeletConfig status for expected error message")
+diff --git a/test/extended/node/node_swap_cnv.go b/test/extended/node/node_swap_cnv.go
+index 66f564b50acb..193d48dff346 100644
+--- a/test/extended/node/node_swap_cnv.go
++++ b/test/extended/node/node_swap_cnv.go
+@@ -116,7 +116,7 @@ var _ = g.Describe("[Jira:Node/Kubelet][sig-node][Serial][Disruptive][Suite:open
+ 		g.By("Checking drop-in directory exists on ALL worker nodes")
+ 		for _, workerNode := range workerNodeNames {
+ 			framework.Logf("Running command: ls -ld %s on node %s", cnvDropInDir, workerNode)
+-			output, err := ExecOnNodeWithChroot(oc, workerNode, "ls", "-ld", cnvDropInDir)
++			output, err := ExecOnNodeWithChroot(ctx, oc, workerNode, "ls", "-ld", cnvDropInDir)
+ 			if err != nil {
+ 				framework.Logf("Drop-in directory does not exist on worker node %s: %v", workerNode, err)
+ 				e2eskipper.Skipf("Drop-in directory not present on worker node %s - CNV operator may not be installed", workerNode)
+@@ -129,7 +129,7 @@ var _ = g.Describe("[Jira:Node/Kubelet][sig-node][Serial][Disruptive][Suite:open
+ 		g.By("Checking directory permissions on all worker nodes (should be 755 or stricter)")
+ 		for _, workerNode := range workerNodeNames {
+ 			framework.Logf("Running command: stat -c %%a %s on node %s", cnvDropInDir, workerNode)
+-			output, err := ExecOnNodeWithChroot(oc, workerNode, "stat", "-c", "%a", cnvDropInDir)
++			output, err := ExecOnNodeWithChroot(ctx, oc, workerNode, "stat", "-c", "%a", cnvDropInDir)
+ 			o.Expect(err).NotTo(o.HaveOccurred())
+ 			perms := strings.TrimSpace(output)
+ 			framework.Logf("Output from node %s: permissions=%s", workerNode, perms)
+@@ -139,7 +139,7 @@ var _ = g.Describe("[Jira:Node/Kubelet][sig-node][Serial][Disruptive][Suite:open
+ 
+ 		g.By("Checking SELinux context on worker nodes")
+ 		framework.Logf("Running command: ls -ldZ %s on node %s", cnvDropInDir, cnvWorkerNode)
+-		output, err := ExecOnNodeWithChroot(oc, cnvWorkerNode, "ls", "-ldZ", cnvDropInDir)
++		output, err := ExecOnNodeWithChroot(ctx, oc, cnvWorkerNode, "ls", "-ldZ", cnvDropInDir)
+ 		if err == nil {
+ 			framework.Logf("Output: %s", output)
+ 		}
+@@ -168,7 +168,7 @@ var _ = g.Describe("[Jira:Node/Kubelet][sig-node][Serial][Disruptive][Suite:open
+ 
+ 			// Drop-in directory SHOULD exist on control plane nodes (created by MCO for all nodes)
+ 			for _, cpNode := range controlPlaneNodes {
+-				output, err := ExecOnNodeWithChroot(oc, cpNode.Name, "ls", "-ld", cnvDropInDir)
++				output, err := ExecOnNodeWithChroot(ctx, oc, cpNode.Name, "ls", "-ld", cnvDropInDir)
+ 				o.Expect(err).NotTo(o.HaveOccurred(), "Drop-in directory should exist on control plane node %s", cpNode.Name)
+ 				framework.Logf("Control plane node %s has drop-in directory (expected): %s", cpNode.Name, strings.TrimSpace(output))
+ 
+@@ -190,14 +190,14 @@ var _ = g.Describe("[Jira:Node/Kubelet][sig-node][Serial][Disruptive][Suite:open
+ 		framework.Logf("Using CNV worker node for tests: %s", cnvWorkerNode)
+ 
+ 		g.By("Checking if drop-in directory exists and is empty")
+-		output, err := ExecOnNodeWithChroot(oc, cnvWorkerNode, "ls", "-la", cnvDropInDir)
++		output, err := ExecOnNodeWithChroot(ctx, oc, cnvWorkerNode, "ls", "-la", cnvDropInDir)
+ 		if err != nil {
+ 			e2eskipper.Skipf("Drop-in directory not present")
+ 		}
+ 		framework.Logf("Directory contents: %s", output)
+ 
+ 		g.By("Verifying kubelet is running")
+-		output, err = ExecOnNodeWithChroot(oc, cnvWorkerNode, "systemctl", "is-active", "kubelet")
++		output, err = ExecOnNodeWithChroot(ctx, oc, cnvWorkerNode, "systemctl", "is-active", "kubelet")
+ 		o.Expect(err).NotTo(o.HaveOccurred())
+ 		o.Expect(strings.TrimSpace(output)).To(o.Equal("active"), "Kubelet should be active")
+ 
+@@ -241,11 +241,11 @@ var _ = g.Describe("[Jira:Node/Kubelet][sig-node][Serial][Disruptive][Suite:open
+ 
+ 		g.By("Creating drop-in file with LimitedSwap configuration in /etc/openshift/kubelet.conf.d/")
+ 		framework.Logf("Creating file: %s with content:\n%s", cnvDropInFilePath, loadConfigFromFile(cnvLimitedSwapConfigPath))
+-		err = createDropInFile(oc, cnvWorkerNode, cnvDropInFilePath, loadConfigFromFile(cnvLimitedSwapConfigPath))
++		err = createDropInFile(ctx, oc, cnvWorkerNode, cnvDropInFilePath, loadConfigFromFile(cnvLimitedSwapConfigPath))
+ 		o.Expect(err).NotTo(o.HaveOccurred())
+ 
+ 		g.By("Verifying drop-in file was created successfully")
+-		output, err := ExecOnNodeWithChroot(oc, cnvWorkerNode, "cat", cnvDropInFilePath)
++		output, err := ExecOnNodeWithChroot(ctx, oc, cnvWorkerNode, "cat", cnvDropInFilePath)
+ 		o.Expect(err).NotTo(o.HaveOccurred())
+ 		framework.Logf("Drop-in file content:\n%s", output)
+ 		o.Expect(output).To(o.ContainSubstring("LimitedSwap"), "Drop-in file should contain LimitedSwap configuration")
+@@ -293,7 +293,7 @@ var _ = g.Describe("[Jira:Node/Kubelet][sig-node][Serial][Disruptive][Suite:open
+ 		if configInitial.MemorySwap.SwapBehavior != "LimitedSwap" {
+ 			g.By("Creating drop-in file with LimitedSwap configuration")
+ 			framework.Logf("Creating file: %s", cnvDropInFilePath)
+-			err = createDropInFile(oc, cnvWorkerNode, cnvDropInFilePath, loadConfigFromFile(cnvLimitedSwapConfigPath))
++			err = createDropInFile(ctx, oc, cnvWorkerNode, cnvDropInFilePath, loadConfigFromFile(cnvLimitedSwapConfigPath))
+ 			o.Expect(err).NotTo(o.HaveOccurred())
+ 
+ 			g.By("Restarting kubelet to apply LimitedSwap")
+@@ -336,13 +336,13 @@ var _ = g.Describe("[Jira:Node/Kubelet][sig-node][Serial][Disruptive][Suite:open
+ 
+ 		g.By("Ensuring drop-in directory exists")
+ 		framework.Logf("Running: mkdir -p %s", cnvDropInDir)
+-		_, err := ExecOnNodeWithChroot(oc, cnvWorkerNode, "mkdir", "-p", cnvDropInDir)
++		_, err := ExecOnNodeWithChroot(ctx, oc, cnvWorkerNode, "mkdir", "-p", cnvDropInDir)
+ 		o.Expect(err).NotTo(o.HaveOccurred())
+ 		framework.Logf("Directory exists or created successfully")
+ 
+ 		g.By("Verifying directory ownership is root:root")
+ 		framework.Logf("Running: stat -c %%U:%%G %s", cnvDropInDir)
+-		output, err := ExecOnNodeWithChroot(oc, cnvWorkerNode, "stat", "-c", "%U:%G", cnvDropInDir)
++		output, err := ExecOnNodeWithChroot(ctx, oc, cnvWorkerNode, "stat", "-c", "%U:%G", cnvDropInDir)
+ 		o.Expect(err).NotTo(o.HaveOccurred())
+ 		ownership := strings.TrimSpace(output)
+ 		framework.Logf("Directory ownership: %s", ownership)
+@@ -350,7 +350,7 @@ var _ = g.Describe("[Jira:Node/Kubelet][sig-node][Serial][Disruptive][Suite:open
+ 
+ 		g.By("Verifying directory permissions")
+ 		framework.Logf("Running: stat -c %%a %s", cnvDropInDir)
+-		output, err = ExecOnNodeWithChroot(oc, cnvWorkerNode, "stat", "-c", "%a", cnvDropInDir)
++		output, err = ExecOnNodeWithChroot(ctx, oc, cnvWorkerNode, "stat", "-c", "%a", cnvDropInDir)
+ 		o.Expect(err).NotTo(o.HaveOccurred())
+ 		perms := strings.TrimSpace(output)
+ 		framework.Logf("Directory permissions: %s", perms)
+@@ -358,7 +358,7 @@ var _ = g.Describe("[Jira:Node/Kubelet][sig-node][Serial][Disruptive][Suite:open
+ 
+ 		g.By("Checking SELinux context of directory")
+ 		framework.Logf("Running: ls -ldZ %s", cnvDropInDir)
+-		output, err = ExecOnNodeWithChroot(oc, cnvWorkerNode, "ls", "-ldZ", cnvDropInDir)
++		output, err = ExecOnNodeWithChroot(ctx, oc, cnvWorkerNode, "ls", "-ldZ", cnvDropInDir)
+ 		if err == nil {
+ 			framework.Logf("SELinux context: %s", strings.TrimSpace(output))
+ 		}
+@@ -367,21 +367,21 @@ var _ = g.Describe("[Jira:Node/Kubelet][sig-node][Serial][Disruptive][Suite:open
+ 		testFile := cnvDropInDir + "/test-permissions.conf"
+ 		framework.Logf("Creating test file: %s", testFile)
+ 		framework.Logf("File content:\n%s", loadConfigFromFile(cnvLimitedSwapConfigPath))
+-		err = createDropInFile(oc, cnvWorkerNode, testFile, loadConfigFromFile(cnvLimitedSwapConfigPath))
++		err = createDropInFile(ctx, oc, cnvWorkerNode, testFile, loadConfigFromFile(cnvLimitedSwapConfigPath))
+ 		o.Expect(err).NotTo(o.HaveOccurred())
+ 		framework.Logf("Test file created successfully")
+-		defer removeDropInFile(oc, cnvWorkerNode, testFile)
++		defer removeDropInFile(ctx, oc, cnvWorkerNode, testFile)
+ 
+ 		g.By("Verifying config file ownership")
+ 		framework.Logf("Running: stat -c %%U:%%G %s", testFile)
+-		output, err = ExecOnNodeWithChroot(oc, cnvWorkerNode, "stat", "-c", "%U:%G", testFile)
++		output, err = ExecOnNodeWithChroot(ctx, oc, cnvWorkerNode, "stat", "-c", "%U:%G", testFile)
+ 		o.Expect(err).NotTo(o.HaveOccurred())
+ 		fileOwnership := strings.TrimSpace(output)
+ 		framework.Logf("File ownership: %s", fileOwnership)
+ 
+ 		g.By("Verifying config file permissions (should be 644 or 600)")
+ 		framework.Logf("Running: stat -c %%a %s", testFile)
+-		output, err = ExecOnNodeWithChroot(oc, cnvWorkerNode, "stat", "-c", "%a", testFile)
++		output, err = ExecOnNodeWithChroot(ctx, oc, cnvWorkerNode, "stat", "-c", "%a", testFile)
+ 		o.Expect(err).NotTo(o.HaveOccurred())
+ 		filePerms := strings.TrimSpace(output)
+ 		framework.Logf("File permissions: %s", filePerms)
+@@ -410,12 +410,12 @@ var _ = g.Describe("[Jira:Node/Kubelet][sig-node][Serial][Disruptive][Suite:open
+ 		g.By("Creating LimitedSwap configuration")
+ 		framework.Logf("Creating drop-in file: %s", cnvDropInFilePath)
+ 		framework.Logf("Drop-in file content:\n%s", loadConfigFromFile(cnvLimitedSwapConfigPath))
+-		err := createDropInFile(oc, cnvWorkerNode, cnvDropInFilePath, loadConfigFromFile(cnvLimitedSwapConfigPath))
++		err := createDropInFile(ctx, oc, cnvWorkerNode, cnvDropInFilePath, loadConfigFromFile(cnvLimitedSwapConfigPath))
+ 		o.Expect(err).NotTo(o.HaveOccurred())
+ 		framework.Logf("Drop-in file created successfully")
+ 
+ 		// Verify file was created
+-		output, err := ExecOnNodeWithChroot(oc, cnvWorkerNode, "cat", cnvDropInFilePath)
++		output, err := ExecOnNodeWithChroot(ctx, oc, cnvWorkerNode, "cat", cnvDropInFilePath)
+ 		o.Expect(err).NotTo(o.HaveOccurred())
+ 		framework.Logf("Verified drop-in file content:\n%s", output)
+ 
+@@ -526,13 +526,13 @@ var _ = g.Describe("[Jira:Node/Kubelet][sig-node][Serial][Disruptive][Suite:open
+ 
+ 		g.By("Checking drop-in directory on non-CNV node")
+ 		framework.Logf("Running: ls -ld %s on node %s", cnvDropInDir, nonCNVWorkerNode)
+-		output, err = ExecOnNodeWithChroot(oc, nonCNVWorkerNode, "ls", "-ld", cnvDropInDir)
++		output, err = ExecOnNodeWithChroot(ctx, oc, nonCNVWorkerNode, "ls", "-ld", cnvDropInDir)
+ 		if err == nil {
+ 			framework.Logf("Drop-in directory exists: %s", strings.TrimSpace(output))
+ 			framework.Logf("Note: Directory exists because CNV was previously installed on this node")
+ 			g.By("Checking directory contents")
+ 			framework.Logf("Running: ls -la %s", cnvDropInDir)
+-			dirOutput, _ := ExecOnNodeWithChroot(oc, nonCNVWorkerNode, "ls", "-la", cnvDropInDir)
++			dirOutput, _ := ExecOnNodeWithChroot(ctx, oc, nonCNVWorkerNode, "ls", "-la", cnvDropInDir)
+ 			framework.Logf("Directory contents:\n%s", dirOutput)
+ 		} else {
+ 			framework.Logf("Drop-in directory does not exist on non-CNV node (expected for truly non-CNV nodes)")
+@@ -571,28 +571,28 @@ var _ = g.Describe("[Jira:Node/Kubelet][sig-node][Serial][Disruptive][Suite:open
+ 		g.By("Creating 98-swap-disabled.conf with NoSwap")
+ 		framework.Logf("Creating file: %s", file98)
+ 		framework.Logf("Content:\n%s", loadConfigFromFile(cnvNoSwapConfigPath))
+-		err := createDropInFile(oc, cnvWorkerNode, file98, loadConfigFromFile(cnvNoSwapConfigPath))
++		err := createDropInFile(ctx, oc, cnvWorkerNode, file98, loadConfigFromFile(cnvNoSwapConfigPath))
+ 		o.Expect(err).NotTo(o.HaveOccurred())
+ 		framework.Logf("Created: %s (NoSwap)", file98)
+ 
+ 		g.By("Creating 99-swap-limited.conf with LimitedSwap")
+ 		framework.Logf("Creating file: %s", file99)
+ 		framework.Logf("Content:\n%s", loadConfigFromFile(cnvLimitedSwapConfigPath))
+-		err = createDropInFile(oc, cnvWorkerNode, file99, loadConfigFromFile(cnvLimitedSwapConfigPath))
++		err = createDropInFile(ctx, oc, cnvWorkerNode, file99, loadConfigFromFile(cnvLimitedSwapConfigPath))
+ 		o.Expect(err).NotTo(o.HaveOccurred())
+ 		framework.Logf("Created: %s (LimitedSwap)", file99)
+ 
+ 		g.By("Listing drop-in directory contents")
+ 		framework.Logf("Running: ls -la %s", cnvDropInDir)
+-		output, _ := ExecOnNodeWithChroot(oc, cnvWorkerNode, "ls", "-la", cnvDropInDir)
++		output, _ := ExecOnNodeWithChroot(ctx, oc, cnvWorkerNode, "ls", "-la", cnvDropInDir)
+ 		framework.Logf("Directory contents:\n%s", output)
+ 
+ 		defer func() {
+ 			g.By("Cleaning up multiple config files")
+ 			framework.Logf("Removing: %s", file98)
+-			removeDropInFile(oc, cnvWorkerNode, file98)
++			removeDropInFile(ctx, oc, cnvWorkerNode, file98)
+ 			framework.Logf("Removing: %s", file99)
+-			removeDropInFile(oc, cnvWorkerNode, file99)
++			removeDropInFile(ctx, oc, cnvWorkerNode, file99)
+ 			framework.Logf("Running: systemctl restart kubelet")
+ 			restartKubeletOnNode(ctx, oc, cnvWorkerNode)
+ 			waitForNodeToBeReady(ctx, oc, cnvWorkerNode)
+@@ -655,7 +655,7 @@ var _ = g.Describe("[Jira:Node/Kubelet][sig-node][Serial][Disruptive][Suite:open
+ 		framework.Logf("Content:\n%s", loadConfigFromFile(cnvLimitedSwapConfigPath))
+ 		for _, node := range cnvNodes {
+ 			framework.Logf("Creating drop-in file on node: %s", node)
+-			err := createDropInFile(oc, node, cnvDropInFilePath, loadConfigFromFile(cnvLimitedSwapConfigPath))
++			err := createDropInFile(ctx, oc, node, cnvDropInFilePath, loadConfigFromFile(cnvLimitedSwapConfigPath))
+ 			o.Expect(err).NotTo(o.HaveOccurred())
+ 			framework.Logf("  -> Created successfully on %s", node)
+ 		}
+@@ -664,7 +664,7 @@ var _ = g.Describe("[Jira:Node/Kubelet][sig-node][Serial][Disruptive][Suite:open
+ 			g.By("Cleaning up all CNV nodes")
+ 			for _, node := range cnvNodes {
+ 				framework.Logf("Removing drop-in file from node: %s", node)
+-				removeDropInFile(oc, node, cnvDropInFilePath)
++				removeDropInFile(ctx, oc, node, cnvDropInFilePath)
+ 				framework.Logf("Restarting kubelet on node: %s", node)
+ 				restartKubeletOnNode(ctx, oc, node)
+ 			}
+@@ -679,7 +679,7 @@ var _ = g.Describe("[Jira:Node/Kubelet][sig-node][Serial][Disruptive][Suite:open
+ 		checksums := make(map[string]string)
+ 		for _, node := range cnvNodes {
+ 			framework.Logf("Running: md5sum %s on node %s", cnvDropInFilePath, node)
+-			output, err := ExecOnNodeWithChroot(oc, node, "md5sum", cnvDropInFilePath)
++			output, err := ExecOnNodeWithChroot(ctx, oc, node, "md5sum", cnvDropInFilePath)
+ 			o.Expect(err).NotTo(o.HaveOccurred())
+ 			// Extract checksum (first field)
+ 			checksum := strings.Fields(strings.TrimSpace(output))[0]
+@@ -740,7 +740,7 @@ var _ = g.Describe("[Jira:Node/Kubelet][sig-node][Serial][Disruptive][Suite:open
+ 		driftDetected := false
+ 		for _, node := range cnvNodes {
+ 			framework.Logf("Running: md5sum %s on node %s (after wait)", cnvDropInFilePath, node)
+-			output, err := ExecOnNodeWithChroot(oc, node, "md5sum", cnvDropInFilePath)
++			output, err := ExecOnNodeWithChroot(ctx, oc, node, "md5sum", cnvDropInFilePath)
+ 			o.Expect(err).NotTo(o.HaveOccurred())
+ 			checksum := strings.Fields(strings.TrimSpace(output))[0]
+ 			framework.Logf("Checksum for %s (after wait): %s", node, checksum)
+@@ -784,7 +784,7 @@ var _ = g.Describe("[Jira:Node/Kubelet][sig-node][Serial][Disruptive][Suite:open
+ 
+ 		g.By("Checking initial OS-level swap status")
+ 		framework.Logf("Running: swapon -s")
+-		initialSwapOutput, err := ExecOnNodeWithChroot(oc, cnvWorkerNode, "swapon", "-s")
++		initialSwapOutput, err := ExecOnNodeWithChroot(ctx, oc, cnvWorkerNode, "swapon", "-s")
+ 		o.Expect(err).NotTo(o.HaveOccurred(), "Failed to check initial swap status on node %s: %v", cnvWorkerNode, err)
+ 		framework.Logf("Initial swapon -s output:\n%s", initialSwapOutput)
+ 		initialHasSwap := strings.TrimSpace(initialSwapOutput) != "" && initialSwapOutput != "Filename\t\t\t\tType\t\tSize\t\tUsed\t\tPriority"
+@@ -793,7 +793,7 @@ var _ = g.Describe("[Jira:Node/Kubelet][sig-node][Serial][Disruptive][Suite:open
+ 		if initialHasSwap {
+ 			g.By("Disabling existing OS-level swap for test")
+ 			framework.Logf("Running: swapoff -a")
+-			swapoffOutput, swapoffErr := ExecOnNodeWithNsenter(oc, cnvWorkerNode, "swapoff", "-a")
++			swapoffOutput, swapoffErr := ExecOnNodeWithNsenter(ctx, oc, cnvWorkerNode, "swapoff", "-a")
+ 			if swapoffErr != nil {
+ 				framework.Failf("Failed to disable swap on node %s: %v (output: %s)", cnvWorkerNode, swapoffErr, swapoffOutput)
+ 			}
+@@ -802,7 +802,7 @@ var _ = g.Describe("[Jira:Node/Kubelet][sig-node][Serial][Disruptive][Suite:open
+ 
+ 		g.By("Verifying no OS-level swap is present")
+ 		framework.Logf("Running: swapon -s")
+-		swapOutput, err := ExecOnNodeWithChroot(oc, cnvWorkerNode, "swapon", "-s")
++		swapOutput, err := ExecOnNodeWithChroot(ctx, oc, cnvWorkerNode, "swapon", "-s")
+ 		o.Expect(err).NotTo(o.HaveOccurred(), "Failed to verify swap status on node %s: %v", cnvWorkerNode, err)
+ 		framework.Logf("swapon -s output:\n%s", swapOutput)
+ 		hasOSSwap := strings.TrimSpace(swapOutput) != "" && swapOutput != "Filename\t\t\t\tType\t\tSize\t\tUsed\t\tPriority"
+@@ -818,19 +818,19 @@ var _ = g.Describe("[Jira:Node/Kubelet][sig-node][Serial][Disruptive][Suite:open
+ 
+ 		g.By("Ensuring drop-in directory exists")
+ 		framework.Logf("Running: mkdir -p %s", cnvDropInDir)
+-		_, _ = ExecOnNodeWithChroot(oc, cnvWorkerNode, "mkdir", "-p", cnvDropInDir)
++		_, _ = ExecOnNodeWithChroot(ctx, oc, cnvWorkerNode, "mkdir", "-p", cnvDropInDir)
+ 
+ 		g.By("Creating LimitedSwap drop-in configuration")
+ 		framework.Logf("Creating drop-in file: %s", cnvDropInFilePath)
+ 		framework.Logf("Content:\n%s", loadConfigFromFile(cnvLimitedSwapConfigPath))
+-		err = createDropInFile(oc, cnvWorkerNode, cnvDropInFilePath, loadConfigFromFile(cnvLimitedSwapConfigPath))
++		err = createDropInFile(ctx, oc, cnvWorkerNode, cnvDropInFilePath, loadConfigFromFile(cnvLimitedSwapConfigPath))
+ 		o.Expect(err).NotTo(o.HaveOccurred())
+ 		framework.Logf("Drop-in file created successfully")
+ 
+ 		defer func() {
+ 			g.By("Cleaning up")
+ 			framework.Logf("Removing drop-in file: %s", cnvDropInFilePath)
+-			removeDropInFile(oc, cnvWorkerNode, cnvDropInFilePath)
++			removeDropInFile(ctx, oc, cnvWorkerNode, cnvDropInFilePath)
+ 			// Re-enable swap if it was initially present
+ 			if initialHasSwap {
+ 				framework.Logf("Note: OS swap was initially enabled, may need manual re-enable")
+@@ -902,7 +902,7 @@ var _ = g.Describe("[Jira:Node/Kubelet][sig-node][Serial][Disruptive][Suite:open
+ 
+ 		g.By("Verifying /proc/meminfo shows swap fields (even if 0)")
+ 		framework.Logf("Running: grep -i swap /proc/meminfo")
+-		meminfoOutput, err := ExecOnNodeWithChroot(oc, cnvWorkerNode, "grep", "-i", "swap", "/proc/meminfo")
++		meminfoOutput, err := ExecOnNodeWithChroot(ctx, oc, cnvWorkerNode, "grep", "-i", "swap", "/proc/meminfo")
+ 		o.Expect(err).NotTo(o.HaveOccurred())
+ 		framework.Logf("Swap info from /proc/meminfo:\n%s", strings.TrimSpace(meminfoOutput))
+ 		o.Expect(meminfoOutput).To(o.ContainSubstring("SwapTotal"))
+@@ -910,7 +910,7 @@ var _ = g.Describe("[Jira:Node/Kubelet][sig-node][Serial][Disruptive][Suite:open
+ 
+ 		g.By("Verifying free -h shows swap status")
+ 		framework.Logf("Running: free -h")
+-		freeOutput, _ := ExecOnNodeWithChroot(oc, cnvWorkerNode, "free", "-h")
++		freeOutput, _ := ExecOnNodeWithChroot(ctx, oc, cnvWorkerNode, "free", "-h")
+ 		framework.Logf("free -h output:\n%s", freeOutput)
+ 
+ 		g.By("Verifying node has no memory pressure conditions")
+@@ -960,7 +960,7 @@ var _ = g.Describe("[Jira:Node/Kubelet][sig-node][Serial][Disruptive][Suite:open
+ 		g.By("Creating LimitedSwap drop-in configuration")
+ 		framework.Logf("Creating drop-in file: %s", cnvDropInFilePath)
+ 		framework.Logf("Content:\n%s", loadConfigFromFile(cnvLimitedSwapConfigPath))
+-		err := createDropInFile(oc, cnvWorkerNode, cnvDropInFilePath, loadConfigFromFile(cnvLimitedSwapConfigPath))
++		err := createDropInFile(ctx, oc, cnvWorkerNode, cnvDropInFilePath, loadConfigFromFile(cnvLimitedSwapConfigPath))
+ 		o.Expect(err).NotTo(o.HaveOccurred())
+ 		framework.Logf("Drop-in file created successfully")
+ 
+@@ -968,11 +968,11 @@ var _ = g.Describe("[Jira:Node/Kubelet][sig-node][Serial][Disruptive][Suite:open
+ 			g.By("Final cleanup")
+ 			// Disable and remove any test swap file
+ 			framework.Logf("Disabling test swap file if present")
+-			ExecOnNodeWithNsenter(oc, cnvWorkerNode, "swapoff", swapFilePath)
+-			ExecOnNodeWithChroot(oc, cnvWorkerNode, "rm", "-f", swapFilePath)
++			ExecOnNodeWithNsenter(ctx, oc, cnvWorkerNode, "swapoff", swapFilePath)
++			ExecOnNodeWithChroot(ctx, oc, cnvWorkerNode, "rm", "-f", swapFilePath)
+ 			// Remove drop-in config
+ 			framework.Logf("Removing drop-in file: %s", cnvDropInFilePath)
+-			removeDropInFile(oc, cnvWorkerNode, cnvDropInFilePath)
++			removeDropInFile(ctx, oc, cnvWorkerNode, cnvDropInFilePath)
+ 			framework.Logf("Restarting kubelet")
+ 			restartKubeletOnNode(ctx, oc, cnvWorkerNode)
+ 			waitForNodeToBeReady(ctx, oc, cnvWorkerNode)
+@@ -999,19 +999,19 @@ var _ = g.Describe("[Jira:Node/Kubelet][sig-node][Serial][Disruptive][Suite:open
+ 
+ 			g.By(fmt.Sprintf("Disabling any existing swap for %s test", swapSize.name))
+ 			framework.Logf("Running: swapoff -a on node %s", cnvWorkerNode)
+-			swapoffOutput, swapoffErr := ExecOnNodeWithNsenter(oc, cnvWorkerNode, "swapoff", "-a")
++			swapoffOutput, swapoffErr := ExecOnNodeWithNsenter(ctx, oc, cnvWorkerNode, "swapoff", "-a")
+ 			if swapoffErr != nil {
+ 				framework.Failf("Failed to disable swap on node %s for %s test: %v (output: %s)", cnvWorkerNode, swapSize.name, swapoffErr, swapoffOutput)
+ 			}
+ 			framework.Logf("Running: rm -f %s on node %s", swapFilePath, cnvWorkerNode)
+-			rmOutput, rmErr := ExecOnNodeWithChroot(oc, cnvWorkerNode, "rm", "-f", swapFilePath)
++			rmOutput, rmErr := ExecOnNodeWithChroot(ctx, oc, cnvWorkerNode, "rm", "-f", swapFilePath)
+ 			if rmErr != nil {
+ 				framework.Failf("Failed to remove swap file %s on node %s for %s test: %v (output: %s)", swapFilePath, cnvWorkerNode, swapSize.name, rmErr, rmOutput)
+ 			}
+ 
+ 			g.By(fmt.Sprintf("Creating %dMB swap file", swapSize.sizeMB))
+ 			framework.Logf("Running: dd if=/dev/zero of=%s bs=1M count=%d", swapFilePath, swapSize.sizeMB)
+-			_, err := ExecOnNodeWithChroot(oc, cnvWorkerNode, "dd", "if=/dev/zero", fmt.Sprintf("of=%s", swapFilePath),
++			_, err := ExecOnNodeWithChroot(ctx, oc, cnvWorkerNode, "dd", "if=/dev/zero", fmt.Sprintf("of=%s", swapFilePath),
+ 				"bs=1M", fmt.Sprintf("count=%d", swapSize.sizeMB))
+ 			if err != nil {
+ 				framework.Logf("Warning: Failed to create swap file: %v", err)
+@@ -1021,10 +1021,10 @@ var _ = g.Describe("[Jira:Node/Kubelet][sig-node][Serial][Disruptive][Suite:open
+ 			}
+ 
+ 			framework.Logf("Running: chmod 600 %s", swapFilePath)
+-			ExecOnNodeWithChroot(oc, cnvWorkerNode, "chmod", "600", swapFilePath)
++			ExecOnNodeWithChroot(ctx, oc, cnvWorkerNode, "chmod", "600", swapFilePath)
+ 
+ 			framework.Logf("Running: mkswap %s", swapFilePath)
+-			_, err = ExecOnNodeWithChroot(oc, cnvWorkerNode, "mkswap", swapFilePath)
++			_, err = ExecOnNodeWithChroot(ctx, oc, cnvWorkerNode, "mkswap", swapFilePath)
+ 			if err != nil {
+ 				framework.Logf("Warning: Failed to mkswap: %v", err)
+ 				result.success = false
+@@ -1033,7 +1033,7 @@ var _ = g.Describe("[Jira:Node/Kubelet][sig-node][Serial][Disruptive][Suite:open
+ 			}
+ 
+ 			framework.Logf("Running: swapon %s", swapFilePath)
+-			_, err = ExecOnNodeWithNsenter(oc, cnvWorkerNode, "swapon", swapFilePath)
++			_, err = ExecOnNodeWithNsenter(ctx, oc, cnvWorkerNode, "swapon", swapFilePath)
+ 			if err != nil {
+ 				framework.Logf("Warning: Failed to enable swap: %v", err)
+ 				result.success = false
+@@ -1061,11 +1061,11 @@ var _ = g.Describe("[Jira:Node/Kubelet][sig-node][Serial][Disruptive][Suite:open
+ 
+ 			g.By(fmt.Sprintf("Verifying swap metrics with %s swap", swapSize.name))
+ 			framework.Logf("Running: swapon -s")
+-			swapOutput, _ := ExecOnNodeWithChroot(oc, cnvWorkerNode, "swapon", "-s")
++			swapOutput, _ := ExecOnNodeWithChroot(ctx, oc, cnvWorkerNode, "swapon", "-s")
+ 			framework.Logf("swapon -s output:\n%s", swapOutput)
+ 
+ 			framework.Logf("Running: grep -i swap /proc/meminfo")
+-			meminfoOutput, _ := ExecOnNodeWithChroot(oc, cnvWorkerNode, "grep", "-i", "swap", "/proc/meminfo")
++			meminfoOutput, _ := ExecOnNodeWithChroot(ctx, oc, cnvWorkerNode, "grep", "-i", "swap", "/proc/meminfo")
+ 			framework.Logf("Swap info from /proc/meminfo:\n%s", strings.TrimSpace(meminfoOutput))
+ 
+ 			// Parse SwapTotal
+@@ -1079,7 +1079,7 @@ var _ = g.Describe("[Jira:Node/Kubelet][sig-node][Serial][Disruptive][Suite:open
+ 			}
+ 
+ 			framework.Logf("Running: free -h")
+-			freeOutput, _ := ExecOnNodeWithChroot(oc, cnvWorkerNode, "free", "-h")
++			freeOutput, _ := ExecOnNodeWithChroot(ctx, oc, cnvWorkerNode, "free", "-h")
+ 			framework.Logf("free -h output:\n%s", freeOutput)
+ 
+ 			// Verify swap size is approximately what we configured (within 10%)
+@@ -1127,7 +1127,7 @@ var _ = g.Describe("[Jira:Node/Kubelet][sig-node][Serial][Disruptive][Suite:open
+ 
+ 		g.By("Checking OS-level swap status")
+ 		framework.Logf("Running: swapon -s")
+-		swapOutput, _ := ExecOnNodeWithChroot(oc, cnvWorkerNode, "swapon", "-s")
++		swapOutput, _ := ExecOnNodeWithChroot(ctx, oc, cnvWorkerNode, "swapon", "-s")
+ 		framework.Logf("swapon -s output:\n%s", swapOutput)
+ 		hasOSSwap := strings.TrimSpace(swapOutput) != "" && swapOutput != "Filename\t\t\t\tType\t\tSize\t\tUsed\t\tPriority"
+ 
+@@ -1138,30 +1138,30 @@ var _ = g.Describe("[Jira:Node/Kubelet][sig-node][Serial][Disruptive][Suite:open
+ 
+ 			g.By(fmt.Sprintf("Creating %dMB swap file at %s", swapSizeMB, swapFilePath))
+ 			framework.Logf("Running: dd if=/dev/zero of=%s bs=1M count=%d", swapFilePath, swapSizeMB)
+-			ddOutput, err := ExecOnNodeWithChroot(oc, cnvWorkerNode, "dd", "if=/dev/zero", fmt.Sprintf("of=%s", swapFilePath), "bs=1M", fmt.Sprintf("count=%d", swapSizeMB))
++			ddOutput, err := ExecOnNodeWithChroot(ctx, oc, cnvWorkerNode, "dd", "if=/dev/zero", fmt.Sprintf("of=%s", swapFilePath), "bs=1M", fmt.Sprintf("count=%d", swapSizeMB))
+ 			if err != nil {
+ 				framework.Logf("Warning: dd command returned error (may still have succeeded): %v", err)
+ 			}
+ 			framework.Logf("dd output: %s", ddOutput)
+ 
+ 			framework.Logf("Running: chmod 600 %s", swapFilePath)
+-			_, err = ExecOnNodeWithChroot(oc, cnvWorkerNode, "chmod", "600", swapFilePath)
++			_, err = ExecOnNodeWithChroot(ctx, oc, cnvWorkerNode, "chmod", "600", swapFilePath)
+ 			o.Expect(err).NotTo(o.HaveOccurred())
+ 
+ 			framework.Logf("Running: mkswap %s", swapFilePath)
+-			mkswapOutput, err := ExecOnNodeWithChroot(oc, cnvWorkerNode, "mkswap", swapFilePath)
++			mkswapOutput, err := ExecOnNodeWithChroot(ctx, oc, cnvWorkerNode, "mkswap", swapFilePath)
+ 			o.Expect(err).NotTo(o.HaveOccurred())
+ 			framework.Logf("mkswap output: %s", mkswapOutput)
+ 
+ 			g.By("Enabling swap")
+ 			framework.Logf("Running: swapon %s", swapFilePath)
+-			_, err = ExecOnNodeWithNsenter(oc, cnvWorkerNode, "swapon", swapFilePath)
++			_, err = ExecOnNodeWithNsenter(ctx, oc, cnvWorkerNode, "swapon", swapFilePath)
+ 			o.Expect(err).NotTo(o.HaveOccurred())
+ 			swapCreated = true
+ 
+ 			// Verify swap is now enabled
+ 			framework.Logf("Verifying swap is enabled...")
+-			swapVerify, _ := ExecOnNodeWithChroot(oc, cnvWorkerNode, "swapon", "-s")
++			swapVerify, _ := ExecOnNodeWithChroot(ctx, oc, cnvWorkerNode, "swapon", "-s")
+ 			framework.Logf("swapon -s after enabling:\n%s", swapVerify)
+ 			hasOSSwap = true
+ 		}
+@@ -1170,9 +1170,9 @@ var _ = g.Describe("[Jira:Node/Kubelet][sig-node][Serial][Disruptive][Suite:open
+ 			g.By("Cleaning up swap file and drop-in configuration")
+ 			if swapCreated {
+ 				framework.Logf("Disabling swap: swapoff %s", swapFilePath)
+-				ExecOnNodeWithNsenter(oc, cnvWorkerNode, "swapoff", swapFilePath)
++				ExecOnNodeWithNsenter(ctx, oc, cnvWorkerNode, "swapoff", swapFilePath)
+ 				framework.Logf("Removing swap file: rm -f %s", swapFilePath)
+-				ExecOnNodeWithChroot(oc, cnvWorkerNode, "rm", "-f", swapFilePath)
++				ExecOnNodeWithChroot(ctx, oc, cnvWorkerNode, "rm", "-f", swapFilePath)
+ 			}
+ 			cleanupDropInAndRestartKubelet(ctx, oc, cnvWorkerNode, cnvDropInFilePath)
+ 		}()
+@@ -1180,7 +1180,7 @@ var _ = g.Describe("[Jira:Node/Kubelet][sig-node][Serial][Disruptive][Suite:open
+ 		g.By("Creating LimitedSwap configuration")
+ 		framework.Logf("Creating drop-in file: %s", cnvDropInFilePath)
+ 		framework.Logf("Content:\n%s", loadConfigFromFile(cnvLimitedSwapConfigPath))
+-		err := createDropInFile(oc, cnvWorkerNode, cnvDropInFilePath, loadConfigFromFile(cnvLimitedSwapConfigPath))
++		err := createDropInFile(ctx, oc, cnvWorkerNode, cnvDropInFilePath, loadConfigFromFile(cnvLimitedSwapConfigPath))
+ 		o.Expect(err).NotTo(o.HaveOccurred())
+ 		framework.Logf("Drop-in file created successfully")
+ 
+@@ -1200,7 +1200,7 @@ var _ = g.Describe("[Jira:Node/Kubelet][sig-node][Serial][Disruptive][Suite:open
+ 
+ 		g.By("Getting swap metrics from /proc/meminfo (baseline)")
+ 		framework.Logf("Running: grep -i swap /proc/meminfo")
+-		meminfoOutput, err := ExecOnNodeWithChroot(oc, cnvWorkerNode, "grep", "-i", "swap", "/proc/meminfo")
++		meminfoOutput, err := ExecOnNodeWithChroot(ctx, oc, cnvWorkerNode, "grep", "-i", "swap", "/proc/meminfo")
+ 		o.Expect(err).NotTo(o.HaveOccurred())
+ 		framework.Logf("Swap metrics from /proc/meminfo:\n%s", strings.TrimSpace(meminfoOutput))
+ 
+@@ -1219,7 +1219,7 @@ var _ = g.Describe("[Jira:Node/Kubelet][sig-node][Serial][Disruptive][Suite:open
+ 
+ 		g.By("Checking free -h output for swap")
+ 		framework.Logf("Running: free -h")
+-		freeOutput, _ := ExecOnNodeWithChroot(oc, cnvWorkerNode, "free", "-h")
++		freeOutput, _ := ExecOnNodeWithChroot(ctx, oc, cnvWorkerNode, "free", "-h")
+ 		framework.Logf("free -h output:\n%s", freeOutput)
+ 
+ 		g.By("Querying Prometheus for node swap metrics")
+diff --git a/test/extended/node/node_utils.go b/test/extended/node/node_utils.go
+index e5697355514e..7ce343742b81 100644
+--- a/test/extended/node/node_utils.go
++++ b/test/extended/node/node_utils.go
+@@ -10,24 +10,32 @@ import (
+ 	"strings"
+ 	"time"
+ 
++	g "github.com/onsi/ginkgo/v2"
++	o "github.com/onsi/gomega"
+ 	corev1 "k8s.io/api/core/v1"
+ 	apierrors "k8s.io/apimachinery/pkg/api/errors"
+ 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+ 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
+ 	"k8s.io/apimachinery/pkg/runtime/schema"
++	"k8s.io/apimachinery/pkg/types"
+ 	"k8s.io/apimachinery/pkg/util/wait"
+ 	kubeletconfigv1beta1 "k8s.io/kubelet/config/v1beta1"
+ 	"k8s.io/kubernetes/test/e2e/framework"
+ 
+-	g "github.com/onsi/ginkgo/v2"
+-	o "github.com/onsi/gomega"
+-
+-	configv1 "github.com/openshift/api/config/v1"
+ 	machineconfigv1 "github.com/openshift/api/machineconfiguration/v1"
+ 	machineconfigclient "github.com/openshift/client-go/machineconfiguration/clientset/versioned"
+ 	exutil "github.com/openshift/origin/test/extended/util"
+ )
+ 
++// SkipOnMicroShift skips the current test if the cluster is MicroShift.
++func SkipOnMicroShift(oc *exutil.CLI) {
++	isMicroShift, err := exutil.IsMicroShiftCluster(oc.AdminKubeClient())
++	o.Expect(err).NotTo(o.HaveOccurred())
++	if isMicroShift {
++		g.Skip("Skipping test on MicroShift cluster")
++	}
++}
++
+ // getNodesByLabel returns nodes matching the specified label selector
+ func getNodesByLabel(ctx context.Context, oc *exutil.CLI, labelSelector string) ([]corev1.Node, error) {
+ 	nodes, err := oc.AdminKubeClient().CoreV1().Nodes().List(ctx, metav1.ListOptions{
+@@ -102,7 +110,11 @@ func getPureWorkerNodes(nodes []corev1.Node) []corev1.Node {
+ 		_, hasControlPlane := node.Labels["node-role.kubernetes.io/control-plane"]
+ 		_, hasMaster := node.Labels["node-role.kubernetes.io/master"]
+ 		if hasControlPlane || hasMaster {
+-			framework.Logf("Skipping worker validation for node %s (also has control-plane role, e.g. SNO)", node.Name)
++			framework.Logf("Skipping node %s (control-plane role)", node.Name)
++			continue
++		}
++		if role, found := NodeHasCustomRole(node); found {
++			framework.Logf("Skipping node %s (already has custom role %q)", node.Name, role)
+ 			continue
+ 		}
+ 		pureWorkers = append(pureWorkers, node)
+@@ -172,34 +184,69 @@ func getCNVWorkerNodeName(ctx context.Context, oc *exutil.CLI) string {
+ 	return nodes[rand.Intn(len(nodes))].Name
+ }
+ 
+-// ExecOnNodeWithChroot runs a command on a node using oc debug with chroot /host
+-func ExecOnNodeWithChroot(oc *exutil.CLI, nodeName string, cmd ...string) (string, error) {
++func execOnNodeWithDebug(ctx context.Context, oc *exutil.CLI, nodeName string, timeout time.Duration, args []string) (string, error) {
++	timeoutCtx, cancel := context.WithTimeout(ctx, timeout)
++	defer cancel()
++
++	execCmd, stdOutBuf, stdErrBuf, err := oc.AsAdmin().WithoutNamespace().Run("debug").Args(args...).Background()
++	if err != nil {
++		return "", err
++	}
++
++	type result struct {
++		err error
++	}
++	resultCh := make(chan result, 1)
++
++	go func() {
++		resultCh <- result{err: execCmd.Wait()}
++	}()
++
++	select {
++	case res := <-resultCh:
++		stdOut := strings.TrimSpace(stdOutBuf.String())
++		stdErr := strings.TrimSpace(stdErrBuf.String())
++		if res.err != nil {
++			return stdOut, fmt.Errorf("oc debug failed: %w\nStdErr: %s", res.err, stdErr)
++		}
++		return stdOut, nil
++	case <-timeoutCtx.Done():
++		var killErr error
++		if execCmd.Process != nil {
++			killErr = execCmd.Process.Kill()
++		}
++		if ctx.Err() != nil {
++			return "", fmt.Errorf("oc debug command canceled on node %s: %w", nodeName, ctx.Err())
++		}
++		if killErr != nil {
++			return "", fmt.Errorf("oc debug command timed out after %v on node %s; failed to stop debug process: %w", timeout, nodeName, killErr)
++		}
++		return "", fmt.Errorf("oc debug command timed out after %v on node %s (cleanup likely hung)", timeout, nodeName)
++	}
++}
++
++func ExecOnNodeWithChroot(ctx context.Context, oc *exutil.CLI, nodeName string, cmd ...string) (string, error) {
+ 	args := append([]string{"node/" + nodeName, "-n" + DebugNamespace, "--", "chroot", "/host"}, cmd...)
+-	stdOut, _, err := oc.AsAdmin().WithoutNamespace().Run("debug").Args(args...).Outputs()
+-	return stdOut, err
++	return execOnNodeWithDebug(ctx, oc, nodeName, 2*time.Minute, args)
+ }
+ 
+-// ExecOnNodeWithNsenter runs a command on a node using nsenter to access host namespaces
+-// This is needed for swap operations (swapon/swapoff) that require direct namespace access
+-func ExecOnNodeWithNsenter(oc *exutil.CLI, nodeName string, cmd ...string) (string, error) {
++func ExecOnNodeWithNsenter(ctx context.Context, oc *exutil.CLI, nodeName string, cmd ...string) (string, error) {
+ 	nsenterCmd := append([]string{"nsenter", "-a", "-t", "1"}, cmd...)
+ 	args := append([]string{"node/" + nodeName, "-n" + DebugNamespace, "--"}, nsenterCmd...)
+-	stdOut, _, err := oc.AsAdmin().WithoutNamespace().Run("debug").Args(args...).Outputs()
+-	return stdOut, err
++	return execOnNodeWithDebug(ctx, oc, nodeName, 2*time.Minute, args)
+ }
+ 
+ // createDropInFile creates a drop-in configuration file on the specified node
+-func createDropInFile(oc *exutil.CLI, nodeName, filePath, content string) error {
+-	// Escape content for shell
++func createDropInFile(ctx context.Context, oc *exutil.CLI, nodeName, filePath, content string) error {
+ 	escapedContent := strings.ReplaceAll(content, "'", "'\\''")
+ 	cmd := fmt.Sprintf("echo '%s' > %s && chmod 644 %s", escapedContent, filePath, filePath)
+-	_, err := ExecOnNodeWithChroot(oc, nodeName, "sh", "-c", cmd)
++	_, err := ExecOnNodeWithChroot(ctx, oc, nodeName, "sh", "-c", cmd)
+ 	return err
+ }
+ 
+ // removeDropInFile removes a drop-in configuration file from the specified node
+-func removeDropInFile(oc *exutil.CLI, nodeName, filePath string) error {
+-	_, err := ExecOnNodeWithChroot(oc, nodeName, "rm", "-f", filePath)
++func removeDropInFile(ctx context.Context, oc *exutil.CLI, nodeName, filePath string) error {
++	_, err := ExecOnNodeWithChroot(ctx, oc, nodeName, "rm", "-f", filePath)
+ 	return err
+ }
+ 
+@@ -218,7 +265,7 @@ func restartKubeletOnNode(ctx context.Context, oc *exutil.CLI, nodeName string)
+ 	const maxAttempts = 3
+ 	var lastErr error
+ 	for attempt := 0; attempt < maxAttempts; attempt++ {
+-		_, err := ExecOnNodeWithChroot(oc, nodeName, "systemctl", "restart", "kubelet")
++		_, err := ExecOnNodeWithChroot(ctx, oc, nodeName, "systemctl", "restart", "kubelet")
+ 		if err == nil {
+ 			return nil
+ 		}
+@@ -287,7 +334,7 @@ func isNodeInReadyState(node *corev1.Node) bool {
+ // cleanupDropInAndRestartKubelet removes the drop-in file and restarts kubelet
+ func cleanupDropInAndRestartKubelet(ctx context.Context, oc *exutil.CLI, nodeName, filePath string) {
+ 	framework.Logf("Removing drop-in file: %s", filePath)
+-	removeDropInFile(oc, nodeName, filePath)
++	removeDropInFile(ctx, oc, nodeName, filePath)
+ 	framework.Logf("Restarting kubelet on node: %s", nodeName)
+ 	restartKubeletOnNode(ctx, oc, nodeName)
+ 	framework.Logf("Waiting for node to be ready...")
+@@ -458,7 +505,7 @@ func installCNVOperator(ctx context.Context, oc *exutil.CLI) error {
+ 		return fmt.Errorf("failed to create MC client for MCP check: %w", err)
+ 	}
+ 
+-	err = waitForMCP(ctx, mcClient, "worker", 30*time.Minute)
++	err = WaitForMCP(ctx, mcClient, "worker", 15*time.Minute)
+ 	if err != nil {
+ 		return fmt.Errorf("MCP rollout failed after CNV installation: %w", err)
+ 	}
+@@ -501,7 +548,7 @@ func waitForCNVOperatorReady(ctx context.Context, oc *exutil.CLI) error {
+ func waitForHyperConvergedReady(ctx context.Context, oc *exutil.CLI) error {
+ 	dynamicClient := oc.AdminDynamicClient()
+ 
+-	return wait.PollUntilContextTimeout(ctx, 15*time.Second, 20*time.Minute, true, func(ctx context.Context) (bool, error) {
++	return wait.PollUntilContextTimeout(ctx, 15*time.Second, 15*time.Minute, true, func(ctx context.Context) (bool, error) {
+ 		hc, err := dynamicClient.Resource(hyperConvergedGVR).Namespace(cnvNamespace).Get(ctx, cnvHyperConverged, metav1.GetOptions{})
+ 		if err != nil {
+ 			framework.Logf("Error getting HyperConverged: %v", err)
+@@ -553,9 +600,9 @@ func WaitMCPAllowDegraded() func(*waitMCPOptions) {
+ 	}
+ }
+ 
+-// waitForMCP waits for a MachineConfigPool to be ready (not updating, updated, and all machines ready).
++// WaitForMCP waits for a MachineConfigPool to be ready (not updating, updated, and all machines ready).
+ // By default it returns an error immediately if the MCP becomes degraded.
+-func waitForMCP(ctx context.Context, mcClient *machineconfigclient.Clientset, poolName string, timeout time.Duration, opts ...func(*waitMCPOptions)) error {
++func WaitForMCP(ctx context.Context, mcClient *machineconfigclient.Clientset, poolName string, timeout time.Duration, opts ...func(*waitMCPOptions)) error {
+ 	options := waitMCPOptions{}
+ 	for _, opt := range opts {
+ 		opt(&options)
+@@ -724,22 +771,39 @@ func uninstallCNVOperator(ctx context.Context, oc *exutil.CLI) error {
+ 	dynamicClient := oc.AdminDynamicClient()
+ 
+ 	// Step 1: Delete HyperConverged CR
++	// Give the operator 3 minutes to clean up gracefully; if the CR is still stuck,
++	// strip its finalizers so deletion can proceed.
+ 	framework.Logf("Deleting HyperConverged CR %s", cnvHyperConverged)
+ 	err := dynamicClient.Resource(hyperConvergedGVR).Namespace(cnvNamespace).Delete(ctx, cnvHyperConverged, metav1.DeleteOptions{})
+ 	if err != nil && !apierrors.IsNotFound(err) {
+ 		framework.Logf("Warning: failed to delete HyperConverged CR: %v", err)
+ 	}
+ 
+-	// Wait for HyperConverged to be deleted
+-	framework.Logf("Waiting for HyperConverged CR to be deleted...")
+-	_ = wait.PollUntilContextTimeout(ctx, 10*time.Second, 10*time.Minute, true, func(ctx context.Context) (bool, error) {
+-		_, err := dynamicClient.Resource(hyperConvergedGVR).Namespace(cnvNamespace).Get(ctx, cnvHyperConverged, metav1.GetOptions{})
+-		if apierrors.IsNotFound(err) {
+-			return true, nil
+-		}
+-		framework.Logf("Waiting for HyperConverged to be deleted...")
+-		return false, nil
+-	})
++	if err == nil || !apierrors.IsNotFound(err) {
++		framework.Logf("Waiting for HyperConverged CR to be deleted...")
++		finalizersStripped := false
++		startTime := time.Now()
++		_ = wait.PollUntilContextTimeout(ctx, 10*time.Second, 5*time.Minute, true, func(ctx context.Context) (bool, error) {
++			_, getErr := dynamicClient.Resource(hyperConvergedGVR).Namespace(cnvNamespace).Get(ctx, cnvHyperConverged, metav1.GetOptions{})
++			if apierrors.IsNotFound(getErr) {
++				return true, nil
++			}
++
++			if !finalizersStripped && time.Since(startTime) > 3*time.Minute {
++				framework.Logf("HyperConverged CR still present after 3m, stripping finalizers")
++				patch := []byte(`{"metadata":{"finalizers":[]}}`)
++				_, patchErr := dynamicClient.Resource(hyperConvergedGVR).Namespace(cnvNamespace).Patch(
++					ctx, cnvHyperConverged, types.MergePatchType, patch, metav1.PatchOptions{})
++				if patchErr != nil && !apierrors.IsNotFound(patchErr) {
++					framework.Logf("Warning: failed to strip finalizers from HyperConverged CR: %v", patchErr)
++				}
++				finalizersStripped = true
++			}
++
++			framework.Logf("Waiting for HyperConverged to be deleted...")
++			return false, nil
++		})
++	}
+ 
+ 	// Step 2: Delete Subscription
+ 	framework.Logf("Deleting Subscription %s", cnvSubscription)
+@@ -792,7 +856,7 @@ func uninstallCNVOperator(ctx context.Context, oc *exutil.CLI) error {
+ 	if err != nil {
+ 		framework.Logf("Warning: failed to create MC client for MCP check: %v", err)
+ 	} else {
+-		err = waitForMCP(ctx, mcClient, "worker", 30*time.Minute)
++		err = WaitForMCP(ctx, mcClient, "worker", 15*time.Minute)
+ 		if err != nil {
+ 			framework.Logf("Warning: MCP rollout check failed: %v", err)
+ 		}
+@@ -810,7 +874,7 @@ func ensureDropInDirectoryExists(ctx context.Context, oc *exutil.CLI, dirPath st
+ 	}
+ 
+ 	for _, node := range nodes {
+-		_, err := ExecOnNodeWithChroot(oc, node.Name, "mkdir", "-p", dirPath)
++		_, err := ExecOnNodeWithChroot(ctx, oc, node.Name, "mkdir", "-p", dirPath)
+ 		if err != nil {
+ 			framework.Logf("Warning: failed to create directory on node %s: %v", node.Name, err)
+ 		}
+@@ -821,25 +885,26 @@ func ensureDropInDirectoryExists(ctx context.Context, oc *exutil.CLI, dirPath st
+ 
+ // GetFirstReadyWorkerNode returns the name of the first Ready worker node in the cluster.
+ func GetFirstReadyWorkerNode(oc *exutil.CLI) string {
+-	nodeNames, err := oc.AsAdmin().WithoutNamespace().Run("get").Args(
+-		"nodes", "-l", "node-role.kubernetes.io/worker",
+-		"-o=jsonpath={.items[*].metadata.name}",
+-	).Output()
++	ctx := context.Background()
++	nodes, err := oc.AdminKubeClient().CoreV1().Nodes().List(ctx, metav1.ListOptions{
++		LabelSelector: "node-role.kubernetes.io/worker",
++	})
+ 	o.Expect(err).NotTo(o.HaveOccurred())
+-	workers := strings.Fields(nodeNames)
+-	o.Expect(workers).NotTo(o.BeEmpty(), "no worker nodes found")
++	o.Expect(nodes.Items).NotTo(o.BeEmpty(), "no worker nodes found")
+ 
+-	for _, w := range workers {
+-		status, statusErr := oc.AsAdmin().WithoutNamespace().Run("get").Args(
+-			"nodes", w,
+-			"-o=jsonpath={.status.conditions[?(@.type=='Ready')].status}",
+-		).Output()
+-		if statusErr == nil && status == "True" {
+-			return w
++	for _, node := range nodes.Items {
++		if role, found := NodeHasCustomRole(node); found {
++			framework.Logf("Skipping node %s (already has custom role %q)", node.Name, role)
++			continue
++		}
++		for _, condition := range node.Status.Conditions {
++			if condition.Type == corev1.NodeReady && condition.Status == corev1.ConditionTrue {
++				return node.Name
++			}
+ 		}
+ 	}
+-	o.Expect(false).To(o.BeTrue(), "no Ready worker node found among %v", workers)
+-	return "" // unreachable; satisfies compiler
++	o.Expect(false).To(o.BeTrue(), "no Ready worker node without custom roles found")
++	return ""
+ }
+ 
+ // CalculateEventTimeDiff calculates the time difference between two Kubernetes events.
+@@ -862,9 +927,9 @@ func CalculateEventTimeDiff(startEvent, endEvent *corev1.Event) time.Duration {
+ // GetPodNetNs retrieves the network namespace path for a pod using crictl.
+ // It uses crictl to get the sandbox ID and then inspects it to extract the NetNS path.
+ // Returns the NetNS path and an error if not found.
+-func GetPodNetNs(oc *exutil.CLI, nodeName, podName string) (string, error) {
++func GetPodNetNs(ctx context.Context, oc *exutil.CLI, nodeName, podName string) (string, error) {
+ 	// Get sandbox ID using crictl
+-	sandboxID, err := ExecOnNodeWithChroot(oc, nodeName, "crictl", "pods", "--name", podName, "-q")
++	sandboxID, err := ExecOnNodeWithChroot(ctx, oc, nodeName, "crictl", "pods", "--name", podName, "-q")
+ 	if err != nil || sandboxID == "" {
+ 		framework.Logf("Failed to get sandbox ID for pod %s: %v", podName, err)
+ 		return "", fmt.Errorf("failed to get sandbox ID for pod %s: %w", podName, err)
+@@ -873,7 +938,7 @@ func GetPodNetNs(oc *exutil.CLI, nodeName, podName string) (string, error) {
+ 	framework.Logf("Found sandbox ID: %s", sandboxID)
+ 
+ 	// Extract network namespace path from sandbox inspection
+-	netNsStr, err := ExecOnNodeWithChroot(oc, nodeName, "sh", "-c", fmt.Sprintf("crictl inspectp %s | grep -i netns", sandboxID))
++	netNsStr, err := ExecOnNodeWithChroot(ctx, oc, nodeName, "sh", "-c", fmt.Sprintf("crictl inspectp %s | grep -i netns", sandboxID))
+ 	if err != nil {
+ 		framework.Logf("Failed to get NetNS from crictl inspect: %v", err)
+ 		return "", fmt.Errorf("failed to get NetNS from crictl inspect: %w", err)
+@@ -894,9 +959,9 @@ func GetPodNetNs(oc *exutil.CLI, nodeName, podName string) (string, error) {
+ // CheckNetNsCleaned verifies that the network namespace file has been cleaned up.
+ // It checks if the NetNS path no longer exists on the node.
+ // Returns nil if the file is cleaned, error if it still exists.
+-func CheckNetNsCleaned(oc *exutil.CLI, nodeName, netNsPath string) error {
++func CheckNetNsCleaned(ctx context.Context, oc *exutil.CLI, nodeName, netNsPath string) error {
+ 	// Use test command which returns proper exit code
+-	_, err := ExecOnNodeWithChroot(oc, nodeName, "test", "-e", netNsPath)
++	_, err := ExecOnNodeWithChroot(ctx, oc, nodeName, "test", "-e", netNsPath)
+ 	if err != nil {
+ 		// Non-nil err: file absent (test exit 1) OR exec/debug failure.
+ 		framework.Logf("NetNS file considered cleaned (test -e returned error: %v)", err)
+@@ -906,42 +971,25 @@ func CheckNetNsCleaned(oc *exutil.CLI, nodeName, netNsPath string) error {
+ 	return fmt.Errorf("NetNS file still exists at %s", netNsPath)
+ }
+ 
+-func skipUnlessAdditionalStorageConfigEnabled(ctx context.Context, oc *exutil.CLI) {
+-	// Skip on MicroShift - MachineConfig resources are not available
+-	isMicroShift, err := exutil.IsMicroShiftCluster(oc.AdminKubeClient())
+-	if err != nil {
+-		framework.Logf("Failed to detect MicroShift cluster: %v", err)
+-		g.Skip("Cannot verify cluster type")
+-	}
+-	if isMicroShift {
+-		g.Skip("Skipping test on MicroShift cluster - MachineConfig resources are not available")
+-	}
+-
+-	// Skip on Microsoft
+-	infra, err := oc.AdminConfigClient().ConfigV1().Infrastructures().Get(ctx, "cluster", metav1.GetOptions{})
++func GetNotReadyNodes(ctx context.Context, oc *exutil.CLI) ([]string, error) {
++	nodes, err := oc.AdminKubeClient().CoreV1().Nodes().List(ctx, metav1.ListOptions{})
+ 	if err != nil {
+-		framework.Logf("Failed to get Infrastructure resource: %v", err)
+-		g.Skip("Cannot verify platform type")
+-	}
+-	if infra.Status.PlatformStatus != nil && infra.Status.PlatformStatus.Type == configv1.AzurePlatformType {
+-		g.Skip("Skipping test on Microsoft Azure cluster")
+-	}
+-
+-	// Verify AdditionalStorageConfig feature gate is enabled
+-	g.By("Verifying AdditionalStorageConfig feature gate is enabled")
+-	fgs, err := oc.AdminConfigClient().ConfigV1().FeatureGates().Get(ctx, "cluster", metav1.GetOptions{})
+-	if err != nil {
+-		framework.Logf("Failed to get FeatureGate resource: %v", err)
+-		g.Skip("Cannot verify AdditionalStorageConfig feature gate requirement")
++		return nil, err
+ 	}
+ 
+-	for _, fg := range fgs.Status.FeatureGates {
+-		for _, enabledFG := range fg.Enabled {
+-			if enabledFG.Name == "AdditionalStorageConfig" {
+-				return // All prerequisites met, continue with test
+-			}
++	var notReadyNodes []string
++	for _, node := range nodes.Items {
++		if !isNodeInReadyState(&node) {
++			notReadyNodes = append(notReadyNodes, node.Name)
+ 		}
+ 	}
+ 
+-	g.Skip("Skipping test - AdditionalStorageConfig feature gate is not enabled")
++	return notReadyNodes, nil
++}
++
++func EnsureNodesReady(ctx context.Context, oc *exutil.CLI) {
++	notReadyNodes, err := GetNotReadyNodes(ctx, oc)
++	o.Expect(err).NotTo(o.HaveOccurred(), "failed to check node readiness")
++	o.Expect(notReadyNodes).To(o.BeEmpty(),
++		"Cannot start test: nodes not Ready: %v. Cluster may be recovering from previous test.", notReadyNodes)
+ }
+diff --git a/test/extended/node/runc_upgrade_cases.go b/test/extended/node/runc_upgrade_cases.go
+index d253006d5419..0ce16b47207b 100644
+--- a/test/extended/node/runc_upgrade_cases.go
++++ b/test/extended/node/runc_upgrade_cases.go
+@@ -115,7 +115,7 @@ var _ = g.Describe("[Suite:openshift/disruptive-longrunning][sig-node][Serial][D
+ 
+ 		g.By("Recovering pool by setting osImageStream back to rhel-9")
+ 		o.Expect(setPoolOSImageStream(ctx, mcClient, runcRHCOS10GuardPool, streamRHEL9)).To(o.Succeed())
+-		o.Expect(waitForMCP(ctx, mcClient, runcRHCOS10GuardPool, 10*time.Minute, WaitMCPAllowDegraded())).To(o.Succeed())
++		o.Expect(WaitForMCP(ctx, mcClient, runcRHCOS10GuardPool, 10*time.Minute, WaitMCPAllowDegraded())).To(o.Succeed())
+ 
+ 		g.By("Verifying cluster upgradeability recovers after pool returns to rhel-9")
+ 		// MCO may take up to ~30 minutes to propagate Upgradeable after RenderDegraded clears.
+@@ -146,11 +146,11 @@ var _ = g.Describe("[Suite:openshift/disruptive-longrunning][sig-node][Serial][D
+ 			o.Expect(setPoolOSImageStream(ctx, mcClient, runcRHCOS10GuardPool, streamRHEL10)).To(o.Succeed())
+ 			o.Expect(waitForNodeRHELMajorVersion(ctx, oc, nodeName, "10", 45*time.Minute)).To(o.Succeed(),
+ 				"node should reboot onto RHCOS 10 after rhel-10 stream change without runc")
+-			o.Expect(waitForMCP(ctx, mcClient, runcRHCOS10GuardPool, 30*time.Minute)).To(o.Succeed())
++			o.Expect(WaitForMCP(ctx, mcClient, runcRHCOS10GuardPool, 30*time.Minute)).To(o.Succeed())
+ 
+ 			g.By("Verifying node rolled out to RHCOS 10 with crun")
+ 			o.Expect(verifyNodeReadyAndNotRollingOut(ctx, oc, nodeName)).To(o.Succeed())
+-			o.Expect(assertCrunRuntimeOnNode(oc, nodeName)).To(o.Succeed(), "node should use crun after runc config is removed")
++			o.Expect(assertCrunRuntimeOnNode(ctx, oc, nodeName)).To(o.Succeed(), "node should use crun after runc config is removed")
+ 		}
+ 	})
+ 
+@@ -166,7 +166,7 @@ var _ = g.Describe("[Suite:openshift/disruptive-longrunning][sig-node][Serial][D
+ 			framework.Logf("cleanup: failed to delete ContainerRuntimeConfig %s: %v", runcGuardCRCName, err)
+ 		}
+ 		if nodeName != "" {
+-			if err := waitForMCP(ctx, mcClient, runcRHCOS10GuardPool, 10*time.Minute, WaitMCPWithMachineCount(0)); err != nil {
++			if err := WaitForMCP(ctx, mcClient, runcRHCOS10GuardPool, 10*time.Minute, WaitMCPWithMachineCount(0)); err != nil {
+ 				framework.Logf("cleanup: failed waiting for MCP %s machine count 0: %v", runcRHCOS10GuardPool, err)
+ 			}
+ 			if err := waitForNodeWorkerConfigRollback(ctx, oc, nodeName, runcRHCOS10GuardPool, 15*time.Minute); err != nil {
+@@ -177,7 +177,7 @@ var _ = g.Describe("[Suite:openshift/disruptive-longrunning][sig-node][Serial][D
+ 			framework.Logf("cleanup: failed to delete MachineConfigPool %s: %v", runcRHCOS10GuardPool, err)
+ 		}
+ 		if nodeName != "" {
+-			if err := waitForMCP(ctx, mcClient, "worker", 30*time.Minute); err != nil {
++			if err := WaitForMCP(ctx, mcClient, "worker", 30*time.Minute); err != nil {
+ 				framework.Logf("cleanup: failed waiting for worker MCP to become ready: %v", err)
+ 			}
+ 		}
+@@ -565,6 +565,9 @@ func labelFirstPureWorker(ctx context.Context, oc *exutil.CLI, poolName string)
+ 	if err != nil {
+ 		return "", err
+ 	}
++	if len(workers) == 0 {
++		return "", fmt.Errorf("no pure worker nodes without custom roles available")
++	}
+ 
+ 	node := workers[0]
+ 	label := poolNodeRoleLabel(poolName)
+@@ -635,10 +638,10 @@ func waitForMCPRenderDegraded(ctx context.Context, mcClient *machineconfigclient
+ 	})
+ }
+ 
+-func hasRuncRuntimeOnNode(oc *exutil.CLI, nodeName string) (bool, error) {
++func hasRuncRuntimeOnNode(ctx context.Context, oc *exutil.CLI, nodeName string) (bool, error) {
+ 	// Use a shell guard so missing drop-ins do not make oc debug exit non-zero (which spams test logs).
+ 	readDropIn := fmt.Sprintf("if [ -f %q ]; then grep default_runtime %q; fi", runcCRCDefaultRuntimePath, runcCRCDefaultRuntimePath)
+-	out, err := ExecOnNodeWithChroot(oc, nodeName, "sh", "-c", readDropIn)
++	out, err := ExecOnNodeWithChroot(ctx, oc, nodeName, "sh", "-c", readDropIn)
+ 	if err != nil {
+ 		if isTransientNodeDebugError(err) {
+ 			return false, err
+@@ -650,7 +653,7 @@ func hasRuncRuntimeOnNode(oc *exutil.CLI, nodeName string) (bool, error) {
+ 
+ func expectRuncRuntimeOnNode(ctx context.Context, oc *exutil.CLI, nodeName string, timeout time.Duration) error {
+ 	err := wait.PollUntilContextTimeout(ctx, 10*time.Second, timeout, true, func(ctx context.Context) (bool, error) {
+-		hasRunc, err := hasRuncRuntimeOnNode(oc, nodeName)
++		hasRunc, err := hasRuncRuntimeOnNode(ctx, oc, nodeName)
+ 		if err != nil {
+ 			if isTransientNodeDebugError(err) {
+ 				framework.Logf("Transient debug error checking runc on node %s: %v", nodeName, err)
+@@ -741,7 +744,7 @@ func waitForRuncRemovedFromNode(ctx context.Context, oc *exutil.CLI, nodeName st
+ 			framework.Logf("Node %s is unschedulable while waiting for runc removal", nodeName)
+ 		}
+ 
+-		hasRunc, err := hasRuncRuntimeOnNode(oc, nodeName)
++		hasRunc, err := hasRuncRuntimeOnNode(ctx, oc, nodeName)
+ 		if err != nil {
+ 			if isTransientNodeDebugError(err) {
+ 				framework.Logf("Node %s debug unavailable during runc removal rollout, retrying: %v", nodeName, err)
+@@ -803,8 +806,8 @@ func waitForNodeRHELMajorVersion(ctx context.Context, oc *exutil.CLI, nodeName,
+ 	})
+ }
+ 
+-func assertCrunRuntimeOnNode(oc *exutil.CLI, nodeName string) error {
+-	hasRunc, err := hasRuncRuntimeOnNode(oc, nodeName)
++func assertCrunRuntimeOnNode(ctx context.Context, oc *exutil.CLI, nodeName string) error {
++	hasRunc, err := hasRuncRuntimeOnNode(ctx, oc, nodeName)
+ 	if err != nil {
+ 		if isTransientNodeDebugError(err) {
+ 			return fmt.Errorf("failed to verify runtime on node %s: debug unavailable: %w", nodeName, err)
+diff --git a/test/extended/node/system_compressible.go b/test/extended/node/system_compressible.go
+index 6eb0dcc6351d..b79dfa926b83 100644
+--- a/test/extended/node/system_compressible.go
++++ b/test/extended/node/system_compressible.go
+@@ -10,12 +10,12 @@ import (
+ 	g "github.com/onsi/ginkgo/v2"
+ 	o "github.com/onsi/gomega"
+ 	corev1 "k8s.io/api/core/v1"
+-	apierrors "k8s.io/apimachinery/pkg/api/errors"
++	"k8s.io/apimachinery/pkg/api/resource"
+ 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+ 	"k8s.io/apimachinery/pkg/runtime"
+-	"k8s.io/apimachinery/pkg/types"
+ 	kubeletconfigv1beta1 "k8s.io/kubelet/config/v1beta1"
+ 	"k8s.io/kubernetes/test/e2e/framework"
++	"sigs.k8s.io/yaml"
+ 
+ 	mcfgv1 "github.com/openshift/api/machineconfiguration/v1"
+ 	machineconfigclient "github.com/openshift/client-go/machineconfiguration/clientset/versioned"
+@@ -28,12 +28,8 @@ var _ = g.Describe("[Suite:openshift/disruptive-longrunning][sig-node][Disruptiv
+ 	oc := exutil.NewCLIWithoutNamespace("system-compressible")
+ 
+ 	g.BeforeEach(func(ctx context.Context) {
+-		// Skip all tests on MicroShift clusters
+-		isMicroShift, err := exutil.IsMicroShiftCluster(oc.AdminKubeClient())
+-		o.Expect(err).NotTo(o.HaveOccurred())
+-		if isMicroShift {
+-			g.Skip("Skipping test on MicroShift cluster")
+-		}
++		SkipOnMicroShift(oc)
++		EnsureNodesReady(ctx, oc)
+ 	})
+ 
+ 	g.It("should enforce system compressible CPU limit by default", func(ctx context.Context) {
+@@ -55,24 +51,22 @@ var _ = g.Describe("[Suite:openshift/disruptive-longrunning][sig-node][Disruptiv
+ 		o.Expect(isSystemCompressibleEnabled(config)).To(o.BeTrue(),
+ 			"System compressible should be enabled by default")
+ 
+-		// Read SYSTEM_RESERVED_CPU from /etc/node-sizing.env
+-		g.By("Reading SYSTEM_RESERVED_CPU from /etc/node-sizing.env")
+-		nodeSizingOutput, err := ExecOnNodeWithChroot(oc, nodeName, "cat", "/etc/node-sizing.env")
+-		o.Expect(err).NotTo(o.HaveOccurred(), "Should be able to read /etc/node-sizing.env")
+-		framework.Logf("/etc/node-sizing.env contents:\n%s", nodeSizingOutput)
+-
+-		// Parse SYSTEM_RESERVED_CPU value (e.g., "0.5" means 500m)
+-		var systemReservedCPU float64
+-		for _, line := range strings.Split(nodeSizingOutput, "\n") {
+-			if strings.HasPrefix(line, "SYSTEM_RESERVED_CPU=") {
+-				cpuStr := strings.TrimPrefix(line, "SYSTEM_RESERVED_CPU=")
+-				systemReservedCPU, err = strconv.ParseFloat(cpuStr, 64)
+-				o.Expect(err).NotTo(o.HaveOccurred(), "Should be able to parse SYSTEM_RESERVED_CPU value: %s", cpuStr)
+-				break
+-			}
+-		}
+-		o.Expect(systemReservedCPU).To(o.BeNumerically(">", 0), "SYSTEM_RESERVED_CPU should be set")
+-		framework.Logf("SYSTEM_RESERVED_CPU: %.2f (%.0f millicores)", systemReservedCPU, systemReservedCPU*1000)
++		g.By("Reading systemReserved.cpu from /etc/openshift/kubelet.conf.d/20-auto-sizing.conf")
++		autoSizingOutput, err := ExecOnNodeWithChroot(ctx, oc, nodeName, "cat", "/etc/openshift/kubelet.conf.d/20-auto-sizing.conf")
++		o.Expect(err).NotTo(o.HaveOccurred(), "Should be able to read /etc/openshift/kubelet.conf.d/20-auto-sizing.conf")
++		framework.Logf("/etc/openshift/kubelet.conf.d/20-auto-sizing.conf contents:\n%s", autoSizingOutput)
++
++		var autoSizingConfig kubeletconfigv1beta1.KubeletConfiguration
++		err = yaml.Unmarshal([]byte(autoSizingOutput), &autoSizingConfig)
++		o.Expect(err).NotTo(o.HaveOccurred(), "Should be able to parse auto-sizing config")
++
++		cpuQuantity, ok := autoSizingConfig.SystemReserved["cpu"]
++		o.Expect(ok).To(o.BeTrue(), "systemReserved.cpu should be set")
++		cpuResource, err := resource.ParseQuantity(cpuQuantity)
++		o.Expect(err).NotTo(o.HaveOccurred(), "systemReserved.cpu must be a valid resource quantity")
++		systemReservedCPU := float64(cpuResource.MilliValue()) / 1000.0
++		o.Expect(systemReservedCPU).To(o.BeNumerically(">", 0), "systemReserved.cpu should be greater than 0")
++		framework.Logf("systemReserved.cpu: %.2f (%.0f millicores)", systemReservedCPU, systemReservedCPU*1000)
+ 
+ 		// Convert to cpuShares: cpuShares = systemReservedCPU * 1024
+ 		cpuShares := uint64(systemReservedCPU * 1024)
+@@ -81,7 +75,7 @@ var _ = g.Describe("[Suite:openshift/disruptive-longrunning][sig-node][Disruptiv
+ 
+ 		// Check cgroup cpu.weight configuration for system.slice
+ 		g.By("Verifying system.slice cgroup CPU weight")
+-		actualWeight, err := readCgroupCPUWeight(oc, nodeName, "system.slice")
++		actualWeight, err := readCgroupCPUWeight(ctx, oc, nodeName, "system.slice")
+ 		o.Expect(err).NotTo(o.HaveOccurred(), "Should be able to read cpu.weight for system.slice")
+ 		framework.Logf("system.slice actual cpu.weight: %d", actualWeight)
+ 
+@@ -97,7 +91,6 @@ var _ = g.Describe("[Suite:openshift/disruptive-longrunning][sig-node][Disruptiv
+ 		o.Expect(err).NotTo(o.HaveOccurred(), "Error creating MCO client")
+ 
+ 		testMCPName := "system-compressible-test"
+-		testNodeMCPLabel := fmt.Sprintf("node-role.kubernetes.io/%s", testMCPName)
+ 		kubeletConfigName := "system-compressible-override"
+ 
+ 		// Select node
+@@ -105,111 +98,24 @@ var _ = g.Describe("[Suite:openshift/disruptive-longrunning][sig-node][Disruptiv
+ 		o.Expect(err).NotTo(o.HaveOccurred(), "Should find a node with at least 4 CPUs")
+ 		framework.Logf("Testing on node: %s with %d CPUs", nodeName, cpuCount)
+ 
+-		// Setup cleanup functions
+-		cleanupNodeLabel := func() {
+-			g.By(fmt.Sprintf("Removing node label %s from node %s", testNodeMCPLabel, nodeName))
+-			cleanupCtx := context.Background()
+-			patchData := []byte(fmt.Sprintf(`{"metadata":{"labels":{%q:null}}}`, testNodeMCPLabel))
+-			_, updateErr := oc.AdminKubeClient().CoreV1().Nodes().Patch(cleanupCtx, nodeName, types.MergePatchType, patchData, metav1.PatchOptions{})
+-			if apierrors.IsNotFound(updateErr) {
+-				// Node already deleted, nothing to clean up
+-				return
+-			} else if updateErr != nil {
+-				framework.Failf("Failed to remove label from node %s: %v", nodeName, updateErr)
+-			}
+-
+-			g.By(fmt.Sprintf("Waiting for node %s to transition back to worker pool", nodeName))
+-			o.Eventually(func() bool {
+-				currentNode, err := oc.AdminKubeClient().CoreV1().Nodes().Get(cleanupCtx, nodeName, metav1.GetOptions{})
+-				if err != nil {
+-					return false
+-				}
+-				currentConfig := currentNode.Annotations["machineconfiguration.openshift.io/currentConfig"]
+-				desiredConfig := currentNode.Annotations["machineconfiguration.openshift.io/desiredConfig"]
+-				isWorkerConfig := currentConfig != "" && !strings.Contains(currentConfig, testMCPName) && currentConfig == desiredConfig
+-				return isWorkerConfig
+-			}, 7*time.Minute, 10*time.Second).Should(o.BeTrue())
+-		}
+-
+-		cleanupKubeletConfig := func() {
+-			g.By("Cleaning up KubeletConfig")
++		// Register cleanups BEFORE MCP creation so they always run
++		var mcpConfig *CustomMCPConfig
++		g.DeferCleanup(func() {
+ 			cleanupCtx := context.Background()
+-			deleteErr := mcClient.MachineconfigurationV1().KubeletConfigs().Delete(cleanupCtx, kubeletConfigName, metav1.DeleteOptions{})
+-			if apierrors.IsNotFound(deleteErr) {
+-				// KubeletConfig already deleted, nothing to clean up
+-			} else if deleteErr != nil {
+-				framework.Failf("Failed to delete KubeletConfig %s: %v", kubeletConfigName, deleteErr)
++			if err := CleanupCustomMCP(cleanupCtx, mcpConfig); err != nil {
++				framework.Logf("Warning: MCP cleanup had errors: %v", err)
+ 			}
+-		}
+-
+-		cleanupMCP := func() {
+-			g.By("Cleaning up custom MachineConfigPool")
++		})
++		g.DeferCleanup(func() {
+ 			cleanupCtx := context.Background()
+-			deleteErr := mcClient.MachineconfigurationV1().MachineConfigPools().Delete(cleanupCtx, testMCPName, metav1.DeleteOptions{})
+-			if apierrors.IsNotFound(deleteErr) {
+-				// MachineConfigPool already deleted, nothing to clean up
+-			} else if deleteErr != nil {
+-				framework.Failf("Failed to delete MachineConfigPool %s: %v", testMCPName, deleteErr)
++			if err := CleanupKubeletConfig(cleanupCtx, mcClient, kubeletConfigName, ""); err != nil {
++				framework.Logf("Warning: KubeletConfig cleanup failed: %v", err)
+ 			}
++		})
+ 
+-			// Wait for worker MCP to stabilize after custom MCP deletion
+-			g.By("Waiting for worker MCP to stabilize after custom MCP deletion")
+-			waitErr := waitForMCP(cleanupCtx, mcClient, "worker", 10*time.Minute)
+-			if apierrors.IsNotFound(waitErr) {
+-				// MachineConfigPool already deleted, nothing to wait for
+-			} else if waitErr != nil {
+-				framework.Failf("Worker MCP did not stabilize after custom MCP deletion: %v", waitErr)
+-			}
+-		}
+-
+-		// Register cleanups in LIFO order
+-		g.DeferCleanup(cleanupMCP)
+-		g.DeferCleanup(cleanupKubeletConfig)
+-		g.DeferCleanup(cleanupNodeLabel)
+-
+-		// Label node
+-		g.By(fmt.Sprintf("Labeling node %s with %s", nodeName, testNodeMCPLabel))
+-		patchData := []byte(fmt.Sprintf(`{"metadata":{"labels":{%q:""}}}`, testNodeMCPLabel))
+-		_, err = oc.AdminKubeClient().CoreV1().Nodes().Patch(ctx, nodeName, types.MergePatchType, patchData, metav1.PatchOptions{})
+-		o.Expect(err).NotTo(o.HaveOccurred(), "Should be able to label node")
+-
+-		// Create custom MCP
+-		g.By(fmt.Sprintf("Creating custom MachineConfigPool %s", testMCPName))
+-		testMCP := &mcfgv1.MachineConfigPool{
+-			TypeMeta: metav1.TypeMeta{
+-				APIVersion: "machineconfiguration.openshift.io/v1",
+-				Kind:       "MachineConfigPool",
+-			},
+-			ObjectMeta: metav1.ObjectMeta{
+-				Name: testMCPName,
+-				Labels: map[string]string{
+-					"machineconfiguration.openshift.io/pool": testMCPName,
+-				},
+-			},
+-			Spec: mcfgv1.MachineConfigPoolSpec{
+-				MachineConfigSelector: &metav1.LabelSelector{
+-					MatchExpressions: []metav1.LabelSelectorRequirement{
+-						{
+-							Key:      "machineconfiguration.openshift.io/role",
+-							Operator: metav1.LabelSelectorOpIn,
+-							Values:   []string{"worker", testMCPName},
+-						},
+-					},
+-				},
+-				NodeSelector: &metav1.LabelSelector{
+-					MatchLabels: map[string]string{
+-						testNodeMCPLabel: "",
+-					},
+-				},
+-			},
+-		}
+-		_, err = mcClient.MachineconfigurationV1().MachineConfigPools().Create(ctx, testMCP, metav1.CreateOptions{})
+-		o.Expect(err).NotTo(o.HaveOccurred(), "Should create custom MachineConfigPool")
+-
+-		// Wait for MCP ready
+-		g.By("Waiting for custom MachineConfigPool to be ready")
+-		err = waitForMCP(ctx, mcClient, testMCPName, 5*time.Minute)
+-		o.Expect(err).NotTo(o.HaveOccurred(), "MCP should be ready")
++		// Create custom MCP for the node
++		mcpConfig, err = CreateCustomMCPForNode(ctx, oc, mcClient, testMCPName, nodeName)
++		o.Expect(err).NotTo(o.HaveOccurred(), "Should create custom MCP")
+ 
+ 		// Create KubeletConfig to disable system compressible
+ 		g.By("Creating KubeletConfig to disable system compressible")
+@@ -233,29 +139,9 @@ var _ = g.Describe("[Suite:openshift/disruptive-longrunning][sig-node][Disruptiv
+ 			},
+ 		}
+ 
+-		_, err = mcClient.MachineconfigurationV1().KubeletConfigs().Create(ctx, kubeletConfig, metav1.CreateOptions{})
+-		o.Expect(err).NotTo(o.HaveOccurred(), "Should create KubeletConfig")
+-
+-		// Wait for MCP to start updating
+-		g.By(fmt.Sprintf("Waiting for %s MCP to start updating", testMCPName))
+-		o.Eventually(func() bool {
+-			mcp, err := mcClient.MachineconfigurationV1().MachineConfigPools().Get(ctx, testMCPName, metav1.GetOptions{})
+-			if err != nil {
+-				framework.Logf("Error getting %s MCP: %v", testMCPName, err)
+-				return false
+-			}
+-			for _, condition := range mcp.Status.Conditions {
+-				if condition.Type == "Updating" && condition.Status == corev1.ConditionTrue {
+-					return true
+-				}
+-			}
+-			return false
+-		}, 2*time.Minute, 10*time.Second).Should(o.BeTrue(), fmt.Sprintf("%s MCP should start updating", testMCPName))
+-
+-		// Wait for MCP to apply configuration
+-		g.By("Waiting for MCP to update with new configuration")
+-		err = waitForMCP(ctx, mcClient, testMCPName, 15*time.Minute)
+-		o.Expect(err).NotTo(o.HaveOccurred(), "MCP should update successfully")
++		g.By("Applying KubeletConfig and waiting for MCP rollout")
++		err = ApplyKubeletConfigAndWaitForMCP(ctx, mcClient, kubeletConfig, testMCPName, 15*time.Minute)
++		o.Expect(err).NotTo(o.HaveOccurred(), "Should apply KubeletConfig and complete MCP rollout")
+ 
+ 		// Verify system compressible is disabled
+ 		config, err := getKubeletConfigFromNode(ctx, oc, nodeName)
+@@ -265,7 +151,7 @@ var _ = g.Describe("[Suite:openshift/disruptive-longrunning][sig-node][Disruptiv
+ 
+ 		// Check cgroup cpu.weight configuration for system.slice
+ 		g.By("Verifying system.slice cgroup CPU weight when system compressible is disabled")
+-		actualWeight, err := readCgroupCPUWeight(oc, nodeName, "system.slice")
++		actualWeight, err := readCgroupCPUWeight(ctx, oc, nodeName, "system.slice")
+ 		o.Expect(err).NotTo(o.HaveOccurred(), "Should be able to read cpu.weight for system.slice")
+ 		framework.Logf("system.slice actual cpu.weight when disabled: %d", actualWeight)
+ 
+@@ -280,9 +166,8 @@ var _ = g.Describe("[Suite:openshift/disruptive-longrunning][sig-node][Disruptiv
+ 		framework.Logf("System compressible override verified successfully: cpu.weight is default value")
+ 
+ 		// Cleanup explicitly before DeferCleanup
+-		cleanupKubeletConfig()
+-		cleanupNodeLabel()
+-		cleanupMCP()
++		CleanupKubeletConfig(ctx, mcClient, kubeletConfigName, "")
++		CleanupCustomMCP(ctx, mcpConfig)
+ 	})
+ 
+ 	g.It("should not enable system compressible when reserved CPU is configured", func(ctx context.Context) {
+@@ -290,7 +175,6 @@ var _ = g.Describe("[Suite:openshift/disruptive-longrunning][sig-node][Disruptiv
+ 		o.Expect(err).NotTo(o.HaveOccurred(), "Error creating MCO client")
+ 
+ 		testMCPName := "reserved-cpu-test"
+-		testNodeMCPLabel := fmt.Sprintf("node-role.kubernetes.io/%s", testMCPName)
+ 		kubeletConfigName := "reserved-cpu-config"
+ 
+ 		// Select node
+@@ -298,111 +182,24 @@ var _ = g.Describe("[Suite:openshift/disruptive-longrunning][sig-node][Disruptiv
+ 		o.Expect(err).NotTo(o.HaveOccurred(), "Should find a node with at least 4 CPUs")
+ 		framework.Logf("Testing on node: %s with %d CPUs", nodeName, cpuCount)
+ 
+-		// Setup cleanup functions
+-		cleanupNodeLabel := func() {
+-			g.By(fmt.Sprintf("Removing node label %s from node %s", testNodeMCPLabel, nodeName))
++		// Register cleanups BEFORE MCP creation so they always run
++		var mcpConfig *CustomMCPConfig
++		g.DeferCleanup(func() {
+ 			cleanupCtx := context.Background()
+-			patchData := []byte(fmt.Sprintf(`{"metadata":{"labels":{%q:null}}}`, testNodeMCPLabel))
+-			_, updateErr := oc.AdminKubeClient().CoreV1().Nodes().Patch(cleanupCtx, nodeName, types.MergePatchType, patchData, metav1.PatchOptions{})
+-			if apierrors.IsNotFound(updateErr) {
+-				// Node already deleted, nothing to clean up
+-				return
+-			} else if updateErr != nil {
+-				framework.Failf("Failed to remove label from node %s: %v", nodeName, updateErr)
++			if err := CleanupCustomMCP(cleanupCtx, mcpConfig); err != nil {
++				framework.Logf("Warning: MCP cleanup had errors: %v", err)
+ 			}
+-
+-			g.By(fmt.Sprintf("Waiting for node %s to transition back to worker pool", nodeName))
+-			o.Eventually(func() bool {
+-				currentNode, err := oc.AdminKubeClient().CoreV1().Nodes().Get(cleanupCtx, nodeName, metav1.GetOptions{})
+-				if err != nil {
+-					return false
+-				}
+-				currentConfig := currentNode.Annotations["machineconfiguration.openshift.io/currentConfig"]
+-				desiredConfig := currentNode.Annotations["machineconfiguration.openshift.io/desiredConfig"]
+-				isWorkerConfig := currentConfig != "" && !strings.Contains(currentConfig, testMCPName) && currentConfig == desiredConfig
+-				return isWorkerConfig
+-			}, 7*time.Minute, 10*time.Second).Should(o.BeTrue())
+-		}
+-
+-		cleanupKubeletConfig := func() {
+-			g.By("Cleaning up KubeletConfig")
++		})
++		g.DeferCleanup(func() {
+ 			cleanupCtx := context.Background()
+-			deleteErr := mcClient.MachineconfigurationV1().KubeletConfigs().Delete(cleanupCtx, kubeletConfigName, metav1.DeleteOptions{})
+-			if apierrors.IsNotFound(deleteErr) {
+-				// KubeletConfig already deleted, nothing to clean up
+-			} else if deleteErr != nil {
+-				framework.Failf("Failed to delete KubeletConfig %s: %v", kubeletConfigName, deleteErr)
++			if err := CleanupKubeletConfig(cleanupCtx, mcClient, kubeletConfigName, ""); err != nil {
++				framework.Logf("Warning: KubeletConfig cleanup failed: %v", err)
+ 			}
+-		}
+-
+-		cleanupMCP := func() {
+-			g.By("Cleaning up custom MachineConfigPool")
+-			cleanupCtx := context.Background()
+-			deleteErr := mcClient.MachineconfigurationV1().MachineConfigPools().Delete(cleanupCtx, testMCPName, metav1.DeleteOptions{})
+-			if apierrors.IsNotFound(deleteErr) {
+-				// MachineConfigPool already deleted, nothing to clean up
+-			} else if deleteErr != nil {
+-				framework.Failf("Failed to delete MachineConfigPool %s: %v", testMCPName, deleteErr)
+-			}
+-
+-			// Wait for worker MCP to stabilize after custom MCP deletion
+-			g.By("Waiting for worker MCP to stabilize after custom MCP deletion")
+-			waitErr := waitForMCP(cleanupCtx, mcClient, "worker", 10*time.Minute)
+-			if apierrors.IsNotFound(waitErr) {
+-				// MachineConfigPool already deleted, nothing to wait for
+-			} else if waitErr != nil {
+-				framework.Failf("Worker MCP did not stabilize after custom MCP deletion: %v", waitErr)
+-			}
+-		}
+-
+-		// Register cleanups in LIFO order
+-		g.DeferCleanup(cleanupMCP)
+-		g.DeferCleanup(cleanupKubeletConfig)
+-		g.DeferCleanup(cleanupNodeLabel)
+-
+-		// Label node
+-		g.By(fmt.Sprintf("Labeling node %s with %s", nodeName, testNodeMCPLabel))
+-		patchData := []byte(fmt.Sprintf(`{"metadata":{"labels":{%q:""}}}`, testNodeMCPLabel))
+-		_, err = oc.AdminKubeClient().CoreV1().Nodes().Patch(ctx, nodeName, types.MergePatchType, patchData, metav1.PatchOptions{})
+-		o.Expect(err).NotTo(o.HaveOccurred(), "Should be able to label node")
+-
+-		// Create custom MCP
+-		g.By(fmt.Sprintf("Creating custom MachineConfigPool %s", testMCPName))
+-		testMCP := &mcfgv1.MachineConfigPool{
+-			TypeMeta: metav1.TypeMeta{
+-				APIVersion: "machineconfiguration.openshift.io/v1",
+-				Kind:       "MachineConfigPool",
+-			},
+-			ObjectMeta: metav1.ObjectMeta{
+-				Name: testMCPName,
+-				Labels: map[string]string{
+-					"machineconfiguration.openshift.io/pool": testMCPName,
+-				},
+-			},
+-			Spec: mcfgv1.MachineConfigPoolSpec{
+-				MachineConfigSelector: &metav1.LabelSelector{
+-					MatchExpressions: []metav1.LabelSelectorRequirement{
+-						{
+-							Key:      "machineconfiguration.openshift.io/role",
+-							Operator: metav1.LabelSelectorOpIn,
+-							Values:   []string{"worker", testMCPName},
+-						},
+-					},
+-				},
+-				NodeSelector: &metav1.LabelSelector{
+-					MatchLabels: map[string]string{
+-						testNodeMCPLabel: "",
+-					},
+-				},
+-			},
+-		}
+-		_, err = mcClient.MachineconfigurationV1().MachineConfigPools().Create(ctx, testMCP, metav1.CreateOptions{})
+-		o.Expect(err).NotTo(o.HaveOccurred(), "Should create custom MachineConfigPool")
++		})
+ 
+-		// Wait for MCP ready
+-		g.By("Waiting for custom MachineConfigPool to be ready")
+-		err = waitForMCP(ctx, mcClient, testMCPName, 5*time.Minute)
+-		o.Expect(err).NotTo(o.HaveOccurred(), "MCP should be ready")
++		// Create custom MCP for the node
++		mcpConfig, err = CreateCustomMCPForNode(ctx, oc, mcClient, testMCPName, nodeName)
++		o.Expect(err).NotTo(o.HaveOccurred(), "Should create custom MCP")
+ 
+ 		// Configure static CPU manager with reserved CPUs
+ 		g.By("Creating KubeletConfig with reserved CPU")
+@@ -426,29 +223,9 @@ var _ = g.Describe("[Suite:openshift/disruptive-longrunning][sig-node][Disruptiv
+ 			},
+ 		}
+ 
+-		_, err = mcClient.MachineconfigurationV1().KubeletConfigs().Create(ctx, kubeletConfig, metav1.CreateOptions{})
+-		o.Expect(err).NotTo(o.HaveOccurred(), "Should create KubeletConfig")
+-
+-		// Wait for MCP to start updating
+-		g.By(fmt.Sprintf("Waiting for %s MCP to start updating", testMCPName))
+-		o.Eventually(func() bool {
+-			mcp, err := mcClient.MachineconfigurationV1().MachineConfigPools().Get(ctx, testMCPName, metav1.GetOptions{})
+-			if err != nil {
+-				framework.Logf("Error getting %s MCP: %v", testMCPName, err)
+-				return false
+-			}
+-			for _, condition := range mcp.Status.Conditions {
+-				if condition.Type == "Updating" && condition.Status == corev1.ConditionTrue {
+-					return true
+-				}
+-			}
+-			return false
+-		}, 2*time.Minute, 10*time.Second).Should(o.BeTrue(), fmt.Sprintf("%s MCP should start updating", testMCPName))
+-
+-		// Wait for configuration
+-		g.By("Waiting for MCP to update with reserved CPU configuration")
+-		err = waitForMCP(ctx, mcClient, testMCPName, 15*time.Minute)
+-		o.Expect(err).NotTo(o.HaveOccurred(), "MCP should update successfully")
++		g.By("Applying KubeletConfig and waiting for MCP rollout")
++		err = ApplyKubeletConfigAndWaitForMCP(ctx, mcClient, kubeletConfig, testMCPName, 15*time.Minute)
++		o.Expect(err).NotTo(o.HaveOccurred(), "Should apply KubeletConfig and complete MCP rollout")
+ 
+ 		// Verify reserved CPU is enabled
+ 		config, err := getKubeletConfigFromNode(ctx, oc, nodeName)
+@@ -463,9 +240,8 @@ var _ = g.Describe("[Suite:openshift/disruptive-longrunning][sig-node][Disruptiv
+ 		framework.Logf("Reserved CPU takes precedence over system compressible")
+ 
+ 		// Cleanup explicitly before DeferCleanup
+-		cleanupKubeletConfig()
+-		cleanupNodeLabel()
+-		cleanupMCP()
++		CleanupKubeletConfig(ctx, mcClient, kubeletConfigName, "")
++		CleanupCustomMCP(ctx, mcpConfig)
+ 	})
+ })
+ 
+@@ -542,7 +318,11 @@ func selectTestNode(ctx context.Context, oc *exutil.CLI, minCPUs int) (string, i
+ 			continue
+ 		}
+ 
+-		// Check MCP stability - current config should match desired config
++		if role, found := NodeHasCustomRole(node); found {
++			framework.Logf("Skipping node %s: already has custom role %q", node.Name, role)
++			continue
++		}
++
+ 		currentConfig := node.Annotations["machineconfiguration.openshift.io/currentConfig"]
+ 		desiredConfig := node.Annotations["machineconfiguration.openshift.io/desiredConfig"]
+ 		if currentConfig == "" || desiredConfig == "" || currentConfig != desiredConfig {
+@@ -562,10 +342,10 @@ func selectTestNode(ctx context.Context, oc *exutil.CLI, minCPUs int) (string, i
+ }
+ 
+ // readCgroupCPUWeight reads cpu.weight file for a cgroup slice
+-func readCgroupCPUWeight(oc *exutil.CLI, nodeName, slicePath string) (uint64, error) {
++func readCgroupCPUWeight(ctx context.Context, oc *exutil.CLI, nodeName, slicePath string) (uint64, error) {
+ 	weightPath := fmt.Sprintf("/sys/fs/cgroup/%s/cpu.weight", slicePath)
+ 
+-	output, err := ExecOnNodeWithChroot(oc, nodeName, "cat", weightPath)
++	output, err := ExecOnNodeWithChroot(ctx, oc, nodeName, "cat", weightPath)
+ 	if err != nil {
+ 		return 0, fmt.Errorf("failed to read %s: %w", weightPath, err)
+ 	}

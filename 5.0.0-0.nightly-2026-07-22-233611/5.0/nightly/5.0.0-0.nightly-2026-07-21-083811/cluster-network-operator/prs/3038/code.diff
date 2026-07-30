@@ -1,0 +1,374 @@
+diff --git a/bindata/network/ovn-kubernetes/common/008-script-lib.yaml b/bindata/network/ovn-kubernetes/common/008-script-lib.yaml
+index b244e6b3f8..5ba59c2018 100644
+--- a/bindata/network/ovn-kubernetes/common/008-script-lib.yaml
++++ b/bindata/network/ovn-kubernetes/common/008-script-lib.yaml
+@@ -526,15 +526,23 @@ data:
+       cni-bin-copy
+ 
+       echo "I$(date "+%m%d %H:%M:%S.%N") - disable conntrack on geneve port"
+-      iptables -t raw -A PREROUTING -p udp --dport {{.GenevePort}} -j NOTRACK
+-      iptables -t raw -A OUTPUT -p udp --dport {{.GenevePort}} -j NOTRACK
+-      ip6tables -t raw -A PREROUTING -p udp --dport {{.GenevePort}} -j NOTRACK
+-      ip6tables -t raw -A OUTPUT -p udp --dport {{.GenevePort}} -j NOTRACK
++      # Clean up old iptables NOTRACK rules from before the nftables migration.
++      # This cleanup code can be removed once all nodes have been upgraded.
++      iptables -t raw -D PREROUTING -p udp --dport {{.GenevePort}} -j NOTRACK 2>/dev/null || true
++      iptables -t raw -D OUTPUT -p udp --dport {{.GenevePort}} -j NOTRACK 2>/dev/null || true
++      ip6tables -t raw -D PREROUTING -p udp --dport {{.GenevePort}} -j NOTRACK 2>/dev/null || true
++      ip6tables -t raw -D OUTPUT -p udp --dport {{.GenevePort}} -j NOTRACK 2>/dev/null || true
++      nft 'add table inet ovn_notrack { comment "OVN conntrack notrack rules" ; }'
++      nft flush table inet ovn_notrack
++      nft 'add chain inet ovn_notrack prerouting { type filter hook prerouting priority raw; policy accept; }'
++      nft 'add chain inet ovn_notrack output { type filter hook output priority raw; policy accept; }'
++      nft add rule inet ovn_notrack prerouting udp dport {{.GenevePort}} notrack
++      nft add rule inet ovn_notrack output udp dport {{.GenevePort}} notrack
+ 
+       {{- if .OVNHybridOverlayVXLANPort}}
+       echo "I$(date "+%m%d %H:%M:%S.%N") - disable conntrack on hybrid overlay VXLAN port"
+-      iptables -t raw -A PREROUTING -p udp --dport {{.OVNHybridOverlayVXLANPort}} -j NOTRACK
+-      iptables -t raw -A OUTPUT -p udp --dport {{.OVNHybridOverlayVXLANPort}} -j NOTRACK
++      nft add rule inet ovn_notrack prerouting udp dport {{.OVNHybridOverlayVXLANPort}} notrack
++      nft add rule inet ovn_notrack output udp dport {{.OVNHybridOverlayVXLANPort}} notrack
+       {{- end}}
+ 
+       echo "I$(date "+%m%d %H:%M:%S.%N") - starting ovnkube-node"
+diff --git a/bindata/network/ovn-kubernetes/managed/ovnkube-node.yaml b/bindata/network/ovn-kubernetes/managed/ovnkube-node.yaml
+index f26e34709e..2343f4f49e 100644
+--- a/bindata/network/ovn-kubernetes/managed/ovnkube-node.yaml
++++ b/bindata/network/ovn-kubernetes/managed/ovnkube-node.yaml
+@@ -486,11 +486,6 @@ spec:
+         - mountPath: /etc/systemd/system
+           name: systemd-units
+           readOnly: true
+-        # for the iptables wrapper
+-        - mountPath: /host
+-          name: host-slash
+-          readOnly: true
+-          mountPropagation: HostToContainer
+         # for the CNI server socket
+         - mountPath: /run/ovn-kubernetes/
+           name: host-run-ovn-kubernetes
+@@ -597,41 +592,37 @@ spec:
+           export KUBECONFIG=/var/run/ovnkube-kubeconfig
+ {{ end }}
+ 
+-          touch /var/run/ovn/add_iptables.sh
+-          chmod 0755 /var/run/ovn/add_iptables.sh
+-          cat <<'EOF' > /var/run/ovn/add_iptables.sh
++          touch /var/run/ovn/add_nft_icmp.sh
++          chmod 0755 /var/run/ovn/add_nft_icmp.sh
++          cat <<'EOF' > /var/run/ovn/add_nft_icmp.sh
+           #!/bin/sh
+           if [ -z "$3" ]
+           then
+                echo "Called with host address missing, ignore"
+                exit 0
+           fi
+-          echo "Adding ICMP drop rule for '$3' "
+-          if iptables -C CHECK_ICMP_SOURCE -p icmp -s $3 -j ICMP_ACTION
+-          then
+-               echo "iptables already set for $3"
+-          else
+-               iptables -A CHECK_ICMP_SOURCE -p icmp -s $3 -j ICMP_ACTION
+-          fi
++          echo "Adding ICMP drop rule for '$3'"
++          nft add element ip azure_icmp icmp_sources "{ $3 }"
+           EOF
+ 
+           echo "I$(date "+%m%d %H:%M:%S.%N") - drop-icmp - start drop-icmp ${K8S_NODE}"
+-          iptables -X CHECK_ICMP_SOURCE || true
+-          iptables -N CHECK_ICMP_SOURCE || true
+-          iptables -F CHECK_ICMP_SOURCE
+-          iptables -D INPUT -p icmp --icmp-type fragmentation-needed -j CHECK_ICMP_SOURCE || true
+-          iptables -I INPUT -p icmp --icmp-type fragmentation-needed -j CHECK_ICMP_SOURCE
+-          iptables -N ICMP_ACTION || true
+-          iptables -F ICMP_ACTION
+-          iptables -A ICMP_ACTION -j LOG
+-          iptables -A ICMP_ACTION -j DROP
++          # Clean up old iptables ICMP rules from before the nftables migration.
++          # This cleanup code can be removed once all nodes have been upgraded.
++          iptables -D INPUT -p icmp --icmp-type fragmentation-needed -j CHECK_ICMP_SOURCE 2>/dev/null || true
++          iptables -F CHECK_ICMP_SOURCE 2>/dev/null || true
++          iptables -X CHECK_ICMP_SOURCE 2>/dev/null || true
++          iptables -F ICMP_ACTION 2>/dev/null || true
++          iptables -X ICMP_ACTION 2>/dev/null || true
++          nft 'add table ip azure_icmp { comment "Azure ICMP drop filtering" ; }'
++          nft flush table ip azure_icmp
++          nft 'add set ip azure_icmp icmp_sources { type ipv4_addr; }'
++          nft 'add chain ip azure_icmp input { type filter hook input priority 0; policy accept; }'
++          nft add rule ip azure_icmp input icmp type destination-unreachable icmp code frag-needed ip saddr @icmp_sources counter log drop
+           #
+           ip addr show
+           ip route show
+-          iptables -nvL
+-          iptables -nvL -t nat
+-          oc observe pods -n openshift-ovn-kubernetes --listen-addr='' -l app=ovnkube-node -a '{ .status.hostIP }' -- /var/run/ovn/add_iptables.sh
+-          #systemd-run -qPG -- oc observe pods -n openshift-ovn-kubernetes --listen-addr='' -l app=ovnkube-node -a '{ .status.hostIP }' -- /var/run/ovn/add_iptables.sh
++          nft list table ip azure_icmp
++          oc observe pods -n openshift-ovn-kubernetes --listen-addr='' -l app=ovnkube-node -a '{ .status.hostIP }' -- /var/run/ovn/add_nft_icmp.sh
+         lifecycle:
+           preStop:
+             exec:
+@@ -644,11 +635,6 @@ spec:
+         - mountPath: /etc/ovn/
+           name: etc-openvswitch
+ {{ end }}
+-        # for the iptables wrapper
+-        - mountPath: /host
+-          name: host-slash
+-          readOnly: true
+-          mountPropagation: HostToContainer
+         - mountPath: /run/ovn/
+           name: run-ovn
+         resources:
+@@ -673,10 +659,6 @@ spec:
+       - name: systemd-units
+         hostPath:
+           path: /etc/systemd/system
+-      # used for iptables wrapper scripts
+-      - name: host-slash
+-        hostPath:
+-          path: /
+       - name: host-run-netns
+         hostPath:
+           path: /run/netns
+diff --git a/bindata/network/ovn-kubernetes/self-hosted/ovnkube-node.yaml b/bindata/network/ovn-kubernetes/self-hosted/ovnkube-node.yaml
+index 18f52c983c..661df324b3 100644
+--- a/bindata/network/ovn-kubernetes/self-hosted/ovnkube-node.yaml
++++ b/bindata/network/ovn-kubernetes/self-hosted/ovnkube-node.yaml
+@@ -510,11 +510,6 @@ spec:
+         - mountPath: /etc/systemd/system
+           name: systemd-units
+           readOnly: true
+-        # for the iptables wrapper
+-        - mountPath: /host
+-          name: host-slash
+-          readOnly: true
+-          mountPropagation: HostToContainer
+         # for the CNI server socket
+         - mountPath: /run/ovn-kubernetes/
+           name: host-run-ovn-kubernetes
+@@ -603,41 +598,37 @@ spec:
+           export KUBECONFIG=/etc/ovn/kubeconfig
+ {{ end }}
+ 
+-          touch /var/run/ovn/add_iptables.sh
+-          chmod 0755 /var/run/ovn/add_iptables.sh
+-          cat <<'EOF' > /var/run/ovn/add_iptables.sh
++          touch /var/run/ovn/add_nft_icmp.sh
++          chmod 0755 /var/run/ovn/add_nft_icmp.sh
++          cat <<'EOF' > /var/run/ovn/add_nft_icmp.sh
+           #!/bin/sh
+           if [ -z "$3" ]
+           then
+                echo "Called with host address missing, ignore"
+                exit 0
+           fi
+-          echo "Adding ICMP drop rule for '$3' "
+-          if iptables -C CHECK_ICMP_SOURCE -p icmp -s $3 -j ICMP_ACTION
+-          then
+-               echo "iptables already set for $3"
+-          else
+-               iptables -A CHECK_ICMP_SOURCE -p icmp -s $3 -j ICMP_ACTION
+-          fi
++          echo "Adding ICMP drop rule for '$3'"
++          nft add element ip azure_icmp icmp_sources "{ $3 }"
+           EOF
+ 
+           echo "I$(date "+%m%d %H:%M:%S.%N") - drop-icmp - start drop-icmp ${K8S_NODE}"
+-          iptables -X CHECK_ICMP_SOURCE || true
+-          iptables -N CHECK_ICMP_SOURCE || true
+-          iptables -F CHECK_ICMP_SOURCE
+-          iptables -D INPUT -p icmp --icmp-type fragmentation-needed -j CHECK_ICMP_SOURCE || true
+-          iptables -I INPUT -p icmp --icmp-type fragmentation-needed -j CHECK_ICMP_SOURCE
+-          iptables -N ICMP_ACTION || true
+-          iptables -F ICMP_ACTION
+-          iptables -A ICMP_ACTION -j LOG
+-          iptables -A ICMP_ACTION -j DROP
++          # Clean up old iptables ICMP rules from before the nftables migration.
++          # This cleanup code can be removed once all nodes have been upgraded.
++          iptables -D INPUT -p icmp --icmp-type fragmentation-needed -j CHECK_ICMP_SOURCE 2>/dev/null || true
++          iptables -F CHECK_ICMP_SOURCE 2>/dev/null || true
++          iptables -X CHECK_ICMP_SOURCE 2>/dev/null || true
++          iptables -F ICMP_ACTION 2>/dev/null || true
++          iptables -X ICMP_ACTION 2>/dev/null || true
++          nft 'add table ip azure_icmp { comment "Azure ICMP drop filtering" ; }'
++          nft flush table ip azure_icmp
++          nft 'add set ip azure_icmp icmp_sources { type ipv4_addr; }'
++          nft 'add chain ip azure_icmp input { type filter hook input priority 0; policy accept; }'
++          nft add rule ip azure_icmp input icmp type destination-unreachable icmp code frag-needed ip saddr @icmp_sources counter log drop
+           #
+           ip addr show
+           ip route show
+-          iptables -nvL
+-          iptables -nvL -t nat
+-          oc observe pods -n openshift-ovn-kubernetes --listen-addr='' -l app=ovnkube-node -a '{ .status.hostIP }' -- /var/run/ovn/add_iptables.sh
+-          #systemd-run -qPG -- oc observe pods -n openshift-ovn-kubernetes --listen-addr='' -l app=ovnkube-node -a '{ .status.hostIP }' -- /var/run/ovn/add_iptables.sh
++          nft list table ip azure_icmp
++          oc observe pods -n openshift-ovn-kubernetes --listen-addr='' -l app=ovnkube-node -a '{ .status.hostIP }' -- /var/run/ovn/add_nft_icmp.sh
+         lifecycle:
+           preStop:
+             exec:
+@@ -650,11 +641,6 @@ spec:
+         - mountPath: /etc/ovn/
+           name: etc-openvswitch
+ {{ end }}
+-        # for the iptables wrapper
+-        - mountPath: /host
+-          name: host-slash
+-          readOnly: true
+-          mountPropagation: HostToContainer
+         - mountPath: /run/ovn/
+           name: run-ovn
+         resources:
+@@ -679,10 +665,6 @@ spec:
+       - name: systemd-units
+         hostPath:
+           path: /etc/systemd/system
+-      # used for iptables wrapper scripts
+-      - name: host-slash
+-        hostPath:
+-          path: /
+       - name: host-run-netns
+         hostPath:
+           path: /run/netns
+diff --git a/pkg/util/k8s/kubeproxy.go b/pkg/util/k8s/kubeproxy.go
+index 3099a9a7b1..582a91b67c 100644
+--- a/pkg/util/k8s/kubeproxy.go
++++ b/pkg/util/k8s/kubeproxy.go
+@@ -63,6 +63,11 @@ func GenerateKubeProxyConfiguration(args map[string]operv1.ProxyArgumentList) (s
+ 	kpc.IPTables.SyncPeriod.Duration = ka.getDuration("iptables-sync-period")
+ 	kpc.IPTables.MinSyncPeriod.Duration = ka.getDuration("iptables-min-sync-period")
+ 
++	kpc.NFTables.MasqueradeBit = ka.getOptInt32("nftables-masquerade-bit")
++	kpc.NFTables.MasqueradeAll = ka.getBool("nftables-masquerade-all")
++	kpc.NFTables.SyncPeriod.Duration = ka.getDuration("nftables-sync-period")
++	kpc.NFTables.MinSyncPeriod.Duration = ka.getDuration("nftables-min-sync-period")
++
+ 	kpc.IPVS.SyncPeriod.Duration = ka.getDuration("ipvs-sync-period")
+ 	kpc.IPVS.MinSyncPeriod.Duration = ka.getDuration("ipvs-min-sync-period")
+ 	kpc.IPVS.Scheduler = ka.getString("ipvs-scheduler")
+@@ -84,10 +89,16 @@ func GenerateKubeProxyConfiguration(args map[string]operv1.ProxyArgumentList) (s
+ 	if duration := ka.getDuration("conntrack-tcp-timeout-close-wait"); duration != 0 {
+ 		kpc.Conntrack.TCPCloseWaitTimeout = &metav1.Duration{Duration: duration}
+ 	}
++	kpc.Conntrack.TCPBeLiberal = ka.getBool("conntrack-tcp-be-liberal")
+ 
+ 	kpc.ConfigSyncPeriod.Duration = ka.getDuration("config-sync-period")
+ 
+-	kpc.NodePortAddresses = ka.getCIDRList("node-port-addresses")
++	kpc.NodePortAddresses = ka.getStringList("nodeport-addresses")
++	if kpc.NodePortAddresses == nil {
++		kpc.NodePortAddresses = ka.getStringList("node-port-addresses")
++	} else {
++		ka.getStringList("node-port-addresses")
++	}
+ 
+ 	// kpc.Winkernel : CNO's kube-proxy config is never used for Windows kube-proxy so
+ 	// there's no need to allow overriding this.
+@@ -217,6 +228,15 @@ func (ka *kpcArgs) getCIDRList(key string) []string {
+ 	return values
+ }
+ 
++// getStringList parses a comma-separated list and returns an array of strings
++func (ka *kpcArgs) getStringList(key string) []string {
++	value := ka.get(key)
++	if value == "" {
++		return nil
++	}
++	return strings.Split(value, ",")
++}
++
+ // getOptInt32 returns an optional int32
+ func (ka *kpcArgs) getOptInt32(key string) *int32 {
+ 	value := ka.get(key)
+diff --git a/pkg/util/k8s/kubeproxy_test.go b/pkg/util/k8s/kubeproxy_test.go
+index f1a8f30e85..2b2a1371f7 100644
+--- a/pkg/util/k8s/kubeproxy_test.go
++++ b/pkg/util/k8s/kubeproxy_test.go
+@@ -396,6 +396,85 @@ nodePortAddresses: null
+ oomScoreAdj: null
+ portRange: 1000+10
+ showHiddenMetricsForVersion: ""
++winkernel:
++  enableDSR: false
++  forwardHealthCheckVip: false
++  networkName: ""
++  rootHnsEndpointName: ""
++  sourceVip: ""
++`,
++		},
++		{
++			description: "nftables overrides",
++			overrides: map[string]operv1.ProxyArgumentList{
++				"proxy-mode":               {"nftables"},
++				"nftables-masquerade-bit":  {"14"},
++				"nftables-masquerade-all":  {"true"},
++				"nftables-sync-period":     {"30s"},
++				"nftables-min-sync-period": {"10s"},
++			},
++			output: `
++apiVersion: kubeproxy.config.k8s.io/v1alpha1
++bindAddress: 0.0.0.0
++bindAddressHardFail: false
++clientConnection:
++  acceptContentTypes: ""
++  burst: 0
++  contentType: ""
++  kubeconfig: ""
++  qps: 0
++clusterCIDR: ""
++configSyncPeriod: 0s
++conntrack:
++  maxPerCore: null
++  min: null
++  tcpBeLiberal: false
++  tcpCloseWaitTimeout: null
++  tcpEstablishedTimeout: null
++  udpStreamTimeout: 0s
++  udpTimeout: 0s
++detectLocal:
++  bridgeInterface: ""
++  interfaceNamePrefix: ""
++detectLocalMode: ""
++enableProfiling: false
++healthzBindAddress: ""
++hostnameOverride: ""
++iptables:
++  localhostNodePorts: null
++  masqueradeAll: false
++  masqueradeBit: 0
++  minSyncPeriod: 0s
++  syncPeriod: 0s
++ipvs:
++  excludeCIDRs: null
++  minSyncPeriod: 0s
++  scheduler: ""
++  strictARP: false
++  syncPeriod: 0s
++  tcpFinTimeout: 0s
++  tcpTimeout: 0s
++  udpTimeout: 0s
++kind: KubeProxyConfiguration
++logging:
++  flushFrequency: 0
++  options:
++    json:
++      infoBufferSize: "0"
++    text:
++      infoBufferSize: "0"
++  verbosity: 0
++metricsBindAddress: 0.0.0.0:9102
++mode: nftables
++nftables:
++  masqueradeAll: true
++  masqueradeBit: 14
++  minSyncPeriod: 10s
++  syncPeriod: 30s
++nodePortAddresses: null
++oomScoreAdj: null
++portRange: ""
++showHiddenMetricsForVersion: ""
+ winkernel:
+   enableDSR: false
+   forwardHealthCheckVip: false

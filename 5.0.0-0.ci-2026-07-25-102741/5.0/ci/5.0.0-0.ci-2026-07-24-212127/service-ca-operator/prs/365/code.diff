@@ -1,0 +1,590 @@
+diff --git a/bindata/assets/controller-config.yaml b/bindata/assets/controller-config.yaml
+new file mode 100644
+index 000000000..fbd3fd9ac
+--- /dev/null
++++ b/bindata/assets/controller-config.yaml
+@@ -0,0 +1,9 @@
++apiVersion: v1
++kind: ConfigMap
++metadata:
++  namespace: openshift-service-ca
++  name: service-ca-controller-config
++data:
++  controller-config.yaml: |
++    apiVersion: operator.openshift.io/v1alpha1
++    kind: GenericOperatorConfig
+diff --git a/bindata/assets/deployment.yaml b/bindata/assets/deployment.yaml
+index 979e6093d..c409d42e2 100644
+--- a/bindata/assets/deployment.yaml
++++ b/bindata/assets/deployment.yaml
+@@ -29,6 +29,9 @@ spec:
+         image: ${IMAGE}
+         imagePullPolicy: IfNotPresent
+         command: ["service-ca-operator", "controller"]
++        args:
++        - --config=/var/run/configmaps/config/controller-config.yaml
++        - --terminate-on-files=/var/run/configmaps/config/controller-config.yaml
+         ports:
+         - containerPort: 8443
+         securityContext:
+@@ -45,6 +48,8 @@ spec:
+           name: signing-key
+         - mountPath: /var/run/configmaps/signing-cabundle
+           name: signing-cabundle
++        - mountPath: /var/run/configmaps/config
++          name: config
+       volumes:
+       - name: signing-key
+         secret:
+@@ -52,6 +57,9 @@ spec:
+       - name: signing-cabundle
+         configMap:
+           name: signing-cabundle
++      - name: config
++        configMap:
++          name: service-ca-controller-config
+       nodeSelector:
+         node-role.kubernetes.io/master: ""
+       priorityClassName: "system-cluster-critical"
+diff --git a/go.mod b/go.mod
+index b726913c0..8eb9adeec 100644
+--- a/go.mod
++++ b/go.mod
+@@ -24,6 +24,7 @@ require (
+ 	k8s.io/kube-aggregator v0.35.1
+ 	k8s.io/kubernetes v1.35.1
+ 	k8s.io/utils v0.0.0-20251002143259-bc988d571ff4
++	sigs.k8s.io/yaml v1.6.0
+ )
+ 
+ require (
+@@ -119,7 +120,6 @@ require (
+ 	sigs.k8s.io/kube-storage-version-migrator v0.0.6-0.20230721195810-5c8923c5ff96 // indirect
+ 	sigs.k8s.io/randfill v1.0.0 // indirect
+ 	sigs.k8s.io/structured-merge-diff/v6 v6.3.0 // indirect
+-	sigs.k8s.io/yaml v1.6.0 // indirect
+ )
+ 
+ replace (
+diff --git a/pkg/operator/configobservation/configobserver_controller.go b/pkg/operator/configobservation/configobserver_controller.go
+new file mode 100644
+index 000000000..93a16d3c7
+--- /dev/null
++++ b/pkg/operator/configobservation/configobserver_controller.go
+@@ -0,0 +1,65 @@
++package configobservation
++
++import (
++	"k8s.io/client-go/tools/cache"
++
++	configinformers "github.com/openshift/client-go/config/informers/externalversions"
++	configlistersv1 "github.com/openshift/client-go/config/listers/config/v1"
++	"github.com/openshift/library-go/pkg/controller/factory"
++	"github.com/openshift/library-go/pkg/operator/configobserver"
++	libgoapiserver "github.com/openshift/library-go/pkg/operator/configobserver/apiserver"
++	"github.com/openshift/library-go/pkg/operator/events"
++	"github.com/openshift/library-go/pkg/operator/resourcesynccontroller"
++	"github.com/openshift/library-go/pkg/operator/v1helpers"
++)
++
++// Listers combines the required listers for config observation
++type Listers struct {
++	apiServerLister configlistersv1.APIServerLister
++	resourceSyncer  resourcesynccontroller.ResourceSyncer
++	cacheSyncs      []cache.InformerSynced
++}
++
++// APIServerLister returns the APIServer lister
++func (l Listers) APIServerLister() configlistersv1.APIServerLister {
++	return l.apiServerLister
++}
++
++// ResourceSyncer returns the resource syncer
++func (l Listers) ResourceSyncer() resourcesynccontroller.ResourceSyncer {
++	return l.resourceSyncer
++}
++
++// PreRunHasSynced returns the cache sync functions
++func (l Listers) PreRunHasSynced() []cache.InformerSynced {
++	return l.cacheSyncs
++}
++
++// NewConfigObserverController creates a config observer controller for service-ca-operator
++func NewConfigObserverController(
++	operatorClient v1helpers.OperatorClient,
++	configInformer configinformers.SharedInformerFactory,
++	resourceSyncer resourcesynccontroller.ResourceSyncer,
++	eventRecorder events.Recorder,
++) factory.Controller {
++	informers := []factory.Informer{
++		operatorClient.Informer(),
++		configInformer.Config().V1().APIServers().Informer(),
++	}
++
++	return configobserver.NewConfigObserver(
++		"service-ca",
++		operatorClient,
++		eventRecorder,
++		Listers{
++			apiServerLister: configInformer.Config().V1().APIServers().Lister(),
++			resourceSyncer:  resourceSyncer,
++			cacheSyncs: []cache.InformerSynced{
++				operatorClient.Informer().HasSynced,
++				configInformer.Config().V1().APIServers().Informer().HasSynced,
++			},
++		},
++		informers,
++		libgoapiserver.ObserveTLSSecurityProfile,
++	)
++}
+diff --git a/pkg/operator/starter.go b/pkg/operator/starter.go
+index bdf13e268..af947c474 100644
+--- a/pkg/operator/starter.go
++++ b/pkg/operator/starter.go
+@@ -24,6 +24,7 @@ import (
+ 	"github.com/openshift/library-go/pkg/operator/status"
+ 	"github.com/openshift/library-go/pkg/operator/v1helpers"
+ 	"github.com/openshift/service-ca-operator/pkg/controller/api"
++	"github.com/openshift/service-ca-operator/pkg/operator/configobservation"
+ 	"github.com/openshift/service-ca-operator/pkg/operator/operatorclient"
+ )
+ 
+@@ -107,6 +108,13 @@ func RunOperator(ctx context.Context, controllerContext *controllercmd.Controlle
+ 		controllerContext.EventRecorder,
+ 	)
+ 
++	configObserver := configobservation.NewConfigObserverController(
++		operatorClient,
++		configInformers,
++		resourceSyncController,
++		controllerContext.EventRecorder,
++	)
++
+ 	klog.Infof("Fetching FeatureGates")
+ 	stopChan := ctx.Done()
+ 	featureGateAccessor := featuregates.NewFeatureGateAccess(
+@@ -189,6 +197,7 @@ func RunOperator(ctx context.Context, controllerContext *controllercmd.Controlle
+ 		operatorLogLevelController.Run,
+ 		clusterOperatorStatus.Run,
+ 		resourceSyncController.Run,
++		configObserver.Run,
+ 	} {
+ 		go controllerRunner(ctx, 1)
+ 	}
+diff --git a/pkg/operator/sync.go b/pkg/operator/sync.go
+index 99811f401..ca5bd15ac 100644
+--- a/pkg/operator/sync.go
++++ b/pkg/operator/sync.go
+@@ -33,8 +33,14 @@ func (c *serviceCAOperator) syncControllers(ctx context.Context, operatorConfig
+ 		return err
+ 	}
+ 
++	// Sync the controller config with TLS settings
++	configModified, err := c.manageControllerConfig(ctx, operatorConfig)
++	if err != nil {
++		return err
++	}
++
+ 	// Sync the controller.
+-	_, err = c.manageDeployment(ctx, operatorConfig, needsDeploy || caModified, shouldScheduleOnWorkers(infrastructure))
++	_, err = c.manageDeployment(ctx, operatorConfig, needsDeploy || caModified || configModified, shouldScheduleOnWorkers(infrastructure))
+ 	if err != nil {
+ 		return err
+ 	}
+diff --git a/pkg/operator/sync_common.go b/pkg/operator/sync_common.go
+index 3d8e52c85..53a63d19e 100644
+--- a/pkg/operator/sync_common.go
++++ b/pkg/operator/sync_common.go
+@@ -4,12 +4,16 @@ import (
+ 	"bytes"
+ 	"context"
+ 	"crypto/x509"
++	"encoding/json"
+ 	"fmt"
+ 	"os"
+ 	"sort"
+ 	"strings"
+ 	"time"
+ 
++	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
++	"sigs.k8s.io/yaml"
++
+ 	"github.com/openshift/library-go/pkg/pki"
+ 	"github.com/openshift/service-ca-operator/pkg/operator/metrics"
+ 
+@@ -230,6 +234,44 @@ func (c *serviceCAOperator) manageSignerCABundle(ctx context.Context, forceUpdat
+ 	return mod, err
+ }
+ 
++func (c *serviceCAOperator) manageControllerConfig(ctx context.Context, operatorConfig *operatorv1.ServiceCA) (bool, error) {
++	required := resourceread.ReadConfigMapV1OrDie(bindata.MustAsset("assets/controller-config.yaml"))
++
++	var observedConfig map[string]interface{}
++	if len(operatorConfig.Spec.ObservedConfig.Raw) > 0 {
++		if err := json.Unmarshal(operatorConfig.Spec.ObservedConfig.Raw, &observedConfig); err != nil {
++			return false, fmt.Errorf("failed to unmarshal observedConfig: %w", err)
++		}
++	}
++
++	config := map[string]interface{}{
++		"apiVersion": "operator.openshift.io/v1alpha1",
++		"kind":       "GenericOperatorConfig",
++	}
++
++	servingInfo := map[string]interface{}{}
++	if minTLSVersion, found, err := unstructured.NestedString(observedConfig, "servingInfo", "minTLSVersion"); err == nil && found && minTLSVersion != "" {
++		servingInfo["minTLSVersion"] = minTLSVersion
++	}
++	if cipherSuites, found, err := unstructured.NestedStringSlice(observedConfig, "servingInfo", "cipherSuites"); err == nil && found && len(cipherSuites) > 0 {
++		servingInfo["cipherSuites"] = cipherSuites
++	}
++
++	if len(servingInfo) > 0 {
++		config["servingInfo"] = servingInfo
++	}
++
++	configYAML, err := yaml.Marshal(config)
++	if err != nil {
++		return false, fmt.Errorf("failed to marshal controller config: %w", err)
++	}
++
++	required.Data["controller-config.yaml"] = string(configYAML)
++
++	_, mod, err := resourceapply.ApplyConfigMap(ctx, c.corev1Client, c.eventRecorder, required)
++	return mod, err
++}
++
+ func (c *serviceCAOperator) manageDeployment(ctx context.Context, options *operatorv1.ServiceCA, forceDeployment, runOnWorkers bool) (bool, error) {
+ 	required := resourceread.ReadDeploymentV1OrDie(bindata.MustAsset("assets/deployment.yaml"))
+ 	required.Spec.Template.Spec.Containers[0].Image = os.Getenv("CONTROLLER_IMAGE")
+diff --git a/vendor/github.com/openshift/library-go/pkg/operator/configobserver/apiserver/OWNERS b/vendor/github.com/openshift/library-go/pkg/operator/configobserver/apiserver/OWNERS
+new file mode 100644
+index 000000000..582d67101
+--- /dev/null
++++ b/vendor/github.com/openshift/library-go/pkg/operator/configobserver/apiserver/OWNERS
+@@ -0,0 +1,8 @@
++reviewers:
++  - tkashem
++  - p0lyn0mial
++  - sttts
++approvers:
++  - tkashem
++  - p0lyn0mial
++  - sttts
+diff --git a/vendor/github.com/openshift/library-go/pkg/operator/configobserver/apiserver/listers.go b/vendor/github.com/openshift/library-go/pkg/operator/configobserver/apiserver/listers.go
+new file mode 100644
+index 000000000..2c0d1bda3
+--- /dev/null
++++ b/vendor/github.com/openshift/library-go/pkg/operator/configobserver/apiserver/listers.go
+@@ -0,0 +1,9 @@
++package apiserver
++
++import (
++	configlistersv1 "github.com/openshift/client-go/config/listers/config/v1"
++)
++
++type APIServerLister interface {
++	APIServerLister() configlistersv1.APIServerLister
++}
+diff --git a/vendor/github.com/openshift/library-go/pkg/operator/configobserver/apiserver/observe_audit.go b/vendor/github.com/openshift/library-go/pkg/operator/configobserver/apiserver/observe_audit.go
+new file mode 100644
+index 000000000..39aa79cb6
+--- /dev/null
++++ b/vendor/github.com/openshift/library-go/pkg/operator/configobserver/apiserver/observe_audit.go
+@@ -0,0 +1,88 @@
++package apiserver
++
++import (
++	"fmt"
++
++	k8serrors "k8s.io/apimachinery/pkg/api/errors"
++	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
++	"k8s.io/klog/v2"
++
++	"github.com/openshift/library-go/pkg/operator/configobserver"
++	"github.com/openshift/library-go/pkg/operator/events"
++)
++
++// AuditPolicyPathGetterFunc allows the observer to be agnostic of the source of audit profile(s).
++// The function returns the path to the audit policy file (associated with the
++// given profile) in the static manifest folder.
++type AuditPolicyPathGetterFunc func(profile string) (string, error)
++
++// NewAuditObserver returns an ObserveConfigFunc that observes the audit field of the APIServer resource
++// and sets the apiServerArguments:audit-policy-file field for the apiserver appropriately.
++func NewAuditObserver(pathGetter AuditPolicyPathGetterFunc) configobserver.ObserveConfigFunc {
++	var (
++		apiServerArgumentsAuditPath = []string{"apiServerArguments", "audit-policy-file"}
++	)
++
++	return func(genericListers configobserver.Listers, recorder events.Recorder, existingConfig map[string]interface{}) (observed map[string]interface{}, _ []error) {
++		defer func() {
++			observed = configobserver.Pruned(observed, apiServerArgumentsAuditPath)
++		}()
++
++		errs := []error{}
++
++		// if the function encounters an error it returns existing/current config, which means that
++		// some other entity (default config in bindata ) must ensure to default the configuration.
++		// otherwise, the apiserver won't have a path to audit policy file and it will fail to start.
++		listers := genericListers.(APIServerLister)
++		apiServer, err := listers.APIServerLister().Get("cluster")
++		if err != nil {
++			if k8serrors.IsNotFound(err) {
++				klog.Warningf("apiserver.config.openshift.io/cluster: not found")
++
++				return existingConfig, errs
++			}
++
++			return existingConfig, append(errs, err)
++		}
++
++		desiredProfile := string(apiServer.Spec.Audit.Profile)
++		if len(desiredProfile) == 0 {
++			// The specified Profile is empty, so let the defaulting layer choose a default for us.
++			return map[string]interface{}{}, errs
++		}
++
++		desiredAuditPolicyPath, err := pathGetter(desiredProfile)
++		if err != nil {
++			return existingConfig, append(errs, fmt.Errorf("audit profile is not valid name=%s", desiredProfile))
++		}
++
++		currentAuditPolicyPath, err := getCurrentPolicyPath(existingConfig, apiServerArgumentsAuditPath...)
++		if err != nil {
++			return existingConfig, append(errs, fmt.Errorf("audit profile is not valid name=%s", desiredProfile))
++		}
++		if desiredAuditPolicyPath == currentAuditPolicyPath {
++			return existingConfig, errs
++		}
++
++		// we have a change of audit policy here!
++		observedConfig := map[string]interface{}{}
++		if err := unstructured.SetNestedStringSlice(observedConfig, []string{desiredAuditPolicyPath}, apiServerArgumentsAuditPath...); err != nil {
++			return existingConfig, append(errs, fmt.Errorf("failed to set desired audit profile in observed config name=%s", desiredProfile))
++		}
++
++		recorder.Eventf("ObserveAPIServerArgumentsAudit", "audit policy has been set to profile=%s", desiredProfile)
++		return observedConfig, errs
++	}
++}
++
++func getCurrentPolicyPath(existing map[string]interface{}, fields ...string) (string, error) {
++	current, _, err := unstructured.NestedStringSlice(existing, fields...)
++	if err != nil {
++		return "", err
++	}
++	if len(current) == 0 {
++		return "", nil
++	}
++
++	return current[0], nil
++}
+diff --git a/vendor/github.com/openshift/library-go/pkg/operator/configobserver/apiserver/observe_cors.go b/vendor/github.com/openshift/library-go/pkg/operator/configobserver/apiserver/observe_cors.go
+new file mode 100644
+index 000000000..f8868aa2a
+--- /dev/null
++++ b/vendor/github.com/openshift/library-go/pkg/operator/configobserver/apiserver/observe_cors.go
+@@ -0,0 +1,75 @@
++package apiserver
++
++import (
++	"k8s.io/klog/v2"
++
++	"github.com/openshift/library-go/pkg/operator/configobserver"
++	"github.com/openshift/library-go/pkg/operator/events"
++	"k8s.io/apimachinery/pkg/api/errors"
++	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
++	"k8s.io/apimachinery/pkg/util/sets"
++)
++
++var clusterDefaultCORSAllowedOrigins = []string{
++	`//127\.0\.0\.1(:|$)`,
++	`//localhost(:|$)`,
++}
++
++// ObserveAdditionalCORSAllowedOrigins observes the additionalCORSAllowedOrigins field
++// of the APIServer resource and sets the corsAllowedOrigins field of observedConfig
++func ObserveAdditionalCORSAllowedOrigins(genericListers configobserver.Listers, recorder events.Recorder, existingConfig map[string]interface{}) (map[string]interface{}, []error) {
++	return innerObserveAdditionalCORSAllowedOrigins(genericListers, recorder, existingConfig, []string{"corsAllowedOrigins"})
++}
++
++// ObserveAdditionalCORSAllowedOriginsToArguments observes the additionalCORSAllowedOrigins field
++// of the APIServer resource and sets the cors-allowed-origins field in observedConfig.apiServerArguments
++func ObserveAdditionalCORSAllowedOriginsToArguments(genericListers configobserver.Listers, recorder events.Recorder, existingConfig map[string]interface{}) (map[string]interface{}, []error) {
++	return innerObserveAdditionalCORSAllowedOrigins(genericListers, recorder, existingConfig, []string{"apiServerArguments", "cors-allowed-origins"})
++}
++
++func innerObserveAdditionalCORSAllowedOrigins(genericListers configobserver.Listers, recorder events.Recorder, existingConfig map[string]interface{}, corsAllowedOriginsPath []string) (ret map[string]interface{}, _ []error) {
++	defer func() {
++		ret = configobserver.Pruned(ret, corsAllowedOriginsPath)
++	}()
++
++	lister := genericListers.(APIServerLister)
++	errs := []error{}
++	defaultConfig := map[string]interface{}{}
++	if err := unstructured.SetNestedStringSlice(defaultConfig, clusterDefaultCORSAllowedOrigins, corsAllowedOriginsPath...); err != nil {
++		// this should not happen
++		return existingConfig, append(errs, err)
++	}
++
++	// grab the current CORS origins to later check whether they were updated
++	currentCORSAllowedOrigins, _, err := unstructured.NestedStringSlice(existingConfig, corsAllowedOriginsPath...)
++	if err != nil {
++		errs = append(errs, err)
++		// keep going on read error from existing config
++	}
++	currentCORSSet := sets.New(currentCORSAllowedOrigins...)
++	currentCORSSet.Insert(clusterDefaultCORSAllowedOrigins...)
++
++	observedConfig := map[string]interface{}{}
++	apiServer, err := lister.APIServerLister().Get("cluster")
++	if errors.IsNotFound(err) {
++		klog.Warningf("apiserver.config.openshift.io/cluster: not found")
++		return defaultConfig, errs
++	}
++	if err != nil {
++		// return existingConfig here in case err is just a transient error so
++		// that we don't rewrite the config that was observed previously
++		return existingConfig, append(errs, err)
++	}
++
++	newCORSSet := sets.New(clusterDefaultCORSAllowedOrigins...)
++	newCORSSet.Insert(apiServer.Spec.AdditionalCORSAllowedOrigins...)
++	if err := unstructured.SetNestedStringSlice(observedConfig, sets.List(newCORSSet), corsAllowedOriginsPath...); err != nil {
++		return existingConfig, append(errs, err)
++	}
++
++	if !currentCORSSet.Equal(newCORSSet) {
++		recorder.Eventf("ObserveAdditionalCORSAllowedOrigins", "corsAllowedOrigins changed to %q", sets.List(newCORSSet))
++	}
++
++	return observedConfig, errs
++}
+diff --git a/vendor/github.com/openshift/library-go/pkg/operator/configobserver/apiserver/observe_tlssecurityprofile.go b/vendor/github.com/openshift/library-go/pkg/operator/configobserver/apiserver/observe_tlssecurityprofile.go
+new file mode 100644
+index 000000000..3360126e3
+--- /dev/null
++++ b/vendor/github.com/openshift/library-go/pkg/operator/configobserver/apiserver/observe_tlssecurityprofile.go
+@@ -0,0 +1,109 @@
++package apiserver
++
++import (
++	"fmt"
++	"reflect"
++
++	"k8s.io/klog/v2"
++
++	configv1 "github.com/openshift/api/config/v1"
++	"github.com/openshift/library-go/pkg/crypto"
++	"github.com/openshift/library-go/pkg/operator/configobserver"
++	"github.com/openshift/library-go/pkg/operator/events"
++	"k8s.io/apimachinery/pkg/api/errors"
++	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
++)
++
++// ObserveTLSSecurityProfile observes APIServer.Spec.TLSSecurityProfile field and sets
++// the ServingInfo.MinTLSVersion, ServingInfo.CipherSuites fields of observed config
++func ObserveTLSSecurityProfile(genericListers configobserver.Listers, recorder events.Recorder, existingConfig map[string]interface{}) (map[string]interface{}, []error) {
++	return innerTLSSecurityProfileObservations(genericListers, recorder, existingConfig, []string{"servingInfo", "minTLSVersion"}, []string{"servingInfo", "cipherSuites"})
++}
++
++// ObserveTLSSecurityProfileWithPaths is like ObserveTLSSecurityProfile, but accepts
++// custom paths for ServingInfo.MinTLSVersion and ServingInfo.CipherSuites fields of observed config.
++func ObserveTLSSecurityProfileWithPaths(genericListers configobserver.Listers, recorder events.Recorder, existingConfig map[string]interface{}, minTLSVersionPath, cipherSuitesPath []string) (map[string]interface{}, []error) {
++	return innerTLSSecurityProfileObservations(genericListers, recorder, existingConfig, minTLSVersionPath, cipherSuitesPath)
++}
++
++// ObserveTLSSecurityProfileToArguments observes APIServer.Spec.TLSSecurityProfile field and sets
++// the tls-min-version and tls-cipher-suites fileds of observedConfig.apiServerArguments
++func ObserveTLSSecurityProfileToArguments(genericListers configobserver.Listers, recorder events.Recorder, existingConfig map[string]interface{}) (map[string]interface{}, []error) {
++	return innerTLSSecurityProfileObservations(genericListers, recorder, existingConfig, []string{"apiServerArguments", "tls-min-version"}, []string{"apiServerArguments", "tls-cipher-suites"})
++}
++
++func innerTLSSecurityProfileObservations(genericListers configobserver.Listers, recorder events.Recorder, existingConfig map[string]interface{}, minTLSVersionPath, cipherSuitesPath []string) (ret map[string]interface{}, _ []error) {
++	defer func() {
++		ret = configobserver.Pruned(ret, minTLSVersionPath, cipherSuitesPath)
++	}()
++
++	listers := genericListers.(APIServerLister)
++	errs := []error{}
++
++	currentMinTLSVersion, _, versionErr := unstructured.NestedString(existingConfig, minTLSVersionPath...)
++	if versionErr != nil {
++		errs = append(errs, fmt.Errorf("failed to retrieve spec.servingInfo.minTLSVersion: %v", versionErr))
++		// keep going on read error from existing config
++	}
++
++	currentCipherSuites, _, suitesErr := unstructured.NestedStringSlice(existingConfig, cipherSuitesPath...)
++	if suitesErr != nil {
++		errs = append(errs, fmt.Errorf("failed to retrieve spec.servingInfo.cipherSuites: %v", suitesErr))
++		// keep going on read error from existing config
++	}
++
++	apiServer, err := listers.APIServerLister().Get("cluster")
++	if errors.IsNotFound(err) {
++		klog.Warningf("apiserver.config.openshift.io/cluster: not found")
++		apiServer = &configv1.APIServer{}
++	} else if err != nil {
++		return existingConfig, append(errs, err)
++	}
++
++	observedConfig := map[string]interface{}{}
++	observedMinTLSVersion, observedCipherSuites := getSecurityProfileCiphers(apiServer.Spec.TLSSecurityProfile)
++	if err = unstructured.SetNestedField(observedConfig, observedMinTLSVersion, minTLSVersionPath...); err != nil {
++		return existingConfig, append(errs, err)
++	}
++	if err = unstructured.SetNestedStringSlice(observedConfig, observedCipherSuites, cipherSuitesPath...); err != nil {
++		return existingConfig, append(errs, err)
++	}
++
++	if observedMinTLSVersion != currentMinTLSVersion {
++		recorder.Eventf("ObserveTLSSecurityProfile", "minTLSVersion changed to %s", observedMinTLSVersion)
++	}
++	if !reflect.DeepEqual(observedCipherSuites, currentCipherSuites) {
++		recorder.Eventf("ObserveTLSSecurityProfile", "cipherSuites changed to %q", observedCipherSuites)
++	}
++
++	return observedConfig, errs
++}
++
++// Extracts the minimum TLS version and cipher suites from TLSSecurityProfile object,
++// Converts the ciphers to IANA names as supported by Kube ServingInfo config.
++// If profile is nil, returns config defined by the Intermediate TLS Profile
++func getSecurityProfileCiphers(profile *configv1.TLSSecurityProfile) (string, []string) {
++	var profileType configv1.TLSProfileType
++	if profile == nil {
++		profileType = crypto.DefaultTLSProfileType
++	} else {
++		profileType = profile.Type
++	}
++
++	var profileSpec *configv1.TLSProfileSpec
++	if profileType == configv1.TLSProfileCustomType {
++		if profile.Custom != nil {
++			profileSpec = &profile.Custom.TLSProfileSpec
++		}
++	} else {
++		profileSpec = configv1.TLSProfiles[profileType]
++	}
++
++	// nothing found / custom type set but no actual custom spec
++	if profileSpec == nil {
++		profileSpec = configv1.TLSProfiles[crypto.DefaultTLSProfileType]
++	}
++
++	// need to remap all Ciphers to their respective IANA names used by Go
++	return string(profileSpec.MinTLSVersion), crypto.OpenSSLToIANACipherSuites(profileSpec.Ciphers)
++}
+diff --git a/vendor/modules.txt b/vendor/modules.txt
+index 46de2730c..b62347a74 100644
+--- a/vendor/modules.txt
++++ b/vendor/modules.txt
+@@ -358,6 +358,7 @@ github.com/openshift/library-go/pkg/network
+ github.com/openshift/library-go/pkg/operator/certrotation
+ github.com/openshift/library-go/pkg/operator/condition
+ github.com/openshift/library-go/pkg/operator/configobserver
++github.com/openshift/library-go/pkg/operator/configobserver/apiserver
+ github.com/openshift/library-go/pkg/operator/configobserver/featuregates
+ github.com/openshift/library-go/pkg/operator/events
+ github.com/openshift/library-go/pkg/operator/loglevel

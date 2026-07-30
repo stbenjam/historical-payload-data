@@ -1,0 +1,478 @@
+diff --git a/pkg/controller/common/helpers.go b/pkg/controller/common/helpers.go
+index 0d6cc5d271..a0fe7b1bce 100644
+--- a/pkg/controller/common/helpers.go
++++ b/pkg/controller/common/helpers.go
+@@ -565,7 +565,7 @@ func SupportedExtensions() map[string][]string {
+ 	// Each extension keeps a list of packages required to get enabled on host.
+ 	return map[string][]string{
+ 		"two-node-ha":          {"pacemaker", "pcs", "fence-agents-all"},
+-		"ipsec":                {"NetworkManager-libreswan", "libreswan"},
++		"ipsec":                {"NetworkManager-libreswan", "libreswan", "openvswitch3.5-ipsec"},
+ 		"usbguard":             {"usbguard"},
+ 		"kerberos":             {"krb5-workstation", "libkadm5"},
+ 		"kernel-devel":         {"kernel-devel", "kernel-headers"},
+@@ -574,6 +574,39 @@ func SupportedExtensions() map[string][]string {
+ 	}
+ }
+ 
++// LegacyExtensionPackages tracks the legacy package list for extensions
++// that have changed.
++func LegacyExtensionPackages() map[string][]string {
++	return map[string][]string{
++		// ipsec extension only have libreswan packages in <= 4.x releases.
++		"ipsec": {"NetworkManager-libreswan", "libreswan"},
++	}
++}
++
++// GetAllValidPackageSetsForExtension returns all valid package sets for an extension,
++// including both current and legacy package lists. This is used during verification
++// to handle upgrade scenarios gracefully.
++// During an upgrade the new MCD code may run before the OS image update. This function
++// ensures that verification accepts either the old package set (from the current OS
++// image) OR the new package set (from the updated code).
++func GetAllValidPackageSetsForExtension(extension string) [][]string {
++	var validSets [][]string
++
++	// Add current package set
++	currentExtensions := SupportedExtensions()
++	if packages, exists := currentExtensions[extension]; exists {
++		validSets = append(validSets, packages)
++	}
++
++	// Add legacy package set (if exists)
++	legacyExtensions := LegacyExtensionPackages()
++	if packages, exists := legacyExtensions[extension]; exists {
++		validSets = append(validSets, packages)
++	}
++
++	return validSets
++}
++
+ // IgnParseWrapper parses rawIgn for both V2 and V3 ignition configs and returns
+ // a V2 or V3 Config or an error. This wrapper is necessary since V2 and V3 use different parsers.
+ func IgnParseWrapper(rawIgn []byte) (interface{}, error) {
+diff --git a/pkg/controller/common/helpers_test.go b/pkg/controller/common/helpers_test.go
+index 2305b1c5fa..0cab9a8565 100644
+--- a/pkg/controller/common/helpers_test.go
++++ b/pkg/controller/common/helpers_test.go
+@@ -979,7 +979,7 @@ func TestGetPackagesForSupportedExtensions(t *testing.T) {
+ 		{
+ 			name:             "Supported multiple multi-package extensions",
+ 			extensions:       []string{"ipsec", "kerberos"},
+-			expectedPackages: []string{"NetworkManager-libreswan", "libreswan", "krb5-workstation", "libkadm5"},
++			expectedPackages: []string{"NetworkManager-libreswan", "libreswan", "openvswitch3.5-ipsec", "krb5-workstation", "libkadm5"},
+ 		},
+ 	}
+ 
+@@ -2002,3 +2002,73 @@ func TestDetectRuncInMachineConfig(t *testing.T) {
+ 		})
+ 	}
+ }
++
++func TestGetAllValidPackageSetsForExtension(t *testing.T) {
++	tests := []struct {
++		name                 string
++		extension            string
++		expectedSetCount     int
++		shouldContainCurrent bool
++		shouldContainLegacy  bool
++	}{
++		{
++			name:                 "ipsec extension should have both current and legacy sets",
++			extension:            "ipsec",
++			expectedSetCount:     2, // current + 1 legacy
++			shouldContainCurrent: true,
++			shouldContainLegacy:  true,
++		},
++		{
++			name:                 "usbguard extension should only have current set",
++			extension:            "usbguard",
++			expectedSetCount:     1, // only current, no legacy
++			shouldContainCurrent: true,
++			shouldContainLegacy:  false,
++		},
++		{
++			name:                 "non-existent extension should return empty",
++			extension:            "non-existent",
++			expectedSetCount:     0,
++			shouldContainCurrent: false,
++			shouldContainLegacy:  false,
++		},
++	}
++
++	for _, tt := range tests {
++		t.Run(tt.name, func(t *testing.T) {
++			packageSets := GetAllValidPackageSetsForExtension(tt.extension)
++
++			require.Equal(t, tt.expectedSetCount, len(packageSets),
++				"Expected %d package sets for extension %q", tt.expectedSetCount, tt.extension)
++
++			if tt.shouldContainCurrent {
++				// Verify current package set is included
++				currentPackages := SupportedExtensions()[tt.extension]
++				found := false
++				for _, pkgSet := range packageSets {
++					if reflect.DeepEqual(pkgSet, currentPackages) {
++						found = true
++						break
++					}
++				}
++				require.True(t, found, "Current package set should be included for extension %q", tt.extension)
++			}
++
++			if tt.shouldContainLegacy {
++				// Verify historical set is included
++				history := LegacyExtensionPackages()
++				if historicalSet, exists := history[tt.extension]; exists {
++					found := false
++					for _, pkgSet := range packageSets {
++						if reflect.DeepEqual(pkgSet, historicalSet) {
++							found = true
++							break
++						}
++					}
++					require.True(t, found, "Legacy package set should be included for extension %q", tt.extension)
++				}
++			}
++		})
++	}
++}
++
+diff --git a/pkg/daemon/update.go b/pkg/daemon/update.go
+index 8169c43149..8f107bbec8 100644
+--- a/pkg/daemon/update.go
++++ b/pkg/daemon/update.go
+@@ -1907,6 +1907,43 @@ func (dn *CoreOSDaemon) verifyExtensionsStaged(config *mcfgv1.MachineConfig) err
+ 	return nil
+ }
+ 
++// execRpmQuery is a package-level variable for RPM package query that can be mocked in tests.
++// Returns true if package is installed, false if not installed, or error for query failures.
++var execRpmQuery = func(pkg string) (bool, error) {
++	out, err := exec.Command("rpm", "-q", pkg).CombinedOutput()
++	if err == nil {
++		return true, nil
++	}
++
++	// Check if this is exit code 1 (package not installed) vs other errors
++	var exitErr *exec.ExitError
++	if errors.As(err, &exitErr) && exitErr.ExitCode() == 1 {
++		return false, nil
++	}
++
++	// Other errors (execution failure, permission issues, etc.)
++	return false, fmt.Errorf("failed to query RPM database for package %q: %v: %s", pkg, err, strings.TrimSpace(string(out)))
++}
++
++// AreAllPackagesInstalled checks if all packages in a list are installed in the RPM database.
++// Returns true if all are installed, false if any are missing, or an error for query failures.
++// This function is exported to allow testing with mocked RPM queries.
++func AreAllPackagesInstalled(packages []string) (bool, []string, error) {
++	var missingPackages []string
++
++	for _, pkg := range packages {
++		installed, err := execRpmQuery(pkg)
++		if err != nil {
++			return false, nil, err
++		}
++		if !installed {
++			missingPackages = append(missingPackages, pkg)
++		}
++	}
++
++	return len(missingPackages) == 0, missingPackages, nil
++}
++
+ // verifyExtensionPackages verifies that all extension packages specified in a
+ // MachineConfig are actually installed in the RPM database after a node reboot.
+ // See: https://redhat.atlassian.net/browse/OCPBUGS-65645
+@@ -1923,39 +1960,43 @@ func (dn *CoreOSDaemon) verifyExtensionPackages(config *mcfgv1.MachineConfig) er
+ 		return nil
+ 	}
+ 
+-	// Map extensions to actual package names using the existing helper
+-	expectedPackages, err := ctrlcommon.GetPackagesForSupportedExtensions(extensions)
+-	if err != nil {
+-		return fmt.Errorf("failed to get packages for extensions: %w", err)
+-	}
+-
+-	klog.Infof("Verifying %d extension packages are installed for config %s", len(expectedPackages), config.GetName())
++	klog.Infof("Verifying extension packages are installed for config %s", config.GetName())
+ 
+-	// Verify each package is in the RPM database
+-	var missingPackages []string
+-	var exitErr *exec.ExitError
+-	for _, pkg := range expectedPackages {
+-		// Query RPM database directly for installed packages
+-		out, err := exec.Command("rpm", "-q", pkg).CombinedOutput()
+-		if err == nil {
+-			continue
+-		}
+-		// Check if this is exit code 1 (package not installed) vs other errors
+-		if errors.As(err, &exitErr) && exitErr.ExitCode() == 1 {
+-			missingPackages = append(missingPackages, pkg)
+-			klog.Warningf("Extension package %s not found in RPM database", pkg)
+-			continue
++	// Verify each extension individually, accepting any valid package set
++	for _, ext := range extensions {
++		// Get all valid package sets for this extension (current + legacy)
++		validPackageSets := ctrlcommon.GetAllValidPackageSetsForExtension(ext)
++		if len(validPackageSets) == 0 {
++			return fmt.Errorf("extension %q has no valid package sets defined", ext)
+ 		}
+ 
+-		// Other errors (execution failure, permission issues, etc.) should fail immediately
+-		return fmt.Errorf("failed to query RPM database for package %q: %v: %s", pkg, err, strings.TrimSpace(string(out)))
+-	}
++		// Try to match against any valid package set
++		var areValidPackagesInstalled bool
++		var allMissingPackages [][]string
+ 
+-	if len(missingPackages) > 0 {
+-		return fmt.Errorf("the following extension packages are missing from the RPM database: %v", missingPackages)
++		for _, packageSet := range validPackageSets {
++			allInstalled, missingPkgs, err := AreAllPackagesInstalled(packageSet)
++			if err != nil {
++				return err
++			}
++
++			if allInstalled {
++				areValidPackagesInstalled = true
++				klog.Infof("Extension %q verified with package set: %v", ext, packageSet)
++				break
++			}
++
++			allMissingPackages = append(allMissingPackages, missingPkgs)
++		}
++
++		// If no package set matched, the extension verification failed
++		if !areValidPackagesInstalled {
++			return fmt.Errorf("extension %q verification failed: no valid package set is fully installed. Tried %d package set(s), missing packages per set: %v",
++				ext, len(validPackageSets), allMissingPackages)
++		}
+ 	}
+ 
+-	klog.Infof("Successfully verified all %d extension packages are installed", len(expectedPackages))
++	klog.Infof("Successfully verified all extension packages are installed")
+ 	return nil
+ }
+ 
+diff --git a/pkg/daemon/update_test.go b/pkg/daemon/update_test.go
+index 84d1e8ef14..0490e438d5 100644
+--- a/pkg/daemon/update_test.go
++++ b/pkg/daemon/update_test.go
+@@ -858,7 +858,7 @@ func TestGenerateExtensionsArgs(t *testing.T) {
+ 			name:         "no extensions installed, install multiple extensions",
+ 			installedSet: sets.New[string](),
+ 			extensions:   []string{"sysstat", "ipsec"},
+-			expected:     []string{constants.RPMOSTreeInstallArg, "NetworkManager-libreswan", constants.RPMOSTreeInstallArg, "sysstat", constants.RPMOSTreeInstallArg, "libreswan"},
++			expected:     []string{constants.RPMOSTreeInstallArg, "NetworkManager-libreswan", constants.RPMOSTreeInstallArg, "sysstat", constants.RPMOSTreeInstallArg, "libreswan", constants.RPMOSTreeInstallArg, "openvswitch3.5-ipsec"},
+ 		},
+ 		{
+ 			name:         "sysstat already installed, require sysstat",
+@@ -874,15 +874,15 @@ func TestGenerateExtensionsArgs(t *testing.T) {
+ 		},
+ 		{
+ 			name:         "sysstat and ipsec installed, only sysstat required",
+-			installedSet: sets.New("sysstat", "NetworkManager-libreswan", "libreswan"),
++			installedSet: sets.New("sysstat", "NetworkManager-libreswan", "libreswan", "openvswitch3.5-ipsec"),
+ 			extensions:   []string{"sysstat"},
+-			expected:     []string{constants.RPMOSTreeUninstallArg, "NetworkManager-libreswan", constants.RPMOSTreeUninstallArg, "libreswan"},
++			expected:     []string{constants.RPMOSTreeUninstallArg, "NetworkManager-libreswan", constants.RPMOSTreeUninstallArg, "libreswan", constants.RPMOSTreeUninstallArg, "openvswitch3.5-ipsec"},
+ 		},
+ 		{
+ 			name:         "some packages installed, switch to different extension",
+ 			installedSet: sets.New("sysstat"),
+ 			extensions:   []string{"ipsec"},
+-			expected:     []string{constants.RPMOSTreeInstallArg, "NetworkManager-libreswan", constants.RPMOSTreeInstallArg, "libreswan", constants.RPMOSTreeUninstallArg, "sysstat"},
++			expected:     []string{constants.RPMOSTreeInstallArg, "NetworkManager-libreswan", constants.RPMOSTreeInstallArg, "libreswan", constants.RPMOSTreeInstallArg, "openvswitch3.5-ipsec", constants.RPMOSTreeUninstallArg, "sysstat"},
+ 		},
+ 		{
+ 			name:         "complex scenario with two-node-ha",
+@@ -900,7 +900,7 @@ func TestGenerateExtensionsArgs(t *testing.T) {
+ 			name:         "all supported extensions",
+ 			installedSet: sets.New[string](),
+ 			extensions:   []string{"two-node-ha", "ipsec", "usbguard", "kerberos", "kernel-devel", "sandboxed-containers", "sysstat"},
+-			expected:     []string{constants.RPMOSTreeInstallArg, "NetworkManager-libreswan", constants.RPMOSTreeInstallArg, "fence-agents-all", constants.RPMOSTreeInstallArg, "kata-containers", constants.RPMOSTreeInstallArg, "kernel-devel", constants.RPMOSTreeInstallArg, "kernel-headers", constants.RPMOSTreeInstallArg, "krb5-workstation", constants.RPMOSTreeInstallArg, "libkadm5", constants.RPMOSTreeInstallArg, "libreswan", constants.RPMOSTreeInstallArg, "pacemaker", constants.RPMOSTreeInstallArg, "pcs", constants.RPMOSTreeInstallArg, "sysstat", constants.RPMOSTreeInstallArg, "usbguard"},
++			expected:     []string{constants.RPMOSTreeInstallArg, "NetworkManager-libreswan", constants.RPMOSTreeInstallArg, "fence-agents-all", constants.RPMOSTreeInstallArg, "kata-containers", constants.RPMOSTreeInstallArg, "kernel-devel", constants.RPMOSTreeInstallArg, "kernel-headers", constants.RPMOSTreeInstallArg, "krb5-workstation", constants.RPMOSTreeInstallArg, "libkadm5", constants.RPMOSTreeInstallArg, "libreswan", constants.RPMOSTreeInstallArg, "openvswitch3.5-ipsec", constants.RPMOSTreeInstallArg, "pacemaker", constants.RPMOSTreeInstallArg, "pcs", constants.RPMOSTreeInstallArg, "sysstat", constants.RPMOSTreeInstallArg, "usbguard"},
+ 		},
+ 	}
+ 
+@@ -974,3 +974,74 @@ func TestPodmanCopy_CreateContainerCall(t *testing.T) {
+ 	// We're only testing that the CreatePodmanContainer interface is called correctly
+ 	assert.Error(t, err, "Expected error from podmanRemove since we're not mocking that part")
+ }
++
++func TestLegacyExtensionPackageUpgradeScenario(t *testing.T) {
++	// This test validates the upgrade scenario from 4.x to 5.0 where the new MCD
++	// code runs before the OS image update. It mocks the RPM query to simulate
++	// package installation state and verifies that AreAllPackagesInstalled correctly
++	// matches against both current and legacy package sets.
++
++	// Save and restore the original execRpmQuery
++	originalExecRpmQuery := execRpmQuery
++	defer func() { execRpmQuery = originalExecRpmQuery }()
++
++	extension := "ipsec"
++
++	// Get all valid package sets (current + legacy)
++	validSets := ctrlcommon.GetAllValidPackageSetsForExtension(extension)
++	require.Greater(t, len(validSets), 0, "Should have at least one valid package set")
++
++	// Test Scenario 1: Old system (4.x) with only libreswan packages
++	installedPkgs := map[string]bool{
++		"NetworkManager-libreswan": true,
++		"libreswan":                true,
++		// openvswitch3.5-ipsec is NOT installed yet
++	}
++
++	// Mock the RPM query to return our simulated installation state
++	execRpmQuery = func(pkg string) (bool, error) {
++		installed, exists := installedPkgs[pkg]
++		return exists && installed, nil
++	}
++
++	// Try to verify packages using AreAllPackagesInstalled
++	foundMatch := false
++	for _, pkgSet := range validSets {
++		allInstalled, missingPkgs, err := AreAllPackagesInstalled(pkgSet)
++		require.NoError(t, err, "RPM query should not error")
++
++		if allInstalled {
++			foundMatch = true
++			t.Logf("Found matching package set during upgrade (4.x state): %v", pkgSet)
++			require.ElementsMatch(t, []string{"NetworkManager-libreswan", "libreswan"}, pkgSet,
++				"Should match the legacy package set without openvswitch-ipsec")
++			break
++		} else {
++			t.Logf("Package set %v not fully installed, missing: %v", pkgSet, missingPkgs)
++		}
++	}
++
++	require.True(t, foundMatch, "Should find a valid package set matching the old OS image state (legacy packages)")
++
++	// Test Scenario 2: New system (5.0) with all packages installed
++	installedPkgs["openvswitch3.5-ipsec"] = true
++
++	// Try to verify packages again with the updated installation state
++	foundNewMatch := false
++	for _, pkgSet := range validSets {
++		allInstalled, missingPkgs, err := AreAllPackagesInstalled(pkgSet)
++		require.NoError(t, err, "RPM query should not error")
++
++		if allInstalled {
++			foundNewMatch = true
++			t.Logf("Found matching package set after upgrade (5.0 state): %v", pkgSet)
++			require.ElementsMatch(t, []string{"NetworkManager-libreswan", "libreswan", "openvswitch3.5-ipsec"}, pkgSet,
++				"Should match the current package set with openvswitch-ipsec")
++			break
++		} else {
++			t.Logf("Package set %v not fully installed, missing: %v", pkgSet, missingPkgs)
++		}
++	}
++
++	require.True(t, foundNewMatch, "Should find a valid package set matching the new OS image state (current packages)")
++}
+diff --git a/templates/common/_base/files/wait-for-ipsec-connect.yaml b/templates/common/_base/files/wait-for-ipsec-connect.yaml
+index 48bb813cf9..8754d9641f 100644
+--- a/templates/common/_base/files/wait-for-ipsec-connect.yaml
++++ b/templates/common/_base/files/wait-for-ipsec-connect.yaml
+@@ -4,33 +4,62 @@ contents:
+   inline: |
+     #!/bin/bash
+     set -x
++    set -o pipefail
+ 
+     if [ ! -e "/etc/ipsec.d/openshift.conf" ]; then
+       exit 0
+     fi
+ 
+-    # Modify existing IPsec out connection entries with "auto=start"
+-    # option and restart ipsec systemd service. This helps to
+-    # establish IKE SAs for the existing IPsec connections with
+-    # peer nodes. This option will be deleted from connections
+-    # once ovs-monitor-ipsec process spinned up on the node by
+-    # ovn-ipsec-host pod, but still it won't reestablish IKE SAs
+-    # again with peer nodes, so it shouldn't be a problem.
+-    # We are updating only out connections with "auto=start" to
+-    # avoid cross stream issue with Libreswan 5.2.
+-    # The in connections use default auto=route parameter.
+-    if ! grep -q "auto=start" /etc/ipsec.d/openshift.conf; then
+-      sed -i '/^.*conn ovn.*-out-1$/a\    auto=start' /etc/ipsec.d/openshift.conf
++    # If "openshift.conf" is referenced in /etc/sysconfig/openvswitch,
++    # the ovn-ipsec-host pod has already configured the openvswitch-ipsec
++    # systemd service for establishing OVN IPsec connections.
++    # However, the machine-config-daemon pod may reset this service to
++    # a disabled state, causing it not to start after a node reboot.
++    # To handle this scenario, enable and start the service here as well.
++    ovsipsecsvc="openvswitch-ipsec.service"
++    if grep -q "openshift.conf" /etc/sysconfig/openvswitch; then
++      if ! systemctl enable --now $ovsipsecsvc; then
++        echo "Failed to enable and start $ovsipsecsvc"
++        exit 1
++      fi
++    else
++      echo "$ovsipsecsvc is not configured, so make pluto to establish IKE SAs"
++
++      # Modify existing IPsec out connection entries with "auto=start"
++      # option and restart ipsec systemd service. This helps to
++      # establish IKE SAs for the existing IPsec connections with
++      # peer nodes. This option will be deleted from connections
++      # once ovs-monitor-ipsec process spinned up on the node by
++      # ovn-ipsec-host pod, but still it won't reestablish IKE SAs
++      # again with peer nodes, so it shouldn't be a problem.
++      # We are updating only out connections with "auto=start" to
++      # avoid cross stream issue with Libreswan 5.2.
++      # The in connections use default auto=route parameter.
++      if ! grep -q "auto=start" /etc/ipsec.d/openshift.conf; then
++        sed -i '/^.*conn ovn.*-out-1$/a\    auto=start' /etc/ipsec.d/openshift.conf
++      fi
++      chroot /proc/1/root ipsec restart
+     fi
+-    chroot /proc/1/root ipsec restart
+ 
+     # Wait for upto 60s to get IPsec SAs to establish with peer nodes.
++    # We derived total wait time 60s based on the testing from 6 and 32 nodes
++    # cluster. In 6 node cluster, it took mostly about 2s (in worst case 4s),
++    # In 32 node cluster, it took mostly about 2s or 4s (in worst case 14s)
++    # to get IPsec connections up with peer nodes.
++    # This is a best-effort attempt to bootstrap IPsec connections upfront to
++    # avoid disruptions, waiting longer would impact node reboot time.
+     timeout=60
+     elapsed=0
+     desiredconn=""
+     establishedsa=""
+     while [[ $elapsed -lt $timeout ]]; do
+-      desiredconn=$(grep -E '^\s*conn\s+' /etc/ipsec.d/openshift.conf | grep -v '%default' | awk '{print $2}' | tr ' ' '\n' | sort | tr '\n' ' ')
++      if ! desiredconn=$(ovs-vsctl --bare --columns=name find interface type=geneve options:remote_name!='""' \
++       | sort \
++       | awk 'NF {print $0"-in-1", $0"-out-1"}' \
++       | tr '\n' ' '); then
++        echo "failed to query OVS Geneve interfaces for desired IPsec connections"
++        exit 1
++      fi
+       establishedsa=$(ipsec showstates | grep ESTABLISHED_CHILD_SA | grep -o '"[^"]*"' | sed 's/"//g' | tr ' ' '\n' | sort | uniq | tr '\n' ' ')
+       if [ "$desiredconn" == "$establishedsa" ]; then
+         echo "IPsec SAs are established for desired connections after ${elapsed}s"
+@@ -44,4 +73,8 @@ contents:
+ 
+     if [[ $elapsed -ge $timeout ]]; then
+         echo "Timed out waiting, some connections are not established, desired conns $desiredconn, established conns $establishedsa"
++        # Not treating this as a hard failure since this is a best-effort wait,
++        # peer nodes may be down or still rebooting during fairly common parallel
++        # reboots.
++        exit 0
+     fi
+diff --git a/templates/common/_base/units/openvswitch-ipsec.service.yaml b/templates/common/_base/units/openvswitch-ipsec.service.yaml
+new file mode 100644
+index 0000000000..aa42d44cf4
+--- /dev/null
++++ b/templates/common/_base/units/openvswitch-ipsec.service.yaml
+@@ -0,0 +1,7 @@
++name: openvswitch-ipsec.service
++dropins:
++  - name: 01-after-pluto-start.conf
++    contents: |
++      [Unit]
++      After=ipsec.service
++      Before=crio.service

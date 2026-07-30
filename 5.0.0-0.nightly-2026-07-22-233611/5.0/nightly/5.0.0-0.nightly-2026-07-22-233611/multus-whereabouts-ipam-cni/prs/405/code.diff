@@ -1,0 +1,96 @@
+diff --git a/Dockerfile.openshift b/Dockerfile.openshift
+index 27f812df..3950ce69 100644
+--- a/Dockerfile.openshift
++++ b/Dockerfile.openshift
+@@ -3,39 +3,21 @@ ADD . /go/src/github.com/openshift/whereabouts
+ WORKDIR /go/src/github.com/openshift/whereabouts
+ ENV CGO_ENABLED=1
+ ENV GO111MODULE=on
+-RUN go build -mod vendor -o bin/whereabouts     cmd/whereabouts.go
+-RUN go build -mod vendor -o bin/ip-control-loop cmd/controlloop/controlloop.go
+-RUN go build -mod vendor -o bin/node-slice-controller cmd/nodeslicecontroller/node_slice_controller.go
+-WORKDIR /
+-
+-FROM registry.ci.openshift.org/ocp/builder:rhel-8-golang-1.24-openshift-4.20 AS rhel8
+-ADD . /go/src/github.com/openshift/whereabouts
+-WORKDIR /go/src/github.com/openshift/whereabouts
+-ENV CGO_ENABLED=1
+-ENV GO111MODULE=on
+-RUN go build -mod vendor -o bin/whereabouts     cmd/whereabouts.go
+-RUN go build -mod vendor -o bin/ip-control-loop cmd/controlloop/controlloop.go
+-RUN go build -mod vendor -o bin/node-slice-controller cmd/nodeslicecontroller/node_slice_controller.go
++RUN go build -mod vendor -ldflags '-s -w' -o bin/whereabouts     cmd/whereabouts.go
++RUN go build -mod vendor -ldflags '-s -w' -o bin/ip-control-loop cmd/controlloop/controlloop.go
++RUN go build -mod vendor -ldflags '-s -w' -o bin/node-slice-controller cmd/nodeslicecontroller/node_slice_controller.go
+ WORKDIR /
+ 
+ FROM registry.ci.openshift.org/ocp/4.20:base-rhel9
+ RUN mkdir -p /usr/src/whereabouts/images && \
+-       mkdir -p /usr/src/whereabouts/bin && \
+-       mkdir -p /usr/src/whereabouts/rhel9/bin && \
+-       mkdir -p /usr/src/whereabouts/rhel8/bin
+-COPY --from=rhel8 /go/src/github.com/openshift/whereabouts/entrypoint.sh       /usr/src/whereabouts/bin
+-COPY --from=rhel8 /go/src/github.com/openshift/whereabouts/bin/whereabouts     /usr/src/whereabouts/bin
+-COPY --from=rhel8 /go/src/github.com/openshift/whereabouts/bin/ip-control-loop /usr/src/whereabouts/bin
+-COPY --from=rhel8 /go/src/github.com/openshift/whereabouts/bin/node-slice-controller /usr/src/whereabouts/bin
+-COPY --from=rhel9 /go/src/github.com/openshift/whereabouts/bin/whereabouts     /usr/src/whereabouts/rhel9/bin
+-COPY --from=rhel9 /go/src/github.com/openshift/whereabouts/bin/ip-control-loop /usr/src/whereabouts/rhel9/bin
+-COPY --from=rhel9 /go/src/github.com/openshift/whereabouts/bin/node-slice-controller /usr/src/whereabouts/rhel9/bin
+-COPY --from=rhel8 /go/src/github.com/openshift/whereabouts/bin/whereabouts     /usr/src/whereabouts/rhel8/bin
+-COPY --from=rhel8 /go/src/github.com/openshift/whereabouts/bin/ip-control-loop /usr/src/whereabouts/rhel8/bin
+-COPY --from=rhel8 /go/src/github.com/openshift/whereabouts/bin/node-slice-controller /usr/src/whereabouts/rhel8/bin
++       mkdir -p /usr/src/whereabouts/bin
++COPY --from=rhel9 /go/src/github.com/openshift/whereabouts/entrypoint.sh       /usr/src/whereabouts/bin
++COPY --from=rhel9 /go/src/github.com/openshift/whereabouts/bin/whereabouts     /usr/src/whereabouts/bin
++COPY --from=rhel9 /go/src/github.com/openshift/whereabouts/bin/ip-control-loop /usr/src/whereabouts/bin
++COPY --from=rhel9 /go/src/github.com/openshift/whereabouts/bin/node-slice-controller /usr/src/whereabouts/bin
+ 
+ LABEL org.opencontainers.image.source https://github.com/openshift/whereabouts
+ LABEL io.k8s.display-name="Whereabouts CNI" \
+       io.k8s.description="This is a component of OpenShift Container Platform and provides a cluster-wide IPAM CNI plugin." \
+       io.openshift.tags="openshift" \
+-      maintainer="CTO Networking <nfvpe-container@redhat.com>"
+\ No newline at end of file
++      maintainer="CTO Networking <nfvpe-container@redhat.com>"
+diff --git a/entrypoint.sh b/entrypoint.sh
+index 3e181d13..4adb4a13 100755
+--- a/entrypoint.sh
++++ b/entrypoint.sh
+@@ -1,35 +1,6 @@
+ #!/bin/bash
+-# whereabout downstream entrypoint.sh to invoke corresponding
+-# ip-control-loop binary, based on RHEL version
++# whereabout downstream entrypoint.sh to invoke the ip-control-loop binary
+ 
+ set -e
+ 
+-function log()
+-{
+-	echo "$(date --iso-8601=seconds) [entrypoint.sh] ${1}"
+-}
+-
+-# Collect host OS information
+-. /etc/os-release
+-rhelmajor=
+-# detect which version we're using in order to copy the proper binaries
+-case "${ID}" in
+-	rhcos|scos)
+-		rhelmajor=$(echo ${RHEL_VERSION} | cut -f 1 -d .)
+-		;;
+-	rhel|centos)
+-		rhelmajor=$(echo "${VERSION_ID}" | cut -f 1 -d .)
+-		;;
+-	fedora)
+-		if [ "${VARIANT_ID}" == "coreos" ]; then
+-			rhelmajor=8
+-		else
+-			log "FATAL ERROR: Unsupported Fedora variant=${VARIANT_ID}"
+-			exit 1
+-		fi
+-		;;
+-	*) log "FATAL ERROR: Unsupported OS ID=${ID}"; exit 1
+-		;;
+-esac
+-
+-/usr/src/whereabouts/rhel${rhelmajor}/bin/ip-control-loop $@
++/usr/src/whereabouts/bin/ip-control-loop $@

@@ -1,0 +1,154 @@
+diff --git a/examples/machinecontrollerconfig.deploy.yaml b/examples/machinecontrollerconfig.deploy.yaml
+index bb2898650c..b4f7efc36c 100644
+--- a/examples/machinecontrollerconfig.deploy.yaml
++++ b/examples/machinecontrollerconfig.deploy.yaml
+@@ -32,3 +32,6 @@ spec:
+       - key: "node-role.kubernetes.io/master"
+         operator: "Exists"
+         effect: "NoSchedule"
++      - key: "node-role.kubernetes.io/control-plane"
++        operator: "Exists"
++        effect: "NoSchedule"
+diff --git a/install/0000_80_machine-config_04_deployment.yaml b/install/0000_80_machine-config_04_deployment.yaml
+index 7ff8c9d6a1..ee3d7bcf72 100644
+--- a/install/0000_80_machine-config_04_deployment.yaml
++++ b/install/0000_80_machine-config_04_deployment.yaml
+@@ -55,6 +55,9 @@ spec:
+       - key: "node-role.kubernetes.io/master"
+         operator: "Exists"
+         effect: "NoSchedule"
++      - key: "node-role.kubernetes.io/control-plane"
++        operator: "Exists"
++        effect: "NoSchedule"
+       - key: "node.kubernetes.io/unreachable"
+         operator: "Exists"
+         effect: "NoExecute"
+diff --git a/manifests/bootstrap-pod-v2.yaml b/manifests/bootstrap-pod-v2.yaml
+index b1c19619ab..5f06b93e85 100644
+--- a/manifests/bootstrap-pod-v2.yaml
++++ b/manifests/bootstrap-pod-v2.yaml
+@@ -57,6 +57,9 @@ spec:
+     - key: node-role.kubernetes.io/master
+       operator: Exists
+       effect: NoSchedule
++    - key: node-role.kubernetes.io/control-plane
++      operator: Exists
++      effect: NoSchedule
+   restartPolicy: Always
+   volumes:
+   - name: server-certs
+diff --git a/manifests/machineconfigcontroller/deployment.yaml b/manifests/machineconfigcontroller/deployment.yaml
+index 0049d33daa..a0469ff36d 100644
+--- a/manifests/machineconfigcontroller/deployment.yaml
++++ b/manifests/machineconfigcontroller/deployment.yaml
+@@ -87,6 +87,9 @@ spec:
+       - key: node-role.kubernetes.io/master
+         operator: Exists
+         effect: "NoSchedule"
++      - key: node-role.kubernetes.io/control-plane
++        operator: Exists
++        effect: "NoSchedule"
+       - key: "node.kubernetes.io/unreachable"
+         operator: "Exists"
+         effect: "NoExecute"
+diff --git a/manifests/machineconfigserver/daemonset.yaml b/manifests/machineconfigserver/daemonset.yaml
+index 2a8809f98f..c10da70567 100644
+--- a/manifests/machineconfigserver/daemonset.yaml
++++ b/manifests/machineconfigserver/daemonset.yaml
+@@ -53,6 +53,9 @@ spec:
+       - key: node-role.kubernetes.io/master
+         operator: Exists
+         effect: NoSchedule
++      - key: node-role.kubernetes.io/control-plane
++        operator: Exists
++        effect: NoSchedule
+       - key: node-role.kubernetes.io/etcd
+         operator: Exists
+         effect: NoSchedule
+diff --git a/manifests/machineosbuilder/deployment.yaml b/manifests/machineosbuilder/deployment.yaml
+index 98ee01a034..9828e9e6f6 100644
+--- a/manifests/machineosbuilder/deployment.yaml
++++ b/manifests/machineosbuilder/deployment.yaml
+@@ -34,6 +34,9 @@ spec:
+       - key: node-role.kubernetes.io/master
+         operator: Exists
+         effect: "NoSchedule"
++      - key: node-role.kubernetes.io/control-plane
++        operator: Exists
++        effect: "NoSchedule"
+       - key: "node.kubernetes.io/unreachable"
+         operator: "Exists"
+         effect: "NoExecute"
+diff --git a/pkg/controller/common/constants.go b/pkg/controller/common/constants.go
+index 3aa5b9adc5..1a5343f057 100644
+--- a/pkg/controller/common/constants.go
++++ b/pkg/controller/common/constants.go
+@@ -54,6 +54,9 @@ const (
+ 	// MasterLabel defines the label associated with master node. The master taint uses the same label as taint's key
+ 	MasterLabel = "node-role.kubernetes.io/master"
+ 
++	// ControlPlaneTaintKey defines the taint key associated with control-plane nodes
++	ControlPlaneTaintKey = "node-role.kubernetes.io/control-plane"
++
+ 	// MCNameSuffixAnnotationKey is used to keep track of the machine config name associated with a CR
+ 	MCNameSuffixAnnotationKey = "machineconfiguration.openshift.io/mc-name-suffix"
+ 
+diff --git a/pkg/controller/node/node_controller.go b/pkg/controller/node/node_controller.go
+index c1d0df5ead..f7b8455ea3 100644
+--- a/pkg/controller/node/node_controller.go
++++ b/pkg/controller/node/node_controller.go
+@@ -467,8 +467,8 @@ func (ctrl *Controller) makeMasterNodeUnSchedulable(node *corev1.Node) error {
+ 	return nil
+ }
+ 
+-// makeMasterNodeSchedulable makes master node schedulable by removing NoSchedule master taint and
+-// adding worker label
++// makeMasterNodeSchedulable makes master node schedulable by removing NoSchedule master and
++// control-plane taints and adding worker label
+ func (ctrl *Controller) makeMasterNodeSchedulable(node *corev1.Node) error {
+ 	_, err := internal.UpdateNodeRetry(ctrl.kubeClient.CoreV1().Nodes(), ctrl.nodeLister, node.Name, func(node *corev1.Node) {
+ 		// Add worker label
+@@ -477,10 +477,10 @@ func (ctrl *Controller) makeMasterNodeSchedulable(node *corev1.Node) error {
+ 			newLabels[WorkerLabel] = ""
+ 		}
+ 		node.Labels = newLabels
+-		// Remove master taint
++		// Remove master and control-plane taints
+ 		newTaints := []corev1.Taint{}
+ 		for _, t := range node.Spec.Taints {
+-			if t.Key == ctrlcommon.MasterLabel && t.Effect == corev1.TaintEffectNoSchedule {
++			if t.Effect == corev1.TaintEffectNoSchedule && (t.Key == ctrlcommon.MasterLabel || t.Key == ctrlcommon.ControlPlaneTaintKey) {
+ 				continue
+ 			}
+ 			newTaints = append(newTaints, t)
+diff --git a/test/e2e-2of2/mco_test.go b/test/e2e-2of2/mco_test.go
+index 856e6caf04..d2087ee0d4 100644
+--- a/test/e2e-2of2/mco_test.go
++++ b/test/e2e-2of2/mco_test.go
+@@ -101,16 +101,22 @@ func checkMasterNodesSchedulability(cs *framework.ClientSet, masterSchedulable b
+ }
+ 
+ // CheckMasterIsAlreadySchedulable checks if the given node has a worker label and doesn't have NoSchedule master
+-// taint
++// or control-plane taint
+ func CheckMasterIsAlreadySchedulable(master *corev1.Node) bool {
+ 	_, hasWorkerLabel := master.Labels[node.WorkerLabel]
+ 	hasMasterTaint := false
++	hasControlPlaneTaint := false
+ 	for _, taint := range master.Spec.Taints {
+-		if taint.Key == ctrlcommon.MasterLabel && taint.Effect == corev1.TaintEffectNoSchedule {
+-			hasMasterTaint = true
++		if taint.Effect == corev1.TaintEffectNoSchedule {
++			if taint.Key == ctrlcommon.MasterLabel {
++				hasMasterTaint = true
++			}
++			if taint.Key == ctrlcommon.ControlPlaneTaintKey {
++				hasControlPlaneTaint = true
++			}
+ 		}
+ 	}
+-	return hasWorkerLabel && !hasMasterTaint
++	return hasWorkerLabel && !hasMasterTaint && !hasControlPlaneTaint
+ }
+ 
+ func waitForAllMastersUpdate(cs *framework.ClientSet, mastersSchedulable bool) error {

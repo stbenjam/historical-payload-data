@@ -1,0 +1,187 @@
+diff --git a/pkg/manifests/config.go b/pkg/manifests/config.go
+index 887962c111..f36b059ed8 100644
+--- a/pkg/manifests/config.go
++++ b/pkg/manifests/config.go
+@@ -610,18 +610,13 @@ func (c *Config) LoadClusterID(load func() (*configv1.ClusterVersion, error)) er
+ 	return nil
+ }
+ 
+-func (c *Config) LoadToken(load func() (*v1.Secret, error)) error {
++func (c *Config) LoadToken(pullSecret *v1.Secret) error {
+ 	if c.ClusterMonitoringConfiguration.TelemeterClientConfig.Token != "" {
+ 		return nil
+ 	}
+ 
+-	secret, err := load()
+-	if err != nil {
+-		return fmt.Errorf("error loading secret: %w", err)
+-	}
+-
+-	if secret.Type != v1.SecretTypeDockerConfigJson {
+-		return fmt.Errorf("error expecting secret type %s got %s", v1.SecretTypeDockerConfigJson, secret.Type)
++	if pullSecret.Type != v1.SecretTypeDockerConfigJson {
++		return fmt.Errorf("error expecting secret type %s got %s", v1.SecretTypeDockerConfigJson, pullSecret.Type)
+ 	}
+ 
+ 	ps := struct {
+@@ -632,7 +627,7 @@ func (c *Config) LoadToken(load func() (*v1.Secret, error)) error {
+ 		} `json:"auths"`
+ 	}{}
+ 
+-	if err := json.Unmarshal(secret.Data[v1.DockerConfigJsonKey], &ps); err != nil {
++	if err := json.Unmarshal(pullSecret.Data[v1.DockerConfigJsonKey], &ps); err != nil {
+ 		return fmt.Errorf("unmarshaling pull secret failed: %w", err)
+ 	}
+ 
+diff --git a/pkg/operator/operator.go b/pkg/operator/operator.go
+index 61edc701c6..5fd2bc7df8 100644
+--- a/pkg/operator/operator.go
++++ b/pkg/operator/operator.go
+@@ -1048,15 +1048,41 @@ func (o *Operator) Config(ctx context.Context) (*manifests.Config, []string, err
+ 			klog.Warningf("Could not fetch cluster version from API. Proceeding without it: %v", err)
+ 		}
+ 
+-		err = c.LoadToken(func() (*v1.Secret, error) {
+-			return o.client.KubernetesInterface().CoreV1().Secrets("openshift-config").Get(ctx, "pull-secret", metav1.GetOptions{})
+-		})
++		o.loadTelemeterToken(ctx, c)
++	}
++
++	return c, warnings, nil
++}
+ 
++// loadTelemeterToken tries to load the cloud.openshift.com token from
++// openshift-config/pull-secret first, then falls back to
++// kube-system/global-pull-secret (HCP clusters where the customer adds
++// cloud.openshift.com via day-2 additional-pull-secret).
++func (o *Operator) loadTelemeterToken(ctx context.Context, c *manifests.Config) {
++	tokenSources := []struct{ namespace, name string }{
++		{"openshift-config", "pull-secret"},
++		{"kube-system", "global-pull-secret"},
++	}
++	var tokenErrors []error
++	for _, s := range tokenSources {
++		pullSecret, err := o.client.GetSecret(ctx, s.namespace, s.name)
+ 		if err != nil {
+-			klog.Warningf("Error loading token from API. Proceeding without it: %v", err)
++			tokenErrors = append(tokenErrors, fmt.Errorf("failed to get secret %s/%s: %w", s.namespace, s.name, err))
++			continue
++		}
++
++		if err = c.LoadToken(pullSecret); err != nil {
++			tokenErrors = append(tokenErrors, fmt.Errorf("failed to parse pull secret %s/%s: %w", s.namespace, s.name, err))
++			continue
++		}
++
++		if c.ClusterMonitoringConfiguration.TelemeterClientConfig.Token != "" {
++			break
+ 		}
+ 	}
+-	return c, warnings, nil
++	if c.ClusterMonitoringConfiguration.TelemeterClientConfig.Token == "" && len(tokenErrors) > 0 {
++		klog.Warningf("Failed to load token from any source. Proceeding without it: %v", tokenErrors)
++	}
+ }
+ 
+ // storageNotConfiguredMessage returns the message to be set if a pvc has not
+diff --git a/pkg/operator/operator_test.go b/pkg/operator/operator_test.go
+index 2bb994ca96..fd0bd948ff 100644
+--- a/pkg/operator/operator_test.go
++++ b/pkg/operator/operator_test.go
+@@ -22,7 +22,11 @@ import (
+ 
+ 	configv1 "github.com/openshift/api/config/v1"
+ 	"github.com/stretchr/testify/require"
++	v1 "k8s.io/api/core/v1"
++	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
++	k8sruntime "k8s.io/apimachinery/pkg/runtime"
+ 	apiutilerrors "k8s.io/apimachinery/pkg/util/errors"
++	"k8s.io/client-go/kubernetes/fake"
+ 
+ 	"github.com/openshift/cluster-monitoring-operator/pkg/client"
+ 	"github.com/openshift/cluster-monitoring-operator/pkg/manifests"
+@@ -558,3 +562,84 @@ func TestGenerateRunReportFromTaskErrors(t *testing.T) {
+ 		})
+ 	}
+ }
++
++func newPullSecret(namespace, name, auths string) *v1.Secret {
++	return &v1.Secret{
++		ObjectMeta: metav1.ObjectMeta{
++			Namespace: namespace,
++			Name:      name,
++		},
++		Type: v1.SecretTypeDockerConfigJson,
++		Data: map[string][]byte{
++			v1.DockerConfigJsonKey: []byte(fmt.Sprintf(`{"auths":{%s}}`, auths)),
++		},
++	}
++}
++
++func TestLoadTelemeterToken(t *testing.T) {
++	for _, tc := range []struct {
++		name        string
++		secrets     []*v1.Secret
++		expectToken string
++	}{
++		{
++			name: "primary has cloud.openshift.com token",
++			secrets: []*v1.Secret{
++				newPullSecret("openshift-config", "pull-secret", `"cloud.openshift.com":{"auth":"primarytoken"}`),
++			},
++			expectToken: "primarytoken",
++		},
++		{
++			name: "primary lacks token, fallback has token",
++			secrets: []*v1.Secret{
++				newPullSecret("openshift-config", "pull-secret", `"arohcpocpprod.azurecr.io":{"auth":"acrtoken"}`),
++				newPullSecret("kube-system", "global-pull-secret", `"cloud.openshift.com":{"auth":"fallbacktoken"}`),
++			},
++			expectToken: "fallbacktoken",
++		},
++		{
++			name: "primary has token, fallback ignored",
++			secrets: []*v1.Secret{
++				newPullSecret("openshift-config", "pull-secret", `"cloud.openshift.com":{"auth":"primarytoken"}`),
++				newPullSecret("kube-system", "global-pull-secret", `"cloud.openshift.com":{"auth":"fallbacktoken"}`),
++			},
++			expectToken: "primarytoken",
++		},
++		{
++			name: "both secrets lack token",
++			secrets: []*v1.Secret{
++				newPullSecret("openshift-config", "pull-secret", `"arohcpocpprod.azurecr.io":{"auth":"acrtoken"}`),
++				newPullSecret("kube-system", "global-pull-secret", `"other.registry.io":{"auth":"othertoken"}`),
++			},
++			expectToken: "",
++		},
++		{
++			name:        "no secrets exist, fallback also missing",
++			secrets:     []*v1.Secret{},
++			expectToken: "",
++		},
++	} {
++		t.Run(tc.name, func(t *testing.T) {
++			objects := make([]k8sruntime.Object, len(tc.secrets))
++			for i, s := range tc.secrets {
++				objects[i] = s
++			}
++			cl := client.New(
++				"v0.0.0",
++				"openshift-monitoring",
++				"openshift-user-workload-monitoring",
++				client.KubernetesClient(fake.NewSimpleClientset(objects...)),
++			)
++
++			c, err := manifests.NewConfigFromString("")
++			require.NoError(t, err)
++
++			o := &Operator{
++				client: cl,
++			}
++			o.loadTelemeterToken(context.Background(), c)
++
++			require.Equal(t, tc.expectToken, c.ClusterMonitoringConfiguration.TelemeterClientConfig.Token)
++		})
++	}
++}

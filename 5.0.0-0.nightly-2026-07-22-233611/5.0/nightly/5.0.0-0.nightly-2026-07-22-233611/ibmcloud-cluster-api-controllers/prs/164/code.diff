@@ -1,0 +1,160 @@
+diff --git a/openshift/capi-operator-manifests/default/manifests.yaml b/openshift/capi-operator-manifests/default/manifests.yaml
+index b10b8c3b5c..f4b99f9790 100644
+--- a/openshift/capi-operator-manifests/default/manifests.yaml
++++ b/openshift/capi-operator-manifests/default/manifests.yaml
+@@ -8226,7 +8226,7 @@ spec:
+         - name: IBM_CREDENTIALS_FILE
+           value: /home/.ibmcloud/ibm-credentials.env
+         image: registry.ci.openshift.org/openshift:ibmcloud-cluster-api-controllers
+-        imagePullPolicy: Always
++        imagePullPolicy: IfNotPresent
+         livenessProbe:
+           httpGet:
+             path: /healthz
+diff --git a/openshift/tools/go.mod b/openshift/tools/go.mod
+index 23d2e16ebd..0f5108361b 100644
+--- a/openshift/tools/go.mod
++++ b/openshift/tools/go.mod
+@@ -2,7 +2,7 @@ module tools
+ 
+ go 1.25.0
+ 
+-require github.com/openshift/cluster-capi-operator/manifests-gen v0.0.0-20260506082208-390a5b10a37c
++require github.com/openshift/cluster-capi-operator/manifests-gen v0.0.0-20260703150646-e8d2830a6f46
+ 
+ require (
+ 	github.com/blang/semver/v4 v4.0.0 // indirect
+diff --git a/openshift/tools/go.sum b/openshift/tools/go.sum
+index b740d6b704..dcf41e12c6 100644
+--- a/openshift/tools/go.sum
++++ b/openshift/tools/go.sum
+@@ -95,8 +95,8 @@ github.com/opencontainers/go-digest v1.0.0 h1:apOUWs51W5PlhuyGyz9FCeeBIOUDA/6nW8
+ github.com/opencontainers/go-digest v1.0.0/go.mod h1:0JzlMkj0TRzQZfJkVvzbP0HBR3IKzErnv2BNG4W4MAM=
+ github.com/openshift/api v0.0.0-20260416105050-3c6b218b8a80 h1:r0S/yoZAI0iWo1JvoIijaIgWGWf/izg4WiV7Wrtz16k=
+ github.com/openshift/api v0.0.0-20260416105050-3c6b218b8a80/go.mod h1:pyVjK0nZ4sRs4fuQVQ4rubsJdahI1PB94LnQ8sGdvxo=
+-github.com/openshift/cluster-capi-operator/manifests-gen v0.0.0-20260506082208-390a5b10a37c h1:mCbdsqRsXvIw22zy5c07zmFpaE/ng6ehx0Pq399UM3w=
+-github.com/openshift/cluster-capi-operator/manifests-gen v0.0.0-20260506082208-390a5b10a37c/go.mod h1:mRpBhhCeqkf0GwRIVYfwlZlTqOMRfxMLxxFmltzMksY=
++github.com/openshift/cluster-capi-operator/manifests-gen v0.0.0-20260703150646-e8d2830a6f46 h1:ZZHWNeS9h8Wmnny6j4VJbxsrwkJmuN3GqUoaw4n/8Cw=
++github.com/openshift/cluster-capi-operator/manifests-gen v0.0.0-20260703150646-e8d2830a6f46/go.mod h1:mRpBhhCeqkf0GwRIVYfwlZlTqOMRfxMLxxFmltzMksY=
+ github.com/pmezard/go-difflib v1.0.0/go.mod h1:iKH77koFhYxTK1pcRnkKkqfTogsbg7gZNVY4sRDYZ/4=
+ github.com/pmezard/go-difflib v1.0.1-0.20181226105442-5d4384ee4fb2 h1:Jamvg5psRIccs7FGNTlIRMkT8wgtp5eCXdBlqhYGL6U=
+ github.com/pmezard/go-difflib v1.0.1-0.20181226105442-5d4384ee4fb2/go.mod h1:iKH77koFhYxTK1pcRnkKkqfTogsbg7gZNVY4sRDYZ/4=
+diff --git a/openshift/tools/vendor/github.com/openshift/cluster-capi-operator/manifests-gen/kustomization.yaml b/openshift/tools/vendor/github.com/openshift/cluster-capi-operator/manifests-gen/kustomization.yaml
+index 07a007dd78..51c744c349 100644
+--- a/openshift/tools/vendor/github.com/openshift/cluster-capi-operator/manifests-gen/kustomization.yaml
++++ b/openshift/tools/vendor/github.com/openshift/cluster-capi-operator/manifests-gen/kustomization.yaml
+@@ -4,7 +4,7 @@ kind: Component
+ namespace: openshift-cluster-api
+ 
+ resources:
+-  - webhook-namespace-selector.yaml
++  - kustomize-values.yaml
+ 
+ # Scope all provider webhooks to the openshift-cluster-api namespace.
+ # This prevents webhooks from intercepting requests in other namespaces,
+@@ -12,7 +12,7 @@ resources:
+ replacements:
+   - source:
+       kind: ConfigMap
+-      name: webhook-namespace-selector
++      name: kustomize-values
+       fieldPath: data.namespace
+     targets:
+       - select:
+@@ -27,6 +27,56 @@ replacements:
+           - webhooks.*.namespaceSelector.matchLabels.kubernetes\.io/metadata\.name
+         options:
+           create: true
++  # In disconnected clusters using pinned image sets, images are already
++  # present on nodes. IfNotPresent avoids unnecessary pulls that fail
++  # when the registry is unreachable (OCPBUGS-85337).
++  - source:
++      kind: ConfigMap
++      name: kustomize-values
++      fieldPath: data.imagePullPolicy
++    targets:
++      - select:
++          kind: Deployment
++        fieldPaths:
++          - spec.template.spec.containers.*.imagePullPolicy
++        options:
++          create: true
++      - select:
++          kind: StatefulSet
++        fieldPaths:
++          - spec.template.spec.containers.*.imagePullPolicy
++        options:
++          create: true
++      - select:
++          kind: DaemonSet
++        fieldPaths:
++          - spec.template.spec.containers.*.imagePullPolicy
++        options:
++          create: true
++      - select:
++          kind: ReplicaSet
++        fieldPaths:
++          - spec.template.spec.containers.*.imagePullPolicy
++        options:
++          create: true
++      - select:
++          kind: Job
++        fieldPaths:
++          - spec.template.spec.containers.*.imagePullPolicy
++        options:
++          create: true
++      - select:
++          kind: CronJob
++        fieldPaths:
++          - spec.jobTemplate.spec.template.spec.containers.*.imagePullPolicy
++        options:
++          create: true
++      - select:
++          kind: Pod
++        fieldPaths:
++          - spec.containers.*.imagePullPolicy
++        options:
++          create: true
+ 
+ patches:
+ 
+diff --git a/openshift/tools/vendor/github.com/openshift/cluster-capi-operator/manifests-gen/webhook-namespace-selector.yaml b/openshift/tools/vendor/github.com/openshift/cluster-capi-operator/manifests-gen/kustomize-values.yaml
+similarity index 67%
+rename from openshift/tools/vendor/github.com/openshift/cluster-capi-operator/manifests-gen/webhook-namespace-selector.yaml
+rename to openshift/tools/vendor/github.com/openshift/cluster-capi-operator/manifests-gen/kustomize-values.yaml
+index a7c9157f90..41a186c087 100644
+--- a/openshift/tools/vendor/github.com/openshift/cluster-capi-operator/manifests-gen/webhook-namespace-selector.yaml
++++ b/openshift/tools/vendor/github.com/openshift/cluster-capi-operator/manifests-gen/kustomize-values.yaml
+@@ -1,14 +1,15 @@
+ # This ConfigMap is a kustomize workaround: replacements need a concrete source resource
+-# to read a value from, but there is no real resource that holds the target namespace.
+-# This ConfigMap acts as that source, providing the namespace value to inject into webhook
+-# namespaceSelector fields via the replacements defined in kustomization.yaml.
++# to read a value from, but there is no real resource that holds the values we need.
++# This ConfigMap acts as that source, providing values to inject into target resources
++# via the replacements defined in kustomization.yaml.
+ # It is marked as local-config so kustomize never emits it in the final output.
+ apiVersion: v1
+ kind: ConfigMap
+ metadata:
+-  name: webhook-namespace-selector
++  name: kustomize-values
+   annotations:
+     # Marks this resource as local-only so kustomize excludes it from the final output.
+     config.kubernetes.io/local-config: "true"
+ data:
+   namespace: openshift-cluster-api
++  imagePullPolicy: IfNotPresent
+diff --git a/openshift/tools/vendor/modules.txt b/openshift/tools/vendor/modules.txt
+index eb8cf1ebb0..0c990f9ce3 100644
+--- a/openshift/tools/vendor/modules.txt
++++ b/openshift/tools/vendor/modules.txt
+@@ -111,7 +111,7 @@ github.com/opencontainers/go-digest
+ # github.com/openshift/api v0.0.0-20260416105050-3c6b218b8a80
+ ## explicit; go 1.25.0
+ github.com/openshift/api/config/v1
+-# github.com/openshift/cluster-capi-operator/manifests-gen v0.0.0-20260506082208-390a5b10a37c
++# github.com/openshift/cluster-capi-operator/manifests-gen v0.0.0-20260703150646-e8d2830a6f46
+ ## explicit; go 1.25.0
+ github.com/openshift/cluster-capi-operator/manifests-gen
+ github.com/openshift/cluster-capi-operator/manifests-gen/providermetadata

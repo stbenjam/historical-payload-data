@@ -1,0 +1,1125 @@
+diff --git a/hypershift-operator/controllers/nodepool/config.go b/hypershift-operator/controllers/nodepool/config.go
+index 7dffe44d4a9a..2e27fbc60537 100644
+--- a/hypershift-operator/controllers/nodepool/config.go
++++ b/hypershift-operator/controllers/nodepool/config.go
+@@ -11,6 +11,7 @@ import (
+ 	"strings"
+ 
+ 	hyperv1 "github.com/openshift/hypershift/api/hypershift/v1beta1"
++	cpomanifests "github.com/openshift/hypershift/control-plane-operator/controllers/hostedcontrolplane/manifests"
+ 	"github.com/openshift/hypershift/support/api"
+ 	"github.com/openshift/hypershift/support/backwardcompat"
+ 	"github.com/openshift/hypershift/support/capabilities"
+@@ -24,6 +25,7 @@ import (
+ 	"github.com/openshift/api/operator/v1alpha1"
+ 
+ 	corev1 "k8s.io/api/core/v1"
++	apierrors "k8s.io/apimachinery/pkg/api/errors"
+ 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+ 	"k8s.io/apimachinery/pkg/runtime"
+ 	serializer "k8s.io/apimachinery/pkg/runtime/serializer/json"
+@@ -405,3 +407,26 @@ func globalConfigString(hcluster *hyperv1.HostedCluster) (string, error) {
+ 	// Some fields in the ClusterConfiguration have changes that are not backwards compatible with older versions of the CPO.
+ 	return backwardcompat.GetBackwardCompatibleConfigString(rawConfig), nil
+ }
++
++// GetCloudConfigHash returns a hash of the platform-specific cloud config ConfigMap content.
++// For platforms without a cloud config ConfigMap (e.g. AWS), it returns an empty string.
++func (cg *ConfigGenerator) GetCloudConfigHash(ctx context.Context) (string, error) {
++	var cm *corev1.ConfigMap
++	switch cg.hostedCluster.Spec.Platform.Type {
++	case hyperv1.AzurePlatform:
++		cm = cpomanifests.AzureProviderConfig(cg.controlplaneNamespace)
++	case hyperv1.OpenStackPlatform:
++		cm = cpomanifests.OpenStackProviderConfig(cg.controlplaneNamespace)
++	default:
++		return "", nil
++	}
++
++	if err := cg.Get(ctx, client.ObjectKeyFromObject(cm), cm); err != nil {
++		if apierrors.IsNotFound(err) {
++			return "", nil
++		}
++		return "", fmt.Errorf("failed to get cloud config ConfigMap %s/%s: %w", cm.Namespace, cm.Name, err)
++	}
++
++	return supportutil.HashConfigMapData(cm.Data), nil
++}
+diff --git a/hypershift-operator/controllers/nodepool/config_test.go b/hypershift-operator/controllers/nodepool/config_test.go
+index 2d8d2f67d652..82b3c93e8282 100644
+--- a/hypershift-operator/controllers/nodepool/config_test.go
++++ b/hypershift-operator/controllers/nodepool/config_test.go
+@@ -3,6 +3,7 @@ package nodepool
+ import (
+ 	"bytes"
+ 	"compress/gzip"
++	"context"
+ 	"errors"
+ 	"fmt"
+ 	"io"
+@@ -12,6 +13,7 @@ import (
+ 
+ 	hyperv1 "github.com/openshift/hypershift/api/hypershift/v1beta1"
+ 	"github.com/openshift/hypershift/api/util/ipnet"
++	cpomanifests "github.com/openshift/hypershift/control-plane-operator/controllers/hostedcontrolplane/manifests"
+ 	api "github.com/openshift/hypershift/support/api"
+ 	"github.com/openshift/hypershift/support/releaseinfo"
+ 	supportutil "github.com/openshift/hypershift/support/util"
+@@ -24,6 +26,7 @@ import (
+ 
+ 	crclient "sigs.k8s.io/controller-runtime/pkg/client"
+ 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
++	"sigs.k8s.io/controller-runtime/pkg/client/interceptor"
+ 
+ 	"github.com/google/go-cmp/cmp"
+ )
+@@ -1991,3 +1994,144 @@ func TestGlobalConfigString(t *testing.T) {
+ 		})
+ 	}
+ }
++
++func TestCloudConfigHash(t *testing.T) {
++	controlPlaneNamespace := "test-cp"
++	azureCloudConfig := cpomanifests.AzureProviderConfig(controlPlaneNamespace)
++	azureCloudConfig.Data = map[string]string{
++		"cloud.conf": `{"tenantId":"t1","subscriptionId":"s1"}`,
++	}
++
++	azureCloudConfigDifferent := cpomanifests.AzureProviderConfig(controlPlaneNamespace)
++	azureCloudConfigDifferent.Data = map[string]string{
++		"cloud.conf": `{"tenantId":"t1","subscriptionId":"s1","userAssignedIdentityID":"new-id"}`,
++	}
++
++	testCases := []struct {
++		name        string
++		platform    hyperv1.PlatformType
++		objects     []crclient.Object
++		expectEmpty bool
++	}{
++		{
++			name:     "When platform is Azure and cloud config exists it should return a hash",
++			platform: hyperv1.AzurePlatform,
++			objects:  []crclient.Object{azureCloudConfig.DeepCopy()},
++		},
++		{
++			name:        "When platform is Azure and cloud config is missing it should return empty",
++			platform:    hyperv1.AzurePlatform,
++			objects:     []crclient.Object{},
++			expectEmpty: true,
++		},
++		{
++			name:        "When platform is AWS it should return empty",
++			platform:    hyperv1.AWSPlatform,
++			objects:     []crclient.Object{},
++			expectEmpty: true,
++		},
++		{
++			name:     "When cloud config content changes it should produce a different hash",
++			platform: hyperv1.AzurePlatform,
++			objects:  []crclient.Object{azureCloudConfigDifferent.DeepCopy()},
++		},
++		{
++			name:     "When platform is OpenStack and cloud config exists it should return a hash",
++			platform: hyperv1.OpenStackPlatform,
++			objects: []crclient.Object{func() crclient.Object {
++				cm := cpomanifests.OpenStackProviderConfig(controlPlaneNamespace)
++				cm.Data = map[string]string{"cloud.conf": `[Global]\nauth-url=https://openstack.example.com`}
++				return cm
++			}()},
++		},
++		{
++			name:        "When platform is OpenStack and cloud config is missing it should return empty",
++			platform:    hyperv1.OpenStackPlatform,
++			objects:     []crclient.Object{},
++			expectEmpty: true,
++		},
++	}
++
++	for _, tc := range testCases {
++		t.Run(tc.name, func(t *testing.T) {
++			g := NewWithT(t)
++			fakeClient := fake.NewClientBuilder().WithScheme(api.Scheme).WithObjects(tc.objects...).Build()
++
++			cg := &ConfigGenerator{
++				Client: fakeClient,
++				hostedCluster: &hyperv1.HostedCluster{
++					Spec: hyperv1.HostedClusterSpec{
++						Platform: hyperv1.PlatformSpec{
++							Type: tc.platform,
++						},
++					},
++				},
++				controlplaneNamespace: controlPlaneNamespace,
++				rolloutConfig:         &rolloutConfig{},
++			}
++
++			hash, err := cg.GetCloudConfigHash(t.Context())
++			g.Expect(err).ToNot(HaveOccurred())
++
++			if tc.expectEmpty {
++				g.Expect(hash).To(BeEmpty())
++			} else {
++				g.Expect(hash).ToNot(BeEmpty())
++			}
++		})
++	}
++
++	t.Run("When content differs the hashes should differ", func(t *testing.T) {
++		g := NewWithT(t)
++
++		getHash := func(obj crclient.Object) string {
++			fakeClient := fake.NewClientBuilder().WithScheme(api.Scheme).WithObjects(obj).Build()
++			cg := &ConfigGenerator{
++				Client: fakeClient,
++				hostedCluster: &hyperv1.HostedCluster{
++					Spec: hyperv1.HostedClusterSpec{
++						Platform: hyperv1.PlatformSpec{
++							Type: hyperv1.AzurePlatform,
++						},
++					},
++				},
++				controlplaneNamespace: controlPlaneNamespace,
++				rolloutConfig:         &rolloutConfig{},
++			}
++			hash, err := cg.GetCloudConfigHash(t.Context())
++			g.Expect(err).ToNot(HaveOccurred())
++			return hash
++		}
++
++		hash1 := getHash(azureCloudConfig.DeepCopy())
++		hash2 := getHash(azureCloudConfigDifferent.DeepCopy())
++		g.Expect(hash1).ToNot(Equal(hash2))
++	})
++
++	t.Run("When a non-NotFound error occurs it should return the error", func(t *testing.T) {
++		g := NewWithT(t)
++		injectedErr := errors.New("connection refused")
++		fakeClient := fake.NewClientBuilder().WithScheme(api.Scheme).WithInterceptorFuncs(interceptor.Funcs{
++			Get: func(_ context.Context, _ crclient.WithWatch, _ crclient.ObjectKey, _ crclient.Object, _ ...crclient.GetOption) error {
++				return injectedErr
++			},
++		}).Build()
++
++		cg := &ConfigGenerator{
++			Client: fakeClient,
++			hostedCluster: &hyperv1.HostedCluster{
++				Spec: hyperv1.HostedClusterSpec{
++					Platform: hyperv1.PlatformSpec{
++						Type: hyperv1.AzurePlatform,
++					},
++				},
++			},
++			controlplaneNamespace: controlPlaneNamespace,
++			rolloutConfig:         &rolloutConfig{},
++		}
++
++		_, err := cg.GetCloudConfigHash(t.Context())
++		g.Expect(err).To(HaveOccurred())
++		g.Expect(err.Error()).To(ContainSubstring("connection refused"))
++	})
++}
+diff --git a/hypershift-operator/controllers/nodepool/nodepool_controller.go b/hypershift-operator/controllers/nodepool/nodepool_controller.go
+index d26d090b8235..ab1b94143ba6 100644
+--- a/hypershift-operator/controllers/nodepool/nodepool_controller.go
++++ b/hypershift-operator/controllers/nodepool/nodepool_controller.go
+@@ -51,6 +51,7 @@ import (
+ 	"sigs.k8s.io/controller-runtime/pkg/controller"
+ 	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
+ 	"sigs.k8s.io/controller-runtime/pkg/handler"
++	"sigs.k8s.io/controller-runtime/pkg/predicate"
+ 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
+ 
+ 	"github.com/blang/semver"
+@@ -143,6 +144,10 @@ func (r *NodePoolReconciler) SetupWithManager(mgr ctrl.Manager) error {
+ 		Watches(&corev1.Secret{}, handler.EnqueueRequestsFromMapFunc(enqueueParentNodePool), builder.WithPredicates(supportutil.PredicatesForHostedClusterAnnotationScoping(mgr.GetClient()))).
+ 		// We want to reconcile when the ConfigMaps referenced by the spec.config and also the core ones change.
+ 		Watches(&corev1.ConfigMap{}, handler.EnqueueRequestsFromMapFunc(r.enqueueNodePoolsForConfig), builder.WithPredicates(supportutil.PredicatesForHostedClusterAnnotationScoping(mgr.GetClient()))).
++		// We want to reconcile when cloud provider config ConfigMaps change in the control plane namespace.
++		Watches(&corev1.ConfigMap{}, handler.EnqueueRequestsFromMapFunc(r.enqueueNodePoolsForCloudConfig), builder.WithPredicates(predicate.NewPredicateFuncs(func(obj client.Object) bool {
++			return obj.GetName() == "azure-cloud-config" || obj.GetName() == "openstack-cloud-config"
++		}))).
+ 		WithOptions(controller.Options{
+ 			RateLimiter:             workqueue.NewTypedItemExponentialFailureRateLimiter[reconcile.Request](1*time.Second, 10*time.Second),
+ 			MaxConcurrentReconciles: 10,
+@@ -959,6 +964,33 @@ func (r *NodePoolReconciler) enqueueNodePoolsForConfig(ctx context.Context, obj
+ 	return result
+ }
+ 
++func (r *NodePoolReconciler) enqueueNodePoolsForCloudConfig(ctx context.Context, obj client.Object) []reconcile.Request {
++	hcpList := &hyperv1.HostedControlPlaneList{}
++	if err := r.List(ctx, hcpList, client.InNamespace(obj.GetNamespace())); err != nil || len(hcpList.Items) == 0 {
++		return nil
++	}
++	hcName, ok := hcpList.Items[0].Annotations[k8sutil.HostedClusterAnnotation]
++	if !ok {
++		return nil
++	}
++	hc := supportutil.ParseNamespacedName(hcName)
++
++	nodePoolList := &hyperv1.NodePoolList{}
++	if err := r.List(ctx, nodePoolList, client.InNamespace(hc.Namespace)); err != nil {
++		return nil
++	}
++
++	var result []reconcile.Request
++	for i := range nodePoolList.Items {
++		if nodePoolList.Items[i].Spec.ClusterName == hc.Name {
++			result = append(result, reconcile.Request{
++				NamespacedName: client.ObjectKeyFromObject(&nodePoolList.Items[i]),
++			})
++		}
++	}
++	return result
++}
++
+ // getNodePoolNamespace returns the namespaced name of a NodePool, given the NodePools name
+ // and the control plane namespace name for the hosted cluster that this NodePool is a part of.
+ func (r *NodePoolReconciler) getNodePoolNamespacedName(nodePoolName string, controlPlaneNamespace string) (types.NamespacedName, error) {
+diff --git a/hypershift-operator/controllers/nodepool/nodepool_controller_test.go b/hypershift-operator/controllers/nodepool/nodepool_controller_test.go
+index fd8ba054e071..b16323ab6ef2 100644
+--- a/hypershift-operator/controllers/nodepool/nodepool_controller_test.go
++++ b/hypershift-operator/controllers/nodepool/nodepool_controller_test.go
+@@ -3747,3 +3747,128 @@ func TestNodePoolReconciler_reconcile(t *testing.T) {
+ 		})
+ 	}
+ }
++
++func TestEnqueueNodePoolsForCloudConfig(t *testing.T) {
++	t.Parallel()
++	hcNamespace := "clusters"
++	hcName := "my-cluster"
++	cpNamespace := "clusters-my-cluster"
++
++	hcp := &hyperv1.HostedControlPlane{
++		ObjectMeta: metav1.ObjectMeta{
++			Name:      hcName,
++			Namespace: cpNamespace,
++			Annotations: map[string]string{
++				k8sutil.HostedClusterAnnotation: hcNamespace + "/" + hcName,
++			},
++		},
++	}
++
++	matchingNodePool := &hyperv1.NodePool{
++		ObjectMeta: metav1.ObjectMeta{
++			Name:      "np-1",
++			Namespace: hcNamespace,
++		},
++		Spec: hyperv1.NodePoolSpec{
++			ClusterName: hcName,
++		},
++	}
++
++	unrelatedNodePool := &hyperv1.NodePool{
++		ObjectMeta: metav1.ObjectMeta{
++			Name:      "np-other",
++			Namespace: hcNamespace,
++		},
++		Spec: hyperv1.NodePoolSpec{
++			ClusterName: "other-cluster",
++		},
++	}
++
++	testCases := []struct {
++		name     string
++		cm       *corev1.ConfigMap
++		objects  []client.Object
++		expected []reconcile.Request
++	}{
++		{
++			name: "When azure-cloud-config changes, it should enqueue matching NodePools",
++			cm: &corev1.ConfigMap{
++				ObjectMeta: metav1.ObjectMeta{
++					Name:      "azure-cloud-config",
++					Namespace: cpNamespace,
++				},
++			},
++			objects: []client.Object{hcp, matchingNodePool, unrelatedNodePool},
++			expected: []reconcile.Request{
++				{NamespacedName: types.NamespacedName{Name: "np-1", Namespace: hcNamespace}},
++			},
++		},
++		{
++			name: "When openstack-cloud-config changes, it should enqueue matching NodePools",
++			cm: &corev1.ConfigMap{
++				ObjectMeta: metav1.ObjectMeta{
++					Name:      "openstack-cloud-config",
++					Namespace: cpNamespace,
++				},
++			},
++			objects: []client.Object{hcp, matchingNodePool},
++			expected: []reconcile.Request{
++				{NamespacedName: types.NamespacedName{Name: "np-1", Namespace: hcNamespace}},
++			},
++		},
++		{
++			name: "When no HostedControlPlane exists in the namespace, it should return nil",
++			cm: &corev1.ConfigMap{
++				ObjectMeta: metav1.ObjectMeta{
++					Name:      "azure-cloud-config",
++					Namespace: cpNamespace,
++				},
++			},
++			objects:  []client.Object{matchingNodePool},
++			expected: nil,
++		},
++		{
++			name: "When HostedControlPlane has no cluster annotation, it should return nil",
++			cm: &corev1.ConfigMap{
++				ObjectMeta: metav1.ObjectMeta{
++					Name:      "azure-cloud-config",
++					Namespace: cpNamespace,
++				},
++			},
++			objects: []client.Object{
++				&hyperv1.HostedControlPlane{
++					ObjectMeta: metav1.ObjectMeta{
++						Name:      hcName,
++						Namespace: cpNamespace,
++					},
++				},
++				matchingNodePool,
++			},
++			expected: nil,
++		},
++		{
++			name: "When no NodePools match the HostedCluster, it should return empty",
++			cm: &corev1.ConfigMap{
++				ObjectMeta: metav1.ObjectMeta{
++					Name:      "azure-cloud-config",
++					Namespace: cpNamespace,
++				},
++			},
++			objects:  []client.Object{hcp, unrelatedNodePool},
++			expected: nil,
++		},
++	}
++
++	for _, tc := range testCases {
++		t.Run(tc.name, func(t *testing.T) {
++			t.Parallel()
++			g := NewWithT(t)
++
++			c := fake.NewClientBuilder().WithScheme(api.Scheme).WithObjects(tc.objects...).Build()
++			r := &NodePoolReconciler{Client: c}
++
++			result := r.enqueueNodePoolsForCloudConfig(context.Background(), tc.cm)
++			g.Expect(result).To(Equal(tc.expected))
++		})
++	}
++}
+diff --git a/hypershift-operator/controllers/nodepool/token.go b/hypershift-operator/controllers/nodepool/token.go
+index 4c8daa216fbf..a7e85b272c3f 100644
+--- a/hypershift-operator/controllers/nodepool/token.go
++++ b/hypershift-operator/controllers/nodepool/token.go
+@@ -41,6 +41,7 @@ const (
+ 	TokenSecretPullSecretHashKey         = "pull-secret-hash"
+ 	TokenSecretHCConfigurationHashKey    = "hc-configuration-hash"
+ 	TokenSecretAdditionalTrustBundleKey  = "additional-trust-bundle-hash"
++	TokenSecretCloudConfigHashKey        = "cloud-config-hash"
+ 	TokenSecretConfigKey                 = "config"
+ 	TokenSecretAnnotation                = "hypershift.openshift.io/ignition-config"
+ 	TokenSecretIgnitionReachedAnnotation = "hypershift.openshift.io/ignition-reached"
+@@ -62,6 +63,7 @@ type Token struct {
+ 	pullSecretHash            []byte
+ 	additionalTrustBundleHash []byte
+ 	globalConfigHash          []byte
++	cloudConfigHash           []byte
+ 	userData                  *userData
+ }
+ 
+@@ -114,6 +116,11 @@ func NewToken(ctx context.Context, configGenerator *ConfigGenerator, cpoCapabili
+ 		return nil, fmt.Errorf("failed to hash HostedCluster configuration: %w", err)
+ 	}
+ 
++	cloudConfigHash, err := configGenerator.GetCloudConfigHash(ctx)
++	if err != nil {
++		return nil, err
++	}
++
+ 	token := &Token{
+ 		CreateOrUpdateProvider:    upsert.New(false),
+ 		ConfigGenerator:           configGenerator,
+@@ -121,6 +128,7 @@ func NewToken(ctx context.Context, configGenerator *ConfigGenerator, cpoCapabili
+ 		pullSecretHash:            []byte(supportutil.HashSimple(pullSecretBytes)),
+ 		additionalTrustBundleHash: []byte(supportutil.HashSimple(additionalTrustBundle)),
+ 		globalConfigHash:          []byte(hcConfigurationHash),
++		cloudConfigHash:           []byte(cloudConfigHash),
+ 	}
+ 
+ 	// User data input.
+@@ -358,11 +366,13 @@ func (t *Token) reconcileTokenSecret(tokenSecret *corev1.Secret) error {
+ 		// TODO(CNTRLPLANE-3553): consumed by the ignition-server's TokenSecretReconciler once
+ 		// multi-stream ignition support lands. Until then this key is written but not read downstream.
+ 		tokenSecret.Data[TokenSecretOSStreamKey] = []byte(t.resolvedRHELStreamForBootImage)
++		tokenSecret.Data[TokenSecretCloudConfigHashKey] = t.cloudConfigHash
+ 	}
+ 	// TODO (alberto): Only apply this on creation and change the hash generation to only use triggering upgrade fields.
+ 	// We let this change to happen inplace now as the tokenSecret and the mcs config use the whole spec.Config for the comparing hash.
+ 	// Otherwise if something which does not trigger a new token generation from spec.Config changes, like .IDP, both hashes would mismatch forever.
+ 	tokenSecret.Data[TokenSecretHCConfigurationHashKey] = t.globalConfigHash
++	tokenSecret.Data[TokenSecretCloudConfigHashKey] = t.cloudConfigHash
+ 
+ 	return nil
+ }
+diff --git a/hypershift-operator/controllers/nodepool/token_test.go b/hypershift-operator/controllers/nodepool/token_test.go
+index 33df617a04ef..ef12006a48ed 100644
+--- a/hypershift-operator/controllers/nodepool/token_test.go
++++ b/hypershift-operator/controllers/nodepool/token_test.go
+@@ -101,6 +101,7 @@ func TestNewToken(t *testing.T) {
+ 				},
+ 				nodePool:              &hyperv1.NodePool{},
+ 				controlplaneNamespace: controlplaneNamespace,
++				rolloutConfig:         &rolloutConfig{},
+ 			},
+ 			fakeObjects: []crclient.Object{
+ 				pullSecret,
+@@ -132,6 +133,7 @@ func TestNewToken(t *testing.T) {
+ 				},
+ 				nodePool:              &hyperv1.NodePool{},
+ 				controlplaneNamespace: controlplaneNamespace,
++				rolloutConfig:         &rolloutConfig{},
+ 			},
+ 			fakeObjects: []crclient.Object{
+ 				pullSecret,
+@@ -163,6 +165,7 @@ func TestNewToken(t *testing.T) {
+ 				},
+ 				nodePool:              &hyperv1.NodePool{},
+ 				controlplaneNamespace: controlplaneNamespace,
++				rolloutConfig:         &rolloutConfig{},
+ 			},
+ 			fakeObjects: []crclient.Object{
+ 				additionalTrustBundle,
+@@ -193,6 +196,7 @@ func TestNewToken(t *testing.T) {
+ 				},
+ 				nodePool:              &hyperv1.NodePool{},
+ 				controlplaneNamespace: controlplaneNamespace,
++				rolloutConfig:         &rolloutConfig{},
+ 			},
+ 			fakeObjects: []crclient.Object{
+ 				pullSecret,
+@@ -223,6 +227,7 @@ func TestNewToken(t *testing.T) {
+ 				},
+ 				nodePool:              &hyperv1.NodePool{},
+ 				controlplaneNamespace: controlplaneNamespace,
++				rolloutConfig:         &rolloutConfig{},
+ 			},
+ 			fakeObjects: []crclient.Object{
+ 				pullSecret,
+@@ -264,6 +269,7 @@ func TestNewToken(t *testing.T) {
+ 				},
+ 				nodePool:              &hyperv1.NodePool{},
+ 				controlplaneNamespace: controlplaneNamespace,
++				rolloutConfig:         &rolloutConfig{},
+ 			},
+ 			fakeObjects: []crclient.Object{
+ 				pullSecret,
+@@ -369,6 +375,7 @@ func TestTokenCleanupOutdated(t *testing.T) {
+ 						},
+ 					},
+ 					controlplaneNamespace: controlplaneNamespace,
++					rolloutConfig:         &rolloutConfig{},
+ 				},
+ 			},
+ 			fakeObjects: []crclient.Object{
+@@ -395,6 +402,7 @@ func TestTokenCleanupOutdated(t *testing.T) {
+ 						},
+ 					},
+ 					controlplaneNamespace: controlplaneNamespace,
++					rolloutConfig:         &rolloutConfig{},
+ 				},
+ 			},
+ 			fakeObjects:   []crclient.Object{},
+@@ -418,6 +426,7 @@ func TestTokenCleanupOutdated(t *testing.T) {
+ 						},
+ 					},
+ 					controlplaneNamespace: controlplaneNamespace,
++					rolloutConfig:         &rolloutConfig{},
+ 				},
+ 			},
+ 			fakeObjects: []crclient.Object{
+diff --git a/ignition-server/cmd/run_local_ignitionprovider.go b/ignition-server/cmd/run_local_ignitionprovider.go
+index 5453957ff10e..47b41a43401b 100644
+--- a/ignition-server/cmd/run_local_ignitionprovider.go
++++ b/ignition-server/cmd/run_local_ignitionprovider.go
+@@ -112,7 +112,7 @@ func (o *RunLocalIgnitionProviderOptions) Run(ctx context.Context) error {
+ 	}
+ 
+ 	osStream := string(token.Data[controllers.TokenSecretOSStreamKey])
+-	payload, err := p.GetPayload(ctx, o.Image, config.String(), "", "", "", osStream)
++	payload, err := p.GetPayload(ctx, o.Image, config.String(), "", "", "", osStream, "")
+ 	if err != nil {
+ 		return err
+ 	}
+diff --git a/ignition-server/controllers/cache.go b/ignition-server/controllers/cache.go
+index ba3ef0567b92..6811494189bc 100644
+--- a/ignition-server/controllers/cache.go
++++ b/ignition-server/controllers/cache.go
+@@ -32,8 +32,9 @@ type ExpiringCache struct {
+ }
+ 
+ type CacheValue struct {
+-	Payload    []byte
+-	SecretName string
++	Payload         []byte
++	SecretName      string
++	CloudConfigHash string
+ }
+ 
+ type entry struct {
+diff --git a/ignition-server/controllers/local_ignitionprovider.go b/ignition-server/controllers/local_ignitionprovider.go
+index 71a6944bbeb2..09efbed64c3a 100644
+--- a/ignition-server/controllers/local_ignitionprovider.go
++++ b/ignition-server/controllers/local_ignitionprovider.go
+@@ -300,8 +300,10 @@ func (p *LocalIgnitionProvider) extractImageReferences(ctx context.Context, rele
+ 	return releaseImage, nil
+ }
+ 
+-// For Azure and OpenStack, extract the cloud provider config file as MCO input
+-func (p *LocalIgnitionProvider) writeCloudProviderConfig(ctx context.Context, mcoDir string) error {
++// For Azure and OpenStack, extract the cloud provider config file as MCO input.
++// When cloudConfigHash is non-empty, the ConfigMap content is verified against the hash
++// before writing to ensure the ignition server does not serve stale cloud config.
++func (p *LocalIgnitionProvider) writeCloudProviderConfig(ctx context.Context, mcoDir, cloudConfigHash string) error {
+ 	if p.CloudProvider != hyperv1.AzurePlatform && p.CloudProvider != hyperv1.OpenStackPlatform {
+ 		return nil
+ 	}
+@@ -316,6 +318,13 @@ func (p *LocalIgnitionProvider) writeCloudProviderConfig(ctx context.Context, mc
+ 			return fmt.Errorf("failed to get cloud provider configmap: %w", err)
+ 		}
+ 	}
++	if cloudConfigHash != "" {
++		actualHash := util.HashConfigMapData(cloudConfigMap.Data)
++		if actualHash != cloudConfigHash {
++			return fmt.Errorf("cloud config %s/%s hash mismatch (expected %s, got %s), waiting for update",
++				cloudConfigMap.Namespace, cloudConfigMap.Name, cloudConfigHash, actualHash)
++		}
++	}
+ 	cloudConfYaml, err := yaml.Marshal(cloudConfigMap)
+ 	if err != nil {
+ 		return fmt.Errorf("failed to marshal cloud config: %w", err)
+@@ -607,7 +616,7 @@ func (p *LocalIgnitionProvider) runMCSAndFetchPayload(ctx context.Context, dirs
+ 	return payload, err
+ }
+ 
+-func (p *LocalIgnitionProvider) GetPayload(ctx context.Context, releaseImage, customConfig, pullSecretHash, additionalTrustBundleHash, hcConfigurationHash, osStream string) ([]byte, error) {
++func (p *LocalIgnitionProvider) GetPayload(ctx context.Context, releaseImage, customConfig, pullSecretHash, additionalTrustBundleHash, hcConfigurationHash, osStream, cloudConfigHash string) ([]byte, error) {
+ 	p.lock.Lock()
+ 	defer p.lock.Unlock()
+ 
+@@ -682,7 +691,7 @@ func (p *LocalIgnitionProvider) GetPayload(ctx context.Context, releaseImage, cu
+ 		return nil, fmt.Errorf("failed to extract image-references from image: %w", err)
+ 	}
+ 
+-	if err := p.writeCloudProviderConfig(ctx, dirs.mcoDir); err != nil {
++	if err := p.writeCloudProviderConfig(ctx, dirs.mcoDir, cloudConfigHash); err != nil {
+ 		return nil, err
+ 	}
+ 
+diff --git a/ignition-server/controllers/local_ignitionprovider_test.go b/ignition-server/controllers/local_ignitionprovider_test.go
+index 7eff382c04d5..95fc76d6953d 100644
+--- a/ignition-server/controllers/local_ignitionprovider_test.go
++++ b/ignition-server/controllers/local_ignitionprovider_test.go
+@@ -16,6 +16,7 @@ import (
+ 
+ 	hyperv1 "github.com/openshift/hypershift/api/hypershift/v1beta1"
+ 	"github.com/openshift/hypershift/control-plane-operator/controllers/hostedcontrolplane/imageprovider"
++	"github.com/openshift/hypershift/support/util"
+ 
+ 	corev1 "k8s.io/api/core/v1"
+ 	"k8s.io/apimachinery/pkg/api/meta"
+@@ -1105,11 +1106,12 @@ func TestWriteCloudProviderConfig(t *testing.T) {
+ 	t.Parallel()
+ 
+ 	tests := []struct {
+-		name          string
+-		cloudProvider hyperv1.PlatformType
+-		objects       []client.Object
+-		expectFile    bool
+-		expectError   string
++		name            string
++		cloudProvider   hyperv1.PlatformType
++		objects         []client.Object
++		cloudConfigHash string
++		expectFile      bool
++		expectError     string
+ 	}{
+ 		{
+ 			name:          "When cloud provider is AWS, it should return nil without writing any file",
+@@ -1149,6 +1151,30 @@ func TestWriteCloudProviderConfig(t *testing.T) {
+ 			objects:       []client.Object{},
+ 			expectError:   "failed to get cloud provider configmap",
+ 		},
++		{
++			name:          "When cloud provider is Azure and hash matches, it should write cloud config file",
++			cloudProvider: hyperv1.AzurePlatform,
++			objects: []client.Object{
++				&corev1.ConfigMap{
++					ObjectMeta: metav1.ObjectMeta{Name: "azure-cloud-config", Namespace: "test-ns"},
++					Data:       map[string]string{"cloud.conf": "azure-config-data"},
++				},
++			},
++			cloudConfigHash: util.HashConfigMapData(map[string]string{"cloud.conf": "azure-config-data"}),
++			expectFile:      true,
++		},
++		{
++			name:          "When cloud provider is Azure and hash does not match, it should return an error",
++			cloudProvider: hyperv1.AzurePlatform,
++			objects: []client.Object{
++				&corev1.ConfigMap{
++					ObjectMeta: metav1.ObjectMeta{Name: "azure-cloud-config", Namespace: "test-ns"},
++					Data:       map[string]string{"cloud.conf": "azure-config-data"},
++				},
++			},
++			cloudConfigHash: "wrong-hash",
++			expectError:     "hash mismatch",
++		},
+ 	}
+ 
+ 	for _, tt := range tests {
+@@ -1165,7 +1191,7 @@ func TestWriteCloudProviderConfig(t *testing.T) {
+ 				CloudProvider: tt.cloudProvider,
+ 			}
+ 
+-			err := provider.writeCloudProviderConfig(t.Context(), mcoDir)
++			err := provider.writeCloudProviderConfig(t.Context(), mcoDir, tt.cloudConfigHash)
+ 			if tt.expectError != "" {
+ 				g.Expect(err).To(HaveOccurred())
+ 				g.Expect(err.Error()).To(ContainSubstring(tt.expectError))
+diff --git a/ignition-server/controllers/tokensecret_controller.go b/ignition-server/controllers/tokensecret_controller.go
+index a527ea1f137a..92c8a4d69e42 100644
+--- a/ignition-server/controllers/tokensecret_controller.go
++++ b/ignition-server/controllers/tokensecret_controller.go
+@@ -35,7 +35,9 @@ const (
+ 	TokenSecretPullSecretHashKey            = "pull-secret-hash"
+ 	TokenSecretHCConfigurationHashKey       = "hc-configuration-hash"
+ 	TokenSecretAdditionalTrustBundleHashKey = "additional-trust-bundle-hash"
++	TokenSecretCloudConfigHashKey           = "cloud-config-hash"
+ 	InvalidConfigReason                     = "InvalidConfig"
++	CloudConfigPendingReason                = "CloudConfigPending"
+ 	TokenSecretReasonKey                    = "reason"
+ 	// TokenSecretOSStreamKey is intentionally duplicated from nodepool/token.go
+ 	// to avoid a dependency from ignition-server → hypershift-operator.
+@@ -88,7 +90,7 @@ func NewPayloadStore() *ExpiringCache {
+ type IgnitionProvider interface {
+ 	// GetPayload returns the ignition payload content for
+ 	// the provided release image and a config string containing 0..N MachineConfig yaml definitions.
+-	GetPayload(ctx context.Context, payloadImage, config, pullSecretHash, additionalTrustBundleHash, hcConfigurationHash, osStream string) ([]byte, error)
++	GetPayload(ctx context.Context, payloadImage, config, pullSecretHash, additionalTrustBundleHash, hcConfigurationHash, osStream, cloudConfigHash string) ([]byte, error)
+ }
+ 
+ // TokenSecretReconciler watches token Secrets
+@@ -231,25 +233,35 @@ func (r *TokenSecretReconciler) Reconcile(ctx context.Context, req ctrl.Request)
+ 	}
+ 
+ 	token := string(tokenSecret.Data[TokenSecretTokenKey])
++	cloudConfigHash := string(tokenSecret.Data[TokenSecretCloudConfigHashKey])
+ 	if value, ok := r.PayloadStore.Get(token); ok {
+-		log.Info("Payload found in cache")
+-
+-		if tokenNeedRotation(timeLived) {
+-			log.Info("Rotating token ID")
+-			if err := r.rotateToken(ctx, tokenSecret, value, now); err != nil {
+-				return ctrl.Result{}, err
++		if value.CloudConfigHash != cloudConfigHash {
++			log.Info("Cloud config hash changed, invalidating cached payload")
++			r.PayloadStore.Delete(token)
++		} else {
++			log.Info("Payload found in cache")
++
++			if tokenNeedRotation(timeLived) {
++				log.Info("Rotating token ID")
++				if err := r.rotateToken(ctx, tokenSecret, value, now); err != nil {
++					return ctrl.Result{}, err
++				}
++				TokenRotationTotal.Inc()
+ 			}
+-			TokenRotationTotal.Inc()
++			return ctrl.Result{RequeueAfter: ttl/2 - durationDeref(timeLived)}, nil
+ 		}
+-		return ctrl.Result{RequeueAfter: ttl/2 - durationDeref(timeLived)}, nil
+ 	}
+ 
+ 	// If something else rotated the token (e.g. running in HA), we fall back to set the cache value from the old one.
+ 	oldToken, ok := tokenSecret.Data[TokenSecretOldTokenKey]
+ 	if ok {
+ 		if value, ok := r.PayloadStore.Get(string(oldToken)); ok {
+-			r.PayloadStore.Set(token, value)
+-			return ctrl.Result{RequeueAfter: ttl/2 - durationDeref(timeLived)}, nil
++			if value.CloudConfigHash == cloudConfigHash {
++				r.PayloadStore.Set(token, value)
++				return ctrl.Result{RequeueAfter: ttl/2 - durationDeref(timeLived)}, nil
++			}
++			log.Info("Cloud config hash changed, invalidating old token cached payload")
++			r.PayloadStore.Delete(string(oldToken))
+ 		}
+ 	}
+ 
+@@ -279,7 +291,7 @@ func (r *TokenSecretReconciler) Reconcile(ctx context.Context, req ctrl.Request)
+ 	osStream := string(tokenSecret.Data[TokenSecretOSStreamKey])
+ 	payload, err := func() ([]byte, error) {
+ 		start := time.Now()
+-		payload, err := r.IgnitionProvider.GetPayload(ctx, releaseImage, config.String(), pullSecretHash, additionalTrustBundleHash, hcConfigurationHash, osStream)
++		payload, err := r.IgnitionProvider.GetPayload(ctx, releaseImage, config.String(), pullSecretHash, additionalTrustBundleHash, hcConfigurationHash, osStream, cloudConfigHash)
+ 		if err != nil {
+ 			return nil, fmt.Errorf("error getting ignition payload: %w", err)
+ 		}
+@@ -292,12 +304,16 @@ func (r *TokenSecretReconciler) Reconcile(ctx context.Context, req ctrl.Request)
+ 		// This patch could flood the API server, so we should only do it when the reason or message is different from the current one.
+ 		// More info here: https://issues.redhat.com/browse/OCPBUGS-42320.
+ 		errWithFullMsg := fmt.Errorf("failed to generate payload: %w", err)
+-		if hasSameReasonAndMessage(tokenSecret, InvalidConfigReason, errWithFullMsg) {
++		reason := InvalidConfigReason
++		if strings.Contains(err.Error(), "hash mismatch") {
++			reason = CloudConfigPendingReason
++		}
++		if hasSameReasonAndMessage(tokenSecret, reason, errWithFullMsg) {
+ 			return ctrl.Result{}, errWithFullMsg
+ 		}
+ 
+ 		patch := tokenSecret.DeepCopy()
+-		patch.Data[TokenSecretReasonKey] = []byte(InvalidConfigReason)
++		patch.Data[TokenSecretReasonKey] = []byte(reason)
+ 		patch.Data[TokenSecretMessageKey] = []byte(errWithFullMsg.Error())
+ 		if err := r.Client.Patch(ctx, patch, client.MergeFrom(tokenSecret)); err != nil {
+ 			return ctrl.Result{}, fmt.Errorf("failed to patch tokenSecret with payload content: %w", err)
+@@ -307,12 +323,13 @@ func (r *TokenSecretReconciler) Reconcile(ctx context.Context, req ctrl.Request)
+ 	}
+ 
+ 	log.Info("IgnitionProvider generated payload")
+-	r.PayloadStore.Set(token, CacheValue{Payload: payload, SecretName: tokenSecret.Name})
++	cacheValue := CacheValue{Payload: payload, SecretName: tokenSecret.Name, CloudConfigHash: cloudConfigHash}
++	r.PayloadStore.Set(token, cacheValue)
+ 	oldToken, ok = tokenSecret.Data[TokenSecretOldTokenKey]
+ 	if ok {
+ 		// If we got here and there's an old token e.g. ignition server pod was restarted, then we set it as well
+ 		// So Machines that were given that token right before the restart can succeed.
+-		r.PayloadStore.Set(string(oldToken), CacheValue{Payload: payload, SecretName: tokenSecret.Name})
++		r.PayloadStore.Set(string(oldToken), cacheValue)
+ 	}
+ 
+ 	patch := tokenSecret.DeepCopy()
+diff --git a/ignition-server/controllers/tokensecret_controller_test.go b/ignition-server/controllers/tokensecret_controller_test.go
+index e06b06e49cc6..04236a165b0a 100644
+--- a/ignition-server/controllers/tokensecret_controller_test.go
++++ b/ignition-server/controllers/tokensecret_controller_test.go
+@@ -30,7 +30,7 @@ var (
+ 
+ type fakeIgnitionProvider struct{}
+ 
+-func (p *fakeIgnitionProvider) GetPayload(ctx context.Context, releaseImage, config, pullSecretHash, additionalTrustBundleHash, hcConfigurationHash, osStream string) (payload []byte, err error) {
++func (p *fakeIgnitionProvider) GetPayload(ctx context.Context, releaseImage, config, pullSecretHash, additionalTrustBundleHash, hcConfigurationHash, osStream, cloudConfigHash string) (payload []byte, err error) {
+ 	return []byte(fakePayload), nil
+ }
+ 
+@@ -694,7 +694,7 @@ type osStreamCapturingProvider struct {
+ 	capturedOSStream string
+ }
+ 
+-func (p *osStreamCapturingProvider) GetPayload(_ context.Context, _, _, _, _, _, osStream string) ([]byte, error) {
++func (p *osStreamCapturingProvider) GetPayload(_ context.Context, _, _, _, _, _, osStream, _ string) ([]byte, error) {
+ 	p.capturedOSStream = osStream
+ 	return []byte(fakePayload), nil
+ }
+@@ -775,3 +775,211 @@ func TestReconcileOSStreamPropagation(t *testing.T) {
+ 		})
+ 	}
+ }
++
++func TestCacheInvalidationOnCloudConfigHashChange(t *testing.T) {
++	compressedConfig, err := util.CompressAndEncode([]byte("compressedConfig"))
++	if err != nil {
++		t.Fatal(err)
++	}
++	compressedConfigBytes := compressedConfig.Bytes()
++
++	tokenID := uuid.New().String()
++	secretName := "test"
++
++	tests := []struct {
++		name               string
++		cachedHash         string
++		secretHash         string
++		expectRegeneration bool
++	}{
++		{
++			name:               "When cloud config hash matches cached value, it should return cached payload",
++			cachedHash:         "abc123",
++			secretHash:         "abc123",
++			expectRegeneration: false,
++		},
++		{
++			name:               "When cloud config hash differs from cached value, it should regenerate payload",
++			cachedHash:         "old-hash",
++			secretHash:         "new-hash",
++			expectRegeneration: true,
++		},
++		{
++			name:               "When cloud config hash changes from non-empty to empty, it should regenerate payload",
++			cachedHash:         "some-hash",
++			secretHash:         "",
++			expectRegeneration: true,
++		},
++		{
++			name:               "When cloud config hash changes from empty to non-empty, it should regenerate payload",
++			cachedHash:         "",
++			secretHash:         "new-hash",
++			expectRegeneration: true,
++		},
++	}
++
++	for _, tt := range tests {
++		t.Run(tt.name, func(t *testing.T) {
++			g := NewWithT(t)
++
++			secret := &corev1.Secret{
++				ObjectMeta: metav1.ObjectMeta{
++					Name:      secretName,
++					Namespace: "test",
++					Annotations: map[string]string{
++						TokenSecretAnnotation:          "true",
++						TokenSecretTokenGenerationTime: time.Now().Format(time.RFC3339Nano),
++					},
++					CreationTimestamp: metav1.Now(),
++				},
++				Data: map[string][]byte{
++					TokenSecretTokenKey:           []byte(tokenID),
++					TokenSecretReleaseKey:         []byte("release"),
++					TokenSecretConfigKey:          compressedConfigBytes,
++					TokenSecretCloudConfigHashKey: []byte(tt.secretHash),
++				},
++			}
++
++			callCount := 0
++			provider := &countingIgnitionProvider{count: &callCount}
++
++			r := TokenSecretReconciler{
++				Client:           fake.NewClientBuilder().WithObjects(secret).Build(),
++				IgnitionProvider: provider,
++				PayloadStore:     NewPayloadStore(),
++			}
++
++			r.PayloadStore.Set(tokenID, CacheValue{
++				Payload:         []byte("old-payload"),
++				SecretName:      secretName,
++				CloudConfigHash: tt.cachedHash,
++			})
++
++			_, err := r.Reconcile(t.Context(), ctrl.Request{NamespacedName: client.ObjectKeyFromObject(secret)})
++			g.Expect(err).ToNot(HaveOccurred())
++
++			if tt.expectRegeneration {
++				g.Expect(callCount).To(Equal(1), "expected GetPayload to be called for regeneration")
++				value, found := r.PayloadStore.Get(tokenID)
++				g.Expect(found).To(BeTrue())
++				g.Expect(value.CloudConfigHash).To(Equal(tt.secretHash))
++			} else {
++				g.Expect(callCount).To(Equal(0), "expected cached payload to be returned without calling GetPayload")
++			}
++		})
++	}
++}
++
++func TestOldTokenFallbackWithCloudConfigHashMismatch(t *testing.T) {
++	g := NewWithT(t)
++
++	compressedConfig, err := util.CompressAndEncode([]byte("config"))
++	g.Expect(err).ToNot(HaveOccurred())
++	compressedConfigBytes := compressedConfig.Bytes()
++
++	currentToken := "current-token"
++	oldToken := "old-token"
++	secretName := "test"
++
++	secret := &corev1.Secret{
++		ObjectMeta: metav1.ObjectMeta{
++			Name:      secretName,
++			Namespace: "test",
++			Annotations: map[string]string{
++				TokenSecretAnnotation:          "true",
++				TokenSecretTokenGenerationTime: time.Now().Format(time.RFC3339Nano),
++			},
++			CreationTimestamp: metav1.Now(),
++		},
++		Data: map[string][]byte{
++			TokenSecretTokenKey:           []byte(currentToken),
++			TokenSecretOldTokenKey:        []byte(oldToken),
++			TokenSecretReleaseKey:         []byte("release"),
++			TokenSecretConfigKey:          compressedConfigBytes,
++			TokenSecretCloudConfigHashKey: []byte("new-hash"),
++		},
++	}
++
++	callCount := 0
++	provider := &countingIgnitionProvider{count: &callCount}
++
++	r := TokenSecretReconciler{
++		Client:           fake.NewClientBuilder().WithObjects(secret).Build(),
++		IgnitionProvider: provider,
++		PayloadStore:     NewPayloadStore(),
++	}
++
++	r.PayloadStore.Set(oldToken, CacheValue{
++		Payload:         []byte("old-payload"),
++		SecretName:      secretName,
++		CloudConfigHash: "old-hash",
++	})
++
++	_, err = r.Reconcile(t.Context(), ctrl.Request{NamespacedName: client.ObjectKeyFromObject(secret)})
++	g.Expect(err).ToNot(HaveOccurred())
++
++	g.Expect(callCount).To(Equal(1), "expected GetPayload to be called when old token hash mismatches")
++
++	value, found := r.PayloadStore.Get(currentToken)
++	g.Expect(found).To(BeTrue())
++	g.Expect(value.CloudConfigHash).To(Equal("new-hash"))
++
++	oldValue, found := r.PayloadStore.Get(oldToken)
++	g.Expect(found).To(BeTrue(), "old token should be re-cached with new payload after regeneration")
++	g.Expect(oldValue.CloudConfigHash).To(Equal("new-hash"), "old token cache should have updated hash")
++}
++
++type countingIgnitionProvider struct {
++	count *int
++}
++
++func (p *countingIgnitionProvider) GetPayload(_ context.Context, _, _, _, _, _, _, _ string) ([]byte, error) {
++	*p.count++
++	return []byte("regenerated-payload"), nil
++}
++
++type errorIgnitionProvider struct {
++	err error
++}
++
++func (p *errorIgnitionProvider) GetPayload(_ context.Context, _, _, _, _, _, _, _ string) ([]byte, error) {
++	return nil, p.err
++}
++
++func TestCloudConfigPendingReasonOnHashMismatch(t *testing.T) {
++	g := NewWithT(t)
++
++	compressedConfig, err := util.CompressAndEncode([]byte("config"))
++	g.Expect(err).ToNot(HaveOccurred())
++
++	secret := &corev1.Secret{
++		ObjectMeta: metav1.ObjectMeta{
++			Name:      "test",
++			Namespace: "test",
++			Annotations: map[string]string{
++				TokenSecretAnnotation:          "true",
++				TokenSecretTokenGenerationTime: time.Now().Format(time.RFC3339Nano),
++			},
++			CreationTimestamp: metav1.Now(),
++		},
++		Data: map[string][]byte{
++			TokenSecretTokenKey:           []byte("token"),
++			TokenSecretReleaseKey:         []byte("release"),
++			TokenSecretConfigKey:          compressedConfig.Bytes(),
++			TokenSecretCloudConfigHashKey: []byte("expected-hash"),
++		},
++	}
++
++	r := TokenSecretReconciler{
++		Client:           fake.NewClientBuilder().WithObjects(secret).Build(),
++		IgnitionProvider: &errorIgnitionProvider{err: fmt.Errorf("cloud config ns/name hash mismatch (expected a, got b), waiting for update")},
++		PayloadStore:     NewPayloadStore(),
++	}
++
++	_, err = r.Reconcile(t.Context(), ctrl.Request{NamespacedName: client.ObjectKeyFromObject(secret)})
++	g.Expect(err).To(HaveOccurred())
++
++	updated := &corev1.Secret{}
++	g.Expect(r.Client.Get(t.Context(), client.ObjectKeyFromObject(secret), updated)).To(Succeed())
++	g.Expect(string(updated.Data[TokenSecretReasonKey])).To(Equal(CloudConfigPendingReason))
++}
+diff --git a/support/util/util.go b/support/util/util.go
+index 5b917a90b10b..aceba4a02667 100644
+--- a/support/util/util.go
++++ b/support/util/util.go
+@@ -178,6 +178,28 @@ func InsecureHTTPClient() *http.Client {
+ 	}
+ }
+ 
++// HashConfigMapData hashes the key-value pairs of a ConfigMap's Data field
++// deterministically, using null-byte delimiters to prevent key/value collisions.
++// Returns an empty string for nil or empty maps.
++func HashConfigMapData(data map[string]string) string {
++	if len(data) == 0 {
++		return ""
++	}
++	keys := make([]string, 0, len(data))
++	for k := range data {
++		keys = append(keys, k)
++	}
++	sort.Strings(keys)
++	var b strings.Builder
++	for _, k := range keys {
++		b.WriteString(k)
++		b.WriteByte(0)
++		b.WriteString(data[k])
++		b.WriteByte(0)
++	}
++	return HashSimple(b.String())
++}
++
+ // HashSimple takes a value, typically a string, and returns a 32-bit FNV-1a hashed version of the value as a string
+ func HashSimple(o interface{}) string {
+ 	hash := fnv.New32a()
+diff --git a/support/util/util_test.go b/support/util/util_test.go
+index 102e29e87337..549cbefaf8ba 100644
+--- a/support/util/util_test.go
++++ b/support/util/util_test.go
+@@ -807,3 +807,52 @@ func TestCountAvailableNodes(t *testing.T) {
+ 		})
+ 	}
+ }
++
++func TestHashConfigMapData(t *testing.T) {
++	testCases := []struct {
++		name string
++		data map[string]string
++	}{
++		{
++			name: "When data is nil it should return empty string",
++			data: nil,
++		},
++		{
++			name: "When data is empty it should return empty string",
++			data: map[string]string{},
++		},
++	}
++	for _, tc := range testCases {
++		t.Run(tc.name, func(t *testing.T) {
++			g := NewWithT(t)
++			g.Expect(HashConfigMapData(tc.data)).To(Equal(""))
++		})
++	}
++
++	t.Run("When data has entries it should return a non-empty hash", func(t *testing.T) {
++		g := NewWithT(t)
++		hash := HashConfigMapData(map[string]string{"key": "value"})
++		g.Expect(hash).NotTo(BeEmpty())
++	})
++
++	t.Run("When same keys are inserted in different order it should return the same hash", func(t *testing.T) {
++		g := NewWithT(t)
++		h1 := HashConfigMapData(map[string]string{"a": "1", "b": "2", "c": "3"})
++		h2 := HashConfigMapData(map[string]string{"c": "3", "a": "1", "b": "2"})
++		g.Expect(h1).To(Equal(h2))
++	})
++
++	t.Run("When keys and values could collide without delimiters it should produce different hashes", func(t *testing.T) {
++		g := NewWithT(t)
++		h1 := HashConfigMapData(map[string]string{"ab": "c"})
++		h2 := HashConfigMapData(map[string]string{"a": "bc"})
++		g.Expect(h1).NotTo(Equal(h2))
++	})
++
++	t.Run("When data differs it should return different hashes", func(t *testing.T) {
++		g := NewWithT(t)
++		h1 := HashConfigMapData(map[string]string{"key": "value1"})
++		h2 := HashConfigMapData(map[string]string{"key": "value2"})
++		g.Expect(h1).NotTo(Equal(h2))
++	})
++}
