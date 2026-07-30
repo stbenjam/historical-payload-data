@@ -31,7 +31,33 @@ JOB_PATH_RE = re.compile(
 _archived_lock = threading.Lock()
 
 
+def _is_source_url(value):
+    return value == f"gs://{SOURCE_BUCKET}" or value.startswith(f"gs://{SOURCE_BUCKET}/")
+
+
+def _assert_source_bucket_read_only(args):
+    """Reject commands that could write to the source bucket."""
+    source_urls = [arg for arg in args if _is_source_url(arg)]
+    if not source_urls:
+        return
+
+    command = args[0]
+    if command in {"cat", "ls"}:
+        return
+
+    # A bucket-to-bucket copy reads from every argument except its final
+    # destination. The source bucket must never be that destination.
+    if command == "cp" and not _is_source_url(args[-1]):
+        return
+
+    raise ValueError(
+        f"refusing command that could modify read-only bucket {SOURCE_BUCKET}: "
+        f"gcloud storage {' '.join(args)}"
+    )
+
+
 def gcs_run(*args, check=False):
+    _assert_source_bucket_read_only(args)
     cmd = ["gcloud", "storage"] + list(args)
     return subprocess.run(cmd, capture_output=True, text=True, check=check)
 
@@ -61,11 +87,20 @@ def server_side_copy(job_path):
 
 def is_aggregated(job_path):
     job_name = job_path.split("/")[1] if "/" in job_path else ""
-    return job_name.startswith("aggregated-")
+    return (
+        job_name.startswith(("aggregated-", "aggregator-"))
+        or job_name.endswith("-analysis-all")
+    )
 
 
 def rewrite_and_find_refs(job_path):
-    """Download text files from dest, rewrite refs, re-upload. Returns referenced job paths."""
+    """Rewrite an aggregate job and return every referenced child job.
+
+    Aggregate jobs are small indexes over many much larger child jobs. Download
+    the aggregate index so references can be discovered in any text artifact,
+    but upload only the individual files that actually changed. Child jobs are
+    copied in full server-side and never pass through this function.
+    """
     referenced = set()
     with tempfile.TemporaryDirectory() as tmpdir:
         result = gcs_run(
@@ -96,14 +131,18 @@ def rewrite_and_find_refs(job_path):
                         f.write(rewritten)
                     modified_files.append(fpath)
 
-        if modified_files:
+        for fpath in modified_files:
+            relative_path = os.path.relpath(fpath, tmpdir)
             result = gcs_run(
-                "cp", "-r",
-                f"{tmpdir}/*",
-                f"gs://{DEST_BUCKET}/{job_path}/",
+                "cp",
+                fpath,
+                f"gs://{DEST_BUCKET}/{job_path}/{relative_path}",
             )
             if result.returncode != 0:
-                print(f"  ERROR re-uploading: {result.stderr.strip()}", file=sys.stderr)
+                print(
+                    f"  ERROR re-uploading {relative_path}: {result.stderr.strip()}",
+                    file=sys.stderr,
+                )
 
     return referenced
 
@@ -140,21 +179,32 @@ def archive_job(job_path, archived, dry_run=False, recursive=True, rewrite_only=
 
 
 def _archive_job_inner(job_path, archived, dry_run, recursive, rewrite_only, executor, pending_futures):
+    exists_in_dest = job_exists_in_dest(job_path)
 
     if rewrite_only:
-        if not job_exists_in_dest(job_path):
+        if not exists_in_dest:
             print(f"  SKIP (not in dest): {job_path}")
             return
+        if dry_run:
+            print(f"  WOULD REWRITE: {job_path}")
+            return
         print(f"  REWRITING: {job_path}")
-        rewrite_and_find_refs(job_path)
+        if is_aggregated(job_path):
+            rewrite_and_find_refs(job_path)
+        else:
+            rewrite_prowjob(job_path)
         print(f"  DONE: {job_path}")
         return
 
-    if job_exists_in_dest(job_path):
+    if exists_in_dest:
         print(f"  SKIP (already archived): {job_path}")
+        if dry_run:
+            return
         if recursive and is_aggregated(job_path):
             referenced = rewrite_and_find_refs(job_path)
             _queue_refs(referenced, archived, dry_run, recursive, rewrite_only, executor, pending_futures)
+        elif not is_aggregated(job_path):
+            rewrite_prowjob(job_path)
         return
 
     if not job_exists_in_source(job_path):
@@ -170,7 +220,11 @@ def _archive_job_inner(job_path, archived, dry_run, recursive, rewrite_only, exe
     if not server_side_copy(job_path):
         return
 
-    referenced = rewrite_and_find_refs(job_path)
+    referenced = set()
+    if is_aggregated(job_path):
+        referenced = rewrite_and_find_refs(job_path)
+    else:
+        rewrite_prowjob(job_path)
 
     print(f"  DONE: {job_path}")
 
@@ -308,7 +362,10 @@ def main():
     )
     parser.add_argument(
         "--rewrite", action="store_true",
-        help="Rewrite all text files in already-archived jobs (use with job paths or --from-snapshot)",
+        help=(
+            "Rewrite aggregate metadata or prowjob.json in already-archived jobs "
+            "(use with job paths or --from-snapshot)"
+        ),
     )
     args = parser.parse_args()
 

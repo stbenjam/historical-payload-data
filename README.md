@@ -30,9 +30,10 @@ python3 hack/archive-job.py --from-snapshot <payload-tag>/ --parallel 8
 
 The script will:
 - Extract all job paths from the snapshot's JSON files
-- Copy each job's artifacts from `test-platform-results` to `prow-artifact-archive` via server-side GCS copy
-- Rewrite `prowjob.json` to reference the new bucket
-- For `aggregated-*` jobs, rewrite all text files and recursively archive dependent jobs
+- Copy every artifact for every job from `test-platform-results` to `prow-artifact-archive` via server-side GCS copy; artifacts are not filtered or minimized
+- Treat `test-platform-results` as strictly read-only, with a code-level guard against using it as a write target
+- Rewrite only each regular job's `prowjob.json` locally
+- Inspect aggregate index jobs (`aggregated-*`, `aggregator-*`, and `*-analysis-all`), rewrite their references, and recursively archive every dependent job in full
 
 Jobs already in `prow-artifact-archive` are skipped automatically, so re-running is safe.
 
@@ -51,7 +52,7 @@ Reusable script for copying Prow jobs between GCS buckets with reference rewriti
 ```
 usage: archive-job.py [-h] [--from-file FILE] [--from-snapshot DIR]
                       [--dry-run] [--no-recursive] [--parallel N]
-                      [--fix-prowjobs] [jobs ...]
+                      [--fix-prowjobs] [--rewrite] [jobs ...]
 
   jobs                      Job path(s), e.g. logs/<job-name>/<build-id>
   --from-file, -f FILE      Read job paths from a file (one per line)
@@ -60,4 +61,6 @@ usage: archive-job.py [-h] [--from-file FILE] [--from-snapshot DIR]
   --no-recursive            Don't recursively archive referenced jobs
   --parallel, -p N          Number of jobs to archive in parallel (default: 4)
   --fix-prowjobs            Rewrite prowjob.json for all jobs in dest bucket
+  --rewrite                 Rewrite aggregate metadata or prowjob.json in
+                            already-archived jobs
 ```
