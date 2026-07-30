@@ -34,8 +34,13 @@ The script will:
 - Treat `test-platform-results` as strictly read-only, with a code-level guard against using it as a write target
 - Rewrite only each regular job's `prowjob.json` locally
 - Inspect aggregate index jobs (`aggregated-*`, `aggregator-*`, and `*-analysis-all`), rewrite their references, and recursively archive every dependent job in full
+- Write `.archive-complete.json` only after the server-side copy finishes
 
-Jobs already in `prow-artifact-archive` are skipped automatically, so re-running is safe.
+Jobs with a completion marker are skipped automatically. An unmarked job is
+re-copied server-side when its source still exists, repairing interrupted and
+legacy copies without downloading their artifact trees. If the source has
+already expired, the unmarked destination is retained and clearly reported
+rather than being presented as verified.
 
 ### 3. Commit the snapshot
 

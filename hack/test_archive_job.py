@@ -93,6 +93,10 @@ class RewriteTests(unittest.TestCase):
                     "logs/child-job/1234567890123456"
                 )
                 (local_dir / "unchanged.log").write_text("complete haystack")
+                (local_dir / archive_job.COMPLETE_MARKER).write_text(
+                    '{"source":"gs://test-platform-results/logs/'
+                    'aggregated-job/9999999999999999/"}'
+                )
             return completed(*args)
 
         gcs_run.side_effect = run
@@ -136,91 +140,185 @@ class RewriteTests(unittest.TestCase):
         self.assertTrue(upload_call[-1].startswith("gs://prow-artifact-archive/"))
         self.assertNotIn("gs://test-platform-results/", upload_call[-1])
 
+    @mock.patch.object(archive_job, "gcs_run")
+    def test_completion_marker_is_written_only_to_archive(self, gcs_run):
+        uploaded_marker = {}
 
-class ArchiveFlowTests(unittest.TestCase):
-    @mock.patch.object(archive_job, "_queue_refs")
-    @mock.patch.object(archive_job, "rewrite_and_find_refs")
-    @mock.patch.object(archive_job, "rewrite_prowjob")
-    @mock.patch.object(archive_job, "server_side_copy")
-    @mock.patch.object(archive_job, "job_exists_in_source")
-    @mock.patch.object(archive_job, "job_exists_in_dest", return_value=True)
-    def test_dry_run_never_rewrites_existing_archive(
-        self,
-        _exists_dest,
-        exists_source,
-        server_side_copy,
-        rewrite_prowjob,
-        rewrite_and_find_refs,
-        queue_refs,
-    ):
-        archive_job._archive_job_inner(
-            "logs/aggregated-gcp-job/9999999999999999",
-            set(),
-            True,
-            True,
-            False,
-            None,
-            None,
+        def run(*args, **_kwargs):
+            uploaded_marker["destination"] = args[-1]
+            uploaded_marker["content"] = pathlib.Path(args[-2]).read_text()
+            return completed(*args)
+
+        gcs_run.side_effect = run
+
+        self.assertTrue(
+            archive_job.mark_job_complete("logs/job/1234567890123456")
         )
 
+        self.assertEqual(
+            uploaded_marker["destination"],
+            "gs://prow-artifact-archive/logs/job/1234567890123456/"
+            ".archive-complete.json",
+        )
+        self.assertIn(
+            "gs://test-platform-results/logs/job/1234567890123456/",
+            uploaded_marker["content"],
+        )
+
+
+class ArchiveFlowTests(unittest.TestCase):
+    def test_dry_run_never_rewrites_completed_archive(self):
+        with (
+            mock.patch.object(
+                archive_job, "job_is_complete_in_dest", return_value=True
+            ),
+            mock.patch.object(archive_job, "job_exists_in_dest") as exists_dest,
+            mock.patch.object(archive_job, "job_exists_in_source") as exists_source,
+            mock.patch.object(archive_job, "server_side_copy") as server_side_copy,
+            mock.patch.object(archive_job, "rewrite_prowjob") as rewrite_prowjob,
+            mock.patch.object(
+                archive_job, "rewrite_and_find_refs"
+            ) as rewrite_and_find_refs,
+            mock.patch.object(archive_job, "_queue_refs") as queue_refs,
+        ):
+            archive_job._archive_job_inner(
+                "logs/aggregated-gcp-job/9999999999999999",
+                set(),
+                True,
+                True,
+                False,
+                None,
+                None,
+            )
+
+        exists_dest.assert_not_called()
         exists_source.assert_not_called()
         server_side_copy.assert_not_called()
         rewrite_prowjob.assert_not_called()
         rewrite_and_find_refs.assert_not_called()
         queue_refs.assert_not_called()
 
-    @mock.patch.object(archive_job, "_queue_refs")
-    @mock.patch.object(archive_job, "rewrite_and_find_refs")
-    @mock.patch.object(archive_job, "rewrite_prowjob")
-    @mock.patch.object(archive_job, "server_side_copy", return_value=True)
-    @mock.patch.object(archive_job, "job_exists_in_source", return_value=True)
-    @mock.patch.object(archive_job, "job_exists_in_dest", return_value=False)
-    def test_regular_job_never_uses_recursive_rewrite(
-        self,
-        _exists_dest,
-        _exists_source,
-        _copy,
-        rewrite_prowjob,
-        rewrite_and_find_refs,
-        queue_refs,
-    ):
+    def test_regular_job_never_uses_recursive_rewrite(self):
         job_path = "logs/periodic-ci-e2e/1234567890123456"
 
-        archive_job._archive_job_inner(
-            job_path, set(), False, True, False, None, None
-        )
+        with (
+            mock.patch.object(
+                archive_job, "job_is_complete_in_dest", return_value=False
+            ),
+            mock.patch.object(
+                archive_job, "job_exists_in_dest", return_value=False
+            ),
+            mock.patch.object(
+                archive_job, "job_exists_in_source", return_value=True
+            ),
+            mock.patch.object(
+                archive_job, "server_side_copy", return_value=True
+            ),
+            mock.patch.object(archive_job, "rewrite_prowjob") as rewrite_prowjob,
+            mock.patch.object(
+                archive_job, "rewrite_and_find_refs"
+            ) as rewrite_and_find_refs,
+            mock.patch.object(
+                archive_job, "mark_job_complete", return_value=True
+            ) as mark_job_complete,
+            mock.patch.object(archive_job, "_queue_refs") as queue_refs,
+        ):
+            archive_job._archive_job_inner(
+                job_path, set(), False, True, False, None, None
+            )
 
         rewrite_prowjob.assert_called_once_with(job_path)
         rewrite_and_find_refs.assert_not_called()
+        mark_job_complete.assert_called_once_with(job_path)
         queue_refs.assert_not_called()
 
-    @mock.patch.object(archive_job, "_queue_refs")
-    @mock.patch.object(
-        archive_job,
-        "rewrite_and_find_refs",
-        return_value={"logs/child/1234567890123456"},
-    )
-    @mock.patch.object(archive_job, "rewrite_prowjob")
-    @mock.patch.object(archive_job, "server_side_copy", return_value=True)
-    @mock.patch.object(archive_job, "job_exists_in_source", return_value=True)
-    @mock.patch.object(archive_job, "job_exists_in_dest", return_value=False)
-    def test_aggregate_discovers_children_after_server_side_copy(
-        self,
-        _exists_dest,
-        _exists_source,
-        _copy,
-        rewrite_prowjob,
-        rewrite_and_find_refs,
-        queue_refs,
-    ):
+    def test_unmarked_destination_is_repaired_before_marking_complete(self):
+        job_path = "logs/periodic-ci-e2e/1234567890123456"
+
+        with (
+            mock.patch.object(
+                archive_job, "job_is_complete_in_dest", return_value=False
+            ),
+            mock.patch.object(
+                archive_job, "job_exists_in_dest", return_value=True
+            ),
+            mock.patch.object(
+                archive_job, "job_exists_in_source", return_value=True
+            ),
+            mock.patch.object(
+                archive_job, "server_side_copy", return_value=True
+            ) as server_side_copy,
+            mock.patch.object(archive_job, "rewrite_prowjob"),
+            mock.patch.object(
+                archive_job, "mark_job_complete", return_value=True
+            ) as mark_job_complete,
+        ):
+            archive_job._archive_job_inner(
+                job_path, set(), False, True, False, None, None
+            )
+
+        server_side_copy.assert_called_once_with(job_path)
+        mark_job_complete.assert_called_once_with(job_path)
+
+    def test_unmarked_legacy_destination_survives_missing_source(self):
+        job_path = "logs/periodic-ci-e2e/1234567890123456"
+
+        with (
+            mock.patch.object(
+                archive_job, "job_is_complete_in_dest", return_value=False
+            ),
+            mock.patch.object(
+                archive_job, "job_exists_in_dest", return_value=True
+            ),
+            mock.patch.object(
+                archive_job, "job_exists_in_source", return_value=False
+            ),
+            mock.patch.object(archive_job, "server_side_copy") as server_side_copy,
+            mock.patch.object(archive_job, "rewrite_prowjob") as rewrite_prowjob,
+            mock.patch.object(archive_job, "mark_job_complete") as mark_job_complete,
+        ):
+            archive_job._archive_job_inner(
+                job_path, set(), False, True, False, None, None
+            )
+
+        server_side_copy.assert_not_called()
+        rewrite_prowjob.assert_called_once_with(job_path)
+        mark_job_complete.assert_not_called()
+
+    def test_aggregate_discovers_children_after_server_side_copy(self):
         job_path = "logs/aggregated-gcp-job/9999999999999999"
 
-        archive_job._archive_job_inner(
-            job_path, set(), False, True, False, None, None
-        )
+        with (
+            mock.patch.object(
+                archive_job, "job_is_complete_in_dest", return_value=False
+            ),
+            mock.patch.object(
+                archive_job, "job_exists_in_dest", return_value=False
+            ),
+            mock.patch.object(
+                archive_job, "job_exists_in_source", return_value=True
+            ),
+            mock.patch.object(
+                archive_job, "server_side_copy", return_value=True
+            ),
+            mock.patch.object(archive_job, "rewrite_prowjob") as rewrite_prowjob,
+            mock.patch.object(
+                archive_job,
+                "rewrite_and_find_refs",
+                return_value={"logs/child/1234567890123456"},
+            ) as rewrite_and_find_refs,
+            mock.patch.object(
+                archive_job, "mark_job_complete", return_value=True
+            ) as mark_job_complete,
+            mock.patch.object(archive_job, "_queue_refs") as queue_refs,
+        ):
+            archive_job._archive_job_inner(
+                job_path, set(), False, True, False, None, None
+            )
 
         rewrite_and_find_refs.assert_called_once_with(job_path)
         rewrite_prowjob.assert_not_called()
+        mark_job_complete.assert_called_once_with(job_path)
         queue_refs.assert_called_once()
 
 

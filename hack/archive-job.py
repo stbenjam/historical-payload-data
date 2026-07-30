@@ -23,6 +23,7 @@ print = functools.partial(print, flush=True)
 
 SOURCE_BUCKET = "test-platform-results"
 DEST_BUCKET = "prow-artifact-archive"
+COMPLETE_MARKER = ".archive-complete.json"
 
 JOB_PATH_RE = re.compile(
     r"(?:test-platform-results|prow-artifact-archive)/((?:logs|pr-logs)/[a-zA-Z0-9/._-]+?/\d{16,})"
@@ -67,6 +68,11 @@ def job_exists_in_dest(job_path):
     return result.returncode == 0
 
 
+def job_is_complete_in_dest(job_path):
+    result = gcs_run("ls", f"gs://{DEST_BUCKET}/{job_path}/{COMPLETE_MARKER}")
+    return result.returncode == 0
+
+
 def job_exists_in_source(job_path):
     result = gcs_run("ls", f"gs://{SOURCE_BUCKET}/{job_path}/started.json")
     return result.returncode == 0
@@ -81,6 +87,32 @@ def server_side_copy(job_path):
     )
     if result.returncode != 0:
         print(f"  ERROR copying: {result.stderr.strip()}", file=sys.stderr)
+        return False
+    return True
+
+
+def mark_job_complete(job_path):
+    """Record that the full server-side copy finished successfully."""
+    marker = {
+        "version": 1,
+        "completed_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+        "source": f"gs://{SOURCE_BUCKET}/{job_path}/",
+        "destination": f"gs://{DEST_BUCKET}/{job_path}/",
+    }
+    marker_path = f"gs://{DEST_BUCKET}/{job_path}/{COMPLETE_MARKER}"
+    with tempfile.NamedTemporaryFile(mode="w", suffix=".json", delete=False) as f:
+        json.dump(marker, f, indent=2, sort_keys=True)
+        f.write("\n")
+        tmppath = f.name
+    try:
+        result = gcs_run("cp", tmppath, marker_path)
+    finally:
+        os.unlink(tmppath)
+    if result.returncode != 0:
+        print(
+            f"  ERROR writing completion marker: {result.stderr.strip()}",
+            file=sys.stderr,
+        )
         return False
     return True
 
@@ -116,6 +148,8 @@ def rewrite_and_find_refs(job_path):
         for root, _dirs, files in os.walk(tmpdir):
             for fname in files:
                 fpath = os.path.join(root, fname)
+                if os.path.relpath(fpath, tmpdir) == COMPLETE_MARKER:
+                    continue
                 try:
                     with open(fpath, "r", encoding="utf-8", errors="strict") as f:
                         content = f.read()
@@ -179,7 +213,8 @@ def archive_job(job_path, archived, dry_run=False, recursive=True, rewrite_only=
 
 
 def _archive_job_inner(job_path, archived, dry_run, recursive, rewrite_only, executor, pending_futures):
-    exists_in_dest = job_exists_in_dest(job_path)
+    complete_in_dest = job_is_complete_in_dest(job_path)
+    exists_in_dest = complete_in_dest or job_exists_in_dest(job_path)
 
     if rewrite_only:
         if not exists_in_dest:
@@ -196,7 +231,7 @@ def _archive_job_inner(job_path, archived, dry_run, recursive, rewrite_only, exe
         print(f"  DONE: {job_path}")
         return
 
-    if exists_in_dest:
+    if complete_in_dest:
         print(f"  SKIP (already archived): {job_path}")
         if dry_run:
             return
@@ -207,15 +242,39 @@ def _archive_job_inner(job_path, archived, dry_run, recursive, rewrite_only, exe
             rewrite_prowjob(job_path)
         return
 
-    if not job_exists_in_source(job_path):
-        print(f"  SKIP (not in source): {job_path}")
+    exists_in_source = job_exists_in_source(job_path)
+    if not exists_in_source and exists_in_dest:
+        print(f"  WARNING (unmarked archive; source unavailable): {job_path}")
+        if dry_run:
+            return
+        referenced = set()
+        if is_aggregated(job_path):
+            referenced = rewrite_and_find_refs(job_path)
+        else:
+            rewrite_prowjob(job_path)
+        if recursive and referenced:
+            _queue_refs(
+                referenced,
+                archived,
+                dry_run,
+                recursive,
+                rewrite_only,
+                executor,
+                pending_futures,
+            )
+        return
+
+    if not exists_in_source:
+        print(f"  SKIP (not in source or dest): {job_path}")
         return
 
     if dry_run:
-        print(f"  WOULD ARCHIVE: {job_path}")
+        action = "REPAIR" if exists_in_dest else "ARCHIVE"
+        print(f"  WOULD {action}: {job_path}")
         return
 
-    print(f"  ARCHIVING: {job_path}")
+    action = "REPAIRING" if exists_in_dest else "ARCHIVING"
+    print(f"  {action}: {job_path}")
 
     if not server_side_copy(job_path):
         return
@@ -225,6 +284,9 @@ def _archive_job_inner(job_path, archived, dry_run, recursive, rewrite_only, exe
         referenced = rewrite_and_find_refs(job_path)
     else:
         rewrite_prowjob(job_path)
+
+    if not mark_job_complete(job_path):
+        return
 
     print(f"  DONE: {job_path}")
 
