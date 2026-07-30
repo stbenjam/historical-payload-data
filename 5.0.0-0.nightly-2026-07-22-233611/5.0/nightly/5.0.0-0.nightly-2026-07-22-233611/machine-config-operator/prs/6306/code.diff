@@ -1,0 +1,1733 @@
+diff --git a/cmd/machine-config-controller/start.go b/cmd/machine-config-controller/start.go
+index 17166336c0..f1fb015b43 100644
+--- a/cmd/machine-config-controller/start.go
++++ b/cmd/machine-config-controller/start.go
+@@ -5,6 +5,8 @@ import (
+ 	"flag"
+ 	"fmt"
+ 	"os"
++	"path"
++	"time"
+ 
+ 	features "github.com/openshift/api/features"
+ 	mcfginformersv1 "github.com/openshift/client-go/machineconfiguration/informers/externalversions/machineconfiguration/v1"
+@@ -16,13 +18,14 @@ import (
+ 	containerruntimeconfig "github.com/openshift/machine-config-operator/pkg/controller/container-runtime-config"
+ 	"github.com/openshift/machine-config-operator/pkg/controller/drain"
+ 	"github.com/openshift/machine-config-operator/pkg/controller/internalreleaseimage"
+-	osistreamctrl "github.com/openshift/machine-config-operator/pkg/controller/osimagestream"
+-	"github.com/openshift/machine-config-operator/pkg/osimagestream"
+ 	kubeletconfig "github.com/openshift/machine-config-operator/pkg/controller/kubelet-config"
+ 	"github.com/openshift/machine-config-operator/pkg/controller/node"
++	osistreamctrl "github.com/openshift/machine-config-operator/pkg/controller/osimagestream"
+ 	"github.com/openshift/machine-config-operator/pkg/controller/pinnedimageset"
+ 	"github.com/openshift/machine-config-operator/pkg/controller/render"
+ 	"github.com/openshift/machine-config-operator/pkg/controller/template"
++	"github.com/openshift/machine-config-operator/pkg/imageutils"
++	"github.com/openshift/machine-config-operator/pkg/osimagestream"
+ 	"github.com/openshift/machine-config-operator/pkg/version"
+ 	"github.com/spf13/cobra"
+ 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+@@ -46,6 +49,7 @@ var (
+ 		resourceLockNamespace    string
+ 		tlsCipherSuites          []string
+ 		tlsMinVersion            string
++		streamsCache             string
+ 	}
+ )
+ 
+@@ -56,6 +60,7 @@ func init() {
+ 	startCmd.PersistentFlags().StringVar(&startOpts.promMetricsListenAddress, "metrics-listen-address", "127.0.0.1:8797", "Listen address for prometheus metrics listener")
+ 	startCmd.PersistentFlags().StringSliceVar(&startOpts.tlsCipherSuites, "tls-cipher-suites", nil, "Comma-separated list of cipher suites for the metrics server")
+ 	startCmd.PersistentFlags().StringVar(&startOpts.tlsMinVersion, "tls-min-version", "VersionTLS12", "Minimum TLS version supported for the metrics server")
++	startCmd.PersistentFlags().StringVar(&startOpts.streamsCache, "streams-cache", "/var/cache/mcc", "Directory to use as cache for streams discovery")
+ }
+ 
+ func runStartCmd(_ *cobra.Command, _ []string) {
+@@ -90,11 +95,26 @@ func runStartCmd(_ *cobra.Command, _ []string) {
+ 			return
+ 		}
+ 
++		var inspectionCache *imageutils.FileInspectionCache
++		if startOpts.streamsCache != "" {
++			inspectionCache = imageutils.NewFileInspectionCache(path.Join(startOpts.streamsCache, "image-inspection.json"), 48*time.Hour)
++		}
++
+ 		// OSImageStream must be the first controller to run: the blocking
+ 		// EnsureOSImageStream call guarantees the CR exists before any other
+ 		// controller starts, since render, node, and template depend on it
+ 		// for OS image URLs.
+ 		if osimagestream.IsFeatureEnabled(ctrlctx.FeatureGatesHandler) {
++			var inspectorFactory osimagestream.ImagesInspectorFactory
++			if inspectionCache != nil {
++				inspectorFactory = osimagestream.NewCachedImagesInspectorFactory(
++					&osimagestream.DefaultImagesInspectorFactory{},
++					inspectionCache,
++				)
++			} else {
++				inspectorFactory = &osimagestream.DefaultImagesInspectorFactory{}
++			}
++
+ 			osImageStreamCtrl := osistreamctrl.New(
+ 				ctrlctx.InformerFactory.Machineconfiguration().V1().OSImageStreams(),
+ 				ctrlctx.InformerFactory.Machineconfiguration().V1().ControllerConfigs(),
+@@ -108,6 +128,7 @@ func runStartCmd(_ *cobra.Command, _ []string) {
+ 				ctrlctx.ClientBuilder.KubeClientOrDie("osimagestream-controller"),
+ 				ctrlctx.ClientBuilder.MachineConfigClientOrDie("osimagestream-controller"),
+ 				ctrlctx.FeatureGatesHandler,
++				inspectorFactory,
+ 			)
+ 
+ 			ctrlctx.InformerFactory.Start(ctrlctx.Stop)
+@@ -121,11 +142,15 @@ func runStartCmd(_ *cobra.Command, _ []string) {
+ 			if err := osImageStreamCtrl.EnsureOSImageStream(ctx); err != nil {
+ 				klog.Fatalf("Failed to ensure OSImageStream: %v", err)
+ 			}
++
++			if inspectionCache != nil {
++				inspectionCache.RegisterEvicter(osImageStreamCtrl)
++			}
+ 		}
+ 
+ 		go ctrlcommon.StartMetricsListener(startOpts.promMetricsListenAddress, ctrlctx.Stop, ctrlcommon.RegisterMCCMetrics, startOpts.tlsMinVersion, startOpts.tlsCipherSuites)
+ 
+-		controllers := createControllers(ctrlctx)
++		controllers := createControllers(ctrlctx, inspectionCache)
+ 		draincontroller := drain.New(
+ 			drain.DefaultConfig(),
+ 			ctrlctx.KubeInformerFactory.Core().V1().Nodes(),
+@@ -220,6 +245,10 @@ func runStartCmd(_ *cobra.Command, _ []string) {
+ 		go draincontroller.Run(5, ctrlctx.Stop)
+ 		go certrotationcontroller.Run(ctx, 1)
+ 
++		if inspectionCache != nil {
++			inspectionCache.StartEviction(ctx, 24*time.Hour, 10*time.Minute)
++		}
++
+ 		// wait here in this function until the context gets cancelled (which tells us when we are being shut down)
+ 		<-ctx.Done()
+ 	}
+@@ -243,7 +272,7 @@ func runStartCmd(_ *cobra.Command, _ []string) {
+ 	panic("unreachable")
+ }
+ 
+-func createControllers(ctx *ctrlcommon.ControllerContext) []ctrlcommon.Controller {
++func createControllers(ctx *ctrlcommon.ControllerContext, inspectionCache *imageutils.FileInspectionCache) []ctrlcommon.Controller {
+ 	// Only watch IRI informers when the feature gate is enabled. The
+ 	// InternalReleaseImages CRD is not installed on clusters where the gate is
+ 	// off, so the informer list call would fail and WaitForCacheSync in the
+@@ -255,8 +284,25 @@ func createControllers(ctx *ctrlcommon.ControllerContext) []ctrlcommon.Controlle
+ 		iriInformer = ctx.InformerFactory.Machineconfiguration().V1().InternalReleaseImages()
+ 	}
+ 
++	renderCtrl := render.New(
++		ctx.InformerFactory.Machineconfiguration().V1().MachineConfigPools(),
++		ctx.InformerFactory.Machineconfiguration().V1().MachineConfigs(),
++		ctx.InformerFactory.Machineconfiguration().V1().ControllerConfigs(),
++		ctx.InformerFactory.Machineconfiguration().V1().ContainerRuntimeConfigs(),
++		ctx.InformerFactory.Machineconfiguration().V1().KubeletConfigs(),
++		ctx.OperatorInformerFactory.Operator().V1().MachineConfigurations(),
++		ctx.InformerFactory.Machineconfiguration().V1().OSImageStreams(),
++		ctx.ClientBuilder.KubeClientOrDie("render-controller"),
++		ctx.ClientBuilder.MachineConfigClientOrDie("render-controller"),
++		ctx.FeatureGatesHandler,
++	)
++	if inspectionCache != nil {
++		inspectionCache.RegisterEvicter(renderCtrl)
++	}
++
+ 	var controllers []ctrlcommon.Controller
+ 	controllers = append(controllers,
++		renderCtrl,
+ 		// Our primary MCs come from here
+ 		template.New(
+ 			rootOpts.templates,
+@@ -299,21 +345,7 @@ func createControllers(ctx *ctrlcommon.ControllerContext) []ctrlcommon.Controlle
+ 			ctx.ClientBuilder.ConfigClientOrDie("container-runtime-config-controller"),
+ 			ctx.FeatureGatesHandler,
+ 		),
+-		// The renderer creates "rendered" MCs from the MC fragments generated by
+-		// the above sub-controllers, which are then consumed by the node controller
+-		render.New(
+-			ctx.InformerFactory.Machineconfiguration().V1().MachineConfigPools(),
+-			ctx.InformerFactory.Machineconfiguration().V1().MachineConfigs(),
+-			ctx.InformerFactory.Machineconfiguration().V1().ControllerConfigs(),
+-			ctx.InformerFactory.Machineconfiguration().V1().ContainerRuntimeConfigs(),
+-			ctx.InformerFactory.Machineconfiguration().V1().KubeletConfigs(),
+-			ctx.OperatorInformerFactory.Operator().V1().MachineConfigurations(),
+-			ctx.InformerFactory.Machineconfiguration().V1().OSImageStreams(),
+-			ctx.ClientBuilder.KubeClientOrDie("render-controller"),
+-			ctx.ClientBuilder.MachineConfigClientOrDie("render-controller"),
+-			ctx.FeatureGatesHandler,
+-		),
+-		// The node controller consumes data written by the above
++		// The node controller consumes data written by the render controller
+ 		node.New(
+ 			ctx.InformerFactory.Machineconfiguration().V1().ControllerConfigs(),
+ 			ctx.InformerFactory.Machineconfiguration().V1().MachineConfigs(),
+diff --git a/cmd/machine-config-osimagestream/helpers.go b/cmd/machine-config-osimagestream/helpers.go
+index fe0db293c9..bcaf7985de 100644
+--- a/cmd/machine-config-osimagestream/helpers.go
++++ b/cmd/machine-config-osimagestream/helpers.go
+@@ -3,20 +3,18 @@ package main
+ import (
+ 	"context"
+ 	"encoding/json"
+-	"errors"
+ 	"fmt"
+ 	"os"
+ 	"strings"
+ 	"time"
+ 
+ 	configv1 "github.com/openshift/api/config/v1"
+-	"sigs.k8s.io/yaml"
+-
+ 	imagev1 "github.com/openshift/api/image/v1"
+ 	mcfgv1 "github.com/openshift/api/machineconfiguration/v1"
+-	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
++	"sigs.k8s.io/yaml"
+ 
+ 	k8serrors "k8s.io/apimachinery/pkg/api/errors"
++	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+ 
+ 	"github.com/openshift/machine-config-operator/pkg/imageutils"
+ 	"github.com/openshift/machine-config-operator/pkg/osimagestream"
+@@ -29,7 +27,7 @@ const (
+ )
+ 
+ // Retrieves the OSImageStream for the given release image or ImageStream path.
+-func getOSImageStreamFromReleaseImageOrImageStream(opts getOpts) (_ *mcfgv1.OSImageStream, errOut error) {
++func getOSImageStreamFromReleaseImageOrImageStream(opts getOpts) (*mcfgv1.OSImageStream, error) {
+ 	ctx, cancel := context.WithTimeout(context.Background(), time.Minute*5)
+ 	defer cancel()
+ 
+@@ -42,26 +40,17 @@ func getOSImageStreamFromReleaseImageOrImageStream(opts getOpts) (_ *mcfgv1.OSIm
+ 		klog.V(defaultLogVerbosity).Infof("Retrieved OSImageStream in %s", time.Since(start))
+ 	}()
+ 
+-	sysCtx, err := imageutils.NewSysContextFromFilesystem(imageutils.SysContextPaths{
+-		AdditionalTrustBundles: opts.trustBundlePaths,
+-		CertDir:                opts.certDirPath,
+-		PerHostCertDir:         opts.perHostCertsPath,
+-		Proxy:                  getProxyConfig(),
+-		PullSecret:             opts.authfilePath,
+-		RegistryConfig:         opts.registryConfigPath,
+-	})
+-
+-	if err != nil {
+-		return nil, fmt.Errorf("could not prepare system context: %w", err)
++	sysCtxFactory := func() (*imageutils.SysContext, error) {
++		return imageutils.NewSysContextFromFilesystem(imageutils.SysContextPaths{
++			AdditionalTrustBundles: opts.trustBundlePaths,
++			CertDir:                opts.certDirPath,
++			PerHostCertDir:         opts.perHostCertsPath,
++			Proxy:                  getProxyConfig(),
++			PullSecret:             opts.authfilePath,
++			RegistryConfig:         opts.registryConfigPath,
++		})
+ 	}
+ 
+-	defer func() {
+-		if err := sysCtx.Cleanup(); err != nil {
+-			klog.Warningf("unable to clean resources after OSImageStream inspection: %s", err)
+-			errOut = errors.Join(errOut, err)
+-		}
+-	}()
+-
+ 	var imageStream *imagev1.ImageStream
+ 	if opts.imageStreamPath != "" {
+ 		is, err := getImageStreamFromFile(opts.imageStreamPath)
+@@ -79,7 +68,7 @@ func getOSImageStreamFromReleaseImageOrImageStream(opts getOpts) (_ *mcfgv1.OSIm
+ 		ReleaseImageStream: imageStream,
+ 	}
+ 
+-	osImageStream, err := factory.Create(ctx, sysCtx.SysContext, createOpts)
++	osImageStream, err := factory.Create(ctx, sysCtxFactory, createOpts)
+ 	if err != nil {
+ 		return nil, err
+ 	}
+diff --git a/manifests/machineconfigcontroller/deployment.yaml b/manifests/machineconfigcontroller/deployment.yaml
+index 0049d33daa..663ac969bc 100644
+--- a/manifests/machineconfigcontroller/deployment.yaml
++++ b/manifests/machineconfigcontroller/deployment.yaml
+@@ -26,10 +26,14 @@ spec:
+         - "--payload-version={{.ReleaseVersion}}"
+         - "--tls-cipher-suites={{join .TLSCipherSuites ","}}"
+         - "--tls-min-version={{.TLSMinVersion}}"
++        - "--streams-cache=/var/cache/mcc"
+         resources:
+           requests:
+             cpu: 20m
+             memory: 50Mi
++        volumeMounts:
++        - mountPath: /var/cache/mcc
++          name: image-inspection-cache
+         terminationMessagePolicy: FallbackToLogsOnError
+         {{if .ControllerConfig.Proxy}}
+         env:
+@@ -76,6 +80,9 @@ spec:
+         node-role.kubernetes.io/master: ""
+       priorityClassName: "system-cluster-critical"
+       volumes:
++        - name: image-inspection-cache
++          emptyDir:
++            sizeLimit: 128Mi
+         - name: proxy-tls
+           secret:
+             secretName: mcc-proxy-tls
+diff --git a/pkg/controller/bootstrap/bootstrap.go b/pkg/controller/bootstrap/bootstrap.go
+index abecf9e48a..06c567ca8e 100644
+--- a/pkg/controller/bootstrap/bootstrap.go
++++ b/pkg/controller/bootstrap/bootstrap.go
+@@ -502,30 +502,24 @@ func (b *Bootstrap) fetchOSImageStream(
+ 	ctx, cancel := context.WithTimeout(context.Background(), time.Minute)
+ 	defer cancel()
+ 
+-	sysCtxBuilder := imageutils.NewSysContextBuilder().
+-		WithControllerConfig(cconfig).
+-		WithSecret(pullSecret)
++	sysCtxFactory := func() (*imageutils.SysContext, error) {
++		sysCtxBuilder := imageutils.NewSysContextBuilder().
++			WithControllerConfig(cconfig).
++			WithSecret(pullSecret)
+ 
+-	registriesConfig, err := imageutils.GenerateRegistriesConfig(imgCfg, icspRules, idmsRules, itmsRules)
+-	if err != nil {
+-		return nil, fmt.Errorf("failed to generate registries config for OSImageStreams fetching: %w", err)
+-	}
+-	if registriesConfig != nil {
+-		sysCtxBuilder.WithRegistriesConfig(registriesConfig)
+-	}
++		registriesConfig, err := imageutils.GenerateRegistriesConfig(imgCfg, icspRules, idmsRules, itmsRules)
++		if err != nil {
++			return nil, fmt.Errorf("failed to generate registries config for OSImageStreams fetching: %w", err)
++		}
++		if registriesConfig != nil {
++			sysCtxBuilder.WithRegistriesConfig(registriesConfig)
++		}
+ 
+-	sysCtx, err := sysCtxBuilder.Build()
+-	if err != nil {
+-		return nil, fmt.Errorf("could not prepare for OSImageStream inspection: %w", err)
++		return sysCtxBuilder.Build()
+ 	}
+-	defer func() {
+-		if err := sysCtx.Cleanup(); err != nil {
+-			klog.Warningf("Unable to clean resources after OSImageStream inspection: %s", err)
+-		}
+-	}()
+ 
+ 	factory := b.getImageStreamFactory()
+-	osImageStream, err := factory.Create(ctx, sysCtx.SysContext, osimagestream.CreateOptions{
++	osImageStream, err := factory.Create(ctx, sysCtxFactory, osimagestream.CreateOptions{
+ 		ExistingOSImageStream: existingOSImageStream,
+ 		ReleaseImageStream:    imageStream,
+ 		CliImages: &osimagestream.OSImageTuple{
+diff --git a/pkg/controller/bootstrap/bootstrap_test.go b/pkg/controller/bootstrap/bootstrap_test.go
+index 5338435dc1..2dfd6ee4d1 100644
+--- a/pkg/controller/bootstrap/bootstrap_test.go
++++ b/pkg/controller/bootstrap/bootstrap_test.go
+@@ -10,7 +10,6 @@ import (
+ 	"strings"
+ 	"testing"
+ 
+-	"github.com/containers/image/v5/types"
+ 	ign3types "github.com/coreos/ignition/v2/config/v3_5/types"
+ 	"github.com/stretchr/testify/assert"
+ 	"github.com/stretchr/testify/require"
+@@ -19,6 +18,7 @@ import (
+ 	mcfgv1 "github.com/openshift/api/machineconfiguration/v1"
+ 	mcoResourceRead "github.com/openshift/machine-config-operator/lib/resourceread"
+ 	ctrlcommon "github.com/openshift/machine-config-operator/pkg/controller/common"
++	"github.com/openshift/machine-config-operator/pkg/imageutils"
+ 	"github.com/openshift/machine-config-operator/pkg/osimagestream"
+ )
+ 
+@@ -170,7 +170,7 @@ type fakeImageStreamFactory struct {
+ 	createCalled bool
+ }
+ 
+-func (f *fakeImageStreamFactory) Create(ctx context.Context, sysCtx *types.SystemContext, createOptions osimagestream.CreateOptions) (*mcfgv1.OSImageStream, error) {
++func (f *fakeImageStreamFactory) Create(_ context.Context, _ imageutils.SysContextFactory, _ osimagestream.CreateOptions) (*mcfgv1.OSImageStream, error) {
+ 	f.createCalled = true
+ 	return f.stream, nil
+ }
+diff --git a/pkg/controller/osimagestream/osimagestream_controller.go b/pkg/controller/osimagestream/osimagestream_controller.go
+index 45a23b41ac..e191f30d7b 100644
+--- a/pkg/controller/osimagestream/osimagestream_controller.go
++++ b/pkg/controller/osimagestream/osimagestream_controller.go
+@@ -28,6 +28,7 @@ import (
+ 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+ 	"k8s.io/apimachinery/pkg/labels"
+ 	utilruntime "k8s.io/apimachinery/pkg/util/runtime"
++	"k8s.io/apimachinery/pkg/util/sets"
+ 	"k8s.io/apimachinery/pkg/util/wait"
+ 	clientset "k8s.io/client-go/kubernetes"
+ 	corev1client "k8s.io/client-go/kubernetes/typed/core/v1"
+@@ -79,6 +80,8 @@ type Controller struct {
+ 	imgLister       configlistersv1.ImageLister
+ 	imgListerSynced cache.InformerSynced
+ 
++	inspectorFactory osimagestream.ImagesInspectorFactory
++
+ 	queue workqueue.TypedRateLimitingInterface[string]
+ 
+ 	initialSyncDone chan error
+@@ -98,17 +101,19 @@ func New(
+ 	kubeClient clientset.Interface,
+ 	mcfgClient mcfgclientset.Interface,
+ 	fgHandler ctrlcommon.FeatureGatesHandler,
++	inspectorFactory osimagestream.ImagesInspectorFactory,
+ ) *Controller {
+ 	eventBroadcaster := record.NewBroadcaster()
+ 	eventBroadcaster.StartLogging(klog.Infof)
+ 	eventBroadcaster.StartRecordingToSink(&corev1client.EventSinkImpl{Interface: kubeClient.CoreV1().Events("")})
+ 
+ 	ctrl := &Controller{
+-		kubeClient:      kubeClient,
+-		mcfgClient:      mcfgClient,
+-		eventRecorder:   ctrlcommon.NamespacedEventRecorder(eventBroadcaster.NewRecorder(scheme.Scheme, corev1.EventSource{Component: "machineconfigcontroller-osimagestreamcontroller"})),
+-		fgHandler:       fgHandler,
+-		initialSyncDone: make(chan error, 1),
++		kubeClient:       kubeClient,
++		mcfgClient:       mcfgClient,
++		eventRecorder:    ctrlcommon.NamespacedEventRecorder(eventBroadcaster.NewRecorder(scheme.Scheme, corev1.EventSource{Component: "machineconfigcontroller-osimagestreamcontroller"})),
++		fgHandler:        fgHandler,
++		inspectorFactory: inspectorFactory,
++		initialSyncDone:  make(chan error, 1),
+ 		queue: workqueue.NewTypedRateLimitingQueueWithConfig(
+ 			workqueue.DefaultTypedControllerRateLimiter[string](),
+ 			workqueue.TypedRateLimitingQueueConfig[string]{Name: "machineconfigcontroller-osimagestreamcontroller"}),
+@@ -389,28 +394,21 @@ func (ctrl *Controller) buildOSImageStream(ctx context.Context, existing *mcfgv1
+ 		return fmt.Errorf("could not get the cluster PullSecret for OSImageStream sync: %w", err)
+ 	}
+ 
+-	sysCtxBuilder, err := ctrl.getSysContextBuilder(clusterPullSecret, cc)
+-	if err != nil {
+-		return fmt.Errorf("could not build SysContext for OSImageStream build: %w", err)
+-	}
+-
+-	sysCtx, err := sysCtxBuilder.Build()
+-	if err != nil {
+-		return fmt.Errorf("could not prepare for OSImageStream inspection: %w", err)
+-	}
+-	defer func() {
+-		if err := sysCtx.Cleanup(); err != nil {
+-			klog.Warningf("Unable to clean resources after OSImageStream inspection: %s", err)
++	sysCtxFactory := func() (*imageutils.SysContext, error) {
++		builder, err := ctrl.getSysContextBuilder(clusterPullSecret, cc)
++		if err != nil {
++			return nil, fmt.Errorf("could not build SysContext for OSImageStream build: %w", err)
+ 		}
+-	}()
++		return builder.Build()
++	}
+ 
+ 	buildCtx, buildCancel := context.WithTimeout(ctx, 5*time.Minute)
+ 	defer buildCancel()
+ 
+-	factory := osimagestream.NewDefaultStreamSourceFactory(&osimagestream.DefaultImagesInspectorFactory{})
++	factory := osimagestream.NewDefaultStreamSourceFactory(ctrl.inspectorFactory)
+ 	osImageStream, err := factory.Create(
+ 		buildCtx,
+-		sysCtx.SysContext,
++		sysCtxFactory,
+ 		osimagestream.CreateOptions{
+ 			ReleaseImage:          image,
+ 			ConfigMapLister:       ctrl.mcoCmLister,
+@@ -544,3 +542,24 @@ func (ctrl *Controller) getSysContextBuilder(clusterPullSecret *corev1.Secret, c
+ 
+ 	return sysCtxBuilder, nil
+ }
++
++// Retain implements CacheEvicter — it keeps cached digests referenced by the
++// OSImage and OSExtensionsImage of each available stream in the OSImageStream.
++func (ctrl *Controller) Retain(digests []string) []string {
++	osis, err := ctrl.getExistingOSImageStream()
++	if err != nil || osis == nil {
++		return digests
++	}
++
++	active := sets.New[string]()
++	for _, s := range osis.Status.AvailableStreams {
++		if d := imageutils.DigestFromPullspec(string(s.OSImage)); d != "" {
++			active.Insert(d)
++		}
++		if d := imageutils.DigestFromPullspec(string(s.OSExtensionsImage)); d != "" {
++			active.Insert(d)
++		}
++	}
++
++	return sets.New(digests...).Intersection(active).UnsortedList()
++}
+diff --git a/pkg/controller/render/render_controller.go b/pkg/controller/render/render_controller.go
+index 2d7726b369..e2a96879eb 100644
+--- a/pkg/controller/render/render_controller.go
++++ b/pkg/controller/render/render_controller.go
+@@ -20,6 +20,7 @@ import (
+ 	mcoResourceApply "github.com/openshift/machine-config-operator/lib/resourceapply"
+ 	"github.com/openshift/machine-config-operator/pkg/apihelpers"
+ 	ctrlcommon "github.com/openshift/machine-config-operator/pkg/controller/common"
++	"github.com/openshift/machine-config-operator/pkg/imageutils"
+ 	daemonconsts "github.com/openshift/machine-config-operator/pkg/daemon/constants"
+ 	"github.com/openshift/machine-config-operator/pkg/osimagestream"
+ 	"github.com/openshift/machine-config-operator/pkg/version"
+@@ -29,6 +30,7 @@ import (
+ 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+ 	"k8s.io/apimachinery/pkg/labels"
+ 	utilruntime "k8s.io/apimachinery/pkg/util/runtime"
++	"k8s.io/apimachinery/pkg/util/sets"
+ 	"k8s.io/apimachinery/pkg/util/wait"
+ 	clientset "k8s.io/client-go/kubernetes"
+ 	corev1client "k8s.io/client-go/kubernetes/typed/core/v1"
+@@ -1015,3 +1017,33 @@ func getMachineConfigRefs(mcfgs []*mcfgv1.MachineConfig) []corev1.ObjectReferenc
+ 
+ 	return refs
+ }
++
++// Retain implements CacheEvicter — it keeps cached digests referenced by the
++// OSImageURL and BaseOSExtensionsContainerImage of the rendered MachineConfig
++// applied to each pool.
++func (ctrl *Controller) Retain(digests []string) []string {
++	pools, err := ctrl.mcpLister.List(labels.Everything())
++	if err != nil {
++		return digests
++	}
++
++	active := sets.New[string]()
++	for _, pool := range pools {
++		name := pool.Spec.Configuration.Name
++		if name == "" {
++			continue
++		}
++		mc, err := ctrl.mcLister.Get(name)
++		if err != nil {
++			return digests
++		}
++		if d := imageutils.DigestFromPullspec(mc.Spec.OSImageURL); d != "" {
++			active.Insert(d)
++		}
++		if d := imageutils.DigestFromPullspec(mc.Spec.BaseOSExtensionsContainerImage); d != "" {
++			active.Insert(d)
++		}
++	}
++
++	return sets.New(digests...).Intersection(active).UnsortedList()
++}
+diff --git a/pkg/imageutils/inspect_cache.go b/pkg/imageutils/inspect_cache.go
+new file mode 100644
+index 0000000000..0ec3eba425
+--- /dev/null
++++ b/pkg/imageutils/inspect_cache.go
+@@ -0,0 +1,230 @@
++package imageutils
++
++import (
++	"bytes"
++	"context"
++	"encoding/json"
++	"fmt"
++	"maps"
++	"os"
++	"path/filepath"
++	"sync"
++	"time"
++
++	"github.com/google/renameio"
++	"k8s.io/klog/v2"
++)
++
++const inspectionCacheVersion = 1
++
++// InspectionCacheEntry holds cached inspection data for a single image.
++type InspectionCacheEntry struct {
++	Labels    map[string]string `json:"labels,omitempty"`
++	Files     map[string][]byte `json:"files,omitempty"`
++	CreatedAt time.Time         `json:"createdAt,omitempty"`
++}
++
++func (e *InspectionCacheEntry) deepCopy() *InspectionCacheEntry {
++	cp := &InspectionCacheEntry{
++		CreatedAt: e.CreatedAt,
++		Labels:    maps.Clone(e.Labels),
++	}
++	if e.Files != nil {
++		cp.Files = make(map[string][]byte, len(e.Files))
++		for k, v := range e.Files {
++			cp.Files[k] = bytes.Clone(v)
++		}
++	}
++	return cp
++}
++
++// InspectionCache provides access to cached image inspection results keyed by digest.
++type InspectionCache interface {
++	// Get returns the cached entry for the given digest, or nil if not found.
++	Get(digest string) *InspectionCacheEntry
++	// Put stores or merges an entry for the given digest.
++	Put(digest string, entry *InspectionCacheEntry) error
++}
++
++// CacheEvicter determines which cached digests should be retained.
++// Retain receives all digests currently in the cache and returns the subset
++// that this evicter wants to keep. An entry is purged only if no registered
++// evicter includes it in its retain list.
++type CacheEvicter interface {
++	Retain(digests []string) []string
++}
++
++type inspectionCacheFile struct {
++	Version int                              `json:"version"`
++	Entries map[string]*InspectionCacheEntry `json:"entries"`
++}
++
++// FileInspectionCache is a file-backed InspectionCache.
++// It keeps an in-memory copy for fast reads and writes through to a JSON file on every Put.
++type FileInspectionCache struct {
++	path     string
++	mu       sync.RWMutex
++	entries  map[string]*InspectionCacheEntry
++	evicters []CacheEvicter
++	minAge   time.Duration
++}
++
++// NewFileInspectionCache creates a cache backed by the given file path.
++// If the file exists it is loaded; a missing or corrupt file starts an empty cache.
++// minAge is the minimum time an entry must live before it can be evicted.
++func NewFileInspectionCache(path string, minAge time.Duration) *FileInspectionCache {
++	c := &FileInspectionCache{
++		path:    path,
++		entries: make(map[string]*InspectionCacheEntry),
++		minAge:  minAge,
++	}
++	c.load()
++	return c
++}
++
++func (c *FileInspectionCache) Get(digest string) *InspectionCacheEntry {
++	c.mu.RLock()
++	defer c.mu.RUnlock()
++	e := c.entries[digest]
++	if e == nil {
++		return nil
++	}
++	return e.deepCopy()
++}
++
++func (c *FileInspectionCache) Put(digest string, entry *InspectionCacheEntry) error {
++	c.mu.Lock()
++	defer c.mu.Unlock()
++	if existing, ok := c.entries[digest]; ok {
++		if entry.Labels != nil {
++			existing.Labels = maps.Clone(entry.Labels)
++		}
++		for k, v := range entry.Files {
++			if existing.Files == nil {
++				existing.Files = map[string][]byte{}
++			}
++			existing.Files[k] = bytes.Clone(v)
++		}
++	} else {
++		cp := entry.deepCopy()
++		cp.CreatedAt = time.Now()
++		c.entries[digest] = cp
++	}
++	return c.saveLocked()
++}
++
++func (c *FileInspectionCache) load() {
++	data, err := os.ReadFile(c.path)
++	if err != nil {
++		return
++	}
++	var file inspectionCacheFile
++	if err := json.Unmarshal(data, &file); err != nil || file.Version != inspectionCacheVersion {
++		return
++	}
++	if file.Entries != nil {
++		c.entries = file.Entries
++	}
++}
++
++func (c *FileInspectionCache) saveLocked() error {
++	data, err := json.Marshal(&inspectionCacheFile{
++		Version: inspectionCacheVersion,
++		Entries: c.entries,
++	})
++	if err != nil {
++		return fmt.Errorf("marshalling inspection cache: %w", err)
++	}
++
++	dir := filepath.Dir(c.path)
++	if err := os.MkdirAll(dir, 0o755); err != nil {
++		return fmt.Errorf("creating inspection cache directory: %w", err)
++	}
++
++	t, err := renameio.TempFile(dir, c.path)
++	if err != nil {
++		return fmt.Errorf("creating temp file for inspection cache: %w", err)
++	}
++	defer t.Cleanup()
++
++	if _, err := t.Write(data); err != nil {
++		return fmt.Errorf("writing inspection cache: %w", err)
++	}
++	return t.CloseAtomicallyReplace()
++}
++
++// RegisterEvicter adds an evicter that will be consulted during eviction
++// to determine which entries should be retained.
++func (c *FileInspectionCache) RegisterEvicter(e CacheEvicter) {
++	c.mu.Lock()
++	defer c.mu.Unlock()
++	c.evicters = append(c.evicters, e)
++}
++
++// StartEviction runs a background goroutine that periodically evicts entries
++// older than minAge that no registered CacheEvicter wants to retain.
++func (c *FileInspectionCache) StartEviction(ctx context.Context, interval, initialDelay time.Duration) {
++	go func() {
++		select {
++		case <-time.After(initialDelay):
++		case <-ctx.Done():
++			return
++		}
++
++		ticker := time.NewTicker(interval)
++		defer ticker.Stop()
++
++		c.evict()
++		for {
++			select {
++			case <-ticker.C:
++				c.evict()
++			case <-ctx.Done():
++				return
++			}
++		}
++	}()
++}
++
++func (c *FileInspectionCache) evict() {
++	c.mu.Lock()
++	defer c.mu.Unlock()
++
++	if len(c.entries) == 0 {
++		return
++	}
++
++	now := time.Now()
++	candidates := make([]string, 0, len(c.entries))
++	for d, entry := range c.entries {
++		if now.Sub(entry.CreatedAt) >= c.minAge {
++			candidates = append(candidates, d)
++		}
++	}
++
++	if len(candidates) == 0 {
++		return
++	}
++
++	retained := make(map[string]bool)
++	for _, e := range c.evicters {
++		for _, d := range e.Retain(candidates) {
++			retained[d] = true
++		}
++	}
++
++	evicted := 0
++	for _, d := range candidates {
++		if !retained[d] {
++			delete(c.entries, d)
++			evicted++
++		}
++	}
++
++	if evicted > 0 {
++		klog.Infof("Inspection cache eviction: removed %d entries, %d retained", evicted, len(c.entries))
++		if err := c.saveLocked(); err != nil {
++			klog.Warningf("Failed to persist inspection cache after eviction: %v", err)
++		}
++	}
++}
+diff --git a/pkg/imageutils/inspect_cache_test.go b/pkg/imageutils/inspect_cache_test.go
+new file mode 100644
+index 0000000000..33443d430c
+--- /dev/null
++++ b/pkg/imageutils/inspect_cache_test.go
+@@ -0,0 +1,191 @@
++package imageutils
++
++import (
++	"context"
++	"os"
++	"path/filepath"
++	"testing"
++	"time"
++
++	"github.com/stretchr/testify/assert"
++	"github.com/stretchr/testify/require"
++)
++
++func TestFileInspectionCache_PutAndGet(t *testing.T) {
++	path := filepath.Join(t.TempDir(), "cache.json")
++	cache := NewFileInspectionCache(path, 0)
++
++	entry := &InspectionCacheEntry{Labels: map[string]string{"k": "v"}}
++	require.NoError(t, cache.Put("sha256:aaa", entry))
++
++	got := cache.Get("sha256:aaa")
++	require.NotNil(t, got)
++	assert.Equal(t, "v", got.Labels["k"])
++
++	assert.Nil(t, cache.Get("sha256:missing"))
++}
++
++func TestFileInspectionCache_PersistsAcrossInstances(t *testing.T) {
++	path := filepath.Join(t.TempDir(), "cache.json")
++
++	c1 := NewFileInspectionCache(path, 0)
++	require.NoError(t, c1.Put("sha256:aaa", &InspectionCacheEntry{Labels: map[string]string{"a": "1"}}))
++	require.NoError(t, c1.Put("sha256:bbb", &InspectionCacheEntry{Labels: map[string]string{"b": "2"}}))
++
++	c2 := NewFileInspectionCache(path, 0)
++	got := c2.Get("sha256:aaa")
++	require.NotNil(t, got)
++	assert.Equal(t, "1", got.Labels["a"])
++
++	got = c2.Get("sha256:bbb")
++	require.NotNil(t, got)
++	assert.Equal(t, "2", got.Labels["b"])
++}
++
++func TestFileInspectionCache_MissingFile(t *testing.T) {
++	cache := NewFileInspectionCache(filepath.Join(t.TempDir(), "does-not-exist.json"), 0)
++	assert.Nil(t, cache.Get("sha256:any"))
++}
++
++func TestFileInspectionCache_CorruptFile(t *testing.T) {
++	path := filepath.Join(t.TempDir(), "cache.json")
++	require.NoError(t, os.WriteFile(path, []byte("not json"), 0o644))
++
++	cache := NewFileInspectionCache(path, 0)
++	assert.Nil(t, cache.Get("sha256:any"))
++
++	require.NoError(t, cache.Put("sha256:aaa", &InspectionCacheEntry{Labels: map[string]string{"k": "v"}}))
++	assert.NotNil(t, cache.Get("sha256:aaa"))
++}
++
++func TestFileInspectionCache_WrongVersion(t *testing.T) {
++	path := filepath.Join(t.TempDir(), "cache.json")
++	require.NoError(t, os.WriteFile(path, []byte(`{"version":999,"entries":{"sha256:aaa":{"labels":{"k":"v"}}}}`), 0o644))
++
++	cache := NewFileInspectionCache(path, 0)
++	assert.Nil(t, cache.Get("sha256:aaa"))
++}
++
++type retainFunc func(digests []string) []string
++
++func (f retainFunc) Retain(digests []string) []string { return f(digests) }
++
++func TestFileInspectionCache_EvictNoEvicters(t *testing.T) {
++	path := filepath.Join(t.TempDir(), "cache.json")
++	cache := NewFileInspectionCache(path, 0)
++	require.NoError(t, cache.Put("sha256:aaa", &InspectionCacheEntry{Labels: map[string]string{"a": "1"}}))
++	require.NoError(t, cache.Put("sha256:bbb", &InspectionCacheEntry{Labels: map[string]string{"b": "2"}}))
++
++	ctx, cancel := context.WithCancel(context.Background())
++	defer cancel()
++	cache.StartEviction(ctx, 50*time.Millisecond, 0)
++
++	require.Eventually(t, func() bool {
++		return cache.Get("sha256:aaa") == nil && cache.Get("sha256:bbb") == nil
++	}, 5*time.Second, 50*time.Millisecond)
++
++	reloaded := NewFileInspectionCache(path, 0)
++	assert.Nil(t, reloaded.Get("sha256:aaa"))
++}
++
++func TestFileInspectionCache_EvictRetainsUnion(t *testing.T) {
++	path := filepath.Join(t.TempDir(), "cache.json")
++	cache := NewFileInspectionCache(path, 0)
++	require.NoError(t, cache.Put("sha256:aaa", &InspectionCacheEntry{Labels: map[string]string{"a": "1"}}))
++	require.NoError(t, cache.Put("sha256:bbb", &InspectionCacheEntry{Labels: map[string]string{"b": "2"}}))
++	require.NoError(t, cache.Put("sha256:ccc", &InspectionCacheEntry{Labels: map[string]string{"c": "3"}}))
++
++	cache.RegisterEvicter(retainFunc(func(digests []string) []string {
++		return []string{"sha256:aaa"}
++	}))
++	cache.RegisterEvicter(retainFunc(func(digests []string) []string {
++		return []string{"sha256:bbb"}
++	}))
++
++	ctx, cancel := context.WithCancel(context.Background())
++	defer cancel()
++	cache.StartEviction(ctx, 50*time.Millisecond, 0)
++
++	require.Eventually(t, func() bool {
++		return cache.Get("sha256:ccc") == nil
++	}, 5*time.Second, 50*time.Millisecond)
++
++	assert.NotNil(t, cache.Get("sha256:aaa"))
++	assert.NotNil(t, cache.Get("sha256:bbb"))
++
++	reloaded := NewFileInspectionCache(path, 0)
++	assert.NotNil(t, reloaded.Get("sha256:aaa"))
++	assert.NotNil(t, reloaded.Get("sha256:bbb"))
++	assert.Nil(t, reloaded.Get("sha256:ccc"))
++}
++
++func TestFileInspectionCache_EvictRespectsMinAge(t *testing.T) {
++	path := filepath.Join(t.TempDir(), "cache.json")
++	cache := NewFileInspectionCache(path, 500*time.Millisecond)
++	require.NoError(t, cache.Put("sha256:aaa", &InspectionCacheEntry{Labels: map[string]string{"a": "1"}}))
++
++	ctx, cancel := context.WithCancel(context.Background())
++	defer cancel()
++	cache.StartEviction(ctx, 50*time.Millisecond, 0)
++
++	require.Never(t, func() bool {
++		return cache.Get("sha256:aaa") == nil
++	}, 400*time.Millisecond, 50*time.Millisecond)
++
++	require.Eventually(t, func() bool {
++		return cache.Get("sha256:aaa") == nil
++	}, 5*time.Second, 50*time.Millisecond)
++}
++
++func TestFileInspectionCache_PutMergesFiles(t *testing.T) {
++	path := filepath.Join(t.TempDir(), "cache.json")
++	cache := NewFileInspectionCache(path, 0)
++
++	require.NoError(t, cache.Put("sha256:aaa", &InspectionCacheEntry{Labels: map[string]string{"k": "v"}}))
++	require.NoError(t, cache.Put("sha256:aaa", &InspectionCacheEntry{Files: map[string][]byte{"/etc/config": []byte("data")}}))
++
++	got := cache.Get("sha256:aaa")
++	require.NotNil(t, got)
++	assert.Equal(t, "v", got.Labels["k"])
++	assert.Equal(t, []byte("data"), got.Files["/etc/config"])
++
++	reloaded := NewFileInspectionCache(path, 0)
++	got = reloaded.Get("sha256:aaa")
++	require.NotNil(t, got)
++	assert.Equal(t, "v", got.Labels["k"])
++	assert.Equal(t, []byte("data"), got.Files["/etc/config"])
++}
++
++func TestDigestFromPullspec(t *testing.T) {
++	tests := []struct {
++		input string
++		want  string
++	}{
++		{
++			input: "quay.io/openshift/os@sha256:abcdef1234567890abcdef1234567890abcdef1234567890abcdef1234567890",
++			want:  "sha256:abcdef1234567890abcdef1234567890abcdef1234567890abcdef1234567890",
++		},
++		{
++			input: "registry.example.com/repo/image@sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
++			want:  "sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
++		},
++		{
++			input: "quay.io/openshift/os:latest",
++			want:  "",
++		},
++		{
++			input: "not a valid ref @@@",
++			want:  "",
++		},
++		{
++			input: "",
++			want:  "",
++		},
++	}
++
++	for _, tt := range tests {
++		t.Run(tt.input, func(t *testing.T) {
++			assert.Equal(t, tt.want, DigestFromPullspec(tt.input))
++		})
++	}
++}
+diff --git a/pkg/imageutils/reference.go b/pkg/imageutils/reference.go
+index 264b982781..e083dc4e7c 100644
+--- a/pkg/imageutils/reference.go
++++ b/pkg/imageutils/reference.go
+@@ -8,6 +8,7 @@ import (
+ 	"github.com/containers/common/pkg/retry"
+ 	"github.com/containers/image/v5/docker"
+ 	"github.com/containers/image/v5/types"
++	"github.com/distribution/reference"
+ )
+ 
+ // GetImageSourceFromReference creates an ImageSource from an ImageReference with retry logic.
+@@ -39,3 +40,17 @@ func ParseImageName(imgName string) (types.ImageReference, error) {
+ 
+ 	return docker.Transport.ParseReference(imgName)
+ }
++
++// DigestFromPullspec extracts the digest from a digest-based image reference
++// (e.g. "registry/repo@sha256:abc..."). Returns an empty string for tag-only
++// references or unparseable input.
++func DigestFromPullspec(image string) string {
++	ref, err := reference.Parse(image)
++	if err != nil {
++		return ""
++	}
++	if digested, ok := ref.(reference.Digested); ok {
++		return digested.Digest().String()
++	}
++	return ""
++}
+diff --git a/pkg/imageutils/sys_context.go b/pkg/imageutils/sys_context.go
+index e2ab5376a8..53e261da22 100644
+--- a/pkg/imageutils/sys_context.go
++++ b/pkg/imageutils/sys_context.go
+@@ -22,6 +22,9 @@ type SysContext struct {
+ 	temporalDir string
+ }
+ 
++// SysContextFactory lazily creates a SysContext on demand.
++type SysContextFactory func() (*SysContext, error)
++
+ // SysContextBuilder provides a fluent API for constructing SysContext instances.
+ type SysContextBuilder struct {
+ 	secret           *corev1.Secret
+diff --git a/pkg/osimagestream/cached_inspector.go b/pkg/osimagestream/cached_inspector.go
+new file mode 100644
+index 0000000000..34120ea466
+--- /dev/null
++++ b/pkg/osimagestream/cached_inspector.go
+@@ -0,0 +1,128 @@
++package osimagestream
++
++import (
++	"context"
++	"github.com/containers/image/v5/types"
++	"github.com/openshift/machine-config-operator/pkg/imageutils"
++	"k8s.io/klog/v2"
++)
++
++// CachedImagesInspector wraps an ImagesInspector and serves label lookups
++// from an InspectionCache when the image pullspec contains a digest.
++// Cache misses are delegated to the underlying inspector and written back.
++type CachedImagesInspector struct {
++	delegate ImagesInspector
++	cache    imageutils.InspectionCache
++}
++
++// NewCachedImagesInspector creates a CachedImagesInspector decorator.
++func NewCachedImagesInspector(delegate ImagesInspector, cache imageutils.InspectionCache) *CachedImagesInspector {
++	return &CachedImagesInspector{delegate: delegate, cache: cache}
++}
++
++func (c *CachedImagesInspector) Inspect(ctx context.Context, images ...string) ([]imageutils.BulkInspectResult, error) {
++	results := make([]imageutils.BulkInspectResult, len(images))
++	indices := make(map[string][]int, len(images))
++	for i, img := range images {
++		indices[img] = append(indices[img], i)
++	}
++
++	var misses []string
++	for img := range indices {
++		digest := imageutils.DigestFromPullspec(img)
++		if digest == "" {
++			misses = append(misses, img)
++			continue
++		}
++
++		entry := c.cache.Get(digest)
++		if entry == nil {
++			misses = append(misses, img)
++			continue
++		}
++
++		klog.V(4).Infof("cache hit for digest %s", digest)
++		hit := imageutils.BulkInspectResult{
++			Image:       img,
++			InspectInfo: &types.ImageInspectInfo{Labels: entry.Labels},
++		}
++		for _, idx := range indices[img] {
++			results[idx] = hit
++		}
++	}
++
++	if len(misses) == 0 {
++		return results, nil
++	}
++
++	fetched, err := c.delegate.Inspect(ctx, misses...)
++	if err != nil {
++		for _, img := range misses {
++			for _, idx := range indices[img] {
++				results[idx] = imageutils.BulkInspectResult{Image: img, Error: err}
++			}
++		}
++		return results, nil
++	}
++
++	for _, r := range fetched {
++		for _, idx := range indices[r.Image] {
++			results[idx] = r
++		}
++		if r.Error != nil || r.InspectInfo == nil {
++			continue
++		}
++		digest := imageutils.DigestFromPullspec(r.Image)
++		if digest == "" {
++			continue
++		}
++		if err := c.cache.Put(digest, &imageutils.InspectionCacheEntry{Labels: r.InspectInfo.Labels}); err != nil {
++			klog.Warningf("failed to cache inspection result for digest %s: %v", digest, err)
++		}
++	}
++
++	return results, nil
++}
++
++func (c *CachedImagesInspector) FetchImageFile(ctx context.Context, image, filePath string) ([]byte, error) {
++	digest := imageutils.DigestFromPullspec(image)
++	if digest != "" {
++		if entry := c.cache.Get(digest); entry != nil && entry.Files != nil {
++			if data, ok := entry.Files[filePath]; ok {
++				klog.V(4).Infof("cache hit for file %s in digest %s", filePath, digest)
++				return data, nil
++			}
++		}
++	}
++
++	data, err := c.delegate.FetchImageFile(ctx, image, filePath)
++	if err != nil {
++		return nil, err
++	}
++
++	if digest != "" {
++		if putErr := c.cache.Put(digest, &imageutils.InspectionCacheEntry{
++			Files: map[string][]byte{filePath: data},
++		}); putErr != nil {
++			klog.Warningf("failed to cache file %s for digest %s: %v", filePath, digest, putErr)
++		}
++	}
++
++	return data, nil
++}
++
++// CachedImagesInspectorFactory wraps an ImagesInspectorFactory and injects
++// an InspectionCache into every inspector it creates.
++type CachedImagesInspectorFactory struct {
++	delegate ImagesInspectorFactory
++	cache    imageutils.InspectionCache
++}
++
++// NewCachedImagesInspectorFactory creates a factory that decorates inspectors with caching.
++func NewCachedImagesInspectorFactory(delegate ImagesInspectorFactory, cache imageutils.InspectionCache) *CachedImagesInspectorFactory {
++	return &CachedImagesInspectorFactory{delegate: delegate, cache: cache}
++}
++
++func (f *CachedImagesInspectorFactory) ForContext(sysCtxFactory imageutils.SysContextFactory) ImagesInspector {
++	return NewCachedImagesInspector(f.delegate.ForContext(sysCtxFactory), f.cache)
++}
+diff --git a/pkg/osimagestream/cached_inspector_test.go b/pkg/osimagestream/cached_inspector_test.go
+new file mode 100644
+index 0000000000..846f13521b
+--- /dev/null
++++ b/pkg/osimagestream/cached_inspector_test.go
+@@ -0,0 +1,218 @@
++package osimagestream
++
++import (
++	"context"
++	"errors"
++	"testing"
++
++	"github.com/containers/image/v5/types"
++	"github.com/openshift/machine-config-operator/pkg/imageutils"
++	"github.com/stretchr/testify/assert"
++	"github.com/stretchr/testify/require"
++)
++
++const (
++	digestedImage1 = "quay.io/openshift/os@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
++	digestedImage2 = "quay.io/openshift/ext@sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
++	digest1        = "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
++	digest2        = "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
++	taggedImage    = "quay.io/openshift/os:latest"
++)
++
++type fakeCache struct {
++	data map[string]*imageutils.InspectionCacheEntry
++	puts []string
++}
++
++func newFakeCache() *fakeCache {
++	return &fakeCache{data: make(map[string]*imageutils.InspectionCacheEntry)}
++}
++
++func (c *fakeCache) Get(digest string) *imageutils.InspectionCacheEntry {
++	return c.data[digest]
++}
++
++func (c *fakeCache) Put(digest string, entry *imageutils.InspectionCacheEntry) error {
++	c.data[digest] = entry
++	c.puts = append(c.puts, digest)
++	return nil
++}
++
++func TestCachedImagesInspector_AllCacheHits(t *testing.T) {
++	cache := newFakeCache()
++	cache.data[digest1] = &imageutils.InspectionCacheEntry{Labels: map[string]string{"os": "rhel9"}}
++	cache.data[digest2] = &imageutils.InspectionCacheEntry{Labels: map[string]string{"ext": "true"}}
++
++	delegate := &mockImagesInspector{err: errors.New("should not be called")}
++	inspector := NewCachedImagesInspector(delegate, cache)
++
++	results, err := inspector.Inspect(context.Background(), digestedImage1, digestedImage2)
++	require.NoError(t, err)
++	require.Len(t, results, 2)
++	assert.Equal(t, "rhel9", results[0].InspectInfo.Labels["os"])
++	assert.Equal(t, "true", results[1].InspectInfo.Labels["ext"])
++}
++
++func TestCachedImagesInspector_AllCacheMisses(t *testing.T) {
++	cache := newFakeCache()
++	delegate := &mockImagesInspector{
++		inspectData: map[string]*types.ImageInspectInfo{
++			digestedImage1: {Labels: map[string]string{"os": "rhel9"}},
++			digestedImage2: {Labels: map[string]string{"ext": "true"}},
++		},
++	}
++	inspector := NewCachedImagesInspector(delegate, cache)
++
++	results, err := inspector.Inspect(context.Background(), digestedImage1, digestedImage2)
++	require.NoError(t, err)
++	require.Len(t, results, 2)
++
++	assert.Equal(t, "rhel9", results[0].InspectInfo.Labels["os"])
++	assert.Equal(t, "true", results[1].InspectInfo.Labels["ext"])
++	assert.Contains(t, cache.puts, digest1)
++	assert.Contains(t, cache.puts, digest2)
++}
++
++func TestCachedImagesInspector_MixedHitsAndMisses(t *testing.T) {
++	cache := newFakeCache()
++	cache.data[digest1] = &imageutils.InspectionCacheEntry{Labels: map[string]string{"os": "rhel9"}}
++
++	delegate := &mockImagesInspector{
++		inspectData: map[string]*types.ImageInspectInfo{
++			digestedImage2: {Labels: map[string]string{"ext": "true"}},
++		},
++	}
++	inspector := NewCachedImagesInspector(delegate, cache)
++
++	results, err := inspector.Inspect(context.Background(), digestedImage1, digestedImage2)
++	require.NoError(t, err)
++	require.Len(t, results, 2)
++
++	assert.Equal(t, "rhel9", results[0].InspectInfo.Labels["os"])
++	assert.Equal(t, "true", results[1].InspectInfo.Labels["ext"])
++	assert.Equal(t, []string{digest2}, cache.puts)
++}
++
++func TestCachedImagesInspector_DuplicateInputs(t *testing.T) {
++	cache := newFakeCache()
++	delegate := &mockImagesInspector{
++		inspectData: map[string]*types.ImageInspectInfo{
++			digestedImage1: {Labels: map[string]string{"os": "rhel9"}},
++		},
++	}
++	inspector := NewCachedImagesInspector(delegate, cache)
++
++	results, err := inspector.Inspect(context.Background(), digestedImage1, digestedImage2, digestedImage1)
++	require.NoError(t, err)
++	require.Len(t, results, 3)
++	assert.Equal(t, "rhel9", results[0].InspectInfo.Labels["os"])
++	assert.Error(t, results[1].Error)
++	assert.Equal(t, "rhel9", results[2].InspectInfo.Labels["os"])
++}
++
++func TestCachedImagesInspector_TaggedImageBypassesCache(t *testing.T) {
++	cache := newFakeCache()
++	delegate := &mockImagesInspector{
++		inspectData: map[string]*types.ImageInspectInfo{
++			taggedImage: {Labels: map[string]string{"os": "rhel9"}},
++		},
++	}
++	inspector := NewCachedImagesInspector(delegate, cache)
++
++	results, err := inspector.Inspect(context.Background(), taggedImage)
++	require.NoError(t, err)
++	require.Len(t, results, 1)
++	assert.Equal(t, "rhel9", results[0].InspectInfo.Labels["os"])
++	assert.Empty(t, cache.puts)
++}
++
++func TestCachedImagesInspector_DelegateError(t *testing.T) {
++	cache := newFakeCache()
++	delegate := &mockImagesInspector{err: errors.New("network failure")}
++	inspector := NewCachedImagesInspector(delegate, cache)
++
++	results, err := inspector.Inspect(context.Background(), digestedImage1)
++	require.NoError(t, err)
++	require.Len(t, results, 1)
++	assert.ErrorContains(t, results[0].Error, "network failure")
++}
++
++func TestCachedImagesInspector_DelegateErrorPreservesCacheHits(t *testing.T) {
++	cache := newFakeCache()
++	cache.data[digest1] = &imageutils.InspectionCacheEntry{Labels: map[string]string{"os": "rhel9"}}
++
++	delegate := &mockImagesInspector{err: errors.New("network failure")}
++	inspector := NewCachedImagesInspector(delegate, cache)
++
++	results, err := inspector.Inspect(context.Background(), digestedImage1, digestedImage2)
++	require.NoError(t, err)
++	require.Len(t, results, 2)
++	assert.Equal(t, "rhel9", results[0].InspectInfo.Labels["os"])
++	assert.ErrorContains(t, results[1].Error, "network failure")
++}
++
++func TestCachedImagesInspector_PerImageErrorNotCached(t *testing.T) {
++	cache := newFakeCache()
++	delegate := &mockImagesInspector{
++		inspectData: map[string]*types.ImageInspectInfo{},
++	}
++	inspector := NewCachedImagesInspector(delegate, cache)
++
++	results, err := inspector.Inspect(context.Background(), digestedImage1)
++	require.NoError(t, err)
++	require.Len(t, results, 1)
++	assert.Error(t, results[0].Error)
++	assert.Empty(t, cache.puts)
++}
++
++func TestCachedImagesInspector_FetchImageFileCachesResult(t *testing.T) {
++	cache := newFakeCache()
++	delegate := &mockImagesInspector{
++		fileData: map[string][]byte{
++			digestedImage1 + ":/etc/os-release": []byte("ID=rhel"),
++		},
++	}
++	inspector := NewCachedImagesInspector(delegate, cache)
++
++	data, err := inspector.FetchImageFile(context.Background(), digestedImage1, "/etc/os-release")
++	require.NoError(t, err)
++	assert.Equal(t, []byte("ID=rhel"), data)
++	assert.Contains(t, cache.puts, digest1)
++
++	// Second call should hit cache, not delegate
++	delegate.err = errors.New("should not be called")
++	data, err = inspector.FetchImageFile(context.Background(), digestedImage1, "/etc/os-release")
++	require.NoError(t, err)
++	assert.Equal(t, []byte("ID=rhel"), data)
++}
++
++func TestCachedImagesInspector_FetchImageFileTaggedBypassesCache(t *testing.T) {
++	cache := newFakeCache()
++	delegate := &mockImagesInspector{
++		fileData: map[string][]byte{
++			taggedImage + ":/etc/os-release": []byte("ID=rhel"),
++		},
++	}
++	inspector := NewCachedImagesInspector(delegate, cache)
++
++	data, err := inspector.FetchImageFile(context.Background(), taggedImage, "/etc/os-release")
++	require.NoError(t, err)
++	assert.Equal(t, []byte("ID=rhel"), data)
++	assert.Empty(t, cache.puts)
++}
++
++func TestCachedImagesInspectorFactory(t *testing.T) {
++	cache := newFakeCache()
++	cache.data[digest1] = &imageutils.InspectionCacheEntry{Labels: map[string]string{"os": "rhel9"}}
++
++	delegate := &mockImagesInspectorFactory{
++		inspector: &mockImagesInspector{err: errors.New("should not be called")},
++	}
++	factory := NewCachedImagesInspectorFactory(delegate, cache)
++	inspector := factory.ForContext(nil)
++
++	results, err := inspector.Inspect(context.Background(), digestedImage1)
++	require.NoError(t, err)
++	require.Len(t, results, 1)
++	assert.Equal(t, "rhel9", results[0].InspectInfo.Labels["os"])
++}
+diff --git a/pkg/osimagestream/inspector.go b/pkg/osimagestream/inspector.go
+index 27ea843b21..67c44cb644 100644
+--- a/pkg/osimagestream/inspector.go
++++ b/pkg/osimagestream/inspector.go
+@@ -4,12 +4,13 @@ import (
+ 	"archive/tar"
+ 	"context"
+ 	"errors"
++	"fmt"
+ 	"net"
+ 	"strings"
+ 
+ 	"github.com/containers/common/pkg/retry"
+-	"github.com/containers/image/v5/types"
+ 	"github.com/openshift/machine-config-operator/pkg/imageutils"
++	"k8s.io/klog/v2"
+ )
+ 
+ // isNetworkErrorRetryable checks if an error is a network-related error that should be retried.
+@@ -59,15 +60,16 @@ type ImagesInspector interface {
+ }
+ 
+ // ImagesInspectorImpl is the default implementation of ImagesInspector.
++// It lazily creates a SysContext on each operation via the provided factory.
+ type ImagesInspectorImpl struct {
+ 	bulkInspector *imageutils.BulkInspector
+-	sysCtx        *types.SystemContext
++	sysCtxFactory imageutils.SysContextFactory
+ }
+ 
+-// NewImagesInspector creates a new ImagesInspector with the given system context.
+-func NewImagesInspector(sysCtx *types.SystemContext) *ImagesInspectorImpl {
++// NewImagesInspector creates a new ImagesInspector with the given SysContext factory.
++func NewImagesInspector(sysCtxFactory imageutils.SysContextFactory) *ImagesInspectorImpl {
+ 	return &ImagesInspectorImpl{
+-		sysCtx: sysCtx,
++		sysCtxFactory: sysCtxFactory,
+ 		bulkInspector: imageutils.NewBulkInspector(&imageutils.BulkInspectorOptions{
+ 			RetryOpts: newImageInspectionRetryOptions(),
+ 			Count:     5,
+@@ -78,27 +80,44 @@ func NewImagesInspector(sysCtx *types.SystemContext) *ImagesInspectorImpl {
+ 
+ // Inspect retrieves metadata for the specified container images.
+ func (i *ImagesInspectorImpl) Inspect(ctx context.Context, image ...string) ([]imageutils.BulkInspectResult, error) {
+-	return i.bulkInspector.Inspect(ctx, i.sysCtx, image...)
++	sysCtx, err := i.sysCtxFactory()
++	if err != nil {
++		return nil, fmt.Errorf("creating system context for image inspection: %w", err)
++	}
++	defer func() {
++		if cleanupErr := sysCtx.Cleanup(); cleanupErr != nil {
++			klog.Warningf("could not clean up system context: %v", cleanupErr)
++		}
++	}()
++	return i.bulkInspector.Inspect(ctx, sysCtx.SysContext, image...)
+ }
+ 
+ // FetchImageFile extracts and returns the contents of a file from the container image.
+ func (i *ImagesInspectorImpl) FetchImageFile(ctx context.Context, image, path string) ([]byte, error) {
++	sysCtx, err := i.sysCtxFactory()
++	if err != nil {
++		return nil, fmt.Errorf("creating system context for image file fetch: %w", err)
++	}
++	defer func() {
++		if cleanupErr := sysCtx.Cleanup(); cleanupErr != nil {
++			klog.Warningf("could not clean up system context: %v", cleanupErr)
++		}
++	}()
+ 	targetHeaderPath := strings.TrimLeft(path, "./")
+-	return imageutils.ReadImageFileContent(ctx, i.sysCtx, image, func(header *tar.Header) bool {
++	return imageutils.ReadImageFileContent(ctx, sysCtx.SysContext, image, func(header *tar.Header) bool {
+ 		return targetHeaderPath == strings.TrimLeft(header.Name, "./")
+ 	}, newImageInspectionRetryOptions())
+ }
+ 
+-// ImagesInspectorFactory creates ImagesInspector instances for different system contexts.
++// ImagesInspectorFactory creates ImagesInspector instances.
+ type ImagesInspectorFactory interface {
+-	// ForContext creates an ImagesInspector for the given system context.
+-	ForContext(sysCtx *types.SystemContext) ImagesInspector
++	ForContext(sysCtxFactory imageutils.SysContextFactory) ImagesInspector
+ }
+ 
+ // DefaultImagesInspectorFactory is the production implementation of ImagesInspectorFactory.
+ type DefaultImagesInspectorFactory struct{}
+ 
+-// ForContext creates an ImagesInspector for the given system context.
+-func (f *DefaultImagesInspectorFactory) ForContext(sysCtx *types.SystemContext) ImagesInspector {
+-	return NewImagesInspector(sysCtx)
++// ForContext creates an ImagesInspector with the given SysContext factory.
++func (f *DefaultImagesInspectorFactory) ForContext(sysCtxFactory imageutils.SysContextFactory) ImagesInspector {
++	return NewImagesInspector(sysCtxFactory)
+ }
+diff --git a/pkg/osimagestream/mocks_test.go b/pkg/osimagestream/mocks_test.go
+index c378c108e2..48a2a1f59f 100644
+--- a/pkg/osimagestream/mocks_test.go
++++ b/pkg/osimagestream/mocks_test.go
+@@ -88,6 +88,6 @@ type mockImagesInspectorFactory struct {
+ 	inspector ImagesInspector
+ }
+ 
+-func (f *mockImagesInspectorFactory) ForContext(_ *types.SystemContext) ImagesInspector {
++func (f *mockImagesInspectorFactory) ForContext(_ imageutils.SysContextFactory) ImagesInspector {
+ 	return f.inspector
+ }
+diff --git a/pkg/osimagestream/osimagestream.go b/pkg/osimagestream/osimagestream.go
+index 1a1e57ae51..66abca3a92 100644
+--- a/pkg/osimagestream/osimagestream.go
++++ b/pkg/osimagestream/osimagestream.go
+@@ -8,10 +8,10 @@ import (
+ 	"maps"
+ 	"slices"
+ 
+-	"github.com/containers/image/v5/types"
+ 	imagev1 "github.com/openshift/api/image/v1"
+ 	mcfgv1 "github.com/openshift/api/machineconfiguration/v1"
+ 	ctrlcommon "github.com/openshift/machine-config-operator/pkg/controller/common"
++	"github.com/openshift/machine-config-operator/pkg/imageutils"
+ 	"github.com/openshift/machine-config-operator/pkg/version"
+ 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+ 	k8sversion "k8s.io/apimachinery/pkg/util/version"
+@@ -31,7 +31,7 @@ type StreamSource interface {
+ // ImageStreamFactory creates OS image streams for different runtime contexts.
+ type ImageStreamFactory interface {
+ 	// Create builds an OSImageStream from the configured sources and options.
+-	Create(ctx context.Context, sysCtx *types.SystemContext, opts CreateOptions) (*mcfgv1.OSImageStream, error)
++	Create(ctx context.Context, sysCtxFactory imageutils.SysContextFactory, opts CreateOptions) (*mcfgv1.OSImageStream, error)
+ }
+ 
+ // CreateOptions configures how an OSImageStream is built.
+@@ -65,9 +65,9 @@ func NewDefaultStreamSourceFactory(inspectorFactory ImagesInspectorFactory) *Def
+ }
+ 
+ // Create builds an OSImageStream from the configured sources and options.
+-func (f *DefaultStreamSourceFactory) Create(ctx context.Context, sysCtx *types.SystemContext, createOptions CreateOptions) (*mcfgv1.OSImageStream, error) {
++func (f *DefaultStreamSourceFactory) Create(ctx context.Context, sysCtxFactory imageutils.SysContextFactory, createOptions CreateOptions) (*mcfgv1.OSImageStream, error) {
+ 	var sources []StreamSource
+-	imagesInspector := f.inspectorFactory.ForContext(sysCtx)
++	imagesInspector := f.inspectorFactory.ForContext(sysCtxFactory)
+ 	discoverer := NewStreamDiscoverer(imagesInspector, f.imagesExtractor)
+ 	if createOptions.CliImages != nil {
+ 		sources = append(sources, NewOSImagesURLStreamSource(NewStaticURLProvider(*createOptions.CliImages), discoverer))
+diff --git a/pkg/osimagestream/osimagestream_test.go b/pkg/osimagestream/osimagestream_test.go
+index 44f1ac8071..99c7ebfc3c 100644
+--- a/pkg/osimagestream/osimagestream_test.go
++++ b/pkg/osimagestream/osimagestream_test.go
+@@ -161,7 +161,7 @@ func TestDefaultStreamSourceFactory_Create_RuntimeBothSources(t *testing.T) {
+ 		"quay.io/openshift/release:4.16:/release-manifests/image-references": manifest,
+ 	})
+ 
+-	result, err := factory.Create(context.Background(), &types.SystemContext{}, CreateOptions{
++	result, err := factory.Create(context.Background(), nil, CreateOptions{
+ 		ReleaseImage:    "quay.io/openshift/release:4.16",
+ 		ConfigMapLister: cmLister,
+ 		InstallVersion:  testInstallVersion,
+@@ -182,7 +182,7 @@ func TestDefaultStreamSourceFactory_Create_RuntimeConfigMapOnly(t *testing.T) {
+ 		"quay.io/openshift/release:4.16:/release-manifests/image-references": manifest,
+ 	})
+ 
+-	result, err := factory.Create(context.Background(), &types.SystemContext{}, CreateOptions{
++	result, err := factory.Create(context.Background(), nil, CreateOptions{
+ 		ReleaseImage:    "quay.io/openshift/release:4.16",
+ 		ConfigMapLister: cmLister,
+ 		InstallVersion:  testInstallVersion,
+@@ -201,7 +201,7 @@ func TestDefaultStreamSourceFactory_Create_RuntimeBothSourcesFail(t *testing.T)
+ 	cmLister := newTestEmptyConfigMapLister()
+ 	factory := newTestFactory(map[string]*types.ImageInspectInfo{}, nil)
+ 
+-	result, err := factory.Create(context.Background(), &types.SystemContext{}, CreateOptions{
++	result, err := factory.Create(context.Background(), nil, CreateOptions{
+ 		ReleaseImage:    "quay.io/openshift/release:4.16",
+ 		ConfigMapLister: cmLister,
+ 	})
+@@ -220,7 +220,7 @@ func TestDefaultStreamSourceFactory_Create_RuntimeMultipleStreams(t *testing.T)
+ 		"quay.io/openshift/release:4.16:/release-manifests/image-references": manifest,
+ 	})
+ 
+-	result, err := factory.Create(context.Background(), &types.SystemContext{}, CreateOptions{
++	result, err := factory.Create(context.Background(), nil, CreateOptions{
+ 		ReleaseImage:    "quay.io/openshift/release:4.16",
+ 		ConfigMapLister: cmLister,
+ 		InstallVersion:  testInstallVersion,
+@@ -243,7 +243,7 @@ func TestDefaultStreamSourceFactory_Create_BootstrapMultipleStreams(t *testing.T
+ 
+ 	factory := newTestFactory(newTestInspectData(testStreamDefRHEL9, testStreamDefRHEL10), nil)
+ 
+-	result, err := factory.Create(context.Background(), &types.SystemContext{}, CreateOptions{
++	result, err := factory.Create(context.Background(), nil, CreateOptions{
+ 		ReleaseImageStream: imageStream,
+ 		InstallVersion:     testInstallVersion,
+ 	})
+@@ -264,7 +264,7 @@ func TestDefaultStreamSourceFactory_Create_UserDefaultOverride(t *testing.T) {
+ 	})
+ 	factory := newTestFactory(newTestInspectData(testStreamDefRHEL9, testStreamDefRHEL10), nil)
+ 
+-	result, err := factory.Create(context.Background(), &types.SystemContext{}, CreateOptions{
++	result, err := factory.Create(context.Background(), nil, CreateOptions{
+ 		ReleaseImageStream: imageStream,
+ 		InstallVersion:     testInstallVersion,
+ 		ExistingOSImageStream: &mcfgv1.OSImageStream{
+@@ -286,7 +286,7 @@ func TestDefaultStreamSourceFactory_Create_BootstrapCliImagesOnly(t *testing.T)
+ 	})
+ 	factory := newTestFactory(newTestInspectData(testStreamDefRHEL9), nil)
+ 
+-	result, err := factory.Create(context.Background(), &types.SystemContext{}, CreateOptions{
++	result, err := factory.Create(context.Background(), nil, CreateOptions{
+ 		CliImages:          &OSImageTuple{OSImage: testStreamDefRHEL9.osImage, OSExtensionsImage: testStreamDefRHEL9.extImage},
+ 		ReleaseImageStream: imageStream,
+ 		InstallVersion:     testInstallVersion,
+@@ -315,7 +315,7 @@ func TestDefaultStreamSourceFactory_Create_PreservesExistingSpec(t *testing.T) {
+ 		Spec: mcfgv1.OSImageStreamSpec{DefaultStream: "rhel-9"},
+ 	}
+ 
+-	result, err := factory.Create(context.Background(), &types.SystemContext{}, CreateOptions{
++	result, err := factory.Create(context.Background(), nil, CreateOptions{
+ 		ReleaseImageStream:    imageStream,
+ 		InstallVersion:        testInstallVersion,
+ 		ExistingOSImageStream: existing,
+@@ -334,7 +334,7 @@ func TestDefaultStreamSourceFactory_Create_BootstrapImageStreamOnly(t *testing.T
+ 	})
+ 	factory := newTestFactory(newTestInspectData(testStreamDefRHEL9), nil)
+ 
+-	result, err := factory.Create(context.Background(), &types.SystemContext{}, CreateOptions{
++	result, err := factory.Create(context.Background(), nil, CreateOptions{
+ 		ReleaseImageStream: imageStream,
+ 		InstallVersion:     testInstallVersion,
+ 	})
+@@ -356,7 +356,7 @@ func TestDefaultStreamSourceFactory_Create_BootstrapBothSources(t *testing.T) {
+ 	})
+ 	factory := newTestFactory(newTestInspectData(rhel9CLI, rhel9Stream), nil)
+ 
+-	result, err := factory.Create(context.Background(), &types.SystemContext{}, CreateOptions{
++	result, err := factory.Create(context.Background(), nil, CreateOptions{
+ 		ReleaseImageStream: imageStream,
+ 		CliImages:          &OSImageTuple{OSImage: rhel9CLI.osImage, OSExtensionsImage: rhel9CLI.extImage},
+ 		InstallVersion:     testInstallVersion,
+@@ -373,7 +373,7 @@ func TestDefaultStreamSourceFactory_Create_InstallVersionTakesPriority(t *testin
+ 	imageStream := newTestImageStream("5.0.0", testStreamDefRHEL9, testStreamDefRHEL10)
+ 	factory := newTestFactory(newTestInspectData(testStreamDefRHEL9, testStreamDefRHEL10), nil)
+ 
+-	result, err := factory.Create(context.Background(), &types.SystemContext{}, CreateOptions{
++	result, err := factory.Create(context.Background(), nil, CreateOptions{
+ 		ReleaseImageStream: imageStream,
+ 		InstallVersion:     k8sversion.MustParseGeneric("4.22.0"),
+ 	})
+@@ -392,7 +392,7 @@ func TestDefaultStreamSourceFactory_Create_DuplicateStreamsLastSourceWins(t *tes
+ 		"quay.io/openshift/release:4.16:/release-manifests/image-references": manifest,
+ 	})
+ 
+-	result, err := factory.Create(context.Background(), &types.SystemContext{}, CreateOptions{
++	result, err := factory.Create(context.Background(), nil, CreateOptions{
+ 		ReleaseImage:    "quay.io/openshift/release:4.16",
+ 		ConfigMapLister: cmLister,
+ 		InstallVersion:  testInstallVersion,
+@@ -415,7 +415,7 @@ func TestDefaultStreamSourceFactory_Create_PartialSourceFailure(t *testing.T) {
+ 	})
+ 	factory := newTestFactory(newTestInspectData(testStreamDefRHEL9), nil)
+ 
+-	result, err := factory.Create(context.Background(), &types.SystemContext{}, CreateOptions{
++	result, err := factory.Create(context.Background(), nil, CreateOptions{
+ 		ReleaseImageStream: imageStream,
+ 		ConfigMapLister:    newTestEmptyConfigMapLister(),
+ 		InstallVersion:     testInstallVersion,
+@@ -435,7 +435,7 @@ func TestDefaultStreamSourceFactory_Create_InvalidUserDefault(t *testing.T) {
+ 	})
+ 	factory := newTestFactory(newTestInspectData(testStreamDefRHEL9), nil)
+ 
+-	_, err := factory.Create(context.Background(), &types.SystemContext{}, CreateOptions{
++	_, err := factory.Create(context.Background(), nil, CreateOptions{
+ 		ReleaseImageStream: imageStream,
+ 		InstallVersion:     testInstallVersion,
+ 		ExistingOSImageStream: &mcfgv1.OSImageStream{
+@@ -456,7 +456,7 @@ func TestDefaultStreamSourceFactory_Create_FallsBackToBuildVersion(t *testing.T)
+ 	version.ReleaseVersion = "4.18.0"
+ 	defer func() { version.ReleaseVersion = originalReleaseVersion }()
+ 
+-	result, err := factory.Create(context.Background(), &types.SystemContext{}, CreateOptions{
++	result, err := factory.Create(context.Background(), nil, CreateOptions{
+ 		ReleaseImageStream: imageStream,
+ 	})
+ 
+@@ -467,7 +467,7 @@ func TestDefaultStreamSourceFactory_Create_FallsBackToBuildVersion(t *testing.T)
+ func TestDefaultStreamSourceFactory_Create_BootstrapNoSources(t *testing.T) {
+ 	factory := newTestFactory(map[string]*types.ImageInspectInfo{}, nil)
+ 
+-	result, err := factory.Create(context.Background(), &types.SystemContext{}, CreateOptions{})
++	result, err := factory.Create(context.Background(), nil, CreateOptions{})
+ 
+ 	require.Error(t, err)
+ 	assert.Nil(t, result)
+diff --git a/test/e2e-2of2/osimagestream_test.go b/test/e2e-2of2/osimagestream_test.go
+index a34c1df8ad..70eff28a52 100644
+--- a/test/e2e-2of2/osimagestream_test.go
++++ b/test/e2e-2of2/osimagestream_test.go
+@@ -2,10 +2,15 @@ package e2e_2of2
+ 
+ import (
+ 	"context"
++	"errors"
++	"os"
++	"path/filepath"
+ 	"testing"
++	"time"
+ 
+ 	"github.com/openshift/machine-config-operator/internal/clients"
+ 	ctrlcommon "github.com/openshift/machine-config-operator/pkg/controller/common"
++	"github.com/openshift/machine-config-operator/pkg/imageutils"
+ 	"github.com/openshift/machine-config-operator/pkg/osimagestream"
+ 	"github.com/openshift/machine-config-operator/test/framework"
+ 	"github.com/stretchr/testify/assert"
+@@ -47,11 +52,9 @@ func TestImageStreamProviderCVO(t *testing.T) {
+ 	assert.Equal(t, getCVOImage(t, cs), image)
+ 
+ 	sysContext := setupSysContext(t, cs)
+-	defer func() {
+-		require.NoError(t, sysContext.Cleanup())
+-	}()
++	sysCtxFactory := func() (*imageutils.SysContext, error) { return sysContext, nil }
+ 
+-	isNetProvider := osimagestream.NewImageStreamProviderNetwork(osimagestream.NewImagesInspector(sysContext.SysContext), image)
++	isNetProvider := osimagestream.NewImageStreamProviderNetwork(osimagestream.NewImagesInspector(sysCtxFactory), image)
+ 	imageStream, err := isNetProvider.ReadImageStream(ctx)
+ 	assert.NoError(t, err)
+ 	assert.NotNil(t, imageStream)
+@@ -98,3 +101,57 @@ func TestConfigMapUrlProvider(t *testing.T) {
+ 	assert.True(t, ok)
+ 	assert.Equal(t, baseOSExtensionsContainerImage, urls.OSExtensionsImage)
+ }
++
++// TestCachedInspectorFactory validates the CachedImagesInspectorFactory stack
++// (cache + real image inspector) wired the same way as production. It inspects
++// a real cluster image to populate the cache, then verifies a second inspect
++// with a broken SysContextFactory is served entirely from cache.
++func TestCachedInspectorFactory(t *testing.T) {
++	cs := framework.NewClientSet("")
++
++	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
++	defer cancel()
++
++	image := getCVOImage(t, cs)
++	digest := imageutils.DigestFromPullspec(image)
++	require.NotEmpty(t, digest, "CVO release image must be digested")
++
++	cachePath := filepath.Join(t.TempDir(), "test-cache.json")
++	cache := imageutils.NewFileInspectionCache(cachePath, 48*time.Hour)
++	factory := osimagestream.NewCachedImagesInspectorFactory(
++		&osimagestream.DefaultImagesInspectorFactory{},
++		cache,
++	)
++
++	// First inspect: cache miss, hits the real registry
++	sysContext := setupSysContext(t, cs)
++	sysCtxFactory := func() (*imageutils.SysContext, error) { return sysContext, nil }
++	inspector := factory.ForContext(sysCtxFactory)
++
++	results, err := inspector.Inspect(ctx, image)
++	require.NoError(t, err)
++	require.Len(t, results, 1)
++	require.NoError(t, results[0].Error)
++	require.NotNil(t, results[0].InspectInfo)
++	require.NotEmpty(t, results[0].InspectInfo.Labels)
++
++	entry := cache.Get(digest)
++	require.NotNil(t, entry, "cache must be populated after first inspect")
++	assert.Equal(t, results[0].InspectInfo.Labels, entry.Labels)
++
++	_, err = os.Stat(cachePath)
++	require.NoError(t, err, "cache file must exist on disk")
++
++	// Second inspect: uses a broken factory that errors if called, proving
++	// the result is served from cache without touching the registry.
++	broken := func() (*imageutils.SysContext, error) {
++		return nil, errors.New("must not be called — cache should serve this")
++	}
++	inspector2 := factory.ForContext(broken)
++
++	results2, err := inspector2.Inspect(ctx, image)
++	require.NoError(t, err)
++	require.Len(t, results2, 1)
++	require.NoError(t, results2[0].Error)
++	assert.Equal(t, results[0].InspectInfo.Labels, results2[0].InspectInfo.Labels)
++}

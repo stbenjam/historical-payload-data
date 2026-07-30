@@ -1,0 +1,124 @@
+diff --git a/.pre-commit-config.yaml b/.pre-commit-config.yaml
+index 532b48b15d03..563f290ae368 100644
+--- a/.pre-commit-config.yaml
++++ b/.pre-commit-config.yaml
+@@ -1,5 +1,5 @@
+ default_stages: [pre-commit, pre-push]
+-default_install_hook_types: [pre-commit, pre-push]
++default_install_hook_types: [pre-commit, pre-push, post-checkout]
+ repos:
+   - repo: https://github.com/pre-commit/pre-commit-hooks
+     rev: v5.0.0
+@@ -34,18 +34,34 @@ repos:
+           - Dockerfile.control-plane
+         description: Ensures the CPO container files stay in sync
+         stages: [pre-commit]
+-      - id: make-lint-fix
++      - id: api-lint-fix
++        name: Sort API imports
++        description: Runs `make api-lint-fix` to sort imports in the api/ module.
++        entry: make api-lint-fix PULL_BASE_SHA=HEAD
++        language: system
++        stages: [pre-commit]
++        files: '^api/.*\.go$'
++      - id: main-lint-fix
+         name: Sort imports
+-        description: Runs `make lint-fix` to sort imports.
+-        entry: make lint-fix
++        description: Runs `make main-lint-fix` to sort imports in the main module.
++        entry: make main-lint-fix PULL_BASE_SHA=HEAD
+         language: system
+         stages: [pre-commit]
++        files: '\.go$'
++        exclude: '^api/'
+       - id: run-gitlint
+         name: Run gitlint
+         description: Runs `make run-gitlint` to validate commit messages.
+         entry: make run-gitlint
+         language: system
+         stages: [pre-commit]
++      - id: clean-stale-mocks
++        name: Clean stale mock files
++        description: Removes gitignored *_mock.go files that may be stale after a branch switch.
++        entry: find . -name '*_mock.go' -not -path '*/vendor/*' -delete
++        language: system
++        stages: [post-checkout]
++        always_run: true
+       - id: make-verify
+         name: Run make verify
+         description: Runs `make verify`.
+@@ -60,4 +76,4 @@ repos:
+         language: system
+         stages: [ pre-push ]
+ exclude: '^vendor/|^hack/tools/vendor/|^api/vendor/'
+-fail_fast: true
+\ No newline at end of file
++fail_fast: false
+diff --git a/DEVELOPMENT.md b/DEVELOPMENT.md
+index ab8935f002fd..7d82e416b325 100644
+--- a/DEVELOPMENT.md
++++ b/DEVELOPMENT.md
+@@ -63,7 +63,7 @@ make pre-commit               # Full pre-PR gate (build, e2e compile, verify, te
+ ```bash
+ make api                      # Regenerate all CRDs, deepcopy, clients
+ make api-lint-fix             # Run API linter and auto-fix violations
+-make generate                 # Run go generate (cleans stale *_mock.go files first)
++make generate                 # Run go generate (regenerates *_mock.go files in place)
+ make clients                  # Update generated clients
+ make update                   # Full update (api-deps, workspace-sync, deps, api, api-docs, clients, docs-aggregate)
+ ```
+@@ -112,7 +112,7 @@ The minimum Go version is declared in [`go.mod`](go.mod). The `api/` module uses
+ - Use `make verify` before submitting PRs to catch formatting/generation issues.
+ - Platform-specific controllers require their respective cloud credentials for testing.
+ - E2E tests need proper cloud infrastructure setup (S3 buckets, DNS zones, etc.).
+-- `make generate` cleans stale `*_mock.go` files via `git clean -fx` before regenerating — don't hand-edit mock files.
++- `make generate` regenerates `*_mock.go` files in place via `go generate` — don't hand-edit mock files.
+ - **No unrelated changes in PRs**: Do not include cosmetic formatting, whitespace, or import reordering changes in files unrelated to the PR's purpose. Unrelated changes increase review surface and make PRs harder to revert cleanly. If you notice something worth cleaning up, do it in a separate PR.
+ - **Follow existing codebase patterns**: Before implementing a new approach (e.g., using service-ca operator for TLS), search the codebase for how similar problems are already solved (e.g., `reconcileSelfSignedCA`). HyperShift self-signs certificates — use the existing self-signing pattern instead of relying on external certificate operators.
+ 
+diff --git a/Makefile b/Makefile
+index 2018e8801b8e..615d0e8fcdc2 100644
+--- a/Makefile
++++ b/Makefile
+@@ -105,16 +105,18 @@ $(KUBEAPILINTER_PLUGIN): $(TOOLS_DIR)/go.mod # Build kube-api-linter as Go plugi
+ 
+ # When not otherwise set, diff/lint against the upstream main branch.
+ # This is always set in OpenShift CI.
++# Falls back through: upstream remote/main → local main → empty (lint all files).
+ UPSTREAM_REMOTE ?= $(shell git remote -v 2>/dev/null | grep 'openshift/hypershift.*fetch' | head -1 | cut -f1)
+-PULL_BASE_SHA ?= $(if $(UPSTREAM_REMOTE),$(shell git rev-parse $(UPSTREAM_REMOTE)/main), $(shell git rev-parse main))
++PULL_BASE_SHA ?= $(if $(UPSTREAM_REMOTE),$(shell git rev-parse $(UPSTREAM_REMOTE)/main 2>/dev/null),)
++PULL_BASE_SHA := $(if $(PULL_BASE_SHA),$(PULL_BASE_SHA),$(shell git rev-parse main 2>/dev/null))
+ 
+ .PHONY: api-lint
+ api-lint: $(GOLANGCI_LINT) $(KUBEAPILINTER_PLUGIN)
+-	cd api && $(GOLANGCI_LINT) run --config ./.golangci.yml --modules-download-mode=readonly -v --new-from-rev=${PULL_BASE_SHA}
++	cd api && $(GOLANGCI_LINT) run --config ./.golangci.yml --modules-download-mode=readonly -v $(if $(PULL_BASE_SHA),--new-from-rev=$(PULL_BASE_SHA) --whole-files)
+ 
+ .PHONY: api-lint-fix
+ api-lint-fix: $(GOLANGCI_LINT) $(KUBEAPILINTER_PLUGIN)
+-	cd api && $(GOLANGCI_LINT) run --config ./.golangci.yml --fix -v --new-from-rev=${PULL_BASE_SHA}
++	cd api && $(GOLANGCI_LINT) run --config ./.golangci.yml --fix -v $(if $(PULL_BASE_SHA),--new-from-rev=$(PULL_BASE_SHA) --whole-files)
+ 
+ .PHONY: lint
+ lint: generate
+@@ -122,6 +124,10 @@ lint: generate
+ 	$(GOLANGCI_LINT) run --config ./.golangci.yml --modules-download-mode=readonly -v; main_rc=$$?; \
+ 	exit $$(( api_rc > main_rc ? api_rc : main_rc ))
+ 
++.PHONY: main-lint-fix
++main-lint-fix: generate $(GOLANGCI_LINT)
++	$(GOLANGCI_LINT) run --config ./.golangci.yml --fix -v $(if $(PULL_BASE_SHA),--new-from-rev=$(PULL_BASE_SHA) --whole-files)
++
+ .PHONY: lint-fix
+ lint-fix: generate
+ 	$(MAKE) api-lint-fix; api_rc=$$?; \
+@@ -185,8 +191,6 @@ $(CRD_SCHEMA_CHECK): $(TOOLS_DIR)/go.mod # Build crd-schema-check tool
+ 
+ .PHONY: generate
+ generate: $(MOCKGEN)
+-	@echo "Cleaning stale mock files..."
+-	find . -name '*_mock.go' -not -path '*/vendor/*' -delete
+ 	$(GO) generate ./...
+ 
+ # Compile all tests

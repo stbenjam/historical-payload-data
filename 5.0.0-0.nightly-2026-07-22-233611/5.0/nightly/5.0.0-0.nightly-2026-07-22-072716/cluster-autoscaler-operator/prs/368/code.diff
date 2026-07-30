@@ -1,0 +1,303 @@
+diff --git a/install/03_rbac.yaml b/install/03_rbac.yaml
+index dc23be529..657dfa098 100644
+--- a/install/03_rbac.yaml
++++ b/install/03_rbac.yaml
+@@ -478,4 +478,109 @@ subjects:
+   - kind: ServiceAccount
+     name: cluster-autoscaler
+     namespace: openshift-machine-api
+-
++---
++# roles related to clusterapi enablement these roles should be incorporated into the main role or an aggregated role should be configured
++apiVersion: rbac.authorization.k8s.io/v1
++kind: ClusterRole
++metadata:
++  annotations:
++    feature-gate.release.openshift.io/ClusterAPIMachineManagement: "true"
++    include.release.openshift.io/hypershift: "true"
++    include.release.openshift.io/ibm-cloud-managed: "true"
++    include.release.openshift.io/self-managed-high-availability: "true"
++    include.release.openshift.io/single-node-developer: "true"
++  name: cluster-autoscaler-operator-clusterapi
++rules:
++- apiGroups:
++  - cluster.x-k8s.io
++  resources:
++  - machinedeployments
++  - machinesets
++  verbs:
++  - watch
++  - list
++  - get
++  - update
++---
++apiVersion: rbac.authorization.k8s.io/v1
++kind: ClusterRoleBinding
++metadata:
++  name: cluster-autoscaler-operator-clusterapi
++  annotations:
++    feature-gate.release.openshift.io/ClusterAPIMachineManagement: "true"
++    include.release.openshift.io/hypershift: "true"
++    include.release.openshift.io/ibm-cloud-managed: "true"
++    include.release.openshift.io/self-managed-high-availability: "true"
++    include.release.openshift.io/single-node-developer: "true"
++roleRef:
++  apiGroup: rbac.authorization.k8s.io
++  kind: ClusterRole
++  name: cluster-autoscaler-operator-clusterapi
++subjects:
++  - kind: ServiceAccount
++    name: cluster-autoscaler-operator
++    namespace: openshift-machine-api
++---
++apiVersion: rbac.authorization.k8s.io/v1
++kind: ClusterRole
++metadata:
++  annotations:
++    feature-gate.release.openshift.io/ClusterAPIMachineManagement: "true"
++    include.release.openshift.io/hypershift: "true"
++    include.release.openshift.io/ibm-cloud-managed: "true"
++    include.release.openshift.io/self-managed-high-availability: "true"
++    include.release.openshift.io/single-node-developer: "true"
++  name: cluster-autoscaler-clusterapi
++rules:
++- apiGroups:
++  - cluster.x-k8s.io
++  resources:
++  - machinedeployments
++  - machinesets
++  - machines
++  verbs:
++  - watch
++  - list
++  - get
++  - update
++- apiGroups:
++  - cluster.x-k8s.io
++  resources:
++  - machinesets/scale
++  verbs:
++  - watch
++  - list
++  - get
++- apiGroups:
++  - infrastructure.cluster.x-k8s.io
++  resources:
++  - awsmachinetemplates
++  - azuremachinetemplates
++  - gcpmachinetemplates
++  - ibmpowervsmachinetemplates
++  - metal3machinetemplates
++  - openstackmachinetemplates
++  - vspheremachinetemplates
++  verbs:
++  - watch
++  - list
++  - get
++---
++apiVersion: rbac.authorization.k8s.io/v1
++kind: ClusterRoleBinding
++metadata:
++  name: cluster-autoscaler-clusterapi
++  annotations:
++    feature-gate.release.openshift.io/ClusterAPIMachineManagement: "true"
++    include.release.openshift.io/hypershift: "true"
++    include.release.openshift.io/ibm-cloud-managed: "true"
++    include.release.openshift.io/self-managed-high-availability: "true"
++    include.release.openshift.io/single-node-developer: "true"
++roleRef:
++  apiGroup: rbac.authorization.k8s.io
++  kind: ClusterRole
++  name: cluster-autoscaler-clusterapi
++subjects:
++  - kind: ServiceAccount
++    name: cluster-autoscaler
++    namespace: openshift-machine-api
+diff --git a/pkg/controller/clusterautoscaler/clusterautoscaler.go b/pkg/controller/clusterautoscaler/clusterautoscaler.go
+index 213eead14..a22b41539 100644
+--- a/pkg/controller/clusterautoscaler/clusterautoscaler.go
++++ b/pkg/controller/clusterautoscaler/clusterautoscaler.go
+@@ -7,6 +7,7 @@ import (
+ 
+ 	configv1 "github.com/openshift/api/config/v1"
+ 	v1 "github.com/openshift/cluster-autoscaler-operator/pkg/apis/autoscaling/v1"
++	"github.com/openshift/library-go/pkg/operator/configobserver/featuregates"
+ 	"k8s.io/klog/v2"
+ )
+ 
+@@ -26,6 +27,15 @@ const (
+ 	// ProvisioningRequest FeatureGate name
+ 	provisioningRequestFGName = "ProvisioningRequestAvailable"
+ 
++	// Cluster API Machine Management FeatureGate names
++	clusterapiAWSFGName       = "ClusterAPIMachineManagementAWS"
++	clusterapiAzureFGName     = "ClusterAPIMachineManagementAzure"
++	clusterapiBareMetalFGName = "ClusterAPIMachineManagementBareMetal"
++	clusterapiGCPFGName       = "ClusterAPIMachineManagementGCP"
++	clusterapiPowerVSFGName   = "ClusterAPIMachineManagementPowerVS"
++	clusterapiOpenStackFGName = "ClusterAPIMachineManagementOpenStack"
++	clusterapiVSphereFGName   = "ClusterAPIMachineManagementVSphere"
++
+ 	// API Content-Type for autoscaler Kubernetes clients
+ 	autoscalerAPIContentType = "application/json"
+ )
+@@ -89,6 +99,7 @@ const (
+ 	MaxBulkSoftTaintCountArg         AutoscalerArg = "--max-bulk-soft-taint-count"
+ 	EnableProvisioningRequestsArg    AutoscalerArg = "--enable-provisioning-requests"
+ 	KubeAPIContentType               AutoscalerArg = "--kube-api-content-type"
++	NodeGroupAutoDiscovery           AutoscalerArg = "--node-group-auto-discovery"
+ )
+ 
+ // Constants for the command line expander flags
+@@ -222,20 +233,15 @@ func AutoscalerArgs(ca *v1.ClusterAutoscaler, cfg *Config) []string {
+ 		KubeAPIContentType.Value(autoscalerAPIContentType),
+ 	}
+ 
+-	// if we can't determine the feature gate, log and skip it
+-	if cfg.FeatureGateAccessor != nil {
+-		if featureGates, err := cfg.FeatureGateAccessor.CurrentFeatureGates(); err != nil {
+-			klog.Errorf("unable to get feature gate accessor for autoscaler args: %v", err)
+-		} else {
+-			// prevent a panic from the Enabled call if possible.
+-			if slices.Contains(featureGates.KnownFeatures(), provisioningRequestFGName) {
+-				if featureGates.Enabled(provisioningRequestFGName) {
+-					args = append(args, EnableProvisioningRequestsArg.Value(trueFlag))
+-				}
+-			} else {
+-				klog.Info("ProvisioingRequest feature gate not found.")
+-			}
+-		}
++	// if Cluster API is enabled for this platform, we need to add an autodiscovery flag so that
++	// the autoscaler can discover node groups that are Cluster API authoritative.
++	if !shouldDisableClusterAPIProviderFor(*cfg) {
++		args = append(args, NodeGroupAutoDiscovery.Value("clusterapi:namespace=openshift-cluster-api"))
++	}
++
++	// if feature gate for ProvisioningRequest is enabled, turn on the flag
++	if isFeatureGateEnabled(cfg.FeatureGateAccessor, provisioningRequestFGName) {
++		args = append(args, EnableProvisioningRequestsArg.Value(trueFlag))
+ 	}
+ 
+ 	if ca.Spec.MaxPodGracePeriod != nil {
+@@ -395,3 +401,58 @@ func ResourceArgs(rl *v1.ResourceLimits) []string {
+ 
+ 	return args
+ }
++
++func isFeatureGateEnabled(accessor featuregates.FeatureGateAccess, name string) bool {
++	if accessor != nil {
++		if featureGates, err := accessor.CurrentFeatureGates(); err != nil {
++			klog.Errorf("unable to get feature gate accessor: %v", err)
++		} else {
++			// check if the feature gate is present in all the known gates, this is done to prevent a possible panic in the `Enabled` call.
++			if slices.Contains(featureGates.KnownFeatures(), configv1.FeatureGateName(name)) {
++				return featureGates.Enabled(configv1.FeatureGateName(name))
++			} else {
++				klog.Infof("%q feature gate not found.", name)
++			}
++		}
++	} else {
++		// this shouldn't happen
++		klog.Errorf("unexpected error: feature gate accessor is nil when checking for %q", name)
++	}
++
++	return false
++}
++
++// shouldDisableClusterAPIProviderFor returns true if the Cluster API provider should be disabled
++// on a given platform. Because not all OpenShift clusters will have Cluster API resources
++// available, we need to determine when Cluster API provider creation should be disabled on a platform.
++func shouldDisableClusterAPIProviderFor(cfg Config) bool {
++	var fgName string
++
++	switch cfg.platformType {
++	case configv1.AWSPlatformType:
++		fgName = clusterapiAWSFGName
++	case configv1.AzurePlatformType:
++		fgName = clusterapiAzureFGName
++	case configv1.BareMetalPlatformType:
++		fgName = clusterapiBareMetalFGName
++	case configv1.GCPPlatformType:
++		fgName = clusterapiGCPFGName
++	case configv1.OpenStackPlatformType:
++		fgName = clusterapiOpenStackFGName
++	case configv1.PowerVSPlatformType:
++		fgName = clusterapiPowerVSFGName
++	case configv1.VSpherePlatformType:
++		fgName = clusterapiVSphereFGName
++	default:
++		// if we can't determine the platform type, default to disabling Cluster API to be safe
++		fgName = ""
++	}
++
++	if len(fgName) > 0 {
++		// if the feature gate is enabled on a given platform, then we know Cluster API is enabled
++		return !isFeatureGateEnabled(cfg.FeatureGateAccessor, fgName)
++	}
++
++	// if we fall through to here it is because we can't determine the platform, the safest thing to do is disable Cluster API
++	return true
++}
+diff --git a/pkg/controller/clusterautoscaler/clusterautoscaler_controller.go b/pkg/controller/clusterautoscaler/clusterautoscaler_controller.go
+index aaea7f7d0..92ecaa94c 100644
+--- a/pkg/controller/clusterautoscaler/clusterautoscaler_controller.go
++++ b/pkg/controller/clusterautoscaler/clusterautoscaler_controller.go
+@@ -37,12 +37,9 @@ const (
+ 	controllerName                 = "cluster_autoscaler_controller"
+ 	caServiceAccount               = "cluster-autoscaler"
+ 	caPriorityClassName            = "system-cluster-critical"
+-	CAPIGroupEnvVar                = "CAPI_GROUP"
+-	CAPIGroup                      = "machine.openshift.io"
+ 	CAPIScaleZeroDefaultArchEnvVar = "CAPI_SCALE_ZERO_DEFAULT_ARCH"
+-	CAPIVersionEnvVar              = "CAPI_VERSION"
+-	CAPIVersion                    = "v1beta1"
+ 	infrastructureName             = "cluster"
++	CAPIDisableEnvVar              = "OPENSHIFT_CLUSTERAPI_DISABLE"
+ )
+ 
+ // NewReconciler returns a new Reconciler.
+@@ -466,14 +463,6 @@ func (r *Reconciler) AutoscalerPodSpec(ca *autoscalingv1.ClusterAutoscaler) *cor
+ 					},
+ 				},
+ 				Env: []corev1.EnvVar{
+-					{
+-						Name:  CAPIGroupEnvVar,
+-						Value: CAPIGroup,
+-					},
+-					{
+-						Name:  CAPIVersionEnvVar,
+-						Value: CAPIVersion,
+-					},
+ 					{
+ 						Name:  CAPIScaleZeroDefaultArchEnvVar,
+ 						Value: goruntime.GOARCH,
+@@ -502,6 +491,16 @@ func (r *Reconciler) AutoscalerPodSpec(ca *autoscalingv1.ClusterAutoscaler) *cor
+ 		},
+ 	}
+ 
++	// when using the new openshift provider, we need to override the creation of the inner
++	// cluster api provider on platforms where openshift does not yet support cluster api.
++	if shouldDisableClusterAPIProviderFor(r.config) {
++		capiDisable := corev1.EnvVar{
++			Name:  CAPIDisableEnvVar,
++			Value: "true",
++		}
++		spec.Containers[0].Env = append(spec.Containers[0].Env, capiDisable)
++	}
++
+ 	return spec
+ }
+ 
+diff --git a/pkg/operator/config.go b/pkg/operator/config.go
+index ddbea3f88..3df8a240a 100644
+--- a/pkg/operator/config.go
++++ b/pkg/operator/config.go
+@@ -41,7 +41,7 @@ const (
+ 
+ 	// DefaultClusterAutoscalerCloudProvider is the default name for
+ 	// the CloudProvider beeing used.
+-	DefaultClusterAutoscalerCloudProvider = "clusterapi"
++	DefaultClusterAutoscalerCloudProvider = "openshift"
+ 
+ 	// DefaultClusterAutoscalerVerbosity is the default logging
+ 	// verbosity level for ClusterAutoscaler deployments.

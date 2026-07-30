@@ -1,0 +1,566 @@
+diff --git a/e2e/crd_compatibility.go b/e2e/crd_compatibility.go
+new file mode 100644
+index 000000000..1c55c439b
+--- /dev/null
++++ b/e2e/crd_compatibility.go
+@@ -0,0 +1,286 @@
++/*
++Copyright 2026 Red Hat, Inc.
++
++Licensed under the Apache License, Version 2.0 (the "License");
++you may not use this file except in compliance with the License.
++You may obtain a copy of the License at
++
++	http://www.apache.org/licenses/LICENSE-2.0
++
++Unless required by applicable law or agreed to in writing, software
++distributed under the License is distributed on an "AS IS" BASIS,
++WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++See the License for the specific language governing permissions and
++limitations under the License.
++*/
++package e2e
++
++import (
++	. "github.com/onsi/ginkgo/v2"
++	. "github.com/onsi/gomega"
++
++	admissionregistrationv1 "k8s.io/api/admissionregistration/v1"
++	appsv1 "k8s.io/api/apps/v1"
++	corev1 "k8s.io/api/core/v1"
++	apiextensionsv1 "k8s.io/apiextensions-apiserver/pkg/apis/apiextensions/v1"
++	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
++	"k8s.io/apimachinery/pkg/runtime/schema"
++	"sigs.k8s.io/controller-runtime/pkg/client"
++
++	apiextensionsv1alpha1 "github.com/openshift/api/apiextensions/v1alpha1"
++	configv1 "github.com/openshift/api/config/v1"
++	"github.com/openshift/api/features"
++	"github.com/openshift/cluster-capi-operator/e2e/framework"
++	"github.com/openshift/cluster-capi-operator/pkg/test"
++)
++
++const (
++	crdCompatibilityDeploymentName = "compatibility-requirements-controllers"
++
++	staticVWCCRDValidation = "openshift-compatibility-requirements-apiextensions-k8s-io-v1-customresourcedefinition-validation"
++	staticVWCCRValidation  = "openshift-compatibility-requirements-apiextensions-openshift-io-v1alpha1-compatibilityrequirement-validation"
++)
++
++func waitForRequirementReady(crd *apiextensionsv1.CustomResourceDefinition, requirement *apiextensionsv1alpha1.CompatibilityRequirement) {
++	GinkgoHelper()
++
++	By("Refreshing the CRD to get its UID and generation", func() {
++		Expect(cl.Get(ctx, client.ObjectKeyFromObject(crd), crd)).To(Succeed())
++	})
++
++	By("Waiting for CompatibilityRequirement to be admitted and up to date", func() {
++		Eventually(func(g Gomega) {
++			fresh := &apiextensionsv1alpha1.CompatibilityRequirement{}
++			g.Expect(cl.Get(ctx, client.ObjectKeyFromObject(requirement), fresh)).To(Succeed())
++
++			g.Expect(fresh.Status.ObservedCRD.UID).To(Equal(string(crd.UID)),
++				"requirement should have observed the test CRD")
++			g.Expect(fresh.Status.ObservedCRD.Generation).To(Equal(crd.Generation),
++				"requirement should have observed the current CRD generation")
++
++			g.Expect(fresh.Status.Conditions).To(SatisfyAll(
++				test.HaveCondition(apiextensionsv1alpha1.CompatibilityRequirementAdmitted).
++					WithStatus(metav1.ConditionTrue),
++				test.HaveCondition(apiextensionsv1alpha1.CompatibilityRequirementProgressing).
++					WithStatus(metav1.ConditionFalse).
++					WithReason(apiextensionsv1alpha1.CompatibilityRequirementUpToDateReason),
++			))
++		}).WithTimeout(framework.WaitMedium).WithPolling(framework.RetryMedium).Should(Succeed())
++	})
++}
++
++func createTestCRDAndRequirement(crd *apiextensionsv1.CustomResourceDefinition, requirement *apiextensionsv1alpha1.CompatibilityRequirement) {
++	GinkgoHelper()
++
++	By("Creating the test CRD", func() {
++		framework.CreateAndCleanup(ctx, cl, crd)
++		trackResource(crd)
++	})
++
++	By("Creating the CompatibilityRequirement", func() {
++		framework.CreateAndCleanup(ctx, cl, requirement)
++		trackResource(requirement)
++	})
++}
++
++func testCRDGVK(crd *apiextensionsv1.CustomResourceDefinition) schema.GroupVersionKind {
++	return schema.GroupVersionKind{
++		Group:   crd.Spec.Group,
++		Version: crd.Spec.Versions[0].Name,
++		Kind:    crd.Spec.Names.Kind,
++	}
++}
++
++var _ = Describe("[sig-cluster-lifecycle][OCPFeatureGate:CRDCompatibilityRequirementOperator] CRD Compatibility Checker", Ordered, func() {
++	BeforeAll(func() {
++		if !framework.IsFeatureGateEnabled(ctx, cl, features.FeatureGateCRDCompatibilityRequirementOperator) {
++			Skip("Feature gate CRDCompatibilityRequirementOperator is not enabled.")
++		}
++	})
++
++	Context("Deployment health", func() {
++		It("should have a running deployment and static ValidatingWebhookConfigs", func() {
++			By("Checking the compatibility-requirements-controllers deployment is Available", func() {
++				deployment := &appsv1.Deployment{}
++
++				Eventually(func(g Gomega) {
++					g.Expect(cl.Get(ctx, client.ObjectKey{
++						Namespace: framework.CompatibilityRequirementsNamespace,
++						Name:      crdCompatibilityDeploymentName,
++					}, deployment)).To(Succeed())
++
++					g.Expect(deployment.Status.Conditions).To(ContainElement(SatisfyAll(
++						HaveField("Type", Equal(appsv1.DeploymentAvailable)),
++						HaveField("Status", Equal(corev1.ConditionTrue)),
++					)))
++				}).WithTimeout(framework.WaitLong).WithPolling(framework.RetryMedium).Should(Succeed())
++			})
++
++			By("Checking all pods are Running", func() {
++				Eventually(func(g Gomega) {
++					pods := &corev1.PodList{}
++					g.Expect(cl.List(ctx, pods,
++						client.InNamespace(framework.CompatibilityRequirementsNamespace),
++						client.MatchingLabels{"k8s-app": crdCompatibilityDeploymentName},
++					)).To(Succeed())
++					g.Expect(pods.Items).ToNot(BeEmpty(), "expected at least one pod")
++					g.Expect(pods.Items).To(HaveEach(HaveField("Status.Phase", Equal(corev1.PodRunning))))
++				}).WithTimeout(framework.WaitMedium).WithPolling(framework.RetryMedium).Should(Succeed())
++			})
++
++			By("Checking the CRD validation ValidatingWebhookConfiguration exists", func() {
++				Eventually(func() error {
++					return cl.Get(ctx, client.ObjectKey{Name: staticVWCCRDValidation}, &admissionregistrationv1.ValidatingWebhookConfiguration{})
++				}).WithTimeout(framework.WaitShort).WithPolling(framework.RetryMedium).Should(Succeed())
++			})
++
++			By("Checking the CompatibilityRequirement validation ValidatingWebhookConfiguration exists", func() {
++				Eventually(func() error {
++					return cl.Get(ctx, client.ObjectKey{Name: staticVWCCRValidation}, &admissionregistrationv1.ValidatingWebhookConfiguration{})
++				}).WithTimeout(framework.WaitShort).WithPolling(framework.RetryMedium).Should(Succeed())
++			})
++		})
++	})
++
++	Context("Deployment replicas", func() {
++		It("should have the correct number of replicas based on cluster topology", func() {
++			deployment := &appsv1.Deployment{}
++			Expect(cl.Get(ctx, client.ObjectKey{
++				Namespace: framework.CompatibilityRequirementsNamespace,
++				Name:      crdCompatibilityDeploymentName,
++			}, deployment)).To(Succeed())
++
++			Expect(deployment.Spec.Replicas).ToNot(BeNil())
++
++			if infra.Status.ControlPlaneTopology == configv1.SingleReplicaTopologyMode {
++				Expect(*deployment.Spec.Replicas).To(Equal(int32(1)),
++					"SNO cluster should have 1 replica")
++			} else {
++				Expect(*deployment.Spec.Replicas).To(Equal(int32(2)),
++					"non-SNO cluster should have 2 replicas")
++			}
++		})
++	})
++
++	Context("CRD admission", func() {
++		var (
++			testCRD     *apiextensionsv1.CustomResourceDefinition
++			requirement *apiextensionsv1alpha1.CompatibilityRequirement
++		)
++
++		BeforeEach(func() {
++			testCRD = test.GenerateTestCRD()
++			requirement = test.GenerateTestCompatibilityRequirement(testCRD)
++			createTestCRDAndRequirement(testCRD, requirement)
++			waitForRequirementReady(testCRD, requirement)
++		})
++
++		It("should allow compatible CRD updates", func() {
++			By("Adding a new optional property to the CRD (compatible change)", func() {
++				Eventually(func() error {
++					fresh := &apiextensionsv1.CustomResourceDefinition{}
++					if err := cl.Get(ctx, client.ObjectKeyFromObject(testCRD), fresh); err != nil {
++						return err
++					}
++
++					specProps := fresh.Spec.Versions[0].Schema.OpenAPIV3Schema.Properties["spec"]
++					if specProps.Properties == nil {
++						specProps.Properties = make(map[string]apiextensionsv1.JSONSchemaProps)
++					}
++
++					specProps.Properties["newOptionalField"] = apiextensionsv1.JSONSchemaProps{Type: "string"}
++					fresh.Spec.Versions[0].Schema.OpenAPIV3Schema.Properties["spec"] = specProps
++
++					return cl.Update(ctx, fresh)
++				}).WithTimeout(framework.WaitShort).WithPolling(framework.RetryShort).Should(Succeed(), "compatible CRD update should succeed")
++			})
++		})
++
++		It("should reject incompatible CRD updates", func() {
++			By("Attempting to remove the status property from the CRD", func() {
++				Eventually(func() error {
++					fresh := &apiextensionsv1.CustomResourceDefinition{}
++					if err := cl.Get(ctx, client.ObjectKeyFromObject(testCRD), fresh); err != nil {
++						return err
++					}
++
++					delete(fresh.Spec.Versions[0].Schema.OpenAPIV3Schema.Properties, "status")
++					fresh.Spec.Versions[0].Subresources = nil
++
++					err := cl.Update(ctx, fresh)
++					if err == nil {
++						return StopTrying("CRD update succeeded but should have been rejected")
++					}
++
++					return err
++				}).WithTimeout(framework.WaitShort).WithPolling(framework.RetryShort).Should(MatchError(ContainSubstring("CRD is not compatible with CompatibilityRequirements")))
++			})
++		})
++	})
++
++	Context("Object validation admission", func() {
++		var (
++			testCRD     *apiextensionsv1.CustomResourceDefinition
++			requirement *apiextensionsv1alpha1.CompatibilityRequirement
++		)
++
++		BeforeEach(func() {
++			testCRD = test.GenerateTestCRD()
++
++			specSchema := testCRD.Spec.Versions[0].Schema.OpenAPIV3Schema.Properties["spec"]
++			specSchema.Properties = map[string]apiextensionsv1.JSONSchemaProps{
++				"appName": {Type: "string"},
++			}
++			specSchema.Required = []string{"appName"}
++			testCRD.Spec.Versions[0].Schema.OpenAPIV3Schema.Properties["spec"] = specSchema
++
++			requirement = test.GenerateTestCompatibilityRequirement(testCRD)
++			requirement.Spec.ObjectSchemaValidation.Action = apiextensionsv1alpha1.CRDAdmitActionDeny
++			createTestCRDAndRequirement(testCRD, requirement)
++			waitForRequirementReady(testCRD, requirement)
++
++			By("Waiting for the dynamic ValidatingWebhookConfiguration to exist", func() {
++				Eventually(func() error {
++					return cl.Get(ctx, client.ObjectKey{Name: requirement.Name}, &admissionregistrationv1.ValidatingWebhookConfiguration{})
++				}).WithTimeout(framework.WaitMedium).WithPolling(framework.RetryMedium).Should(Succeed())
++			})
++		})
++
++		It("should accept CRs that conform to the compatibility schema", func() {
++			By("Submitting a valid CR with the required appName field", func() {
++				validCR := test.NewTestObject(testCRDGVK(testCRD)).
++					WithName("valid-cr-test").
++					WithSpec(map[string]any{
++						"appName": "my-app",
++					}).
++					Build()
++
++				Eventually(func() error {
++					return cl.Create(ctx, validCR)
++				}).WithTimeout(framework.WaitShort).WithPolling(framework.RetryShort).Should(Succeed(), "valid CR should be accepted")
++
++				DeferCleanup(func() {
++					_ = cl.Delete(ctx, validCR)
++				})
++			})
++		})
++
++		It("should reject CRs that do not conform to the compatibility schema", func() {
++			By("Submitting a CR missing the required appName field", func() {
++				invalidCR := test.NewTestObject(testCRDGVK(testCRD)).
++					WithName("invalid-cr-test").
++					WithSpec(map[string]any{}).
++					Build()
++
++				Eventually(func() error {
++					err := cl.Create(ctx, invalidCR.DeepCopy())
++					if err == nil {
++						return StopTrying("CR creation succeeded but should have been rejected")
++					}
++
++					return err
++				}).WithTimeout(framework.WaitShort).WithPolling(framework.RetryShort).Should(MatchError(ContainSubstring("spec.appName")))
++			})
++		})
++	})
++})
+diff --git a/e2e/e2e_common.go b/e2e/e2e_common.go
+index ec332e581..bd7141d3a 100644
+--- a/e2e/e2e_common.go
++++ b/e2e/e2e_common.go
+@@ -46,6 +46,7 @@ import (
+ 	ctrl "sigs.k8s.io/controller-runtime"
+ 	logf "sigs.k8s.io/controller-runtime/pkg/log"
+ 
++	apiextensionsv1alpha1 "github.com/openshift/api/apiextensions/v1alpha1"
+ 	configv1 "github.com/openshift/api/config/v1"
+ 	mapiv1beta1 "github.com/openshift/api/machine/v1beta1"
+ 	capiframework "github.com/openshift/cluster-capi-operator/e2e/framework"
+@@ -85,6 +86,7 @@ func init() {
+ 	utilruntime.Must(vspherev1.AddToScheme(scheme.Scheme))
+ 	utilruntime.Must(metal3v1.AddToScheme(scheme.Scheme))
+ 	utilruntime.Must(bmov1alpha1.AddToScheme(scheme.Scheme))
++	utilruntime.Must(apiextensionsv1alpha1.AddToScheme(scheme.Scheme))
+ }
+ 
+ // InitCommonVariables initializes global variables used across test cases.
+diff --git a/e2e/framework/framework.go b/e2e/framework/framework.go
+index 5fb75b9e6..6fe2b5daa 100644
+--- a/e2e/framework/framework.go
++++ b/e2e/framework/framework.go
+@@ -51,6 +51,38 @@ func resolveTimeout(defaultTimeout time.Duration, override []time.Duration) time
+ 	return defaultTimeout
+ }
+ 
++// CreateAndCleanup creates an object and schedules its cleanup via DeferCleanup.
++// The cleanup deletes the object and waits for it to be fully removed.
++func CreateAndCleanup(ctx context.Context, cl client.Client, obj client.Object) {
++	GinkgoHelper()
++
++	Expect(cl.Create(ctx, obj)).To(Succeed(), "failed to create %T %s", obj, obj.GetName())
++
++	DeferCleanup(func() {
++		DeleteAndWait(ctx, cl, obj)
++	})
++}
++
++// DeleteAndWait deletes an object and waits for it to be fully removed.
++func DeleteAndWait(ctx context.Context, cl client.Client, obj client.Object, timeout ...time.Duration) {
++	GinkgoHelper()
++
++	key := client.ObjectKeyFromObject(obj)
++	gvk := obj.GetObjectKind().GroupVersionKind()
++
++	DeleteObjects(ctx, cl, obj)
++
++	By(fmt.Sprintf("Waiting for %T %s to be fully deleted", obj, key.Name))
++
++	Eventually(func() bool {
++		probe := obj.DeepCopyObject().(client.Object)
++		err := cl.Get(ctx, key, probe)
++
++		return apierrors.IsNotFound(err)
++	}).WithTimeout(resolveTimeout(WaitMedium, timeout)).WithPolling(RetryMedium).Should(BeTrue(),
++		"expected %s %s to be deleted", gvk.Kind, key.Name)
++}
++
+ // DeleteObjects deletes the objects in the given list, tolerating NotFound errors.
+ func DeleteObjects(ctx context.Context, cl client.Client, objs ...client.Object) {
+ 	GinkgoHelper()
+diff --git a/e2e/go.mod b/e2e/go.mod
+index fb23a2c35..6bdee1090 100644
+--- a/e2e/go.mod
++++ b/e2e/go.mod
+@@ -54,7 +54,11 @@ require (
+ 	github.com/beorn7/perks v1.0.1 // indirect
+ 	github.com/blang/semver/v4 v4.0.0 // indirect
+ 	github.com/cespare/xxhash/v2 v2.3.0 // indirect
++	github.com/containerd/stargz-snapshotter/estargz v0.18.1 // indirect
+ 	github.com/davecgh/go-spew v1.1.2-0.20180830191138-d8f796af33cc // indirect
++	github.com/docker/cli v29.2.1+incompatible // indirect
++	github.com/docker/distribution v2.8.3+incompatible // indirect
++	github.com/docker/docker-credential-helpers v0.9.3 // indirect
+ 	github.com/emicklei/go-restful/v3 v3.13.0 // indirect
+ 	github.com/evanphx/json-patch/v5 v5.9.11 // indirect
+ 	github.com/fsnotify/fsnotify v1.9.0 // indirect
+@@ -86,6 +90,7 @@ require (
+ 	github.com/gobuffalo/flect v1.0.3 // indirect
+ 	github.com/google/btree v1.1.3 // indirect
+ 	github.com/google/gnostic-models v0.7.1 // indirect
++	github.com/google/go-containerregistry v0.20.7 // indirect
+ 	github.com/google/pprof v0.0.0-20260115054156-294ebfa9ad83 // indirect
+ 	github.com/google/uuid v1.6.0 // indirect
+ 	github.com/gophercloud/gophercloud/v2 v2.10.0 // indirect
+@@ -94,16 +99,21 @@ require (
+ 	github.com/imdario/mergo v0.3.16 // indirect
+ 	github.com/jmespath/go-jmespath v0.4.1-0.20220621161143-b0104c826a24 // indirect
+ 	github.com/json-iterator/go v1.1.12 // indirect
++	github.com/klauspost/compress v1.18.1 // indirect
+ 	github.com/leodido/go-urn v1.4.0 // indirect
+ 	github.com/metal3-io/baremetal-operator/pkg/hardwareutils v0.5.1 // indirect
+ 	github.com/metal3-io/ip-address-manager/api v1.11.2 // indirect
++	github.com/mitchellh/go-homedir v1.1.0 // indirect
+ 	github.com/modern-go/concurrent v0.0.0-20180306012644-bacd9c7ef1dd // indirect
+ 	github.com/modern-go/reflect2 v1.0.3-0.20250322232337-35a7c28c31ee // indirect
+ 	github.com/munnerz/goautoneg v0.0.0-20191010083416-a7dc8b61c822 // indirect
+ 	github.com/oklog/ulid v1.3.1 // indirect
++	github.com/opencontainers/go-digest v1.0.0 // indirect
++	github.com/opencontainers/image-spec v1.1.1 // indirect
+ 	github.com/openshift/client-go v0.0.0-20260416131737-a19e91702ab5 // indirect
+ 	github.com/openshift/cluster-api-actuator-pkg/testutils v0.0.0 // indirect
+ 	github.com/openshift/cluster-autoscaler-operator v0.0.1-0.20250702183526-4eb64d553940 // indirect
++	github.com/openshift/cluster-capi-operator/manifests-gen v0.0.0-00010101000000-000000000000 // indirect
+ 	github.com/openshift/library-go v0.0.0-20260413093329-d2db42c961e1 // indirect
+ 	github.com/openshift/machine-api-operator v0.2.1-0.20260226113419-88465550a74b // indirect
+ 	github.com/pkg/errors v0.9.1 // indirect
+@@ -113,10 +123,12 @@ require (
+ 	github.com/prometheus/common v0.67.5 // indirect
+ 	github.com/prometheus/procfs v0.20.1 // indirect
+ 	github.com/robfig/cron v1.2.0 // indirect
++	github.com/sirupsen/logrus v1.9.4 // indirect
+ 	github.com/spf13/pflag v1.0.10 // indirect
+ 	github.com/tidwall/gjson v1.18.0 // indirect
+ 	github.com/tidwall/match v1.1.1 // indirect
+ 	github.com/tidwall/pretty v1.2.1 // indirect
++	github.com/vbatts/tar-split v0.12.2 // indirect
+ 	github.com/x448/float16 v0.8.4 // indirect
+ 	go.mongodb.org/mongo-driver v1.17.6 // indirect
+ 	go.opentelemetry.io/otel v1.42.0 // indirect
+diff --git a/e2e/go.sum b/e2e/go.sum
+index da9491013..507087a72 100644
+--- a/e2e/go.sum
++++ b/e2e/go.sum
+@@ -140,6 +140,8 @@ github.com/charmbracelet/x/term v0.2.1 h1:AQeHeLZ1OqSXhrAWpYUtZyX1T3zVxfpZuEQMIQ
+ github.com/charmbracelet/x/term v0.2.1/go.mod h1:oQ4enTYFV7QN4m0i9mzHrViD7TQKvNEEkHUMCmsxdUg=
+ github.com/ckaznocha/intrange v0.3.1 h1:j1onQyXvHUsPWujDH6WIjhyH26gkRt/txNlV7LspvJs=
+ github.com/ckaznocha/intrange v0.3.1/go.mod h1:QVepyz1AkUoFQkpEqksSYpNpUo3c5W7nWh/s6SHIJJk=
++github.com/containerd/stargz-snapshotter/estargz v0.18.1 h1:cy2/lpgBXDA3cDKSyEfNOFMA/c10O1axL69EU7iirO8=
++github.com/containerd/stargz-snapshotter/estargz v0.18.1/go.mod h1:ALIEqa7B6oVDsrF37GkGN20SuvG/pIMm7FwP7ZmRb0Q=
+ github.com/curioswitch/go-reassign v0.3.0 h1:dh3kpQHuADL3cobV/sSGETA8DOv457dwl+fbBAhrQPs=
+ github.com/curioswitch/go-reassign v0.3.0/go.mod h1:nApPCCTtqLJN/s8HfItCcKV0jIPwluBOvZP+dsJGA88=
+ github.com/daixiang0/gci v0.13.7 h1:+0bG5eK9vlI08J+J/NWGbWPTNiXPG4WhNLJOkSxWITQ=
+@@ -154,6 +156,12 @@ github.com/denis-tingaikin/go-header v0.5.0 h1:SRdnP5ZKvcO9KKRP1KJrhFR3RrlGuD+42
+ github.com/denis-tingaikin/go-header v0.5.0/go.mod h1:mMenU5bWrok6Wl2UsZjy+1okegmwQ3UgWl4V1D8gjlY=
+ github.com/dlclark/regexp2 v1.11.5 h1:Q/sSnsKerHeCkc/jSTNq1oCm7KiVgUMZRDUoRu0JQZQ=
+ github.com/dlclark/regexp2 v1.11.5/go.mod h1:DHkYz0B9wPfa6wondMfaivmHpzrQ3v9q8cnmRbL6yW8=
++github.com/docker/cli v29.2.1+incompatible h1:n3Jt0QVCN65eiVBoUTZQM9mcQICCJt3akW4pKAbKdJg=
++github.com/docker/cli v29.2.1+incompatible/go.mod h1:JLrzqnKDaYBop7H2jaqPtU4hHvMKP+vjCwu2uszcLI8=
++github.com/docker/distribution v2.8.3+incompatible h1:AtKxIZ36LoNK51+Z6RpzLpddBirtxJnzDrHLEKxTAYk=
++github.com/docker/distribution v2.8.3+incompatible/go.mod h1:J2gT2udsDAN96Uj4KfcMRqY0/ypR+oyYUYmja8H+y+w=
++github.com/docker/docker-credential-helpers v0.9.3 h1:gAm/VtF9wgqJMoxzT3Gj5p4AqIjCBS4wrsOh9yRqcz8=
++github.com/docker/docker-credential-helpers v0.9.3/go.mod h1:x+4Gbw9aGmChi3qTLZj8Dfn0TD20M/fuWy0E5+WDeCo=
+ github.com/emicklei/go-restful/v3 v3.13.0 h1:C4Bl2xDndpU6nJ4bc1jXd+uTmYPVUwkD6bFY/oTyCes=
+ github.com/emicklei/go-restful/v3 v3.13.0/go.mod h1:6n3XBCmQQb25CM2LCACGz8ukIrRry+4bhvbpWn3mrbc=
+ github.com/ettle/strcase v0.2.0 h1:fGNiVF21fHXpX1niBgk0aROov1LagYsOwV/xqKDKR/Q=
+@@ -304,6 +312,8 @@ github.com/google/gnostic-models v0.7.1 h1:SisTfuFKJSKM5CPZkffwi6coztzzeYUhc3v4y
+ github.com/google/gnostic-models v0.7.1/go.mod h1:whL5G0m6dmc5cPxKc5bdKdEN3UjI7OUGxBlw57miDrQ=
+ github.com/google/go-cmp v0.7.0 h1:wk8382ETsv4JYUZwIsn6YpYiWiBsYLSJiTsyBybVuN8=
+ github.com/google/go-cmp v0.7.0/go.mod h1:pXiqmnSA92OHEEa9HXL2W4E7lf9JzCmGVUdgjX3N/iU=
++github.com/google/go-containerregistry v0.20.7 h1:24VGNpS0IwrOZ2ms2P1QE3Xa5X9p4phx0aUgzYzHW6I=
++github.com/google/go-containerregistry v0.20.7/go.mod h1:Lx5LCZQjLH1QBaMPeGwsME9biPeo1lPx6lbGj/UmzgM=
+ github.com/google/gofuzz v1.0.0/go.mod h1:dBl0BpW6vV/+mYPU4Po3pmUjxk6FQPldtuIdl/M65Eg=
+ github.com/google/gofuzz v1.2.0 h1:xRy4A+RhZaiKjJ1bPfwQ8sedCA+YS2YcCHW6ec7JMi0=
+ github.com/google/gofuzz v1.2.0/go.mod h1:dBl0BpW6vV/+mYPU4Po3pmUjxk6FQPldtuIdl/M65Eg=
+@@ -462,6 +472,10 @@ github.com/onsi/ginkgo/v2 v2.28.1 h1:S4hj+HbZp40fNKuLUQOYLDgZLwNUVn19N3Atb98NCyI
+ github.com/onsi/ginkgo/v2 v2.28.1/go.mod h1:CLtbVInNckU3/+gC8LzkGUb9oF+e8W8TdUsxPwvdOgE=
+ github.com/onsi/gomega v1.39.1 h1:1IJLAad4zjPn2PsnhH70V4DKRFlrCzGBNrNaru+Vf28=
+ github.com/onsi/gomega v1.39.1/go.mod h1:hL6yVALoTOxeWudERyfppUcZXjMwIMLnuSfruD2lcfg=
++github.com/opencontainers/go-digest v1.0.0 h1:apOUWs51W5PlhuyGyz9FCeeBIOUDA/6nW8Oi/yOhh5U=
++github.com/opencontainers/go-digest v1.0.0/go.mod h1:0JzlMkj0TRzQZfJkVvzbP0HBR3IKzErnv2BNG4W4MAM=
++github.com/opencontainers/image-spec v1.1.1 h1:y0fUlFfIZhPF1W537XOLg0/fcx6zcHCJwooC2xJA040=
++github.com/opencontainers/image-spec v1.1.1/go.mod h1:qpqAh3Dmcf36wStyyWU+kCeDgrGnAve2nCC8+7h8Q0M=
+ github.com/openshift/api v0.0.0-20260416105050-3c6b218b8a80 h1:r0S/yoZAI0iWo1JvoIijaIgWGWf/izg4WiV7Wrtz16k=
+ github.com/openshift/api v0.0.0-20260416105050-3c6b218b8a80/go.mod h1:pyVjK0nZ4sRs4fuQVQ4rubsJdahI1PB94LnQ8sGdvxo=
+ github.com/openshift/client-go v0.0.0-20260416131737-a19e91702ab5 h1:R5gdIA+R7MONtwKIEfZ7WM0k9ELv6GM2AbYApaCRNrA=
+@@ -602,6 +616,8 @@ github.com/uudashr/gocognit v1.2.1 h1:CSJynt5txTnORn/DkhiB4mZjwPuifyASC8/6Q0I/QS
+ github.com/uudashr/gocognit v1.2.1/go.mod h1:acaubQc6xYlXFEMb9nWX2dYBzJ/bIjEkc1zzvyIZg5Q=
+ github.com/uudashr/iface v1.4.1 h1:J16Xl1wyNX9ofhpHmQ9h9gk5rnv2A6lX/2+APLTo0zU=
+ github.com/uudashr/iface v1.4.1/go.mod h1:pbeBPlbuU2qkNDn0mmfrxP2X+wjPMIQAy+r1MBXSXtg=
++github.com/vbatts/tar-split v0.12.2 h1:w/Y6tjxpeiFMR47yzZPlPj/FcPLpXbTUi/9H7d3CPa4=
++github.com/vbatts/tar-split v0.12.2/go.mod h1:eF6B6i6ftWQcDqEn3/iGFRFRo8cBIMSJVOpnNdfTMFA=
+ github.com/x448/float16 v0.8.4 h1:qLwI1I70+NjRFUR3zs1JPUCgaCXSh3SW62uAKT1mSBM=
+ github.com/x448/float16 v0.8.4/go.mod h1:14CWIYCyZA/cWjXOioeEpHeN/83MdbZDRQHoFcYsOfg=
+ github.com/xen0n/gosmopolitan v1.3.0 h1:zAZI1zefvo7gcpbCOrPSHJZJYA9ZgLfJqtKzZ5pHqQM=
+@@ -688,6 +704,8 @@ gopkg.in/yaml.v2 v2.4.0/go.mod h1:RDklbk79AGWmwhnvt/jBztapEOGDOx6ZbXqjP6csGnQ=
+ gopkg.in/yaml.v3 v3.0.0-20200313102051-9f266ea9e77c/go.mod h1:K4uyk7z7BCEPqu6E+C64Yfv1cQ7kz7rIZviUmN+EgEM=
+ gopkg.in/yaml.v3 v3.0.1 h1:fxVm/GzAzEWqLHuvctI91KS9hhNmmWOoWu0XTYJS7CA=
+ gopkg.in/yaml.v3 v3.0.1/go.mod h1:K4uyk7z7BCEPqu6E+C64Yfv1cQ7kz7rIZviUmN+EgEM=
++gotest.tools/v3 v3.4.0 h1:ZazjZUfuVeZGLAmlKKuyv3IKP5orXcwtOwDQH6YVr6o=
++gotest.tools/v3 v3.4.0/go.mod h1:CtbdzLSsqVhDgMtKsx03ird5YTGB3ar27v0u/yKBW5g=
+ honnef.co/go/tools v0.7.0 h1:w6WUp1VbkqPEgLz4rkBzH/CSU6HkoqNLp6GstyTx3lU=
+ honnef.co/go/tools v0.7.0/go.mod h1:pm29oPxeP3P82ISxZDgIYeOaf9ta6Pi0EWvCFoLG2vc=
+ k8s.io/api v0.35.3 h1:pA2fiBc6+N9PDf7SAiluKGEBuScsTzd2uYBkA5RzNWQ=
+diff --git a/openshift-tests-extension/go.mod b/openshift-tests-extension/go.mod
+index 27d80dfbd..0880485e7 100644
+--- a/openshift-tests-extension/go.mod
++++ b/openshift-tests-extension/go.mod
+@@ -11,7 +11,9 @@ require (
+ replace (
+ 	github.com/onsi/ginkgo/v2 => github.com/openshift/onsi-ginkgo/v2 v2.6.1-0.20241205171354-8006f302fd12
+ 	github.com/openshift/cluster-api-actuator-pkg/testutils => github.com/openshift/cluster-api-actuator-pkg/testutils v0.0.0-20260616083352-ff0f225cc3b5
++	github.com/openshift/cluster-capi-operator => ../
+ 	github.com/openshift/cluster-capi-operator/e2e => ../e2e
++	github.com/openshift/cluster-capi-operator/manifests-gen => ../manifests-gen
+ )
+ 
+ require (
+@@ -90,6 +92,7 @@ require (
+ 	github.com/openshift/cluster-api-actuator-pkg/testutils v0.0.0 // indirect
+ 	github.com/openshift/cluster-autoscaler-operator v0.0.1-0.20250702183526-4eb64d553940 // indirect
+ 	github.com/openshift/cluster-capi-operator v0.0.0-20260425200736-89a8af46df2a // indirect
++	github.com/openshift/cluster-capi-operator/manifests-gen v0.0.0-00010101000000-000000000000 // indirect
+ 	github.com/openshift/library-go v0.0.0-20260413093329-d2db42c961e1 // indirect
+ 	github.com/openshift/machine-api-operator v0.2.1-0.20260226113419-88465550a74b // indirect
+ 	github.com/pkg/errors v0.9.1 // indirect
+diff --git a/openshift-tests-extension/go.sum b/openshift-tests-extension/go.sum
+index ee14b9410..a80775d2f 100644
+--- a/openshift-tests-extension/go.sum
++++ b/openshift-tests-extension/go.sum
+@@ -461,8 +461,6 @@ github.com/openshift/cluster-api-provider-baremetal v0.0.0-20250619124612-fb678f
+ github.com/openshift/cluster-api-provider-baremetal v0.0.0-20250619124612-fb678fec5f7e/go.mod h1:xMvpaHoSmJ48WvX970zF82PPD9Wj8cMuZBFH6UxnvbE=
+ github.com/openshift/cluster-autoscaler-operator v0.0.1-0.20250702183526-4eb64d553940 h1:NCCRJ7JfGLpRu4IQSV7Qw9VoAdIgF1BiwospisP06a8=
+ github.com/openshift/cluster-autoscaler-operator v0.0.1-0.20250702183526-4eb64d553940/go.mod h1:zCklcJwbnaNx46KvR38Rh86uZdow5gvub4ATcNDopTM=
+-github.com/openshift/cluster-capi-operator v0.0.0-20260425200736-89a8af46df2a h1:oZH3mjDJKZj+CuTLld/gPX4cMOKcPK5pzLVYVDma8vI=
+-github.com/openshift/cluster-capi-operator v0.0.0-20260425200736-89a8af46df2a/go.mod h1:TT6AWfzFzzJpU4Zbj/eBi2QiQs83QMD6Iu4KahNNRCk=
+ github.com/openshift/library-go v0.0.0-20260413093329-d2db42c961e1 h1:NdVGxmPGwWoMlhSmTxMMgp2SszLtAH3nJ6AMGBpXclY=
+ github.com/openshift/library-go v0.0.0-20260413093329-d2db42c961e1/go.mod h1:3bi4pLpYRdVd1aEhsHfRTJkwxwPLfRZ+ZePn3RmJd2k=
+ github.com/openshift/machine-api-operator v0.2.1-0.20260226113419-88465550a74b h1:LtHX/qyWHCOf/KqTAUHZOi4Q7cKErhm9f4jGYW4o2sk=
+diff --git a/vendor/modules.txt b/vendor/modules.txt
+index a6d861e24..6205fc1dc 100644
+--- a/vendor/modules.txt
++++ b/vendor/modules.txt
+@@ -288,6 +288,8 @@ github.com/charmbracelet/x/term
+ # github.com/ckaznocha/intrange v0.3.1
+ ## explicit; go 1.23.0
+ github.com/ckaznocha/intrange
++# github.com/containerd/stargz-snapshotter/estargz v0.18.1
++## explicit; go 1.24.0
+ # github.com/coreos/go-semver v0.3.1
+ ## explicit; go 1.8
+ github.com/coreos/go-semver/semver
+@@ -331,6 +333,12 @@ github.com/distribution/reference
+ ## explicit; go 1.13
+ github.com/dlclark/regexp2
+ github.com/dlclark/regexp2/syntax
++# github.com/docker/cli v29.2.1+incompatible
++## explicit
++# github.com/docker/distribution v2.8.3+incompatible
++## explicit
++# github.com/docker/docker-credential-helpers v0.9.3
++## explicit; go 1.21
+ # github.com/drone/envsubst/v2 v2.0.0-20210730161058-179042472c46
+ ## explicit; go 1.13
+ github.com/drone/envsubst/v2
+@@ -1131,6 +1139,8 @@ github.com/onsi/gomega/types
+ # github.com/opencontainers/go-digest v1.0.0
+ ## explicit; go 1.13
+ github.com/opencontainers/go-digest
++# github.com/opencontainers/image-spec v1.1.1
++## explicit; go 1.18
+ # github.com/openshift-eng/openshift-tests-extension v0.0.0-20260612102633-2fd5b2fa4221
+ ## explicit; go 1.23.0
+ github.com/openshift-eng/openshift-tests-extension/pkg/cmd
+@@ -1281,7 +1291,7 @@ github.com/openshift/cluster-api-provider-baremetal/pkg/apis/baremetal/v1alpha1
+ # github.com/openshift/cluster-autoscaler-operator v0.0.1-0.20250702183526-4eb64d553940
+ ## explicit; go 1.23.0
+ github.com/openshift/cluster-autoscaler-operator/pkg/apis/autoscaling/v1
+-# github.com/openshift/cluster-capi-operator v0.0.0-20260425200736-89a8af46df2a
++# github.com/openshift/cluster-capi-operator v0.0.0-20260425200736-89a8af46df2a => .
+ ## explicit; go 1.25.3
+ # github.com/openshift/cluster-capi-operator/e2e v0.0.0-00010101000000-000000000000 => ./e2e
+ ## explicit; go 1.25.3
+@@ -1542,6 +1552,8 @@ github.com/uudashr/iface/internal/directive
+ github.com/uudashr/iface/opaque
+ github.com/uudashr/iface/unexported
+ github.com/uudashr/iface/unused
++# github.com/vbatts/tar-split v0.12.2
++## explicit; go 1.17
+ # github.com/x448/float16 v0.8.4
+ ## explicit; go 1.11
+ github.com/x448/float16

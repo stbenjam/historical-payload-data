@@ -23,6 +23,7 @@ print = functools.partial(print, flush=True)
 
 SOURCE_BUCKET = "test-platform-results"
 DEST_BUCKET = "prow-artifact-archive"
+COMPLETE_MARKER = ".archive-complete.json"
 
 JOB_PATH_RE = re.compile(
     r"(?:test-platform-results|prow-artifact-archive)/((?:logs|pr-logs)/[a-zA-Z0-9/._-]+?/\d{16,})"
@@ -31,13 +32,44 @@ JOB_PATH_RE = re.compile(
 _archived_lock = threading.Lock()
 
 
+def _is_source_url(value):
+    return value == f"gs://{SOURCE_BUCKET}" or value.startswith(f"gs://{SOURCE_BUCKET}/")
+
+
+def _assert_source_bucket_read_only(args):
+    """Reject commands that could write to the source bucket."""
+    source_urls = [arg for arg in args if _is_source_url(arg)]
+    if not source_urls:
+        return
+
+    command = args[0]
+    if command in {"cat", "ls"}:
+        return
+
+    # A bucket-to-bucket copy reads from every argument except its final
+    # destination. The source bucket must never be that destination.
+    if command == "cp" and not _is_source_url(args[-1]):
+        return
+
+    raise ValueError(
+        f"refusing command that could modify read-only bucket {SOURCE_BUCKET}: "
+        f"gcloud storage {' '.join(args)}"
+    )
+
+
 def gcs_run(*args, check=False):
+    _assert_source_bucket_read_only(args)
     cmd = ["gcloud", "storage"] + list(args)
     return subprocess.run(cmd, capture_output=True, text=True, check=check)
 
 
 def job_exists_in_dest(job_path):
     result = gcs_run("ls", f"gs://{DEST_BUCKET}/{job_path}/started.json")
+    return result.returncode == 0
+
+
+def job_is_complete_in_dest(job_path):
+    result = gcs_run("ls", f"gs://{DEST_BUCKET}/{job_path}/{COMPLETE_MARKER}")
     return result.returncode == 0
 
 
@@ -59,13 +91,48 @@ def server_side_copy(job_path):
     return True
 
 
+def mark_job_complete(job_path):
+    """Record that the full server-side copy finished successfully."""
+    marker = {
+        "version": 1,
+        "completed_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+        "source": f"gs://{SOURCE_BUCKET}/{job_path}/",
+        "destination": f"gs://{DEST_BUCKET}/{job_path}/",
+    }
+    marker_path = f"gs://{DEST_BUCKET}/{job_path}/{COMPLETE_MARKER}"
+    with tempfile.NamedTemporaryFile(mode="w", suffix=".json", delete=False) as f:
+        json.dump(marker, f, indent=2, sort_keys=True)
+        f.write("\n")
+        tmppath = f.name
+    try:
+        result = gcs_run("cp", tmppath, marker_path)
+    finally:
+        os.unlink(tmppath)
+    if result.returncode != 0:
+        print(
+            f"  ERROR writing completion marker: {result.stderr.strip()}",
+            file=sys.stderr,
+        )
+        return False
+    return True
+
+
 def is_aggregated(job_path):
     job_name = job_path.split("/")[1] if "/" in job_path else ""
-    return job_name.startswith("aggregated-")
+    return (
+        job_name.startswith(("aggregated-", "aggregator-"))
+        or job_name.endswith("-analysis-all")
+    )
 
 
 def rewrite_and_find_refs(job_path):
-    """Download text files from dest, rewrite refs, re-upload. Returns referenced job paths."""
+    """Rewrite an aggregate job and return every referenced child job.
+
+    Aggregate jobs are small indexes over many much larger child jobs. Download
+    the aggregate index so references can be discovered in any text artifact,
+    but upload only the individual files that actually changed. Child jobs are
+    copied in full server-side and never pass through this function.
+    """
     referenced = set()
     with tempfile.TemporaryDirectory() as tmpdir:
         result = gcs_run(
@@ -81,6 +148,8 @@ def rewrite_and_find_refs(job_path):
         for root, _dirs, files in os.walk(tmpdir):
             for fname in files:
                 fpath = os.path.join(root, fname)
+                if os.path.relpath(fpath, tmpdir) == COMPLETE_MARKER:
+                    continue
                 try:
                     with open(fpath, "r", encoding="utf-8", errors="strict") as f:
                         content = f.read()
@@ -96,14 +165,18 @@ def rewrite_and_find_refs(job_path):
                         f.write(rewritten)
                     modified_files.append(fpath)
 
-        if modified_files:
+        for fpath in modified_files:
+            relative_path = os.path.relpath(fpath, tmpdir)
             result = gcs_run(
-                "cp", "-r",
-                f"{tmpdir}/*",
-                f"gs://{DEST_BUCKET}/{job_path}/",
+                "cp",
+                fpath,
+                f"gs://{DEST_BUCKET}/{job_path}/{relative_path}",
             )
             if result.returncode != 0:
-                print(f"  ERROR re-uploading: {result.stderr.strip()}", file=sys.stderr)
+                print(
+                    f"  ERROR re-uploading {relative_path}: {result.stderr.strip()}",
+                    file=sys.stderr,
+                )
 
     return referenced
 
@@ -140,37 +213,80 @@ def archive_job(job_path, archived, dry_run=False, recursive=True, rewrite_only=
 
 
 def _archive_job_inner(job_path, archived, dry_run, recursive, rewrite_only, executor, pending_futures):
+    complete_in_dest = job_is_complete_in_dest(job_path)
+    exists_in_dest = complete_in_dest or job_exists_in_dest(job_path)
 
     if rewrite_only:
-        if not job_exists_in_dest(job_path):
+        if not exists_in_dest:
             print(f"  SKIP (not in dest): {job_path}")
             return
+        if dry_run:
+            print(f"  WOULD REWRITE: {job_path}")
+            return
         print(f"  REWRITING: {job_path}")
-        rewrite_and_find_refs(job_path)
+        if is_aggregated(job_path):
+            rewrite_and_find_refs(job_path)
+        else:
+            rewrite_prowjob(job_path)
         print(f"  DONE: {job_path}")
         return
 
-    if job_exists_in_dest(job_path):
+    if complete_in_dest:
         print(f"  SKIP (already archived): {job_path}")
+        if dry_run:
+            return
         if recursive and is_aggregated(job_path):
             referenced = rewrite_and_find_refs(job_path)
             _queue_refs(referenced, archived, dry_run, recursive, rewrite_only, executor, pending_futures)
+        elif not is_aggregated(job_path):
+            rewrite_prowjob(job_path)
         return
 
-    if not job_exists_in_source(job_path):
-        print(f"  SKIP (not in source): {job_path}")
+    exists_in_source = job_exists_in_source(job_path)
+    if not exists_in_source and exists_in_dest:
+        print(f"  WARNING (unmarked archive; source unavailable): {job_path}")
+        if dry_run:
+            return
+        referenced = set()
+        if is_aggregated(job_path):
+            referenced = rewrite_and_find_refs(job_path)
+        else:
+            rewrite_prowjob(job_path)
+        if recursive and referenced:
+            _queue_refs(
+                referenced,
+                archived,
+                dry_run,
+                recursive,
+                rewrite_only,
+                executor,
+                pending_futures,
+            )
+        return
+
+    if not exists_in_source:
+        print(f"  SKIP (not in source or dest): {job_path}")
         return
 
     if dry_run:
-        print(f"  WOULD ARCHIVE: {job_path}")
+        action = "REPAIR" if exists_in_dest else "ARCHIVE"
+        print(f"  WOULD {action}: {job_path}")
         return
 
-    print(f"  ARCHIVING: {job_path}")
+    action = "REPAIRING" if exists_in_dest else "ARCHIVING"
+    print(f"  {action}: {job_path}")
 
     if not server_side_copy(job_path):
         return
 
-    referenced = rewrite_and_find_refs(job_path)
+    referenced = set()
+    if is_aggregated(job_path):
+        referenced = rewrite_and_find_refs(job_path)
+    else:
+        rewrite_prowjob(job_path)
+
+    if not mark_job_complete(job_path):
+        return
 
     print(f"  DONE: {job_path}")
 
@@ -308,7 +424,10 @@ def main():
     )
     parser.add_argument(
         "--rewrite", action="store_true",
-        help="Rewrite all text files in already-archived jobs (use with job paths or --from-snapshot)",
+        help=(
+            "Rewrite aggregate metadata or prowjob.json in already-archived jobs "
+            "(use with job paths or --from-snapshot)"
+        ),
     )
     args = parser.parse_args()
 

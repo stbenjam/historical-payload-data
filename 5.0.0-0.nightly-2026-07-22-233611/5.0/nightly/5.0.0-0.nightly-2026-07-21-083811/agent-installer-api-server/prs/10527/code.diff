@@ -1,0 +1,334 @@
+diff --git a/deploy/operator/capi/deploy_capi_cluster.sh b/deploy/operator/capi/deploy_capi_cluster.sh
+index 2bb6317fea3f..c92ea988f461 100755
+--- a/deploy/operator/capi/deploy_capi_cluster.sh
++++ b/deploy/operator/capi/deploy_capi_cluster.sh
+@@ -67,6 +67,9 @@ fi
+ 
+ if [ "${DISCONNECTED}" = "true" ]; then
+     install_oc_mirrorv2
++    export AUTHFILE="${XDG_RUNTIME_DIR}/containers/auth.json"
++    mkdir -p "$(dirname "${AUTHFILE}")"
++    merge_authfiles "${PULL_SECRET_FILE}" "${REGISTRY_CREDS}" "${AUTHFILE}"
+     # Disconnected hypershift requires:
+     export OCP_MIRROR_REGISTRY="${LOCAL_REGISTRY}/$(get_image_repository_only ${ASSISTED_OPENSHIFT_INSTALL_RELEASE_IMAGE})"
+     # 1. pull secret in hypershift namespace for the hypershift operator
+@@ -220,7 +223,11 @@ oc patch storageclass assisted-service -p '{"metadata": {"annotations":{"storage
+ ### Hypershift CLI needs access to the kubeconfig, pull-secret and public SSH key
+ function hypershift_cli() {
+   full_cmd="update-ca-trust;$@"
+-  podman run -it --net host --rm --entrypoint /bin/bash -v $KUBECONFIG:/root/.kube/config -v $ASSISTED_PULLSECRET_JSON:$ASSISTED_PULLSECRET_JSON -v /root/.ssh/id_rsa.pub:/root/.ssh/id_rsa.pub $EXTRA_HYPERSHIFT_CLI_MOUNTS $HYPERSHIFT_IMAGE -c "$full_cmd"
++  authfile_arg=""
++  if [[ -n "${AUTHFILE:-}" && -f "${AUTHFILE}" ]]; then
++    authfile_arg="--authfile ${AUTHFILE}"
++  fi
++  podman run -it --net host --rm ${authfile_arg} --entrypoint /bin/bash -v $KUBECONFIG:/root/.kube/config -v $ASSISTED_PULLSECRET_JSON:$ASSISTED_PULLSECRET_JSON -v /root/.ssh/id_rsa.pub:/root/.ssh/id_rsa.pub $EXTRA_HYPERSHIFT_CLI_MOUNTS $HYPERSHIFT_IMAGE -c "$full_cmd"
+ }
+ 
+ echo "Installing HyperShift using upstream image"
+diff --git a/deploy/operator/mirror_utils.sh b/deploy/operator/mirror_utils.sh
+index f13bf9679b8c..72c9bd7e6771 100644
+--- a/deploy/operator/mirror_utils.sh
++++ b/deploy/operator/mirror_utils.sh
+@@ -152,10 +152,125 @@ function ocp_mirror_release() {
+   pull_secret_file="${1}"
+   source_image="${2}"
+   dest_mirror_repo="${3}"
++  local max_attempts="${OCP_MIRROR_RELEASE_RETRIES:-3}"
++  local retry_delay="${OCP_MIRROR_RELEASE_RETRY_DELAY:-30}"
++  local attempt=1
++  local output=""
+ 
+-  oc adm -a "${pull_secret_file}" release mirror \
+-         --from="${source_image}" \
+-         --to="${dest_mirror_repo}"
++  while [ "${attempt}" -le "${max_attempts}" ]; do
++    if output=$(oc adm -a "${pull_secret_file}" release mirror \
++               --from="${source_image}" \
++               --to="${dest_mirror_repo}" 2>&1); then
++      echo "${output}"
++      return 0
++    fi
++
++    echo "${output}"
++
++    if [ "${attempt}" -ge "${max_attempts}" ] || ! transient_registry_error "${output}"; then
++      return 1
++    fi
++
++    echo "Release mirror failed with a transient registry error (attempt ${attempt}/${max_attempts}), retrying in ${retry_delay}s..." >&2
++    sleep "${retry_delay}"
++    attempt=$((attempt + 1))
++  done
++}
++
++function transient_registry_error() {
++  echo "${1}" | grep -Eqi 'unexpected EOF|504 Gateway|502 Bad Gateway|503 Service Unavailable|connection reset|TLS handshake timeout|broken pipe|i/o timeout|use of closed network connection'
++}
++
++function image_repo_from_pullspec() {
++  echo "${1%%@*}"
++}
++
++function discover_os_image_stream_images_from_mco_tool() {
++  release_image="${1}"
++  authfile="${2}"
++  local mco_image osimagestream_json authfile_dir authfile_name mco_stderr
++
++  if ! mco_image=$(oc adm -a "${authfile}" release info "${release_image}" --image-for machine-config-operator); then
++    echo "machine-config-osimagestream discovery failed: could not resolve machine-config-operator image" >&2
++    return 2
++  fi
++
++  if ! podman run --quiet --rm --net=none --authfile "${authfile}" "${mco_image}" test -x /usr/bin/machine-config-osimagestream 2>/dev/null; then
++    return 1
++  fi
++
++  authfile_dir=$(dirname "${authfile}")
++  authfile_name=$(basename "${authfile}")
++  mco_stderr=$(mktemp)
++
++  if ! osimagestream_json=$(podman run --quiet --rm --net=host \
++        --authfile "${authfile}" \
++        -v "${authfile_dir}:/authfile:ro,Z" \
++        "${mco_image}" \
++        /usr/bin/machine-config-osimagestream get osimagestream \
++          --release-image "${release_image}" \
++          --authfile "/authfile/${authfile_name}" \
++          --output-format json 2>"${mco_stderr}"); then
++    echo "machine-config-osimagestream discovery failed:" >&2
++    cat "${mco_stderr}" >&2
++    rm -f "${mco_stderr}"
++    return 2
++  fi
++  rm -f "${mco_stderr}"
++
++  echo "${osimagestream_json}" | jq -r '
++    .status.availableStreams[]? |
++    (.osImage, .osExtensionsImage) |
++    select(. != null and . != "")
++  '
++}
++
++function discover_os_image_stream_sources_from_release_json() {
++  release_image="${1}"
++  authfile="${2}"
++
++  oc adm -a "${authfile}" release info "${release_image}" -o json | \
++    jq -r '[.. | strings | select(test("^quay.io/openshift-release-dev/ocp-v[0-9]+\\.[0-9]+-art-dev@sha256:"))] | map(split("@")[0]) | unique | .[]'
++}
++
++# Discover OSImageStream source repositories for registries.conf. The MCO helper
++# matches bootstrap discovery; release metadata is a fallback for older payloads.
++function discover_os_image_stream_sources() {
++  release_image="${1}"
++  authfile="${2}"
++  local images mco_status=0
++
++  images=$(discover_os_image_stream_images_from_mco_tool "${release_image}" "${authfile}") || mco_status=$?
++
++  if [ "${mco_status}" -eq 0 ] && [ -n "${images}" ]; then
++    printf '%s\n' "${images}" | while IFS= read -r image; do
++      [ -n "${image}" ] || continue
++      image_repo_from_pullspec "${image}"
++    done | sort -u
++    return 0
++  fi
++
++  if [ "${mco_status}" -eq 2 ]; then
++    return 1
++  fi
++
++  echo "machine-config-osimagestream unavailable; falling back to release metadata scan" >&2
++  discover_os_image_stream_sources_from_release_json "${release_image}" "${authfile}"
++}
++
++function registry_configs_for_os_image_stream_sources() {
++  release_image="${1}"
++  authfile="${2}"
++  release_mirror_repo="${3}"
++  shift 3
++
++  while IFS= read -r source; do
++    [ -n "${source}" ] || continue
++    for skip_repo in "$@"; do
++      [ "${source}" = "${skip_repo}" ] && continue 2
++    done
++    registry_config "${source}" "${release_mirror_repo}"
++  done < <(discover_os_image_stream_sources "${release_image}" "${authfile}")
+ }
+ 
+ function install_oc_mirrorv2(){
+diff --git a/deploy/operator/setup_assisted_operator.sh b/deploy/operator/setup_assisted_operator.sh
+index ca8ca422d9ff..6f1fc76c2389 100755
+--- a/deploy/operator/setup_assisted_operator.sh
++++ b/deploy/operator/setup_assisted_operator.sh
+@@ -282,6 +282,10 @@ data:
+     $(registry_config "$(get_image_without_tag ${ASSISTED_OPENSHIFT_INSTALL_RELEASE_IMAGE})" "${LOCAL_REGISTRY}/$(get_image_repository_only ${ASSISTED_OPENSHIFT_INSTALL_RELEASE_IMAGE})")
+     $(registry_config "$(get_image_without_tag ${cli_image})" "${LOCAL_REGISTRY}/$(get_image_repository_only ${ASSISTED_OPENSHIFT_INSTALL_RELEASE_IMAGE})")
+     $(registry_config "$(get_image_without_tag ${ironic_agent_image})" "${LOCAL_REGISTRY}/$(get_image_repository_only ${OPENSHIFT_INSTALL_RELEASE_IMAGE_OVERRIDE})")
++    $(registry_configs_for_os_image_stream_sources "${ASSISTED_OPENSHIFT_INSTALL_RELEASE_IMAGE}" "${AUTHFILE:-${PULL_SECRET_FILE}}" "${LOCAL_REGISTRY}/$(get_image_repository_only ${ASSISTED_OPENSHIFT_INSTALL_RELEASE_IMAGE})" \
++      "$(get_image_without_tag ${ASSISTED_OPENSHIFT_INSTALL_RELEASE_IMAGE})" \
++      "$(get_image_without_tag ${cli_image})" \
++      "$(get_image_without_tag ${ironic_agent_image})")
+     $(
+       if kubectl get crd imagedigestmirrorsets.config.openshift.io &>/dev/null; then
+         for row in $(kubectl get imagedigestmirrorset -o json |
+diff --git a/deploy/operator/utils.sh b/deploy/operator/utils.sh
+index 462860f7645b..b6a3557a44a7 100644
+--- a/deploy/operator/utils.sh
++++ b/deploy/operator/utils.sh
+@@ -145,7 +145,17 @@ function wait_for_condition() {
+     wait_for_resource "${object}" "${namespace}"
+ 
+     echo "Waiting for (${object}) on namespace (${namespace}) with labels (${selector}) to become (${condition})..."
+-    oc wait -n "${namespace}" --for="${condition}"  "${object}" --timeout="${timeout}" --selector "${selector}" -o json
++    if ! oc wait -n "${namespace}" --for="${condition}"  "${object}" --timeout="${timeout}" --selector "${selector}" -o json; then
++        echo "ERROR: timed out waiting for (${object}) on namespace (${namespace}) to become (${condition})"
++        oc get "${object}" -n "${namespace}" \
++            -o 'custom-columns=NAME:.metadata.name,CONDITIONS:.status.conditions[*].type' \
++            2>/dev/null || true
++        oc get events -n "${namespace}" --sort-by='.lastTimestamp' 2>/dev/null | tail -15 || true
++        if [ "${ASSISTED_DEBUG_WAIT_FAILURES:-false}" = "true" ]; then
++            oc get "${object}" -n "${namespace}" -o yaml
++        fi
++        exit 1
++    fi
+ }
+ 
+ function wait_for_object_amount() {
+@@ -196,6 +206,8 @@ function wait_for_resource() {
+     object="$1"
+     namespace="$2"
+     selector="${3:-}"
++    local errexit_was_on=0
++    [[ $- == *e* ]] && errexit_was_on=1
+     set +e
+ 
+     counter=1
+@@ -205,12 +217,18 @@ function wait_for_resource() {
+       if [[ "${counter}" -eq 150 ]]; # 2 minutes 
+       then
+         echo "$(date --rfc-3339=seconds) ERROR: failed Waiting for ${object} on namespace ${namespace}"
+-        oc get ${object}  --namespace="${namespace}" -o json
++        oc get "${object}" --namespace="${namespace}" \
++            -o 'custom-columns=NAME:.metadata.name' 2>/dev/null || true
++        if [ "${ASSISTED_DEBUG_WAIT_FAILURES:-false}" = "true" ]; then
++            oc get "${object}" --namespace="${namespace}" -o json
++        fi
++        (( errexit_was_on )) && set -e
+         exit 1
+         break 
+       fi
+       ((counter++)) && sleep 2
+     done
++    (( errexit_was_on )) && set -e
+ }
+ 
+ function get_image_without_tag() {
+diff --git a/deploy/operator/ztp/deploy_spoke_cluster.sh b/deploy/operator/ztp/deploy_spoke_cluster.sh
+index 3221db695bd2..b95af200bc0e 100755
+--- a/deploy/operator/ztp/deploy_spoke_cluster.sh
++++ b/deploy/operator/ztp/deploy_spoke_cluster.sh
+@@ -134,9 +134,25 @@ wait_for_condition "agentclusterinstall/${ASSISTED_AGENT_CLUSTER_INSTALL_NAME}"
+ echo "Cluster installation has been stopped (either for good or bad reasons)"
+ 
+ wait_for_condition "agentclusterinstall/${ASSISTED_AGENT_CLUSTER_INSTALL_NAME}" "condition=Completed" "1m" "${SPOKE_NAMESPACE}"
++COMPLETED_STATUS=$(oc get -n "${SPOKE_NAMESPACE}" "agentclusterinstall/${ASSISTED_AGENT_CLUSTER_INSTALL_NAME}" -o jsonpath='{.status.conditions[?(@.type=="Completed")].status}')
++COMPLETED_REASON=$(oc get -n "${SPOKE_NAMESPACE}" "agentclusterinstall/${ASSISTED_AGENT_CLUSTER_INSTALL_NAME}" -o jsonpath='{.status.conditions[?(@.type=="Completed")].reason}')
++STATE_INFO=$(oc get -n "${SPOKE_NAMESPACE}" "agentclusterinstall/${ASSISTED_AGENT_CLUSTER_INSTALL_NAME}" -o jsonpath='{.status.debugInfo.stateInfo}')
++
++if [[ "${COMPLETED_STATUS}" != "True" ]] || [[ "${COMPLETED_REASON}" != "InstallationCompleted" ]]; then
++    echo "Cluster installation failed: Completed=${COMPLETED_STATUS}/${COMPLETED_REASON}, stateInfo=${STATE_INFO}"
++    oc get -n "${SPOKE_NAMESPACE}" "agentclusterinstall/${ASSISTED_AGENT_CLUSTER_INSTALL_NAME}" \
++        -o 'custom-columns=NAME:.metadata.name,CONDITIONS:.status.conditions[*].type' 2>/dev/null || true
++    if [ "${ASSISTED_DEBUG_WAIT_FAILURES:-false}" = "true" ]; then
++        oc get -n "${SPOKE_NAMESPACE}" "agentclusterinstall/${ASSISTED_AGENT_CLUSTER_INSTALL_NAME}" -o yaml
++    fi
++    exit 1
++fi
+ echo "Cluster has been installed successfully!"
+ 
+-wait_for_boolean_field "clusterdeployment/${ASSISTED_CLUSTER_DEPLOYMENT_NAME}" spec.installed "${SPOKE_NAMESPACE}"
++if ! wait_for_boolean_field "clusterdeployment/${ASSISTED_CLUSTER_DEPLOYMENT_NAME}" spec.installed "${SPOKE_NAMESPACE}"; then
++    echo "Hive ClusterDeployment spec.installed never became true"
++    exit 1
++fi
+ echo "Hive acknowledged cluster installation!"
+ 
+ # For SNO we derive API IP from .status.apiVIP of the agentclusterinstall as this is the address of the single node.
+@@ -151,7 +167,7 @@ if [ ${SPOKE_CONTROLPLANE_AGENTS} -eq 1 ] || [ "${USER_MANAGED_NETWORKING}" == "
+         echo "Fatal:"
+         echo "No value found in the agentclusterinstall for .status.apiVIP"
+         echo "Cannot determine the address of the API"
+-        exit
++        exit 1
+     fi
+ fi
+ 
+diff --git a/internal/controller/controllers/images.go b/internal/controller/controllers/images.go
+index 68d35f6cd53c..fc99db0c7ba8 100644
+--- a/internal/controller/controllers/images.go
++++ b/internal/controller/controllers/images.go
+@@ -69,7 +69,7 @@ func MustGatherImages() string {
+ }
+ 
+ func getEnvVar(key, def string) string {
+-	if value, ok := os.LookupEnv(key); ok {
++	if value, ok := os.LookupEnv(key); ok && value != "" {
+ 		return value
+ 	}
+ 	return def
+diff --git a/internal/controller/controllers/images_test.go b/internal/controller/controllers/images_test.go
+new file mode 100644
+index 000000000000..02b2ac2499ed
+--- /dev/null
++++ b/internal/controller/controllers/images_test.go
+@@ -0,0 +1,48 @@
++package controllers
++
++import (
++	"os"
++
++	. "github.com/onsi/ginkgo"
++	. "github.com/onsi/gomega"
++)
++
++var _ = Describe("getEnvVar", func() {
++	const key = "TEST_GET_ENV_VAR"
++
++	AfterEach(func() {
++		Expect(os.Unsetenv(key)).To(Succeed())
++	})
++
++	It("returns the default when the variable is unset", func() {
++		Expect(getEnvVar(key, "default")).To(Equal("default"))
++	})
++
++	It("returns the default when the variable is empty", func() {
++		Expect(os.Setenv(key, "")).To(Succeed())
++		Expect(getEnvVar(key, "default")).To(Equal("default"))
++	})
++
++	It("returns the configured value when the variable is set", func() {
++		Expect(os.Setenv(key, "custom")).To(Succeed())
++		Expect(getEnvVar(key, "default")).To(Equal("custom"))
++	})
++})
++
++var _ = Describe("DatabaseImage", func() {
++	const key = "DATABASE_IMAGE"
++
++	AfterEach(func() {
++		Expect(os.Unsetenv(key)).To(Succeed())
++	})
++
++	It("returns the default postgres image when DATABASE_IMAGE is empty", func() {
++		Expect(os.Setenv(key, "")).To(Succeed())
++		Expect(DatabaseImage()).To(Equal("quay.io/sclorg/postgresql-16-c9s:latest"))
++	})
++
++	It("returns DATABASE_IMAGE when it is set", func() {
++		Expect(os.Setenv(key, "registry.example/olm/sclorg-postgresql-16-c9s:latest")).To(Succeed())
++		Expect(DatabaseImage()).To(Equal("registry.example/olm/sclorg-postgresql-16-c9s:latest"))
++	})
++})

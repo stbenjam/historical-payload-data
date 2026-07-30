@@ -1,0 +1,361 @@
+diff --git a/providers/gce/gce_loadbalancer_internal_openshift.go b/providers/gce/gce_loadbalancer_internal_openshift.go
+index 23ee03485c..1a5ea259aa 100644
+--- a/providers/gce/gce_loadbalancer_internal_openshift.go
++++ b/providers/gce/gce_loadbalancer_internal_openshift.go
+@@ -17,6 +17,7 @@ limitations under the License.
+ package gce
+ 
+ import (
++	"fmt"
+ 	"slices"
+ 	"strings"
+ 
+@@ -65,7 +66,7 @@ func (g *Cloud) filterNodesWithExistingExternalInstanceGroups(name string, nodes
+ 		}
+ 
+ 		// Track instances that are already managed by existing external instance groups
+-		instancesInExistingInstanceGroups := sets.NewString()
++		instancesInExistingInstanceGroups := sets.New[string]()
+ 
+ 		candidateExternalInstanceGroups, err := g.candidateExternalInstanceGroups(zone)
+ 		if err != nil {
+@@ -122,8 +123,8 @@ func filterNodeObjectFromName(nodesInZone []*v1.Node, nodeNames []string) []*v1.
+ }
+ 
+ // extractInstanceNamesFromGroup extracts instance names from a list of instances in an instance group.
+-func extractInstanceNamesFromGroup(instances []*compute.InstanceWithNamedPorts) sets.String {
+-	instanceNames := sets.NewString()
++func extractInstanceNamesFromGroup(instances []*compute.InstanceWithNamedPorts) sets.Set[string] {
++	instanceNames := sets.New[string]()
+ 	for _, ins := range instances {
+ 		// Extract instance name from URL path (e.g., ".../instances/node-name")
+ 		parts := strings.Split(ins.Instance, "/")
+@@ -134,7 +135,7 @@ func extractInstanceNamesFromGroup(instances []*compute.InstanceWithNamedPorts)
+ 
+ // evaluateExternalInstanceGroup determines if an external instance group can be reused.
+ // It returns whether the group should be reused and the set of instance names in the group.
+-func (g *Cloud) evaluateExternalInstanceGroup(ig *compute.InstanceGroup, zone string, gceHostNamesInZone sets.String) (shouldReuse bool, instanceNames sets.String, err error) {
++func (g *Cloud) evaluateExternalInstanceGroup(ig *compute.InstanceGroup, zone string, gceHostNamesInZone sets.Set[string]) (shouldReuse bool, instanceNames sets.Set[string], err error) {
+ 	// Get all instances in this external instance group
+ 	instances, err := g.ListInstancesInInstanceGroup(ig.Name, zone, allInstances)
+ 	if err != nil {
+@@ -144,39 +145,26 @@ func (g *Cloud) evaluateExternalInstanceGroup(ig *compute.InstanceGroup, zone st
+ 	// Extract instance names from the group
+ 	instanceNames = extractInstanceNamesFromGroup(instances)
+ 
+-	// If all instances in this external instance group are also in our zone's node list,
+-	// or they all have the node instance prefix, we can reuse this instance group instead
+-	// of creating our own internal instance group
+-	hasAll := gceHostNamesInZone.HasAll(instanceNames.UnsortedList()...)
+-	allHavePrefix := g.allHaveNodePrefix(instanceNames.UnsortedList())
+-	shouldReuse = hasAll || allHavePrefix
+-	klog.V(2).Infof("evaluateExternalInstanceGroup(%v): shouldReuse=%v (hasAll=%v, allHavePrefix=%v), instances=%v", ig.Name, shouldReuse, hasAll, allHavePrefix, instanceNames.UnsortedList())
++	// During bootstrap the bootstrap machine is placed in one of the master
++	// instance groups. However, the bootstrap machine does not have an
++	// associated Node. This will prevent us from considering this instance
++	// group for reuse because the instance group contains an instance which is
++	// not in the service's Node list. Consequently we will attempt to add the
++	// masters to a second instance group, which will fail with
++	// INSTANCE_IN_MULTIPLE_LOAD_BALANCED_IGS.
++	//
++	// To avoid this we explicitly exclude the bootstrap machine from
++	// consideration if it is present.
++	bootstrapInstanceName := fmt.Sprintf("%s-bootstrap", g.nodeInstancePrefix)
++	instanceNames.Delete(bootstrapInstanceName)
++
++	// If all instances in this external instance group are also in our zone's node list
++	shouldReuse = gceHostNamesInZone.HasAll(instanceNames.UnsortedList()...) && instanceNames.Len() > 0
++	klog.V(2).Infof("evaluateExternalInstanceGroup(%v): shouldReuse=%v, instances=%v", ig.Name, shouldReuse, instanceNames.UnsortedList())
+ 
+ 	return shouldReuse, instanceNames, nil
+ }
+ 
+-// allHaveNodePrefix checks if all instances have the cluster's node instance prefix.
+-//
+-// DO NOT REMOVE. This is load-bearing for all OCP GCP clusters.
+-//
+-// The OpenShift installer creates per-zone master instance groups (e.g.
+-// <infra>-master-<zone>). During CAPG installs (OCPBUGS-35256), the bootstrap
+-// node is placed in the same master IG as a control plane node. The bootstrap
+-// node is not a k8s node, so HasAll rejects the master IG. Without this prefix
+-// fallback the CCM then tries to add the master to its own k8s-ig, which fails
+-// with INSTANCE_IN_MULTIPLE_LOAD_BALANCED_IGS (master is already in the
+-// installer's IG). It then tries to add the worker to that same k8s-ig
+-// alongside the master, which fails with wrongSubnetwork (masters and workers
+-// are on different subnets).
+-func (g *Cloud) allHaveNodePrefix(instances []string) bool {
+-	for _, instance := range instances {
+-		if !strings.HasPrefix(instance, g.nodeInstancePrefix) {
+-			return false
+-		}
+-	}
+-	return true
+-}
+-
+ // candidateExternalInstanceGroups returns instance groups with the external instance groups prefix, if defined.
+ func (g *Cloud) candidateExternalInstanceGroups(zone string) ([]*compute.InstanceGroup, error) {
+ 	if g.externalInstanceGroupsPrefix == "" {
+@@ -187,14 +175,14 @@ func (g *Cloud) candidateExternalInstanceGroups(zone string) ([]*compute.Instanc
+ }
+ 
+ // gceInstanceNamesInZone returns a set of GCE Host names from the list of nodes provided
+-func (g *Cloud) gceInstanceNamesInZone(zoneNodes []*v1.Node) (sets.String, error) {
++func (g *Cloud) gceInstanceNamesInZone(zoneNodes []*v1.Node) (sets.Set[string], error) {
+ 	// hosts is a list of GCE instances matching the zone's node names.
+ 	hosts, err := g.getFoundInstanceByNames(nodeNames(zoneNodes))
+ 	if err != nil {
+ 		return nil, err
+ 	}
+ 
+-	names := sets.NewString()
++	names := sets.New[string]()
+ 	for _, h := range hosts {
+ 		names.Insert(h.Name)
+ 	}
+diff --git a/providers/gce/gce_loadbalancer_internal_openshift_test.go b/providers/gce/gce_loadbalancer_internal_openshift_test.go
+index 50090f8266..bbc4d3db13 100644
+--- a/providers/gce/gce_loadbalancer_internal_openshift_test.go
++++ b/providers/gce/gce_loadbalancer_internal_openshift_test.go
+@@ -20,6 +20,7 @@ package gce
+ 
+ import (
+ 	"fmt"
++	"slices"
+ 	"testing"
+ 
+ 	"github.com/stretchr/testify/assert"
+@@ -40,6 +41,10 @@ func fqdnName(short string) string {
+ 	return fmt.Sprintf("%s.c.%s.internal", short, "test-project")
+ }
+ 
++func igSelfLink(zone, role string) string {
++	return fmt.Sprintf("https://www.googleapis.com/compute/v1/projects/test-project/zones/%s/instanceGroups/%s", zone, testInfraName+"-"+role+"-"+zone)
++}
++
+ func TestFilterNodeObjectFromName(t *testing.T) {
+ 	t.Parallel()
+ 	for name, tc := range map[string]struct {
+@@ -95,6 +100,214 @@ func TestFilterNodeObjectFromName(t *testing.T) {
+ 	}
+ }
+ 
++func TestFilterNodesWithExistingExternalInstanceGroups(t *testing.T) {
++	t.Parallel()
++
++	vals := DefaultTestClusterValues()
++	zoneA := vals.ZoneName          // us-central1-b
++	zoneB := vals.SecondaryZoneName // us-central1-c
++
++	type testNode struct{ name, zone string }
++
++	testNodes := []testNode{
++		{name: "master-0", zone: zoneA},
++		{name: "worker-a-wnjp7", zone: zoneA},
++		{name: "infra-a-zztd5", zone: zoneA},
++		{name: "master-1", zone: zoneB},
++		{name: "worker-b-s48dq", zone: zoneB},
++		{name: "infra-b-2bn6x", zone: zoneB},
++	}
++
++	nodesFn := func(fqdn bool) []*v1.Node {
++		r := make([]*v1.Node, len(testNodes))
++		for i, t := range testNodes {
++			r[i] = &v1.Node{ObjectMeta: metav1.ObjectMeta{
++				Name:   testInfraName + "-" + t.name,
++				Labels: map[string]string{v1.LabelTopologyZone: t.zone}}}
++			if fqdn {
++				r[i].Name = fqdnName(r[i].Name)
++			}
++		}
++
++		return r
++	}
++
++	// setupFake creates a fake GCE cloud with instances and master IGs in both zones.
++	// igZoneAInstances allows the set of instances in the zoneA master IG to be overridden.
++	setupFake := func(t *testing.T, prefix string, igZoneAInstances []string) *Cloud {
++		t.Helper()
++		gce, err := fakeGCECloud(vals)
++		require.NoError(t, err)
++		gce.nodeInstancePrefix = testInfraName
++		gce.externalInstanceGroupsPrefix = prefix
++
++		// Create GCE instances for the test nodes
++		for _, testNode := range testNodes {
++			require.NoError(t, gce.InsertInstance(gce.ProjectID(), testNode.zone, &compute.Instance{
++				Name: testInfraName + "-" + testNode.name, Tags: &compute.Tags{Items: []string{testNode.name}}, Zone: testNode.zone,
++			}))
++		}
++
++		// Create GCE instances for any additional instances specified for the first instance group.
++		for _, inst := range igZoneAInstances {
++			if !slices.ContainsFunc(testNodes, func(t testNode) bool { return testInfraName+"-"+t.name == inst }) {
++				require.NoError(t, gce.InsertInstance(gce.ProjectID(), zoneA, &compute.Instance{
++					Name: inst, Tags: &compute.Tags{Items: []string{inst}}, Zone: zoneA,
++				}))
++			}
++		}
++
++		// By default the first instance group contains the first master
++		// instance, but it can be overridden.
++		if igZoneAInstances == nil {
++			igZoneAInstances = []string{testInfraName + "-master-0"}
++		}
++
++		// Create a GCE instance group for each test zone
++		for _, ig := range []struct {
++			zone, name string
++			members    []string
++		}{
++			{zoneA, testInfraName + "-master-" + zoneA, igZoneAInstances},
++			{zoneB, testInfraName + "-master-" + zoneB, []string{testInfraName + "-master-1"}},
++		} {
++			require.NoError(t, gce.CreateInstanceGroup(&compute.InstanceGroup{Name: ig.name}, ig.zone))
++			for _, member := range ig.members {
++				require.NoError(t, gce.AddInstancesToInstanceGroup(ig.name, ig.zone, []*compute.InstanceReference{
++					{Instance: fmt.Sprintf("zones/%s/instances/%s", ig.zone, member)},
++				}))
++			}
++		}
++
++		return gce
++	}
++
++	nodeNames := func(nodes []*v1.Node) sets.Set[string] {
++		names := sets.New[string]()
++		for _, n := range nodes {
++			names.Insert(n.Name)
++		}
++		return names
++	}
++
++	for name, tc := range map[string]struct {
++		useFQDNNodeNames             bool
++		externalInstanceGroupsPrefix string
++		lbIGName                     string
++		igZoneAInstances             []string // instances in zoneA master IG; nil = default (master-0)
++		excludeNodeNames             []string // nodes to remove before calling the function, simulating CCM pre-filtering
++		wantIGs                      []string
++		wantExcludedNodes            []string
++	}{
++		"FQDN nodes covered by external master IGs are filtered out and workers and infra remain": {
++			useFQDNNodeNames:             true,
++			externalInstanceGroupsPrefix: testInfraName,
++			lbIGName:                     "k8s-ig--test-lb",
++			wantIGs: []string{
++				igSelfLink(zoneA, "master"),
++				igSelfLink(zoneB, "master"),
++			},
++			wantExcludedNodes: []string{fqdnName(testInfraName + "-master-0"), fqdnName(testInfraName + "-master-1")},
++		},
++		"no external instance groups prefix configured so all nodes remain": {
++			externalInstanceGroupsPrefix: "",
++			lbIGName:                     "k8s-ig--test-lb",
++			wantIGs:                      nil,
++		},
++		// The LB IG name matches an existing external IG name in zoneA.
++		// That IG is skipped; only the zoneB master IG is reused.
++		"external IG with same name as LB IG is skipped": {
++			externalInstanceGroupsPrefix: testInfraName,
++			lbIGName:                     testInfraName + "-master-" + zoneA,
++			wantIGs:                      []string{igSelfLink(zoneB, "master")},
++			wantExcludedNodes:            []string{testInfraName + "-master-1"},
++		},
++		"bootstrap instance in master IG is ignored and IG is still reused": {
++			externalInstanceGroupsPrefix: testInfraName,
++			lbIGName:                     "k8s-ig--test-lb",
++			igZoneAInstances:             []string{testInfraName + "-master-0", testInfraName + "-bootstrap"},
++			wantIGs: []string{
++				igSelfLink(zoneA, "master"),
++				igSelfLink(zoneB, "master"),
++			},
++			wantExcludedNodes: []string{testInfraName + "-master-0", testInfraName + "-master-1"},
++		},
++		"bootstrap-only instance group is not reused": {
++			externalInstanceGroupsPrefix: testInfraName,
++			lbIGName:                     "k8s-ig--test-lb",
++			igZoneAInstances:             []string{testInfraName + "-bootstrap"},
++			wantIGs:                      []string{igSelfLink(zoneB, "master")},
++			wantExcludedNodes:            []string{testInfraName + "-master-1"},
++		},
++		"empty instance group is not reused": {
++			externalInstanceGroupsPrefix: testInfraName,
++			lbIGName:                     "k8s-ig--test-lb",
++			igZoneAInstances:             []string{},
++			wantIGs:                      []string{igSelfLink(zoneB, "master")},
++			wantExcludedNodes:            []string{testInfraName + "-master-1"},
++		},
++		"IG with unknown instance is not reused": {
++			externalInstanceGroupsPrefix: testInfraName,
++			lbIGName:                     "k8s-ig--test-lb",
++			igZoneAInstances:             []string{"other-cluster-master-0"},
++			wantIGs:                      []string{igSelfLink(zoneB, "master")},
++			wantExcludedNodes:            []string{testInfraName + "-master-1"},
++		},
++		"all IG instances are known nodes so IG is reused": {
++			externalInstanceGroupsPrefix: testInfraName,
++			lbIGName:                     "k8s-ig--test-lb",
++			wantIGs: []string{
++				igSelfLink(zoneA, "master"),
++				igSelfLink(zoneB, "master"),
++			},
++			wantExcludedNodes: []string{testInfraName + "-master-0", testInfraName + "-master-1"},
++		},
++		// Masters labelled node.kubernetes.io/exclude-from-external-load-balancers are
++		// filtered by the CCM framework before the cloud provider is called. The master
++		// instance groups still exist on GCP and contain the master instances, but because
++		// gceHostNamesInZone is derived only from the nodes passed in (workers+infra),
++		// HasAll fails for those IGs and they must not be reused. The old allHaveNodePrefix
++		// fallback would have returned shouldReuse=true here (all masters share the infra
++		// prefix), incorrectly sending traffic to the control plane.
++		"masters pre-filtered by CCM label: master IGs not reused, workers and infra get internal IGs": {
++			externalInstanceGroupsPrefix: testInfraName,
++			lbIGName:                     "k8s-ig--test-lb",
++			excludeNodeNames: []string{
++				testInfraName + "-master-0",
++				testInfraName + "-master-1",
++			},
++			wantIGs:           nil, // master IGs must not be reused
++			wantExcludedNodes: nil, // all remaining nodes (workers+infra) need internal IGs
++		},
++	} {
++		t.Run(name, func(t *testing.T) {
++			t.Parallel()
++
++			gce := setupFake(t, tc.externalInstanceGroupsPrefix, tc.igZoneAInstances)
++			nodes := nodesFn(tc.useFQDNNodeNames)
++			if len(tc.excludeNodeNames) > 0 {
++				excludeSet := sets.New(tc.excludeNodeNames...)
++				var kept []*v1.Node
++				for _, n := range nodes {
++					if !excludeSet.Has(n.Name) {
++						kept = append(kept, n)
++					}
++				}
++				nodes = kept
++			}
++			filteredNodes, existingIGLinks, err := gce.filterNodesWithExistingExternalInstanceGroups(tc.lbIGName, nodes)
++			require.NoError(t, err)
++
++			assert.ElementsMatch(t, tc.wantIGs, existingIGLinks)
++
++			// Assert that filteredNodes contains all nodes except the excluded ones.
++			allNodeNames := nodeNames(nodes)
++			wantIncluded := allNodeNames.Difference(sets.New(tc.wantExcludedNodes...))
++			assert.ElementsMatch(t, wantIncluded.UnsortedList(), nodeNames(filteredNodes).UnsortedList())
++		})
++	}
++}
++
+ func TestEvaluateExternalInstanceGroup(t *testing.T) {
+ 	t.Parallel()
+ 	vals := DefaultTestClusterValues()
+@@ -118,7 +331,7 @@ func TestEvaluateExternalInstanceGroup(t *testing.T) {
+ 	masterIG, err := gce.GetInstanceGroup(masterIGName, zone)
+ 	require.NoError(t, err)
+ 
+-	gceHostNames := sets.NewString(
++	gceHostNames := sets.New(
+ 		testInfraName+"-master-0",
+ 		testInfraName+"-worker-a-wnjp7",
+ 		testInfraName+"-infra-a-zztd5",

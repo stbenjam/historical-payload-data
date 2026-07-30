@@ -1,0 +1,1221 @@
+diff --git a/CONTRIBUTING.md b/CONTRIBUTING.md
+index 415ca3cc3..e397368fb 100644
+--- a/CONTRIBUTING.md
++++ b/CONTRIBUTING.md
+@@ -153,13 +153,7 @@ changes
+ 
+ #### Files
+ 
+-| Type             | Convention                        | Example                                                                              |
+-| ---------------- | --------------------------------- | ------------------------------------------------------------------------------------ |
+-| React Components | PascalCase                        | `MetricsPage.tsx`, `QueryBrowser.tsx`                                                |
+-| Utilities        | kebab-case                        | `safe-fetch-hook.ts`, `poll-hook.ts`                                                 |
+-| Types            | kebab-case or PascalCase          | `types.ts`, `AlertUtils.tsx`                                                         |
+-| Tests            | `.spec.ts` suffix                 | `MetricsPage.spec.tsx`, `safe-fetch-hook.spec.ts`, `format.spec.ts`, `utils.spec.ts` |
+-| Styles           | `.scss` suffix matching component | `query-browser.scss`                                                                 |
++File naming conventions (TypeScript, Go, shell scripts, CSS, and more) are defined in the canonical **[Style Guide](STYLEGUIDE.md)**. All new and renamed files must conform to those rules.
+ 
+ #### File Placement
+ 
+diff --git a/docs/STYLEGUIDE.md b/docs/STYLEGUIDE.md
+new file mode 100644
+index 000000000..69b33b153
+--- /dev/null
++++ b/docs/STYLEGUIDE.md
+@@ -0,0 +1,24 @@
++# Monitoring Plugin Style Guide
++
++This document defines the monitoring-plugin repository style guides. It is a living document and should be updated as style decisions are made
++
++## File Naming Conventions
++
++| File type                      | Convention                            | Examples                                                           |
++| ------------------------------ | ------------------------------------- | ------------------------------------------------------------------ |
++| React component files (`.tsx`) | PascalCase                            | `AlertsPage.tsx`, `SilenceForm.tsx`, `DashboardListPage.tsx`       |
++| React Hook files               | camelCase with `use` prefix           | `useAlerts.ts`, `useLegacyDashboards.ts`, `usePerspective.tsx`     |
++| All other `.ts` files          | kebab-case                            | `filter-rules.ts`, `dashboard-api.ts`, `sort-utils.ts`             |
++| JS Spec / test files           | Match source file stem convention     | `filter-rules.spec.ts`, `AlertsPage.spec.tsx`, `useAlerts.spec.ts` |
++| Go files                       | snake_case                            | `plugin_handler.go`, `proxy.go`                                    |
++| Go test files                  | snake_case                            | `server_test.go`                                                   |
++| Shell scripts                  | kebab-case                            | `build-image.sh`, `start-console.sh`                               |
++| CSS / SCSS                     | kebab-case                            | `query-browser.scss`, `dashboard-page.css`                         |
++| Config files (JSON, YAML)      | kebab-case                            | `acm-alerting.patch.json`                                          |
++| Dockerfiles                    | `Dockerfile` or `Dockerfile.<suffix>` | `Dockerfile`, `Dockerfile.dev`, `Dockerfile.mcp`                   |
++| Folder names                   | kebab-case                            | `alert-rules-page/`, `legacy-dashboards/`, `perses-dashboards/`    |
++
++## Existing files
++
++Existing files that predate this styleguide are not required to be renamed immediately. New files and renamed files must conform. Existing
++non-conforming files will be migrated incrementally over time without disrupting CI.
+diff --git a/web/eslint-rules/file-naming.spec.ts b/web/eslint-rules/file-naming.spec.ts
+new file mode 100644
+index 000000000..95ad47355
+--- /dev/null
++++ b/web/eslint-rules/file-naming.spec.ts
+@@ -0,0 +1,35 @@
++import { RuleTester } from 'eslint';
++import { fileNaming } from './file-naming';
++
++const ruleTester = new RuleTester({
++  languageOptions: { ecmaVersion: 2021, sourceType: 'module' },
++});
++
++ruleTester.run('file-naming', fileNaming, {
++  valid: [
++    { code: '', filename: '/src/features/alerts/MyComponent.tsx' },
++    { code: '', filename: '/src/shared/utils/my-utils.ts' },
++    { code: '', filename: '/src/shared/hooks/useMyHook.ts' },
++    { code: '', filename: '/src/shared/hooks/useMyHook.tsx' },
++    { code: '', filename: '/src/shared/hooks/useMyHook.spec.tsx' },
++    { code: '', filename: '/src/features/alerts/MyComponent.spec.tsx' },
++    { code: '', filename: '/src/shared/utils/my-utils.spec.ts' },
++  ],
++  invalid: [
++    {
++      code: '',
++      filename: '/src/features/alerts/my-component.tsx',
++      errors: [{ messageId: 'invalidTsxName' }],
++    },
++    {
++      code: '',
++      filename: '/src/shared/utils/MyUtils.ts',
++      errors: [{ messageId: 'invalidTsName' }],
++    },
++    {
++      code: '',
++      filename: '/src/shared/utils/MyUtils.spec.ts',
++      errors: [{ messageId: 'invalidTsName' }],
++    },
++  ],
++});
+diff --git a/web/eslint-rules/file-naming.ts b/web/eslint-rules/file-naming.ts
+new file mode 100644
+index 000000000..db85c1999
+--- /dev/null
++++ b/web/eslint-rules/file-naming.ts
+@@ -0,0 +1,50 @@
++import path from 'node:path';
++import type { Rule } from 'eslint';
++
++const PASCAL_CASE = /^[A-Z][a-zA-Z0-9]*$/;
++const KEBAB_CASE = /^[a-z][a-z0-9]*(-[a-z0-9]+)*$/;
++const CAMEL_USE = /^use[A-Z][a-zA-Z0-9]*$/;
++
++export const fileNaming: Rule.RuleModule = {
++  meta: {
++    type: 'problem',
++    docs: {
++      description:
++        'Enforce file naming conventions (.tsx = PascalCase, .ts = kebab-case or useXxx)',
++    },
++    schema: [],
++    messages: {
++      invalidTsxName:
++        'TSX file "{{name}}" must use PascalCase (e.g. MyComponent.tsx) or camelCase with a "use" prefix for hooks (e.g. useMyHook.tsx).',
++      invalidTsName:
++        'TS file "{{name}}" must use kebab-case (e.g. my-utils.ts) or camelCase with a "use" prefix for hooks (e.g. useMyHook.ts).',
++    },
++  },
++  create(context) {
++    const filename = context.getFilename();
++    const ext = path.extname(filename);
++    const stem = path.basename(filename, ext);
++    // Strip spec/test suffix before checking
++    const baseStem = stem.replace(/\.(spec|test)$/, '');
++
++    if (ext === '.tsx') {
++      if (!PASCAL_CASE.test(baseStem) && !CAMEL_USE.test(baseStem)) {
++        context.report({
++          loc: { line: 1, column: 0 },
++          messageId: 'invalidTsxName',
++          data: { name: path.basename(filename) },
++        });
++      }
++    } else if (ext === '.ts') {
++      const valid = KEBAB_CASE.test(baseStem) || CAMEL_USE.test(baseStem);
++      if (!valid) {
++        context.report({
++          loc: { line: 1, column: 0 },
++          messageId: 'invalidTsName',
++          data: { name: path.basename(filename) },
++        });
++      }
++    }
++    return {};
++  },
++};
+diff --git a/web/eslint.config.ts b/web/eslint.config.ts
+index e01be2b6b..fb5d17dc9 100644
+--- a/web/eslint.config.ts
++++ b/web/eslint.config.ts
+@@ -11,6 +11,7 @@ import js from '@eslint/js';
+ import { FlatCompat } from '@eslint/eslintrc';
+ import importPlugin from 'eslint-plugin-import';
+ import { importBoundaryZones } from './eslint-rules/import-boundary-zones';
++import { fileNaming } from './eslint-rules/file-naming';
+ 
+ const __filename = fileURLToPath(import.meta.url);
+ const __dirname = path.dirname(__filename);
+@@ -178,6 +179,16 @@ export default defineConfig([
+       ],
+     },
+   },
++  {
++    files: ['src/**/*.ts', 'src/**/*.tsx'],
++    ignores: ['cypress/**', 'src/**/*.d.ts'],
++    plugins: {
++      'local-rules': { rules: { 'file-naming': fileNaming } } as any,
++    },
++    rules: {
++      'local-rules/file-naming': 'error',
++    },
++  },
+   {
+     files: ['src/features/**/*.ts', 'src/features/**/*.tsx'],
+     plugins: {
+diff --git a/web/package.json b/web/package.json
+index 83acf326a..9c755d908 100644
+--- a/web/package.json
++++ b/web/package.json
+@@ -175,7 +175,7 @@
+     "exposedModules": {
+       "DashboardListPage": "./features/perses-dashboards/pages/dashboard-list-page/DashboardListPage",
+       "DashboardPage": "./features/perses-dashboards/pages/dashboard-page/DashboardPage",
+-      "LegacyDashboardsPage": "./features/legacy-dashboards/pages/legacy-dashboard-page",
++      "LegacyDashboardsPage": "./features/legacy-dashboards/pages/LegacyDashboardPage",
+       "SilencesPage": "./features/alerts/pages/silences-page/SilencesPage",
+       "SilencesDetailsPage": "./features/alerts/pages/SilencesDetailsPage",
+       "SilenceCreatePage": "./features/alerts/pages/SilenceCreatePage",
+@@ -188,7 +188,7 @@
+       "AlertRulesDetailsPage": "./features/alerts/pages/AlertRulesDetailsPage",
+       "MonitoringReducer": "./shared/store/reducers",
+       "IncidentsPage": "./features/incidents/pages/IncidentsPage",
+-      "TargetsPage": "./features/targets/pages/targets-page",
++      "TargetsPage": "./features/targets/pages/TargetsPage",
+       "PrometheusRedirectPage": "./features/metrics/pages/PrometheusRedirectPage",
+       "MonitoringContext": "./shared/contexts/MonitoringContext",
+       "ols-tool-ui": "./features/perses-dashboards/ols-tool-ui/ShowTimeseries"
+diff --git a/web/src/features/alerts/components/AlertUtils.tsx b/web/src/features/alerts/components/AlertUtils.tsx
+index 06c59b4fd..d4a84b0fb 100644
+--- a/web/src/features/alerts/components/AlertUtils.tsx
++++ b/web/src/features/alerts/components/AlertUtils.tsx
+@@ -49,7 +49,7 @@ import { memo } from 'react';
+ import { useTranslation } from 'react-i18next';
+ import { Link } from 'react-router';
+ 
+-import { FormatSeriesTitle, QueryBrowser } from '@/shared/components/query-browser/query-browser';
++import { FormatSeriesTitle, QueryBrowser } from '@/shared/components/query-browser/QueryBrowser';
+ import { SeverityBadge } from '@/shared/components/SeverityBadge';
+ import { NamespaceModel } from '@/shared/console/models';
+ import { useMonitoringNamespace } from '@/shared/hooks/useMonitoringNamespace';
+diff --git a/web/src/features/alerts/components/SilenceForm.tsx b/web/src/features/alerts/components/SilenceForm.tsx
+index e16ee05d6..090c1421d 100644
+--- a/web/src/features/alerts/components/SilenceForm.tsx
++++ b/web/src/features/alerts/components/SilenceForm.tsx
+@@ -38,12 +38,12 @@ import { Trans, useTranslation } from 'react-i18next';
+ import { useSelector } from 'react-redux';
+ import { useNavigate } from 'react-router';
+ 
+-import withFallback from '@/shared/console/console-shared/error/fallbacks/withFallback';
++import withFallback from '@/shared/console/console-shared/error/fallbacks/WithFallback';
+ import {
+   formatPrometheusDuration,
+   parsePrometheusDuration,
+ } from '@/shared/console/console-shared/src/datetime/prometheus';
+-import { ExternalLink } from '@/shared/console/utils/link';
++import { ExternalLink } from '@/shared/console/utils/Link';
+ import { DataTestIDs } from '@/shared/constants/data-test';
+ import { useAlerts } from '@/shared/hooks/useAlerts';
+ import { useBoolean } from '@/shared/hooks/useBoolean';
+diff --git a/web/src/features/alerts/pages/AlertRulesDetailsPage.tsx b/web/src/features/alerts/pages/AlertRulesDetailsPage.tsx
+index 1cf1a2a03..424023087 100644
+--- a/web/src/features/alerts/pages/AlertRulesDetailsPage.tsx
++++ b/web/src/features/alerts/pages/AlertRulesDetailsPage.tsx
+@@ -50,13 +50,13 @@ import {
+   SourceHelp,
+ } from '@/features/alerts/components/AlertUtils';
+ import KebabDropdown from '@/shared/components/KebabDropdown';
+-import { Labels } from '@/shared/components/labels';
++import { Labels } from '@/shared/components/Labels';
+ import { SeverityBadge } from '@/shared/components/SeverityBadge';
+ import { ToggleGraph } from '@/shared/components/ToggleGraph';
+-import withFallback from '@/shared/console/console-shared/error/fallbacks/withFallback';
++import withFallback from '@/shared/console/console-shared/error/fallbacks/WithFallback';
+ import { StatusBox } from '@/shared/console/console-shared/src/components/status/StatusBox';
+ import { formatPrometheusDuration } from '@/shared/console/console-shared/src/datetime/prometheus';
+-import { ExternalLink } from '@/shared/console/utils/link';
++import { ExternalLink } from '@/shared/console/utils/Link';
+ import { DataTestIDs } from '@/shared/constants/data-test';
+ import { MonitoringProvider } from '@/shared/contexts/MonitoringContext';
+ import { useAlerts } from '@/shared/hooks/useAlerts';
+diff --git a/web/src/features/alerts/pages/AlertsDetailsPage.tsx b/web/src/features/alerts/pages/AlertsDetailsPage.tsx
+index 311099947..45ab9687d 100644
+--- a/web/src/features/alerts/pages/AlertsDetailsPage.tsx
++++ b/web/src/features/alerts/pages/AlertsDetailsPage.tsx
+@@ -58,10 +58,10 @@ import {
+   SourceHelp,
+ } from '@/features/alerts/components/AlertUtils';
+ import { SilencedByList } from '@/features/alerts/components/SilencedByTable';
+-import { Labels } from '@/shared/components/labels';
++import { Labels } from '@/shared/components/Labels';
+ import { SeverityBadge } from '@/shared/components/SeverityBadge';
+ import { ToggleGraph } from '@/shared/components/ToggleGraph';
+-import withFallback from '@/shared/console/console-shared/error/fallbacks/withFallback';
++import withFallback from '@/shared/console/console-shared/error/fallbacks/WithFallback';
+ import { StatusBox } from '@/shared/console/console-shared/src/components/status/StatusBox';
+ import {
+   ContainerModel,
+@@ -73,7 +73,7 @@ import {
+   PodModel,
+   StatefulSetModel,
+ } from '@/shared/console/models';
+-import { ExternalLink, LinkifyExternal } from '@/shared/console/utils/link';
++import { ExternalLink, LinkifyExternal } from '@/shared/console/utils/Link';
+ import { DataTestIDs } from '@/shared/constants/data-test';
+ import { MonitoringProvider } from '@/shared/contexts/MonitoringContext';
+ import { useAlerts } from '@/shared/hooks/useAlerts';
+diff --git a/web/src/features/alerts/pages/SilencesDetailsPage.tsx b/web/src/features/alerts/pages/SilencesDetailsPage.tsx
+index 12db4fda4..329366d0c 100644
+--- a/web/src/features/alerts/pages/SilencesDetailsPage.tsx
++++ b/web/src/features/alerts/pages/SilencesDetailsPage.tsx
+@@ -38,7 +38,7 @@ import {
+ } from '@/features/alerts/components/SilencesUtils';
+ import KebabDropdown from '@/shared/components/KebabDropdown';
+ import { SeverityBadge } from '@/shared/components/SeverityBadge';
+-import withFallback from '@/shared/console/console-shared/error/fallbacks/withFallback';
++import withFallback from '@/shared/console/console-shared/error/fallbacks/WithFallback';
+ import { LoadingInline } from '@/shared/console/console-shared/src/components/loading/LoadingInline';
+ import { StatusBox } from '@/shared/console/console-shared/src/components/status/StatusBox';
+ import { DataTestIDs } from '@/shared/constants/data-test';
+diff --git a/web/src/features/alerts/pages/alert-rules-page/AlertRulesPage.tsx b/web/src/features/alerts/pages/alert-rules-page/AlertRulesPage.tsx
+index 97471284f..8d87403df 100644
+--- a/web/src/features/alerts/pages/alert-rules-page/AlertRulesPage.tsx
++++ b/web/src/features/alerts/pages/alert-rules-page/AlertRulesPage.tsx
+@@ -29,15 +29,15 @@ import { useTableColumns } from '@/shared/components/table/hooks/useTableColumns
+ import { rowFilter, useTableFilters } from '@/shared/components/table/hooks/useTableFilters';
+ import { useTablePagination } from '@/shared/components/table/hooks/useTablePagination';
+ import { directedSort, localeCompareSort } from '@/shared/components/table/sort-utils';
+-import { ITEMS_PER_PAGE, TablePagination } from '@/shared/components/table/table-pagination';
+ import {
+   TableFilter,
+   TableFilterOption,
+   TableFilterProps,
+   TableFilters,
+ } from '@/shared/components/table/TableFilters';
++import { ITEMS_PER_PAGE, TablePagination } from '@/shared/components/table/TablePagination';
+ import { TableToolbar } from '@/shared/components/table/TableToolbar';
+-import withFallback from '@/shared/console/console-shared/error/fallbacks/withFallback';
++import withFallback from '@/shared/console/console-shared/error/fallbacks/WithFallback';
+ import { EmptyBox } from '@/shared/console/console-shared/src/components/empty-state/EmptyBox';
+ import { LoadingBox } from '@/shared/console/console-shared/src/components/loading/LoadingBox';
+ import { DataTestIDs } from '@/shared/constants/data-test';
+diff --git a/web/src/features/alerts/pages/alerts-page/AggregateAlertTableRow.tsx b/web/src/features/alerts/pages/alerts-page/AggregateAlertTableRow.tsx
+index 6447bb966..a81b0df97 100644
+--- a/web/src/features/alerts/pages/alerts-page/AggregateAlertTableRow.tsx
++++ b/web/src/features/alerts/pages/alerts-page/AggregateAlertTableRow.tsx
+@@ -6,7 +6,7 @@ import { useTranslation } from 'react-i18next';
+ import { Link } from 'react-router';
+ 
+ import { AlertState } from '@/features/alerts/components/AlertUtils';
+-import { AggregatedAlert } from '@/features/alerts/pages/alerts-page/AlertsAggregates';
++import { AggregatedAlert } from '@/features/alerts/pages/alerts-page/alerts-aggregates';
+ import { AggregatedAlertFilters } from '@/features/alerts/pages/alerts-page/AlertsPage';
+ import AlertTableRow from '@/features/alerts/pages/alerts-page/AlertTableRow';
+ import { filterAlerts } from '@/features/alerts/pages/alerts-page/filter-alerts';
+diff --git a/web/src/features/alerts/pages/alerts-page/AlertsPage.tsx b/web/src/features/alerts/pages/alerts-page/AlertsPage.tsx
+index 5fb6f2a96..8b9a2b6df 100644
+--- a/web/src/features/alerts/pages/alerts-page/AlertsPage.tsx
++++ b/web/src/features/alerts/pages/alerts-page/AlertsPage.tsx
+@@ -14,22 +14,22 @@ import AggregateAlertTableRow from '@/features/alerts/pages/alerts-page/Aggregat
+ import {
+   AggregatedAlert,
+   getAggregateAlertsLists,
+-} from '@/features/alerts/pages/alerts-page/AlertsAggregates';
++} from '@/features/alerts/pages/alerts-page/alerts-aggregates';
+ import DownloadCSVButton from '@/features/alerts/pages/alerts-page/DownloadCSVButton';
+ import { filterAlerts } from '@/features/alerts/pages/alerts-page/filter-alerts';
+ import { useTableColumns } from '@/shared/components/table/hooks/useTableColumns';
+ import { rowFilter, useTableFilters } from '@/shared/components/table/hooks/useTableFilters';
+ import { useTablePagination } from '@/shared/components/table/hooks/useTablePagination';
+ import { directedSort, localeCompareSort } from '@/shared/components/table/sort-utils';
+-import { ITEMS_PER_PAGE, TablePagination } from '@/shared/components/table/table-pagination';
+ import {
+   TableFilter,
+   TableFilterOption,
+   TableFilterProps,
+   TableFilters,
+ } from '@/shared/components/table/TableFilters';
++import { ITEMS_PER_PAGE, TablePagination } from '@/shared/components/table/TablePagination';
+ import { TableToolbar } from '@/shared/components/table/TableToolbar';
+-import withFallback from '@/shared/console/console-shared/error/fallbacks/withFallback';
++import withFallback from '@/shared/console/console-shared/error/fallbacks/WithFallback';
+ import { AccessDenied } from '@/shared/console/console-shared/src/components/empty-state/AccessDenied';
+ import { EmptyBox } from '@/shared/console/console-shared/src/components/empty-state/EmptyBox';
+ import { LoadingBox } from '@/shared/console/console-shared/src/components/loading/LoadingBox';
+diff --git a/web/src/features/alerts/pages/alerts-page/DownloadCSVButton.tsx b/web/src/features/alerts/pages/alerts-page/DownloadCSVButton.tsx
+index 521faf3d3..7005a5755 100644
+--- a/web/src/features/alerts/pages/alerts-page/DownloadCSVButton.tsx
++++ b/web/src/features/alerts/pages/alerts-page/DownloadCSVButton.tsx
+@@ -2,7 +2,7 @@ import { Button, ButtonVariant } from '@patternfly/react-core';
+ import { FC } from 'react';
+ import { useTranslation } from 'react-i18next';
+ 
+-import { AggregatedAlert } from '@/features/alerts/pages/alerts-page/AlertsAggregates';
++import { AggregatedAlert } from '@/features/alerts/pages/alerts-page/alerts-aggregates';
+ import { DataTestIDs } from '@/shared/constants/data-test';
+ import { usePerspective } from '@/shared/hooks/usePerspective';
+ 
+diff --git a/web/src/features/alerts/pages/alerts-page/AlertsAggregates.ts b/web/src/features/alerts/pages/alerts-page/alerts-aggregates.ts
+similarity index 100%
+rename from web/src/features/alerts/pages/alerts-page/AlertsAggregates.ts
+rename to web/src/features/alerts/pages/alerts-page/alerts-aggregates.ts
+diff --git a/web/src/features/alerts/pages/silences-page/SilencesPage.tsx b/web/src/features/alerts/pages/silences-page/SilencesPage.tsx
+index c354c0760..e9043751f 100644
+--- a/web/src/features/alerts/pages/silences-page/SilencesPage.tsx
++++ b/web/src/features/alerts/pages/silences-page/SilencesPage.tsx
+@@ -44,15 +44,15 @@ import { useTableColumns } from '@/shared/components/table/hooks/useTableColumns
+ import { rowFilter, useTableFilters } from '@/shared/components/table/hooks/useTableFilters';
+ import { useTablePagination } from '@/shared/components/table/hooks/useTablePagination';
+ import { directedSort, localeCompareSort } from '@/shared/components/table/sort-utils';
+-import { ITEMS_PER_PAGE, TablePagination } from '@/shared/components/table/table-pagination';
+ import {
+   TableFilter,
+   TableFilterOption,
+   TableFilterProps,
+   TableFilters,
+ } from '@/shared/components/table/TableFilters';
++import { ITEMS_PER_PAGE, TablePagination } from '@/shared/components/table/TablePagination';
+ import { TableToolbar } from '@/shared/components/table/TableToolbar';
+-import withFallback from '@/shared/console/console-shared/error/fallbacks/withFallback';
++import withFallback from '@/shared/console/console-shared/error/fallbacks/WithFallback';
+ import { EmptyBox } from '@/shared/console/console-shared/src/components/empty-state/EmptyBox';
+ import { LoadingBox } from '@/shared/console/console-shared/src/components/loading/LoadingBox';
+ import { DataTestIDs } from '@/shared/constants/data-test';
+diff --git a/web/src/features/incidents/pages/IncidentsPage.tsx b/web/src/features/incidents/pages/IncidentsPage.tsx
+index 0ae338b33..05081a4f1 100644
+--- a/web/src/features/incidents/pages/IncidentsPage.tsx
++++ b/web/src/features/incidents/pages/IncidentsPage.tsx
+@@ -37,12 +37,12 @@ import IncidentFilterToolbarItem, {
+ } from '@/features/incidents/components/ToolbarItemFilter';
+ import { Incident, IncidentsPageFiltersExpandedState } from '@/features/incidents/types/model';
+ import { createAlertsQuery, fetchDataForIncidentsAndAlerts } from '@/features/incidents/utils/api';
+-import { convertToAlerts, groupAlertsForTable } from '@/features/incidents/utils/processAlerts';
++import { convertToAlerts, groupAlertsForTable } from '@/features/incidents/utils/process-alerts';
+ import {
+   convertToIncidents,
+   getIncidentsTimeRanges,
+   processIncidentsForAlerts,
+-} from '@/features/incidents/utils/processIncidents';
++} from '@/features/incidents/utils/process-incidents';
+ import {
+   changeDaysFilter,
+   filterIncident,
+@@ -54,7 +54,7 @@ import {
+   parseUrlParams,
+   updateBrowserUrl,
+ } from '@/features/incidents/utils/utils';
+-import withFallback from '@/shared/console/console-shared/error/fallbacks/withFallback';
++import withFallback from '@/shared/console/console-shared/error/fallbacks/WithFallback';
+ import { AccessDenied } from '@/shared/console/console-shared/src/components/empty-state/AccessDenied';
+ import { parsePrometheusDuration } from '@/shared/console/console-shared/src/datetime/prometheus';
+ import { useSafeFetch } from '@/shared/console/utils/safe-fetch-hook';
+diff --git a/web/src/features/incidents/utils/processAlerts.spec.ts b/web/src/features/incidents/utils/process-alerts.spec.ts
+similarity index 99%
+rename from web/src/features/incidents/utils/processAlerts.spec.ts
+rename to web/src/features/incidents/utils/process-alerts.spec.ts
+index 11d17c6af..fa564592e 100644
+--- a/web/src/features/incidents/utils/processAlerts.spec.ts
++++ b/web/src/features/incidents/utils/process-alerts.spec.ts
+@@ -1,7 +1,7 @@
+ import { PrometheusResult } from '@openshift-console/dynamic-plugin-sdk';
+ 
+ import { Incident } from '@/features/incidents/types/model';
+-import { convertToAlerts, deduplicateAlerts } from '@/features/incidents/utils/processAlerts';
++import { convertToAlerts, deduplicateAlerts } from '@/features/incidents/utils/process-alerts';
+ import { getCurrentTime } from '@/features/incidents/utils/utils';
+ 
+ describe('convertToAlerts', () => {
+diff --git a/web/src/features/incidents/utils/processAlerts.ts b/web/src/features/incidents/utils/process-alerts.ts
+similarity index 100%
+rename from web/src/features/incidents/utils/processAlerts.ts
+rename to web/src/features/incidents/utils/process-alerts.ts
+diff --git a/web/src/features/incidents/utils/processIncidents.spec.ts b/web/src/features/incidents/utils/process-incidents.spec.ts
+similarity index 99%
+rename from web/src/features/incidents/utils/processIncidents.spec.ts
+rename to web/src/features/incidents/utils/process-incidents.spec.ts
+index 205d6c08a..1cc0d6bb2 100644
+--- a/web/src/features/incidents/utils/processIncidents.spec.ts
++++ b/web/src/features/incidents/utils/process-incidents.spec.ts
+@@ -5,7 +5,7 @@ import {
+   getIncidents,
+   getIncidentsTimeRanges,
+   processIncidentsForAlerts,
+-} from '@/features/incidents/utils/processIncidents';
++} from '@/features/incidents/utils/process-incidents';
+ import { getCurrentTime } from '@/features/incidents/utils/utils';
+ 
+ describe('convertToIncidents', () => {
+diff --git a/web/src/features/incidents/utils/processIncidents.ts b/web/src/features/incidents/utils/process-incidents.ts
+similarity index 100%
+rename from web/src/features/incidents/utils/processIncidents.ts
+rename to web/src/features/incidents/utils/process-incidents.ts
+diff --git a/web/src/features/legacy-dashboards/components/custom-time-range-modal.tsx b/web/src/features/legacy-dashboards/components/CustomTimeRangeModal.tsx
+similarity index 100%
+rename from web/src/features/legacy-dashboards/components/custom-time-range-modal.tsx
+rename to web/src/features/legacy-dashboards/components/CustomTimeRangeModal.tsx
+diff --git a/web/src/features/legacy-dashboards/components/dashboard-skeleton-legacy.tsx b/web/src/features/legacy-dashboards/components/DashboardSkeletonLegacy.tsx
+similarity index 92%
+rename from web/src/features/legacy-dashboards/components/dashboard-skeleton-legacy.tsx
+rename to web/src/features/legacy-dashboards/components/DashboardSkeletonLegacy.tsx
+index 44240f5f7..5ab7c50c9 100644
+--- a/web/src/features/legacy-dashboards/components/dashboard-skeleton-legacy.tsx
++++ b/web/src/features/legacy-dashboards/components/DashboardSkeletonLegacy.tsx
+@@ -5,12 +5,12 @@ import type { FC, PropsWithChildren } from 'react';
+ import { memo, useCallback } from 'react';
+ import { useTranslation } from 'react-i18next';
+ 
+-import { LegacyDashboardsAllVariableDropdowns } from '@/features/legacy-dashboards/components/legacy-variable-dropdowns';
++import { LegacyDashboardsAllVariableDropdowns } from '@/features/legacy-dashboards/components/LegacyVariableDropdowns';
+ import {
+   PollIntervalDropdown,
+   TimespanDropdown,
+-} from '@/features/legacy-dashboards/components/time-dropdowns';
+-import { DashboardDropdown } from '@/shared/components/dashboard-dropdown';
++} from '@/features/legacy-dashboards/components/TimeDropdowns';
++import { DashboardDropdown } from '@/shared/components/DashboardDropdown';
+ import type { CombinedDashboardMetadata } from '@/shared/types/types';
+ 
+ const HeaderTop: FC = memo(() => {
+diff --git a/web/src/features/legacy-dashboards/components/error.tsx b/web/src/features/legacy-dashboards/components/Error.tsx
+similarity index 100%
+rename from web/src/features/legacy-dashboards/components/error.tsx
+rename to web/src/features/legacy-dashboards/components/Error.tsx
+diff --git a/web/src/features/legacy-dashboards/components/legacy-dashboard.tsx b/web/src/features/legacy-dashboards/components/LegacyDashboard.tsx
+similarity index 99%
+rename from web/src/features/legacy-dashboards/components/legacy-dashboard.tsx
+rename to web/src/features/legacy-dashboards/components/LegacyDashboard.tsx
+index 674a9fbc0..b89401650 100644
+--- a/web/src/features/legacy-dashboards/components/legacy-dashboard.tsx
++++ b/web/src/features/legacy-dashboards/components/LegacyDashboard.tsx
+@@ -33,11 +33,11 @@ import { useQueryParam } from 'use-query-params';
+ import {
+   evaluateVariableTemplate,
+   Variable,
+-} from '@/features/legacy-dashboards/components/legacy-variable-dropdowns';
+-import BarChart from '@/features/legacy-dashboards/components/panels/bar-chart';
+-import Graph from '@/features/legacy-dashboards/components/panels/graph';
+-import SingleStat from '@/features/legacy-dashboards/components/panels/single-stat';
+-import Table from '@/features/legacy-dashboards/components/panels/table';
++} from '@/features/legacy-dashboards/components/LegacyVariableDropdowns';
++import BarChart from '@/features/legacy-dashboards/components/panels/BarChart';
++import Graph from '@/features/legacy-dashboards/components/panels/Graph';
++import SingleStat from '@/features/legacy-dashboards/components/panels/SingleStat';
++import Table from '@/features/legacy-dashboards/components/panels/Table';
+ import { Panel, Row } from '@/features/legacy-dashboards/types/types';
+ import { RefreshIntervalParam, TimeRangeParam } from '@/features/legacy-dashboards/utils/utils';
+ import KebabDropdown from '@/shared/components/KebabDropdown';
+diff --git a/web/src/features/legacy-dashboards/components/legacy-variable-dropdowns.tsx b/web/src/features/legacy-dashboards/components/LegacyVariableDropdowns.tsx
+similarity index 99%
+rename from web/src/features/legacy-dashboards/components/legacy-variable-dropdowns.tsx
+rename to web/src/features/legacy-dashboards/components/LegacyVariableDropdowns.tsx
+index a64ff1406..2d870048a 100644
+--- a/web/src/features/legacy-dashboards/components/legacy-variable-dropdowns.tsx
++++ b/web/src/features/legacy-dashboards/components/LegacyVariableDropdowns.tsx
+@@ -39,7 +39,7 @@ import {
+   isIntervalVariable,
+ } from '@/features/legacy-dashboards/utils/variable-utils';
+ import { useSafeFetch } from '@/shared/console/utils/safe-fetch-hook';
+-import { SingleTypeaheadDropdown } from '@/shared/console/utils/single-typeahead-dropdown';
++import { SingleTypeaheadDropdown } from '@/shared/console/utils/SingleTypeaheadDropdown';
+ import { QueryParams } from '@/shared/constants/query-params';
+ import { useDeepMemo } from '@/shared/hooks/useDeepMemo';
+ import { useMonitoring } from '@/shared/hooks/useMonitoring';
+diff --git a/web/src/features/legacy-dashboards/components/time-dropdowns.tsx b/web/src/features/legacy-dashboards/components/TimeDropdowns.tsx
+similarity index 99%
+rename from web/src/features/legacy-dashboards/components/time-dropdowns.tsx
+rename to web/src/features/legacy-dashboards/components/TimeDropdowns.tsx
+index b0d502497..4ef7e2d06 100644
+--- a/web/src/features/legacy-dashboards/components/time-dropdowns.tsx
++++ b/web/src/features/legacy-dashboards/components/TimeDropdowns.tsx
+@@ -5,7 +5,7 @@ import type { FC } from 'react';
+ import { useTranslation } from 'react-i18next';
+ import { NumberParam, useQueryParam } from 'use-query-params';
+ 
+-import CustomTimeRangeModal from '@/features/legacy-dashboards/components/custom-time-range-modal';
++import CustomTimeRangeModal from '@/features/legacy-dashboards/components/CustomTimeRangeModal';
+ import { RefreshIntervalParam, TimeRangeParam } from '@/features/legacy-dashboards/utils/utils';
+ import { DropDownPollInterval } from '@/shared/components/DropdownPollInterval';
+ import {
+diff --git a/web/src/features/legacy-dashboards/components/panels/bar-chart.tsx b/web/src/features/legacy-dashboards/components/panels/BarChart.tsx
+similarity index 90%
+rename from web/src/features/legacy-dashboards/components/panels/bar-chart.tsx
+rename to web/src/features/legacy-dashboards/components/panels/BarChart.tsx
+index 3e00916ab..62b3f15ad 100644
+--- a/web/src/features/legacy-dashboards/components/panels/bar-chart.tsx
++++ b/web/src/features/legacy-dashboards/components/panels/BarChart.tsx
+@@ -1,7 +1,7 @@
+ import { CustomDataSource } from '@openshift-console/dynamic-plugin-sdk/lib/extensions/dashboard-data-source';
+ import type { FC } from 'react';
+ 
+-import { Bar } from '@/shared/console/graphs/bar';
++import { Bar } from '@/shared/console/graphs/Bar';
+ 
+ const BarChart: FC<BarChartProps> = ({ customDataSource, pollInterval, query }) => (
+   <Bar
+diff --git a/web/src/features/legacy-dashboards/components/panels/graph.tsx b/web/src/features/legacy-dashboards/components/panels/Graph.tsx
+similarity index 98%
+rename from web/src/features/legacy-dashboards/components/panels/graph.tsx
+rename to web/src/features/legacy-dashboards/components/panels/Graph.tsx
+index 39f644044..8d22bca49 100644
+--- a/web/src/features/legacy-dashboards/components/panels/graph.tsx
++++ b/web/src/features/legacy-dashboards/components/panels/Graph.tsx
+@@ -4,7 +4,7 @@ import { useCallback } from 'react';
+ import { NumberParam, useQueryParam } from 'use-query-params';
+ 
+ import { DEFAULT_GRAPH_SAMPLES, TimeRangeParam } from '@/features/legacy-dashboards/utils/utils';
+-import { FormatSeriesTitle, QueryBrowser } from '@/shared/components/query-browser/query-browser';
++import { FormatSeriesTitle, QueryBrowser } from '@/shared/components/query-browser/QueryBrowser';
+ import { QueryParams } from '@/shared/constants/query-params';
+ import { GraphUnits } from '@/shared/utils/units';
+ 
+diff --git a/web/src/features/legacy-dashboards/components/panels/single-stat.tsx b/web/src/features/legacy-dashboards/components/panels/SingleStat.tsx
+similarity index 99%
+rename from web/src/features/legacy-dashboards/components/panels/single-stat.tsx
+rename to web/src/features/legacy-dashboards/components/panels/SingleStat.tsx
+index e14d7ac0e..46afd55ba 100644
+--- a/web/src/features/legacy-dashboards/components/panels/single-stat.tsx
++++ b/web/src/features/legacy-dashboards/components/panels/SingleStat.tsx
+@@ -38,7 +38,7 @@ import { useCallback, useState } from 'react';
+ import type { FC, ReactNode } from 'react';
+ import { useTranslation } from 'react-i18next';
+ 
+-import ErrorAlert from '@/features/legacy-dashboards/components/error';
++import ErrorAlert from '@/features/legacy-dashboards/components/Error';
+ import { Panel } from '@/features/legacy-dashboards/types/types';
+ import { formatNumber } from '@/shared/components/format';
+ import { LoadingInline } from '@/shared/console/console-shared/src/components/loading/LoadingInline';
+diff --git a/web/src/features/legacy-dashboards/components/panels/table.tsx b/web/src/features/legacy-dashboards/components/panels/Table.tsx
+similarity index 98%
+rename from web/src/features/legacy-dashboards/components/panels/table.tsx
+rename to web/src/features/legacy-dashboards/components/panels/Table.tsx
+index 1f9b4d8ba..c6f5868a2 100644
+--- a/web/src/features/legacy-dashboards/components/panels/table.tsx
++++ b/web/src/features/legacy-dashboards/components/panels/Table.tsx
+@@ -17,11 +17,11 @@ import { useCallback, useState } from 'react';
+ import type { FC } from 'react';
+ import { useTranslation } from 'react-i18next';
+ 
+-import ErrorAlert from '@/features/legacy-dashboards/components/error';
++import ErrorAlert from '@/features/legacy-dashboards/components/Error';
+ import { ColumnStyle, Panel } from '@/features/legacy-dashboards/types/types';
+ import { formatNumber } from '@/shared/components/format';
+-import { ITEMS_PER_PAGE, TablePagination } from '@/shared/components/table/table-pagination';
+-import { GraphEmpty } from '@/shared/console/graphs/graph-empty';
++import { ITEMS_PER_PAGE, TablePagination } from '@/shared/components/table/TablePagination';
++import { GraphEmpty } from '@/shared/console/graphs/GraphEmpty';
+ import { usePoll } from '@/shared/console/utils/poll-hook';
+ import { useSafeFetch } from '@/shared/console/utils/safe-fetch-hook';
+ import { useMonitoring } from '@/shared/hooks/useMonitoring';
+diff --git a/web/src/features/legacy-dashboards/pages/legacy-dashboard-page.tsx b/web/src/features/legacy-dashboards/pages/LegacyDashboardPage.tsx
+similarity index 96%
+rename from web/src/features/legacy-dashboards/pages/legacy-dashboard-page.tsx
+rename to web/src/features/legacy-dashboards/pages/LegacyDashboardPage.tsx
+index 38f0e503e..fd606a356 100644
+--- a/web/src/features/legacy-dashboards/pages/legacy-dashboard-page.tsx
++++ b/web/src/features/legacy-dashboards/pages/LegacyDashboardPage.tsx
+@@ -4,11 +4,11 @@ import { useTranslation } from 'react-i18next';
+ import { useParams } from 'react-router';
+ import { StringParam, useQueryParam } from 'use-query-params';
+ 
+-import { DashboardSkeletonLegacy } from '@/features/legacy-dashboards/components/dashboard-skeleton-legacy';
+-import ErrorAlert from '@/features/legacy-dashboards/components/error';
+-import { LegacyDashboard } from '@/features/legacy-dashboards/components/legacy-dashboard';
++import { DashboardSkeletonLegacy } from '@/features/legacy-dashboards/components/DashboardSkeletonLegacy';
++import ErrorAlert from '@/features/legacy-dashboards/components/Error';
++import { LegacyDashboard } from '@/features/legacy-dashboards/components/LegacyDashboard';
+ import { useLegacyDashboards } from '@/features/legacy-dashboards/hooks/useLegacyDashboards';
+-import withFallback from '@/shared/console/console-shared/error/fallbacks/withFallback';
++import withFallback from '@/shared/console/console-shared/error/fallbacks/WithFallback';
+ import { LoadingInline } from '@/shared/console/console-shared/src/components/loading/LoadingInline';
+ import { QueryParams } from '@/shared/constants/query-params';
+ import { MonitoringProvider } from '@/shared/contexts/MonitoringContext';
+diff --git a/web/src/features/metrics/components/promql-expression-input.tsx b/web/src/features/metrics/components/PromqlExpressionInput.tsx
+similarity index 100%
+rename from web/src/features/metrics/components/promql-expression-input.tsx
+rename to web/src/features/metrics/components/PromqlExpressionInput.tsx
+diff --git a/web/src/features/metrics/pages/MetricsPage.tsx b/web/src/features/metrics/pages/MetricsPage.tsx
+index de87202ef..8f799e1e0 100644
+--- a/web/src/features/metrics/pages/MetricsPage.tsx
++++ b/web/src/features/metrics/pages/MetricsPage.tsx
+@@ -81,14 +81,14 @@ import { StringParam, useQueryParam } from 'use-query-params';
+ 
+ import { DropDownPollInterval } from '@/shared/components/DropdownPollInterval';
+ import KebabDropdown from '@/shared/components/KebabDropdown';
+-import { colors, Error, QueryBrowser } from '@/shared/components/query-browser/query-browser';
+-import { TablePagination } from '@/shared/components/table/table-pagination';
++import { colors, Error, QueryBrowser } from '@/shared/components/query-browser/QueryBrowser';
++import { TablePagination } from '@/shared/components/table/TablePagination';
+ import { ToggleGraph } from '@/shared/components/ToggleGraph';
+ import { TypeaheadSelect } from '@/shared/components/TypeaheadSelect';
+-import withFallback from '@/shared/console/console-shared/error/fallbacks/withFallback';
++import withFallback from '@/shared/console/console-shared/error/fallbacks/WithFallback';
+ import { LoadingInline } from '@/shared/console/console-shared/src/components/loading/LoadingInline';
+ import { valueFormatter } from '@/shared/console/console-shared/src/components/query-browser/QueryBrowserTooltip';
+-import { AsyncComponent } from '@/shared/console/utils/async';
++import { AsyncComponent } from '@/shared/console/utils/Async';
+ import { usePoll } from '@/shared/console/utils/poll-hook';
+ import { useSafeFetch } from '@/shared/console/utils/safe-fetch-hook';
+ import { DataTestIDs } from '@/shared/constants/data-test';
+@@ -904,7 +904,7 @@ const QueryTable: FC<QueryTableProps> = ({ index, namespace, customDatasource, u
+ const PromQLExpressionInput = (props) => (
+   <AsyncComponent
+     loader={() =>
+-      import('../components/promql-expression-input').then((c) => c.PromQLExpressionInput)
++      import('../components/PromqlExpressionInput').then((c) => c.PromQLExpressionInput)
+     }
+     {...props}
+   />
+diff --git a/web/src/features/perses-dashboards/components/dashboard-action-modals.tsx b/web/src/features/perses-dashboards/components/DashboardActionModals.tsx
+similarity index 100%
+rename from web/src/features/perses-dashboards/components/dashboard-action-modals.tsx
+rename to web/src/features/perses-dashboards/components/DashboardActionModals.tsx
+diff --git a/web/src/features/perses-dashboards/components/dashboard-actions-menu.tsx b/web/src/features/perses-dashboards/components/DashboardActionsMenu.tsx
+similarity index 97%
+rename from web/src/features/perses-dashboards/components/dashboard-actions-menu.tsx
+rename to web/src/features/perses-dashboards/components/DashboardActionsMenu.tsx
+index 9e8fd28d4..c7246766a 100644
+--- a/web/src/features/perses-dashboards/components/dashboard-actions-menu.tsx
++++ b/web/src/features/perses-dashboards/components/DashboardActionsMenu.tsx
+@@ -10,8 +10,8 @@ import {
+ import { FC, Ref, useState } from 'react';
+ import { useTranslation } from 'react-i18next';
+ 
+-import { DashboardCreateDialog } from '@/features/perses-dashboards/components/dashboard-create-dialog';
+-import { DashboardImportDialog } from '@/features/perses-dashboards/components/dashboard-import-dialog';
++import { DashboardCreateDialog } from '@/features/perses-dashboards/components/DashboardCreateDialog';
++import { DashboardImportDialog } from '@/features/perses-dashboards/components/DashboardImportDialog';
+ import { useEditableProjects } from '@/features/perses-dashboards/hooks/useEditableProjects';
+ import { persesDashboardDataTestIDs } from '@/shared/constants/data-test';
+ 
+diff --git a/web/src/features/perses-dashboards/components/dashboard-create-dialog.tsx b/web/src/features/perses-dashboards/components/DashboardCreateDialog.tsx
+similarity index 97%
+rename from web/src/features/perses-dashboards/components/dashboard-create-dialog.tsx
+rename to web/src/features/perses-dashboards/components/DashboardCreateDialog.tsx
+index 210b67cc3..ad749fa0b 100644
+--- a/web/src/features/perses-dashboards/components/dashboard-create-dialog.tsx
++++ b/web/src/features/perses-dashboards/components/DashboardCreateDialog.tsx
+@@ -24,14 +24,14 @@ import { useTranslation } from 'react-i18next';
+ import {
+   formGroupStyle,
+   LabelSpacer,
+-} from '@/features/perses-dashboards/components/dashboard-action-modals';
++} from '@/features/perses-dashboards/components/DashboardActionModals';
+ import {
+   PermissionStateWrapper,
+   ProjectSelectFormGroup,
+   useDashboardNavigation,
+   useDashboardProjects,
+   useProjectCreation,
+-} from '@/features/perses-dashboards/components/dashboard-dialog-helpers';
++} from '@/features/perses-dashboards/components/DashboardDialogHelpers';
+ import { useToast } from '@/features/perses-dashboards/components/ToastProvider';
+ import {
+   createDashboardDialogValidationSchema,
+diff --git a/web/src/features/perses-dashboards/components/dashboard-dialog-helpers.tsx b/web/src/features/perses-dashboards/components/DashboardDialogHelpers.tsx
+similarity index 98%
+rename from web/src/features/perses-dashboards/components/dashboard-dialog-helpers.tsx
+rename to web/src/features/perses-dashboards/components/DashboardDialogHelpers.tsx
+index 0f18b8a37..3fb3765db 100644
+--- a/web/src/features/perses-dashboards/components/dashboard-dialog-helpers.tsx
++++ b/web/src/features/perses-dashboards/components/DashboardDialogHelpers.tsx
+@@ -16,7 +16,7 @@ import { useNavigate } from 'react-router';
+ import {
+   formGroupStyle,
+   LabelSpacer,
+-} from '@/features/perses-dashboards/components/dashboard-action-modals';
++} from '@/features/perses-dashboards/components/DashboardActionModals';
+ import { useToast } from '@/features/perses-dashboards/components/ToastProvider';
+ import { useEditableProjects } from '@/features/perses-dashboards/hooks/useEditableProjects';
+ import { usePerses } from '@/features/perses-dashboards/hooks/usePerses';
+diff --git a/web/src/features/perses-dashboards/components/dashboard-header.tsx b/web/src/features/perses-dashboards/components/DashboardHeader.tsx
+similarity index 98%
+rename from web/src/features/perses-dashboards/components/dashboard-header.tsx
+rename to web/src/features/perses-dashboards/components/DashboardHeader.tsx
+index 0f11a1120..31b12f845 100644
+--- a/web/src/features/perses-dashboards/components/dashboard-header.tsx
++++ b/web/src/features/perses-dashboards/components/DashboardHeader.tsx
+@@ -12,8 +12,8 @@ import type { FC, PropsWithChildren } from 'react';
+ import { useTranslation } from 'react-i18next';
+ import { useNavigate } from 'react-router';
+ 
+-import { DashboardActionsMenu } from '@/features/perses-dashboards/components/dashboard-actions-menu';
+-import { PagePadding } from '@/features/perses-dashboards/pages/dashboard-page/dashboard-page-padding';
++import { DashboardActionsMenu } from '@/features/perses-dashboards/components/DashboardActionsMenu';
++import { PagePadding } from '@/features/perses-dashboards/pages/dashboard-page/DashboardPagePadding';
+ import { listPersesDashboardsDataTestIDs } from '@/shared/constants/data-test';
+ import { usePatternFlyTheme } from '@/shared/hooks/usePatternflyTheme';
+ import { getDashboardsListUrl, usePerspective } from '@/shared/hooks/usePerspective';
+diff --git a/web/src/features/perses-dashboards/components/dashboard-import-dialog.tsx b/web/src/features/perses-dashboards/components/DashboardImportDialog.tsx
+similarity index 99%
+rename from web/src/features/perses-dashboards/components/dashboard-import-dialog.tsx
+rename to web/src/features/perses-dashboards/components/DashboardImportDialog.tsx
+index 776071c44..f0513deb1 100644
+--- a/web/src/features/perses-dashboards/components/dashboard-import-dialog.tsx
++++ b/web/src/features/perses-dashboards/components/DashboardImportDialog.tsx
+@@ -29,7 +29,7 @@ import {
+   useDashboardNavigation,
+   useDashboardProjects,
+   useProjectCreation,
+-} from '@/features/perses-dashboards/components/dashboard-dialog-helpers';
++} from '@/features/perses-dashboards/components/DashboardDialogHelpers';
+ import { useToast } from '@/features/perses-dashboards/components/ToastProvider';
+ import {
+   importDashboardDialogValidationSchema,
+diff --git a/web/src/features/perses-dashboards/components/emptystates/DashboardEmptyState.tsx b/web/src/features/perses-dashboards/components/emptystates/DashboardEmptyState.tsx
+index 68f5b3d44..699ec3bae 100644
+--- a/web/src/features/perses-dashboards/components/emptystates/DashboardEmptyState.tsx
++++ b/web/src/features/perses-dashboards/components/emptystates/DashboardEmptyState.tsx
+@@ -3,7 +3,7 @@ import { ListIcon } from '@patternfly/react-icons';
+ import { ReactElement } from 'react';
+ import { useTranslation } from 'react-i18next';
+ 
+-import { ExternalLink } from '@/shared/console/utils/link';
++import { ExternalLink } from '@/shared/console/utils/Link';
+ 
+ export function DashboardEmptyState(): ReactElement {
+   const { t } = useTranslation(process.env.I18N_NAMESPACE);
+diff --git a/web/src/features/perses-dashboards/components/emptystates/ProjectEmptyState.tsx b/web/src/features/perses-dashboards/components/emptystates/ProjectEmptyState.tsx
+index 4ca2ae57d..33c538a6a 100644
+--- a/web/src/features/perses-dashboards/components/emptystates/ProjectEmptyState.tsx
++++ b/web/src/features/perses-dashboards/components/emptystates/ProjectEmptyState.tsx
+@@ -3,7 +3,7 @@ import { ListIcon } from '@patternfly/react-icons';
+ import { ReactElement } from 'react';
+ import { useTranslation } from 'react-i18next';
+ 
+-import { ExternalLink } from '@/shared/console/utils/link';
++import { ExternalLink } from '@/shared/console/utils/Link';
+ 
+ export function ProjectEmptyState(): ReactElement {
+   const { t } = useTranslation(process.env.I18N_NAMESPACE);
+diff --git a/web/src/features/perses-dashboards/pages/dashboard-list-page/dashboard-list.tsx b/web/src/features/perses-dashboards/pages/dashboard-list-page/DashboardList.tsx
+similarity index 98%
+rename from web/src/features/perses-dashboards/pages/dashboard-list-page/dashboard-list.tsx
+rename to web/src/features/perses-dashboards/pages/dashboard-list-page/DashboardList.tsx
+index db203b178..23f493df7 100644
+--- a/web/src/features/perses-dashboards/pages/dashboard-list-page/dashboard-list.tsx
++++ b/web/src/features/perses-dashboards/pages/dashboard-list-page/DashboardList.tsx
+@@ -31,12 +31,12 @@ import {
+   DeleteActionModal,
+   DuplicateActionModal,
+   RenameActionModal,
+-} from '@/features/perses-dashboards/components/dashboard-action-modals';
++} from '@/features/perses-dashboards/components/DashboardActionModals';
+ import { useDashboardsData } from '@/features/perses-dashboards/hooks/useDashboardsData';
+ import { useEditableProjects } from '@/features/perses-dashboards/hooks/useEditableProjects';
+ import { usePersesEditPermissions } from '@/features/perses-dashboards/hooks/usePersesEditPermissions';
+-import { DashboardListFrame } from '@/features/perses-dashboards/pages/dashboard-list-page/dashboard-list-frame';
+-import { ITEMS_PER_PAGE, TablePagination } from '@/shared/components/table/table-pagination';
++import { DashboardListFrame } from '@/features/perses-dashboards/pages/dashboard-list-page/DashboardListFrame';
++import { ITEMS_PER_PAGE, TablePagination } from '@/shared/components/table/TablePagination';
+ import { listPersesDashboardsDataTestIDs } from '@/shared/constants/data-test';
+ import { getDashboardUrl, usePerspective } from '@/shared/hooks/usePerspective';
+ import { ALL_NAMESPACES_KEY } from '@/shared/utils/utils';
+diff --git a/web/src/features/perses-dashboards/pages/dashboard-list-page/dashboard-list-frame.tsx b/web/src/features/perses-dashboards/pages/dashboard-list-page/DashboardListFrame.tsx
+similarity index 96%
+rename from web/src/features/perses-dashboards/pages/dashboard-list-page/dashboard-list-frame.tsx
+rename to web/src/features/perses-dashboards/pages/dashboard-list-page/DashboardListFrame.tsx
+index 061f1aabd..b8799774c 100644
+--- a/web/src/features/perses-dashboards/pages/dashboard-list-page/dashboard-list-frame.tsx
++++ b/web/src/features/perses-dashboards/pages/dashboard-list-page/DashboardListFrame.tsx
+@@ -1,6 +1,6 @@
+ import { FC, ReactNode } from 'react';
+ 
+-import { DashboardListHeader } from '@/features/perses-dashboards/components/dashboard-header';
++import { DashboardListHeader } from '@/features/perses-dashboards/components/DashboardHeader';
+ import { ProjectBar } from '@/features/perses-dashboards/components/project/ProjectBar';
+ import type { CombinedDashboardMetadata } from '@/shared/types/types';
+ 
+diff --git a/web/src/features/perses-dashboards/pages/dashboard-list-page/DashboardListPage.tsx b/web/src/features/perses-dashboards/pages/dashboard-list-page/DashboardListPage.tsx
+index 3ba0b3fea..5f6e4bc7f 100644
+--- a/web/src/features/perses-dashboards/pages/dashboard-list-page/DashboardListPage.tsx
++++ b/web/src/features/perses-dashboards/pages/dashboard-list-page/DashboardListPage.tsx
+@@ -3,7 +3,7 @@ import { type FC } from 'react';
+ import { QueryParamProvider } from 'use-query-params';
+ 
+ import { ToastProvider } from '@/features/perses-dashboards/components/ToastProvider';
+-import { DashboardList } from '@/features/perses-dashboards/pages/dashboard-list-page/dashboard-list';
++import { DashboardList } from '@/features/perses-dashboards/pages/dashboard-list-page/DashboardList';
+ import { ReactRouter7Adapter } from '@/shared/utils/react-router-7-adapter';
+ 
+ const queryClient = new QueryClient({
+diff --git a/web/src/features/perses-dashboards/pages/dashboard-page/dashboard-app.tsx b/web/src/features/perses-dashboards/pages/dashboard-page/DashboardApp.tsx
+similarity index 98%
+rename from web/src/features/perses-dashboards/pages/dashboard-page/dashboard-app.tsx
+rename to web/src/features/perses-dashboards/pages/dashboard-page/DashboardApp.tsx
+index 00b7d49f9..2876d20c0 100644
+--- a/web/src/features/perses-dashboards/pages/dashboard-page/dashboard-app.tsx
++++ b/web/src/features/perses-dashboards/pages/dashboard-page/DashboardApp.tsx
+@@ -28,8 +28,8 @@ import { useTranslation } from 'react-i18next';
+ import { useSearchParams } from 'react-router';
+ 
+ import { useToast } from '@/features/perses-dashboards/components/ToastProvider';
+-import { OCPDashboardToolbar } from '@/features/perses-dashboards/pages/dashboard-page/dashboard-toolbar';
+-import { ExternalPanelAddition } from '@/features/perses-dashboards/pages/dashboard-page/external-panel-addition';
++import { OCPDashboardToolbar } from '@/features/perses-dashboards/pages/dashboard-page/DashboardToolbar';
++import { ExternalPanelAddition } from '@/features/perses-dashboards/pages/dashboard-page/ExternalPanelAddition';
+ import { useUpdateDashboardMutation } from '@/features/perses-dashboards/utils/dashboard-api';
+ 
+ export interface DashboardAppProps {
+diff --git a/web/src/features/perses-dashboards/pages/dashboard-page/dashboard-frame.tsx b/web/src/features/perses-dashboards/pages/dashboard-page/DashboardFrame.tsx
+similarity index 96%
+rename from web/src/features/perses-dashboards/pages/dashboard-page/dashboard-frame.tsx
+rename to web/src/features/perses-dashboards/pages/dashboard-page/DashboardFrame.tsx
+index e04380105..238402e98 100644
+--- a/web/src/features/perses-dashboards/pages/dashboard-page/dashboard-frame.tsx
++++ b/web/src/features/perses-dashboards/pages/dashboard-page/DashboardFrame.tsx
+@@ -1,11 +1,11 @@
+ import { FC, ReactNode } from 'react';
+ 
+-import { DashboardHeader } from '@/features/perses-dashboards/components/dashboard-header';
++import { DashboardHeader } from '@/features/perses-dashboards/components/DashboardHeader';
+ import { DashboardEmptyState } from '@/features/perses-dashboards/components/emptystates/DashboardEmptyState';
+ import { PersesWrapper } from '@/features/perses-dashboards/components/PersesWrapper';
+ import { ProjectBar } from '@/features/perses-dashboards/components/project/ProjectBar';
+ import { ToastProvider } from '@/features/perses-dashboards/components/ToastProvider';
+-import { PagePadding } from '@/features/perses-dashboards/pages/dashboard-page/dashboard-page-padding';
++import { PagePadding } from '@/features/perses-dashboards/pages/dashboard-page/DashboardPagePadding';
+ import type { CombinedDashboardMetadata } from '@/shared/types/types';
+ 
+ interface DashboardFrameProps {
+diff --git a/web/src/features/perses-dashboards/pages/dashboard-page/DashboardPage.tsx b/web/src/features/perses-dashboards/pages/dashboard-page/DashboardPage.tsx
+index 468f13d1b..b12a99822 100644
+--- a/web/src/features/perses-dashboards/pages/dashboard-page/DashboardPage.tsx
++++ b/web/src/features/perses-dashboards/pages/dashboard-page/DashboardPage.tsx
+@@ -7,8 +7,8 @@ import { QueryParamProvider } from 'use-query-params';
+ import { ProjectEmptyState } from '@/features/perses-dashboards/components/emptystates/ProjectEmptyState';
+ import { ToastProvider } from '@/features/perses-dashboards/components/ToastProvider';
+ import { useDashboardsData } from '@/features/perses-dashboards/hooks/useDashboardsData';
+-import { OCPDashboardApp } from '@/features/perses-dashboards/pages/dashboard-page/dashboard-app';
+-import { DashboardFrame } from '@/features/perses-dashboards/pages/dashboard-page/dashboard-frame';
++import { OCPDashboardApp } from '@/features/perses-dashboards/pages/dashboard-page/DashboardApp';
++import { DashboardFrame } from '@/features/perses-dashboards/pages/dashboard-page/DashboardFrame';
+ import { LoadingInline } from '@/shared/console/console-shared/src/components/loading/LoadingInline';
+ import { ReactRouter7Adapter } from '@/shared/utils/react-router-7-adapter';
+ import '@/features/perses-dashboards/pages/dashboard-page/dashboard-page.css';
+diff --git a/web/src/features/perses-dashboards/pages/dashboard-page/dashboard-page-padding.tsx b/web/src/features/perses-dashboards/pages/dashboard-page/DashboardPagePadding.tsx
+similarity index 100%
+rename from web/src/features/perses-dashboards/pages/dashboard-page/dashboard-page-padding.tsx
+rename to web/src/features/perses-dashboards/pages/dashboard-page/DashboardPagePadding.tsx
+diff --git a/web/src/features/perses-dashboards/pages/dashboard-page/dashboard-toolbar.tsx b/web/src/features/perses-dashboards/pages/dashboard-page/DashboardToolbar.tsx
+similarity index 98%
+rename from web/src/features/perses-dashboards/pages/dashboard-page/dashboard-toolbar.tsx
+rename to web/src/features/perses-dashboards/pages/dashboard-page/DashboardToolbar.tsx
+index 4d890cb19..52937d642 100644
+--- a/web/src/features/perses-dashboards/pages/dashboard-page/dashboard-toolbar.tsx
++++ b/web/src/features/perses-dashboards/pages/dashboard-page/DashboardToolbar.tsx
+@@ -22,7 +22,7 @@ import { useTranslation } from 'react-i18next';
+ 
+ import { useDashboardsData } from '@/features/perses-dashboards/hooks/useDashboardsData';
+ import { usePersesEditPermissions } from '@/features/perses-dashboards/hooks/usePersesEditPermissions';
+-import { DashboardDropdown } from '@/shared/components/dashboard-dropdown';
++import { DashboardDropdown } from '@/shared/components/DashboardDropdown';
+ import { persesDashboardDataTestIDs } from '@/shared/constants/data-test';
+ 
+ export interface DashboardToolbarProps {
+diff --git a/web/src/features/perses-dashboards/pages/dashboard-page/external-panel-addition.tsx b/web/src/features/perses-dashboards/pages/dashboard-page/ExternalPanelAddition.tsx
+similarity index 100%
+rename from web/src/features/perses-dashboards/pages/dashboard-page/external-panel-addition.tsx
+rename to web/src/features/perses-dashboards/pages/dashboard-page/ExternalPanelAddition.tsx
+diff --git a/web/src/features/targets/pages/targets-page.tsx b/web/src/features/targets/pages/TargetsPage.tsx
+similarity index 99%
+rename from web/src/features/targets/pages/targets-page.tsx
+rename to web/src/features/targets/pages/TargetsPage.tsx
+index 98051ea48..8cdd5e77a 100644
+--- a/web/src/features/targets/pages/targets-page.tsx
++++ b/web/src/features/targets/pages/TargetsPage.tsx
+@@ -41,18 +41,18 @@ import { useTranslation } from 'react-i18next';
+ import { Link, useParams } from 'react-router';
+ 
+ import { filterTargets } from '@/features/targets/utils/filter-targets';
+-import { Labels } from '@/shared/components/labels';
++import { Labels } from '@/shared/components/Labels';
+ import { useTableColumns } from '@/shared/components/table/hooks/useTableColumns';
+ import { rowFilter, useTableFilters } from '@/shared/components/table/hooks/useTableFilters';
+ import { useTablePagination } from '@/shared/components/table/hooks/useTablePagination';
+ import { directedSort, localeCompareSort } from '@/shared/components/table/sort-utils';
+-import { ITEMS_PER_PAGE, TablePagination } from '@/shared/components/table/table-pagination';
+ import {
+   TableFilter,
+   TableFilterOption,
+   TableFilterProps,
+   TableFilters,
+ } from '@/shared/components/table/TableFilters';
++import { ITEMS_PER_PAGE, TablePagination } from '@/shared/components/table/TablePagination';
+ import { TableToolbar } from '@/shared/components/table/TableToolbar';
+ import { EmptyBox } from '@/shared/console/console-shared/src/components/empty-state/EmptyBox';
+ import { LoadingBox } from '@/shared/console/console-shared/src/components/loading/LoadingBox';
+diff --git a/web/src/features/targets/utils/filter-targets.spec.ts b/web/src/features/targets/utils/filter-targets.spec.ts
+index 3e4440cee..344798682 100644
+--- a/web/src/features/targets/utils/filter-targets.spec.ts
++++ b/web/src/features/targets/utils/filter-targets.spec.ts
+@@ -2,7 +2,7 @@ jest.mock('@openshift-console/dynamic-plugin-sdk', () => ({
+   ...jest.requireActual('@openshift-console/dynamic-plugin-sdk/lib/api/common-types'),
+ }));
+ 
+-import { TargetsFilterOptions, TargetsFilters } from '@/features/targets/pages/targets-page';
++import { TargetsFilterOptions, TargetsFilters } from '@/features/targets/pages/TargetsPage';
+ import { filterTargets } from '@/features/targets/utils/filter-targets';
+ import { Target } from '@/shared/types/types';
+ 
+diff --git a/web/src/features/targets/utils/filter-targets.ts b/web/src/features/targets/utils/filter-targets.ts
+index 63c1df5ea..49ae196b5 100644
+--- a/web/src/features/targets/utils/filter-targets.ts
++++ b/web/src/features/targets/utils/filter-targets.ts
+@@ -1,4 +1,4 @@
+-import { TargetsFilterOptions, TargetsFilters } from '@/features/targets/pages/targets-page';
++import { TargetsFilterOptions, TargetsFilters } from '@/features/targets/pages/TargetsPage';
+ import { Target } from '@/shared/types/types';
+ import { fuzzyCaseInsensitive, targetSource } from '@/shared/utils/utils';
+ 
+diff --git a/web/src/shared/components/dashboard-dropdown.tsx b/web/src/shared/components/DashboardDropdown.tsx
+similarity index 98%
+rename from web/src/shared/components/dashboard-dropdown.tsx
+rename to web/src/shared/components/DashboardDropdown.tsx
+index 083e5b15f..3b2d40abb 100644
+--- a/web/src/shared/components/dashboard-dropdown.tsx
++++ b/web/src/shared/components/DashboardDropdown.tsx
+@@ -14,7 +14,7 @@ import { memo, useEffect } from 'react';
+ import { useTranslation } from 'react-i18next';
+ 
+ import { CombinedDashboardMetadata } from '@/features/perses-dashboards/hooks/useDashboardsData';
+-import { SingleTypeaheadDropdown } from '@/shared/console/utils/single-typeahead-dropdown';
++import { SingleTypeaheadDropdown } from '@/shared/console/utils/SingleTypeaheadDropdown';
+ 
+ type TagColor = 'red' | 'purple' | 'blue' | 'green' | 'teal' | 'orange';
+ const tagColors: TagColor[] = ['red', 'purple', 'blue', 'green', 'teal', 'orange'];
+diff --git a/web/src/shared/components/labels.tsx b/web/src/shared/components/Labels.tsx
+similarity index 100%
+rename from web/src/shared/components/labels.tsx
+rename to web/src/shared/components/Labels.tsx
+diff --git a/web/src/shared/components/format.tsx b/web/src/shared/components/format.ts
+similarity index 100%
+rename from web/src/shared/components/format.tsx
+rename to web/src/shared/components/format.ts
+diff --git a/web/src/shared/components/query-browser/query-browser.tsx b/web/src/shared/components/query-browser/QueryBrowser.tsx
+similarity index 99%
+rename from web/src/shared/components/query-browser/query-browser.tsx
+rename to web/src/shared/components/query-browser/QueryBrowser.tsx
+index e73b66434..49f436fd8 100644
+--- a/web/src/shared/components/query-browser/query-browser.tsx
++++ b/web/src/shared/components/query-browser/QueryBrowser.tsx
+@@ -55,10 +55,9 @@ import type { ComponentType, FC, KeyboardEvent, MouseEvent, ReactNode, Ref } fro
+ import { useTranslation } from 'react-i18next';
+ import { useDispatch, useSelector } from 'react-redux';
+ 
+-import { GraphUnits } from '@/features/metrics/utils/units';
+ import { queryBrowserTheme } from '@/shared/components/query-browser/query-browser-theme';
+ import '@/shared/components/query-browser/query-browser.scss';
+-import withFallback from '@/shared/console/console-shared/error/fallbacks/withFallback';
++import withFallback from '@/shared/console/console-shared/error/fallbacks/WithFallback';
+ import { LoadingInline } from '@/shared/console/console-shared/src/components/loading/LoadingInline';
+ import {
+   QueryBrowserTooltip,
+@@ -68,7 +67,7 @@ import {
+   formatPrometheusDuration,
+   parsePrometheusDuration,
+ } from '@/shared/console/console-shared/src/datetime/prometheus';
+-import { GraphEmpty } from '@/shared/console/graphs/graph-empty';
++import { GraphEmpty } from '@/shared/console/graphs/GraphEmpty';
+ import {
+   dateFormatterNoYear,
+   timeFormatter,
+@@ -88,6 +87,7 @@ import {
+ } from '@/shared/store/actions';
+ import { MonitoringState } from '@/shared/store/store';
+ import { PrometheusAPIError, TimeRange } from '@/shared/types/types';
++import { GraphUnits } from '@/shared/utils/units';
+ import { buildPrometheusUrl, getPrometheusBasePath, getTimeRanges } from '@/shared/utils/utils';
+ 
+ const spans = ['5m', '15m', '30m', '1h', '2h', '6h', '12h', '1d', '2d', '1w', '2w'];
+diff --git a/web/src/shared/components/table/TableLabelFilter.tsx b/web/src/shared/components/table/TableLabelFilter.tsx
+index 29a001e7e..07536bbbe 100644
+--- a/web/src/shared/components/table/TableLabelFilter.tsx
++++ b/web/src/shared/components/table/TableLabelFilter.tsx
+@@ -2,7 +2,7 @@ import { ToolbarFilter, ToolbarLabel } from '@patternfly/react-core';
+ import * as _ from 'lodash';
+ import { useState } from 'react';
+ 
+-import AutocompleteInput from '@/shared/console/public/components/autocomplete';
++import AutocompleteInput from '@/shared/console/public/components/Autocomplete';
+ 
+ export type DataViewLabelFilterProps<TData> = {
+   data: TData[];
+diff --git a/web/src/shared/components/table/table-pagination.tsx b/web/src/shared/components/table/TablePagination.tsx
+similarity index 100%
+rename from web/src/shared/components/table/table-pagination.tsx
+rename to web/src/shared/components/table/TablePagination.tsx
+diff --git a/web/src/shared/console/console-shared/error/error-boundary.tsx b/web/src/shared/console/console-shared/error/ErrorBoundary.tsx
+similarity index 100%
+rename from web/src/shared/console/console-shared/error/error-boundary.tsx
+rename to web/src/shared/console/console-shared/error/ErrorBoundary.tsx
+diff --git a/web/src/shared/console/console-shared/error/fallbacks/withFallback.tsx b/web/src/shared/console/console-shared/error/fallbacks/WithFallback.tsx
+similarity index 97%
+rename from web/src/shared/console/console-shared/error/fallbacks/withFallback.tsx
+rename to web/src/shared/console/console-shared/error/fallbacks/WithFallback.tsx
+index 1c1a7480d..94a994836 100644
+--- a/web/src/shared/console/console-shared/error/fallbacks/withFallback.tsx
++++ b/web/src/shared/console/console-shared/error/fallbacks/WithFallback.tsx
+@@ -1,6 +1,6 @@
+ import type { ComponentType } from 'react';
+ 
+-import ErrorBoundary from '@/shared/console/console-shared/error/error-boundary';
++import ErrorBoundary from '@/shared/console/console-shared/error/ErrorBoundary';
+ 
+ type WithFallback = <P = object>(
+   Component: ComponentType<P>,
+diff --git a/web/src/shared/console/console-shared/src/components/query-browser/QueryBrowserTooltip.tsx b/web/src/shared/console/console-shared/src/components/query-browser/QueryBrowserTooltip.tsx
+index 83cff5146..2af674aea 100644
+--- a/web/src/shared/console/console-shared/src/components/query-browser/QueryBrowserTooltip.tsx
++++ b/web/src/shared/console/console-shared/src/components/query-browser/QueryBrowserTooltip.tsx
+@@ -5,7 +5,7 @@ import type { FC } from 'react';
+ import { VictoryPortal } from 'victory';
+ 
+ import { formatNumber } from '@/shared/components/format';
+-import withFallback from '@/shared/console/console-shared/error/fallbacks/withFallback';
++import withFallback from '@/shared/console/console-shared/error/fallbacks/WithFallback';
+ import { dateTimeFormatterWithSeconds } from '@/shared/console/utils/datetime';
+ import { humanizeNumberSI } from '@/shared/console/utils/units';
+ 
+diff --git a/web/src/shared/console/console-shared/src/components/status/StatusBox.tsx b/web/src/shared/console/console-shared/src/components/status/StatusBox.tsx
+index 0f39d0c18..f42b6e8b9 100644
+--- a/web/src/shared/console/console-shared/src/components/status/StatusBox.tsx
++++ b/web/src/shared/console/console-shared/src/components/status/StatusBox.tsx
+@@ -8,7 +8,7 @@ import { AccessDenied } from '@/shared/console/console-shared/src/components/emp
+ import { EmptyBox } from '@/shared/console/console-shared/src/components/empty-state/EmptyBox';
+ import { LoadError } from '@/shared/console/console-shared/src/components/loading/LoadError';
+ import { LoadingBox } from '@/shared/console/console-shared/src/components/loading/LoadingBox';
+-import { getLastLanguage } from '@/shared/console/utils/getLastLanguage';
++import { getLastLanguage } from '@/shared/console/utils/get-last-language';
+ 
+ const Data: FC<DataProps> = ({
+   NoDataEmptyMsg,
+diff --git a/web/src/shared/console/graphs/bar.tsx b/web/src/shared/console/graphs/Bar.tsx
+similarity index 97%
+rename from web/src/shared/console/graphs/bar.tsx
+rename to web/src/shared/console/graphs/Bar.tsx
+index 8633e2bbf..ede65a59f 100644
+--- a/web/src/shared/console/graphs/bar.tsx
++++ b/web/src/shared/console/graphs/Bar.tsx
+@@ -10,9 +10,9 @@ import {
+ import type { ComponentType, FC } from 'react';
+ import { Fragment } from 'react';
+ 
+-import { GraphEmpty } from '@/shared/console/graphs/graph-empty';
++import { GraphEmpty } from '@/shared/console/graphs/GraphEmpty';
+ import { DataPoint, getInstantVectorStats } from '@/shared/console/graphs/helpers';
+-import { PrometheusGraph, PrometheusGraphLink } from '@/shared/console/graphs/promethues-graph';
++import { PrometheusGraph, PrometheusGraphLink } from '@/shared/console/graphs/PromethuesGraph';
+ import { useRefWidth } from '@/shared/console/utils/ref-width-hook';
+ import { humanizeNumber } from '@/shared/console/utils/units';
+ 
+diff --git a/web/src/shared/console/graphs/graph-empty.tsx b/web/src/shared/console/graphs/GraphEmpty.tsx
+similarity index 100%
+rename from web/src/shared/console/graphs/graph-empty.tsx
+rename to web/src/shared/console/graphs/GraphEmpty.tsx
+diff --git a/web/src/shared/console/graphs/promethues-graph.tsx b/web/src/shared/console/graphs/PromethuesGraph.tsx
+similarity index 100%
+rename from web/src/shared/console/graphs/promethues-graph.tsx
+rename to web/src/shared/console/graphs/PromethuesGraph.tsx
+diff --git a/web/src/shared/console/public/components/autocomplete.tsx b/web/src/shared/console/public/components/Autocomplete.tsx
+similarity index 99%
+rename from web/src/shared/console/public/components/autocomplete.tsx
+rename to web/src/shared/console/public/components/Autocomplete.tsx
+index 93080a6a4..bbf20eeab 100644
+--- a/web/src/shared/console/public/components/autocomplete.tsx
++++ b/web/src/shared/console/public/components/Autocomplete.tsx
+@@ -12,7 +12,7 @@ import {
+   KeyEventModes,
+   useDocumentListener,
+ } from '@/shared/console/console-shared/hooks/useDocumentListener';
+-import { TextFilter } from '@/shared/console/public/components/factory/text-filter';
++import { TextFilter } from '@/shared/console/public/components/factory/TextFilter';
+ import { fuzzyCaseInsensitive } from '@/shared/utils/utils';
+ 
+ const mapLabelsToStrings = (labels: { [key: string]: string }): string[] => {
+diff --git a/web/src/shared/console/public/components/factory/text-filter.tsx b/web/src/shared/console/public/components/factory/TextFilter.tsx
+similarity index 100%
+rename from web/src/shared/console/public/components/factory/text-filter.tsx
+rename to web/src/shared/console/public/components/factory/TextFilter.tsx
+diff --git a/web/src/shared/console/utils/async.tsx b/web/src/shared/console/utils/Async.tsx
+similarity index 100%
+rename from web/src/shared/console/utils/async.tsx
+rename to web/src/shared/console/utils/Async.tsx
+diff --git a/web/src/shared/console/utils/link.tsx b/web/src/shared/console/utils/Link.tsx
+similarity index 100%
+rename from web/src/shared/console/utils/link.tsx
+rename to web/src/shared/console/utils/Link.tsx
+diff --git a/web/src/shared/console/utils/single-typeahead-dropdown.tsx b/web/src/shared/console/utils/SingleTypeaheadDropdown.tsx
+similarity index 100%
+rename from web/src/shared/console/utils/single-typeahead-dropdown.tsx
+rename to web/src/shared/console/utils/SingleTypeaheadDropdown.tsx
+diff --git a/web/src/shared/console/utils/datetime.ts b/web/src/shared/console/utils/datetime.ts
+index 809b05eed..bcbc242d6 100644
+--- a/web/src/shared/console/utils/datetime.ts
++++ b/web/src/shared/console/utils/datetime.ts
+@@ -1,4 +1,4 @@
+-import { getLastLanguage } from '@/shared/console/utils/getLastLanguage';
++import { getLastLanguage } from '@/shared/console/utils/get-last-language';
+ 
+ const lang = getLastLanguage() || undefined;
+ 
+diff --git a/web/src/shared/console/utils/getLastLanguage.ts b/web/src/shared/console/utils/get-last-language.ts
+similarity index 100%
+rename from web/src/shared/console/utils/getLastLanguage.ts
+rename to web/src/shared/console/utils/get-last-language.ts
+diff --git a/web/src/shared/hooks/usePerspective.tsx b/web/src/shared/hooks/usePerspective.tsx
+index 86bbeb477..00080e674 100644
+--- a/web/src/shared/hooks/usePerspective.tsx
++++ b/web/src/shared/hooks/usePerspective.tsx
+@@ -1,11 +1,11 @@
+ import { PrometheusAlert, Rule, useActivePerspective } from '@openshift-console/dynamic-plugin-sdk';
+ import * as _ from 'lodash-es';
+ 
+-import { GraphUnits } from '@/features/metrics/utils/units';
+ import { QueryParams } from '@/shared/constants/query-params';
+ import { Perspective } from '@/shared/store/actions';
+ import { MonitoringState } from '@/shared/store/store';
+ import { AlertSource } from '@/shared/types/types';
++import { GraphUnits } from '@/shared/utils/units';
+ import {
+   ALERTMANAGER_BASE_PATH,
+   ALERTMANAGER_PROXY_PATH,
+diff --git a/web/src/shared/store/fetch-alerts.tsx b/web/src/shared/store/fetch-alerts.ts
+similarity index 100%
+rename from web/src/shared/store/fetch-alerts.tsx
+rename to web/src/shared/store/fetch-alerts.ts
+diff --git a/web/src/shared/store/store.ts b/web/src/shared/store/store.ts
+index c8474c719..4557c29a7 100644
+--- a/web/src/shared/store/store.ts
++++ b/web/src/shared/store/store.ts
+@@ -7,7 +7,7 @@ import {
+   IncidentSeverityFilters,
+   IncidentStateFilters,
+ } from '@/features/incidents/types/model';
+-import { Variable } from '@/features/legacy-dashboards/components/legacy-variable-dropdowns';
++import { Variable } from '@/features/legacy-dashboards/components/LegacyVariableDropdowns';
+ import { MONITORING_DASHBOARDS_DEFAULT_TIMESPAN } from '@/features/legacy-dashboards/utils/utils';
+ import { Silences } from '@/shared/types/types';
+ 
+diff --git a/web/src/shared/utils/utils.ts b/web/src/shared/utils/utils.ts
+index 0b54e3057..73ed612b4 100644
+--- a/web/src/shared/utils/utils.ts
++++ b/web/src/shared/utils/utils.ts
+@@ -15,7 +15,7 @@ import fuzzy from 'fuzzysearch';
+ import * as _ from 'lodash-es';
+ import { murmur3 } from 'murmurhash-js';
+ 
+-import { AggregatedAlert } from '@/features/alerts/pages/alerts-page/AlertsAggregates';
++import { AggregatedAlert } from '@/features/alerts/pages/alerts-page/alerts-aggregates';
+ import { QueryParams } from '@/shared/constants/query-params';
+ import { AlertSource, MonitoringResource, Target, TimeRange } from '@/shared/types/types';
+ 

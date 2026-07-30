@@ -1,0 +1,162 @@
+diff --git a/.github/workflows/deps.yml b/.github/workflows/deps.yml
+index 93bbf4d24d..28def62055 100644
+--- a/.github/workflows/deps.yml
++++ b/.github/workflows/deps.yml
+@@ -40,11 +40,11 @@ jobs:
+         with:
+           show-progress: false
+       - id: govulncheck
+-        uses: golang/govulncheck-action@31f7c5463448f83528bd771c2d978d940080c9fd # master (post-v1.0.4 with pinned deps)
++        uses: golang/govulncheck-action@3fa7bd9cee2cfdf3499a8803b226e43de7b7cdb4 # master (post-v1.0.4 with pinned deps)
+         with:
+           go-version-file: go.mod
+       - id: govulncheck-tests-e2e
+-        uses: golang/govulncheck-action@31f7c5463448f83528bd771c2d978d940080c9fd # master (post-v1.0.4 with pinned deps)
++        uses: golang/govulncheck-action@3fa7bd9cee2cfdf3499a8803b226e43de7b7cdb4 # master (post-v1.0.4 with pinned deps)
+         with:
+           go-version-file: tests/e2e/go.mod
+   gomod-match-check:
+diff --git a/charts/aws-cloud-controller-manager/templates/serviceaccount.yaml b/charts/aws-cloud-controller-manager/templates/serviceaccount.yaml
+index 5590779f83..f4d06a48b8 100644
+--- a/charts/aws-cloud-controller-manager/templates/serviceaccount.yaml
++++ b/charts/aws-cloud-controller-manager/templates/serviceaccount.yaml
+@@ -6,4 +6,8 @@ metadata:
+   namespace: {{.Values.namespace}}
+   labels:
+     helm.sh/chart: "{{ .Chart.Name }}-{{ .Chart.Version }}"
++  {{- with .Values.serviceAccount.annotations }}
++  annotations:
++    {{- toYaml . | nindent 4 }}
++  {{- end }}
+ ---
+diff --git a/charts/aws-cloud-controller-manager/values.yaml b/charts/aws-cloud-controller-manager/values.yaml
+index 835948fa22..a0278a6df8 100644
+--- a/charts/aws-cloud-controller-manager/values.yaml
++++ b/charts/aws-cloud-controller-manager/values.yaml
+@@ -149,6 +149,9 @@ roleBindingName: cloud-controller-manager:apiserver-authentication-reader
+ 
+ serviceAccountName: cloud-controller-manager
+ 
++serviceAccount:
++  annotations: {}
++
+ roleName: extension-apiserver-authentication-reader
+ 
+ extraVolumes: []
+diff --git a/pkg/providers/v1/describe_instance_batch.go b/pkg/providers/v1/describe_instance_batch.go
+index 9059c0fcc6..62bbe6723c 100644
+--- a/pkg/providers/v1/describe_instance_batch.go
++++ b/pkg/providers/v1/describe_instance_batch.go
+@@ -18,6 +18,7 @@ package aws
+ 
+ import (
+ 	"context"
++	"errors"
+ 	"fmt"
+ 	"sync"
+ 	"time"
+@@ -51,16 +52,50 @@ func newdescribeInstanceBatcher(ctx context.Context, ec2api iface.EC2) *describe
+ 	return &describeInstanceBatcher{batcher: batcher.NewBatcher(ctx, options)}
+ }
+ 
+-// DescribeInstances adds describe instances input to batcher
++// DescribeInstances adds describe instances input to batcher. Inputs with
++// multiple instance IDs are split into one batcher submission per ID so the
++// batcher can coalesce them with other in-flight requests; a single
++// aggregated slice (and joined error, if any) is returned to the caller.
+ func (b *describeInstanceBatcher) DescribeInstances(ctx context.Context, input *ec2.DescribeInstancesInput) ([]*ec2types.Instance, error) {
+-	if len(input.InstanceIds) != 1 {
+-		return nil, fmt.Errorf("expected to receive a single instance only, found %d", len(input.InstanceIds))
++	if len(input.InstanceIds) == 0 {
++		return nil, fmt.Errorf("expected at least one instance ID, found 0")
+ 	}
+-	result := b.batcher.Add(ctx, input)
+-	if result.Output == nil {
+-		return nil, result.Err
++	if len(input.InstanceIds) == 1 {
++		result := b.batcher.Add(ctx, input)
++		if result.Output == nil {
++			return nil, result.Err
++		}
++		return []*ec2types.Instance{result.Output}, result.Err
++	}
++
++	var (
++		mu        sync.Mutex
++		wg        sync.WaitGroup
++		instances []*ec2types.Instance
++		errs      []error
++	)
++	for _, id := range input.InstanceIds {
++		wg.Add(1)
++		go func(id string) {
++			defer wg.Done()
++			subInput := *input
++			subInput.InstanceIds = []string{id}
++			result := b.batcher.Add(ctx, &subInput)
++			mu.Lock()
++			defer mu.Unlock()
++			if result.Err != nil {
++				errs = append(errs, result.Err)
++			}
++			if result.Output != nil {
++				instances = append(instances, result.Output)
++			}
++		}(id)
++	}
++	wg.Wait()
++	if len(errs) > 0 {
++		return instances, errors.Join(errs...)
+ 	}
+-	return []*ec2types.Instance{result.Output}, result.Err
++	return instances, nil
+ }
+ 
+ // DescribeInstanceHasher generates hash for different describe instances inputs
+diff --git a/pkg/providers/v1/instances_v2_test.go b/pkg/providers/v1/instances_v2_test.go
+index eaf500b4da..4b4f1f49cb 100644
+--- a/pkg/providers/v1/instances_v2_test.go
++++ b/pkg/providers/v1/instances_v2_test.go
+@@ -506,6 +506,42 @@ func TestDescribeInstanceBatchingWithBatchedRequestFail(t *testing.T) {
+ 	mockedEC2API.AssertNumberOfCalls(t, "DescribeInstances", 3)
+ }
+ 
++// TestDescribeInstanceBatchingWithMultipleInstanceIDs verifies that an input
++// containing multiple instance IDs is fanned out through the batcher and
++// returns aggregated results. Regression test for #1351.
++func TestDescribeInstanceBatchingWithMultipleInstanceIDs(t *testing.T) {
++	mockedEC2API := newMockedEC2API()
++	batcher := newdescribeInstanceBatcher(context.Background(), &awsSdkEC2{ec2: mockedEC2API})
++
++	mockedEC2API.On("DescribeInstances", mock.Anything).Return(&ec2.DescribeInstancesOutput{
++		Reservations: []ec2types.Reservation{
++			{
++				Instances: []ec2types.Instance{
++					{InstanceId: aws.String("Test-1")},
++					{InstanceId: aws.String("Test-2")},
++					{InstanceId: aws.String("Test-3")},
++				},
++			},
++		},
++	}, nil)
++
++	res, err := batcher.DescribeInstances(context.Background(), &ec2.DescribeInstancesInput{
++		InstanceIds: []string{"Test-1", "Test-2", "Test-3"},
++	})
++	assert.NoError(t, err)
++	assert.Len(t, res, 3)
++
++	gotIDs := map[string]bool{}
++	for _, instance := range res {
++		gotIDs[aws.ToString(instance.InstanceId)] = true
++	}
++	assert.True(t, gotIDs["Test-1"])
++	assert.True(t, gotIDs["Test-2"])
++	assert.True(t, gotIDs["Test-3"])
++
++	mockedEC2API.AssertNumberOfCalls(t, "DescribeInstances", 1)
++}
++
+ func getCloudWithMockedDescribeInstances(instanceExists bool, instanceState ec2types.InstanceStateName, instanceID string) *Cloud {
+ 	mockedEC2API := newMockedEC2API()
+ 	c := &Cloud{ec2: &awsSdkEC2{ec2: mockedEC2API}, describeInstanceBatcher: newdescribeInstanceBatcher(context.Background(), &awsSdkEC2{ec2: mockedEC2API})}

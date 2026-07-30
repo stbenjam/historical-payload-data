@@ -1,0 +1,260 @@
+diff --git a/install/0000_00_cluster-version-operator_45_openshift-lightspeed_namespace.yaml b/install/0000_00_cluster-version-operator_45_openshift-lightspeed_namespace.yaml
+deleted file mode 100644
+index fc0f30e6b..000000000
+--- a/install/0000_00_cluster-version-operator_45_openshift-lightspeed_namespace.yaml
++++ /dev/null
+@@ -1,9 +0,0 @@
+-apiVersion: v1
+-kind: Namespace
+-metadata:
+-  name: openshift-lightspeed
+-  annotations:
+-    kubernetes.io/description: This manifest is only for testing purpose and will be removed before 5.0 GA or figure out how to install the cluster-update-advisory-prompt ConfigMap on a cluster where the openshift-lightspeed Namespace is installed by the OLM-installed OpenShift Lightspeed operator.
+-    include.release.openshift.io/self-managed-high-availability: "true"
+-    workload.openshift.io/allowed: "management"
+-    release.openshift.io/feature-set: TechPreviewNoUpgrade
+diff --git a/install/0000_00_cluster-version-operator_50_lightspeed-prompts.yaml b/install/0000_00_cluster-version-operator_50_lightspeed-prompts.yaml
+deleted file mode 100644
+index 594271190..000000000
+--- a/install/0000_00_cluster-version-operator_50_lightspeed-prompts.yaml
++++ /dev/null
+@@ -1,30 +0,0 @@
+----
+-apiVersion: v1
+-kind: ConfigMap
+-metadata:
+-  name: cluster-update-advisory-prompt
+-  namespace: openshift-lightspeed
+-  annotations:
+-    include.release.openshift.io/self-managed-high-availability: "true"
+-    release.openshift.io/feature-set: TechPreviewNoUpgrade
+-data:
+-  prompt: |
+-    You are an OpenShift upgrade advisor. Analyze the cluster readiness
+-    data in the agentic run request and produce an upgrade risk assessment.
+-
+-    The request contains a "Cluster Readiness Data" section with a JSON
+-    block. This was collected by the Cluster Version Operator — do not
+-    re-collect it. Parse the JSON, evaluate each check's results, and
+-    classify findings as blockers, warnings, or informational.
+-
+-    Use the update-advisor skill for the decision framework and
+-    blocker classification rules. When findings need deeper investigation,
+-    use prometheus metrics and product-lifecycle skills.
+-
+-    When the readiness data includes olm_operator_lifecycle results, use
+-    the product-lifecycle skill to cross-reference each operator's package
+-    name against the Red Hat Product Life Cycle API. Report support phase,
+-    EOL dates, and OCP compatibility from Product Lifecycle alongside the
+-    OLM data.
+-
+-    Do not guess or assume cluster state. Do not execute upgrade commands.
+diff --git a/pkg/agenticrun/controller.go b/pkg/agenticrun/controller.go
+index 43ad38cd6..789cf8e80 100644
+--- a/pkg/agenticrun/controller.go
++++ b/pkg/agenticrun/controller.go
+@@ -13,7 +13,6 @@ import (
+ 	"github.com/blang/semver/v4"
+ 	ctrlruntimeclient "sigs.k8s.io/controller-runtime/pkg/client"
+ 
+-	corev1 "k8s.io/api/core/v1"
+ 	apiextensionsv1 "k8s.io/apiextensions-apiserver/pkg/apis/apiextensions/v1"
+ 	kerrors "k8s.io/apimachinery/pkg/api/errors"
+ 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+@@ -33,6 +32,17 @@ import (
+ //go:embed analysis_schema.json
+ var analysisSchemaJSON []byte
+ 
++var prompt string = `You are an OpenShift upgrade advisor. Analyze the cluster readiness data in the agentic run request and produce an upgrade risk assessment.
++
++The request contains a "Cluster Readiness Data" section with a JSON block. This was collected by the Cluster Version Operator — do not re-collect it. Parse the JSON, evaluate each check's results, and classify findings as blockers, warnings, or informational.
++
++Use the update-advisor skill for the decision framework and blocker classification rules. When findings need deeper investigation, use prometheus metrics and product-lifecycle skills.
++
++When the readiness data includes olm_operator_lifecycle results, use the product-lifecycle skill to cross-reference each operator's package name against the Red Hat Product Life Cycle API. Report support phase, EOL dates, and OCP compatibility from Product Lifecycle alongside the OLM data.
++
++Do not guess or assume cluster state. Do not execute upgrade commands.
++`
++
+ func analysisOutputSchema() *apiextensionsv1.JSONSchemaProps {
+ 	schema := &apiextensionsv1.JSONSchemaProps{}
+ 	if err := json.Unmarshal(analysisSchemaJSON, schema); err != nil {
+@@ -48,7 +58,6 @@ type Controller struct {
+ 	client                ctrlruntimeclient.Client
+ 	dynamicClient         dynamic.Interface
+ 	cvGetterFunc          cvGetterFunc
+-	configMapGetterFunc   configMapGetterFunc
+ 	getCurrentVersionFunc getCurrentVersionFunc
+ 	config                Config
+ 	consolePluginImage    string
+@@ -67,8 +76,6 @@ type cvGetterFunc func(name string) (*configv1.ClusterVersion, error)
+ 
+ type getCurrentVersionFunc func() string
+ 
+-type configMapGetterFunc func(ctx context.Context, namespace, name string, opts metav1.GetOptions) (*corev1.ConfigMap, error)
+-
+ // NewController returns Controller to manage AgenticRuns.
+ // It monitors available and conditional updates, and creates an AgenticRun for every target version of them.
+ // It expires (and replaces) any previous AgenticRuns owned by the CVO after 24h.
+@@ -81,7 +88,6 @@ func NewController(
+ 	client ctrlruntimeclient.Client,
+ 	dynamicClient dynamic.Interface,
+ 	cvGetterFunc cvGetterFunc,
+-	configMapGetterFunc configMapGetterFunc,
+ 	getCurrentVersionFunc getCurrentVersionFunc,
+ ) *Controller {
+ 	return &Controller{
+@@ -93,7 +99,6 @@ func NewController(
+ 		client:                client,
+ 		dynamicClient:         dynamicClient,
+ 		cvGetterFunc:          cvGetterFunc,
+-		configMapGetterFunc:   configMapGetterFunc,
+ 		getCurrentVersionFunc: getCurrentVersionFunc,
+ 		config:                DefaultConfig(),
+ 	}
+@@ -101,17 +106,15 @@ func NewController(
+ 
+ // Config holds configuration for agentic run creation.
+ type Config struct {
+-	Namespace       string
+-	PromptConfigMap string // ConfigMap name containing the system prompt
+-	SkillsImage     string // OCI image containing agentic skills
++	Namespace   string
++	SkillsImage string // OCI image containing agentic skills
+ }
+ 
+ // DefaultConfig returns the default configuration, checking env vars for overrides.
+ func DefaultConfig() Config {
+ 	return Config{
+-		Namespace:       envOrDefault("LIGHTSPEED_AGENTIC_RUN_NAMESPACE", "openshift-lightspeed"),
+-		PromptConfigMap: envOrDefault("LIGHTSPEED_PROMPT_CONFIGMAP", "cluster-update-advisory-prompt"),
+-		SkillsImage:     envOrDefault("LIGHTSPEED_SKILLS_IMAGE", "quay.io/openshift/ci:ocp_5.0_agentic-skills"),
++		Namespace:   envOrDefault("LIGHTSPEED_AGENTIC_RUN_NAMESPACE", "openshift-lightspeed"),
++		SkillsImage: envOrDefault("LIGHTSPEED_SKILLS_IMAGE", "quay.io/openshift/ci:ocp_5.0_agentic-skills"),
+ 	}
+ }
+ 
+@@ -244,22 +247,6 @@ func (c *Controller) Sync(ctx context.Context, key string) error {
+ 		return kutilerrors.NewAggregate(errs)
+ 	}
+ 
+-	var prompt string
+-	promptConfigMap, err := c.configMapGetterFunc(ctx, c.config.Namespace, c.config.PromptConfigMap, metav1.GetOptions{})
+-	if err != nil {
+-		klog.V(i.Normal).Infof("Failed to get prompt ConfigMap %s/%s: %v", c.config.Namespace, c.config.PromptConfigMap, err)
+-		errs = append(errs, fmt.Errorf("failed to get prompt ConfigMap %s/%s: %w", c.config.Namespace, c.config.PromptConfigMap, err))
+-		return kutilerrors.NewAggregate(errs)
+-	}
+-	promptKey := "prompt"
+-	if v, ok := promptConfigMap.Data[promptKey]; ok {
+-		prompt = v
+-	} else {
+-		klog.V(i.Normal).Infof("ConfigMap %s/%s has no key %s in data", c.config.Namespace, c.config.PromptConfigMap, promptKey)
+-		errs = append(errs, fmt.Errorf("failed to get key/%s from ConfigMap %s/%s", promptKey, c.config.Namespace, c.config.PromptConfigMap))
+-		return kutilerrors.NewAggregate(errs)
+-	}
+-
+ 	agenticRuns, err := getAgenticRuns(ctx, c.dynamicClient, updates, conditionalUpdates, c.config.Namespace, currentVersion, cv.Spec.Channel, prompt, c.config.SkillsImage)
+ 	if err != nil {
+ 		klog.V(i.Normal).Infof("Getting agentic runs hit an error: %v", err)
+diff --git a/pkg/agenticrun/controller_test.go b/pkg/agenticrun/controller_test.go
+index 2569bb117..e410bcbb6 100644
+--- a/pkg/agenticrun/controller_test.go
++++ b/pkg/agenticrun/controller_test.go
+@@ -13,7 +13,6 @@ import (
+ 	ctrlruntimeclient "sigs.k8s.io/controller-runtime/pkg/client"
+ 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
+ 
+-	corev1 "k8s.io/api/core/v1"
+ 	kerrors "k8s.io/apimachinery/pkg/api/errors"
+ 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+ 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
+@@ -83,7 +82,7 @@ func TestController_Sync(t *testing.T) {
+ 								},
+ 							},
+ 							Spec: agenticrunv1alpha1.AgenticRunSpec{
+-								Request: `prompt-abc
++								Request: fmt.Sprintf(`%s
+ 
+ ---
+ 
+@@ -95,8 +94,8 @@ Update path: Recommended
+ 
+ ## Cluster Readiness Data
+ 
+-` + "```json\n" +
+-									`{}` + "\n```\n",
++%s
++`, prompt, "```json\n{}\n```"),
+ 								Analysis: agenticrunv1alpha1.AgenticRunStep{
+ 									Agent: "smart",
+ 								},
+@@ -127,17 +126,7 @@ Update path: Recommended
+ 	}
+ 	for _, tt := range tests {
+ 		t.Run(tt.name, func(t *testing.T) {
+-			c := NewController(tt.updatesGetterFunc, tt.client, nil, tt.cvGetterFunc, func(_ context.Context, namespace, name string, _ metav1.GetOptions) (*corev1.ConfigMap, error) {
+-				if namespace == "openshift-lightspeed" && name == "cluster-update-advisory-prompt" {
+-					return &corev1.ConfigMap{
+-						Data: map[string]string{
+-							"prompt": "prompt-abc",
+-							"foo":    "bar",
+-						},
+-					}, nil
+-				}
+-				return nil, fmt.Errorf("ConfigMap %s not found in namespace %s", name, namespace)
+-			}, func() string {
++			c := NewController(tt.updatesGetterFunc, tt.client, nil, tt.cvGetterFunc, func() string {
+ 				return "4.22.1"
+ 			})
+ 			c.crdAvailableCache = true
+diff --git a/pkg/cvo/availableupdates_test.go b/pkg/cvo/availableupdates_test.go
+index 559c0b636..1f20de720 100644
+--- a/pkg/cvo/availableupdates_test.go
++++ b/pkg/cvo/availableupdates_test.go
+@@ -212,9 +212,6 @@ func newOperator(url string, cluster release, promqlMock clusterconditions.Condi
+ 		fake.NewClientBuilder().Build(), nil, func(_ string) (*configv1.ClusterVersion, error) {
+ 			return &configv1.ClusterVersion{}, nil
+ 		},
+-		func(_ context.Context, namespace, name string, _ metav1.GetOptions) (*corev1.ConfigMap, error) {
+-			return &corev1.ConfigMap{}, nil
+-		},
+ 		func() string {
+ 			return operator.release.Version
+ 		},
+@@ -1255,7 +1252,7 @@ func TestOperator_syncAvailableUpdates_noticeResolvedAlertsQuickly(t *testing.T)
+ 		t.Fatalf("accept risk feature is not enabled")
+ 	}
+ 	optr.enabledCVOFeatureGates = cvgGates
+-	optr.agenticRunController = agenticrun.NewController(nil, nil, nil, nil, nil, nil)
++	optr.agenticRunController = agenticrun.NewController(nil, nil, nil, nil, nil)
+ 	err := optr.syncAvailableUpdates(context.Background(), &configv1.ClusterVersion{
+ 		Spec: configv1.ClusterVersionSpec{
+ 			DesiredUpdate: &configv1.Update{
+diff --git a/pkg/cvo/cvo.go b/pkg/cvo/cvo.go
+index 6cc41fdc0..a3f7fcbd3 100644
+--- a/pkg/cvo/cvo.go
++++ b/pkg/cvo/cvo.go
+@@ -366,9 +366,6 @@ func New(
+ 		rtClient,
+ 		dynamicClient,
+ 		cvInformer.Lister().Get,
+-		func(ctx context.Context, namespace, name string, opts metav1.GetOptions) (*corev1.ConfigMap, error) {
+-			return kubeClient.CoreV1().ConfigMaps(namespace).Get(ctx, name, opts)
+-		},
+ 		func() string {
+ 			return optr.release.Version
+ 		},
+diff --git a/pkg/cvo/cvo_test.go b/pkg/cvo/cvo_test.go
+index f42b90ee1..b2a1b1104 100644
+--- a/pkg/cvo/cvo_test.go
++++ b/pkg/cvo/cvo_test.go
+@@ -2758,8 +2758,6 @@ func TestOperator_availableUpdatesSync(t *testing.T) {
+ 				return nil, nil, nil
+ 			}, ctrlruntimefake.NewClientBuilder().Build(), nil, func(_ string) (*configv1.ClusterVersion, error) {
+ 				return &configv1.ClusterVersion{}, nil
+-			}, func(_ context.Context, namespace, name string, _ metav1.GetOptions) (*corev1.ConfigMap, error) {
+-				return &corev1.ConfigMap{}, nil
+ 			}, func() string {
+ 				return optr.release.Version
+ 			})

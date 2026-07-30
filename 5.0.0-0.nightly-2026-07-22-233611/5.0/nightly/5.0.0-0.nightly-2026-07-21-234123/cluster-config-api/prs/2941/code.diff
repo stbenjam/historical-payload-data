@@ -1,0 +1,100 @@
+diff --git a/envtest-releases.yaml b/envtest-releases.yaml
+index ea376ded55e..4705c327e0b 100644
+--- a/envtest-releases.yaml
++++ b/envtest-releases.yaml
+@@ -116,3 +116,16 @@ releases:
+         envtest-v1.35.1-linux-arm64.tar.gz:
+             hash: 309308f9c66f9e2e5192c65a333a388faaaa903841f26f8a96b8f13a5eb3039bcbb818ef6ddbb5803a9cfa9b25e37249a0aed5d472badb25539696569923f87f
+             selfLink: https://storage.googleapis.com/openshift-kubebuilder-tools/envtest-v1.35.1-linux-arm64.tar.gz
++    v1.36.2:
++        envtest-v1.36.2-darwin-amd64.tar.gz:
++            hash: ca924b4435784f12ac3c2513a78d9c6527bb83f2cece48e07d017616843cb67d2ec5836b7a83818f8817c3e0b4de1319c55ead061f3e41c05553a40bf240017a
++            selfLink: https://storage.googleapis.com/openshift-kubebuilder-tools/envtest-v1.36.2-darwin-amd64.tar.gz
++        envtest-v1.36.2-darwin-arm64.tar.gz:
++            hash: f5e45f660fb2abb05a55093bfd3f9594ca91b074a86126112b4645d463bc4b0e0b10261da26420c4dfbef18d189ab92da6c881c347159541481185e157d37d92
++            selfLink: https://storage.googleapis.com/openshift-kubebuilder-tools/envtest-v1.36.2-darwin-arm64.tar.gz
++        envtest-v1.36.2-linux-amd64.tar.gz:
++            hash: 4322b73b1d43c7a16fb46819d2e8a95e34ab2412bcc502c75231c61bdd799a2b43916e12c11f5f0251573260e60a641e34f67e81da37d2726abfcca1720b1e73
++            selfLink: https://storage.googleapis.com/openshift-kubebuilder-tools/envtest-v1.36.2-linux-amd64.tar.gz
++        envtest-v1.36.2-linux-arm64.tar.gz:
++            hash: bbe6810d76c91349cdee6daf65a6a9289010d48ddc2c42d9e163897a927b6ff7de9d0addc75bd54721cfa5048f8aafcac06a950efa59f4a686f037d1386811de
++            selfLink: https://storage.googleapis.com/openshift-kubebuilder-tools/envtest-v1.36.2-linux-arm64.tar.gz
+diff --git a/tools/Makefile b/tools/Makefile
+index fe77b81f74e..d3e00f2a277 100644
+--- a/tools/Makefile
++++ b/tools/Makefile
+@@ -37,7 +37,7 @@ publish-kubebuilder-tools:
+ 	@# Pull secret should be the standard pull secret used for spinning up OpenShift clusters, if you do not have one, follow https://docs.google.com/document/d/1ez2jrjiIQJChobfSu2ISJ5uM_-3HGouamL_xIa2_1W4/edit#heading=h.me93l6citmsq
+ 	@# This also expects you to be already authenticated with the OpenShift GCE devel project on Google Cloud, if you are not,
+ 	@# follow the 'Create the Service Account and grant permissions' and 'Generate an access key' @# steps at https://docs.google.com/document/d/1qm37EKkjgoPtjW4909UClzvsjQO5VSpPUvFO_hW_PEg
+-	go run ./publish-kubebuilder-tools/main.go -version v1.35.1 -output-dir /tmp/kubebuilder-tools -payload=registry.ci.openshift.org/ocp/release:4.22.0-0.ci-2026-03-06-115610 -pull-secret $(PULL_SECRET) -index-file ../envtest-releases.yaml
++	go run ./publish-kubebuilder-tools/main.go -version v1.36.2 -output-dir /tmp/kubebuilder-tools -payload=registry.ci.openshift.org/ocp/release-5:5.0.0-0.ci-2026-07-20-122541 -pull-secret $(PULL_SECRET) -index-file ../envtest-releases.yaml
+ 
+ #############################################
+ #
+diff --git a/tools/publish-kubebuilder-tools/main.go b/tools/publish-kubebuilder-tools/main.go
+index 182ee8c455b..4b7ccb65ef1 100644
+--- a/tools/publish-kubebuilder-tools/main.go
++++ b/tools/publish-kubebuilder-tools/main.go
+@@ -16,6 +16,7 @@ import (
+ 	"net/http"
+ 	"os"
+ 	"path/filepath"
++	"regexp"
+ 	"strings"
+ 
+ 	"cloud.google.com/go/storage"
+@@ -26,7 +27,7 @@ func main() {
+ 	pullSecretFile := flag.String("pull-secret", "", "The pull secret to use for the kubebuilder tools")
+ 	version := flag.String("version", "", "The version of the kubebuilder tools to publish. This should be a Kubernetes version that the build is based upon.")
+ 	outputDir := flag.String("output-dir", "", "The output directory to write the kubebuilder tools to")
+-	payload := flag.String("payload", "", "The payload to use for building the kubebuilder tools archives. This should be in the format registry.ci.openshift.org/ocp/release:<version>")
++	payload := flag.String("payload", "", "The payload to use for building the kubebuilder tools archives. This should be in the format registry.ci.openshift.org/ocp/release:<version> or registry.ci.openshift.org/ocp/release-<number>:<version>")
+ 	skipUpload := flag.Bool("skip-upload", false, "Skip uploading the artifacts created to the openshift-gce-devel/openshift-kubebuilder-tools bucket")
+ 	indexFile := flag.String("index-file", "envtest-releases.yaml", "The index file to use for the kubebuilder tools")
+ 
+@@ -55,15 +56,19 @@ func main() {
+ 		panic(err)
+ 	}
+ 
+-	// We only expect images from the internal releases
+-	if *payload == "" || !strings.HasPrefix(*payload, "registry.ci.openshift.org/ocp/release:") {
+-		panic("payload is required and must be a valid payload starting with \"registry.ci.openshift.org/ocp/release:\"")
++	// We only expect images from the internal releases.
++	// Accept both "registry.ci.openshift.org/ocp/release:" and
++	// "registry.ci.openshift.org/ocp/release-<number>:" formats.
++	matches := regexp.MustCompile(`^registry\.ci\.openshift\.org/ocp/release(-\d+)?:(.+)$`).FindStringSubmatch(*payload)
++	if *payload == "" || matches == nil {
++		panic("payload is required and must be a valid payload starting with \"registry.ci.openshift.org/ocp/release:\" or \"registry.ci.openshift.org/ocp/release-<number>:\"")
+ 	}
+ 
+-	payloadVersion := strings.TrimPrefix(*payload, "registry.ci.openshift.org/ocp/release:")
++	releaseImage := "release" + matches[1]
++	payloadVersion := matches[2]
+ 
+ 	// Download the image-references and convert to a map of image name to digest
+-	manifests, err := getReleaseImages(payloadVersion, registryAuthToken)
++	manifests, err := getReleaseImages(releaseImage, payloadVersion, registryAuthToken)
+ 	if err != nil {
+ 		panic(err)
+ 	}
+@@ -134,8 +139,8 @@ func getRegistryAuthToken(pullSecretFile string) (string, error) {
+ 	return strings.Split(string(registryAuthToken), ":")[1], nil
+ }
+ 
+-func getReleaseImages(version string, registryToken string) (map[string]string, error) {
+-	releaseManifestRaw, err := downloadJSON(getRegistryURL("release", "manifests", version), registryToken)
++func getReleaseImages(releaseImage string, version string, registryToken string) (map[string]string, error) {
++	releaseManifestRaw, err := downloadJSON(getRegistryURL(releaseImage, "manifests", version), registryToken)
+ 	if err != nil {
+ 		return nil, err
+ 	}
+@@ -155,7 +160,7 @@ func getReleaseImages(version string, registryToken string) (map[string]string,
+ 	}
+ 
+ 	// The first fsLayer is the release image manifests, which has the image digests for the release images
+-	releaseImageLayer, close, err := downloadArchive(getRegistryURL("release", "blobs", manifest.FSLayers[0].BlobSum), registryToken)
++	releaseImageLayer, close, err := downloadArchive(getRegistryURL(releaseImage, "blobs", manifest.FSLayers[0].BlobSum), registryToken)
+ 	if err != nil {
+ 		return nil, err
+ 	}

@@ -1,0 +1,2259 @@
+diff --git a/Dockerfile.gcp-pd b/Dockerfile.gcp-pd
+index 5ac44e0f1..b75404cca 100644
+--- a/Dockerfile.gcp-pd
++++ b/Dockerfile.gcp-pd
+@@ -1,10 +1,10 @@
+ FROM registry.ci.openshift.org/ocp/builder:rhel-9-golang-1.26-openshift-5.0 AS builder
+-WORKDIR /go/src/github.com/openshift/gcp-pd-csi-driver-operator
+-COPY legacy/gcp-pd-csi-driver-operator .
+-RUN make
++WORKDIR /go/src/github.com/openshift/csi-operator
++COPY . .
++RUN make GO_BUILD_PACKAGES=./cmd/gcp-pd-csi-driver-operator
+ 
+ FROM registry.ci.openshift.org/ocp/5.0:base-rhel9
+-COPY --from=builder /go/src/github.com/openshift/gcp-pd-csi-driver-operator/gcp-pd-csi-driver-operator /usr/bin/
++COPY --from=builder /go/src/github.com/openshift/csi-operator/bin/gcp-pd-csi-driver-operator /usr/bin/
+ ENTRYPOINT ["/usr/bin/gcp-pd-csi-driver-operator"]
+ LABEL io.k8s.display-name="OpenShift GCP PD CSI Driver Operator" \
+ 	io.k8s.description="The GCP PD CSI Driver Operator installs and maintains the GCP PD CSI Driver on a cluster."
+diff --git a/assets/overlays/gcp-pd/custom/old_controller_privileged_binding.yaml b/assets/overlays/gcp-pd/custom/old_controller_privileged_binding.yaml
+new file mode 100644
+index 000000000..5ff68ca71
+--- /dev/null
++++ b/assets/overlays/gcp-pd/custom/old_controller_privileged_binding.yaml
+@@ -0,0 +1,12 @@
++kind: ClusterRoleBinding
++apiVersion: rbac.authorization.k8s.io/v1
++metadata:
++  name: gcp-pd-controller-privileged-binding
++subjects:
++  - kind: ServiceAccount
++    name: gcp-pd-csi-driver-controller-sa
++    namespace: openshift-cluster-csi-drivers
++roleRef:
++  kind: ClusterRole
++  name: gcp-pd-privileged-role
++  apiGroup: rbac.authorization.k8s.io
+diff --git a/assets/overlays/gcp-pd/generated/standalone/cabundle_cm.yaml b/assets/overlays/gcp-pd/generated/standalone/cabundle_cm.yaml
+new file mode 100644
+index 000000000..bd392d2b3
+--- /dev/null
++++ b/assets/overlays/gcp-pd/generated/standalone/cabundle_cm.yaml
+@@ -0,0 +1,7 @@
++apiVersion: v1
++kind: ConfigMap
++metadata:
++  labels:
++    config.openshift.io/inject-trusted-cabundle: "true"
++  name: gcp-pd-csi-driver-trusted-ca-bundle
++  namespace: openshift-cluster-csi-drivers
+diff --git a/assets/overlays/gcp-pd/generated/standalone/controller.yaml b/assets/overlays/gcp-pd/generated/standalone/controller.yaml
+new file mode 100644
+index 000000000..90c5bc096
+--- /dev/null
++++ b/assets/overlays/gcp-pd/generated/standalone/controller.yaml
+@@ -0,0 +1,331 @@
++kind: Deployment
++apiVersion: apps/v1
++metadata:
++  name: gcp-pd-csi-driver-controller
++  namespace: openshift-cluster-csi-drivers
++  annotations:
++    config.openshift.io/inject-proxy: csi-driver
++    config.openshift.io/inject-proxy-cabundle: csi-driver
++spec:
++  strategy:
++    type: RollingUpdate
++    rollingUpdate:
++      maxUnavailable: 1
++      maxSurge: 0
++  selector:
++    matchLabels:
++      app: gcp-pd-csi-driver-controller
++  template:
++    metadata:
++      labels:
++        app: gcp-pd-csi-driver-controller
++      annotations:
++        openshift.io/required-scc: hostnetwork-v2
++        target.workload.openshift.io/management: '{"effect": "PreferredDuringScheduling"}'
++    spec:
++      hostNetwork: true
++      serviceAccountName: gcp-pd-csi-driver-controller-sa
++      priorityClassName: system-cluster-critical
++      nodeSelector:
++        node-role.kubernetes.io/master: ""
++      tolerations:
++        - key: CriticalAddonsOnly
++          operator: Exists
++        - key: node-role.kubernetes.io/master
++          operator: Exists
++          effect: "NoSchedule"
++      affinity:
++        podAntiAffinity:
++          preferredDuringSchedulingIgnoredDuringExecution:
++            - weight: 100
++              podAffinityTerm:
++                labelSelector:
++                  matchLabels:
++                    app: gcp-pd-csi-driver-controller
++                topologyKey: kubernetes.io/hostname
++      containers:
++        - name: csi-driver
++          securityContext:
++            readOnlyRootFilesystem: true
++          image: ${DRIVER_IMAGE}
++          imagePullPolicy: IfNotPresent
++          args:
++            - --endpoint=$(CSI_ENDPOINT)
++            - --logtostderr
++            - --v=${LOG_LEVEL}
++            - --enable-storage-pools=true
++            - --allow-hdha-provisioning=true
++            - --supports-dynamic-throughput-provisioning=hyperdisk-balanced,hyperdisk-throughput,hyperdisk-ml
++            - --supports-dynamic-iops-provisioning=hyperdisk-balanced,hyperdisk-extreme
++          env:
++            - name: GOOGLE_APPLICATION_CREDENTIALS
++              value: "/etc/cloud-sa/service_account.json"
++            - name: CSI_ENDPOINT
++              value: unix:///var/lib/csi/sockets/pluginproxy/csi.sock
++          ports:
++            - name: healthz
++              # Due to hostNetwork, this port is open on a node!
++              containerPort: 10301
++              protocol: TCP
++          livenessProbe:
++            httpGet:
++              path: /healthz
++              port: healthz
++            initialDelaySeconds: 10
++            timeoutSeconds: 3
++            periodSeconds: 10
++            failureThreshold: 5
++          terminationMessagePolicy: FallbackToLogsOnError
++          volumeMounts:
++            - name: socket-dir
++              mountPath: /var/lib/csi/sockets/pluginproxy/
++            - name: cloud-sa-volume
++              readOnly: true
++              mountPath: "/etc/cloud-sa"
++            - name: bound-sa-token
++              mountPath: /var/run/secrets/openshift/serviceaccount
++              readOnly: true
++          resources:
++            requests:
++              memory: 50Mi
++              cpu: 10m
++        - name: csi-provisioner
++          securityContext:
++            readOnlyRootFilesystem: true
++          image: ${PROVISIONER_IMAGE}
++          imagePullPolicy: IfNotPresent
++          args:
++            - --csi-address=$(ADDRESS)
++            - --default-fstype=ext4
++            - --feature-gates=Topology=true
++            - --extra-create-metadata=true
++            - --http-endpoint=localhost:8202
++            - --timeout=250s
++            - --leader-election
++            - --leader-election-lease-duration=${LEADER_ELECTION_LEASE_DURATION}
++            - --leader-election-renew-deadline=${LEADER_ELECTION_RENEW_DEADLINE}
++            - --leader-election-retry-period=${LEADER_ELECTION_RETRY_PERIOD}
++            - --controller-publish-readonly
++            - --v=${LOG_LEVEL}
++          env:
++            - name: ADDRESS
++              value: /var/lib/csi/sockets/pluginproxy/csi.sock
++          terminationMessagePolicy: FallbackToLogsOnError
++          volumeMounts:
++            - name: socket-dir
++              mountPath: /var/lib/csi/sockets/pluginproxy/
++          resources:
++            requests:
++              memory: 50Mi
++              cpu: 10m
++          # kube-rbac-proxy for external-provisioner container.
++          # Provides https proxy for http-based external-provisioner metrics.
++        - name: provisioner-kube-rbac-proxy
++          securityContext:
++            readOnlyRootFilesystem: true
++          args:
++          - --secure-listen-address=0.0.0.0:9202
++          - --upstream=http://127.0.0.1:8202/
++          - --tls-cert-file=/etc/tls/private/tls.crt
++          - --tls-private-key-file=/etc/tls/private/tls.key
++          - --tls-cipher-suites=${TLS_CIPHER_SUITES}
++          - --tls-min-version=${TLS_MIN_VERSION}
++          - --logtostderr=true
++          image: ${KUBE_RBAC_PROXY_IMAGE}
++          imagePullPolicy: IfNotPresent
++          ports:
++          - containerPort: 9202
++            name: provisioner-m
++            protocol: TCP
++          resources:
++            requests:
++              memory: 20Mi
++              cpu: 10m
++          terminationMessagePolicy: FallbackToLogsOnError
++          volumeMounts:
++          - mountPath: /etc/tls/private
++            name: metrics-serving-cert
++        - name: csi-attacher
++          securityContext:
++            readOnlyRootFilesystem: true
++          image: ${ATTACHER_IMAGE}
++          imagePullPolicy: IfNotPresent
++          args:
++            - --csi-address=$(ADDRESS)
++            - --http-endpoint=localhost:8203
++            - --leader-election
++            - --timeout=250s
++            - --leader-election-lease-duration=${LEADER_ELECTION_LEASE_DURATION}
++            - --leader-election-renew-deadline=${LEADER_ELECTION_RENEW_DEADLINE}
++            - --leader-election-retry-period=${LEADER_ELECTION_RETRY_PERIOD}
++            - --v=${LOG_LEVEL}
++          env:
++            - name: ADDRESS
++              value: /var/lib/csi/sockets/pluginproxy/csi.sock
++          terminationMessagePolicy: FallbackToLogsOnError
++          volumeMounts:
++            - name: socket-dir
++              mountPath: /var/lib/csi/sockets/pluginproxy/
++          resources:
++            requests:
++              memory: 50Mi
++              cpu: 10m
++        - name: attacher-kube-rbac-proxy
++          securityContext:
++            readOnlyRootFilesystem: true
++          args:
++          - --secure-listen-address=0.0.0.0:9203
++          - --upstream=http://127.0.0.1:8203/
++          - --tls-cert-file=/etc/tls/private/tls.crt
++          - --tls-private-key-file=/etc/tls/private/tls.key
++          - --tls-cipher-suites=${TLS_CIPHER_SUITES}
++          - --tls-min-version=${TLS_MIN_VERSION}
++          - --logtostderr=true
++          image: ${KUBE_RBAC_PROXY_IMAGE}
++          imagePullPolicy: IfNotPresent
++          ports:
++          - containerPort: 9203
++            name: attacher-m
++            protocol: TCP
++          resources:
++            requests:
++              memory: 20Mi
++              cpu: 10m
++          terminationMessagePolicy: FallbackToLogsOnError
++          volumeMounts:
++          - mountPath: /etc/tls/private
++            name: metrics-serving-cert
++        - name: csi-resizer
++          securityContext:
++            readOnlyRootFilesystem: true
++          image: ${RESIZER_IMAGE}
++          imagePullPolicy: IfNotPresent
++          args:
++            - --csi-address=$(ADDRESS)
++            - --http-endpoint=localhost:8204
++            - --leader-election
++            - --leader-election-lease-duration=${LEADER_ELECTION_LEASE_DURATION}
++            - --leader-election-renew-deadline=${LEADER_ELECTION_RENEW_DEADLINE}
++            - --leader-election-retry-period=${LEADER_ELECTION_RETRY_PERIOD}
++            - --v=${LOG_LEVEL}
++          env:
++            - name: ADDRESS
++              value: /var/lib/csi/sockets/pluginproxy/csi.sock
++          terminationMessagePolicy: FallbackToLogsOnError
++          volumeMounts:
++            - name: socket-dir
++              mountPath: /var/lib/csi/sockets/pluginproxy/
++          resources:
++            requests:
++              memory: 50Mi
++              cpu: 10m
++        - name: resizer-kube-rbac-proxy
++          securityContext:
++            readOnlyRootFilesystem: true
++          args:
++          - --secure-listen-address=0.0.0.0:9204
++          - --upstream=http://127.0.0.1:8204/
++          - --tls-cert-file=/etc/tls/private/tls.crt
++          - --tls-private-key-file=/etc/tls/private/tls.key
++          - --tls-cipher-suites=${TLS_CIPHER_SUITES}
++          - --tls-min-version=${TLS_MIN_VERSION}
++          - --logtostderr=true
++          image: ${KUBE_RBAC_PROXY_IMAGE}
++          imagePullPolicy: IfNotPresent
++          ports:
++          - containerPort: 9204
++            name: resizer-m
++            protocol: TCP
++          resources:
++            requests:
++              memory: 20Mi
++              cpu: 10m
++          terminationMessagePolicy: FallbackToLogsOnError
++          volumeMounts:
++          - mountPath: /etc/tls/private
++            name: metrics-serving-cert
++        - name: csi-snapshotter
++          securityContext:
++            readOnlyRootFilesystem: true
++          image: ${SNAPSHOTTER_IMAGE}
++          imagePullPolicy: IfNotPresent
++          args:
++            - --csi-address=$(ADDRESS)
++            - --metrics-address=localhost:8205
++            - --leader-election
++            - --timeout=300s
++            - --leader-election-lease-duration=${LEADER_ELECTION_LEASE_DURATION}
++            - --leader-election-renew-deadline=${LEADER_ELECTION_RENEW_DEADLINE}
++            - --leader-election-retry-period=${LEADER_ELECTION_RETRY_PERIOD}
++            - --v=${LOG_LEVEL}
++          env:
++          - name: ADDRESS
++            value: /var/lib/csi/sockets/pluginproxy/csi.sock
++          terminationMessagePolicy: FallbackToLogsOnError
++          volumeMounts:
++          - mountPath: /var/lib/csi/sockets/pluginproxy/
++            name: socket-dir
++          resources:
++            requests:
++              memory: 50Mi
++              cpu: 10m
++        - name: snapshotter-kube-rbac-proxy
++          securityContext:
++            readOnlyRootFilesystem: true
++          args:
++          - --secure-listen-address=0.0.0.0:9205
++          - --upstream=http://127.0.0.1:8205/
++          - --tls-cert-file=/etc/tls/private/tls.crt
++          - --tls-private-key-file=/etc/tls/private/tls.key
++          - --tls-cipher-suites=${TLS_CIPHER_SUITES}
++          - --tls-min-version=${TLS_MIN_VERSION}
++          - --logtostderr=true
++          image: ${KUBE_RBAC_PROXY_IMAGE}
++          imagePullPolicy: IfNotPresent
++          ports:
++          - containerPort: 9205
++            name: snapshotter-m
++            protocol: TCP
++          resources:
++            requests:
++              memory: 20Mi
++              cpu: 10m
++          terminationMessagePolicy: FallbackToLogsOnError
++          volumeMounts:
++          - mountPath: /etc/tls/private
++            name: metrics-serving-cert
++        - name: csi-liveness-probe
++          securityContext:
++            readOnlyRootFilesystem: true
++          image: ${LIVENESS_PROBE_IMAGE}
++          imagePullPolicy: IfNotPresent
++          args:
++            - --csi-address=/csi/csi.sock
++            - --probe-timeout=3s
++            - --health-port=10301
++            - --v=${LOG_LEVEL}
++          terminationMessagePolicy: FallbackToLogsOnError
++          volumeMounts:
++            - name: socket-dir
++              mountPath: /csi
++          resources:
++            requests:
++              memory: 50Mi
++              cpu: 10m
++      volumes:
++        - name: socket-dir
++          emptyDir: {}
++        - name: cloud-sa-volume
++          secret:
++            secretName: gcp-pd-cloud-credentials
++        - name: metrics-serving-cert
++          secret:
++            secretName: gcp-pd-csi-driver-controller-metrics-serving-cert
++        # This service account token can be used to provide identity outside the cluster.
++        # For example, this token can be used to authenticate with GCP using workload identity.
++        - name: bound-sa-token
++          projected:
++            sources:
++            - serviceAccountToken:
++                path: token
++                audience: openshift
+diff --git a/assets/overlays/gcp-pd/generated/standalone/controller_hostnetwork_binding.yaml b/assets/overlays/gcp-pd/generated/standalone/controller_hostnetwork_binding.yaml
+new file mode 100644
+index 000000000..6e59c19bd
+--- /dev/null
++++ b/assets/overlays/gcp-pd/generated/standalone/controller_hostnetwork_binding.yaml
+@@ -0,0 +1,12 @@
++kind: ClusterRoleBinding
++apiVersion: rbac.authorization.k8s.io/v1
++metadata:
++  name: gcp-pd-controller-hostnetwork-binding
++subjects:
++  - kind: ServiceAccount
++    name: gcp-pd-csi-driver-controller-sa
++    namespace: openshift-cluster-csi-drivers
++roleRef:
++  kind: ClusterRole
++  name: gcp-pd-hostnetwork-role
++  apiGroup: rbac.authorization.k8s.io
+diff --git a/assets/overlays/gcp-pd/generated/standalone/controller_pdb.yaml b/assets/overlays/gcp-pd/generated/standalone/controller_pdb.yaml
+new file mode 100644
+index 000000000..5a76d1db8
+--- /dev/null
++++ b/assets/overlays/gcp-pd/generated/standalone/controller_pdb.yaml
+@@ -0,0 +1,11 @@
++apiVersion: policy/v1
++kind: PodDisruptionBudget
++metadata:
++  name: gcp-pd-csi-driver-controller-pdb
++  namespace: openshift-cluster-csi-drivers
++spec:
++  maxUnavailable: 1
++  selector:
++    matchLabels:
++      app: gcp-pd-csi-driver-controller
++  unhealthyPodEvictionPolicy: AlwaysAllow
+diff --git a/assets/overlays/gcp-pd/generated/standalone/controller_sa.yaml b/assets/overlays/gcp-pd/generated/standalone/controller_sa.yaml
+new file mode 100644
+index 000000000..50f259b81
+--- /dev/null
++++ b/assets/overlays/gcp-pd/generated/standalone/controller_sa.yaml
+@@ -0,0 +1,5 @@
++apiVersion: v1
++kind: ServiceAccount
++metadata:
++  name: gcp-pd-csi-driver-controller-sa
++  namespace: openshift-cluster-csi-drivers
+diff --git a/assets/overlays/gcp-pd/generated/standalone/csidriver.yaml b/assets/overlays/gcp-pd/generated/standalone/csidriver.yaml
+new file mode 100644
+index 000000000..19d994f5f
+--- /dev/null
++++ b/assets/overlays/gcp-pd/generated/standalone/csidriver.yaml
+@@ -0,0 +1,13 @@
++apiVersion: storage.k8s.io/v1
++kind: CSIDriver
++metadata:
++  name: pd.csi.storage.gke.io
++spec:
++  attachRequired: true
++  podInfoOnMount: false
++  fsGroupPolicy: File
++  requiresRepublish: false
++  storageCapacity: false
++  seLinuxMount: true
++  volumeLifecycleModes:
++    - Persistent
+diff --git a/assets/overlays/gcp-pd/generated/standalone/hostnetwork_role.yaml b/assets/overlays/gcp-pd/generated/standalone/hostnetwork_role.yaml
+new file mode 100644
+index 000000000..133d40416
+--- /dev/null
++++ b/assets/overlays/gcp-pd/generated/standalone/hostnetwork_role.yaml
+@@ -0,0 +1,12 @@
++kind: ClusterRole
++apiVersion: rbac.authorization.k8s.io/v1
++metadata:
++  name: gcp-pd-hostnetwork-role
++rules:
++  - apiGroups: ["security.openshift.io"]
++    resourceNames: ["hostnetwork-v2"]
++    resources: ["securitycontextconstraints"]
++    verbs: ["use"]
++  - apiGroups: [""]
++    resources: ["nodes"]
++    verbs: ["get"]
+diff --git a/assets/overlays/gcp-pd/generated/standalone/kube_rbac_proxy_binding.yaml b/assets/overlays/gcp-pd/generated/standalone/kube_rbac_proxy_binding.yaml
+new file mode 100644
+index 000000000..426ff4541
+--- /dev/null
++++ b/assets/overlays/gcp-pd/generated/standalone/kube_rbac_proxy_binding.yaml
+@@ -0,0 +1,13 @@
++# Allow kube-rbac-proxies to create tokenreviews to check Prometheus identity when scraping metrics.
++kind: ClusterRoleBinding
++apiVersion: rbac.authorization.k8s.io/v1
++metadata:
++  name: gcp-pd-kube-rbac-proxy-binding
++subjects:
++  - kind: ServiceAccount
++    name: gcp-pd-csi-driver-controller-sa
++    namespace: openshift-cluster-csi-drivers
++roleRef:
++  kind: ClusterRole
++  name: gcp-pd-kube-rbac-proxy-role
++  apiGroup: rbac.authorization.k8s.io
+diff --git a/assets/overlays/gcp-pd/generated/standalone/kube_rbac_proxy_role.yaml b/assets/overlays/gcp-pd/generated/standalone/kube_rbac_proxy_role.yaml
+new file mode 100644
+index 000000000..1985a1506
+--- /dev/null
++++ b/assets/overlays/gcp-pd/generated/standalone/kube_rbac_proxy_role.yaml
+@@ -0,0 +1,12 @@
++# Allow kube-rbac-proxies to create tokenreviews to check Prometheus identity when scraping metrics.
++kind: ClusterRole
++apiVersion: rbac.authorization.k8s.io/v1
++metadata:
++  name: gcp-pd-kube-rbac-proxy-role
++rules:
++  - apiGroups:
++    - "authentication.k8s.io"
++    resources:
++    - "tokenreviews"
++    verbs:
++    - "create"
+diff --git a/assets/overlays/gcp-pd/generated/standalone/lease_leader_election_role.yaml b/assets/overlays/gcp-pd/generated/standalone/lease_leader_election_role.yaml
+new file mode 100644
+index 000000000..152746437
+--- /dev/null
++++ b/assets/overlays/gcp-pd/generated/standalone/lease_leader_election_role.yaml
+@@ -0,0 +1,10 @@
++# Role for electing leader by the operator
++apiVersion: rbac.authorization.k8s.io/v1
++kind: Role
++metadata:
++  name: gcp-pd-csi-driver-lease-leader-election
++  namespace: openshift-cluster-csi-drivers
++rules:
++- apiGroups: ["coordination.k8s.io"]
++  resources: ["leases"]
++  verbs: ["get", "watch", "list", "delete", "update", "create"]
+diff --git a/assets/overlays/gcp-pd/generated/standalone/lease_leader_election_rolebinding.yaml b/assets/overlays/gcp-pd/generated/standalone/lease_leader_election_rolebinding.yaml
+new file mode 100644
+index 000000000..b5ea6606b
+--- /dev/null
++++ b/assets/overlays/gcp-pd/generated/standalone/lease_leader_election_rolebinding.yaml
+@@ -0,0 +1,14 @@
++# Grant controller access to leases
++apiVersion: rbac.authorization.k8s.io/v1
++kind: RoleBinding
++metadata:
++  name: gcp-pd-csi-driver-lease-leader-election
++  namespace: openshift-cluster-csi-drivers
++roleRef:
++  apiGroup: rbac.authorization.k8s.io
++  kind: Role
++  name: gcp-pd-csi-driver-lease-leader-election
++subjects:
++- kind: ServiceAccount
++  name: gcp-pd-csi-driver-controller-sa
++  namespace: openshift-cluster-csi-drivers
+diff --git a/assets/overlays/gcp-pd/generated/standalone/main_attacher_binding.yaml b/assets/overlays/gcp-pd/generated/standalone/main_attacher_binding.yaml
+new file mode 100644
+index 000000000..7bca8b4c2
+--- /dev/null
++++ b/assets/overlays/gcp-pd/generated/standalone/main_attacher_binding.yaml
+@@ -0,0 +1,12 @@
++kind: ClusterRoleBinding
++apiVersion: rbac.authorization.k8s.io/v1
++metadata:
++  name: gcp-pd-csi-main-attacher-binding
++subjects:
++  - kind: ServiceAccount
++    name: gcp-pd-csi-driver-controller-sa
++    namespace: openshift-cluster-csi-drivers
++roleRef:
++  kind: ClusterRole
++  name: openshift-csi-main-attacher-role
++  apiGroup: rbac.authorization.k8s.io
+diff --git a/assets/overlays/gcp-pd/generated/standalone/main_provisioner_binding.yaml b/assets/overlays/gcp-pd/generated/standalone/main_provisioner_binding.yaml
+new file mode 100644
+index 000000000..e8b921e41
+--- /dev/null
++++ b/assets/overlays/gcp-pd/generated/standalone/main_provisioner_binding.yaml
+@@ -0,0 +1,12 @@
++kind: ClusterRoleBinding
++apiVersion: rbac.authorization.k8s.io/v1
++metadata:
++  name: gcp-pd-csi-main-provisioner-binding
++subjects:
++  - kind: ServiceAccount
++    name: gcp-pd-csi-driver-controller-sa
++    namespace: openshift-cluster-csi-drivers
++roleRef:
++  kind: ClusterRole
++  name: openshift-csi-main-provisioner-role
++  apiGroup: rbac.authorization.k8s.io
+diff --git a/assets/overlays/gcp-pd/generated/standalone/main_resizer_binding.yaml b/assets/overlays/gcp-pd/generated/standalone/main_resizer_binding.yaml
+new file mode 100644
+index 000000000..7f188eb77
+--- /dev/null
++++ b/assets/overlays/gcp-pd/generated/standalone/main_resizer_binding.yaml
+@@ -0,0 +1,12 @@
++kind: ClusterRoleBinding
++apiVersion: rbac.authorization.k8s.io/v1
++metadata:
++  name: gcp-pd-csi-main-resizer-binding
++subjects:
++  - kind: ServiceAccount
++    name: gcp-pd-csi-driver-controller-sa
++    namespace: openshift-cluster-csi-drivers
++roleRef:
++  kind: ClusterRole
++  name: openshift-csi-main-resizer-role
++  apiGroup: rbac.authorization.k8s.io
+diff --git a/assets/overlays/gcp-pd/generated/standalone/main_snapshotter_binding.yaml b/assets/overlays/gcp-pd/generated/standalone/main_snapshotter_binding.yaml
+new file mode 100644
+index 000000000..ba293d271
+--- /dev/null
++++ b/assets/overlays/gcp-pd/generated/standalone/main_snapshotter_binding.yaml
+@@ -0,0 +1,12 @@
++kind: ClusterRoleBinding
++apiVersion: rbac.authorization.k8s.io/v1
++metadata:
++  name: gcp-pd-csi-main-snapshotter-binding
++subjects:
++  - kind: ServiceAccount
++    name: gcp-pd-csi-driver-controller-sa
++    namespace: openshift-cluster-csi-drivers
++roleRef:
++  kind: ClusterRole
++  name: openshift-csi-main-snapshotter-role
++  apiGroup: rbac.authorization.k8s.io
+diff --git a/assets/overlays/gcp-pd/generated/standalone/manifests.yaml b/assets/overlays/gcp-pd/generated/standalone/manifests.yaml
+new file mode 100644
+index 000000000..19a6b42fc
+--- /dev/null
++++ b/assets/overlays/gcp-pd/generated/standalone/manifests.yaml
+@@ -0,0 +1,34 @@
++controllerStaticAssetNames:
++- cabundle_cm.yaml
++- controller.yaml
++- controller_pdb.yaml
++- controller_sa.yaml
++- service.yaml
++- servicemonitor.yaml
++guestStaticAssetNames:
++- csidriver.yaml
++- kube_rbac_proxy_binding.yaml
++- kube_rbac_proxy_role.yaml
++- lease_leader_election_rolebinding.yaml
++- lease_leader_election_role.yaml
++- main_attacher_binding.yaml
++- main_provisioner_binding.yaml
++- main_resizer_binding.yaml
++- main_snapshotter_binding.yaml
++- node.yaml
++- node_privileged_binding.yaml
++- controller_hostnetwork_binding.yaml
++- node_sa.yaml
++- privileged_role.yaml
++- hostnetwork_role.yaml
++- prometheus_rolebinding.yaml
++- prometheus_role.yaml
++- storageclass.yaml
++- storageclass_ssd.yaml
++- storageclass_hyperdisk_balanced.yaml
++- storageclass_reader_resizer_binding.yaml
++- volumeattributesclass_reader_provisioner_binding.yaml
++- volumeattributesclass_reader_resizer_binding.yaml
++- volumesnapshot_reader_provisioner_binding.yaml
++- volumesnapshotclass.yaml
++- volumesnapshotclass_images.yaml
+diff --git a/assets/overlays/gcp-pd/generated/standalone/node.yaml b/assets/overlays/gcp-pd/generated/standalone/node.yaml
+new file mode 100644
+index 000000000..bd6b45445
+--- /dev/null
++++ b/assets/overlays/gcp-pd/generated/standalone/node.yaml
+@@ -0,0 +1,193 @@
++kind: DaemonSet
++apiVersion: apps/v1
++metadata:
++  name: gcp-pd-csi-driver-node
++  namespace: openshift-cluster-csi-drivers
++  annotations:
++    config.openshift.io/inject-proxy: csi-driver
++    config.openshift.io/inject-proxy-cabundle: csi-driver
++spec:
++  selector:
++    matchLabels:
++      app: gcp-pd-csi-driver-node
++  updateStrategy:
++    type: RollingUpdate
++    rollingUpdate:
++      maxUnavailable: 10%
++  template:
++    metadata:
++      labels:
++        app: gcp-pd-csi-driver-node
++      annotations:
++        openshift.io/required-scc: privileged
++        target.workload.openshift.io/management: '{"effect": "PreferredDuringScheduling"}'
++        # This annotation prevents eviction from the cluster-autoscaler
++        cluster-autoscaler.kubernetes.io/enable-ds-eviction: "false"
++    spec:
++      hostNetwork: true
++      serviceAccountName: gcp-pd-csi-driver-node-sa
++      priorityClassName: system-node-critical
++      tolerations:
++        - operator: Exists
++      nodeSelector:
++        kubernetes.io/os: linux
++      containers:
++        - name: csi-driver
++          securityContext:
++            privileged: true
++            readOnlyRootFilesystem: true
++          image: ${DRIVER_IMAGE}
++          imagePullPolicy: IfNotPresent
++          args:
++            - --endpoint=$(CSI_ENDPOINT)
++            - --logtostderr
++            - --v=${LOG_LEVEL}
++            - --enable-storage-pools=true
++            - --node-name=$(KUBE_NODE_NAME)
++          env:
++            - name: CSI_ENDPOINT
++              value: unix:/csi/csi.sock
++            - name: KUBE_NODE_NAME
++              valueFrom:
++                fieldRef:
++                  fieldPath: spec.nodeName
++          volumeMounts:
++            - name: kubelet-dir
++              mountPath: /var/lib/kubelet
++              mountPropagation: "Bidirectional"
++            - name: plugin-dir
++              mountPath: /csi
++            - name: device-dir
++              mountPath: /dev
++            # The following mounts are required to trigger host udevadm from
++            # container
++            - name: udev-rules-etc
++              mountPath: /etc/udev
++            - name: udev-rules-lib
++              mountPath: /lib/udev
++            - name: udev-socket
++              mountPath: /run/udev
++            - name: sys
++              mountPath: /sys
++            - name: etc-selinux
++              mountPath: /etc/selinux
++          ports:
++            - name: healthz
++              # Due to hostNetwork, this port is open on all nodes!
++              containerPort: 10300
++              protocol: TCP
++          livenessProbe:
++            httpGet:
++              path: /healthz
++              port: healthz
++            initialDelaySeconds: 10
++            timeoutSeconds: 3
++            periodSeconds: 10
++            failureThreshold: 5
++          resources:
++            requests:
++              memory: 50Mi
++              cpu: 10m
++          terminationMessagePolicy: FallbackToLogsOnError
++        - name: csi-node-driver-registrar
++          securityContext:
++            privileged: true
++            readOnlyRootFilesystem: true
++          image: ${NODE_DRIVER_REGISTRAR_IMAGE}
++          imagePullPolicy: IfNotPresent
++          args:
++            - --csi-address=$(ADDRESS)
++            - --kubelet-registration-path=$(DRIVER_REG_SOCK_PATH)
++            - --http-endpoint=:10303
++            - --v=${LOG_LEVEL}
++          lifecycle:
++            preStop:
++              exec:
++                command: ["/bin/sh", "-c", "rm -rf /registration/pd.csi.storage.gke.io-reg.sock /csi/csi.sock"]
++          env:
++            - name: KUBE_NODE_NAME
++              valueFrom:
++                fieldRef:
++                  fieldPath: spec.nodeName
++            - name: ADDRESS
++              value: /csi/csi.sock
++            - name: DRIVER_REG_SOCK_PATH
++              value: /var/lib/kubelet/plugins/pd.csi.storage.gke.io/csi.sock
++          volumeMounts:
++            - name: plugin-dir
++              mountPath: /csi
++            - name: registration-dir
++              mountPath: /registration
++          ports:
++            - containerPort: 10303
++              name: rhealthz
++          resources:
++            requests:
++              memory: 50Mi
++              cpu: 10m
++          livenessProbe:
++            httpGet:
++              path: /healthz
++              port: rhealthz
++            initialDelaySeconds: 10
++            timeoutSeconds: 3
++            periodSeconds: 10
++            failureThreshold: 5
++          terminationMessagePolicy: FallbackToLogsOnError
++        - name: csi-liveness-probe
++          securityContext:
++            readOnlyRootFilesystem: true
++          image: ${LIVENESS_PROBE_IMAGE}
++          imagePullPolicy: IfNotPresent
++          args:
++            - --csi-address=/csi/csi.sock
++            - --probe-timeout=3s
++            - --health-port=10300
++            - --v=${LOG_LEVEL}
++          volumeMounts:
++            - name: plugin-dir
++              mountPath: /csi
++          resources:
++            requests:
++              memory: 50Mi
++              cpu: 10m
++          terminationMessagePolicy: FallbackToLogsOnError
++      volumes:
++        - name: kubelet-dir
++          hostPath:
++            path: /var/lib/kubelet
++            type: Directory
++        - name: plugin-dir
++          hostPath:
++            path: /var/lib/kubelet/plugins/pd.csi.storage.gke.io/
++            type: DirectoryOrCreate
++        - name: registration-dir
++          hostPath:
++            path: /var/lib/kubelet/plugins_registry/
++            type: Directory
++        - name: device-dir
++          hostPath:
++            path: /dev
++            type: Directory
++        # The following mounts are required to trigger host udevadm from
++        # container
++        - name: udev-rules-etc
++          hostPath:
++            path: /etc/udev
++            type: Directory
++        - name: udev-rules-lib
++          hostPath:
++            path: /lib/udev
++            type: Directory
++        - name: udev-socket
++          hostPath:
++            path: /run/udev
++            type: Directory
++        - name: sys
++          hostPath:
++            path: /sys
++            type: Directory
++        - name: etc-selinux
++          hostPath:
++            path: /etc/selinux
++            type: DirectoryOrCreate
+diff --git a/assets/overlays/gcp-pd/generated/standalone/node_privileged_binding.yaml b/assets/overlays/gcp-pd/generated/standalone/node_privileged_binding.yaml
+new file mode 100644
+index 000000000..908a8c806
+--- /dev/null
++++ b/assets/overlays/gcp-pd/generated/standalone/node_privileged_binding.yaml
+@@ -0,0 +1,12 @@
++kind: ClusterRoleBinding
++apiVersion: rbac.authorization.k8s.io/v1
++metadata:
++  name: gcp-pd-node-privileged-binding
++subjects:
++  - kind: ServiceAccount
++    name: gcp-pd-csi-driver-node-sa
++    namespace: openshift-cluster-csi-drivers
++roleRef:
++  kind: ClusterRole
++  name: gcp-pd-privileged-role
++  apiGroup: rbac.authorization.k8s.io
+diff --git a/assets/overlays/gcp-pd/generated/standalone/node_sa.yaml b/assets/overlays/gcp-pd/generated/standalone/node_sa.yaml
+new file mode 100644
+index 000000000..9f500e68e
+--- /dev/null
++++ b/assets/overlays/gcp-pd/generated/standalone/node_sa.yaml
+@@ -0,0 +1,5 @@
++apiVersion: v1
++kind: ServiceAccount
++metadata:
++  name: gcp-pd-csi-driver-node-sa
++  namespace: openshift-cluster-csi-drivers
+diff --git a/assets/overlays/gcp-pd/generated/standalone/privileged_role.yaml b/assets/overlays/gcp-pd/generated/standalone/privileged_role.yaml
+new file mode 100644
+index 000000000..3d830ecae
+--- /dev/null
++++ b/assets/overlays/gcp-pd/generated/standalone/privileged_role.yaml
+@@ -0,0 +1,13 @@
++# TODO: create custom SCC with things that the CSI driver needs
++kind: ClusterRole
++apiVersion: rbac.authorization.k8s.io/v1
++metadata:
++  name: gcp-pd-privileged-role
++rules:
++  - apiGroups: ["security.openshift.io"]
++    resourceNames: ["privileged"]
++    resources: ["securitycontextconstraints"]
++    verbs: ["use"]
++  - apiGroups: [""]
++    resources: ["nodes"]
++    verbs: ["get"]
+diff --git a/assets/overlays/gcp-pd/generated/standalone/prometheus_role.yaml b/assets/overlays/gcp-pd/generated/standalone/prometheus_role.yaml
+new file mode 100644
+index 000000000..a86e2a697
+--- /dev/null
++++ b/assets/overlays/gcp-pd/generated/standalone/prometheus_role.yaml
+@@ -0,0 +1,17 @@
++# Role for accessing metrics exposed by the operator
++apiVersion: rbac.authorization.k8s.io/v1
++kind: Role
++metadata:
++  name: gcp-pd-csi-driver-prometheus
++  namespace: openshift-cluster-csi-drivers
++rules:
++- apiGroups:
++  - ""
++  resources:
++  - services
++  - endpoints
++  - pods
++  verbs:
++  - get
++  - list
++  - watch
+diff --git a/assets/overlays/gcp-pd/generated/standalone/prometheus_rolebinding.yaml b/assets/overlays/gcp-pd/generated/standalone/prometheus_rolebinding.yaml
+new file mode 100644
+index 000000000..832553d6a
+--- /dev/null
++++ b/assets/overlays/gcp-pd/generated/standalone/prometheus_rolebinding.yaml
+@@ -0,0 +1,14 @@
++# Grant cluster-monitoring access to the operator metrics service
++apiVersion: rbac.authorization.k8s.io/v1
++kind: RoleBinding
++metadata:
++  name: gcp-pd-csi-driver-prometheus
++  namespace: openshift-cluster-csi-drivers
++roleRef:
++  apiGroup: rbac.authorization.k8s.io
++  kind: Role
++  name: gcp-pd-csi-driver-prometheus
++subjects:
++- kind: ServiceAccount
++  name: prometheus-k8s
++  namespace: openshift-monitoring
+diff --git a/assets/overlays/gcp-pd/generated/standalone/service.yaml b/assets/overlays/gcp-pd/generated/standalone/service.yaml
+new file mode 100644
+index 000000000..b94352fd0
+--- /dev/null
++++ b/assets/overlays/gcp-pd/generated/standalone/service.yaml
+@@ -0,0 +1,31 @@
++apiVersion: v1
++kind: Service
++metadata:
++  annotations:
++    service.beta.openshift.io/serving-cert-secret-name: gcp-pd-csi-driver-controller-metrics-serving-cert
++  labels:
++    app: gcp-pd-csi-driver-controller-metrics
++  name: gcp-pd-csi-driver-controller-metrics
++  namespace: openshift-cluster-csi-drivers
++spec:
++  ports:
++  - name: provisioner-m
++    port: 443
++    protocol: TCP
++    targetPort: provisioner-m
++  - name: attacher-m
++    port: 444
++    protocol: TCP
++    targetPort: attacher-m
++  - name: resizer-m
++    port: 445
++    protocol: TCP
++    targetPort: resizer-m
++  - name: snapshotter-m
++    port: 446
++    protocol: TCP
++    targetPort: snapshotter-m
++  selector:
++    app: gcp-pd-csi-driver-controller
++  sessionAffinity: None
++  type: ClusterIP
+diff --git a/assets/overlays/gcp-pd/generated/standalone/servicemonitor.yaml b/assets/overlays/gcp-pd/generated/standalone/servicemonitor.yaml
+new file mode 100644
+index 000000000..f845b429f
+--- /dev/null
++++ b/assets/overlays/gcp-pd/generated/standalone/servicemonitor.yaml
+@@ -0,0 +1,43 @@
++apiVersion: monitoring.coreos.com/v1
++kind: ServiceMonitor
++metadata:
++  name: gcp-pd-csi-driver-controller-monitor
++  namespace: openshift-cluster-csi-drivers
++spec:
++  endpoints:
++  - bearerTokenFile: /var/run/secrets/kubernetes.io/serviceaccount/token
++    interval: 30s
++    path: /metrics
++    port: provisioner-m
++    scheme: https
++    tlsConfig:
++      caFile: /etc/prometheus/configmaps/serving-certs-ca-bundle/service-ca.crt
++      serverName: gcp-pd-csi-driver-controller-metrics.openshift-cluster-csi-drivers.svc
++  - bearerTokenFile: /var/run/secrets/kubernetes.io/serviceaccount/token
++    interval: 30s
++    path: /metrics
++    port: attacher-m
++    scheme: https
++    tlsConfig:
++      caFile: /etc/prometheus/configmaps/serving-certs-ca-bundle/service-ca.crt
++      serverName: gcp-pd-csi-driver-controller-metrics.openshift-cluster-csi-drivers.svc
++  - bearerTokenFile: /var/run/secrets/kubernetes.io/serviceaccount/token
++    interval: 30s
++    path: /metrics
++    port: resizer-m
++    scheme: https
++    tlsConfig:
++      caFile: /etc/prometheus/configmaps/serving-certs-ca-bundle/service-ca.crt
++      serverName: gcp-pd-csi-driver-controller-metrics.openshift-cluster-csi-drivers.svc
++  - bearerTokenFile: /var/run/secrets/kubernetes.io/serviceaccount/token
++    interval: 30s
++    path: /metrics
++    port: snapshotter-m
++    scheme: https
++    tlsConfig:
++      caFile: /etc/prometheus/configmaps/serving-certs-ca-bundle/service-ca.crt
++      serverName: gcp-pd-csi-driver-controller-metrics.openshift-cluster-csi-drivers.svc
++  jobLabel: component
++  selector:
++    matchLabels:
++      app: gcp-pd-csi-driver-controller-metrics
+diff --git a/assets/overlays/gcp-pd/generated/standalone/storageclass.yaml b/assets/overlays/gcp-pd/generated/standalone/storageclass.yaml
+new file mode 100644
+index 000000000..d7a2c5fe5
+--- /dev/null
++++ b/assets/overlays/gcp-pd/generated/standalone/storageclass.yaml
+@@ -0,0 +1,13 @@
++apiVersion: storage.k8s.io/v1
++kind: StorageClass
++metadata:
++  name: standard-csi
++  annotations:
++    storageclass.kubernetes.io/is-default-class: "true"
++provisioner: pd.csi.storage.gke.io
++parameters:
++  type: pd-standard
++  replication-type: none
++volumeBindingMode: WaitForFirstConsumer
++allowVolumeExpansion: true
++reclaimPolicy: Delete
+diff --git a/assets/overlays/gcp-pd/generated/standalone/storageclass_hyperdisk_balanced.yaml b/assets/overlays/gcp-pd/generated/standalone/storageclass_hyperdisk_balanced.yaml
+new file mode 100644
+index 000000000..071c17d2e
+--- /dev/null
++++ b/assets/overlays/gcp-pd/generated/standalone/storageclass_hyperdisk_balanced.yaml
+@@ -0,0 +1,13 @@
++apiVersion: storage.k8s.io/v1
++kind: StorageClass
++metadata:
++  name: hyperdisk-balanced
++  annotations:
++    storageclass.kubernetes.io/is-default-class: "true"
++provisioner: pd.csi.storage.gke.io
++parameters:
++  type: hyperdisk-balanced
++  replication-type: none
++volumeBindingMode: WaitForFirstConsumer
++allowVolumeExpansion: true
++reclaimPolicy: Delete
+diff --git a/assets/overlays/gcp-pd/generated/standalone/storageclass_reader_resizer_binding.yaml b/assets/overlays/gcp-pd/generated/standalone/storageclass_reader_resizer_binding.yaml
+new file mode 100644
+index 000000000..e04d44c03
+--- /dev/null
++++ b/assets/overlays/gcp-pd/generated/standalone/storageclass_reader_resizer_binding.yaml
+@@ -0,0 +1,12 @@
++kind: ClusterRoleBinding
++apiVersion: rbac.authorization.k8s.io/v1
++metadata:
++  name: gcp-pd-storageclass-reader-resizer-binding
++subjects:
++  - kind: ServiceAccount
++    name: gcp-pd-csi-driver-controller-sa
++    namespace: openshift-cluster-csi-drivers
++roleRef:
++  kind: ClusterRole
++  name: openshift-csi-resizer-storageclass-reader-role
++  apiGroup: rbac.authorization.k8s.io
+diff --git a/assets/overlays/gcp-pd/generated/standalone/storageclass_ssd.yaml b/assets/overlays/gcp-pd/generated/standalone/storageclass_ssd.yaml
+new file mode 100644
+index 000000000..f38805708
+--- /dev/null
++++ b/assets/overlays/gcp-pd/generated/standalone/storageclass_ssd.yaml
+@@ -0,0 +1,11 @@
++apiVersion: storage.k8s.io/v1
++kind: StorageClass
++metadata:
++  name: ssd-csi
++provisioner: pd.csi.storage.gke.io
++parameters:
++  type: pd-ssd
++  replication-type: none
++volumeBindingMode: WaitForFirstConsumer
++allowVolumeExpansion: true
++reclaimPolicy: Delete
+diff --git a/assets/overlays/gcp-pd/generated/standalone/volumeattributesclass_reader_provisioner_binding.yaml b/assets/overlays/gcp-pd/generated/standalone/volumeattributesclass_reader_provisioner_binding.yaml
+new file mode 100644
+index 000000000..75904aff2
+--- /dev/null
++++ b/assets/overlays/gcp-pd/generated/standalone/volumeattributesclass_reader_provisioner_binding.yaml
+@@ -0,0 +1,12 @@
++kind: ClusterRoleBinding
++apiVersion: rbac.authorization.k8s.io/v1
++metadata:
++  name: gcp-pd-csi-volumeattributesclass-reader-provisioner-binding
++subjects:
++  - kind: ServiceAccount
++    name: gcp-pd-csi-driver-controller-sa
++    namespace: openshift-cluster-csi-drivers
++roleRef:
++  kind: ClusterRole
++  name: openshift-csi-provisioner-volumeattributesclass-reader-role
++  apiGroup: rbac.authorization.k8s.io
+diff --git a/assets/overlays/gcp-pd/generated/standalone/volumeattributesclass_reader_resizer_binding.yaml b/assets/overlays/gcp-pd/generated/standalone/volumeattributesclass_reader_resizer_binding.yaml
+new file mode 100644
+index 000000000..10ab9c259
+--- /dev/null
++++ b/assets/overlays/gcp-pd/generated/standalone/volumeattributesclass_reader_resizer_binding.yaml
+@@ -0,0 +1,12 @@
++kind: ClusterRoleBinding
++apiVersion: rbac.authorization.k8s.io/v1
++metadata:
++  name: gcp-pd-csi-volumeattributesclass-reader-resizer-binding
++subjects:
++  - kind: ServiceAccount
++    name: gcp-pd-csi-driver-controller-sa
++    namespace: openshift-cluster-csi-drivers
++roleRef:
++  kind: ClusterRole
++  name: openshift-csi-resizer-volumeattributesclass-reader-role
++  apiGroup: rbac.authorization.k8s.io
+diff --git a/assets/overlays/gcp-pd/generated/standalone/volumesnapshot_reader_provisioner_binding.yaml b/assets/overlays/gcp-pd/generated/standalone/volumesnapshot_reader_provisioner_binding.yaml
+new file mode 100644
+index 000000000..7e15fac4e
+--- /dev/null
++++ b/assets/overlays/gcp-pd/generated/standalone/volumesnapshot_reader_provisioner_binding.yaml
+@@ -0,0 +1,12 @@
++kind: ClusterRoleBinding
++apiVersion: rbac.authorization.k8s.io/v1
++metadata:
++  name: gcp-pd-volumesnapshot-reader-provisioner-binding
++subjects:
++  - kind: ServiceAccount
++    name: gcp-pd-csi-driver-controller-sa
++    namespace: openshift-cluster-csi-drivers
++roleRef:
++  kind: ClusterRole
++  name: openshift-csi-provisioner-volumesnapshot-reader-role
++  apiGroup: rbac.authorization.k8s.io
+diff --git a/assets/overlays/gcp-pd/generated/standalone/volumesnapshotclass.yaml b/assets/overlays/gcp-pd/generated/standalone/volumesnapshotclass.yaml
+new file mode 100644
+index 000000000..acc224035
+--- /dev/null
++++ b/assets/overlays/gcp-pd/generated/standalone/volumesnapshotclass.yaml
+@@ -0,0 +1,8 @@
++apiVersion: snapshot.storage.k8s.io/v1
++kind: VolumeSnapshotClass
++metadata:
++  name: csi-gce-pd-vsc
++  annotations:
++    snapshot.storage.kubernetes.io/is-default-class: "true"
++driver: pd.csi.storage.gke.io
++deletionPolicy: Delete
+\ No newline at end of file
+diff --git a/assets/overlays/gcp-pd/generated/standalone/volumesnapshotclass_images.yaml b/assets/overlays/gcp-pd/generated/standalone/volumesnapshotclass_images.yaml
+new file mode 100644
+index 000000000..e261f2f4f
+--- /dev/null
++++ b/assets/overlays/gcp-pd/generated/standalone/volumesnapshotclass_images.yaml
+@@ -0,0 +1,8 @@
++apiVersion: snapshot.storage.k8s.io/v1
++kind: VolumeSnapshotClass
++metadata:
++  name: csi-gce-pd-vsc-images
++driver: pd.csi.storage.gke.io
++deletionPolicy: Delete
++parameters:
++  snapshot-type: images
+\ No newline at end of file
+diff --git a/cmd/gcp-pd-csi-driver-operator/main.go b/cmd/gcp-pd-csi-driver-operator/main.go
+new file mode 100644
+index 000000000..eadc0c94e
+--- /dev/null
++++ b/cmd/gcp-pd-csi-driver-operator/main.go
+@@ -0,0 +1,51 @@
++package main
++
++import (
++	"context"
++	"os"
++
++	gcp_pd "github.com/openshift/csi-operator/pkg/driver/gcp-pd"
++	"github.com/openshift/library-go/pkg/controller/controllercmd"
++	"github.com/spf13/cobra"
++	"k8s.io/component-base/cli"
++	"k8s.io/utils/clock"
++
++	"github.com/openshift/csi-operator/pkg/operator"
++	"github.com/openshift/csi-operator/pkg/version"
++)
++
++func main() {
++	command := NewOperatorCommand()
++	code := cli.Run(command)
++	os.Exit(code)
++}
++
++func NewOperatorCommand() *cobra.Command {
++	cmd := &cobra.Command{
++		Use:   "gcp-pd-csi-driver-operator",
++		Short: "OpenShift GCP PD CSI Driver Operator",
++		Run: func(cmd *cobra.Command, args []string) {
++			cmd.Help()
++			os.Exit(1)
++		},
++	}
++
++	ctrlCmd := controllercmd.NewControllerCommandConfig(
++		"gcp-pd-csi-driver-operator",
++		version.Get(),
++		runCSIDriverOperator,
++		clock.RealClock{},
++	).NewCommand()
++
++	ctrlCmd.Use = "start"
++	ctrlCmd.Short = "Start the GCP PD CSI Driver Operator"
++
++	cmd.AddCommand(ctrlCmd)
++
++	return cmd
++}
++
++func runCSIDriverOperator(ctx context.Context, controllerConfig *controllercmd.ControllerContext) error {
++	opConfig := gcp_pd.GetGCPPDOperatorConfig()
++	return operator.RunOperator(ctx, controllerConfig, "", opConfig)
++}
+diff --git a/pkg/driver/gcp-pd/custom_labels_test.go b/pkg/driver/gcp-pd/custom_labels_test.go
+new file mode 100644
+index 000000000..376f22b04
+--- /dev/null
++++ b/pkg/driver/gcp-pd/custom_labels_test.go
+@@ -0,0 +1,142 @@
++package gcp_pd
++
++import (
++	"fmt"
++	"testing"
++
++	appsv1 "k8s.io/api/apps/v1"
++	corev1 "k8s.io/api/core/v1"
++	"k8s.io/apimachinery/pkg/api/equality"
++	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
++
++	v1 "github.com/openshift/api/config/v1"
++	fakeconfig "github.com/openshift/client-go/config/clientset/versioned/fake"
++	"github.com/openshift/csi-operator/pkg/clients"
++)
++
++func TestCustomLabels(t *testing.T) {
++
++	infraObj := &v1.Infrastructure{
++		ObjectMeta: metav1.ObjectMeta{
++			Name: "cluster",
++		},
++		Status: v1.InfrastructureStatus{
++			InfrastructureName: "test-vbc3g",
++			PlatformStatus: &v1.PlatformStatus{
++				GCP: &v1.GCPPlatformStatus{
++					ProjectID: "test",
++					Region:    "test",
++				},
++			},
++		},
++	}
++
++	tmplDeployObj := &appsv1.Deployment{
++		Spec: appsv1.DeploymentSpec{
++			Template: corev1.PodTemplateSpec{
++				Spec: corev1.PodSpec{
++					Containers: []corev1.Container{
++						{
++							Name:  "csi-driver",
++							Image: "example.io/example-csi-driver",
++							Args: []string{
++								"--endpoint=$(CSI_ENDPOINT)",
++								"--logtostderr",
++								"--v=2",
++							},
++							Env: []corev1.EnvVar{
++								{
++									Name:  "GOOGLE_APPLICATION_CREDENTIALS",
++									Value: "/etc/cloud-sa/service_account.json",
++								},
++								{
++									Name:  "CSI_ENDPOINT",
++									Value: "unix:///var/lib/csi/sockets/pluginproxy/csi.sock",
++								},
++							},
++						},
++						{
++							Name:  "test-driver",
++							Image: "example.io/example-test-driver",
++						},
++					},
++				},
++			},
++		},
++	}
++
++	tests := []struct {
++		name          string
++		labels        []v1.GCPResourceLabel
++		expArgList    string
++		createInfraCR bool
++		wantErr       bool
++	}{
++		{
++			name:          "labels not configured",
++			labels:        []v1.GCPResourceLabel{},
++			expArgList:    fmt.Sprintf("--extra-labels=%s", fmt.Sprintf(ocpDefaultLabelFmt, infraObj.Status.InfrastructureName)),
++			createInfraCR: true,
++			wantErr:       false,
++		},
++		{
++			name: "labels configured",
++			labels: []v1.GCPResourceLabel{
++				{
++					Key:   "key1",
++					Value: "value1",
++				},
++				{
++					Key:   "key2",
++					Value: "value2",
++				},
++				{
++					Key:   "key3",
++					Value: "value3",
++				},
++			},
++			expArgList: fmt.Sprintf("--extra-labels=key1=value1,key2=value2,"+
++				"key3=value3,%s", fmt.Sprintf(ocpDefaultLabelFmt, infraObj.Status.InfrastructureName)),
++			createInfraCR: true,
++			wantErr:       false,
++		},
++		{
++			name:          "Infrastructure CR does not exist",
++			labels:        []v1.GCPResourceLabel{},
++			expArgList:    "",
++			createInfraCR: false,
++			wantErr:       true,
++		},
++	}
++
++	for _, test := range tests {
++		t.Run(test.name, func(t *testing.T) {
++			cr := clients.GetFakeOperatorCR()
++			c := clients.NewFakeClients("clusters-test", cr)
++			hook, _ := withCustomLabels(c)
++
++			if test.createInfraCR {
++				infraObj.Status.PlatformStatus.GCP.ResourceLabels = test.labels
++				c.ConfigClientSet.(*fakeconfig.Clientset).Tracker().Add(infraObj)
++			}
++			clients.SyncFakeInformers(t, c)
++
++			deployment := tmplDeployObj.DeepCopy()
++			updDeployment := tmplDeployObj.DeepCopy()
++			if test.expArgList != "" {
++				updDeployment.Spec.Template.Spec.Containers[0].Args = append(
++					updDeployment.Spec.Template.Spec.Containers[0].Args,
++					test.expArgList,
++				)
++			}
++
++			err := hook(&cr.Spec.OperatorSpec, deployment)
++			if (err != nil) != test.wantErr {
++				t.Fatalf("unexpected hook error: %v", err)
++			}
++			if !equality.Semantic.DeepEqual(deployment, updDeployment) {
++				t.Errorf("unexpected deployment want: %+v got: %+v", updDeployment, deployment)
++			}
++		})
++	}
++}
+diff --git a/pkg/driver/gcp-pd/custom_resource_tags_test.go b/pkg/driver/gcp-pd/custom_resource_tags_test.go
+new file mode 100644
+index 000000000..5a760077e
+--- /dev/null
++++ b/pkg/driver/gcp-pd/custom_resource_tags_test.go
+@@ -0,0 +1,143 @@
++package gcp_pd
++
++import (
++	"testing"
++
++	appsv1 "k8s.io/api/apps/v1"
++	corev1 "k8s.io/api/core/v1"
++	"k8s.io/apimachinery/pkg/api/equality"
++	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
++
++	v1 "github.com/openshift/api/config/v1"
++	fakeconfig "github.com/openshift/client-go/config/clientset/versioned/fake"
++	"github.com/openshift/csi-operator/pkg/clients"
++)
++
++func TestWithCustomResourceTags(t *testing.T) {
++
++	infraObj := &v1.Infrastructure{
++		ObjectMeta: metav1.ObjectMeta{
++			Name: "cluster",
++		},
++		Status: v1.InfrastructureStatus{
++			InfrastructureName: "test-sgdh7",
++			PlatformStatus: &v1.PlatformStatus{
++				GCP: &v1.GCPPlatformStatus{
++					ProjectID: "test",
++					Region:    "test",
++				},
++			},
++		},
++	}
++
++	tmplDeployObj := &appsv1.Deployment{
++		Spec: appsv1.DeploymentSpec{
++			Template: corev1.PodTemplateSpec{
++				Spec: corev1.PodSpec{
++					Containers: []corev1.Container{
++						{
++							Name:  "csi-driver",
++							Image: "example.io/example-csi-driver",
++							Args: []string{
++								"--endpoint=$(CSI_ENDPOINT)",
++								"--logtostderr",
++								"--v=2",
++							},
++							Env: []corev1.EnvVar{
++								{
++									Name:  "GOOGLE_APPLICATION_CREDENTIALS",
++									Value: "/etc/cloud-sa/service_account.json",
++								},
++								{
++									Name:  "CSI_ENDPOINT",
++									Value: "unix:///var/lib/csi/sockets/pluginproxy/csi.sock",
++								},
++							},
++						},
++						{
++							Name:  "test-driver",
++							Image: "example.io/example-test-driver",
++						},
++					},
++				},
++			},
++		},
++	}
++
++	tests := []struct {
++		name          string
++		tags          []v1.GCPResourceTag
++		expArgList    string
++		createInfraCR bool
++		wantErr       bool
++	}{
++		{
++			name:          "user tags not configured",
++			tags:          []v1.GCPResourceTag{},
++			expArgList:    "",
++			createInfraCR: true,
++			wantErr:       false,
++		},
++		{
++			name: "user tags configured",
++			tags: []v1.GCPResourceTag{
++				{
++					ParentID: "openshift",
++					Key:      "key1",
++					Value:    "value1",
++				},
++				{
++					ParentID: "openshift",
++					Key:      "key2",
++					Value:    "value2",
++				},
++				{
++					ParentID: "openshift",
++					Key:      "key3",
++					Value:    "value3",
++				},
++			},
++			expArgList:    "--extra-tags=openshift/key1/value1,openshift/key2/value2,openshift/key3/value3",
++			createInfraCR: true,
++			wantErr:       false,
++		},
++		{
++			name:          "Infrastructure CR does not exist",
++			tags:          []v1.GCPResourceTag{},
++			expArgList:    "",
++			createInfraCR: false,
++			wantErr:       true,
++		},
++	}
++
++	for _, test := range tests {
++		t.Run(test.name, func(t *testing.T) {
++			cr := clients.GetFakeOperatorCR()
++			c := clients.NewFakeClients("clusters-test", cr)
++			hook, _ := withCustomResourceTags(c)
++
++			if test.createInfraCR {
++				infraObj.Status.PlatformStatus.GCP.ResourceTags = test.tags
++				c.ConfigClientSet.(*fakeconfig.Clientset).Tracker().Add(infraObj)
++			}
++			clients.SyncFakeInformers(t, c)
++
++			deployment := tmplDeployObj.DeepCopy()
++			updDeployment := tmplDeployObj.DeepCopy()
++			if test.expArgList != "" {
++				updDeployment.Spec.Template.Spec.Containers[0].Args = append(
++					updDeployment.Spec.Template.Spec.Containers[0].Args,
++					test.expArgList,
++				)
++			}
++
++			err := hook(&cr.Spec.OperatorSpec, deployment)
++			if (err != nil) != test.wantErr {
++				t.Fatalf("unexpected hook error: %v", err)
++			}
++			if !equality.Semantic.DeepEqual(deployment, updDeployment) {
++				t.Errorf("unexpected deployment want: %+v got: %+v", updDeployment, deployment)
++			}
++		})
++	}
++}
+diff --git a/pkg/driver/gcp-pd/gcp_pd.go b/pkg/driver/gcp-pd/gcp_pd.go
+new file mode 100644
+index 000000000..7cb686e18
+--- /dev/null
++++ b/pkg/driver/gcp-pd/gcp_pd.go
+@@ -0,0 +1,320 @@
++package gcp_pd
++
++import (
++	"context"
++	"fmt"
++	"strings"
++	"time"
++
++	"github.com/openshift/csi-operator/assets"
++	"github.com/openshift/csi-operator/pkg/clients"
++	"github.com/openshift/csi-operator/pkg/driver/common/operator"
++	"github.com/openshift/csi-operator/pkg/generator"
++	"github.com/openshift/csi-operator/pkg/operator/config"
++
++	opv1 "github.com/openshift/api/operator/v1"
++	configclient "github.com/openshift/client-go/config/clientset/versioned"
++	"github.com/openshift/library-go/pkg/controller/factory"
++	"github.com/openshift/library-go/pkg/operator/csi/csidrivercontrollerservicecontroller"
++	"github.com/openshift/library-go/pkg/operator/csi/csidrivernodeservicecontroller"
++	"github.com/openshift/library-go/pkg/operator/csi/csistorageclasscontroller"
++	dc "github.com/openshift/library-go/pkg/operator/deploymentcontroller"
++	"github.com/openshift/library-go/pkg/operator/resource/resourceapply"
++	"github.com/openshift/library-go/pkg/operator/staticresourcecontroller"
++	appsv1 "k8s.io/api/apps/v1"
++	storagev1 "k8s.io/api/storage/v1"
++	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
++	"k8s.io/apimachinery/pkg/util/sets"
++	"k8s.io/apimachinery/pkg/util/wait"
++	"k8s.io/klog/v2"
++)
++
++const (
++	customAssetBase    = "overlays/gcp-pd/custom"
++	generatedAssetBase = "overlays/gcp-pd/generated"
++
++	// globalInfrastructureName is the default name of the Infrastructure object
++	globalInfrastructureName = "cluster"
++
++	// gcpDedicatedRegionPrefix is the prefix for GCP Dedicated regions.
++	// GCP Dedicated regions start with "u-" (e.g. "u-germany-northeast1").
++	gcpDedicatedRegionPrefix = "u-"
++
++	// ocpDefaultLabelFmt is the format string for the default label
++	// added to the OpenShift created GCP resources.
++	ocpDefaultLabelFmt = "kubernetes-io-cluster-%s=owned"
++
++	// The name of ConfigMap object with trusted CA certs.
++	trustedCAConfigMap = "gcp-pd-csi-driver-trusted-ca-bundle"
++
++	// The name of Secret object with GCP PD cloud credentials.
++	cloudCredSecretName = "gcp-pd-cloud-credentials"
++
++	// The name of Secret object with a pair signed serving certificate/key
++	// that is generated by Service CA operator for service/gcp-pd-csi-driver-controller-metrics.
++	metricsCertSecretName = "gcp-pd-csi-driver-controller-metrics-serving-cert"
++
++	diskEncryptionKMSKey  = "disk-encryption-kms-key"
++	defaultKMSKeyLocation = "global"
++)
++
++// GetGCPPDOperatorConfig returns runtime configuration of the CSI driver operator.
++func GetGCPPDOperatorConfig() *config.OperatorConfig {
++	return &config.OperatorConfig{
++		CSIDriverName:                   opv1.GCPPDCSIDriver,
++		UserAgent:                       "gcp-pd-csi-driver-operator",
++		AssetReader:                     assets.ReadFile,
++		AssetDir:                        generatedAssetBase,
++		OperatorControllerConfigBuilder: GetGCPPDOperatorControllerConfig,
++		Removable:                       false,
++	}
++}
++
++// GetGCPPDOperatorControllerConfig returns second half of runtime configuration of the CSI driver operator,
++// after a client connection + cluster flavour are established.
++func GetGCPPDOperatorControllerConfig(ctx context.Context, flavour generator.ClusterFlavour, c *clients.Clients) (*config.OperatorControllerConfig, error) {
++	if flavour != generator.FlavourStandalone {
++		klog.Error(nil, "Flavour HyperShift is not supported")
++		return nil, fmt.Errorf("Flavour HyperShift is not supported")
++	}
++
++	cfg := operator.NewDefaultOperatorControllerConfig(flavour, c, "GCPPD")
++
++	oldPrivilegedBindingController := staticresourcecontroller.NewStaticResourceController(
++		cfg.GetControllerName("OldControllerPrivilegedBindingRemoval"),
++		assets.ReadFile,
++		nil,
++		resourceapply.NewKubeClientHolder(c.KubeClient).WithDynamicClient(c.DynamicClient),
++		c.OperatorClient,
++		c.EventRecorder,
++	).WithConditionalResources(
++		assets.ReadFile,
++		[]string{customAssetBase + "/old_controller_privileged_binding.yaml"},
++		func() bool { return false },
++		func() bool { return true },
++	)
++	cfg.ExtraControlPlaneControllers = append(cfg.ExtraControlPlaneControllers, oldPrivilegedBindingController)
++
++	storageClassFiles, err := getStorageClassFiles(ctx, c.ConfigClientSet)
++	if err != nil {
++		return nil, err
++	}
++	storageClassSet := sets.New[string](storageClassFiles...)
++
++	cfg.StorageClassSelector = func(name string) bool {
++		if storageClassSet.Has(name) {
++			return true
++		}
++		return false
++	}
++
++	go c.ConfigInformers.Start(ctx.Done())
++
++	cfg.AddDeploymentHookBuilders(c,
++		withCustomLabels,
++		withCABundleDeploymentHook,
++		withCustomResourceTags,
++	)
++	cfg.AddStorageClassHookBuilders(c, getKMSKeyHook)
++	cfg.DeploymentWatchedSecretNames = append(cfg.DeploymentWatchedSecretNames, cloudCredSecretName, metricsCertSecretName)
++	cfg.AddDaemonSetHookBuilders(c, withCABundleDaemonSetHook, withClusterWideProxyDaemonSetHook)
++
++	return cfg, nil
++}
++
++// getStorageClassFiles returns the list of StorageClass asset files to use,
++// based on whether the cluster runs on GCP Dedicated.
++// It retries for up to 1 minute to fetch the Infrastructure CR, because during
++// early cluster installation the CR may not exist yet.
++// On GCP Dedicated, only hyperdisk-balanced is supported.
++// On regular GCP, standard-csi and ssd-csi are used.
++func getStorageClassFiles(ctx context.Context, configClient configclient.Interface) ([]string, error) {
++	regularFiles := []string{
++		"storageclass.yaml",
++		"storageclass_ssd.yaml",
++	}
++	gcpDedicatedFiles := []string{
++		"storageclass_hyperdisk_balanced.yaml",
++	}
++
++	var region string
++	var lastErr error
++	err := wait.PollUntilContextTimeout(ctx, 5*time.Second, 1*time.Minute, true, func(ctx context.Context) (bool, error) {
++		infra, err := configClient.ConfigV1().Infrastructures().Get(ctx, globalInfrastructureName, metav1.GetOptions{})
++		if err != nil {
++			lastErr = err
++			klog.V(4).Infof("Failed to get Infrastructure CR, will retry: %v", err)
++			return false, nil
++		}
++		if infra.Status.PlatformStatus == nil || infra.Status.PlatformStatus.GCP == nil {
++			klog.V(4).Infof("Infrastructure CR has no GCP PlatformStatus, assuming regular GCP")
++			return true, nil
++		}
++		region = infra.Status.PlatformStatus.GCP.Region
++		return true, nil
++	})
++	if err != nil {
++		return nil, fmt.Errorf("failed to get Infrastructure CR: %w", lastErr)
++	}
++
++	if strings.HasPrefix(region, gcpDedicatedRegionPrefix) {
++		klog.Infof("GCP Dedicated detected (region %q), using hyperdisk-balanced StorageClass", region)
++		return gcpDedicatedFiles, nil
++	}
++	klog.Infof("Regular GCP detected (region %q), using standard StorageClasses", region)
++	return regularFiles, nil
++}
++
++// withCustomLabels adds labels from Infrastructure.Status.PlatformStatus.GCP.ResourceLabels to the
++// driver command line as --extra-labels=<key1>=<value1>,<key2>=<value2>,...
++func withCustomLabels(c *clients.Clients) (dc.DeploymentHookFunc, []factory.Informer) {
++	hook := func(spec *opv1.OperatorSpec, deployment *appsv1.Deployment) error {
++		infraLister := c.GetInfraInformer().Lister()
++		infra, err := infraLister.Get(globalInfrastructureName)
++		if err != nil {
++			return err
++		}
++
++		var labels []string
++		if infra.Status.PlatformStatus != nil &&
++			infra.Status.PlatformStatus.GCP != nil &&
++			infra.Status.PlatformStatus.GCP.ResourceLabels != nil {
++			labels = make([]string, len(infra.Status.PlatformStatus.GCP.ResourceLabels))
++			for i, label := range infra.Status.PlatformStatus.GCP.ResourceLabels {
++				labels[i] = fmt.Sprintf("%s=%s", label.Key, label.Value)
++			}
++		}
++
++		labels = append(labels, fmt.Sprintf(ocpDefaultLabelFmt, infra.Status.InfrastructureName))
++		labelsStr := strings.Join(labels, ",")
++		labelsArg := fmt.Sprintf("--extra-labels=%s", labelsStr)
++		klog.V(5).Infof("withCustomLabels: adding extra-labels arg to driver with value %s", labelsStr)
++
++		for i := range deployment.Spec.Template.Spec.Containers {
++			container := &deployment.Spec.Template.Spec.Containers[i]
++			if container.Name != "csi-driver" {
++				continue
++			}
++			container.Args = append(container.Args, labelsArg)
++		}
++		return nil
++	}
++	informers := []factory.Informer{
++		c.GetInfraInformer().Informer(),
++	}
++	return hook, informers
++}
++
++// withCABundleDeploymentHook projects custom CA bundle ConfigMap into the CSI driver container
++func withCABundleDeploymentHook(c *clients.Clients) (dc.DeploymentHookFunc, []factory.Informer) {
++	hook := csidrivercontrollerservicecontroller.WithCABundleDeploymentHook(
++		c.ControlPlaneNamespace,
++		trustedCAConfigMap,
++		c.GetControlPlaneConfigMapInformer(c.ControlPlaneNamespace),
++	)
++	informers := []factory.Informer{
++		c.GetControlPlaneConfigMapInformer(c.ControlPlaneNamespace).Informer(),
++	}
++	return hook, informers
++}
++
++// withCABundleDaemonSetHook projects custom CA bundle ConfigMap into the CSI driver container
++func withCABundleDaemonSetHook(c *clients.Clients) (csidrivernodeservicecontroller.DaemonSetHookFunc, []factory.Informer) {
++	hook := csidrivernodeservicecontroller.WithCABundleDaemonSetHook(
++		c.GuestNamespace,
++		trustedCAConfigMap,
++		c.GetConfigMapInformer(c.GuestNamespace),
++	)
++	informers := []factory.Informer{
++		c.GetConfigMapInformer(c.GuestNamespace).Informer(),
++	}
++	return hook, informers
++}
++
++// withCustomResourceTags adds resource tags from infrastructure.status.platformStatus.gcp.resourceTags to the
++// driver command line as --extra-tags=<parent_id>/<tagKey_shortname>/<tagValue_shortname>,...
++func withCustomResourceTags(c *clients.Clients) (dc.DeploymentHookFunc, []factory.Informer) {
++	hook := func(spec *opv1.OperatorSpec, deployment *appsv1.Deployment) error {
++		infraLister := c.GetInfraInformer().Lister()
++		infra, err := infraLister.Get(globalInfrastructureName)
++		if err != nil {
++			return err
++		}
++
++		var tags []string
++		if infra.Status.PlatformStatus != nil &&
++			infra.Status.PlatformStatus.GCP != nil &&
++			infra.Status.PlatformStatus.GCP.ResourceTags != nil {
++			tags = make([]string, len(infra.Status.PlatformStatus.GCP.ResourceTags))
++			for i, tag := range infra.Status.PlatformStatus.GCP.ResourceTags {
++				tags[i] = fmt.Sprintf("%s/%s/%s", tag.ParentID, tag.Key, tag.Value)
++			}
++		}
++
++		if len(tags) <= 0 {
++			klog.V(5).Infof("withCustomResourceTags: user tags not configured, no changes made to driver args")
++			return nil
++		}
++
++		tagsStr := strings.Join(tags, ",")
++		tagsArg := fmt.Sprintf("--extra-tags=%s", tagsStr)
++		klog.V(5).Infof("withCustomResourceTags: adding extra-tags arg to driver with value %s", tagsStr)
++
++		for i := range deployment.Spec.Template.Spec.Containers {
++			container := &deployment.Spec.Template.Spec.Containers[i]
++			if container.Name != "csi-driver" {
++				continue
++			}
++			container.Args = append(container.Args, tagsArg)
++		}
++		return nil
++	}
++	informers := []factory.Informer{
++		c.GetInfraInformer().Informer(),
++	}
++	return hook, informers
++}
++
++// withClusterWideProxyHook adds the cluster-wide proxy config to the DaemonSet.
++func withClusterWideProxyDaemonSetHook(_ *clients.Clients) (csidrivernodeservicecontroller.DaemonSetHookFunc, []factory.Informer) {
++	hook := csidrivernodeservicecontroller.WithObservedProxyDaemonSetHook()
++	return hook, nil
++}
++
++// getKMSKeyHook checks for GCPCSIDriverConfigSpec in the ClusterCSIDriver object.
++// If it contains GCPKMSKeyReference, it sets the corresponding parameter in the SC.
++// This allows the admin to specify a customer managed key to be used by default.
++func getKMSKeyHook(c *clients.Clients) csistorageclasscontroller.StorageClassHookFunc {
++	return func(_ *opv1.OperatorSpec, class *storagev1.StorageClass) error {
++		ccdLister := c.OperatorInformers.Operator().V1().ClusterCSIDrivers().Lister()
++		ccd, err := ccdLister.Get(class.Provisioner)
++		if err != nil {
++			return err
++		}
++
++		driverConfig := ccd.Spec.DriverConfig
++		if driverConfig.DriverType != opv1.GCPDriverType || driverConfig.GCP == nil {
++			klog.V(4).Infof("No GCPCSIDriverConfigSpec defined for %s", class.Provisioner)
++			return nil
++		}
++
++		kmsKey := driverConfig.GCP.KMSKey
++		if kmsKey == nil {
++			klog.V(4).Infof("Not setting empty %s parameter in StorageClass %s", diskEncryptionKMSKey, class.Name)
++			return nil
++		}
++
++		if class.Parameters == nil {
++			class.Parameters = map[string]string{}
++		}
++		// location defaults to "global"
++		location := defaultKMSKeyLocation
++		if kmsKey.Location != "" {
++			location = kmsKey.Location
++		}
++		value := fmt.Sprintf("projects/%s/locations/%s/keyRings/%s/cryptoKeys/%s", kmsKey.ProjectID, location, kmsKey.KeyRing, kmsKey.Name)
++		klog.V(4).Infof("Setting %s = %s in StorageClass %s", diskEncryptionKMSKey, value, class.Name)
++		class.Parameters[diskEncryptionKMSKey] = value
++		return nil
++	}
++}
+diff --git a/pkg/driver/gcp-pd/storageclass_test.go b/pkg/driver/gcp-pd/storageclass_test.go
+new file mode 100644
+index 000000000..045446427
+--- /dev/null
++++ b/pkg/driver/gcp-pd/storageclass_test.go
+@@ -0,0 +1,129 @@
++package gcp_pd
++
++import (
++	"context"
++	"testing"
++	"time"
++
++	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
++
++	v1 "github.com/openshift/api/config/v1"
++	fakeconfig "github.com/openshift/client-go/config/clientset/versioned/fake"
++)
++
++func TestGetStorageClassFiles(t *testing.T) {
++	tests := []struct {
++		name          string
++		infra         *v1.Infrastructure
++		expectedFiles []string
++	}{
++		{
++			name: "regular GCP region",
++			infra: &v1.Infrastructure{
++				ObjectMeta: metav1.ObjectMeta{Name: "cluster"},
++				Status: v1.InfrastructureStatus{
++					PlatformStatus: &v1.PlatformStatus{
++						GCP: &v1.GCPPlatformStatus{
++							Region: "us-central1",
++						},
++					},
++				},
++			},
++			expectedFiles: []string{"storageclass.yaml", "storageclass_ssd.yaml"},
++		},
++		{
++			name: "regular GCP region europe",
++			infra: &v1.Infrastructure{
++				ObjectMeta: metav1.ObjectMeta{Name: "cluster"},
++				Status: v1.InfrastructureStatus{
++					PlatformStatus: &v1.PlatformStatus{
++						GCP: &v1.GCPPlatformStatus{
++							Region: "europe-west1",
++						},
++					},
++				},
++			},
++			expectedFiles: []string{"storageclass.yaml", "storageclass_ssd.yaml"},
++		},
++		{
++			name: "GCP Dedicated region",
++			infra: &v1.Infrastructure{
++				ObjectMeta: metav1.ObjectMeta{Name: "cluster"},
++				Status: v1.InfrastructureStatus{
++					PlatformStatus: &v1.PlatformStatus{
++						GCP: &v1.GCPPlatformStatus{
++							Region: "u-germany-northeast1",
++						},
++					},
++				},
++			},
++			expectedFiles: []string{"storageclass_hyperdisk_balanced.yaml"},
++		},
++		{
++			name: "empty region defaults to regular GCP",
++			infra: &v1.Infrastructure{
++				ObjectMeta: metav1.ObjectMeta{Name: "cluster"},
++				Status: v1.InfrastructureStatus{
++					PlatformStatus: &v1.PlatformStatus{
++						GCP: &v1.GCPPlatformStatus{
++							Region: "",
++						},
++					},
++				},
++			},
++			expectedFiles: []string{"storageclass.yaml", "storageclass_ssd.yaml"},
++		},
++		{
++			name: "nil GCP status defaults to regular GCP",
++			infra: &v1.Infrastructure{
++				ObjectMeta: metav1.ObjectMeta{Name: "cluster"},
++				Status: v1.InfrastructureStatus{
++					PlatformStatus: &v1.PlatformStatus{},
++				},
++			},
++			expectedFiles: []string{"storageclass.yaml", "storageclass_ssd.yaml"},
++		},
++		{
++			name: "nil PlatformStatus defaults to regular GCP",
++			infra: &v1.Infrastructure{
++				ObjectMeta: metav1.ObjectMeta{Name: "cluster"},
++				Status:     v1.InfrastructureStatus{},
++			},
++			expectedFiles: []string{"storageclass.yaml", "storageclass_ssd.yaml"},
++		},
++	}
++
++	for _, test := range tests {
++		t.Run(test.name, func(t *testing.T) {
++			configClient := fakeconfig.NewSimpleClientset(test.infra)
++			ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
++			defer cancel()
++
++			files, err := getStorageClassFiles(ctx, configClient)
++			if err != nil {
++				t.Fatalf("unexpected error: %v", err)
++			}
++
++			if len(files) != len(test.expectedFiles) {
++				t.Fatalf("expected %d files, got %d: %v", len(test.expectedFiles), len(files), files)
++			}
++			for i, f := range files {
++				if f != test.expectedFiles[i] {
++					t.Errorf("file[%d]: expected %q, got %q", i, test.expectedFiles[i], f)
++				}
++			}
++		})
++	}
++}
++
++func TestGetStorageClassFilesNoInfrastructure(t *testing.T) {
++	configClient := fakeconfig.NewSimpleClientset()
++	// Use a short timeout so the retry loop finishes quickly in tests.
++	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
++	defer cancel()
++
++	_, err := getStorageClassFiles(ctx, configClient)
++	if err == nil {
++		t.Fatal("expected error when Infrastructure CR does not exist, got nil")
++	}
++}
+diff --git a/pkg/driver/gcp-pd/storageclasshook_test.go b/pkg/driver/gcp-pd/storageclasshook_test.go
+new file mode 100644
+index 000000000..472cee4c9
+--- /dev/null
++++ b/pkg/driver/gcp-pd/storageclasshook_test.go
+@@ -0,0 +1,198 @@
++package gcp_pd
++
++import (
++	"fmt"
++	"testing"
++
++	"github.com/google/go-cmp/cmp"
++	opv1 "github.com/openshift/api/operator/v1"
++	fakeoperator "github.com/openshift/client-go/operator/clientset/versioned/fake"
++	"github.com/openshift/csi-operator/pkg/clients"
++	storagev1 "k8s.io/api/storage/v1"
++	"k8s.io/apimachinery/pkg/api/equality"
++	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
++)
++
++const (
++	provisionerName = "pd.csi.storage.gke.io"
++	testProject     = "test-project"
++	testLocation    = "earth"
++	testKeyRing     = "test-keyring"
++	testKMSName     = "test-kms"
++)
++
++func getExpectedSCParam(proj string, loc string, ring string, name string) string {
++	return fmt.Sprintf("projects/%s/locations/%s/keyRings/%s/cryptoKeys/%s", proj, loc, ring, name)
++}
++
++func sc() *storagev1.StorageClass {
++	return &storagev1.StorageClass{
++		ObjectMeta: metav1.ObjectMeta{
++			Annotations: nil,
++		},
++		Parameters: map[string]string{
++			"type":             "pd-standard",
++			"replication-type": "none",
++		},
++		Provisioner: provisionerName,
++	}
++}
++
++func withParameters(sc *storagev1.StorageClass, keysAndValues ...string) *storagev1.StorageClass {
++	for i := 0; i < len(keysAndValues); i += 2 {
++		sc.Parameters[keysAndValues[i]] = keysAndValues[i+1]
++	}
++	return sc
++}
++
++func TestStorageClassHook(t *testing.T) {
++	tests := []struct {
++		name        string
++		driver      *opv1.ClusterCSIDriver
++		inputSC     *storagev1.StorageClass
++		expectedSC  *storagev1.StorageClass
++		expectError bool
++	}{
++		{
++			name: "invalid provisioner",
++			driver: &opv1.ClusterCSIDriver{
++				Spec: opv1.ClusterCSIDriverSpec{},
++			},
++			inputSC: &storagev1.StorageClass{
++				Provisioner: "invalid-provisioner",
++			},
++			expectedSC: &storagev1.StorageClass{
++				Provisioner: "invalid-provisioner",
++			},
++			expectError: true,
++		},
++		{
++			name: "no driver config",
++			driver: &opv1.ClusterCSIDriver{
++				ObjectMeta: metav1.ObjectMeta{
++					Name: string(opv1.GCPPDCSIDriver),
++				},
++				Spec: opv1.ClusterCSIDriverSpec{},
++			},
++			inputSC:    sc(),
++			expectedSC: sc(),
++		},
++		{
++			name: "driver config with irrelevant type",
++			driver: &opv1.ClusterCSIDriver{
++				ObjectMeta: metav1.ObjectMeta{
++					Name: string(opv1.GCPPDCSIDriver),
++				},
++				Spec: opv1.ClusterCSIDriverSpec{
++					DriverConfig: opv1.CSIDriverConfigSpec{
++						DriverType: opv1.AWSDriverType,
++					},
++				},
++			},
++			inputSC:    sc(),
++			expectedSC: sc(),
++		},
++		{
++			name: "driver config with no spec",
++			driver: &opv1.ClusterCSIDriver{
++				ObjectMeta: metav1.ObjectMeta{
++					Name: string(opv1.GCPPDCSIDriver),
++				},
++				Spec: opv1.ClusterCSIDriverSpec{
++					DriverConfig: opv1.CSIDriverConfigSpec{
++						DriverType: opv1.GCPDriverType,
++					},
++				},
++			},
++			inputSC:    sc(),
++			expectedSC: sc(),
++		},
++		{
++			name: "driver config with nil KMSKey",
++			driver: &opv1.ClusterCSIDriver{
++				ObjectMeta: metav1.ObjectMeta{
++					Name: string(opv1.GCPPDCSIDriver),
++				},
++				Spec: opv1.ClusterCSIDriverSpec{
++					DriverConfig: opv1.CSIDriverConfigSpec{
++						DriverType: opv1.GCPDriverType,
++						GCP: &opv1.GCPCSIDriverConfigSpec{
++							KMSKey: nil,
++						},
++					},
++				},
++			},
++			inputSC:    sc(),
++			expectedSC: sc(),
++		},
++		{
++			name: "with disk-encryption-kms-key in SC",
++			driver: &opv1.ClusterCSIDriver{
++				ObjectMeta: metav1.ObjectMeta{
++					Name: string(opv1.GCPPDCSIDriver),
++				},
++				Spec: opv1.ClusterCSIDriverSpec{
++					DriverConfig: opv1.CSIDriverConfigSpec{
++						DriverType: opv1.GCPDriverType,
++						GCP: &opv1.GCPCSIDriverConfigSpec{
++							KMSKey: &opv1.GCPKMSKeyReference{
++								ProjectID: testProject,
++								Location:  testLocation,
++								KeyRing:   testKeyRing,
++								Name:      testKMSName,
++							},
++						},
++					},
++				},
++			},
++			inputSC:    sc(),
++			expectedSC: withParameters(sc(), diskEncryptionKMSKey, getExpectedSCParam(testProject, testLocation, testKeyRing, testKMSName)),
++		},
++		{
++			name: "with disk-encryption-kms-key in SC, default location",
++			driver: &opv1.ClusterCSIDriver{
++				ObjectMeta: metav1.ObjectMeta{
++					Name: string(opv1.GCPPDCSIDriver),
++				},
++				Spec: opv1.ClusterCSIDriverSpec{
++					DriverConfig: opv1.CSIDriverConfigSpec{
++						DriverType: opv1.GCPDriverType,
++						GCP: &opv1.GCPCSIDriverConfigSpec{
++							KMSKey: &opv1.GCPKMSKeyReference{
++								ProjectID: testProject,
++								KeyRing:   testKeyRing,
++								Name:      testKMSName,
++							},
++						},
++					},
++				},
++			},
++			inputSC:    sc(),
++			expectedSC: withParameters(sc(), diskEncryptionKMSKey, getExpectedSCParam(testProject, "global", testKeyRing, testKMSName)),
++		},
++	}
++
++	for _, test := range tests {
++		test := test
++		t.Run(test.name, func(t *testing.T) {
++			c := clients.NewFakeClients("clusters-test", test.driver)
++			c.OperatorInformers.Operator().V1().ClusterCSIDrivers().Informer().GetStore().Add(test.driver)
++			c.OperatorClientSet.(*fakeoperator.Clientset).Tracker().Add(test.driver)
++
++			hook := getKMSKeyHook(c)
++			clients.SyncFakeInformers(t, c)
++
++			err := hook(nil, test.inputSC)
++
++			if err != nil && !test.expectError {
++				t.Errorf("got unexpected error: %s", err)
++			}
++			if err == nil && test.expectError {
++				t.Errorf("expected error, got none")
++			}
++			if !equality.Semantic.DeepEqual(test.expectedSC, test.inputSC) {
++				t.Errorf("Unexpected StorageClass content:\n%s", cmp.Diff(test.expectedSC, test.inputSC))
++			}
++		})
++	}
++}
+diff --git a/pkg/generated-assets/generated_assets.go b/pkg/generated-assets/generated_assets.go
+index 3c6adc818..e4ea7e90b 100644
+--- a/pkg/generated-assets/generated_assets.go
++++ b/pkg/generated-assets/generated_assets.go
+@@ -52,6 +52,9 @@ type CSIDriverAssets struct {
+ 	GuestAssets map[string][]byte
+ 
+ 	replacer *strings.Replacer
++
++	// StorageClassSelector defines which StorageClass assets to apply. The arg is the name of yaml file.
++	StorageClassSelector func(string) bool
+ }
+ 
+ // GetAsset returns the asset with the given name.
+@@ -132,7 +135,9 @@ func (a *CSIDriverAssets) GetStorageClassAssetNames() []string {
+ 			panic(err)
+ 		}
+ 		if kind == storageClassKind {
+-			names = append(names, name)
++			if a.StorageClassSelector == nil || a.StorageClassSelector(name) {
++				names = append(names, name)
++			}
+ 		}
+ 	}
+ 	return names
+diff --git a/pkg/operator/config/config.go b/pkg/operator/config/config.go
+index a3dbf9fbb..8004f7b8d 100644
+--- a/pkg/operator/config/config.go
++++ b/pkg/operator/config/config.go
+@@ -70,6 +70,9 @@ type OperatorControllerConfig struct {
+ 	// No informers here, because StorageClassController does not accept any.
+ 	StorageClassHooks []csistorageclasscontroller.StorageClassHookFunc
+ 
++	// StorageClassSelector defines which StorageClass assets to apply. The arg is the name of yaml file.
++	StorageClassSelector func(string) bool
++
+ 	VolumeSnapshotClassHooks []volume_snapshot_class.VolumeSnapshotClassHookFunc
+ 
+ 	// ExtraReplacements defines additional replacements that should be made to assets
+diff --git a/pkg/operator/starter.go b/pkg/operator/starter.go
+index c06afd3a4..5094526d3 100644
+--- a/pkg/operator/starter.go
++++ b/pkg/operator/starter.go
+@@ -82,6 +82,8 @@ func RunOperator(ctx context.Context, controllerConfig *controllercmd.Controller
+ 
+ 	a.SetReplacements(defaultReplacements)
+ 
++	a.StorageClassSelector = csiOperatorControllerConfig.StorageClassSelector
++
+ 	// Start controllers that manage resources in the MANAGEMENT cluster.
+ 	controlPlaneControllerInformers := csiOperatorControllerConfig.DeploymentInformers
+ 	controllerHooks := csiOperatorControllerConfig.DeploymentHooks

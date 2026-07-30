@@ -1,0 +1,269 @@
+diff --git a/pkg/controllers/crdcompatibility/crdcompatibility_webhook.go b/pkg/controllers/crdcompatibility/crdcompatibility_webhook.go
+index ff5d413b48..900b4df047 100644
+--- a/pkg/controllers/crdcompatibility/crdcompatibility_webhook.go
++++ b/pkg/controllers/crdcompatibility/crdcompatibility_webhook.go
+@@ -169,8 +169,18 @@ func validateCompatibilitySchema(ctx context.Context, fldPath *field.Path, compa
+ func validateCompatibilitySchemaCustomResourceDefinition(ctx context.Context, fldPath *field.Path, compatibilitySchema apiextensionsv1alpha1.CompatibilitySchema) (*apiextensionsv1.CustomResourceDefinition, field.ErrorList) {
+ 	// Parse the CRD in compatibilityCRD into a CRD object.
+ 	compatibilityCRD := &apiextensionsv1.CustomResourceDefinition{}
+-	if err := yaml.Unmarshal([]byte(compatibilitySchema.CustomResourceDefinition.Data), &compatibilityCRD); err != nil {
+-		return nil, field.ErrorList{field.Invalid(fldPath.Child("data"), compatibilitySchema.CustomResourceDefinition.Data, fmt.Errorf("%w: %w", errInvalidCompatibilityCRD, err).Error())}
++
++	switch compatibilitySchema.CustomResourceDefinition.Type {
++	case apiextensionsv1alpha1.CRDDataTypeYAML:
++		if err := yaml.Unmarshal([]byte(compatibilitySchema.CustomResourceDefinition.Data), &compatibilityCRD); err != nil {
++			return nil, field.ErrorList{field.Invalid(fldPath.Child("data"), compatibilitySchema.CustomResourceDefinition.Data, fmt.Errorf("%w: %w", errInvalidCompatibilityCRD, err).Error())}
++		}
++	default:
++		return nil, field.ErrorList{field.NotSupported(
++			fldPath.Child("type"),
++			compatibilitySchema.CustomResourceDefinition.Type,
++			[]string{string(apiextensionsv1alpha1.CRDDataTypeYAML)},
++		)}
+ 	}
+ 
+ 	if compatibilityCRD.APIVersion != "apiextensions.k8s.io/v1" || compatibilityCRD.Kind != "CustomResourceDefinition" {
+diff --git a/pkg/controllers/crdcompatibility/crdcompatibility_webhook_test.go b/pkg/controllers/crdcompatibility/crdcompatibility_webhook_test.go
+index d070e6f390..97060c9d8e 100644
+--- a/pkg/controllers/crdcompatibility/crdcompatibility_webhook_test.go
++++ b/pkg/controllers/crdcompatibility/crdcompatibility_webhook_test.go
+@@ -102,6 +102,16 @@ func TestCRDRequirementValidator_ValidateCreate(t *testing.T) {
+ 			}(),
+ 			wantErr: MatchError(ContainSubstring("spec.group: Required value, spec.scope: Required value, spec.versions: Invalid value: null: must have exactly one version marked as storage version, spec.names.plural: Required value, spec.names.singular: Required value, spec.names.kind: Required value, spec.names.listKind: Required value, status.storedVersions: Invalid value: null: must have at least one stored version")),
+ 		},
++		{
++			name: "should reject CompatibilityRequirement with unsupported CRDData type",
++			obj: func() *apiextensionsv1alpha1.CompatibilityRequirement {
++				req := test.GenerateTestCompatibilityRequirement(testCRD)
++				req.Spec.CompatibilitySchema.CustomResourceDefinition.Type = "UNSUPPORTED"
++
++				return req
++			}(),
++			wantErr: MatchError(ContainSubstring("Unsupported value: \"UNSUPPORTED\": supported values: \"YAML\"")),
++		},
+ 	}
+ 
+ 	for _, tt := range tests {
+diff --git a/pkg/controllers/crdcompatibility/crdvalidation/crdvalidator_webhook.go b/pkg/controllers/crdcompatibility/crdvalidation/crdvalidator_webhook.go
+index ef8e7b4554..5314492f76 100644
+--- a/pkg/controllers/crdcompatibility/crdvalidation/crdvalidator_webhook.go
++++ b/pkg/controllers/crdcompatibility/crdvalidation/crdvalidator_webhook.go
+@@ -40,11 +40,12 @@ import (
+ 
+ var (
+ 	// ErrCRDHasRequirements is the error which signals a deletion of a CRD is disallowed.
+-	ErrCRDHasRequirements    = errors.New("cannot delete CRD because it has CompatibilityRequirements")
+-	errCRDNotCompatible      = errors.New("CRD is not compatible with CompatibilityRequirements")
+-	errUnknownCRDAdmitAction = errors.New("unknown value for CompatibilityRequirement.spec.customResourceDefinitionSchemaValidation.action")
+-	errPathNotFound          = errors.New("path not found in schema")
+-	errVersionNoSchema       = errors.New("version does not have a schema")
++	ErrCRDHasRequirements     = errors.New("cannot delete CRD because it has CompatibilityRequirements")
++	errCRDNotCompatible       = errors.New("CRD is not compatible with CompatibilityRequirements")
++	errUnknownCRDAdmitAction  = errors.New("unknown value for CompatibilityRequirement.spec.customResourceDefinitionSchemaValidation.action")
++	errPathNotFound           = errors.New("path not found in schema")
++	errVersionNoSchema        = errors.New("version does not have a schema")
++	errUnsupportedCRDDataType = errors.New("unsupported CRDData type")
+ )
+ 
+ // NewValidator returns a partially initialised Validator.
+@@ -97,8 +98,17 @@ func (v *Validator) validateCreateOrUpdate(ctx context.Context, crd *apiextensio
+ 		}
+ 
+ 		compatibilityCRD := &apiextensionsv1.CustomResourceDefinition{}
+-		if err := yaml.Unmarshal([]byte(compatibilityRequirement.Spec.CompatibilitySchema.CustomResourceDefinition.Data), compatibilityCRD); err != nil {
+-			return nil, fmt.Errorf("failed to parse compatibilityCRD for CompatibilityRequirement %q: %w", compatibilityRequirement.Name, err)
++
++		switch compatibilityRequirement.Spec.CompatibilitySchema.CustomResourceDefinition.Type {
++		case apiextensionsv1alpha1.CRDDataTypeYAML:
++			if err := yaml.Unmarshal([]byte(compatibilityRequirement.Spec.CompatibilitySchema.CustomResourceDefinition.Data), compatibilityCRD); err != nil {
++				return nil, fmt.Errorf("failed to parse compatibilityCRD for CompatibilityRequirement %q: %w", compatibilityRequirement.Name, err)
++			}
++		default:
++			return nil, fmt.Errorf("%w: %q for CompatibilityRequirement %q",
++				errUnsupportedCRDDataType,
++				compatibilityRequirement.Spec.CompatibilitySchema.CustomResourceDefinition.Type,
++				compatibilityRequirement.Name)
+ 		}
+ 
+ 		prunedCRD, err := pruneExcludedFields(compatibilityCRD, compatibilityRequirement.Spec.CompatibilitySchema.ExcludedFields)
+diff --git a/pkg/controllers/crdcompatibility/crdvalidation/crdvalidator_webhook_test.go b/pkg/controllers/crdcompatibility/crdvalidation/crdvalidator_webhook_test.go
+index 33944c4e80..7ba5e8f36e 100644
+--- a/pkg/controllers/crdcompatibility/crdvalidation/crdvalidator_webhook_test.go
++++ b/pkg/controllers/crdcompatibility/crdvalidation/crdvalidator_webhook_test.go
+@@ -210,6 +210,21 @@ func Test_crdValidator_validateCreateOrUpdate(t *testing.T) {
+ 			wantWarnings: BeNil(),
+ 			wantErr:      MatchError("unknown value for CompatibilityRequirement.spec.customResourceDefinitionSchemaValidation.action: \"Invalid\" for requirement test-invalid-action"),
+ 		},
++		{
++			name: "Should reject a CRD when a CompatibilityRequirement has an unsupported CRDData type",
++			obj:  testCRDWorking.DeepCopy(),
++			requirements: []client.Object{
++				func() *apiextensionsv1alpha1.CompatibilityRequirement {
++					r := test.GenerateTestCompatibilityRequirement(testCRDWorking.DeepCopy())
++					r.Spec.CompatibilitySchema.CustomResourceDefinition.Type = "UNSUPPORTED"
++					r.Name = "test-unsupported-type"
++
++					return r
++				}(),
++			},
++			wantWarnings: BeNil(),
++			wantErr:      MatchError(Equal("unsupported CRDData type: \"UNSUPPORTED\" for CompatibilityRequirement \"test-unsupported-type\"")),
++		},
+ 	}
+ 	for _, tt := range tests {
+ 		t.Run(tt.name, func(t *testing.T) {
+diff --git a/pkg/controllers/crdcompatibility/objectpruning/validator_unit_test.go b/pkg/controllers/crdcompatibility/objectpruning/validator_unit_test.go
+index 7fe4aedb56..aca72aa788 100644
+--- a/pkg/controllers/crdcompatibility/objectpruning/validator_unit_test.go
++++ b/pkg/controllers/crdcompatibility/objectpruning/validator_unit_test.go
+@@ -98,6 +98,18 @@ var _ = Describe("validator", func() {
+ 				Expect(err).To(MatchError(ContainSubstring("failed to get structural schema: failed to decode compatibility schema data for CompatibilityRequirement \"\": yaml: mapping values are not allowed in this context")))
+ 			})
+ 		})
++
++		Context("when CRDData type is unsupported", func() {
++			It("should return error", func() {
++				unsupportedRequirement := compatibilityRequirement.DeepCopy()
++				unsupportedRequirement.Spec.CompatibilitySchema.CustomResourceDefinition.Type = "UNSUPPORTED"
++				validator := createValidatorWithFakeClient([]client.Object{unsupportedRequirement})
++
++				_, err := validator.getStructuralSchema(unsupportedRequirement, "v1")
++
++				Expect(err).To(MatchError("failed to get structural schema: unsupported CRDData type: \"UNSUPPORTED\" for CompatibilityRequirement \"\""))
++			})
++		})
+ 	})
+ })
+ 
+diff --git a/pkg/controllers/crdcompatibility/objectpruning/webhook.go b/pkg/controllers/crdcompatibility/objectpruning/webhook.go
+index 8b7292f3a2..ca0848f214 100644
+--- a/pkg/controllers/crdcompatibility/objectpruning/webhook.go
++++ b/pkg/controllers/crdcompatibility/objectpruning/webhook.go
+@@ -41,8 +41,9 @@ import (
+ )
+ 
+ var (
+-	errObjectValidator      = errors.New("failed to create the object schema")
+-	errUnexpectedObjectType = errors.New("unexpected object type")
++	errObjectValidator        = errors.New("failed to create the object schema")
++	errUnexpectedObjectType   = errors.New("unexpected object type")
++	errUnsupportedCRDDataType = errors.New("unsupported CRDData type")
+ )
+ 
+ const (
+@@ -197,6 +198,18 @@ func (v *validator) storeStructuralSchemaInCache(compatibilityRequirement *apiex
+ }
+ 
+ func (v *validator) getCompatibilityRequirementStructuralSchema(compatibilityRequirement *apiextensionsv1alpha1.CompatibilityRequirement, version string) (*structuralschema.Structural, error) {
++	switch compatibilityRequirement.Spec.CompatibilitySchema.CustomResourceDefinition.Type {
++	case apiextensionsv1alpha1.CRDDataTypeYAML:
++		return v.getCompatibilityRequirementStructuralSchemaFromYAML(compatibilityRequirement, version)
++	default:
++		return nil, fmt.Errorf("%w: %q for CompatibilityRequirement %q",
++			errUnsupportedCRDDataType,
++			compatibilityRequirement.Spec.CompatibilitySchema.CustomResourceDefinition.Type,
++			compatibilityRequirement.Name)
++	}
++}
++
++func (v *validator) getCompatibilityRequirementStructuralSchemaFromYAML(compatibilityRequirement *apiextensionsv1alpha1.CompatibilityRequirement, version string) (*structuralschema.Structural, error) {
+ 	// Extract the CRD so we can use the schema.
+ 	// Use a universal deserializer as it correctly handles YAML and JSON decoding based on the expected key formatting for CRDs.
+ 	// N.B. DO NOT switch this to a YAML library - they do not correctly handle the OpenAPIV3Schema casing within the CRD version schema.
+diff --git a/pkg/controllers/crdcompatibility/objectvalidation/validator_unit_test.go b/pkg/controllers/crdcompatibility/objectvalidation/validator_unit_test.go
+index f2965d3a5a..dd7f7e98bb 100644
+--- a/pkg/controllers/crdcompatibility/objectvalidation/validator_unit_test.go
++++ b/pkg/controllers/crdcompatibility/objectvalidation/validator_unit_test.go
+@@ -118,6 +118,18 @@ var _ = Describe("validator", func() {
+ 				Expect(err).To(MatchError("failed to create validation strategy: failed to decode compatibility schema data for CompatibilityRequirement \"\": yaml: mapping values are not allowed in this context"))
+ 			})
+ 		})
++
++		Context("when CRDData type is unsupported", func() {
++			It("should return error", func() {
++				unsupportedRequirement := compatibilityRequirement.DeepCopy()
++				unsupportedRequirement.Spec.CompatibilitySchema.CustomResourceDefinition.Type = "UNSUPPORTED"
++				validator := createValidatorWithFakeClient([]client.Object{unsupportedRequirement})
++
++				_, err := validator.getValidationStrategy(unsupportedRequirement, "v1")
++
++				Expect(err).To(MatchError("failed to create validation strategy: unsupported CRDData type: \"UNSUPPORTED\" for CompatibilityRequirement \"\""))
++			})
++		})
+ 	})
+ 
+ 	Describe("validation strategy caching", func() {
+diff --git a/pkg/controllers/crdcompatibility/objectvalidation/webhook.go b/pkg/controllers/crdcompatibility/objectvalidation/webhook.go
+index 47f5fcc80d..99b91b2bc9 100644
+--- a/pkg/controllers/crdcompatibility/objectvalidation/webhook.go
++++ b/pkg/controllers/crdcompatibility/objectvalidation/webhook.go
+@@ -55,9 +55,10 @@ const (
+ )
+ 
+ var (
+-	errObjectValidator       = errors.New("failed to create the object validator")
+-	errUnexpectedObjectType  = errors.New("unexpected object type")
+-	errUnknownCRDAdmitAction = errors.New("unknown CRD admit action")
++	errObjectValidator        = errors.New("failed to create the object validator")
++	errUnexpectedObjectType   = errors.New("unexpected object type")
++	errUnknownCRDAdmitAction  = errors.New("unknown CRD admit action")
++	errUnsupportedCRDDataType = errors.New("unsupported CRDData type")
+ )
+ 
+ var _ admission.Handler = &validator{}
+@@ -260,10 +261,22 @@ func (v *validator) storeValidationStrategyInCache(compatibilityRequirement *api
+ 	}
+ }
+ 
++func (v *validator) createVersionedStrategy(compatibilityRequirement *apiextensionsv1alpha1.CompatibilityRequirement, version string) (rest.RESTCreateUpdateStrategy, error) {
++	switch compatibilityRequirement.Spec.CompatibilitySchema.CustomResourceDefinition.Type {
++	case apiextensionsv1alpha1.CRDDataTypeYAML:
++		return v.createVersionedStrategyFromYAML(compatibilityRequirement, version)
++	default:
++		return nil, fmt.Errorf("%w: %q for CompatibilityRequirement %q",
++			errUnsupportedCRDDataType,
++			compatibilityRequirement.Spec.CompatibilitySchema.CustomResourceDefinition.Type,
++			compatibilityRequirement.Name)
++	}
++}
++
+ // https://github.com/kubernetes/kubernetes/blob/ebc1ccc491c944fa0633f147698e0dc02675051d/staging/src/k8s.io/apiextensions-apiserver/pkg/registry/customresource/strategy.go#L76
+ //
+ //nolint:cyclop,funlen // This is copied so ignore linting issues
+-func (v *validator) createVersionedStrategy(compatibilityRequirement *apiextensionsv1alpha1.CompatibilityRequirement, version string) (rest.RESTCreateUpdateStrategy, error) {
++func (v *validator) createVersionedStrategyFromYAML(compatibilityRequirement *apiextensionsv1alpha1.CompatibilityRequirement, version string) (rest.RESTCreateUpdateStrategy, error) {
+ 	// Extract the CRD so we can use the schema.
+ 	// Use a universal deserializer as it correctly handles YAML and JSON decoding based on the expected key formatting for CRDs.
+ 	// N.B. DO NOT switch this to a YAML library - they do not correctly handle the OpenAPIV3Schema casing within the CRD version schema.
+diff --git a/pkg/controllers/crdcompatibility/reconcile.go b/pkg/controllers/crdcompatibility/reconcile.go
+index 3e435ed0d4..af86b8e860 100644
+--- a/pkg/controllers/crdcompatibility/reconcile.go
++++ b/pkg/controllers/crdcompatibility/reconcile.go
+@@ -51,6 +51,7 @@ const (
+ 
+ var (
+ 	errWebhookConfigNotControlledByCompatibilityRequirement = reconcile.TerminalError(errors.New("webhook config is not controlled by CompatibilityRequirement")) //nolint:err113
++	errUnsupportedCRDDataType                               = errors.New("unsupported CRDData type")
+ )
+ 
+ type reconcileState struct {
+@@ -102,8 +103,17 @@ func (r *reconcileState) reconcile(ctx context.Context, compatibilityRequirement
+ func (r *reconcileState) parseCompatibilityCRD(compatibilityRequirement *apiextensionsv1alpha1.CompatibilityRequirement) error {
+ 	// Parse the CRD in compatibilityCRD into a CRD object
+ 	compatibilityCRD := &apiextensionsv1.CustomResourceDefinition{}
+-	if err := yaml.Unmarshal([]byte(compatibilityRequirement.Spec.CompatibilitySchema.CustomResourceDefinition.Data), compatibilityCRD); err != nil {
+-		return util.TerminalWithReasonError(fmt.Errorf("failed to parse compatibilityCRD: %w", err), terminalErrorReasonConfigurationError) //nolint:wrapcheck
++
++	switch compatibilityRequirement.Spec.CompatibilitySchema.CustomResourceDefinition.Type {
++	case apiextensionsv1alpha1.CRDDataTypeYAML:
++		if err := yaml.Unmarshal([]byte(compatibilityRequirement.Spec.CompatibilitySchema.CustomResourceDefinition.Data), compatibilityCRD); err != nil {
++			return util.TerminalWithReasonError(fmt.Errorf("failed to parse compatibilityCRD: %w", err), terminalErrorReasonConfigurationError) //nolint:wrapcheck
++		}
++	default:
++		return util.TerminalWithReasonError( //nolint:wrapcheck
++			fmt.Errorf("%w: %q", errUnsupportedCRDDataType, compatibilityRequirement.Spec.CompatibilitySchema.CustomResourceDefinition.Type),
++			terminalErrorReasonConfigurationError,
++		)
+ 	}
+ 
+ 	r.compatibilityCRD = compatibilityCRD

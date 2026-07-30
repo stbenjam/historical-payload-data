@@ -1,0 +1,1343 @@
+diff --git a/go.mod b/go.mod
+index 30c601976..667a84753 100644
+--- a/go.mod
++++ b/go.mod
+@@ -129,4 +129,4 @@ require (
+ 	sigs.k8s.io/yaml v1.6.0 // indirect
+ )
+ 
+-replace k8s.io/apiserver => github.com/openshift/kubernetes-apiserver v0.0.0-20260227052614-9120debab75e // points to openshift-apiserver-4.22-kubernetes-1.35.2
++replace k8s.io/apiserver => github.com/openshift/kubernetes-apiserver v0.0.0-20260724190151-8aa3459a8bba // points to openshift-apiserver-4.22-kubernetes-1.35.2
+diff --git a/go.sum b/go.sum
+index 0a64231fb..f159bc5f1 100644
+--- a/go.sum
++++ b/go.sum
+@@ -196,8 +196,8 @@ github.com/openshift/build-machinery-go v0.0.0-20251023084048-5d77c1a5e5af h1:Ui
+ github.com/openshift/build-machinery-go v0.0.0-20251023084048-5d77c1a5e5af/go.mod h1:8jcm8UPtg2mCAsxfqKil1xrmRMI3a+XU2TZ9fF8A7TE=
+ github.com/openshift/client-go v0.0.0-20260703082747-24d059aea27a h1:RfmstmmWz5/23/Tt8gBipICzC1VHQLgGBeQUQ1aWoUA=
+ github.com/openshift/client-go v0.0.0-20260703082747-24d059aea27a/go.mod h1:fNuXvm6bMJff2AxiRb9CR5L3a9CLzVgcoSmHZ3l7FgU=
+-github.com/openshift/kubernetes-apiserver v0.0.0-20260227052614-9120debab75e h1:jbEKWzA6Oh7xKOkWYgeFzI40VYecQCFuKq4YtK8Gsko=
+-github.com/openshift/kubernetes-apiserver v0.0.0-20260227052614-9120debab75e/go.mod h1:CROJUAu0tfjZLyYgSeBsBan2T7LUJGh0ucWwTCSSk7g=
++github.com/openshift/kubernetes-apiserver v0.0.0-20260724190151-8aa3459a8bba h1:HFVoiF5cSXPcRrUb/KuMHVBlGLMfJq/GsQDbMfBWlHU=
++github.com/openshift/kubernetes-apiserver v0.0.0-20260724190151-8aa3459a8bba/go.mod h1:CROJUAu0tfjZLyYgSeBsBan2T7LUJGh0ucWwTCSSk7g=
+ github.com/openshift/library-go v0.0.0-20260713084045-a99049bdd190 h1:gz2C+rsMNTbPDgF4KDl2pOgoLqpXN6z152Mfy+5lh5E=
+ github.com/openshift/library-go v0.0.0-20260713084045-a99049bdd190/go.mod h1:8d0qQEDq2kpIZmaE1tKpvZ4pLeQZT+mW2JpqAh3iZIc=
+ github.com/openshift/osin v1.0.2-0.20220317075346-0f4d38c6e53f h1:4da9vH8eDlJo58703cADj3FlsdnFRgsnfuwj/4lYXfY=
+diff --git a/pkg/groupmapper/groupmapper_test.go b/pkg/groupmapper/groupmapper_test.go
+index f945aec93..edcdc2e94 100644
+--- a/pkg/groupmapper/groupmapper_test.go
++++ b/pkg/groupmapper/groupmapper_test.go
+@@ -3,9 +3,9 @@ package groupmapper
+ import (
+ 	"context"
+ 	"fmt"
+-	"os"
+ 	"reflect"
+ 	"slices"
++	"sync"
+ 	"testing"
+ 	"time"
+ 
+@@ -19,6 +19,7 @@ import (
+ 	"k8s.io/apimachinery/pkg/util/sets"
+ 	"k8s.io/apimachinery/pkg/watch"
+ 	kuser "k8s.io/apiserver/pkg/authentication/user"
++	k8stesting "k8s.io/client-go/testing"
+ 	"k8s.io/client-go/tools/cache"
+ 
+ 	userv1 "github.com/openshift/api/user/v1"
+@@ -30,15 +31,6 @@ import (
+ 	authapi "github.com/openshift/oauth-server/pkg/api"
+ )
+ 
+-// The WatchListClient feature gate (default-on in k8s 1.35) makes informer
+-// reflectors use streaming lists that require bookmark events from the server.
+-// The generated informer's ListWatch doesn't propagate the fake client's
+-// IsWatchListSemanticsUnSupported signal to the reflector, so disable it.
+-func TestMain(m *testing.M) {
+-	os.Setenv("KUBE_FEATURE_WatchListClient", "false")
+-	os.Exit(m.Run())
+-}
+-
+ const testIDPName = "test-idp"
+ 
+ type mockUserMapper struct {
+@@ -89,25 +81,54 @@ func TestUserGroupsMapper_UserFor(t *testing.T) {
+ 		t.Run(tt.name, func(t *testing.T) {
+ 
+ 			groupObjs := []runtime.Object{}
+-			indexer := cache.NewIndexer(cache.MetaNamespaceKeyFunc, cache.Indexers{})
+ 			for _, g := range basicGroups {
+ 				groupObjs = append(groupObjs, g)
+-				require.NoError(t, indexer.Add(g))
+ 			}
+ 			fakeGroupsClient := fakeuserclient.NewSimpleClientset(groupObjs...)
++			// Add watch reactor to send initial bookmark event for k8s 1.35+
++			var once sync.Once
++			fakeGroupsClient.PrependWatchReactor("groups", func(action k8stesting.Action) (handled bool, ret watch.Interface, err error) {
++				gvr := action.GetResource()
++				ns := action.GetNamespace()
++				fakeWatch, err := fakeGroupsClient.Tracker().Watch(gvr, ns)
++				if err != nil {
++					return false, nil, err
++				}
++				// Send initial bookmark event to satisfy k8s 1.35 requirement (only once)
++				once.Do(func() {
++					go func() {
++						time.Sleep(1 * time.Second) // Delay to let List complete and objects be processed
++						fakeWatch.(*watch.RaceFreeFakeWatcher).Action(watch.Bookmark, &userv1.Group{
++							ObjectMeta: metav1.ObjectMeta{
++								ResourceVersion: "1",
++								Annotations: map[string]string{
++									metav1.InitialEventsAnnotationKey: "true",
++								},
++							},
++						})
++					}()
++				})
++				return true, fakeWatch, nil
++			})
+ 
+ 			userInformer := userinformer.NewSharedInformerFactory(fakeGroupsClient, 5*time.Second)
+ 			require.NoError(t, userInformer.User().V1().Groups().Informer().AddIndexers(cache.Indexers{
+ 				usercache.ByUserIndexName: usercache.ByUserIndexKeys,
+ 			}))
+ 			testCtx, cancelCtx := context.WithCancel(context.Background())
+-			go userInformer.Start(testCtx.Done())
++			userInformer.Start(testCtx.Done())
+ 			defer cancelCtx()
++			cache.WaitForCacheSync(testCtx.Done(), userInformer.User().V1().Groups().Informer().HasSynced)
++			// Add the groups to the indexer here because the bookmark is being sent before the informer
++			// processes its initial List results
++			for _, g := range basicGroups {
++				userInformer.User().V1().Groups().Informer().GetIndexer().Add(g)
++			}
+ 
+ 			m := &UserGroupsMapper{
+ 				delegatedUserMapper: &mockUserMapper{userInfo: kuser.DefaultInfo{Name: tt.username, UID: "tehUserUID", Groups: []string{"system:one", "system:two"}}},
+ 				groupsClient:        fakeGroupsClient.UserV1().Groups(),
+-				groupsLister:        userlisterv1.NewGroupLister(indexer),
++				groupsLister:        userInformer.User().V1().Groups().Lister(),
+ 				groupsCache:         usercache.NewGroupCache(userInformer.User().V1().Groups()),
+ 				groupsSynced:        userInformer.User().V1().Groups().Informer().HasSynced,
+ 			}
+@@ -478,6 +499,31 @@ func TestRemoveUserFromGroup_DoesNotMutateCachedObject(t *testing.T) {
+ 		t.Run(tt.name, func(t *testing.T) {
+ 			group := createGroupWithUsers(testGroupName, tt.originalUsers...)
+ 			fakeUserClient := fakeuserclient.NewSimpleClientset(group)
++			// Add watch reactor to send initial bookmark event for k8s 1.35+
++			var once sync.Once
++			fakeUserClient.PrependWatchReactor("groups", func(action k8stesting.Action) (handled bool, ret watch.Interface, err error) {
++				gvr := action.GetResource()
++				ns := action.GetNamespace()
++				fakeWatch, err := fakeUserClient.Tracker().Watch(gvr, ns)
++				if err != nil {
++					return false, nil, err
++				}
++				// Send initial bookmark event to satisfy k8s 1.35 requirement (only once)
++				once.Do(func() {
++					go func() {
++						time.Sleep(1 * time.Second) // Delay to let List complete and objects be processed
++						fakeWatch.(*watch.RaceFreeFakeWatcher).Action(watch.Bookmark, &userv1.Group{
++							ObjectMeta: metav1.ObjectMeta{
++								ResourceVersion: "1",
++								Annotations: map[string]string{
++									metav1.InitialEventsAnnotationKey: "true",
++								},
++							},
++						})
++					}()
++				})
++				return true, fakeWatch, nil
++			})
+ 
+ 			// Use a real informer so the lister and GroupCache share the
+ 			// same underlying indexed store, just like in production.
+@@ -490,6 +536,9 @@ func TestRemoveUserFromGroup_DoesNotMutateCachedObject(t *testing.T) {
+ 			ctx := t.Context()
+ 			informerFactory.Start(ctx.Done())
+ 			cache.WaitForCacheSync(ctx.Done(), groupInformer.Informer().HasSynced)
++			// Add the group to the indexer here because the bookmark is being sent before the informer
++			// processes its initial List results
++			groupInformer.Informer().GetIndexer().Add(group)
+ 
+ 			indexer := groupInformer.Informer().GetIndexer()
+ 
+diff --git a/vendor/k8s.io/apiserver/pkg/admission/plugin/namespace/lifecycle/admission.go b/vendor/k8s.io/apiserver/pkg/admission/plugin/namespace/lifecycle/admission.go
+index 936a95e45..516c23687 100644
+--- a/vendor/k8s.io/apiserver/pkg/admission/plugin/namespace/lifecycle/admission.go
++++ b/vendor/k8s.io/apiserver/pkg/admission/plugin/namespace/lifecycle/admission.go
+@@ -54,7 +54,16 @@ const (
+ // Register registers a plugin
+ func Register(plugins *admission.Plugins) {
+ 	plugins.Register(PluginName, func(config io.Reader) (admission.Interface, error) {
+-		return NewLifecycle(sets.NewString(metav1.NamespaceDefault, metav1.NamespaceSystem, metav1.NamespacePublic))
++		return NewLifecycle(sets.NewString(metav1.NamespaceDefault, metav1.NamespaceSystem, metav1.NamespacePublic,
++			// user specified configuration that cannot be rebuilt
++			"openshift-config",
++			// cluster generated configuration that cannot be rebuilt (etcd encryption keys)
++			"openshift-config-managed",
++			// the CVO which is the root we use to rebuild all the rest
++			"openshift-cluster-version",
++			// contains a namespaced list of all nodes in the cluster (yeah, weird.  they do it for multi-tenant management I think?)
++			"openshift-machine-api",
++		))
+ 	})
+ }
+ 
+@@ -225,7 +234,13 @@ func (l *Lifecycle) ValidateInitialization() error {
+ // accessReviewResources are resources which give a view into permissions in a namespace.  Users must be allowed to create these
+ // resources because returning "not found" errors allows someone to search for the "people I'm going to fire in 2017" namespace.
+ var accessReviewResources = map[schema.GroupResource]bool{
+-	{Group: "authorization.k8s.io", Resource: "localsubjectaccessreviews"}: true,
++	{Group: "authorization.k8s.io", Resource: "localsubjectaccessreviews"}:                            true,
++	schema.GroupResource{Group: "authorization.openshift.io", Resource: "subjectaccessreviews"}:       true,
++	schema.GroupResource{Group: "authorization.openshift.io", Resource: "localsubjectaccessreviews"}:  true,
++	schema.GroupResource{Group: "authorization.openshift.io", Resource: "resourceaccessreviews"}:      true,
++	schema.GroupResource{Group: "authorization.openshift.io", Resource: "localresourceaccessreviews"}: true,
++	schema.GroupResource{Group: "authorization.openshift.io", Resource: "selfsubjectrulesreviews"}:    true,
++	schema.GroupResource{Group: "authorization.openshift.io", Resource: "subjectrulesreviews"}:        true,
+ }
+ 
+ func isAccessReview(a admission.Attributes) bool {
+diff --git a/vendor/k8s.io/apiserver/pkg/apis/apiserver/validation/validation_patch.go b/vendor/k8s.io/apiserver/pkg/apis/apiserver/validation/validation_patch.go
+new file mode 100644
+index 000000000..0e7b4f114
+--- /dev/null
++++ b/vendor/k8s.io/apiserver/pkg/apis/apiserver/validation/validation_patch.go
+@@ -0,0 +1,8 @@
++package validation
++
++import "k8s.io/apimachinery/pkg/util/validation/field"
++
++// ValidateCertificateAuthority is an exported wrapper around validateCertificateAuthority
++func ValidateCertificateAuthority(certificateAuthority string, fldPath *field.Path) field.ErrorList {
++	return validateCertificateAuthority(certificateAuthority, fldPath)
++}
+diff --git a/vendor/k8s.io/apiserver/pkg/authentication/cel/compile_patch.go b/vendor/k8s.io/apiserver/pkg/authentication/cel/compile_patch.go
+new file mode 100644
+index 000000000..b4ec87397
+--- /dev/null
++++ b/vendor/k8s.io/apiserver/pkg/authentication/cel/compile_patch.go
+@@ -0,0 +1,68 @@
++package cel
++
++import (
++	"fmt"
++
++	"github.com/google/cel-go/cel"
++	"k8s.io/apimachinery/pkg/util/version"
++	apiservercel "k8s.io/apiserver/pkg/cel"
++	"k8s.io/apiserver/pkg/cel/environment"
++)
++
++type EnvironmentSet struct {
++	variableName string
++	envOptions   []cel.EnvOption
++	declTypes    []*apiservercel.DeclType
++}
++
++func (es *EnvironmentSet) Build(baseEnv *environment.EnvSet) (*environment.EnvSet, error) {
++	return baseEnv.Extend(environment.VersionedOptions{
++		IntroducedVersion: version.MajorMinor(1, 0),
++		EnvOptions:        es.envOptions,
++		DeclTypes:         es.declTypes,
++	})
++}
++
++// NewEnvironmentSet returns a *EnvironmentSet that is used for configuring an ExtendableCompiler
++// with a new CEL environment variable. The variable name parameter is an arbitrary string
++// representing the new environment variable. It must not be empty.
++func NewEnvironmentSet(variableName string, options []cel.EnvOption, declTypes []*apiservercel.DeclType) *EnvironmentSet {
++	if len(variableName) == 0 {
++		panic("variable name must not be an empty string")
++	}
++
++	return &EnvironmentSet{
++		variableName: variableName,
++		envOptions:   options,
++		declTypes:    declTypes,
++	}
++}
++
++// ExtendableCompiler is an extension of the baseline compiler
++// that allows for extending the capabilities of the baseline compiler.
++type ExtendableCompiler struct {
++	*compiler
++}
++
++func (ec *ExtendableCompiler) Compile(accessor ExpressionAccessor, variableName string) (CompilationResult, error) {
++	return ec.compiler.compile(accessor, variableName)
++}
++
++func NewExtendableCompiler(baseEnv *environment.EnvSet, additionalEnvSets ...*EnvironmentSet) *ExtendableCompiler {
++	compiler := &compiler{
++		varEnvs: mustBuildEnvs(baseEnv),
++	}
++
++	for _, envSet := range additionalEnvSets {
++		builtEnvSet, err := envSet.Build(baseEnv)
++		if err != nil {
++			panic(fmt.Sprintf("building environment set for variable %q: %v", envSet.variableName, err))
++		}
++
++		compiler.varEnvs[envSet.variableName] = builtEnvSet
++	}
++
++	return &ExtendableCompiler{
++		compiler: compiler,
++	}
++}
+diff --git a/vendor/k8s.io/apiserver/pkg/authentication/cel/mapper_patch.go b/vendor/k8s.io/apiserver/pkg/authentication/cel/mapper_patch.go
+new file mode 100644
+index 000000000..6b471d1b9
+--- /dev/null
++++ b/vendor/k8s.io/apiserver/pkg/authentication/cel/mapper_patch.go
+@@ -0,0 +1,36 @@
++package cel
++
++import (
++	"context"
++
++	"github.com/google/cel-go/common/types/traits"
++)
++
++type Mapper struct {
++	*mapper
++}
++
++func NewMapper(compilationResults []CompilationResult) *Mapper {
++	return &Mapper{
++		mapper: &mapper{
++			compilationResults: compilationResults,
++		},
++	}
++}
++
++func (m *Mapper) Eval(ctx context.Context, input VarNameActivation) ([]EvaluationResult, error) {
++	return m.mapper.eval(ctx, input.varNameActivation)
++}
++
++type VarNameActivation struct {
++	*varNameActivation
++}
++
++func NewVarNameActivation(name string, value traits.Mapper) VarNameActivation {
++	return VarNameActivation{
++		varNameActivation: &varNameActivation{
++			name: name,
++			value: value,
++		},
++	}
++}
+diff --git a/vendor/k8s.io/apiserver/pkg/endpoints/deprecation/deprecation.go b/vendor/k8s.io/apiserver/pkg/endpoints/deprecation/deprecation.go
+index 7f8986fae..d29fe3a32 100644
+--- a/vendor/k8s.io/apiserver/pkg/endpoints/deprecation/deprecation.go
++++ b/vendor/k8s.io/apiserver/pkg/endpoints/deprecation/deprecation.go
+@@ -119,7 +119,7 @@ func WarningMessage(obj runtime.Object) string {
+ 	if removed, hasRemovalInfo := obj.(apiLifecycleRemoved); hasRemovalInfo {
+ 		removedMajor, removedMinor := removed.APILifecycleRemoved()
+ 		if removedMajor != 0 || removedMinor != 0 {
+-			deprecationWarning = deprecationWarning + fmt.Sprintf(", unavailable in v%d.%d+", removedMajor, removedMinor)
++			deprecationWarning = deprecationWarning + fmt.Sprintf(", unavailable no sooner than v%d.%d+", removedMajor, removedMinor)
+ 		}
+ 	}
+ 
+diff --git a/vendor/k8s.io/apiserver/pkg/endpoints/filters/patch_request_deadline.go b/vendor/k8s.io/apiserver/pkg/endpoints/filters/patch_request_deadline.go
+new file mode 100644
+index 000000000..40d0359cd
+--- /dev/null
++++ b/vendor/k8s.io/apiserver/pkg/endpoints/filters/patch_request_deadline.go
+@@ -0,0 +1,58 @@
++/*
++Copyright 2021 The Kubernetes Authors.
++
++Licensed under the Apache License, Version 2.0 (the "License");
++you may not use this file except in compliance with the License.
++You may obtain a copy of the License at
++
++    http://www.apache.org/licenses/LICENSE-2.0
++
++Unless required by applicable law or agreed to in writing, software
++distributed under the License is distributed on an "AS IS" BASIS,
++WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++See the License for the specific language governing permissions and
++limitations under the License.
++*/
++
++package filters
++
++import (
++	"context"
++	"net/http"
++	"time"
++)
++
++// RequestContextWithUpperBoundOrWorkAroundOurBrokenCaseWhereTimeoutWasNotAppliedYet returns
++// a new deadline bound context for the request.
++//
++// If the request context is already setup with a deadline then use the
++// requestTimeoutUpperBound as the upper bound.
++// If the request context is not setup with a deadline then use:
++//  - user specified timeout in the request URI, otherwise
++//  - use the default value in requestTimeoutUpperBound
++func RequestContextWithUpperBoundOrWorkAroundOurBrokenCaseWhereTimeoutWasNotAppliedYet(req *http.Request, requestTimeoutUpperBound time.Duration) (context.Context, context.CancelFunc) {
++	ctx := req.Context()
++	if _, ok := ctx.Deadline(); ok {
++		// the request already has a deadline set, use the parent
++		// context to setup an upper bound deadline.
++		return context.WithTimeout(ctx, requestTimeoutUpperBound)
++	}
++
++	// the request context does not have any deadline set yet, it could be
++	// a long running request that WithRequestDeadline did not apply to.
++	// set an upper bound deadline using the user specified timeout in the
++	// request URI if available, otherwise use the default value.
++	timeout := parseTimeoutWithDefault(req, requestTimeoutUpperBound)
++	return context.WithTimeout(ctx, timeout)
++}
++
++// parseTimeoutWithDefault parses the given HTTP request URL and extracts
++// the timeout query parameter value if specified by the user.
++// If a timeout is not specified it returns the default value specified.
++func parseTimeoutWithDefault(req *http.Request, defaultTimeout time.Duration) time.Duration {
++	userSpecifiedTimeout, ok, _ := parseTimeout(req)
++	if ok && userSpecifiedTimeout > 0 {
++		return userSpecifiedTimeout
++	}
++	return defaultTimeout
++}
+diff --git a/vendor/k8s.io/apiserver/pkg/endpoints/handlers/create.go b/vendor/k8s.io/apiserver/pkg/endpoints/handlers/create.go
+index 6e1908aa0..707562737 100644
+--- a/vendor/k8s.io/apiserver/pkg/endpoints/handlers/create.go
++++ b/vendor/k8s.io/apiserver/pkg/endpoints/handlers/create.go
+@@ -37,6 +37,7 @@ import (
+ 	"k8s.io/apimachinery/pkg/runtime/schema"
+ 	"k8s.io/apiserver/pkg/admission"
+ 	"k8s.io/apiserver/pkg/audit"
++	"k8s.io/apiserver/pkg/endpoints/filters"
+ 	"k8s.io/apiserver/pkg/endpoints/handlers/fieldmanager"
+ 	"k8s.io/apiserver/pkg/endpoints/handlers/finisher"
+ 	requestmetrics "k8s.io/apiserver/pkg/endpoints/handlers/metrics"
+@@ -76,7 +77,7 @@ func createHandler(r rest.NamedCreater, scope *RequestScope, admit admission.Int
+ 
+ 		// enforce a timeout of at most requestTimeoutUpperBound (34s) or less if the user-provided
+ 		// timeout inside the parent context is lower than requestTimeoutUpperBound.
+-		ctx, cancel := context.WithTimeout(ctx, requestTimeoutUpperBound)
++		ctx, cancel := filters.RequestContextWithUpperBoundOrWorkAroundOurBrokenCaseWhereTimeoutWasNotAppliedYet(req, requestTimeoutUpperBound)
+ 		defer cancel()
+ 		outputMediaType, _, err := negotiation.NegotiateOutputMediaType(req, scope.Serializer, scope)
+ 		if err != nil {
+diff --git a/vendor/k8s.io/apiserver/pkg/endpoints/handlers/delete.go b/vendor/k8s.io/apiserver/pkg/endpoints/handlers/delete.go
+index 2efd08d25..86b41e145 100644
+--- a/vendor/k8s.io/apiserver/pkg/endpoints/handlers/delete.go
++++ b/vendor/k8s.io/apiserver/pkg/endpoints/handlers/delete.go
+@@ -38,6 +38,7 @@ import (
+ 	"k8s.io/apiserver/pkg/admission"
+ 	"k8s.io/apiserver/pkg/audit"
+ 	"k8s.io/apiserver/pkg/authorization/authorizer"
++	"k8s.io/apiserver/pkg/endpoints/filters"
+ 	"k8s.io/apiserver/pkg/endpoints/handlers/finisher"
+ 	requestmetrics "k8s.io/apiserver/pkg/endpoints/handlers/metrics"
+ 	"k8s.io/apiserver/pkg/endpoints/handlers/negotiation"
+@@ -71,7 +72,7 @@ func DeleteResource(r rest.GracefulDeleter, allowsOptions bool, scope *RequestSc
+ 
+ 		// enforce a timeout of at most requestTimeoutUpperBound (34s) or less if the user-provided
+ 		// timeout inside the parent context is lower than requestTimeoutUpperBound.
+-		ctx, cancel := context.WithTimeout(ctx, requestTimeoutUpperBound)
++		ctx, cancel := filters.RequestContextWithUpperBoundOrWorkAroundOurBrokenCaseWhereTimeoutWasNotAppliedYet(req, requestTimeoutUpperBound)
+ 		defer cancel()
+ 
+ 		ctx = request.WithNamespace(ctx, namespace)
+@@ -221,9 +222,11 @@ func DeleteCollection(r rest.CollectionDeleter, checkBody bool, scope *RequestSc
+ 			return
+ 		}
+ 
+-		// DELETECOLLECTION can be a lengthy operation,
+-		// we should not impose any 34s timeout here.
+-		// NOTE: This is similar to LIST which does not enforce a 34s timeout.
++		// enforce a timeout of at most requestTimeoutUpperBound (34s) or less if the user-provided
++		// timeout inside the parent context is lower than requestTimeoutUpperBound.
++		ctx, cancel := filters.RequestContextWithUpperBoundOrWorkAroundOurBrokenCaseWhereTimeoutWasNotAppliedYet(req, requestTimeoutUpperBound)
++		defer cancel()
++
+ 		ctx = request.WithNamespace(ctx, namespace)
+ 
+ 		outputMediaType, _, err := negotiation.NegotiateOutputMediaType(req, scope.Serializer, scope)
+diff --git a/vendor/k8s.io/apiserver/pkg/endpoints/handlers/patch.go b/vendor/k8s.io/apiserver/pkg/endpoints/handlers/patch.go
+index 060c7cc30..c914cd58b 100644
+--- a/vendor/k8s.io/apiserver/pkg/endpoints/handlers/patch.go
++++ b/vendor/k8s.io/apiserver/pkg/endpoints/handlers/patch.go
+@@ -47,6 +47,7 @@ import (
+ 	"k8s.io/apiserver/pkg/admission"
+ 	"k8s.io/apiserver/pkg/audit"
+ 	"k8s.io/apiserver/pkg/authorization/authorizer"
++	"k8s.io/apiserver/pkg/endpoints/filters"
+ 	"k8s.io/apiserver/pkg/endpoints/handlers/fieldmanager"
+ 	"k8s.io/apiserver/pkg/endpoints/handlers/finisher"
+ 	requestmetrics "k8s.io/apiserver/pkg/endpoints/handlers/metrics"
+@@ -96,7 +97,7 @@ func PatchResource(r rest.Patcher, scope *RequestScope, admit admission.Interfac
+ 
+ 		// enforce a timeout of at most requestTimeoutUpperBound (34s) or less if the user-provided
+ 		// timeout inside the parent context is lower than requestTimeoutUpperBound.
+-		ctx, cancel := context.WithTimeout(ctx, requestTimeoutUpperBound)
++		ctx, cancel := filters.RequestContextWithUpperBoundOrWorkAroundOurBrokenCaseWhereTimeoutWasNotAppliedYet(req, requestTimeoutUpperBound)
+ 		defer cancel()
+ 
+ 		ctx = request.WithNamespace(ctx, namespace)
+diff --git a/vendor/k8s.io/apiserver/pkg/endpoints/handlers/update.go b/vendor/k8s.io/apiserver/pkg/endpoints/handlers/update.go
+index 446723234..537fd49fb 100644
+--- a/vendor/k8s.io/apiserver/pkg/endpoints/handlers/update.go
++++ b/vendor/k8s.io/apiserver/pkg/endpoints/handlers/update.go
+@@ -35,6 +35,7 @@ import (
+ 	"k8s.io/apiserver/pkg/admission"
+ 	"k8s.io/apiserver/pkg/audit"
+ 	"k8s.io/apiserver/pkg/authorization/authorizer"
++	"k8s.io/apiserver/pkg/endpoints/filters"
+ 	"k8s.io/apiserver/pkg/endpoints/handlers/fieldmanager"
+ 	"k8s.io/apiserver/pkg/endpoints/handlers/finisher"
+ 	requestmetrics "k8s.io/apiserver/pkg/endpoints/handlers/metrics"
+@@ -64,7 +65,7 @@ func UpdateResource(r rest.Updater, scope *RequestScope, admit admission.Interfa
+ 
+ 		// enforce a timeout of at most requestTimeoutUpperBound (34s) or less if the user-provided
+ 		// timeout inside the parent context is lower than requestTimeoutUpperBound.
+-		ctx, cancel := context.WithTimeout(ctx, requestTimeoutUpperBound)
++		ctx, cancel := filters.RequestContextWithUpperBoundOrWorkAroundOurBrokenCaseWhereTimeoutWasNotAppliedYet(req, requestTimeoutUpperBound)
+ 		defer cancel()
+ 
+ 		ctx = request.WithNamespace(ctx, namespace)
+diff --git a/vendor/k8s.io/apiserver/pkg/server/config.go b/vendor/k8s.io/apiserver/pkg/server/config.go
+index d10415b94..65e51f1bb 100644
+--- a/vendor/k8s.io/apiserver/pkg/server/config.go
++++ b/vendor/k8s.io/apiserver/pkg/server/config.go
+@@ -21,6 +21,7 @@ import (
+ 	"crypto/sha256"
+ 	"encoding/base32"
+ 	"fmt"
++	"io/ioutil"
+ 	"net"
+ 	"net/http"
+ 	"os"
+@@ -36,6 +37,7 @@ import (
+ 	"golang.org/x/crypto/cryptobyte"
+ 	jsonpatch "gopkg.in/evanphx/json-patch.v4"
+ 
++	corev1 "k8s.io/api/core/v1"
+ 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+ 	"k8s.io/apimachinery/pkg/runtime"
+ 	"k8s.io/apimachinery/pkg/runtime/schema"
+@@ -74,6 +76,8 @@ import (
+ 	utilflowcontrol "k8s.io/apiserver/pkg/util/flowcontrol"
+ 	flowcontrolrequest "k8s.io/apiserver/pkg/util/flowcontrol/request"
+ 	"k8s.io/client-go/informers"
++	"k8s.io/client-go/kubernetes"
++	v1 "k8s.io/client-go/kubernetes/typed/core/v1"
+ 	restclient "k8s.io/client-go/rest"
+ 	basecompatibility "k8s.io/component-base/compatibility"
+ 	"k8s.io/component-base/featuregate"
+@@ -289,6 +293,9 @@ type Config struct {
+ 	// rejected with a 429 status code and a 'Retry-After' response.
+ 	ShutdownSendRetryAfter bool
+ 
++	// EventSink receives events about the life cycle of the API server, e.g. readiness, serving, signals and termination.
++	EventSink EventSink
++
+ 	//===========================================================================
+ 	// values below here are targets for removal
+ 	//===========================================================================
+@@ -329,6 +336,11 @@ type Config struct {
+ 	ShutdownWatchTerminationGracePeriod time.Duration
+ }
+ 
++// EventSink allows to create events.
++type EventSink interface {
++	Create(event *corev1.Event) (*corev1.Event, error)
++}
++
+ type RecommendedConfig struct {
+ 	Config
+ 
+@@ -725,6 +737,10 @@ func (c *Config) Complete(informers informers.SharedInformerFactory) CompletedCo
+ 		c.DiscoveryAddresses = discovery.DefaultAddresses{DefaultAddress: c.ExternalAddress}
+ 	}
+ 
++	if c.EventSink == nil {
++		c.EventSink = nullEventSink{}
++	}
++
+ 	AuthorizeClientBearerToken(c.LoopbackClientConfig, &c.Authentication, &c.Authorization)
+ 
+ 	if c.RequestInfoResolver == nil {
+@@ -752,6 +768,22 @@ func (c *Config) Complete(informers informers.SharedInformerFactory) CompletedCo
+ // Complete fills in any fields not set that are required to have valid data and can be derived
+ // from other fields. If you're going to `ApplyOptions`, do that first. It's mutating the receiver.
+ func (c *RecommendedConfig) Complete() CompletedConfig {
++	if c.ClientConfig != nil {
++		ref, err := eventReference()
++		if err != nil {
++			klog.Warningf("Failed to derive event reference, won't create events: %v", err)
++			c.EventSink = nullEventSink{}
++		} else {
++			ns := ref.Namespace
++			if len(ns) == 0 {
++				ns = "default"
++			}
++			c.EventSink = &v1.EventSinkImpl{
++				Interface: kubernetes.NewForConfigOrDie(c.ClientConfig).CoreV1().Events(ns),
++			}
++		}
++	}
++
+ 	return c.Config.Complete(c.SharedInformerFactory)
+ }
+ 
+@@ -761,6 +793,39 @@ var defaultAllowedMediaTypes = []string{
+ 	runtime.ContentTypeProtobuf,
+ }
+ 
++func eventReference() (*corev1.ObjectReference, error) {
++	ns := os.Getenv("POD_NAMESPACE")
++	pod := os.Getenv("POD_NAME")
++	if len(ns) == 0 && len(pod) > 0 {
++		serviceAccountNamespaceFile := "/var/run/secrets/kubernetes.io/serviceaccount/namespace"
++		if _, err := os.Stat(serviceAccountNamespaceFile); err == nil {
++			bs, err := ioutil.ReadFile(serviceAccountNamespaceFile)
++			if err != nil {
++				return nil, err
++			}
++			ns = string(bs)
++		}
++	}
++	if len(ns) == 0 {
++		pod = ""
++		ns = "kube-system"
++	}
++	if len(pod) == 0 {
++		return &corev1.ObjectReference{
++			Kind:       "Namespace",
++			Name:       ns,
++			APIVersion: "v1",
++		}, nil
++	}
++
++	return &corev1.ObjectReference{
++		Kind:       "Pod",
++		Namespace:  ns,
++		Name:       pod,
++		APIVersion: "v1",
++	}, nil
++}
++
+ // New creates a new server which logically combines the handling chain with the passed server.
+ // name is used to differentiate for logging. The handler chain in particular can be difficult as it starts delegating.
+ // delegationTarget may not be nil.
+@@ -856,6 +921,8 @@ func (c completedConfig) New(name string, delegationTarget DelegationTarget) (*G
+ 		FeatureGate:                             c.FeatureGate,
+ 
+ 		muxAndDiscoveryCompleteSignals: map[string]<-chan struct{}{},
++
++		eventSink: c.EventSink,
+ 	}
+ 
+ 	manager := c.AggregatedDiscoveryGroupManager
+@@ -877,6 +944,13 @@ func (c completedConfig) New(name string, delegationTarget DelegationTarget) (*G
+ 		}
+ 	}
+ 
++	ref, err := eventReference()
++	if err != nil {
++		klog.Warningf("Failed to derive event reference, won't create events: %v", err)
++		c.EventSink = nullEventSink{}
++	}
++	s.eventRef = ref
++
+ 	// first add poststarthooks from delegated targets
+ 	for k, v := range delegationTarget.PostStartHooks() {
+ 		s.postStartHooks[k] = v
+@@ -1205,3 +1279,9 @@ func SetHostnameFuncForTests(name string) {
+ 		return
+ 	}
+ }
++
++type nullEventSink struct{}
++
++func (nullEventSink) Create(event *corev1.Event) (*corev1.Event, error) {
++	return nil, nil
++}
+diff --git a/vendor/k8s.io/apiserver/pkg/server/genericapiserver.go b/vendor/k8s.io/apiserver/pkg/server/genericapiserver.go
+index 99017eb5e..15a5c8281 100644
+--- a/vendor/k8s.io/apiserver/pkg/server/genericapiserver.go
++++ b/vendor/k8s.io/apiserver/pkg/server/genericapiserver.go
+@@ -21,6 +21,7 @@ import (
+ 	"errors"
+ 	"fmt"
+ 	"net/http"
++	"os"
+ 	gpath "path"
+ 	"strings"
+ 	"sync"
+@@ -30,6 +31,7 @@ import (
+ 
+ 	"golang.org/x/time/rate"
+ 	apidiscoveryv2 "k8s.io/api/apidiscovery/v2"
++	corev1 "k8s.io/api/core/v1"
+ 	"k8s.io/apimachinery/pkg/api/meta"
+ 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+ 	"k8s.io/apimachinery/pkg/runtime"
+@@ -301,6 +303,9 @@ type GenericAPIServer struct {
+ 	// This grace period is orthogonal to other grace periods, and
+ 	// it is not overridden by any other grace period.
+ 	ShutdownWatchTerminationGracePeriod time.Duration
++	// EventSink creates events.
++	eventSink EventSink
++	eventRef  *corev1.ObjectReference
+ }
+ 
+ // DelegationTarget is an interface which allows for composition of API servers with top level handling that works
+@@ -567,7 +572,11 @@ func (s preparedGenericAPIServer) RunWithContext(ctx context.Context) error {
+ 		shutdownInitiatedCh.Signal()
+ 		klog.V(1).InfoS("[graceful-termination] shutdown event", "name", shutdownInitiatedCh.Name())
+ 
++		s.Eventf(corev1.EventTypeNormal, "TerminationStart", "Received signal to terminate, becoming unready, but keeping serving")
++
+ 		time.Sleep(s.ShutdownDelayDuration)
++
++		s.Eventf(corev1.EventTypeNormal, "TerminationMinimalShutdownDurationFinished", "The minimal shutdown duration of %v finished", s.ShutdownDelayDuration)
+ 	}()
+ 
+ 	// close socket after delayed stopCh
+@@ -644,6 +653,7 @@ func (s preparedGenericAPIServer) RunWithContext(ctx context.Context) error {
+ 
+ 		// wait for the delayed stopCh before closing the handler chain (it rejects everything after Wait has been called).
+ 		<-notAcceptingNewRequestCh.Signaled()
++		s.Eventf(corev1.EventTypeNormal, "TerminationStoppedServing", "Server has stopped listening")
+ 
+ 		// Wait for all requests to finish, which are bounded by the RequestTimeout variable.
+ 		// once NonLongRunningRequestWaitGroup.Wait is invoked, the apiserver is
+@@ -717,6 +727,7 @@ func (s preparedGenericAPIServer) RunWithContext(ctx context.Context) error {
+ 	if err != nil {
+ 		return err
+ 	}
++	klog.V(1).Info("[graceful-termination] RunPreShutdownHooks has completed")
+ 
+ 	// Wait for all requests in flight to drain, bounded by the RequestTimeout variable.
+ 	<-drainedCh.Signaled()
+@@ -724,6 +735,7 @@ func (s preparedGenericAPIServer) RunWithContext(ctx context.Context) error {
+ 	if s.AuditBackend != nil {
+ 		s.AuditBackend.Shutdown()
+ 		klog.V(1).InfoS("[graceful-termination] audit backend shutdown completed")
++		s.Eventf(corev1.EventTypeNormal, "TerminationPreShutdownHooksFinished", "All pre-shutdown hooks have been finished")
+ 	}
+ 
+ 	// wait for stoppedCh that is closed when the graceful termination (server.Shutdown) is finished.
+@@ -731,6 +743,8 @@ func (s preparedGenericAPIServer) RunWithContext(ctx context.Context) error {
+ 	<-stoppedCh
+ 
+ 	klog.V(1).Info("[graceful-termination] apiserver is exiting")
++	s.Eventf(corev1.EventTypeNormal, "TerminationGracefulTerminationFinished", "All pending requests processed")
++
+ 	return nil
+ }
+ 
+@@ -1088,3 +1102,33 @@ func getResourceNamesForGroup(apiPrefix string, apiGroupInfo *APIGroupInfo, path
+ 
+ 	return resourceNames, nil
+ }
++
++// Eventf creates an event with the API server as source, either in default namespace against default namespace, or
++// if POD_NAME/NAMESPACE are set against that pod.
++func (s *GenericAPIServer) Eventf(eventType, reason, messageFmt string, args ...interface{}) {
++	t := metav1.Time{Time: time.Now()}
++	host, _ := os.Hostname() // expicitly ignore error. Empty host is fine
++
++	ref := *s.eventRef
++	if len(ref.Namespace) == 0 {
++		ref.Namespace = "default" // TODO: event broadcaster sets event ns to default. We have to match. Odd.
++	}
++
++	e := &corev1.Event{
++		ObjectMeta: metav1.ObjectMeta{
++			Name:      fmt.Sprintf("%v.%x", ref.Name, t.UnixNano()),
++			Namespace: ref.Namespace,
++		},
++		InvolvedObject: ref,
++		Reason:         reason,
++		Message:        fmt.Sprintf(messageFmt, args...),
++		Type:           eventType,
++		Source:         corev1.EventSource{Component: "apiserver", Host: host},
++	}
++
++	klog.V(2).Infof("Event(%#v): type: '%v' reason: '%v' %v", e.InvolvedObject, e.Type, e.Reason, e.Message)
++
++	if _, err := s.eventSink.Create(e); err != nil {
++		klog.Warningf("failed to create event %s/%s: %v", e.Namespace, e.Name, err)
++	}
++}
+diff --git a/vendor/k8s.io/apiserver/pkg/server/options/authorization.go b/vendor/k8s.io/apiserver/pkg/server/options/authorization.go
+index 9b2dcb3ff..22fd4b18c 100644
+--- a/vendor/k8s.io/apiserver/pkg/server/options/authorization.go
++++ b/vendor/k8s.io/apiserver/pkg/server/options/authorization.go
+@@ -239,5 +239,10 @@ func (s *DelegatingAuthorizationOptions) getClient() (kubernetes.Interface, erro
+ 		clientConfig.Wrap(s.CustomRoundTripperFn)
+ 	}
+ 
+-	return kubernetes.NewForConfig(clientConfig)
++	// make the client use protobuf
++	protoConfig := rest.CopyConfig(clientConfig)
++	protoConfig.AcceptContentTypes = "application/vnd.kubernetes.protobuf,application/json"
++	protoConfig.ContentType = "application/vnd.kubernetes.protobuf"
++
++	return kubernetes.NewForConfig(protoConfig)
+ }
+diff --git a/vendor/k8s.io/apiserver/pkg/server/patch.go b/vendor/k8s.io/apiserver/pkg/server/patch.go
+new file mode 100644
+index 000000000..54ffbe35c
+--- /dev/null
++++ b/vendor/k8s.io/apiserver/pkg/server/patch.go
+@@ -0,0 +1,8 @@
++package server
++
++func (s *GenericAPIServer) RemoveOpenAPIData() {
++	if s.Handler != nil && s.Handler.NonGoRestfulMux != nil {
++		s.Handler.NonGoRestfulMux.Unregister("/openapi/v2")
++	}
++	s.openAPIConfig = nil
++}
+diff --git a/vendor/k8s.io/apiserver/pkg/server/routes/openapi.go b/vendor/k8s.io/apiserver/pkg/server/routes/openapi.go
+index 12c8b1ad9..51b336135 100644
+--- a/vendor/k8s.io/apiserver/pkg/server/routes/openapi.go
++++ b/vendor/k8s.io/apiserver/pkg/server/routes/openapi.go
+@@ -38,6 +38,17 @@ type OpenAPI struct {
+ 
+ // Install adds the SwaggerUI webservice to the given mux.
+ func (oa OpenAPI) InstallV2(c *restful.Container, mux *mux.PathRecorderMux) (*handler.OpenAPIService, *spec.Swagger) {
++	// we shadow ClustResourceQuotas, RoleBindingRestrictions, and SecurityContextContstraints
++	// with a CRD. This loop removes all CRQ,RBR, SCC paths
++	// from the OpenAPI spec such that they don't conflict with the CRD
++	// apiextensions-apiserver spec during merging.
++	oa.Config.IgnorePrefixes = append(oa.Config.IgnorePrefixes,
++		"/apis/quota.openshift.io/v1/clusterresourcequotas",
++		"/apis/security.openshift.io/v1/securitycontextconstraints",
++		"/apis/authorization.openshift.io/v1/rolebindingrestrictions",
++		"/apis/authorization.openshift.io/v1/namespaces/{namespace}/rolebindingrestrictions",
++		"/apis/authorization.openshift.io/v1/watch/namespaces/{namespace}/rolebindingrestrictions",
++		"/apis/authorization.openshift.io/v1/watch/rolebindingrestrictions")
+ 	spec, err := builder2.BuildOpenAPISpecFromRoutes(restfuladapter.AdaptWebServices(c.RegisteredWebServices()), oa.Config)
+ 	if err != nil {
+ 		klog.Fatalf("Failed to build open api spec for root: %v", err)
+diff --git a/vendor/k8s.io/apiserver/pkg/storage/etcd3/etcd3retry/retry_etcdclient.go b/vendor/k8s.io/apiserver/pkg/storage/etcd3/etcd3retry/retry_etcdclient.go
+new file mode 100644
+index 000000000..020c6852e
+--- /dev/null
++++ b/vendor/k8s.io/apiserver/pkg/storage/etcd3/etcd3retry/retry_etcdclient.go
+@@ -0,0 +1,313 @@
++package etcd3retry
++
++import (
++	"context"
++	"fmt"
++	"regexp"
++	"strings"
++	"time"
++
++	etcdrpc "go.etcd.io/etcd/api/v3/v3rpc/rpctypes"
++	"google.golang.org/grpc/codes"
++
++	"k8s.io/apimachinery/pkg/runtime"
++	"k8s.io/apimachinery/pkg/util/wait"
++	"k8s.io/apimachinery/pkg/watch"
++	"k8s.io/apiserver/pkg/storage"
++	"k8s.io/apiserver/pkg/storage/etcd3/metrics"
++	"k8s.io/klog/v2"
++)
++
++var DefaultRetry = wait.Backoff{
++	Duration: 300 * time.Millisecond,
++	Factor:   2, // double the timeout for every failure
++	Jitter:   0.1,
++	Steps:    6, // .3 + .6 + 1.2 + 2.4 + 4.8 = 10ish  this lets us smooth out short bumps but not long ones and keeps retry behavior closer.
++}
++
++// Closable is an interface for storage implementations that support cleanup via Close.
++type Closable interface {
++	Close()
++}
++
++type retryClient struct {
++	// All methods of storage.Interface are implemented directly on *retryClient, even when they
++	// are purely passthroughs to the delegate. During a rebase, consider whether or not it is
++	// safe and appropriate for a new method added to the method set of storage.Interface to
++	// perform retries.
++	delegate storage.Interface
++}
++
++func (c *retryClient) ReadinessCheck() error {
++	return c.delegate.ReadinessCheck()
++}
++
++// EnableResourceSizeEstimation is not expected to be retried as it setting
++// the keys function always succeeds.
++func (c *retryClient) EnableResourceSizeEstimation(f storage.KeysFunc) error {
++	return c.delegate.EnableResourceSizeEstimation(f)
++}
++
++// CompactRevision() is not expected to be retried as it only reads
++// the current revision from the compactor.
++func (c *retryClient) CompactRevision() int64 {
++	return c.delegate.CompactRevision()
++}
++
++// Each invocation of Stats may produce different results. Thus,
++// it's important to retry in case of an error to get the latest
++// results.
++func (c *retryClient) Stats(ctx context.Context) (storage.Stats, error) {
++	var stats storage.Stats
++	err := OnError(ctx, DefaultRetry, IsRetriableErrorOnRead, func() error {
++		var innerErr error
++		stats, innerErr = c.delegate.Stats(ctx)
++		return innerErr
++	})
++	return stats, err
++}
++
++func (c *retryClient) RequestWatchProgress(ctx context.Context) error {
++	return c.delegate.RequestWatchProgress(ctx)
++}
++
++func (c *retryClient) Versioner() storage.Versioner {
++	return c.delegate.Versioner()
++}
++
++// Close closes the underlying storage if it supports Close.
++// This method is not part of storage.Interface but is called by the factory destroy function.
++func (c *retryClient) Close() {
++	if closer, ok := c.delegate.(Closable); ok {
++		closer.Close()
++	}
++}
++
++// New returns an etcd3 implementation of storage.Interface.
++func NewRetryingEtcdStorage(delegate storage.Interface) *retryClient {
++	return &retryClient{delegate: delegate}
++}
++
++func (c *retryClient) GetCurrentResourceVersion(ctx context.Context) (uint64, error) {
++	var (
++		rv  uint64
++		err error
++	)
++	return rv, OnError(ctx, DefaultRetry, IsRetriableErrorOnRead, func() error {
++		rv, err = c.delegate.GetCurrentResourceVersion(ctx)
++		return err
++	})
++}
++
++// Create adds a new object at a key unless it already exists. 'ttl' is time-to-live
++// in seconds (0 means forever). If no error is returned and out is not nil, out will be
++// set to the read value from database.
++func (c *retryClient) Create(ctx context.Context, key string, obj, out runtime.Object, ttl uint64) error {
++	return OnError(ctx, DefaultRetry, IsRetriableErrorOnWrite, func() error {
++		return c.delegate.Create(ctx, key, obj, out, ttl)
++	})
++}
++
++// Delete removes the specified key and returns the value that existed at that spot.
++// If key didn't exist, it will return NotFound storage error.
++func (c *retryClient) Delete(ctx context.Context, key string, out runtime.Object, preconditions *storage.Preconditions, validateDeletion storage.ValidateObjectFunc, cachedExistingObject runtime.Object, opts storage.DeleteOptions) error {
++	return OnError(ctx, DefaultRetry, IsRetriableErrorOnWrite, func() error {
++		return c.delegate.Delete(ctx, key, out, preconditions, validateDeletion, cachedExistingObject, opts)
++	})
++}
++
++// Watch begins watching the specified key. Events are decoded into API objects,
++// and any items selected by 'p' are sent down to returned watch.Interface.
++// resourceVersion may be used to specify what version to begin watching,
++// which should be the current resourceVersion, and no longer rv+1
++// (e.g. reconnecting without missing any updates).
++// If resource version is "0", this interface will get current object at given key
++// and send it in an "ADDED" event, before watch starts.
++func (c *retryClient) Watch(ctx context.Context, key string, opts storage.ListOptions) (watch.Interface, error) {
++	var ret watch.Interface
++	err := OnError(ctx, DefaultRetry, IsRetriableErrorOnRead, func() error {
++		var innerErr error
++		ret, innerErr = c.delegate.Watch(ctx, key, opts)
++		return innerErr
++	})
++	return ret, err
++}
++
++// Get unmarshals json found at key into objPtr. On a not found error, will either
++// return a zero object of the requested type, or an error, depending on 'opts.ignoreNotFound'.
++// Treats empty responses and nil response nodes exactly like a not found error.
++// The returned contents may be delayed, but it is guaranteed that they will
++// match 'opts.ResourceVersion' according 'opts.ResourceVersionMatch'.
++func (c *retryClient) Get(ctx context.Context, key string, opts storage.GetOptions, objPtr runtime.Object) error {
++	return OnError(ctx, DefaultRetry, IsRetriableErrorOnRead, func() error {
++		return c.delegate.Get(ctx, key, opts, objPtr)
++	})
++}
++
++// GetList unmarshalls objects found at key into a *List api object (an object
++// that satisfies runtime.IsList definition).
++// If 'opts.Recursive' is false, 'key' is used as an exact match. If `opts.Recursive'
++// is true, 'key' is used as a prefix.
++// The returned contents may be delayed, but it is guaranteed that they will
++// match 'opts.ResourceVersion' according 'opts.ResourceVersionMatch'.
++func (c *retryClient) GetList(ctx context.Context, key string, opts storage.ListOptions, listObj runtime.Object) error {
++	return OnError(ctx, DefaultRetry, IsRetriableErrorOnRead, func() error {
++		return c.delegate.GetList(ctx, key, opts, listObj)
++	})
++}
++
++// GuaranteedUpdate keeps calling 'tryUpdate()' to update key 'key' (of type 'destination')
++// retrying the update until success if there is index conflict.
++// Note that object passed to tryUpdate may change across invocations of tryUpdate() if
++// other writers are simultaneously updating it, so tryUpdate() needs to take into account
++// the current contents of the object when deciding how the update object should look.
++// If the key doesn't exist, it will return NotFound storage error if ignoreNotFound=false
++// else `destination` will be set to the zero value of it's type.
++// If the eventual successful invocation of `tryUpdate` returns an output with the same serialized
++// contents as the input, it won't perform any update, but instead set `destination` to an object with those
++// contents.
++// If 'cachedExistingObject' is non-nil, it can be used as a suggestion about the
++// current version of the object to avoid read operation from storage to get it.
++// However, the implementations have to retry in case suggestion is stale.
++//
++// Example:
++//
++// s := /* implementation of Interface */
++// err := s.GuaranteedUpdate(
++//
++//	 "myKey", &MyType{}, true, preconditions,
++//	 func(input runtime.Object, res ResponseMeta) (runtime.Object, *uint64, error) {
++//	   // Before each invocation of the user defined function, "input" is reset to
++//	   // current contents for "myKey" in database.
++//	   curr := input.(*MyType)  // Guaranteed to succeed.
++//
++//	   // Make the modification
++//	   curr.Counter++
++//
++//	   // Return the modified object - return an error to stop iterating. Return
++//	   // a uint64 to alter the TTL on the object, or nil to keep it the same value.
++//	   return cur, nil, nil
++//	}, cachedExistingObject
++//
++// )
++func (c *retryClient) GuaranteedUpdate(ctx context.Context, key string, destination runtime.Object, ignoreNotFound bool,
++	preconditions *storage.Preconditions, tryUpdate storage.UpdateFunc, cachedExistingObject runtime.Object) error {
++	return OnError(ctx, DefaultRetry, IsRetriableErrorOnWrite, func() error {
++		return c.delegate.GuaranteedUpdate(ctx, key, destination, ignoreNotFound, preconditions, tryUpdate, cachedExistingObject)
++	})
++}
++
++// These errors are coming back from the k8s.io/apiserver storage.Interface, not directly from an
++// etcd client. Classifying them can be fragile since the storage methods may not return etcd client
++// errors directly.
++var errorLabelsBySuffix = map[string]string{
++	"etcdserver: leader changed": "LeaderChanged",
++	"etcdserver: no leader":      "NoLeader",
++	"raft proposal dropped":      "ProposalDropped",
++
++	"etcdserver: request timed out":                                              "Timeout",
++	"etcdserver: request timed out, possibly due to previous leader failure":     "Timeout",
++	"etcdserver: request timed out, possible due to connection lost":             "Timeout",
++	"etcdserver: request timed out, waiting for the applied index took too long": "Timeout",
++	"etcdserver: server stopped":                                                 "Stopped",
++}
++
++var retriableWriteErrorSuffixes = func() *regexp.Regexp {
++	// This list should include only errors the caller is certain have no side effects.
++	suffixes := []string{
++		"etcdserver: leader changed",
++		"etcdserver: no leader",
++		"raft proposal dropped",
++	}
++	return regexp.MustCompile(fmt.Sprintf(`(%s)$`, strings.Join(suffixes, `|`)))
++}()
++
++// IsRetriableErrorOnWrite returns true if and only if a retry should be attempted when the provided
++// error is returned from a write attempt. If the error is retriable, a non-empty string classifying
++// the error is also returned.
++func IsRetriableErrorOnWrite(err error) (string, bool) {
++	if suffix := retriableWriteErrorSuffixes.FindString(err.Error()); suffix != "" {
++		return errorLabelsBySuffix[suffix], true
++	}
++	return "", false
++}
++
++var retriableReadErrorSuffixes = func() *regexp.Regexp {
++	var suffixes []string
++	for suffix := range errorLabelsBySuffix {
++		suffixes = append(suffixes, suffix)
++	}
++	return regexp.MustCompile(fmt.Sprintf(`(%s)$`, strings.Join(suffixes, `|`)))
++}()
++
++// IsRetriableErrorOnRead returns true if and only if a retry should be attempted when the provided
++// error is returned from a read attempt. If the error is retriable, a non-empty string classifying
++// the error is also returned.
++func IsRetriableErrorOnRead(err error) (string, bool) {
++	if suffix := retriableReadErrorSuffixes.FindString(err.Error()); suffix != "" {
++		return errorLabelsBySuffix[suffix], true
++	}
++	if etcdError, ok := etcdrpc.Error(err).(etcdrpc.EtcdError); ok && etcdError.Code() == codes.Unavailable {
++		return "Unavailable", true
++	}
++	return "", false
++}
++
++// OnError allows the caller to retry fn in case the error returned by fn is retriable
++// according to the provided function. backoff defines the maximum retries and the wait
++// interval between two retries.
++func OnError(ctx context.Context, backoff wait.Backoff, retriable func(error) (string, bool), fn func() error) error {
++	var lastErr error
++	var lastErrLabel string
++	var retry bool
++	var retryCounter int
++	err := backoffWithRequestContext(ctx, backoff, func() (bool, error) {
++		err := fn()
++		if retry {
++			klog.V(1).Infof("etcd retry - counter: %v, lastErrLabel: %s lastError: %v, error: %v", retryCounter, lastErrLabel, lastErr, err)
++			metrics.UpdateEtcdRequestRetry(lastErrLabel)
++		}
++		if err == nil {
++			return true, nil
++		}
++
++		lastErrLabel, retry = retriable(err)
++		if klog.V(6).Enabled() {
++			klog.V(6).InfoS("observed storage error", "err", err, "retriable", retry)
++		}
++		if retry {
++			lastErr = err
++			retryCounter++
++			return false, nil
++		}
++
++		return false, err
++	})
++	if err == wait.ErrWaitTimeout && lastErr != nil {
++		err = lastErr
++	}
++	return err
++}
++
++// backoffWithRequestContext works with a request context and a Backoff. It ensures that the retry wait never
++// exceeds the deadline specified by the request context.
++func backoffWithRequestContext(ctx context.Context, backoff wait.Backoff, condition wait.ConditionFunc) error {
++	for backoff.Steps > 0 {
++		if ok, err := condition(); err != nil || ok {
++			return err
++		}
++
++		if backoff.Steps == 1 {
++			break
++		}
++
++		waitBeforeRetry := backoff.Step()
++		select {
++		case <-ctx.Done():
++			return ctx.Err()
++		case <-time.After(waitBeforeRetry):
++		}
++	}
++
++	return wait.ErrWaitTimeout
++}
+diff --git a/vendor/k8s.io/apiserver/pkg/storage/etcd3/metrics/metrics.go b/vendor/k8s.io/apiserver/pkg/storage/etcd3/metrics/metrics.go
+index 78f08fb61..263c04ec0 100644
+--- a/vendor/k8s.io/apiserver/pkg/storage/etcd3/metrics/metrics.go
++++ b/vendor/k8s.io/apiserver/pkg/storage/etcd3/metrics/metrics.go
+@@ -174,6 +174,14 @@ var (
+ 		},
+ 		[]string{"group", "resource"},
+ 	)
++	etcdRequestRetry = compbasemetrics.NewCounterVec(
++		&compbasemetrics.CounterOpts{
++			Name:           "etcd_request_retry_total",
++			Help:           "Etcd request retry total",
++			StabilityLevel: compbasemetrics.ALPHA,
++		},
++		[]string{"error"},
++	)
+ )
+ 
+ var registerMetrics sync.Once
+@@ -198,6 +206,7 @@ func Register() {
+ 		legacyregistry.MustRegister(listStorageNumSelectorEvals)
+ 		legacyregistry.MustRegister(listStorageNumReturned)
+ 		legacyregistry.MustRegister(decodeErrorCounts)
++		legacyregistry.MustRegister(etcdRequestRetry)
+ 	})
+ }
+ 
+@@ -286,6 +295,11 @@ func UpdateLeaseObjectCount(count int64) {
+ 	etcdLeaseObjectCounts.WithLabelValues().Observe(float64(count))
+ }
+ 
++// UpdateEtcdRequestRetry sets the etcd_request_retry_total metric.
++func UpdateEtcdRequestRetry(errorCode string) {
++	etcdRequestRetry.WithLabelValues(errorCode).Inc()
++}
++
+ // RecordListEtcd3Metrics notes various metrics of the cost to serve a LIST request
+ func RecordStorageListMetrics(groupResource schema.GroupResource, numFetched, numEvald, numReturned int) {
+ 	listStorageCount.WithLabelValues(groupResource.Group, groupResource.Resource).Inc()
+diff --git a/vendor/k8s.io/apiserver/pkg/storage/storagebackend/config.go b/vendor/k8s.io/apiserver/pkg/storage/storagebackend/config.go
+index c948d6411..b67b64253 100644
+--- a/vendor/k8s.io/apiserver/pkg/storage/storagebackend/config.go
++++ b/vendor/k8s.io/apiserver/pkg/storage/storagebackend/config.go
+@@ -38,7 +38,7 @@ const (
+ 	DefaultCompactInterval      = 5 * time.Minute
+ 	DefaultDBMetricPollInterval = 30 * time.Second
+ 	DefaultEventsHistoryWindow  = 75 * time.Second
+-	DefaultHealthcheckTimeout   = 2 * time.Second
++	DefaultHealthcheckTimeout   = 10 * time.Second
+ 	DefaultReadinessTimeout     = 2 * time.Second
+ )
+ 
+diff --git a/vendor/k8s.io/apiserver/pkg/storage/storagebackend/factory/etcd3.go b/vendor/k8s.io/apiserver/pkg/storage/storagebackend/factory/etcd3.go
+index 53fc9f97a..6c21072b9 100644
+--- a/vendor/k8s.io/apiserver/pkg/storage/storagebackend/factory/etcd3.go
++++ b/vendor/k8s.io/apiserver/pkg/storage/storagebackend/factory/etcd3.go
+@@ -49,6 +49,7 @@ import (
+ 	"k8s.io/apiserver/pkg/server/egressselector"
+ 	"k8s.io/apiserver/pkg/storage"
+ 	"k8s.io/apiserver/pkg/storage/etcd3"
++	"k8s.io/apiserver/pkg/storage/etcd3/etcd3retry"
+ 	"k8s.io/apiserver/pkg/storage/etcd3/metrics"
+ 	"k8s.io/apiserver/pkg/storage/storagebackend"
+ 	"k8s.io/apiserver/pkg/storage/value/encrypt/identity"
+@@ -155,13 +156,13 @@ func newETCD3Check(c storagebackend.Config, timeout time.Duration, stopCh <-chan
+ 	// retry in a loop in the background until we successfully create the client, storing the client or error encountered
+ 
+ 	lock := sync.RWMutex{}
+-	var prober *etcd3ProberMonitor
++	var prober *etcd3RetryingProberMonitor
+ 	clientErr := fmt.Errorf("etcd client connection not yet established")
+ 
+ 	go wait.PollImmediateUntil(time.Second, func() (bool, error) {
+ 		lock.Lock()
+ 		defer lock.Unlock()
+-		newProber, err := newETCD3ProberMonitor(c)
++		newProber, err := newRetryingETCD3ProberMonitor(c)
+ 		// Ensure that server is already not shutting down.
+ 		select {
+ 		case <-stopCh:
+@@ -457,13 +458,14 @@ func newETCD3Storage(c storagebackend.ConfigForResource, newFunc, newListFunc fu
+ 		transformer = etcd3.WithCorruptObjErrorHandlingTransformer(transformer)
+ 		decoder = etcd3.WithCorruptObjErrorHandlingDecoder(decoder)
+ 	}
+-	store, err := etcd3.New(client, compactor, c.Codec, newFunc, newListFunc, c.Prefix, resourcePrefix, c.GroupResource, transformer, c.LeaseManagerConfig, decoder, versioner)
++	baseStore, err := etcd3.New(client, compactor, c.Codec, newFunc, newListFunc, c.Prefix, resourcePrefix, c.GroupResource, transformer, c.LeaseManagerConfig, decoder, versioner)
+ 	if err != nil {
+ 		stopCompactor()
+ 		stopDBSizeMonitor()
+ 		_ = client.Close()
+ 		return nil, nil, err
+ 	}
++	store := etcd3retry.NewRetryingEtcdStorage(baseStore)
+ 	var once sync.Once
+ 	destroyFunc := func() {
+ 		// we know that storage destroy funcs are called multiple times (due to reuse in subresources).
+diff --git a/vendor/k8s.io/apiserver/pkg/storage/storagebackend/factory/factory.go b/vendor/k8s.io/apiserver/pkg/storage/storagebackend/factory/factory.go
+index 2bf3727e8..0967a84cb 100644
+--- a/vendor/k8s.io/apiserver/pkg/storage/storagebackend/factory/factory.go
++++ b/vendor/k8s.io/apiserver/pkg/storage/storagebackend/factory/factory.go
+@@ -69,7 +69,7 @@ func CreateProber(c storagebackend.Config) (Prober, error) {
+ 	case storagebackend.StorageTypeETCD2:
+ 		return nil, fmt.Errorf("%s is no longer a supported storage backend", c.Type)
+ 	case storagebackend.StorageTypeUnset, storagebackend.StorageTypeETCD3:
+-		return newETCD3ProberMonitor(c)
++		return newRetryingETCD3ProberMonitor(c)
+ 	default:
+ 		return nil, fmt.Errorf("unknown storage type: %s", c.Type)
+ 	}
+@@ -80,7 +80,7 @@ func CreateMonitor(c storagebackend.Config) (metrics.Monitor, error) {
+ 	case storagebackend.StorageTypeETCD2:
+ 		return nil, fmt.Errorf("%s is no longer a supported storage backend", c.Type)
+ 	case storagebackend.StorageTypeUnset, storagebackend.StorageTypeETCD3:
+-		return newETCD3ProberMonitor(c)
++		return newRetryingETCD3ProberMonitor(c)
+ 	default:
+ 		return nil, fmt.Errorf("unknown storage type: %s", c.Type)
+ 	}
+diff --git a/vendor/k8s.io/apiserver/pkg/storage/storagebackend/factory/retry_etcdprobemonitor.go b/vendor/k8s.io/apiserver/pkg/storage/storagebackend/factory/retry_etcdprobemonitor.go
+new file mode 100644
+index 000000000..0e6c19b45
+--- /dev/null
++++ b/vendor/k8s.io/apiserver/pkg/storage/storagebackend/factory/retry_etcdprobemonitor.go
+@@ -0,0 +1,46 @@
++package factory
++
++import (
++	"context"
++
++	"k8s.io/apiserver/pkg/storage/etcd3/etcd3retry"
++	"k8s.io/apiserver/pkg/storage/etcd3/metrics"
++	"k8s.io/apiserver/pkg/storage/storagebackend"
++)
++
++type proberMonitor interface {
++	Prober
++	metrics.Monitor
++}
++
++type etcd3RetryingProberMonitor struct {
++	delegate proberMonitor
++}
++
++func newRetryingETCD3ProberMonitor(c storagebackend.Config) (*etcd3RetryingProberMonitor, error) {
++	delegate, err := newETCD3ProberMonitor(c)
++	if err != nil {
++		return nil, err
++	}
++	return &etcd3RetryingProberMonitor{delegate: delegate}, nil
++}
++
++func (t *etcd3RetryingProberMonitor) Probe(ctx context.Context) error {
++	return etcd3retry.OnError(ctx, etcd3retry.DefaultRetry, etcd3retry.IsRetriableErrorOnRead, func() error {
++		return t.delegate.Probe(ctx)
++	})
++}
++
++func (t *etcd3RetryingProberMonitor) Monitor(ctx context.Context) (metrics.StorageMetrics, error) {
++	var ret metrics.StorageMetrics
++	err := etcd3retry.OnError(ctx, etcd3retry.DefaultRetry, etcd3retry.IsRetriableErrorOnRead, func() error {
++		var innerErr error
++		ret, innerErr = t.delegate.Monitor(ctx)
++		return innerErr
++	})
++	return ret, err
++}
++
++func (t *etcd3RetryingProberMonitor) Close() error {
++	return t.delegate.Close()
++}
+diff --git a/vendor/modules.txt b/vendor/modules.txt
+index 3f43625a3..68b251e01 100644
+--- a/vendor/modules.txt
++++ b/vendor/modules.txt
+@@ -794,7 +794,7 @@ k8s.io/apimachinery/pkg/version
+ k8s.io/apimachinery/pkg/watch
+ k8s.io/apimachinery/third_party/forked/golang/json
+ k8s.io/apimachinery/third_party/forked/golang/reflect
+-# k8s.io/apiserver v0.35.2 => github.com/openshift/kubernetes-apiserver v0.0.0-20260227052614-9120debab75e
++# k8s.io/apiserver v0.35.2 => github.com/openshift/kubernetes-apiserver v0.0.0-20260724190151-8aa3459a8bba
+ ## explicit; go 1.25.0
+ k8s.io/apiserver/pkg/admission
+ k8s.io/apiserver/pkg/admission/configuration
+@@ -920,6 +920,7 @@ k8s.io/apiserver/pkg/storage/cacher/metrics
+ k8s.io/apiserver/pkg/storage/cacher/progress
+ k8s.io/apiserver/pkg/storage/errors
+ k8s.io/apiserver/pkg/storage/etcd3
++k8s.io/apiserver/pkg/storage/etcd3/etcd3retry
+ k8s.io/apiserver/pkg/storage/etcd3/metrics
+ k8s.io/apiserver/pkg/storage/feature
+ k8s.io/apiserver/pkg/storage/names
+@@ -1408,4 +1409,4 @@ sigs.k8s.io/structured-merge-diff/v6/value
+ # sigs.k8s.io/yaml v1.6.0
+ ## explicit; go 1.22
+ sigs.k8s.io/yaml
+-# k8s.io/apiserver => github.com/openshift/kubernetes-apiserver v0.0.0-20260227052614-9120debab75e
++# k8s.io/apiserver => github.com/openshift/kubernetes-apiserver v0.0.0-20260724190151-8aa3459a8bba

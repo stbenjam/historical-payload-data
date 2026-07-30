@@ -1,0 +1,1617 @@
+diff --git a/.golangci.yml b/.golangci.yml
+index 03a7f0bd..1e7aba22 100644
+--- a/.golangci.yml
++++ b/.golangci.yml
+@@ -1,7 +1,6 @@
+ version: "2"
+ run:
+   modules-download-mode: vendor
+-  tests: true
+   timeout: 5m
+ linters:
+   enable:
+@@ -50,8 +49,6 @@ linters:
+       - linters:
+           - unparam
+         path: '_test\.go$'
+-issues:
+-  fix: true
+ formatters:
+   enable:
+     - gci
+diff --git a/Makefile b/Makefile
+index 82d1ae4f..561efe01 100644
+--- a/Makefile
++++ b/Makefile
+@@ -35,11 +35,13 @@ $(LOCALBIN):
+ YQ ?= $(LOCALBIN)/yq
+ GOLANGCI_LINT ?= $(LOCALBIN)/golangci-lint
+ HELM ?= $(LOCALBIN)/helm
++CONTROLLER_GEN ?= $(LOCALBIN)/controller-gen
+ 
+ ## Tool Versions
+ YQ_VERSION            ?= v4.53.2
+ GOLANGCI_LINT_VERSION ?= v2.12.1
+ HELM_VERSION          ?= v4.2.0
++CONTROLLER_GEN_VERSION ?= v0.20.0
+ 
+ ##@ Tools
+ 
+@@ -60,7 +62,7 @@ $(GOLANGCI_LINT): $(LOCALBIN)
+ 	  true; \
+ 	else \
+ 	  echo "Installing golangci-lint $(GOLANGCI_LINT_VERSION)..."; \
+-	  GOBIN=$(LOCALBIN) GOFLAGS= go install github.com/golangci/golangci-lint/v2/cmd/golangci-lint@$(GOLANGCI_LINT_VERSION); \
++	  curl -sSfL https://golangci-lint.run/install.sh | sh -s -- -b $(LOCALBIN) $(GOLANGCI_LINT_VERSION); \
+ 	fi
+ 
+ .PHONY: helm
+@@ -75,10 +77,32 @@ $(HELM): $(LOCALBIN)
+ 	    | tar -xz --strip-components=1 -C $(LOCALBIN) "$${PLATFORM}/helm"; \
+ 	fi
+ 
++.PHONY: controller-gen
++controller-gen: $(CONTROLLER_GEN) ## Install controller-gen locally if necessary.
++$(CONTROLLER_GEN): $(LOCALBIN)
++	@if test -s $(CONTROLLER_GEN) && $(CONTROLLER_GEN) --version 2>/dev/null | grep -q "$(CONTROLLER_GEN_VERSION)"; then \
++	  true; \
++	else \
++	  echo "Installing controller-gen $(CONTROLLER_GEN_VERSION)..."; \
++	  GOBIN=$(LOCALBIN) GOFLAGS= go install sigs.k8s.io/controller-tools/cmd/controller-gen@$(CONTROLLER_GEN_VERSION); \
++	fi
++
+ ##@ Development
+ 
+ JUNIT_REPORT := $(if $(ARTIFACT_DIR),--ginkgo.junit-report="$(ARTIFACT_DIR)/junit_e2e.xml")
+ 
++.PHONY: update
++update: fmt generate manifests lint-fix manifest-diff-sync
++
++.PHONY: generate
++generate: $(CONTROLLER_GEN) ## Generate deepcopy methods.
++	$(CONTROLLER_GEN) object paths="./pkg/apis/..."
++
++.PHONY: manifests
++manifests: $(CONTROLLER_GEN) ## Generate CRD manifests.
++	$(CONTROLLER_GEN) crd paths="./pkg/apis/..." output:crd:artifacts:config=install
++	@mv install/autoscaling.openshift.io_karpenters.yaml install/00_autoscaling.openshift.io_karpenters.yaml
++
+ .PHONY: fmt
+ fmt: ## Run go fmt against code.
+ 	go fmt ./...
+@@ -89,7 +113,11 @@ vet: ## Run go vet against code.
+ 
+ .PHONY: lint
+ lint: $(GOLANGCI_LINT) ## Run golangci-lint against code.
+-	GOFLAGS= $(GOLANGCI_LINT) run ./...
++	$(GOLANGCI_LINT) run ./... --config ./.golangci.yml -v
++
++.PHONY: lint-fix
++lint-fix: $(GOLANGCI_LINT) ## Run golangci-lint against code and fix issues.
++	$(GOLANGCI_LINT) run ./... --config ./.golangci.yml -v --fix
+ 
+ .PHONY: manifest-diff
+ manifest-diff: $(YQ) $(HELM) ## Check RBAC manifests are in sync (no writes).
+@@ -101,11 +129,13 @@ manifest-diff-sync: $(YQ) $(HELM) ## Regenerate RBAC manifests from sources.
+ 	YQ=$(YQ) HELM=$(HELM) hack/manifest-diff-upstream.sh --sync
+ 	YQ=$(YQ) hack/manifest-diff.sh --sync
+ 
+-.PHONY: verify-deps
+-verify-deps: ## Verify go.mod and vendor are tidy.
+-	go mod tidy
+-	go mod vendor
+-	git diff --exit-code go.mod go.sum vendor/
++.PHONY: verify-git-clean
++verify-git-clean: vendor
++	git diff-index --cached --quiet --ignore-submodules HEAD --
++	git diff-files --quiet --ignore-submodules
++	git diff --exit-code HEAD --
++	$(eval STATUS = $(shell git status -s))
++	$(if $(strip $(STATUS)),$(error untracked files detected: ${STATUS}))
+ 
+ .PHONY: test
+ test: ## Run unit tests.
+@@ -116,7 +146,10 @@ e2e: ## Run e2e tests (requires KUBECONFIG).
+ 	go test ./test/suites/... -count=1 -timeout 30m -v $(JUNIT_REPORT)
+ 
+ .PHONY: verify
+-verify: vet fmt lint manifest-diff verify-deps test ## Run all verification checks.
++verify: vet lint test ## Run all verification checks.
++	$(MAKE) update
++	$(MAKE) manifest-diff
++	$(MAKE) verify-git-clean
+ 
+ .PHONY: vendor
+ vendor: ## Tidy and vendor Go modules.
+diff --git a/examples/karpenter.yaml b/examples/karpenter.yaml
+new file mode 100644
+index 00000000..07bf1331
+--- /dev/null
++++ b/examples/karpenter.yaml
+@@ -0,0 +1,6 @@
++apiVersion: autoscaling.openshift.io/v1alpha1
++kind: Karpenter
++metadata:
++  name: cluster
++spec:
++  logLevel: info
+diff --git a/go.mod b/go.mod
+index 3a3eedf0..0d83c96a 100644
+--- a/go.mod
++++ b/go.mod
+@@ -1,6 +1,6 @@
+ module github.com/openshift/karpenter-operator
+ 
+-go 1.25.7
++go 1.26.3
+ 
+ require (
+ 	github.com/aws/aws-sdk-go-v2/config v1.32.17
+diff --git a/install/00_autoscaling.openshift.io_karpenters.yaml b/install/00_autoscaling.openshift.io_karpenters.yaml
+new file mode 100644
+index 00000000..c827b969
+--- /dev/null
++++ b/install/00_autoscaling.openshift.io_karpenters.yaml
+@@ -0,0 +1,130 @@
++---
++apiVersion: apiextensions.k8s.io/v1
++kind: CustomResourceDefinition
++metadata:
++  annotations:
++    controller-gen.kubebuilder.io/version: v0.20.0
++    exclude.release.openshift.io/internal-openshift-hosted: "true"
++    include.release.openshift.io/self-managed-high-availability: "true"
++    release.openshift.io/feature-gate: KarpenterOperator
++  name: karpenters.autoscaling.openshift.io
++spec:
++  group: autoscaling.openshift.io
++  names:
++    kind: Karpenter
++    listKind: KarpenterList
++    plural: karpenters
++    shortNames:
++    - karp
++    singular: karpenter
++  scope: Cluster
++  versions:
++  - name: v1alpha1
++    schema:
++      openAPIV3Schema:
++        description: |-
++          Karpenter is the lifecycle object that deploys and manages the Karpenter
++          operand on OpenShift.
++        properties:
++          apiVersion:
++            description: |-
++              APIVersion defines the versioned schema of this representation of an object.
++              Servers should convert recognized schemas to the latest internal value, and
++              may reject unrecognized values.
++              More info: https://git.k8s.io/community/contributors/devel/sig-architecture/api-conventions.md#resources
++            type: string
++          kind:
++            description: |-
++              Kind is a string value representing the REST resource this object represents.
++              Servers may infer this from the endpoint the client submits requests to.
++              Cannot be updated.
++              In CamelCase.
++              More info: https://git.k8s.io/community/contributors/devel/sig-architecture/api-conventions.md#types-kinds
++            type: string
++          metadata:
++            type: object
++          spec:
++            description: KarpenterSpec defines the desired state of the Karpenter
++              operand.
++            properties:
++              logLevel:
++                default: info
++                description: LogLevel is the log verbosity level. Can be one of 'debug',
++                  'info', or 'error'.
++                enum:
++                - debug
++                - info
++                - error
++                type: string
++            type: object
++          status:
++            description: KarpenterStatus defines the observed state of the Karpenter
++              operand.
++            properties:
++              conditions:
++                description: Conditions represent the latest available observations
++                  of the operator's state.
++                items:
++                  description: Condition contains details for one aspect of the current
++                    state of this API Resource.
++                  properties:
++                    lastTransitionTime:
++                      description: |-
++                        lastTransitionTime is the last time the condition transitioned from one status to another.
++                        This should be when the underlying condition changed.  If that is not known, then using the time when the API field changed is acceptable.
++                      format: date-time
++                      type: string
++                    message:
++                      description: |-
++                        message is a human readable message indicating details about the transition.
++                        This may be an empty string.
++                      maxLength: 32768
++                      type: string
++                    observedGeneration:
++                      description: |-
++                        observedGeneration represents the .metadata.generation that the condition was set based upon.
++                        For instance, if .metadata.generation is currently 12, but the .status.conditions[x].observedGeneration is 9, the condition is out of date
++                        with respect to the current state of the instance.
++                      format: int64
++                      minimum: 0
++                      type: integer
++                    reason:
++                      description: |-
++                        reason contains a programmatic identifier indicating the reason for the condition's last transition.
++                        Producers of specific condition types may define expected values and meanings for this field,
++                        and whether the values are considered a guaranteed API.
++                        The value should be a CamelCase string.
++                        This field may not be empty.
++                      maxLength: 1024
++                      minLength: 1
++                      pattern: ^[A-Za-z]([A-Za-z0-9_,:]*[A-Za-z0-9_])?$
++                      type: string
++                    status:
++                      description: status of the condition, one of True, False, Unknown.
++                      enum:
++                      - "True"
++                      - "False"
++                      - Unknown
++                      type: string
++                    type:
++                      description: type of condition in CamelCase or in foo.example.com/CamelCase.
++                      maxLength: 316
++                      pattern: ^([a-z0-9]([-a-z0-9]*[a-z0-9])?(\.[a-z0-9]([-a-z0-9]*[a-z0-9])?)*/)?(([A-Za-z0-9][-A-Za-z0-9_.]*)?[A-Za-z0-9])$
++                      type: string
++                  required:
++                  - lastTransitionTime
++                  - message
++                  - reason
++                  - status
++                  - type
++                  type: object
++                type: array
++                x-kubernetes-list-map-keys:
++                - type
++                x-kubernetes-list-type: map
++            type: object
++        type: object
++    served: true
++    storage: true
++    subresources:
++      status: {}
+diff --git a/install/04_rbac.yaml b/install/04_rbac.yaml
+index 58708d94..97fa6d03 100644
+--- a/install/04_rbac.yaml
++++ b/install/04_rbac.yaml
+@@ -70,6 +70,9 @@ metadata:
+     include.release.openshift.io/self-managed-high-availability: "true"
+     release.openshift.io/feature-gate: KarpenterOperator
+ rules:
++  - apiGroups: ["autoscaling.openshift.io"]
++    resources: ["karpenters", "karpenters/status", "karpenters/finalizers"]
++    verbs: ["get", "list", "watch", "update", "patch"]
+   - apiGroups: ["config.openshift.io"]
+     resources: ["clusteroperators", "clusteroperators/status"]
+     verbs: ["create", "get", "update", "patch", "list", "watch"]
+@@ -145,7 +148,7 @@ metadata:
+ rules:
+   # Read
+   - apiGroups: ["karpenter.sh"]
+-    resources: ["nodepools", "nodepools/status", "nodeclaims", "nodeclaims/status", "nodeoverlays", "nodeoverlays/status"]
++    resources: ["nodepools", "nodepools/status", "nodeclaims", "nodeclaims/status", "nodeclaims/finalizers", "nodeoverlays", "nodeoverlays/status"]
+     verbs: ["get", "list", "watch"]
+   - apiGroups: [""]
+     resources: ["pods", "nodes", "persistentvolumes", "persistentvolumeclaims", "replicationcontrollers", "namespaces"]
+@@ -164,10 +167,10 @@ rules:
+     verbs: ["get", list, "watch"]
+   # Write
+   - apiGroups: ["karpenter.sh"]
+-    resources: ["nodeclaims", "nodeclaims/status"]
++    resources: ["nodeclaims", "nodeclaims/status", "nodeclaims/finalizers"]
+     verbs: ["create", "delete", "update", "patch"]
+   - apiGroups: ["karpenter.sh"]
+-    resources: ["nodepools", "nodepools/status", "nodeoverlays/status"]
++    resources: ["nodepools", "nodepools/status", "nodepools/finalizers", "nodeoverlays/status"]
+     verbs: ["update", "patch"]
+   - apiGroups: [""]
+     resources: ["events"]
+diff --git a/pkg/apis/autoscaling/v1alpha1/doc.go b/pkg/apis/autoscaling/v1alpha1/doc.go
+new file mode 100644
+index 00000000..3f3e2c3a
+--- /dev/null
++++ b/pkg/apis/autoscaling/v1alpha1/doc.go
+@@ -0,0 +1,28 @@
++// +k8s:deepcopy-gen=package,register
++// +groupName=autoscaling.openshift.io
++package v1alpha1
++
++import (
++	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
++	"k8s.io/apimachinery/pkg/runtime"
++	"k8s.io/apimachinery/pkg/runtime/schema"
++	"k8s.io/client-go/kubernetes/scheme"
++)
++
++var SchemeGroupVersion = schema.GroupVersion{Group: "autoscaling.openshift.io", Version: "v1alpha1"}
++
++func init() {
++	metav1.AddToGroupVersion(scheme.Scheme, SchemeGroupVersion)
++	scheme.Scheme.AddKnownTypes(SchemeGroupVersion,
++		&Karpenter{},
++		&KarpenterList{})
++}
++
++// AddToScheme registers the types in this package with the given scheme.
++func AddToScheme(s *runtime.Scheme) error {
++	metav1.AddToGroupVersion(s, SchemeGroupVersion)
++	s.AddKnownTypes(SchemeGroupVersion,
++		&Karpenter{},
++		&KarpenterList{})
++	return nil
++}
+diff --git a/pkg/apis/autoscaling/v1alpha1/karpenter.go b/pkg/apis/autoscaling/v1alpha1/karpenter.go
+new file mode 100644
+index 00000000..97e33a3a
+--- /dev/null
++++ b/pkg/apis/autoscaling/v1alpha1/karpenter.go
+@@ -0,0 +1,65 @@
++package v1alpha1
++
++import (
++	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
++)
++
++// +kubebuilder:object:root=true
++// +kubebuilder:subresource:status
++// +kubebuilder:resource:path=karpenters,scope=Cluster,shortName=karp
++// +kubebuilder:metadata:annotations="exclude.release.openshift.io/internal-openshift-hosted=true"
++// +kubebuilder:metadata:annotations="include.release.openshift.io/self-managed-high-availability=true"
++// +kubebuilder:metadata:annotations="release.openshift.io/feature-gate=KarpenterOperator"
++
++// Karpenter is the lifecycle object that deploys and manages the Karpenter
++// operand on OpenShift.
++type Karpenter struct {
++	metav1.TypeMeta   `json:",inline"`
++	metav1.ObjectMeta `json:"metadata,omitempty"`
++
++	Spec   KarpenterSpec   `json:"spec,omitempty"`
++	Status KarpenterStatus `json:"status,omitempty"`
++}
++
++// +kubebuilder:object:root=true
++
++// KarpenterList contains a list of Karpenter resources.
++type KarpenterList struct {
++	metav1.TypeMeta `json:",inline"`
++	metav1.ListMeta `json:"metadata,omitempty"`
++	Items           []Karpenter `json:"items"`
++}
++
++// KarpenterLogLevel is the log verbosity for the Karpenter operand.
++// +kubebuilder:validation:Enum=debug;info;error
++type KarpenterLogLevel string
++
++const (
++	LogLevelDebug KarpenterLogLevel = "debug"
++	LogLevelInfo  KarpenterLogLevel = "info"
++	LogLevelError KarpenterLogLevel = "error"
++)
++
++func (l KarpenterLogLevel) Arg() string {
++	if l == "" {
++		return "--log-level=" + string(LogLevelInfo)
++	}
++	return "--log-level=" + string(l)
++}
++
++// KarpenterSpec defines the desired state of the Karpenter operand.
++type KarpenterSpec struct {
++	// LogLevel is the log verbosity level. Can be one of 'debug', 'info', or 'error'.
++	// +kubebuilder:default=info
++	// +optional
++	LogLevel KarpenterLogLevel `json:"logLevel,omitempty"`
++}
++
++// KarpenterStatus defines the observed state of the Karpenter operand.
++type KarpenterStatus struct {
++	// Conditions represent the latest available observations of the operator's state.
++	// +listType=map
++	// +listMapKey=type
++	// +optional
++	Conditions []metav1.Condition `json:"conditions,omitempty"`
++}
+diff --git a/pkg/apis/autoscaling/v1alpha1/zz_generated.deepcopy.go b/pkg/apis/autoscaling/v1alpha1/zz_generated.deepcopy.go
+new file mode 100644
+index 00000000..bbe9bf02
+--- /dev/null
++++ b/pkg/apis/autoscaling/v1alpha1/zz_generated.deepcopy.go
+@@ -0,0 +1,106 @@
++//go:build !ignore_autogenerated
++
++// Code generated by controller-gen. DO NOT EDIT.
++
++package v1alpha1
++
++import (
++	"k8s.io/apimachinery/pkg/apis/meta/v1"
++	"k8s.io/apimachinery/pkg/runtime"
++)
++
++// DeepCopyInto is an autogenerated deepcopy function, copying the receiver, writing into out. in must be non-nil.
++func (in *Karpenter) DeepCopyInto(out *Karpenter) {
++	*out = *in
++	out.TypeMeta = in.TypeMeta
++	in.ObjectMeta.DeepCopyInto(&out.ObjectMeta)
++	out.Spec = in.Spec
++	in.Status.DeepCopyInto(&out.Status)
++}
++
++// DeepCopy is an autogenerated deepcopy function, copying the receiver, creating a new Karpenter.
++func (in *Karpenter) DeepCopy() *Karpenter {
++	if in == nil {
++		return nil
++	}
++	out := new(Karpenter)
++	in.DeepCopyInto(out)
++	return out
++}
++
++// DeepCopyObject is an autogenerated deepcopy function, copying the receiver, creating a new runtime.Object.
++func (in *Karpenter) DeepCopyObject() runtime.Object {
++	if c := in.DeepCopy(); c != nil {
++		return c
++	}
++	return nil
++}
++
++// DeepCopyInto is an autogenerated deepcopy function, copying the receiver, writing into out. in must be non-nil.
++func (in *KarpenterList) DeepCopyInto(out *KarpenterList) {
++	*out = *in
++	out.TypeMeta = in.TypeMeta
++	in.ListMeta.DeepCopyInto(&out.ListMeta)
++	if in.Items != nil {
++		in, out := &in.Items, &out.Items
++		*out = make([]Karpenter, len(*in))
++		for i := range *in {
++			(*in)[i].DeepCopyInto(&(*out)[i])
++		}
++	}
++}
++
++// DeepCopy is an autogenerated deepcopy function, copying the receiver, creating a new KarpenterList.
++func (in *KarpenterList) DeepCopy() *KarpenterList {
++	if in == nil {
++		return nil
++	}
++	out := new(KarpenterList)
++	in.DeepCopyInto(out)
++	return out
++}
++
++// DeepCopyObject is an autogenerated deepcopy function, copying the receiver, creating a new runtime.Object.
++func (in *KarpenterList) DeepCopyObject() runtime.Object {
++	if c := in.DeepCopy(); c != nil {
++		return c
++	}
++	return nil
++}
++
++// DeepCopyInto is an autogenerated deepcopy function, copying the receiver, writing into out. in must be non-nil.
++func (in *KarpenterSpec) DeepCopyInto(out *KarpenterSpec) {
++	*out = *in
++}
++
++// DeepCopy is an autogenerated deepcopy function, copying the receiver, creating a new KarpenterSpec.
++func (in *KarpenterSpec) DeepCopy() *KarpenterSpec {
++	if in == nil {
++		return nil
++	}
++	out := new(KarpenterSpec)
++	in.DeepCopyInto(out)
++	return out
++}
++
++// DeepCopyInto is an autogenerated deepcopy function, copying the receiver, writing into out. in must be non-nil.
++func (in *KarpenterStatus) DeepCopyInto(out *KarpenterStatus) {
++	*out = *in
++	if in.Conditions != nil {
++		in, out := &in.Conditions, &out.Conditions
++		*out = make([]v1.Condition, len(*in))
++		for i := range *in {
++			(*in)[i].DeepCopyInto(&(*out)[i])
++		}
++	}
++}
++
++// DeepCopy is an autogenerated deepcopy function, copying the receiver, creating a new KarpenterStatus.
++func (in *KarpenterStatus) DeepCopy() *KarpenterStatus {
++	if in == nil {
++		return nil
++	}
++	out := new(KarpenterStatus)
++	in.DeepCopyInto(out)
++	return out
++}
+diff --git a/pkg/assets/karpenter/clusterrole-core.yaml b/pkg/assets/karpenter/clusterrole-core.yaml
+index 1c8b8c30..ab229c5a 100644
+--- a/pkg/assets/karpenter/clusterrole-core.yaml
++++ b/pkg/assets/karpenter/clusterrole-core.yaml
+@@ -7,7 +7,7 @@ metadata:
+ rules:
+   # Read
+   - apiGroups: ["karpenter.sh"]
+-    resources: ["nodepools", "nodepools/status", "nodeclaims", "nodeclaims/status", "nodeoverlays", "nodeoverlays/status"]
++    resources: ["nodepools", "nodepools/status", "nodeclaims", "nodeclaims/status", "nodeclaims/finalizers", "nodeoverlays", "nodeoverlays/status"]
+     verbs: ["get", "list", "watch"]
+   - apiGroups: [""]
+     resources: ["pods", "nodes", "persistentvolumes", "persistentvolumeclaims", "replicationcontrollers", "namespaces"]
+@@ -26,10 +26,10 @@ rules:
+     verbs: ["get", list, "watch"]
+   # Write
+   - apiGroups: ["karpenter.sh"]
+-    resources: ["nodeclaims", "nodeclaims/status"]
++    resources: ["nodeclaims", "nodeclaims/status", "nodeclaims/finalizers"]
+     verbs: ["create", "delete", "update", "patch"]
+   - apiGroups: ["karpenter.sh"]
+-    resources: ["nodepools", "nodepools/status", "nodeoverlays/status"]
++    resources: ["nodepools", "nodepools/status", "nodepools/finalizers", "nodeoverlays/status"]
+     verbs: ["update", "patch"]
+   - apiGroups: [""]
+     resources: ["events"]
+diff --git a/pkg/assets/operator/rbac.yaml b/pkg/assets/operator/rbac.yaml
+index 4d5fab65..5fd155df 100644
+--- a/pkg/assets/operator/rbac.yaml
++++ b/pkg/assets/operator/rbac.yaml
+@@ -51,6 +51,9 @@ kind: ClusterRole
+ metadata:
+   name: karpenter-operator
+ rules:
++  - apiGroups: ["autoscaling.openshift.io"]
++    resources: ["karpenters", "karpenters/status", "karpenters/finalizers"]
++    verbs: ["get", "list", "watch", "update", "patch"]
+   - apiGroups: ["config.openshift.io"]
+     resources: ["clusteroperators", "clusteroperators/status"]
+     verbs: ["create", "get", "update", "patch", "list", "watch"]
+diff --git a/pkg/controllers/clusteroperator/controller.go b/pkg/controllers/clusteroperator/controller.go
+index 5ac1e9a2..bc1ce47b 100644
+--- a/pkg/controllers/clusteroperator/controller.go
++++ b/pkg/controllers/clusteroperator/controller.go
+@@ -4,6 +4,8 @@ import (
+ 	"context"
+ 	"fmt"
+ 
++	autoscalingv1alpha1 "github.com/openshift/karpenter-operator/pkg/apis/autoscaling/v1alpha1"
++
+ 	configv1 "github.com/openshift/api/config/v1"
+ 	configac "github.com/openshift/client-go/config/applyconfigurations/config/v1"
+ 
+@@ -59,6 +61,14 @@ func (r *Controller) Reconcile(ctx context.Context, _ ctrl.Request) (ctrl.Result
+ }
+ 
+ func (r *Controller) operandConditions(ctx context.Context) []*configac.ClusterOperatorStatusConditionApplyConfiguration {
++	karp := &autoscalingv1alpha1.Karpenter{}
++	if err := r.client.Get(ctx, client.ObjectKey{Name: "cluster"}, karp); err != nil {
++		if apierrors.IsNotFound(err) {
++			return availableConditions("KarpenterNotFound", fmt.Sprintf("at version %s", r.config.ReleaseVersion))
++		}
++		return degradedConditions("KarpenterCheckFailed", fmt.Sprintf("Failed to get Karpenter CR: %v", err))
++	}
++
+ 	deploy := &appsv1.Deployment{}
+ 	err := r.client.Get(ctx, client.ObjectKey{Namespace: r.config.Namespace, Name: "karpenter"}, deploy)
+ 
+@@ -132,17 +142,27 @@ func (r *Controller) relatedObjects() []*configac.ObjectReferenceApplyConfigurat
+ }
+ 
+ func (r *Controller) SetupWithManager(mgr ctrl.Manager) error {
++	reconcileRequest := []ctrl.Request{{NamespacedName: client.ObjectKey{Name: clusterOperatorName}}}
++
+ 	return ctrl.NewControllerManagedBy(mgr).
+ 		Named(r.Name()).
+ 		For(&configv1.ClusterOperator{}, builder.WithPredicates(predicate.NewPredicateFuncs(func(o client.Object) bool {
+ 			return o.GetName() == clusterOperatorName
+ 		}))).
++		Watches(&autoscalingv1alpha1.Karpenter{}, handler.EnqueueRequestsFromMapFunc(
++			func(_ context.Context, o client.Object) []ctrl.Request {
++				if o.GetName() != "cluster" {
++					return nil
++				}
++				return reconcileRequest
++			},
++		)).
+ 		Watches(&appsv1.Deployment{}, handler.EnqueueRequestsFromMapFunc(
+ 			func(_ context.Context, o client.Object) []ctrl.Request {
+ 				if o.GetNamespace() != r.config.Namespace || o.GetName() != "karpenter" {
+ 					return nil
+ 				}
+-				return []ctrl.Request{{NamespacedName: client.ObjectKey{Name: clusterOperatorName}}}
++				return reconcileRequest
+ 			},
+ 		)).
+ 		Complete(r)
+diff --git a/pkg/controllers/clusteroperator/controller_test.go b/pkg/controllers/clusteroperator/controller_test.go
+index 68fe2755..100075b8 100644
+--- a/pkg/controllers/clusteroperator/controller_test.go
++++ b/pkg/controllers/clusteroperator/controller_test.go
+@@ -5,6 +5,8 @@ import (
+ 	"testing"
+ 	"time"
+ 
++	autoscalingv1alpha1 "github.com/openshift/karpenter-operator/pkg/apis/autoscaling/v1alpha1"
++
+ 	configv1 "github.com/openshift/api/config/v1"
+ 	configac "github.com/openshift/client-go/config/applyconfigurations/config/v1"
+ 
+@@ -27,10 +29,15 @@ var testConfig = &ControllerConfig{
+ 	ReleaseVersion: testReleaseVersion,
+ }
+ 
++var testKarpenterCR = &autoscalingv1alpha1.Karpenter{
++	ObjectMeta: metav1.ObjectMeta{Name: "cluster"},
++}
++
+ func testScheme() *runtime.Scheme {
+ 	s := runtime.NewScheme()
+ 	_ = appsv1.AddToScheme(s)
+ 	_ = configv1.Install(s)
++	_ = autoscalingv1alpha1.AddToScheme(s)
+ 	return s
+ }
+ 
+@@ -59,9 +66,21 @@ func TestReconcile(t *testing.T) { //nolint:gocyclo
+ 		expectRelatedObjCt int
+ 	}{
+ 		{
+-			name:               "operand Deployment not found — reports Progressing",
++			name:               "no Karpenter CR — reports Available",
+ 			objs:               nil,
+ 			expectAvailable:    configv1.ConditionTrue,
++			expectProgressing:  configv1.ConditionFalse,
++			expectDegraded:     configv1.ConditionFalse,
++			expectUpgradeable:  configv1.ConditionTrue,
++			expectMessageOn:    configv1.OperatorAvailable,
++			expectMessage:      "at version " + testReleaseVersion,
++			expectVersion:      testReleaseVersion,
++			expectRelatedObjCt: 6,
++		},
++		{
++			name:               "Karpenter CR exists, Deployment not found — reports Progressing",
++			objs:               []client.Object{testKarpenterCR},
++			expectAvailable:    configv1.ConditionTrue,
+ 			expectProgressing:  configv1.ConditionTrue,
+ 			expectDegraded:     configv1.ConditionFalse,
+ 			expectUpgradeable:  configv1.ConditionTrue,
+@@ -73,6 +92,7 @@ func TestReconcile(t *testing.T) { //nolint:gocyclo
+ 		{
+ 			name: "operand Deployment not ready — reports Progressing",
+ 			objs: []client.Object{
++				testKarpenterCR,
+ 				&appsv1.Deployment{
+ 					ObjectMeta: metav1.ObjectMeta{Name: "karpenter", Namespace: testNamespace},
+ 					Status:     appsv1.DeploymentStatus{Replicas: 1, AvailableReplicas: 0},
+@@ -90,6 +110,7 @@ func TestReconcile(t *testing.T) { //nolint:gocyclo
+ 		{
+ 			name: "operand Deployment rolling out — reports Progressing",
+ 			objs: []client.Object{
++				testKarpenterCR,
+ 				&appsv1.Deployment{
+ 					ObjectMeta: metav1.ObjectMeta{Name: "karpenter", Namespace: testNamespace},
+ 					Status:     appsv1.DeploymentStatus{Replicas: 2, AvailableReplicas: 1, UpdatedReplicas: 1},
+@@ -107,6 +128,7 @@ func TestReconcile(t *testing.T) { //nolint:gocyclo
+ 		{
+ 			name: "operand Deployment healthy — reports Available",
+ 			objs: []client.Object{
++				testKarpenterCR,
+ 				&appsv1.Deployment{
+ 					ObjectMeta: metav1.ObjectMeta{Name: "karpenter", Namespace: testNamespace},
+ 					Status:     appsv1.DeploymentStatus{Replicas: 1, AvailableReplicas: 1, UpdatedReplicas: 1},
+@@ -124,6 +146,7 @@ func TestReconcile(t *testing.T) { //nolint:gocyclo
+ 		{
+ 			name: "updates existing ClusterOperator",
+ 			objs: []client.Object{
++				testKarpenterCR,
+ 				&appsv1.Deployment{
+ 					ObjectMeta: metav1.ObjectMeta{Name: "karpenter", Namespace: testNamespace},
+ 					Status:     appsv1.DeploymentStatus{Replicas: 1, AvailableReplicas: 1, UpdatedReplicas: 1},
+diff --git a/pkg/controllers/controllers.go b/pkg/controllers/controllers.go
+index 622e15ce..639a35f4 100644
+--- a/pkg/controllers/controllers.go
++++ b/pkg/controllers/controllers.go
+@@ -7,7 +7,7 @@ import (
+ 	"github.com/openshift/karpenter-operator/pkg/cloudprovider/common"
+ 	"github.com/openshift/karpenter-operator/pkg/controllers/clusteroperator"
+ 	"github.com/openshift/karpenter-operator/pkg/controllers/crd"
+-	"github.com/openshift/karpenter-operator/pkg/controllers/deployment"
++	karpenterctrl "github.com/openshift/karpenter-operator/pkg/controllers/karpenter"
+ 
+ 	ctrl "sigs.k8s.io/controller-runtime"
+ )
+@@ -35,7 +35,7 @@ func NewControllers(mgr ctrl.Manager, cfg *Config) []Controller {
+ 			Namespace: cfg.Namespace,
+ 			CRDs:      append(assets.CoreCRDs, cfg.CloudProvider.CRDs()...),
+ 		}),
+-		deployment.NewController(mgr, &deployment.ControllerConfig{
++		karpenterctrl.NewController(mgr, &karpenterctrl.ControllerConfig{
+ 			Namespace:       cfg.Namespace,
+ 			KarpenterImage:  cfg.KarpenterImage,
+ 			ClusterName:     cfg.ClusterName,
+diff --git a/pkg/controllers/deployment/controller.go b/pkg/controllers/karpenter/controller.go
+similarity index 81%
+rename from pkg/controllers/deployment/controller.go
+rename to pkg/controllers/karpenter/controller.go
+index 77870944..a45d598f 100644
+--- a/pkg/controllers/deployment/controller.go
++++ b/pkg/controllers/karpenter/controller.go
+@@ -1,10 +1,12 @@
+-package deployment
++package karpenter
+ 
+ import (
+ 	"context"
+ 	"fmt"
+ 	"os"
++	"strconv"
+ 
++	autoscalingv1alpha1 "github.com/openshift/karpenter-operator/pkg/apis/autoscaling/v1alpha1"
+ 	"github.com/openshift/karpenter-operator/pkg/assets"
+ 	"github.com/openshift/karpenter-operator/pkg/cloudprovider/common"
+ 
+@@ -19,19 +21,30 @@ import (
+ 	rbacac "k8s.io/client-go/applyconfigurations/rbac/v1"
+ 
+ 	ctrl "sigs.k8s.io/controller-runtime"
+-	"sigs.k8s.io/controller-runtime/pkg/builder"
+ 	"sigs.k8s.io/controller-runtime/pkg/client"
+ 	"sigs.k8s.io/controller-runtime/pkg/handler"
+ 	"sigs.k8s.io/controller-runtime/pkg/log"
+-	"sigs.k8s.io/controller-runtime/pkg/predicate"
+ )
+ 
+ const (
+-	karpenterName          = "karpenter"
+-	operatorDeploymentName = "karpenter-operator"
+-	fieldManager           = "karpenter-operator"
++	karpenterName = "karpenter"
++	singletonName = "default"
++	fieldManager  = "karpenter-operator"
+ )
+ 
++const (
++	defaultMetricsPort     = 8080
++	defaultHealthProbePort = 8081
++
++	metricsPortName     = "metrics"
++	healthProbePortName = "http"
++
++	karpenterPodTerminationGracePeriodSeconds = 10
++	karpenterPodPriorityClassName             = "system-node-critical"
++)
++
++var defaultHealthProbePortStr = strconv.Itoa(defaultHealthProbePort)
++
+ type ControllerConfig struct {
+ 	Namespace       string
+ 	KarpenterImage  string
+@@ -58,60 +71,49 @@ func NewController(mgr ctrl.Manager, cfg *ControllerConfig) *Controller {
+ }
+ 
+ func (c *Controller) Name() string {
+-	return "deployment"
++	return "karpenter"
+ }
+ 
+ func (c *Controller) Reconcile(ctx context.Context, _ ctrl.Request) (ctrl.Result, error) {
+ 	log.FromContext(ctx).Info("reconciling karpenter deployment")
+ 
+-	owner, err := c.getOperatorDeployment(ctx)
+-	if err != nil {
+-		return ctrl.Result{}, fmt.Errorf("failed to get operator deployment: %w", err)
++	karp := &autoscalingv1alpha1.Karpenter{}
++	if err := c.client.Get(ctx, client.ObjectKey{Name: singletonName}, karp); err != nil {
++		return ctrl.Result{}, client.IgnoreNotFound(err)
+ 	}
+ 
+-	if err := c.applyServiceAccount(ctx, owner); err != nil {
++	if err := c.applyServiceAccount(ctx, karp); err != nil {
+ 		return ctrl.Result{}, fmt.Errorf("failed to reconcile ServiceAccount: %w", err)
+ 	}
+ 
+ 	cloudRBAC := c.config.CloudProvider.RBAC()
+-	if err := c.applyRoles(ctx, owner, append(assets.CoreRBAC.Roles, cloudRBAC.Roles...)); err != nil {
++	if err := c.applyRoles(ctx, karp, append(assets.CoreRBAC.Roles, cloudRBAC.Roles...)); err != nil {
+ 		return ctrl.Result{}, fmt.Errorf("failed to reconcile Roles: %w", err)
+ 	}
+-	if err := c.applyRoleBindings(ctx, owner, append(assets.CoreRBAC.RoleBindings, cloudRBAC.RoleBindings...)); err != nil {
++	if err := c.applyRoleBindings(ctx, karp, append(assets.CoreRBAC.RoleBindings, cloudRBAC.RoleBindings...)); err != nil {
+ 		return ctrl.Result{}, fmt.Errorf("failed to reconcile RoleBindings: %w", err)
+ 	}
+-	if err := c.applyClusterRoles(ctx, append(assets.CoreRBAC.ClusterRoles, cloudRBAC.ClusterRoles...)); err != nil {
++	if err := c.applyClusterRoles(ctx, karp, append(assets.CoreRBAC.ClusterRoles, cloudRBAC.ClusterRoles...)); err != nil {
+ 		return ctrl.Result{}, fmt.Errorf("failed to reconcile ClusterRoles: %w", err)
+ 	}
+-	if err := c.applyClusterRoleBindings(ctx, append(assets.CoreRBAC.ClusterRoleBindings, cloudRBAC.ClusterRoleBindings...)); err != nil {
++	if err := c.applyClusterRoleBindings(ctx, karp, append(assets.CoreRBAC.ClusterRoleBindings, cloudRBAC.ClusterRoleBindings...)); err != nil {
+ 		return ctrl.Result{}, fmt.Errorf("failed to reconcile ClusterRoleBindings: %w", err)
+ 	}
+ 
+-	if err := c.applyDeployment(ctx, owner); err != nil {
++	if err := c.applyDeployment(ctx, karp); err != nil {
+ 		return ctrl.Result{}, fmt.Errorf("failed to reconcile Deployment: %w", err)
+ 	}
+ 
+ 	return ctrl.Result{}, nil
+ }
+ 
+-func (c *Controller) getOperatorDeployment(ctx context.Context) (*appsv1.Deployment, error) {
+-	dep := &appsv1.Deployment{}
+-	if err := c.client.Get(ctx, client.ObjectKey{
+-		Namespace: c.config.Namespace,
+-		Name:      operatorDeploymentName,
+-	}, dep); err != nil {
+-		return nil, err
+-	}
+-	return dep, nil
+-}
+-
+-func (c *Controller) applyServiceAccount(ctx context.Context, owner *appsv1.Deployment) error {
++func (c *Controller) applyServiceAccount(ctx context.Context, owner *autoscalingv1alpha1.Karpenter) error {
+ 	sa := coreac.ServiceAccount(karpenterName, c.config.Namespace).
+ 		WithOwnerReferences(ownerRef(owner))
+ 	return c.client.Apply(ctx, sa, client.FieldOwner(fieldManager), client.ForceOwnership)
+ }
+ 
+-func (c *Controller) applyRoles(ctx context.Context, owner *appsv1.Deployment, roles []*rbacv1.Role) error {
++func (c *Controller) applyRoles(ctx context.Context, owner *autoscalingv1alpha1.Karpenter, roles []*rbacv1.Role) error {
+ 	for _, desired := range roles {
+ 		role := rbacac.Role(desired.Name, c.config.Namespace).
+ 			WithOwnerReferences(ownerRef(owner)).
+@@ -123,7 +125,7 @@ func (c *Controller) applyRoles(ctx context.Context, owner *appsv1.Deployment, r
+ 	return nil
+ }
+ 
+-func (c *Controller) applyRoleBindings(ctx context.Context, owner *appsv1.Deployment, bindings []*rbacv1.RoleBinding) error {
++func (c *Controller) applyRoleBindings(ctx context.Context, owner *autoscalingv1alpha1.Karpenter, bindings []*rbacv1.RoleBinding) error {
+ 	for _, desired := range bindings {
+ 		rb := rbacac.RoleBinding(desired.Name, c.config.Namespace).
+ 			WithOwnerReferences(ownerRef(owner)).
+@@ -136,9 +138,10 @@ func (c *Controller) applyRoleBindings(ctx context.Context, owner *appsv1.Deploy
+ 	return nil
+ }
+ 
+-func (c *Controller) applyClusterRoles(ctx context.Context, clusterRoles []*rbacv1.ClusterRole) error {
++func (c *Controller) applyClusterRoles(ctx context.Context, owner *autoscalingv1alpha1.Karpenter, clusterRoles []*rbacv1.ClusterRole) error {
+ 	for _, desired := range clusterRoles {
+ 		cr := rbacac.ClusterRole(desired.Name).
++			WithOwnerReferences(ownerRef(owner)).
+ 			WithLabels(desired.Labels).
+ 			WithRules(policyRules(desired.Rules)...)
+ 		if desired.AggregationRule != nil {
+@@ -155,9 +158,10 @@ func (c *Controller) applyClusterRoles(ctx context.Context, clusterRoles []*rbac
+ 	return nil
+ }
+ 
+-func (c *Controller) applyClusterRoleBindings(ctx context.Context, bindings []*rbacv1.ClusterRoleBinding) error {
++func (c *Controller) applyClusterRoleBindings(ctx context.Context, owner *autoscalingv1alpha1.Karpenter, bindings []*rbacv1.ClusterRoleBinding) error {
+ 	for _, desired := range bindings {
+ 		crb := rbacac.ClusterRoleBinding(desired.Name).
++			WithOwnerReferences(ownerRef(owner)).
+ 			WithRoleRef(roleRef(desired.RoleRef)).
+ 			WithSubjects(subjects(desired.Subjects, c.config.Namespace)...)
+ 		if err := c.client.Apply(ctx, crb, client.FieldOwner(fieldManager), client.ForceOwnership); err != nil {
+@@ -170,7 +174,7 @@ func (c *Controller) applyClusterRoleBindings(ctx context.Context, bindings []*r
+ // TODO(maxcao13): currently if the aws binary doesn't detect valid AWS credentials, it will exit with an error, restarting the pod.
+ // On HCP, there exists an init container bundled with karpenter to wait until such a credential is mounted to the pod.
+ // We should consider adding a similar init container for both topologies, maybe by porting the HCP logic and container image here.
+-func (c *Controller) applyDeployment(ctx context.Context, owner *appsv1.Deployment) error {
++func (c *Controller) applyDeployment(ctx context.Context, owner *autoscalingv1alpha1.Karpenter) error {
+ 	labels := map[string]string{"app": karpenterName}
+ 
+ 	dep := appsac.Deployment(karpenterName, c.config.Namespace).
+@@ -184,19 +188,19 @@ func (c *Controller) applyDeployment(ctx context.Context, owner *appsv1.Deployme
+ 					"openshift.io/required-scc":               "restricted-v2",
+ 				}).
+ 				WithLabels(labels).
+-				WithSpec(c.karpenterPodSpec()),
++				WithSpec(c.karpenterPodSpec(owner.Spec.LogLevel.Arg())),
+ 			),
+ 		)
+ 	return c.client.Apply(ctx, dep, client.FieldOwner(fieldManager), client.ForceOwnership)
+ }
+ 
+-func (c *Controller) karpenterPodSpec() *coreac.PodSpecApplyConfiguration {
++func (c *Controller) karpenterPodSpec(logLevelArg string) *coreac.PodSpecApplyConfiguration {
+ 	cloudCfg := c.config.CloudProvider.OperandConfig()
+ 
+ 	return coreac.PodSpec().
+-		WithPriorityClassName("system-node-critical").
++		WithPriorityClassName(karpenterPodPriorityClassName).
+ 		WithServiceAccountName(karpenterName).
+-		WithTerminationGracePeriodSeconds(10).
++		WithTerminationGracePeriodSeconds(karpenterPodTerminationGracePeriodSeconds).
+ 		WithSecurityContext(coreac.PodSecurityContext().
+ 			WithRunAsNonRoot(true).
+ 			WithSeccompProfile(coreac.SeccompProfile().
+@@ -207,7 +211,7 @@ func (c *Controller) karpenterPodSpec() *coreac.PodSpecApplyConfiguration {
+ 				WithName(karpenterName).
+ 				WithImage(c.config.KarpenterImage).
+ 				WithImagePullPolicy(c.imagePullPolicy).
+-				WithArgs("--log-level=debug"). // TODO(maxcao13): have this configurable
++				WithArgs(logLevelArg).
+ 				WithEnv(c.karpenterEnv(cloudCfg)...).
+ 				WithPorts(karpenterPorts()...).
+ 				WithResources(coreac.ResourceRequirements().
+@@ -243,7 +247,7 @@ func (c *Controller) karpenterEnv(cloudCfg common.OperandCloudConfig) []*coreac.
+ 		coreac.EnvVar().WithName("CLUSTER_ENDPOINT").WithValue(c.config.ClusterEndpoint),
+ 		coreac.EnvVar().WithName("DISABLE_WEBHOOK").WithValue("true"),
+ 		// TODO(maxcao13): allow users to specify feature gates through a Karpenter CR.
+-		coreac.EnvVar().WithName("HEALTH_PROBE_PORT").WithValue("8081"),
++		coreac.EnvVar().WithName("HEALTH_PROBE_PORT").WithValue(defaultHealthProbePortStr),
+ 	}
+ 	return append(env, envVars(cloudCfg.Env)...)
+ }
+@@ -253,14 +257,11 @@ func (c *Controller) SetupWithManager(mgr ctrl.Manager) error {
+ 	managedClusterRoles := namesFromClusterRoles(append(assets.CoreRBAC.ClusterRoles, cloudRBAC.ClusterRoles...))
+ 	managedClusterRoleBindings := namesFromClusterRoleBindings(append(assets.CoreRBAC.ClusterRoleBindings, cloudRBAC.ClusterRoleBindings...))
+ 
+-	reconcileRequest := []ctrl.Request{{NamespacedName: client.ObjectKey{Namespace: c.config.Namespace, Name: operatorDeploymentName}}}
++	reconcileRequest := []ctrl.Request{{NamespacedName: client.ObjectKey{Name: singletonName}}}
+ 
+ 	return ctrl.NewControllerManagedBy(mgr).
+ 		Named(c.Name()).
+-		// TODO(maxcao13): when we get the Karpenter API object, we should watch that instead of the operator deployment.
+-		For(&appsv1.Deployment{}, builder.WithPredicates(predicate.NewPredicateFuncs(func(o client.Object) bool {
+-			return o.GetNamespace() == c.config.Namespace && o.GetName() == operatorDeploymentName
+-		}))).
++		For(&autoscalingv1alpha1.Karpenter{}).
+ 		Owns(&appsv1.Deployment{}).
+ 		Owns(&corev1.ServiceAccount{}).
+ 		Owns(&rbacv1.Role{}).
+@@ -295,10 +296,10 @@ func (c *Controller) SetupWithManager(mgr ctrl.Manager) error {
+ 
+ // --- Owner reference helper ---
+ 
+-func ownerRef(owner *appsv1.Deployment) *metaac.OwnerReferenceApplyConfiguration {
++func ownerRef(owner *autoscalingv1alpha1.Karpenter) *metaac.OwnerReferenceApplyConfiguration {
+ 	return metaac.OwnerReference().
+-		WithAPIVersion("apps/v1").
+-		WithKind("Deployment").
++		WithAPIVersion(autoscalingv1alpha1.SchemeGroupVersion.String()).
++		WithKind("Karpenter").
+ 		WithName(owner.Name).
+ 		WithUID(owner.UID).
+ 		WithBlockOwnerDeletion(true).
+@@ -407,21 +408,21 @@ func namesFromClusterRoleBindings(bindings []*rbacv1.ClusterRoleBinding) map[str
+ 
+ func karpenterPorts() []*coreac.ContainerPortApplyConfiguration {
+ 	return []*coreac.ContainerPortApplyConfiguration{
+-		coreac.ContainerPort().WithName("metrics").WithContainerPort(8080),
+-		coreac.ContainerPort().WithName("http").WithContainerPort(8081).WithProtocol(corev1.ProtocolTCP),
++		coreac.ContainerPort().WithName(metricsPortName).WithContainerPort(defaultMetricsPort),
++		coreac.ContainerPort().WithName(healthProbePortName).WithContainerPort(defaultHealthProbePort).WithProtocol(corev1.ProtocolTCP),
+ 	}
+ }
+ 
+ func karpenterLivenessProbe() *coreac.ProbeApplyConfiguration {
+ 	return coreac.Probe().
+-		WithHTTPGet(coreac.HTTPGetAction().WithPath("/healthz").WithPort(intstr.FromInt32(8081))).
++		WithHTTPGet(coreac.HTTPGetAction().WithPath("/healthz").WithPort(intstr.FromInt(defaultHealthProbePort))).
+ 		WithInitialDelaySeconds(30).
+ 		WithTimeoutSeconds(30)
+ }
+ 
+ func karpenterReadinessProbe() *coreac.ProbeApplyConfiguration {
+ 	return coreac.Probe().
+-		WithHTTPGet(coreac.HTTPGetAction().WithPath("/readyz").WithPort(intstr.FromInt32(8081))).
++		WithHTTPGet(coreac.HTTPGetAction().WithPath("/readyz").WithPort(intstr.FromInt(defaultHealthProbePort))).
+ 		WithInitialDelaySeconds(5).
+ 		WithTimeoutSeconds(30)
+ }
+diff --git a/pkg/controllers/karpenter/controller_test.go b/pkg/controllers/karpenter/controller_test.go
+new file mode 100644
+index 00000000..461a0f68
+--- /dev/null
++++ b/pkg/controllers/karpenter/controller_test.go
+@@ -0,0 +1,240 @@
++package karpenter
++
++import (
++	"testing"
++
++	. "github.com/onsi/gomega"
++
++	autoscalingv1alpha1 "github.com/openshift/karpenter-operator/pkg/apis/autoscaling/v1alpha1"
++	"github.com/openshift/karpenter-operator/pkg/cloudprovider/common"
++
++	configv1 "github.com/openshift/api/config/v1"
++
++	appsv1 "k8s.io/api/apps/v1"
++	corev1 "k8s.io/api/core/v1"
++	rbacv1 "k8s.io/api/rbac/v1"
++	apiextensionsv1 "k8s.io/apiextensions-apiserver/pkg/apis/apiextensions/v1"
++	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
++	"k8s.io/apimachinery/pkg/runtime"
++	"k8s.io/apimachinery/pkg/types"
++
++	ctrl "sigs.k8s.io/controller-runtime"
++	"sigs.k8s.io/controller-runtime/pkg/client"
++	fakeclient "sigs.k8s.io/controller-runtime/pkg/client/fake"
++)
++
++const (
++	testNamespace       = "openshift-karpenter"
++	testKarpenterImage  = "quay.io/openshift/karpenter:test"
++	testClusterName     = "test-cluster"
++	testClusterEndpoint = "https://api.test-cluster.example.com:6443"
++)
++
++// fakeCloudProvider implements common.CloudProvider for testing.
++type fakeCloudProvider struct{}
++
++func (f *fakeCloudProvider) AddToScheme(_ *runtime.Scheme) error { return nil }
++func (f *fakeCloudProvider) KarpenterImage() string              { return testKarpenterImage }
++func (f *fakeCloudProvider) CRDs() []*apiextensionsv1.CustomResourceDefinition {
++	return nil
++}
++func (f *fakeCloudProvider) RelatedObjects() []configv1.ObjectReference { return nil }
++func (f *fakeCloudProvider) RBAC() common.RBACAssets {
++	return common.RBACAssets{
++		ClusterRoles: []*rbacv1.ClusterRole{
++			{ObjectMeta: metav1.ObjectMeta{Name: "karpenter-cloud-test"}, Rules: []rbacv1.PolicyRule{
++				{APIGroups: []string{"test.io"}, Resources: []string{"widgets"}, Verbs: []string{"get", "list"}},
++			}},
++		},
++		ClusterRoleBindings: []*rbacv1.ClusterRoleBinding{
++			{ObjectMeta: metav1.ObjectMeta{Name: "karpenter-cloud-test"}, RoleRef: rbacv1.RoleRef{
++				APIGroup: "rbac.authorization.k8s.io", Kind: "ClusterRole", Name: "karpenter-cloud-test",
++			}, Subjects: []rbacv1.Subject{
++				{Kind: "ServiceAccount", Name: karpenterName, Namespace: testNamespace},
++			}},
++		},
++	}
++}
++func (f *fakeCloudProvider) OperandConfig() common.OperandCloudConfig {
++	return common.OperandCloudConfig{
++		CredentialsSecretName: "karpenter-cloud-credentials",
++		Env: []corev1.EnvVar{
++			{Name: "CLOUD_REGION", Value: "us-east-1"},
++		},
++		Volumes: []corev1.Volume{
++			{Name: "cloud-creds", VolumeSource: corev1.VolumeSource{
++				Secret: &corev1.SecretVolumeSource{SecretName: "karpenter-cloud-credentials"},
++			}},
++		},
++		VolumeMounts: []corev1.VolumeMount{
++			{Name: "cloud-creds", MountPath: "/var/run/secrets/cloud", ReadOnly: true},
++		},
++	}
++}
++
++func testScheme() *runtime.Scheme {
++	s := runtime.NewScheme()
++	_ = autoscalingv1alpha1.AddToScheme(s)
++	_ = appsv1.AddToScheme(s)
++	_ = corev1.AddToScheme(s)
++	_ = rbacv1.AddToScheme(s)
++	return s
++}
++
++func newTestController(objs ...client.Object) *Controller {
++	c := fakeclient.NewClientBuilder().
++		WithScheme(testScheme()).
++		WithObjects(objs...).
++		Build()
++
++	return &Controller{
++		client: c,
++		config: &ControllerConfig{
++			Namespace:       testNamespace,
++			KarpenterImage:  testKarpenterImage,
++			ClusterName:     testClusterName,
++			ClusterEndpoint: testClusterEndpoint,
++			CloudProvider:   &fakeCloudProvider{},
++		},
++		imagePullPolicy: corev1.PullIfNotPresent,
++	}
++}
++
++func karpenterCR(logLevel autoscalingv1alpha1.KarpenterLogLevel) *autoscalingv1alpha1.Karpenter {
++	return &autoscalingv1alpha1.Karpenter{
++		ObjectMeta: metav1.ObjectMeta{
++			Name: singletonName,
++			UID:  types.UID("test-uid-1234"),
++		},
++		Spec: autoscalingv1alpha1.KarpenterSpec{
++			LogLevel: logLevel,
++		},
++	}
++}
++
++func TestReconcile_CRNotFound(t *testing.T) {
++	g := NewWithT(t)
++	controller := newTestController()
++
++	result, err := controller.Reconcile(t.Context(), ctrl.Request{})
++	g.Expect(err).NotTo(HaveOccurred())
++	g.Expect(result).To(Equal(ctrl.Result{}))
++
++	depList := &appsv1.DeploymentList{}
++	g.Expect(controller.client.List(t.Context(), depList)).To(Succeed())
++	g.Expect(depList.Items).To(BeEmpty())
++}
++
++func TestReconcile_CreatesResources(t *testing.T) {
++	g := NewWithT(t)
++	controller := newTestController(karpenterCR(autoscalingv1alpha1.LogLevelInfo))
++
++	_, err := controller.Reconcile(t.Context(), ctrl.Request{})
++	g.Expect(err).NotTo(HaveOccurred())
++
++	// ServiceAccount
++	sa := &corev1.ServiceAccount{}
++	g.Expect(controller.client.Get(t.Context(), client.ObjectKey{
++		Namespace: testNamespace, Name: karpenterName,
++	}, sa)).To(Succeed())
++	g.Expect(sa.OwnerReferences).To(HaveLen(1))
++	g.Expect(sa.OwnerReferences[0].Kind).To(Equal("Karpenter"))
++	g.Expect(sa.OwnerReferences[0].Name).To(Equal(singletonName))
++
++	// Deployment
++	dep := &appsv1.Deployment{}
++	g.Expect(controller.client.Get(t.Context(), client.ObjectKey{
++		Namespace: testNamespace, Name: karpenterName,
++	}, dep)).To(Succeed())
++	g.Expect(dep.OwnerReferences).To(HaveLen(1))
++	g.Expect(dep.OwnerReferences[0].Kind).To(Equal("Karpenter"))
++	g.Expect(*dep.Spec.Replicas).To(Equal(int32(1)))
++	containers := dep.Spec.Template.Spec.Containers
++	g.Expect(containers).To(HaveLen(1))
++	g.Expect(containers[0].Name).To(Equal(karpenterName))
++	g.Expect(containers[0].Image).To(Equal(testKarpenterImage))
++
++	// Cloud ClusterRole
++	cr := &rbacv1.ClusterRole{}
++	g.Expect(controller.client.Get(t.Context(), client.ObjectKey{Name: "karpenter-cloud-test"}, cr)).To(Succeed())
++	g.Expect(cr.Rules).To(HaveLen(1))
++	g.Expect(cr.Rules[0].APIGroups).To(ContainElement("test.io"))
++
++	// Cloud ClusterRoleBinding
++	crb := &rbacv1.ClusterRoleBinding{}
++	g.Expect(controller.client.Get(t.Context(), client.ObjectKey{Name: "karpenter-cloud-test"}, crb)).To(Succeed())
++	g.Expect(crb.Subjects).To(HaveLen(1))
++	g.Expect(crb.Subjects[0].Name).To(Equal(karpenterName))
++	g.Expect(crb.Subjects[0].Namespace).To(Equal(testNamespace))
++}
++
++func TestReconcile_LogLevel(t *testing.T) {
++	testCases := []struct {
++		name        string
++		logLevel    autoscalingv1alpha1.KarpenterLogLevel
++		expectedArg string
++	}{
++		{"debug", autoscalingv1alpha1.LogLevelDebug, "--log-level=debug"},
++		{"info", autoscalingv1alpha1.LogLevelInfo, "--log-level=info"},
++		{"error", autoscalingv1alpha1.LogLevelError, "--log-level=error"},
++		{"empty defaults to info", "", "--log-level=info"},
++	}
++
++	for _, tc := range testCases {
++		t.Run(tc.name, func(t *testing.T) {
++			g := NewWithT(t)
++			controller := newTestController(karpenterCR(tc.logLevel))
++
++			_, err := controller.Reconcile(t.Context(), ctrl.Request{})
++			g.Expect(err).NotTo(HaveOccurred())
++
++			dep := &appsv1.Deployment{}
++			g.Expect(controller.client.Get(t.Context(), client.ObjectKey{
++				Namespace: testNamespace, Name: karpenterName,
++			}, dep)).To(Succeed())
++
++			g.Expect(dep.Spec.Template.Spec.Containers[0].Args).To(ContainElement(tc.expectedArg))
++		})
++	}
++}
++
++func TestReconcile_DeploymentSpec(t *testing.T) {
++	g := NewWithT(t)
++	controller := newTestController(karpenterCR(autoscalingv1alpha1.LogLevelInfo))
++
++	_, err := controller.Reconcile(t.Context(), ctrl.Request{})
++	g.Expect(err).NotTo(HaveOccurred())
++
++	dep := &appsv1.Deployment{}
++	g.Expect(controller.client.Get(t.Context(), client.ObjectKey{
++		Namespace: testNamespace, Name: karpenterName,
++	}, dep)).To(Succeed())
++
++	podSpec := dep.Spec.Template.Spec
++	g.Expect(podSpec.ServiceAccountName).To(Equal(karpenterName))
++	g.Expect(podSpec.PriorityClassName).To(Equal(karpenterPodPriorityClassName))
++	g.Expect(podSpec.SecurityContext).NotTo(BeNil())
++	g.Expect(*podSpec.SecurityContext.RunAsNonRoot).To(BeTrue())
++
++	container := podSpec.Containers[0]
++	g.Expect(container.SecurityContext).NotTo(BeNil())
++	g.Expect(*container.SecurityContext.AllowPrivilegeEscalation).To(BeFalse())
++	g.Expect(container.LivenessProbe).NotTo(BeNil())
++	g.Expect(container.LivenessProbe.HTTPGet.Path).To(Equal("/healthz"))
++	g.Expect(container.ReadinessProbe).NotTo(BeNil())
++	g.Expect(container.ReadinessProbe.HTTPGet.Path).To(Equal("/readyz"))
++
++	envNames := map[string]bool{}
++	for _, e := range container.Env {
++		envNames[e.Name] = true
++	}
++	g.Expect(envNames).To(HaveKey("CLUSTER_NAME"))
++	g.Expect(envNames).To(HaveKey("CLUSTER_ENDPOINT"))
++	g.Expect(envNames).To(HaveKey("CLOUD_REGION"))
++
++	mountNames := map[string]bool{}
++	for _, m := range container.VolumeMounts {
++		mountNames[m.Name] = true
++	}
++	g.Expect(mountNames).To(HaveKey("cloud-creds"))
++}
+diff --git a/pkg/operator/operator.go b/pkg/operator/operator.go
+index e1af50a4..860268e8 100644
+--- a/pkg/operator/operator.go
++++ b/pkg/operator/operator.go
+@@ -4,6 +4,7 @@ import (
+ 	"context"
+ 	"fmt"
+ 
++	autoscalingv1alpha1 "github.com/openshift/karpenter-operator/pkg/apis/autoscaling/v1alpha1"
+ 	"github.com/openshift/karpenter-operator/pkg/cloudprovider"
+ 	"github.com/openshift/karpenter-operator/pkg/cloudprovider/common"
+ 	"github.com/openshift/karpenter-operator/pkg/controllers"
+@@ -29,6 +30,7 @@ func init() {
+ 	_ = clientgoscheme.AddToScheme(scheme)
+ 	_ = configv1.Install(scheme)
+ 	_ = apiextensionsv1.AddToScheme(scheme)
++	_ = autoscalingv1alpha1.AddToScheme(scheme)
+ }
+ 
+ func Run(ctx context.Context, opts Options) error {
+diff --git a/test/pkg/client/client.go b/test/pkg/client/client.go
+index cb0cc1e6..9a1429c4 100644
+--- a/test/pkg/client/client.go
++++ b/test/pkg/client/client.go
+@@ -3,6 +3,8 @@ package client
+ import (
+ 	"fmt"
+ 
++	autoscalingv1alpha1 "github.com/openshift/karpenter-operator/pkg/apis/autoscaling/v1alpha1"
++
+ 	configv1 "github.com/openshift/api/config/v1"
+ 
+ 	apiextensionsv1 "k8s.io/apiextensions-apiserver/pkg/apis/apiextensions/v1"
+@@ -20,6 +22,7 @@ func init() {
+ 	utilruntime.Must(clientgoscheme.AddToScheme(scheme))
+ 	utilruntime.Must(configv1.Install(scheme))
+ 	utilruntime.Must(apiextensionsv1.AddToScheme(scheme))
++	utilruntime.Must(autoscalingv1alpha1.AddToScheme(scheme))
+ }
+ 
+ // NewClient returns a controller-runtime client configured from the
+diff --git a/test/suites/operator/operator_test.go b/test/suites/operator/operator_test.go
+index a65ebf2e..c28aa083 100644
+--- a/test/suites/operator/operator_test.go
++++ b/test/suites/operator/operator_test.go
+@@ -7,12 +7,16 @@ import (
+ 	. "github.com/onsi/ginkgo/v2"
+ 	. "github.com/onsi/gomega"
+ 
++	autoscalingv1alpha1 "github.com/openshift/karpenter-operator/pkg/apis/autoscaling/v1alpha1"
+ 	"github.com/openshift/karpenter-operator/pkg/assets"
+ 
+ 	configv1 "github.com/openshift/api/config/v1"
+ 
+ 	appsv1 "k8s.io/api/apps/v1"
++	corev1 "k8s.io/api/core/v1"
+ 	apiextensionsv1 "k8s.io/apiextensions-apiserver/pkg/apis/apiextensions/v1"
++	apierrors "k8s.io/apimachinery/pkg/api/errors"
++	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+ 	"k8s.io/apimachinery/pkg/types"
+ 
+ 	"sigs.k8s.io/controller-runtime/pkg/client"
+@@ -28,6 +32,11 @@ const (
+ 	pollFiveSecond = 5 * time.Second
+ )
+ 
++// This suite is Ordered and follows the operator lifecycle:
++//  1. Before creating a Karpenter CR, we should validate parts of the karpenter-operator deployment.
++//  2. Next, we check that creating a Karpenter CR will propagate the corresponding changes to the operand and any other resources the operator controls.
++//  3. After the Karpenter CR is ready, we check that our controllers are working as we expected.
++//  4. After the Karpenter CR is deleted, we check that the operator cleans up any resources it owns.
+ var _ = Describe("Resources", Ordered, func() {
+ 	var ctx context.Context
+ 
+@@ -35,55 +44,118 @@ var _ = Describe("Resources", Ordered, func() {
+ 		ctx = context.Background()
+ 	})
+ 
++	AfterAll(func() {
++		deleteKarpenterCR(ctx)
++	})
++
++	// --- Before creating a Karpenter CR ---
++
++	It("karpenter-operator deployment should be ready", func() {
++		dep := &appsv1.Deployment{}
++		Eventually(func(g Gomega) {
++			g.Expect(env.Client.Get(ctx, types.NamespacedName{
++				Name:      operatorDeploymentName,
++				Namespace: operatorNamespace,
++			}, dep)).To(Succeed())
++			g.Expect(dep.Status.ReadyReplicas).To(Equal(*dep.Spec.Replicas))
++		}, pollOneMinute, pollFiveSecond).Should(Succeed())
++	})
++
++	It("ClusterOperator should be available without a Karpenter CR", func() {
++		if env.IsExternalTopology() {
++			Skip("ClusterOperator doesn't run on hosted control plane topologies")
++		}
++		expectClusterOperatorAvailable(ctx)
++	})
++
++	// --- Create ---
++
++	It("should reconcile a new Karpenter CR", func() {
++		karp := &autoscalingv1alpha1.Karpenter{
++			ObjectMeta: metav1.ObjectMeta{Name: "default"},
++			Spec:       autoscalingv1alpha1.KarpenterSpec{},
++		}
++		Expect(env.Client.Create(ctx, karp)).To(Succeed())
++
++		Eventually(func(g Gomega) {
++			got := &autoscalingv1alpha1.Karpenter{}
++			g.Expect(env.Client.Get(ctx, types.NamespacedName{Name: "default"}, got)).To(Succeed())
++			g.Expect(string(got.Spec.LogLevel)).To(Equal("info"))
++		}, pollOneMinute, pollFiveSecond).Should(Succeed())
++
++		waitForOperandReady(ctx)
++	})
++
+ 	Context("ClusterOperator", func() {
+ 		BeforeEach(func() {
+ 			if env.IsExternalTopology() {
+-				Skip("ClusterOperator shouldn't run on hosted control plane topologies")
++				Skip("ClusterOperator doesn't run on hosted control plane topologies")
+ 			}
+ 		})
+ 
+ 		It("should be available", func() {
+-			co := &configv1.ClusterOperator{}
+-			Eventually(func(g Gomega) {
+-				g.Expect(env.Client.Get(ctx, types.NamespacedName{Name: clusterOperatorName}, co)).To(Succeed())
+-
+-				condByType := make(map[configv1.ClusterStatusConditionType]configv1.ConditionStatus)
+-				for _, c := range co.Status.Conditions {
+-					condByType[c.Type] = c.Status
+-				}
+-				g.Expect(condByType).To(HaveKeyWithValue(configv1.OperatorAvailable, configv1.ConditionTrue))
+-				g.Expect(condByType).To(HaveKeyWithValue(configv1.OperatorDegraded, configv1.ConditionFalse))
+-				g.Expect(condByType).To(HaveKeyWithValue(configv1.OperatorProgressing, configv1.ConditionFalse))
+-			}, pollOneMinute, pollFiveSecond).Should(Succeed())
++			expectClusterOperatorAvailable(ctx)
+ 		})
+ 	})
+ 
+-	Context("Deployments", func() {
+-		It("karpenter-operator should be ready", func() {
+-			dep := &appsv1.Deployment{}
+-			Eventually(func(g Gomega) {
+-				g.Expect(env.Client.Get(ctx, types.NamespacedName{
+-					Name:      operatorDeploymentName,
+-					Namespace: operatorNamespace,
+-				}, dep)).To(Succeed())
++	Context("CRDs", func() {
++		It("should install core CRDs", func() {
++			for _, expected := range assets.CoreCRDs {
++				crd := &apiextensionsv1.CustomResourceDefinition{}
++				Eventually(func(g Gomega) {
++					g.Expect(env.Client.Get(ctx, types.NamespacedName{Name: expected.Name}, crd)).To(Succeed())
++					g.Expect(crdEstablished(crd)).To(BeTrue(), "CRD %s should be Established", expected.Name)
++				}, pollOneMinute, pollFiveSecond).Should(Succeed())
++			}
++		})
+ 
+-				g.Expect(dep.Status.ReadyReplicas).To(Equal(*dep.Spec.Replicas))
+-			}, pollOneMinute, pollFiveSecond).Should(Succeed())
++		It("should install AWS CRDs", func() {
++			if !env.IsAWSPlatform() {
++				Skip("not an AWS cluster")
++			}
++
++			for _, expected := range assets.AWSCRDs {
++				crd := &apiextensionsv1.CustomResourceDefinition{}
++				Eventually(func(g Gomega) {
++					g.Expect(env.Client.Get(ctx, types.NamespacedName{Name: expected.Name}, crd)).To(Succeed())
++					g.Expect(crdEstablished(crd)).To(BeTrue(), "CRD %s should be Established", expected.Name)
++				}, pollOneMinute, pollFiveSecond).Should(Succeed())
++			}
+ 		})
++	})
++
++	// --- Reconciliation ---
++
++	Context("spec propagation", func() {
++		It("should propagate log level changes to operand", func() {
++			karp := &autoscalingv1alpha1.Karpenter{}
++			Expect(env.Client.Get(ctx, types.NamespacedName{Name: "default"}, karp)).To(Succeed())
++
++			patch := client.MergeFrom(karp.DeepCopy())
++			karp.Spec.LogLevel = autoscalingv1alpha1.LogLevelDebug
++			Expect(env.Client.Patch(ctx, karp, patch)).To(Succeed())
+ 
+-		It("karpenter should be ready", func() {
+-			dep := &appsv1.Deployment{}
+ 			Eventually(func(g Gomega) {
++				dep := &appsv1.Deployment{}
+ 				g.Expect(env.Client.Get(ctx, types.NamespacedName{
+ 					Name:      operandDeploymentName,
+ 					Namespace: operatorNamespace,
+ 				}, dep)).To(Succeed())
+ 
+-				g.Expect(dep.Status.ReadyReplicas).To(Equal(*dep.Spec.Replicas))
++				args := dep.Spec.Template.Spec.Containers[0].Args
++				g.Expect(args).To(ContainElement("--log-level=debug"))
+ 			}, pollOneMinute, pollFiveSecond).Should(Succeed())
++
++			// Restore default for subsequent tests.
++			Expect(env.Client.Get(ctx, types.NamespacedName{Name: "default"}, karp)).To(Succeed())
++			patch = client.MergeFrom(karp.DeepCopy())
++			karp.Spec.LogLevel = autoscalingv1alpha1.LogLevelInfo
++			Expect(env.Client.Patch(ctx, karp, patch)).To(Succeed())
+ 		})
++	})
+ 
+-		It("karpenter should reconcile after deletion", func() {
++	Context("drift correction", func() {
++		It("should reconcile operand deployment after deletion", func() {
+ 			key := types.NamespacedName{Name: operandDeploymentName, Namespace: operatorNamespace}
+ 
+ 			dep := &appsv1.Deployment{}
+@@ -99,64 +171,26 @@ var _ = Describe("Resources", Ordered, func() {
+ 			}, pollOneMinute, pollFiveSecond).Should(Succeed())
+ 		})
+ 
+-		It("karpenter should reconcile after spec mutations", func() {
++		It("should reconcile operand deployment after spec mutations", func() {
+ 			key := types.NamespacedName{Name: operandDeploymentName, Namespace: operatorNamespace}
+ 
+ 			dep := &appsv1.Deployment{}
+ 			Expect(env.Client.Get(ctx, key, dep)).To(Succeed())
+ 
+ 			originalReplicas := *dep.Spec.Replicas
+-			originalPodAnnotations := dep.Spec.Template.Annotations
+-			originalPodLabels := dep.Spec.Template.Labels
+ 
+ 			patch := client.MergeFrom(dep.DeepCopy())
+ 			zero := int32(0)
+ 			dep.Spec.Replicas = &zero
+-			if dep.Spec.Template.Annotations == nil {
+-				dep.Spec.Template.Annotations = map[string]string{}
+-			}
+-			dep.Spec.Template.Annotations["e2e-test/mutated"] = "true"
+-			if dep.Spec.Template.Labels == nil {
+-				dep.Spec.Template.Labels = map[string]string{}
+-			}
+-			dep.Spec.Template.Labels["e2e-test/mutated"] = "true"
+ 			Expect(env.Client.Patch(ctx, dep, patch)).To(Succeed())
+ 
+ 			Eventually(func(g Gomega) {
+ 				restored := &appsv1.Deployment{}
+ 				g.Expect(env.Client.Get(ctx, key, restored)).To(Succeed())
+ 				g.Expect(*restored.Spec.Replicas).To(Equal(originalReplicas))
+-				g.Expect(restored.Spec.Template.Annotations).To(Equal(originalPodAnnotations))
+-				g.Expect(restored.Spec.Template.Labels).To(Equal(originalPodLabels))
+ 				g.Expect(restored.Status.ReadyReplicas).To(Equal(originalReplicas))
+ 			}, pollOneMinute, pollFiveSecond).Should(Succeed())
+ 		})
+-	})
+-
+-	Context("CRDs", func() {
+-		It("should install core CRDs", func() {
+-			for _, expected := range assets.CoreCRDs {
+-				crd := &apiextensionsv1.CustomResourceDefinition{}
+-				Eventually(func(g Gomega) {
+-					g.Expect(env.Client.Get(ctx, types.NamespacedName{Name: expected.Name}, crd)).To(Succeed())
+-					g.Expect(crdEstablished(crd)).To(BeTrue(), "CRD %s should be Established", expected.Name)
+-				}, pollOneMinute, pollFiveSecond).Should(Succeed())
+-			}
+-		})
+-
+-		It("should install AWS CRDs", func() {
+-			if !env.IsAWSPlatform() {
+-				Skip("not an AWS cluster")
+-			}
+-
+-			for _, expected := range assets.AWSCRDs {
+-				crd := &apiextensionsv1.CustomResourceDefinition{}
+-				Eventually(func(g Gomega) {
+-					g.Expect(env.Client.Get(ctx, types.NamespacedName{Name: expected.Name}, crd)).To(Succeed())
+-					g.Expect(crdEstablished(crd)).To(BeTrue(), "CRD %s should be Established", expected.Name)
+-				}, pollOneMinute, pollFiveSecond).Should(Succeed())
+-			}
+-		})
+ 
+ 		It("should reconcile a deleted CRD", func() {
+ 			target := assets.CoreCRDs[0]
+@@ -175,8 +209,72 @@ var _ = Describe("Resources", Ordered, func() {
+ 			}, pollOneMinute, pollFiveSecond).Should(Succeed())
+ 		})
+ 	})
++
++	// --- Teardown ---
++
++	It("should clean up owned resources on CR deletion", func() {
++		deleteKarpenterCR(ctx)
++
++		Eventually(func(g Gomega) {
++			err := env.Client.Get(ctx, types.NamespacedName{Name: "default"}, &autoscalingv1alpha1.Karpenter{})
++			g.Expect(apierrors.IsNotFound(err)).To(BeTrue(), "Karpenter CR should be gone")
++		}, pollOneMinute, pollFiveSecond).Should(Succeed())
++
++		Eventually(func(g Gomega) {
++			err := env.Client.Get(ctx, types.NamespacedName{
++				Name:      operandDeploymentName,
++				Namespace: operatorNamespace,
++			}, &appsv1.Deployment{})
++			g.Expect(apierrors.IsNotFound(err)).To(BeTrue(), "operand Deployment should be gone")
++		}, pollOneMinute, pollFiveSecond).Should(Succeed())
++
++		Eventually(func(g Gomega) {
++			err := env.Client.Get(ctx, types.NamespacedName{
++				Name:      operandDeploymentName,
++				Namespace: operatorNamespace,
++			}, &corev1.ServiceAccount{})
++			g.Expect(apierrors.IsNotFound(err)).To(BeTrue(), "operand ServiceAccount should be gone")
++		}, pollOneMinute, pollFiveSecond).Should(Succeed())
++	})
+ })
+ 
++func expectClusterOperatorAvailable(ctx context.Context) {
++	EventuallyWithOffset(1, func(g Gomega) {
++		co := &configv1.ClusterOperator{}
++		g.Expect(env.Client.Get(ctx, types.NamespacedName{Name: clusterOperatorName}, co)).To(Succeed())
++
++		condByType := make(map[configv1.ClusterStatusConditionType]configv1.ConditionStatus)
++		for _, c := range co.Status.Conditions {
++			condByType[c.Type] = c.Status
++		}
++		g.Expect(condByType).To(HaveKeyWithValue(configv1.OperatorAvailable, configv1.ConditionTrue))
++		g.Expect(condByType).To(HaveKeyWithValue(configv1.OperatorDegraded, configv1.ConditionFalse))
++		g.Expect(condByType).To(HaveKeyWithValue(configv1.OperatorProgressing, configv1.ConditionFalse))
++	}, pollOneMinute, pollFiveSecond).Should(Succeed())
++}
++
++func deleteKarpenterCR(ctx context.Context) {
++	karp := &autoscalingv1alpha1.Karpenter{}
++	if err := env.Client.Get(ctx, types.NamespacedName{Name: "default"}, karp); err != nil {
++		if apierrors.IsNotFound(err) {
++			return
++		}
++		ExpectWithOffset(1, err).NotTo(HaveOccurred())
++	}
++	ExpectWithOffset(1, env.Client.Delete(ctx, karp)).To(Succeed())
++}
++
++func waitForOperandReady(ctx context.Context) {
++	EventuallyWithOffset(1, func(g Gomega) {
++		dep := &appsv1.Deployment{}
++		g.Expect(env.Client.Get(ctx, types.NamespacedName{
++			Name:      operandDeploymentName,
++			Namespace: operatorNamespace,
++		}, dep)).To(Succeed())
++		g.Expect(dep.Status.ReadyReplicas).To(Equal(*dep.Spec.Replicas))
++	}, pollOneMinute, pollFiveSecond).Should(Succeed())
++}
++
+ func crdEstablished(crd *apiextensionsv1.CustomResourceDefinition) bool {
+ 	for _, c := range crd.Status.Conditions {
+ 		if c.Type == apiextensionsv1.Established {

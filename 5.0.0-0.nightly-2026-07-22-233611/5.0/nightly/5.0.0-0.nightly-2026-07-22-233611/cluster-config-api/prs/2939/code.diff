@@ -1,0 +1,1310 @@
+diff --git a/tools/go.mod b/tools/go.mod
+index 3d375b4ef4e..c1f6cdb3e52 100644
+--- a/tools/go.mod
++++ b/tools/go.mod
+@@ -28,7 +28,7 @@ require (
+ 	k8s.io/utils v0.0.0-20260319190234-28399d86e0b5
+ 	sigs.k8s.io/controller-tools v0.18.0
+ 	sigs.k8s.io/crdify v0.5.0
+-	sigs.k8s.io/kube-api-linter v0.0.0-20260114104534-18147eee9c49
++	sigs.k8s.io/kube-api-linter v0.0.0-20260716143926-092fe0c72997
+ 	sigs.k8s.io/yaml v1.6.0
+ )
+ 
+diff --git a/tools/go.sum b/tools/go.sum
+index 9762c5cbc41..edb98b5c07d 100644
+--- a/tools/go.sum
++++ b/tools/go.sum
+@@ -946,8 +946,8 @@ sigs.k8s.io/crdify v0.5.0 h1:mrMH9CgXQPTZUpTU6Klqfnlys8bggv/7uvLT2lXSP7A=
+ sigs.k8s.io/crdify v0.5.0/go.mod h1:ZIFxaYNgKYmFtZCLPysncXQ8oqwnNlHQbRUfxJHZwzU=
+ sigs.k8s.io/json v0.0.0-20250730193827-2d320260d730 h1:IpInykpT6ceI+QxKBbEflcR5EXP7sU1kvOlxwZh5txg=
+ sigs.k8s.io/json v0.0.0-20250730193827-2d320260d730/go.mod h1:mdzfpAEoE6DHQEN0uh9ZbOCuHbLK5wOm7dK4ctXE9Tg=
+-sigs.k8s.io/kube-api-linter v0.0.0-20260114104534-18147eee9c49 h1:Dlr79S/bnHg+g86cBxul/lbctdVfMTLN1c5XeN6/0JM=
+-sigs.k8s.io/kube-api-linter v0.0.0-20260114104534-18147eee9c49/go.mod h1:5mP60UakkCye+eOcZ5p98VnV2O49qreW1gq9TdsUf7Q=
++sigs.k8s.io/kube-api-linter v0.0.0-20260716143926-092fe0c72997 h1:u5/qbXZq7YIrurEE6HiJKtjQ9ILcFPJJSHNY0Q1ZRhU=
++sigs.k8s.io/kube-api-linter v0.0.0-20260716143926-092fe0c72997/go.mod h1:5mP60UakkCye+eOcZ5p98VnV2O49qreW1gq9TdsUf7Q=
+ sigs.k8s.io/randfill v1.0.0 h1:JfjMILfT8A6RbawdsK2JXGBR5AQVfd+9TbzrlneTyrU=
+ sigs.k8s.io/randfill v1.0.0/go.mod h1:XeLlZ/jmk4i1HRopwe7/aU3H5n1zNUcX6TM94b3QxOY=
+ sigs.k8s.io/structured-merge-diff/v6 v6.4.0 h1:qmp2e3ZfFi1/jJbDGpD4mt3wyp6PE1NfKHCYLqgNQJo=
+diff --git a/tools/vendor/modules.txt b/tools/vendor/modules.txt
+index e4b96f3e8a7..0a209e0d47a 100644
+--- a/tools/vendor/modules.txt
++++ b/tools/vendor/modules.txt
+@@ -2515,7 +2515,7 @@ sigs.k8s.io/crdify/pkg/validators/version/served
+ ## explicit; go 1.23
+ sigs.k8s.io/json
+ sigs.k8s.io/json/internal/golang/encoding/json
+-# sigs.k8s.io/kube-api-linter v0.0.0-20260114104534-18147eee9c49
++# sigs.k8s.io/kube-api-linter v0.0.0-20260716143926-092fe0c72997
+ ## explicit; go 1.24.0
+ sigs.k8s.io/kube-api-linter/pkg/analysis/arrayofstruct
+ sigs.k8s.io/kube-api-linter/pkg/analysis/commentstart
+diff --git a/tools/vendor/sigs.k8s.io/kube-api-linter/pkg/analysis/conflictingmarkers/analyzer.go b/tools/vendor/sigs.k8s.io/kube-api-linter/pkg/analysis/conflictingmarkers/analyzer.go
+index 38bacb6dea2..b32c85b88ab 100644
+--- a/tools/vendor/sigs.k8s.io/kube-api-linter/pkg/analysis/conflictingmarkers/analyzer.go
++++ b/tools/vendor/sigs.k8s.io/kube-api-linter/pkg/analysis/conflictingmarkers/analyzer.go
+@@ -44,7 +44,7 @@ func newAnalyzer(cfg *ConflictingMarkersConfig) *analysis.Analyzer {
+ 	for _, conflictSet := range cfg.Conflicts {
+ 		for _, set := range conflictSet.Sets {
+ 			for _, markerID := range set {
+-				markers.DefaultRegistry().Register(markerID)
++				markers.DefaultRegistry().Register(markers.IdentifierFromString(markerID))
+ 			}
+ 		}
+ 	}
+@@ -94,8 +94,14 @@ func checkConflict(pass *analysis.Pass, field *ast.Field, markers markers.Marker
+ 		foundMarkers := sets.New[string]()
+ 
+ 		for _, markerID := range set {
+-			if markers.Has(markerID) {
+-				foundMarkers.Insert(markerID)
++			if strings.Contains(markerID, "=") {
++				if markers.HasWithValue(markerID) {
++					foundMarkers.Insert(markerID)
++				}
++			} else {
++				if markers.Has(markerID) {
++					foundMarkers.Insert(markerID)
++				}
+ 			}
+ 		}
+ 		// Only add the set if it has at least one marker
+diff --git a/tools/vendor/sigs.k8s.io/kube-api-linter/pkg/analysis/helpers/extractjsontags/analyzer.go b/tools/vendor/sigs.k8s.io/kube-api-linter/pkg/analysis/helpers/extractjsontags/analyzer.go
+index 221a0ee7fa5..30db871b13f 100644
+--- a/tools/vendor/sigs.k8s.io/kube-api-linter/pkg/analysis/helpers/extractjsontags/analyzer.go
++++ b/tools/vendor/sigs.k8s.io/kube-api-linter/pkg/analysis/helpers/extractjsontags/analyzer.go
+@@ -91,14 +91,16 @@ func run(pass *analysis.Pass) (any, error) {
+ 			return
+ 		}
+ 
+-		results.insertFieldTagInfo(field, extractTagInfo(field.Tag))
++		results.insertFieldTagInfo(field, extractTagInfo(field, field.Tag))
+ 	})
+ 
+ 	return results, nil
+ }
+ 
++const emptyJSONTagPrefix = `json:"`
++
+ //nolint:cyclop
+-func extractTagInfo(tag *ast.BasicLit) FieldTagInfo {
++func extractTagInfo(field *ast.Field, tag *ast.BasicLit) FieldTagInfo {
+ 	if tag == nil || tag.Value == "" {
+ 		return FieldTagInfo{Missing: true}
+ 	}
+@@ -115,6 +117,11 @@ func extractTagInfo(tag *ast.BasicLit) FieldTagInfo {
+ 	}
+ 
+ 	if tagValue == "" {
++		if field.Names == nil { // Embedded field with `json:""`
++			pos := tag.Pos() + token.Pos(strings.Index(tag.Value, emptyJSONTagPrefix)+len(emptyJSONTagPrefix))
++			return FieldTagInfo{Inline: true, RawValue: "", Pos: pos, End: pos + token.Pos(1)}
++		}
++
+ 		return FieldTagInfo{}
+ 	}
+ 
+@@ -169,7 +176,7 @@ type FieldTagInfo struct {
+ 	// OmitZero is true if the field has the omitzero option in the json tag.
+ 	OmitZero bool
+ 
+-	// Inline is true if the field has the inline option in the json tag.
++	// Inline is true if the json tag is ",inline", or if the field is embedded and the json tag is "".
+ 	Inline bool
+ 
+ 	// Missing is true when the field had no json tag.
+diff --git a/tools/vendor/sigs.k8s.io/kube-api-linter/pkg/analysis/helpers/markers/analyzer.go b/tools/vendor/sigs.k8s.io/kube-api-linter/pkg/analysis/helpers/markers/analyzer.go
+index 6db10995045..2124b887b89 100644
+--- a/tools/vendor/sigs.k8s.io/kube-api-linter/pkg/analysis/helpers/markers/analyzer.go
++++ b/tools/vendor/sigs.k8s.io/kube-api-linter/pkg/analysis/helpers/markers/analyzer.go
+@@ -918,6 +918,31 @@ func (ms MarkerSet) HasWithValue(marker string) bool {
+ 	return ms.HasWithArgumentsAndPayload(id, args, payload)
+ }
+ 
++// IdentifierFromString extracts the marker identifier from a marker string
++// that may include values (e.g. "listType=atomic" -> "listType",
++// "k8s:listType=atomic" -> "k8s:listType").
++// If the string contains no value separator, it is returned as-is.
++func IdentifierFromString(marker string) string {
++	if !strings.Contains(marker, "=") {
++		return marker
++	}
++
++	if isDeclarativeValidationMarker(marker) {
++		tag, err := codetags.Parse(marker)
++		if err != nil {
++			return marker
++		}
++
++		return tag.Name
++	}
++
++	// Ignored values are the arguments map and payload, which are not needed
++	// for identifier extraction.
++	id, _, _ := extractMarkerIDArgumentsAndPayload(DefaultRegistry(), marker)
++
++	return id
++}
++
+ // HasWithArgumentsAndPayload returns whether marker(s) with the
+ // identifier, arguments, and payload are present in the MarkerSet.
+ func (ms MarkerSet) HasWithArgumentsAndPayload(identifier string, arguments map[string]string, payload Payload) bool {
+diff --git a/tools/vendor/sigs.k8s.io/kube-api-linter/pkg/analysis/jsontags/analyzer.go b/tools/vendor/sigs.k8s.io/kube-api-linter/pkg/analysis/jsontags/analyzer.go
+index 0553bcfae7e..daa61ad4795 100644
+--- a/tools/vendor/sigs.k8s.io/kube-api-linter/pkg/analysis/jsontags/analyzer.go
++++ b/tools/vendor/sigs.k8s.io/kube-api-linter/pkg/analysis/jsontags/analyzer.go
+@@ -19,6 +19,9 @@ import (
+ 	"fmt"
+ 	"go/ast"
+ 	"regexp"
++	"slices"
++	"strings"
++	"unicode"
+ 
+ 	"golang.org/x/tools/go/analysis"
+ 	kalerrors "sigs.k8s.io/kube-api-linter/pkg/analysis/errors"
+@@ -35,7 +38,8 @@ const (
+ )
+ 
+ type analyzer struct {
+-	jsonTagRegex *regexp.Regexp
++	jsonTagRegex   *regexp.Regexp
++	fieldNameMatch FieldNameMatchPolicy
+ }
+ 
+ // newAnalyzer creates a new analyzer with the given json tag regex.
+@@ -52,7 +56,8 @@ func newAnalyzer(cfg *JSONTagsConfig) (*analysis.Analyzer, error) {
+ 	}
+ 
+ 	a := &analyzer{
+-		jsonTagRegex: jsonTagRegex,
++		jsonTagRegex:   jsonTagRegex,
++		fieldNameMatch: cfg.FieldNameMatch,
+ 	}
+ 
+ 	return &analysis.Analyzer{
+@@ -77,8 +82,11 @@ func (a *analyzer) run(pass *analysis.Pass) (any, error) {
+ }
+ 
+ func (a *analyzer) checkField(pass *analysis.Pass, field *ast.Field, tagInfo extractjsontags.FieldTagInfo, qualifiedFieldName string) {
++	embedded := false
+ 	prefix := "field %s"
++
+ 	if len(field.Names) == 0 || field.Names[0] == nil {
++		embedded = true
+ 		prefix = "embedded field %s"
+ 	}
+ 
+@@ -90,22 +98,167 @@ func (a *analyzer) checkField(pass *analysis.Pass, field *ast.Field, tagInfo ext
+ 	}
+ 
+ 	if tagInfo.Inline {
++		if !embedded {
++			pass.Reportf(field.Pos(), "%s has inline json tag, but is not embedded", prefix)
++		}
++
+ 		return
+ 	}
+ 
+ 	if tagInfo.Name == "" {
+-		pass.Reportf(field.Pos(), "%s has empty json tag", prefix)
++		if !embedded {
++			pass.Reportf(field.Pos(), "%s has empty json tag", prefix)
++		}
++
+ 		return
+ 	}
+ 
+-	matched := a.jsonTagRegex.Match([]byte(tagInfo.Name))
+-	if !matched {
++	if !a.jsonTagRegex.MatchString(tagInfo.Name) {
+ 		pass.Reportf(field.Pos(), "%s json tag does not match pattern %q: %s", prefix, a.jsonTagRegex.String(), tagInfo.Name)
+ 	}
++
++	a.checkFieldNameMatch(pass, field, tagInfo, prefix)
++}
++
++func (a *analyzer) checkFieldNameMatch(pass *analysis.Pass, field *ast.Field, tagInfo extractjsontags.FieldTagInfo, prefix string) {
++	if len(field.Names) == 0 || field.Names[0] == nil {
++		return
++	}
++
++	fieldName := field.Names[0].Name
++	if jsonTagMatchesFieldName(fieldName, tagInfo.Name) {
++		return
++	}
++
++	expectedTagName := expectedJSONTagName(fieldName)
++	message := fmt.Sprintf("%s json tag should match the camelCase field name %q: got %q", prefix, expectedTagName, tagInfo.Name)
++
++	switch a.fieldNameMatch {
++	case FieldNameMatchPolicyIgnore:
++		return
++	case FieldNameMatchPolicyWarn:
++		pass.Reportf(field.Pos(), "%s", message)
++	case FieldNameMatchPolicySuggestFix:
++		pass.Report(analysis.Diagnostic{
++			Pos:     field.Pos(),
++			Message: message,
++			SuggestedFixes: []analysis.SuggestedFix{
++				{
++					Message: fmt.Sprintf("replace json tag name with %q", expectedTagName),
++					TextEdits: []analysis.TextEdit{
++						{
++							Pos:     tagInfo.Pos,
++							End:     tagInfo.End,
++							NewText: []byte(strings.Replace(tagInfo.RawValue, tagInfo.Name, expectedTagName, 1)),
++						},
++					},
++				},
++			},
++		})
++	default:
++		panic(fmt.Sprintf("unknown field name match policy: %s", a.fieldNameMatch))
++	}
+ }
+ 
+ func defaultConfig(cfg *JSONTagsConfig) {
+ 	if cfg.JSONTagRegex == "" {
+ 		cfg.JSONTagRegex = camelCaseRegex
+ 	}
++
++	if cfg.FieldNameMatch == "" {
++		cfg.FieldNameMatch = FieldNameMatchPolicyIgnore
++	}
++}
++
++func expectedJSONTagName(fieldName string) string {
++	words := splitIdentifierWords(fieldName)
++	if len(words) == 0 {
++		return ""
++	}
++
++	var b strings.Builder
++
++	b.WriteString(words[0])
++
++	for _, word := range words[1:] {
++		r := []rune(word)
++		if len(r) == 0 {
++			continue
++		}
++
++		r[0] = unicode.ToUpper(r[0])
++		b.WriteString(string(r))
++	}
++
++	return b.String()
++}
++
++func jsonTagMatchesFieldName(fieldName, jsonTagName string) bool {
++	return slices.Equal(splitIdentifierWords(fieldName), splitIdentifierWords(jsonTagName))
++}
++
++func splitIdentifierWords(in string) []string {
++	if in == "" {
++		return nil
++	}
++
++	runes := []rune(in)
++	words := []string{}
++	start := 0
++
++	appendWord := func(end int) {
++		if end <= start {
++			return
++		}
++
++		words = append(words, strings.ToLower(string(runes[start:end])))
++	}
++
++	for i := 1; i < len(runes); i++ {
++		if !isWordBoundary(runes, i, start) {
++			continue
++		}
++
++		appendWord(i)
++		start = i
++	}
++
++	appendWord(len(runes))
++
++	return words
++}
++
++func isWordBoundary(runes []rune, i, start int) bool {
++	prev := runes[i-1]
++	curr := runes[i]
++
++	switch {
++	case unicode.IsLower(prev) && unicode.IsUpper(curr):
++		return true
++	case unicode.IsLetter(prev) && unicode.IsDigit(curr):
++		return true
++	case unicode.IsDigit(prev) && unicode.IsUpper(curr):
++		return true
++	case unicode.IsUpper(prev) && unicode.IsUpper(curr):
++		return isAcronymBoundary(runes, i, start)
++	}
++
++	return false
++}
++
++func isAcronymBoundary(runes []rune, i, start int) bool {
++	if i+1 >= len(runes) {
++		return false
++	}
++
++	next := runes[i+1]
++
++	if !unicode.IsLower(next) || i-start <= 1 {
++		return false
++	}
++
++	// Keep pluralized acronyms together: WWIDs -> wwids, WWIDsBad -> wwidsBad, URLs -> urls.
++	pluralizedAcronym := next == 's' && (i+2 == len(runes) || unicode.IsUpper(runes[i+2]))
++
++	return !pluralizedAcronym
+ }
+diff --git a/tools/vendor/sigs.k8s.io/kube-api-linter/pkg/analysis/jsontags/config.go b/tools/vendor/sigs.k8s.io/kube-api-linter/pkg/analysis/jsontags/config.go
+index 6d561293e5d..a46baab149c 100644
+--- a/tools/vendor/sigs.k8s.io/kube-api-linter/pkg/analysis/jsontags/config.go
++++ b/tools/vendor/sigs.k8s.io/kube-api-linter/pkg/analysis/jsontags/config.go
+@@ -15,10 +15,36 @@ limitations under the License.
+ */
+ package jsontags
+ 
++// FieldNameMatchPolicy controls whether json tag names must match the camelCase field name.
++type FieldNameMatchPolicy string
++
++const (
++	// FieldNameMatchPolicySuggestFix emits diagnostics and suggests fixes when a json
++	// tag name does not match the expected camelCase version of the Go field name.
++	FieldNameMatchPolicySuggestFix FieldNameMatchPolicy = "SuggestFix"
++
++	// FieldNameMatchPolicyWarn emits diagnostics when a json tag name does not match
++	// the expected camelCase version of the Go field name.
++	FieldNameMatchPolicyWarn FieldNameMatchPolicy = "Warn"
++
++	// FieldNameMatchPolicyIgnore disables the field-name matching check.
++	FieldNameMatchPolicyIgnore FieldNameMatchPolicy = "Ignore"
++)
++
+ // JSONTagsConfig contains configuration for the jsontags linter.
+ type JSONTagsConfig struct {
+ 	// jsonTagRegex is the regular expression used to validate that json tags are in a particular format.
+ 	// By default, the regex used is "^[a-z][a-z0-9]*(?:[A-Z][a-z0-9]*)*$" and is used to check for
+ 	// camel case like string.
+ 	JSONTagRegex string `json:"jsonTagRegex"`
++
++	// fieldNameMatch controls whether json tag names must match the camelCase
++	// version of their Go field name.
++	// The check uses word-splitting heuristics to preserve common acronyms and initialisms.
++	// Valid values are "SuggestFix", "Warn" and "Ignore".
++	// When set to "SuggestFix", diagnostics are emitted for mismatches and a fix is suggested.
++	// When set to "Warn", diagnostics are emitted for mismatches.
++	// When set to "Ignore", this check is disabled.
++	// When otherwise not specified, the default value is "Ignore".
++	FieldNameMatch FieldNameMatchPolicy `json:"fieldNameMatch"`
+ }
+diff --git a/tools/vendor/sigs.k8s.io/kube-api-linter/pkg/analysis/jsontags/doc.go b/tools/vendor/sigs.k8s.io/kube-api-linter/pkg/analysis/jsontags/doc.go
+index 2d17f2368b8..7e33101ca24 100644
+--- a/tools/vendor/sigs.k8s.io/kube-api-linter/pkg/analysis/jsontags/doc.go
++++ b/tools/vendor/sigs.k8s.io/kube-api-linter/pkg/analysis/jsontags/doc.go
+@@ -27,5 +27,10 @@ to allow, for example, for fields like `requestTTLSeconds`.
+ 
+ To disallow consecutive capital letters, the regex can be set to `^[a-z][a-z0-9]*(?:[A-Z][a-z0-9]+)*$`.
+ The regex can be configured with the JSONTagRegex field in the JSONTagsConfig struct.
++
++The linter can also check that the json tag name matches the camelCase version of
++the Go field name by setting the FieldNameMatch field to "SuggestFix" or "Warn".
++This check uses identifier word-splitting heuristics and can be disabled by
++setting FieldNameMatch to "Ignore".
+ */
+ package jsontags
+diff --git a/tools/vendor/sigs.k8s.io/kube-api-linter/pkg/analysis/jsontags/initializer.go b/tools/vendor/sigs.k8s.io/kube-api-linter/pkg/analysis/jsontags/initializer.go
+index 190936af3a8..73cdd934a7e 100644
+--- a/tools/vendor/sigs.k8s.io/kube-api-linter/pkg/analysis/jsontags/initializer.go
++++ b/tools/vendor/sigs.k8s.io/kube-api-linter/pkg/analysis/jsontags/initializer.go
+@@ -58,5 +58,15 @@ func validateConfig(jtc *JSONTagsConfig, fldPath *field.Path) field.ErrorList {
+ 		}
+ 	}
+ 
++	switch jtc.FieldNameMatch {
++	case "", FieldNameMatchPolicySuggestFix, FieldNameMatchPolicyWarn, FieldNameMatchPolicyIgnore:
++	default:
++		fieldErrors = append(fieldErrors, field.Invalid(
++			fldPath.Child("fieldNameMatch"),
++			jtc.FieldNameMatch,
++			fmt.Sprintf("invalid value, must be one of %q, %q, %q or omitted", FieldNameMatchPolicySuggestFix, FieldNameMatchPolicyWarn, FieldNameMatchPolicyIgnore),
++		))
++	}
++
+ 	return fieldErrors
+ }
+diff --git a/tools/vendor/sigs.k8s.io/kube-api-linter/pkg/analysis/minlength/analyzer.go b/tools/vendor/sigs.k8s.io/kube-api-linter/pkg/analysis/minlength/analyzer.go
+index 8ad16e48962..55482e58920 100644
+--- a/tools/vendor/sigs.k8s.io/kube-api-linter/pkg/analysis/minlength/analyzer.go
++++ b/tools/vendor/sigs.k8s.io/kube-api-linter/pkg/analysis/minlength/analyzer.go
+@@ -196,7 +196,7 @@ func checkStructType(pass *analysis.Pass, structType *ast.StructType, node ast.N
+ 	}
+ 
+ 	// The field does not have a min properties, and does not have any required fields.
+-	pass.Reportf(node.Pos(), "%s must have a minimum properties, add %s marker", prefix, markers.KubebuilderMinPropertiesMarker)
++	pass.Reportf(node.Pos(), "%s must have either a required field or a minimum properties, add %s marker", prefix, markers.KubebuilderMinPropertiesMarker)
+ }
+ 
+ func getCombinedMarkers(markersAccess markershelper.Markers, node ast.Node, aliases []*ast.TypeSpec) markershelper.MarkerSet {
+diff --git a/tools/vendor/sigs.k8s.io/kube-api-linter/pkg/analysis/optionalfields/analyzer.go b/tools/vendor/sigs.k8s.io/kube-api-linter/pkg/analysis/optionalfields/analyzer.go
+index 6d174663584..363e5ce7c1e 100644
+--- a/tools/vendor/sigs.k8s.io/kube-api-linter/pkg/analysis/optionalfields/analyzer.go
++++ b/tools/vendor/sigs.k8s.io/kube-api-linter/pkg/analysis/optionalfields/analyzer.go
+@@ -43,6 +43,8 @@ func init() {
+ 		markers.KubebuilderMinPropertiesMarker,
+ 		markers.KubebuilderMinimumMarker,
+ 		markers.KubebuilderEnumMarker,
++		markers.KubebuilderExactlyOneOf,
++		markers.KubebuilderAtLeastOneOfMarker,
+ 	)
+ }
+ 
+diff --git a/tools/vendor/sigs.k8s.io/kube-api-linter/pkg/analysis/preferredmarkers/analyzer.go b/tools/vendor/sigs.k8s.io/kube-api-linter/pkg/analysis/preferredmarkers/analyzer.go
+index 494a03da6d0..ff0548ab475 100644
+--- a/tools/vendor/sigs.k8s.io/kube-api-linter/pkg/analysis/preferredmarkers/analyzer.go
++++ b/tools/vendor/sigs.k8s.io/kube-api-linter/pkg/analysis/preferredmarkers/analyzer.go
+@@ -34,6 +34,9 @@ const name = "preferredmarkers"
+ type analyzer struct {
+ 	// equivalentToPreferred maps equivalent marker identifiers to their preferred identifiers
+ 	equivalentToPreferred map[string]string
++
++	// preferredToMessage maps preferred marker identifiers to their custom message
++	preferredToMessage map[string]string
+ }
+ 
+ // newAnalyzer creates a new analysis.Analyzer for the preferredmarkers
+@@ -41,6 +44,7 @@ type analyzer struct {
+ func newAnalyzer(cfg *Config) *analysis.Analyzer {
+ 	a := &analyzer{
+ 		equivalentToPreferred: make(map[string]string),
++		preferredToMessage:    make(map[string]string),
+ 	}
+ 
+ 	// Build the mapping from equivalent identifiers to preferred identifiers
+@@ -48,6 +52,11 @@ func newAnalyzer(cfg *Config) *analysis.Analyzer {
+ 		for _, equivalent := range marker.EquivalentIdentifiers {
+ 			a.equivalentToPreferred[equivalent.Identifier] = marker.PreferredIdentifier
+ 		}
++
++		msg := marker.Message
++		if msg != "" {
++			a.preferredToMessage[marker.PreferredIdentifier] = msg
++		}
+ 	}
+ 
+ 	analyzer := &analysis.Analyzer{
+@@ -75,11 +84,11 @@ func (a *analyzer) run(pass *analysis.Pass) (any, error) {
+ 	}
+ 
+ 	inspect.InspectFields(func(field *ast.Field, _ extractjsontags.FieldTagInfo, markersAccess markers.Markers, qualifiedFieldName string) {
+-		checkField(pass, field, markersAccess, a.equivalentToPreferred, qualifiedFieldName)
++		checkField(pass, field, markersAccess, a.equivalentToPreferred, a.preferredToMessage, qualifiedFieldName)
+ 	})
+ 
+ 	inspect.InspectTypeSpec(func(typeSpec *ast.TypeSpec, markersAccess markers.Markers) {
+-		checkType(pass, typeSpec, markersAccess, a.equivalentToPreferred)
++		checkType(pass, typeSpec, markersAccess, a.equivalentToPreferred, a.preferredToMessage)
+ 	})
+ 
+ 	return nil, nil //nolint:nilnil
+@@ -88,26 +97,26 @@ func (a *analyzer) run(pass *analysis.Pass) (any, error) {
+ // checkField validates a single struct field for marker usage.
+ // Only checks markers directly on the field, not inherited from type aliases,
+ // since inherited markers are already reported at the type level.
+-func checkField(pass *analysis.Pass, field *ast.Field, markersAccess markers.Markers, equivalentToPreferred map[string]string, qualifiedFieldName string) {
++func checkField(pass *analysis.Pass, field *ast.Field, markersAccess markers.Markers, equivalentToPreferred, preferredToMessage map[string]string, qualifiedFieldName string) {
+ 	if field == nil || len(field.Names) == 0 {
+ 		return
+ 	}
+ 
+ 	markerSet := markersAccess.FieldMarkers(field)
+ 	check(markerSet, equivalentToPreferred, func(marks []markers.Marker, preferredIdentifier string, preferredExists bool) {
+-		reportMarkers(pass, marks, preferredIdentifier, qualifiedFieldName, field.Pos(), "field", preferredExists)
++		reportMarkers(pass, marks, preferredIdentifier, preferredToMessage[preferredIdentifier], qualifiedFieldName, field.Pos(), "field", preferredExists)
+ 	})
+ }
+ 
+ // checkType validates a single type definition for marker usage.
+-func checkType(pass *analysis.Pass, typeSpec *ast.TypeSpec, markersAccess markers.Markers, equivalentToPreferred map[string]string) {
++func checkType(pass *analysis.Pass, typeSpec *ast.TypeSpec, markersAccess markers.Markers, equivalentToPreferred, preferredToMessage map[string]string) {
+ 	if typeSpec == nil {
+ 		return
+ 	}
+ 
+ 	markerSet := markersAccess.TypeMarkers(typeSpec)
+ 	check(markerSet, equivalentToPreferred, func(marks []markers.Marker, preferredIdentifier string, preferredExists bool) {
+-		reportMarkers(pass, marks, preferredIdentifier, typeSpec.Name.Name, typeSpec.Pos(), "type", preferredExists)
++		reportMarkers(pass, marks, preferredIdentifier, preferredToMessage[preferredIdentifier], typeSpec.Name.Name, typeSpec.Pos(), "type", preferredExists)
+ 	})
+ }
+ 
+@@ -193,7 +202,7 @@ func buildTextEdits(marks []markers.Marker, preferredIdentifier string, preferre
+ // reportMarkers generates a diagnostic report for markers that should be
+ // replaced. This function handles the common logic for both field and type
+ // reporting.
+-func reportMarkers(pass *analysis.Pass, marks []markers.Marker, preferredIdentifier, elementName string, pos token.Pos, elementType string, preferredExists bool) {
++func reportMarkers(pass *analysis.Pass, marks []markers.Marker, preferredIdentifier, customMessage, elementName string, pos token.Pos, elementType string, preferredExists bool) {
+ 	if len(marks) == 0 {
+ 		return
+ 	}
+@@ -206,6 +215,10 @@ func reportMarkers(pass *analysis.Pass, marks []markers.Marker, preferredIdentif
+ 	message := fmt.Sprintf("%s %s uses %s %s, should use preferred marker %q instead",
+ 		elementType, elementName, markerWord, formatMarkerList(marks), preferredIdentifier)
+ 
++	if customMessage != "" {
++		message += fmt.Sprintf(": %s", customMessage)
++	}
++
+ 	fixMessage := "remove equivalent markers"
+ 	if !preferredExists {
+ 		fixMessage = fmt.Sprintf("replace with %q", preferredIdentifier)
+diff --git a/tools/vendor/sigs.k8s.io/kube-api-linter/pkg/analysis/preferredmarkers/config.go b/tools/vendor/sigs.k8s.io/kube-api-linter/pkg/analysis/preferredmarkers/config.go
+index 44a092eca44..f8441aabe7f 100644
+--- a/tools/vendor/sigs.k8s.io/kube-api-linter/pkg/analysis/preferredmarkers/config.go
++++ b/tools/vendor/sigs.k8s.io/kube-api-linter/pkg/analysis/preferredmarkers/config.go
+@@ -39,6 +39,10 @@ type Marker struct {
+ 	// preferred identifier.
+ 	// Must have at least one entry.
+ 	EquivalentIdentifiers []EquivalentIdentifier `json:"equivalentIdentifiers"`
++
++	// message is an explanation of why the preferred identifier should be used.
++	// If not provided, a default message will be used.
++	Message string `json:"message,omitempty"`
+ }
+ 
+ // EquivalentIdentifier represents a marker identifier that should be
+diff --git a/tools/vendor/sigs.k8s.io/kube-api-linter/pkg/analysis/preferredmarkers/doc.go b/tools/vendor/sigs.k8s.io/kube-api-linter/pkg/analysis/preferredmarkers/doc.go
+index 810115864e0..b7109c51a75 100644
+--- a/tools/vendor/sigs.k8s.io/kube-api-linter/pkg/analysis/preferredmarkers/doc.go
++++ b/tools/vendor/sigs.k8s.io/kube-api-linter/pkg/analysis/preferredmarkers/doc.go
+@@ -43,6 +43,7 @@ limitations under the License.
+ *       - preferredIdentifier: "k8s:optional"
+ *         equivalentIdentifiers:
+ *           - "kubebuilder:validation:Optional"
++*         message: "Use k8s:optional to ensure consistency with upstream Kubernetes types."
+ * ```
+ *
+ * **Scenario:** Enforce using a custom marker instead of multiple equivalent markers
+diff --git a/tools/vendor/sigs.k8s.io/kube-api-linter/pkg/analysis/registry/registry.go b/tools/vendor/sigs.k8s.io/kube-api-linter/pkg/analysis/registry/registry.go
+index d76ca7ea6b6..cdc13447901 100644
+--- a/tools/vendor/sigs.k8s.io/kube-api-linter/pkg/analysis/registry/registry.go
++++ b/tools/vendor/sigs.k8s.io/kube-api-linter/pkg/analysis/registry/registry.go
+@@ -100,6 +100,12 @@ func (r *registry) AllLinters() sets.Set[string] {
+ 	r.lock.RLock()
+ 	defer r.lock.RUnlock()
+ 
++	return r.allLinters()
++}
++
++// allLinters returns the list of all known linters without acquiring the lock.
++// Callers must hold the lock.
++func (r *registry) allLinters() sets.Set[string] {
+ 	linters := sets.New[string]()
+ 
+ 	for _, initializer := range r.initializers {
+@@ -165,11 +171,24 @@ func (r *registry) validateLintersConfig(cfg config.Linters, lintersCfg config.L
+ 		}
+ 	}
+ 
+-	fieldErrors = append(fieldErrors, validateUnusedLinters(lintersCfg, validatedLinters, fieldPath)...)
++	fieldErrors = append(fieldErrors, validateUnusedLinters(lintersCfg, validatedLinters, r.allConfigurableLinters(), r.allLinters(), fieldPath)...)
+ 
+ 	return fieldErrors
+ }
+ 
++// allConfigurableLinters returns the names of all linters that are configurable.
++func (r *registry) allConfigurableLinters() sets.Set[string] {
++	configurableLinters := sets.New[string]()
++
++	for _, init := range r.initializers {
++		if _, ok := isConfigurable(init); ok {
++			configurableLinters.Insert(init.Name())
++		}
++	}
++
++	return configurableLinters
++}
++
+ // getEnabledInitializers returns the initializers that are enabled by the config.
+ // It returns a list of initializers that are enabled by the config.
+ func (r *registry) getEnabledInitializers(cfg config.Linters) []initializer.AnalyzerInitializer {
+@@ -234,18 +253,34 @@ func getConfigByName(name string, lintersCfg config.LintersConfig) (any, bool) {
+ 	return nil, false
+ }
+ 
+-// validateUnusedLinters validates that all linters in the config are enabled.
+-// It returns a list of errors for each linter that is not enabled.
+-func validateUnusedLinters(lintersCfg config.LintersConfig, validatedLinters sets.Set[string], fieldPath *field.Path) field.ErrorList {
++// validateUnusedLinters validates that all linters in the config exist as configurable linters.
++// It returns a list of errors for each linter config that does not correspond to a known configurable linter.
++// It does NOT error for disabled linters that have configuration - this allows users to keep
++// configuration for linters they have temporarily disabled.
++func validateUnusedLinters(lintersCfg config.LintersConfig, validatedLinters, configurableLinters, allLinters sets.Set[string], fieldPath *field.Path) field.ErrorList {
+ 	fieldErrors := field.ErrorList{}
+ 
+ 	for name := range lintersCfg {
+ 		// Hack to allow backwards compatibility with early configuration.
+ 		// We use to have camelCased config names, but now it is all lowercase matched on the linter name.
+ 		// TODO(@JoelSpeed): Remove the strings.ToLower in a future release with a release note about the change.
+-		if !validatedLinters.Has(strings.ToLower(name)) {
+-			fieldErrors = append(fieldErrors, field.Invalid(fieldPath.Child(name), nil, "linter is not enabled"))
++		lowerName := strings.ToLower(name)
++
++		if validatedLinters.Has(lowerName) {
++			continue
++		}
++
++		// If the linter is configurable, it's OK to have config for it even if disabled
++		if configurableLinters.Has(lowerName) {
++			continue
+ 		}
++
++		if allLinters.Has(lowerName) {
++			fieldErrors = append(fieldErrors, field.Invalid(fieldPath.Child(name), name, "linter is not configurable"))
++			continue
++		}
++
++		fieldErrors = append(fieldErrors, field.Invalid(fieldPath.Child(name), name, "unknown linter"))
+ 	}
+ 
+ 	return fieldErrors
+diff --git a/tools/vendor/sigs.k8s.io/kube-api-linter/pkg/analysis/requiredfields/analyzer.go b/tools/vendor/sigs.k8s.io/kube-api-linter/pkg/analysis/requiredfields/analyzer.go
+index 3e4927ad32c..ed4d62039fe 100644
+--- a/tools/vendor/sigs.k8s.io/kube-api-linter/pkg/analysis/requiredfields/analyzer.go
++++ b/tools/vendor/sigs.k8s.io/kube-api-linter/pkg/analysis/requiredfields/analyzer.go
+@@ -41,6 +41,8 @@ func init() {
+ 		markers.KubebuilderMinPropertiesMarker,
+ 		markers.KubebuilderMinimumMarker,
+ 		markers.KubebuilderEnumMarker,
++		markers.KubebuilderExactlyOneOf,
++		markers.KubebuilderAtLeastOneOfMarker,
+ 	)
+ }
+ 
+diff --git a/tools/vendor/sigs.k8s.io/kube-api-linter/pkg/analysis/ssatags/analyzer.go b/tools/vendor/sigs.k8s.io/kube-api-linter/pkg/analysis/ssatags/analyzer.go
+index 0ce0f1d8dcd..61a03a045bb 100644
+--- a/tools/vendor/sigs.k8s.io/kube-api-linter/pkg/analysis/ssatags/analyzer.go
++++ b/tools/vendor/sigs.k8s.io/kube-api-linter/pkg/analysis/ssatags/analyzer.go
+@@ -18,6 +18,7 @@ package ssatags
+ import (
+ 	"fmt"
+ 	"go/ast"
++	"go/types"
+ 
+ 	"golang.org/x/tools/go/analysis"
+ 
+@@ -176,8 +177,7 @@ func (a *analyzer) checkListTypeSet(pass *analysis.Pass, field *ast.Field, quali
+ 		return
+ 	}
+ 
+-	isObjectList := utils.IsObjectList(pass, field)
+-	if !isObjectList {
++	if !isListOfNonScalars(pass, field) {
+ 		return
+ 	}
+ 
+@@ -189,6 +189,47 @@ func (a *analyzer) checkListTypeSet(pass *analysis.Pass, field *ast.Field, quali
+ 	pass.Report(diagnostic)
+ }
+ 
++// isListOfNonScalars reports whether the field is a slice containing non-scalars
++// such as structs, slices, and map. Returns false if the type is unknown.
++func isListOfNonScalars(pass *analysis.Pass, field *ast.Field) bool {
++	typeOf := pass.TypesInfo.TypeOf(field.Type)
++	if typeOf == nil {
++		return false
++	}
++
++	outer, ok := asSlice(typeOf)
++	if !ok {
++		return false
++	}
++
++	elem := outer.Elem()
++	if ptr, ok := elem.(*types.Pointer); ok {
++		elem = ptr.Elem()
++	}
++
++	switch elem.Underlying().(type) {
++	case *types.Struct, *types.Slice, *types.Array:
++		return true
++	}
++
++	return false
++}
++
++func asSlice(t types.Type) (*types.Slice, bool) {
++	for {
++		switch u := t.(type) {
++		case *types.Alias:
++			t = u.Underlying()
++		case *types.Named:
++			t = u.Underlying()
++		case *types.Slice:
++			return u, true
++		default:
++			return nil, false
++		}
++	}
++}
++
+ func (a *analyzer) validateListMapKeys(pass *analysis.Pass, field *ast.Field, listMapKeyMarkers []markers.Marker, qualifiedFieldName string) {
+ 	jsonTags, ok := pass.ResultOf[extractjsontags.Analyzer].(extractjsontags.StructFieldTags)
+ 	if !ok {
+diff --git a/tools/vendor/sigs.k8s.io/kube-api-linter/pkg/analysis/ssatags/config.go b/tools/vendor/sigs.k8s.io/kube-api-linter/pkg/analysis/ssatags/config.go
+index 471718b9771..535b9e3f21d 100644
+--- a/tools/vendor/sigs.k8s.io/kube-api-linter/pkg/analysis/ssatags/config.go
++++ b/tools/vendor/sigs.k8s.io/kube-api-linter/pkg/analysis/ssatags/config.go
+@@ -17,13 +17,9 @@ package ssatags
+ 
+ // SSATagsConfig contains configuration for the ssatags linter.
+ type SSATagsConfig struct {
+-	// listTypeSetUsage is the policy for the listType=set usage.
+-	// Valid values are "Warn" and "Ignore".
+-	// When set to "Warn", the linter will emit a warning if a listType=set is used on object arrays.
+-	// When set to "Ignore", the linter will not emit a warning if a listType=set is used on object arrays.
+-	// Note: listType=set is only flagged on object arrays, not primitive arrays, due to
+-	// Server-Side Apply compatibility issues specific to object arrays.
+-	// When otherwise not specified, the default value is "Warn".
++	// listTypeSetUsage is the policy for listType=set on slices of structs,
++	// slices, and maps. Valid values are "Warn" and "Ignore".
++	// Defaults to "Warn". Scalar element lists are never flagged.
+ 	ListTypeSetUsage SSATagsListTypeSetUsage `json:"listTypeSetUsage"`
+ }
+ 
+@@ -31,9 +27,9 @@ type SSATagsConfig struct {
+ type SSATagsListTypeSetUsage string
+ 
+ const (
+-	// SSATagsListTypeSetUsageWarn indicates that the linter will emit a warning if a listType=set is used on object arrays.
++	// SSATagsListTypeSetUsageWarn warns when listType=set is used on slices of structs, slices, and maps.
+ 	SSATagsListTypeSetUsageWarn SSATagsListTypeSetUsage = "Warn"
+ 
+-	// SSATagsListTypeSetUsageIgnore indicates that the linter will not emit a warning if a listType=set is used on object arrays.
++	// SSATagsListTypeSetUsageIgnore disables the check for listType=set used on slices of structs, slices, and maps.
+ 	SSATagsListTypeSetUsageIgnore SSATagsListTypeSetUsage = "Ignore"
+ )
+diff --git a/tools/vendor/sigs.k8s.io/kube-api-linter/pkg/analysis/ssatags/doc.go b/tools/vendor/sigs.k8s.io/kube-api-linter/pkg/analysis/ssatags/doc.go
+index c20320f2f41..12ede1061fc 100644
+--- a/tools/vendor/sigs.k8s.io/kube-api-linter/pkg/analysis/ssatags/doc.go
++++ b/tools/vendor/sigs.k8s.io/kube-api-linter/pkg/analysis/ssatags/doc.go
+@@ -27,18 +27,15 @@ limitations under the License.
+ // - listType=map: Elements are identified by specific key fields for granular updates
+ //
+ // Important Note on listType=set:
+-// The use of listType=set is discouraged for object arrays due to Server-Side Apply
+-// compatibility issues. When multiple controllers attempt to apply changes to an object
+-// array with listType=set, the merge behavior can be unpredictable and may lead to
+-// data loss or unexpected conflicts. For object arrays, use listType=atomic for simple
+-// replacement semantics or listType=map for granular field-level merging.
+-// listType=set is safe to use with primitive arrays (strings, integers, etc.).
++// listType=set is only supported on slices of scalar elements. Slices of
++// structs, slices, and maps cannot be represented by Server-Side Apply. For
++// those fields, use listType=atomic or listType=map.
+ //
+ // The analyzer checks for:
+ //
+ // 1. Missing listType markers on array fields
+ // 2. Invalid listType values (must be atomic, set, or map)
+-// 3. Usage of listType=set on object arrays (discouraged due to compatibility issues)
++// 3. Usage of listType=set on slices of structs, slices, and maps
+ // 4. Missing listMapKey markers for listType=map arrays
+ // 5. Incorrect usage of listType=map on primitive arrays
+ //
+diff --git a/tools/vendor/sigs.k8s.io/kube-api-linter/pkg/analysis/utils/serialization/serialization_check.go b/tools/vendor/sigs.k8s.io/kube-api-linter/pkg/analysis/utils/serialization/serialization_check.go
+index 3e0071d0709..46571a8e3db 100644
+--- a/tools/vendor/sigs.k8s.io/kube-api-linter/pkg/analysis/utils/serialization/serialization_check.go
++++ b/tools/vendor/sigs.k8s.io/kube-api-linter/pkg/analysis/utils/serialization/serialization_check.go
+@@ -18,6 +18,7 @@ package serialization
+ import (
+ 	"fmt"
+ 	"go/ast"
++	"go/types"
+ 
+ 	"golang.org/x/tools/go/analysis"
+ 	"sigs.k8s.io/kube-api-linter/pkg/analysis/helpers/extractjsontags"
+@@ -306,6 +307,31 @@ func hasExplicitZeroMinValidation(pass *analysis.Pass, field *ast.Field, underly
+ 	case *ast.MapType:
+ 		// Check for explicit MinProperties=0
+ 		return fieldMarkers.HasWithValue(markers.KubebuilderMinPropertiesMarker + "=0")
++	case *ast.Ident, *ast.SelectorExpr:
++		// For named types (local or from external packages), check if the underlying type is a slice or map.
++		return hasExplicitZeroMinValidationForNamedType(pass, underlying, fieldMarkers)
++	}
++
++	return false
++}
++
++// hasExplicitZeroMinValidationForNamedType checks if a named type (like a type alias to slice/map)
++// has an explicit MinItems=0 or MinProperties=0 marker.
++func hasExplicitZeroMinValidationForNamedType(pass *analysis.Pass, underlying ast.Expr, fieldMarkers markershelper.MarkerSet) bool {
++	typeOf := pass.TypesInfo.TypeOf(underlying)
++	if typeOf == nil {
++		return false
++	}
++
++	underlyingType := typeOf.Underlying()
++
++	switch underlyingType.(type) {
++	case *types.Slice:
++		// Check for explicit MinItems=0
++		return fieldMarkers.HasWithValue(markers.KubebuilderMinItemsMarker + "=0")
++	case *types.Map:
++		// Check for explicit MinProperties=0
++		return fieldMarkers.HasWithValue(markers.KubebuilderMinPropertiesMarker + "=0")
+ 	}
+ 
+ 	return false
+diff --git a/tools/vendor/sigs.k8s.io/kube-api-linter/pkg/analysis/utils/utils.go b/tools/vendor/sigs.k8s.io/kube-api-linter/pkg/analysis/utils/utils.go
+index 0735040fcec..1f070488454 100644
+--- a/tools/vendor/sigs.k8s.io/kube-api-linter/pkg/analysis/utils/utils.go
++++ b/tools/vendor/sigs.k8s.io/kube-api-linter/pkg/analysis/utils/utils.go
+@@ -29,7 +29,10 @@ import (
+ 	"sigs.k8s.io/kube-api-linter/pkg/markers"
+ )
+ 
+-const stringTypeName = "string"
++const (
++	stringTypeName       = "string"
++	minMaxValidationHint = "minimum/maximum"
++)
+ 
+ // IsBasicType checks if the type of the given identifier is a basic type.
+ // Basic types are types like int, string, bool, etc.
+@@ -110,15 +113,41 @@ func IsPointerType(pass *analysis.Pass, expr ast.Expr) bool {
+ 		// If the ident is a type alias, keep checking until we find the underlying type.
+ 		typeSpec, ok := LookupTypeSpec(pass, t)
+ 		if !ok {
+-			return false
++			// Fallback to using types info if we can't find the type spec.
++			// This can happen for types defined in external packages.
++			return isNilableType(pass, expr)
+ 		}
+ 
+ 		return IsPointerType(pass, typeSpec.Type)
++	case *ast.SelectorExpr:
++		// For qualified identifiers (e.g., corev1.ResourceList), use type info
++		// since we cannot look up the AST for external packages.
++		return isNilableType(pass, expr)
+ 	default:
+ 		return false
+ 	}
+ }
+ 
++// isNilableType checks if the underlying type is nilable (pointer, slice, or map)
++// using Go's type system (types.TypeInfo).
++// This is used for types that cannot be resolved via AST lookups, such as types
++// from external packages.
++func isNilableType(pass *analysis.Pass, expr ast.Expr) bool {
++	typeOf := pass.TypesInfo.TypeOf(expr)
++	if typeOf == nil {
++		return false
++	}
++
++	underlying := typeOf.Underlying()
++
++	switch underlying.(type) {
++	case *types.Pointer, *types.Slice, *types.Map:
++		return true
++	}
++
++	return false
++}
++
+ // LookupTypeSpec is used to search for the type spec of a given identifier.
+ // It will first check to see if the ident has an Obj, and if so, it will return the type spec
+ // from the Obj. If the Obj is nil, it will search through the files in the package to find the
+diff --git a/tools/vendor/sigs.k8s.io/kube-api-linter/pkg/analysis/utils/zero_value.go b/tools/vendor/sigs.k8s.io/kube-api-linter/pkg/analysis/utils/zero_value.go
+index c1146217d28..e780dbf53a2 100644
+--- a/tools/vendor/sigs.k8s.io/kube-api-linter/pkg/analysis/utils/zero_value.go
++++ b/tools/vendor/sigs.k8s.io/kube-api-linter/pkg/analysis/utils/zero_value.go
+@@ -19,6 +19,8 @@ import (
+ 	"errors"
+ 	"fmt"
+ 	"go/ast"
++	"go/types"
++	"reflect"
+ 	"slices"
+ 	"strconv"
+ 	"strings"
+@@ -57,12 +59,143 @@ func IsZeroValueValid(pass *analysis.Pass, field *ast.Field, typeExpr ast.Expr,
+ 		return isArrayZeroValueValid(pass, field, t, markersAccess)
+ 	case *ast.StarExpr:
+ 		return IsZeroValueValid(pass, field, t.X, markersAccess, considerOmitzero, qualifiedFieldName)
++	case *ast.SelectorExpr:
++		// For qualified identifiers (e.g., corev1.ResourceList), use type info
++		// since we cannot look up the AST for external packages.
++		return isSelectorExprZeroValueValid(pass, field, t, markersAccess, qualifiedFieldName)
+ 	}
+ 
+ 	// We don't know what the type is so can't assert the zero value is valid.
+ 	return false, false
+ }
+ 
++// isSelectorExprZeroValueValid checks if a qualified identifier (external package type) has a valid zero value.
++// It uses Go's type system to determine the underlying type.
++func isSelectorExprZeroValueValid(pass *analysis.Pass, field *ast.Field, selector *ast.SelectorExpr, markersAccess markershelper.Markers, qualifiedFieldName string) (bool, bool) {
++	typeOf := pass.TypesInfo.TypeOf(selector)
++	if typeOf == nil {
++		return false, false
++	}
++
++	underlying := typeOf.Underlying()
++
++	switch t := underlying.(type) {
++	case *types.Slice:
++		return isArrayZeroValueValidFromMarkers(pass, field, markersAccess)
++	case *types.Map:
++		return isMapZeroValueValid(pass, field, markersAccess)
++	case *types.Basic:
++		return isBasicTypeZeroValueValid(pass, field, t, markersAccess, qualifiedFieldName)
++	case *types.Struct:
++		// For external structs, inspect fields via Go's type system.
++		return isExternalStructZeroValueValid(pass, field, t, markersAccess)
++	}
++
++	return false, false
++}
++
++// isBasicTypeZeroValueValid checks if a basic type (string, int, float, bool) has a valid zero value.
++// This is used for external package type aliases to basic types.
++func isBasicTypeZeroValueValid(pass *analysis.Pass, field *ast.Field, basicType *types.Basic, markersAccess markershelper.Markers, qualifiedFieldName string) (bool, bool) {
++	//nolint:exhaustive // We only handle common basic types; other types fall through to default.
++	switch basicType.Kind() {
++	case types.String:
++		return isStringZeroValueValid(pass, field, markersAccess)
++	case types.Bool:
++		// For bool, we can always use a zero value (false is valid).
++		return true, true
++	case types.Int, types.Int8, types.Int16, types.Int32, types.Int64,
++		types.Uint, types.Uint8, types.Uint16, types.Uint32, types.Uint64:
++		return isNumericZeroValueValid[int](pass, field, markersAccess, qualifiedFieldName)
++	case types.Float32, types.Float64:
++		return isNumericZeroValueValid[float64](pass, field, markersAccess, qualifiedFieldName)
++	default:
++		// For other basic types (complex, unsafe pointer, untyped, etc.), we can't determine validity.
++		return false, false
++	}
++}
++
++// isExternalStructZeroValueValid checks if an external struct type has a valid zero value.
++// It inspects the struct fields via Go's type system to count non-omitted fields,
++// similar to how local structs are validated.
++func isExternalStructZeroValueValid(pass *analysis.Pass, field *ast.Field, structType *types.Struct, markersAccess markershelper.Markers) (bool, bool) {
++	fieldMarkers := TypeAwareMarkerCollectionForField(pass, markersAccess, field)
++
++	minProperties, err := GetMinProperties(fieldMarkers)
++	if err != nil {
++		pass.Reportf(field.Pos(), "struct %s has an invalid minProperties marker: %v", FieldName(field), err)
++		return false, false
++	}
++
++	// Count non-omitted fields by inspecting the struct's fields via the type system.
++	nonOmittedFields := countNonOmittedFieldsInExternalStruct(structType)
++
++	zeroValueValid := minProperties == nil || *minProperties <= nonOmittedFields
++
++	// All fields have omitempty/omitzero - zero value is {} but validation is incomplete.
++	completeValidation := minProperties != nil || nonOmittedFields > 0
++
++	return zeroValueValid, completeValidation
++}
++
++// countNonOmittedFieldsInExternalStruct counts fields in an external struct
++// that would be marshalled in the zero value (i.e., fields without omitempty or omitzero).
++func countNonOmittedFieldsInExternalStruct(structType *types.Struct) int {
++	count := 0
++
++	for i := range structType.NumFields() {
++		f := structType.Field(i)
++
++		// Skip unexported and embedded fields.
++		if !f.Exported() || f.Embedded() {
++			continue
++		}
++
++		tag := structType.Tag(i)
++		if isFieldOmittedByTag(tag) {
++			continue
++		}
++
++		count++
++	}
++
++	return count
++}
++
++// isFieldOmittedByTag checks if a struct field would be omitted in the zero value
++// based on its struct tag. It checks for json:"-", omitempty, omitzero, and inline.
++func isFieldOmittedByTag(tag string) bool {
++	jsonTag, ok := reflect.StructTag(tag).Lookup("json")
++	if !ok {
++		return false
++	}
++
++	// Ignored field (json:"-")
++	if jsonTag == "-" {
++		return true
++	}
++
++	parts := strings.Split(jsonTag, ",")
++	for _, part := range parts[1:] {
++		if part == "omitempty" || part == "omitzero" || part == "inline" {
++			return true
++		}
++	}
++
++	return false
++}
++
++// isArrayZeroValueValidFromMarkers checks if an array/slice field can have a zero value based on markers only.
++// This is used for external package types where we can't inspect the AST.
++func isArrayZeroValueValidFromMarkers(pass *analysis.Pass, field *ast.Field, markersAccess markershelper.Markers) (bool, bool) {
++	fieldMarkers := TypeAwareMarkerCollectionForField(pass, markersAccess, field)
++
++	hasMinItemsMarker := fieldMarkers.Has(markers.KubebuilderMinItemsMarker)
++	minItemsMarkerIsZero := fieldMarkers.HasWithValue(fmt.Sprintf("%s=0", markers.KubebuilderMinItemsMarker))
++
++	return !hasMinItemsMarker || minItemsMarkerIsZero, hasMinItemsMarker
++}
++
+ // getUnderlyingType returns the underlying type of the expression.
+ // If the expression is a pointer, it returns the expression inside the pointer.
+ func getUnderlyingType(expr ast.Expr) ast.Expr {
+@@ -119,25 +252,38 @@ func isStructZeroValueValid(pass *analysis.Pass, field *ast.Field, structType *a
+ 
+ 	markerSet := TypeAwareMarkerCollectionForField(pass, markersAccess, field)
+ 
++	structZeroValid, completeStructValidation := checkStructMinProperties(pass, field, markerSet, structType, markersAccess, nonOmittedFields)
++	if !structZeroValid {
++		zeroValueValid = false
++	}
++
++	return zeroValueValid, completeStructValidation
++}
++
++// checkStructMinProperties checks if the struct's zero value satisfies min-properties constraints.
++// It considers both explicit minProperties markers and union markers (ExactlyOneOf/AtLeastOneOf),
++// which implicitly require at least one field to be set.
++// Returns (zeroValueValid, completeValidation).
++func checkStructMinProperties(pass *analysis.Pass, field *ast.Field, markerSet markershelper.MarkerSet, structType *ast.StructType, markersAccess markershelper.Markers, nonOmittedFields int) (bool, bool) {
+ 	minProperties, err := GetMinProperties(markerSet)
+ 	if err != nil {
+ 		pass.Reportf(field.Pos(), "struct %s has an invalid minProperties marker: %v", FieldName(field), err)
+ 		return false, false
+ 	}
+ 
+-	if minProperties != nil && *minProperties > nonOmittedFields {
+-		// The struct requires more properties than would be marshalled in the zero value of the struct.
+-		zeroValueValid = false
++	// Union markers (ExactlyOneOf/AtLeastOneOf) implicitly require at least one field,
++	// equivalent to minProperties=1.
++	structMarkerSet := markersAccess.StructMarkers(structType)
++	if minProperties == nil && (structMarkerSet.Has(markers.KubebuilderExactlyOneOf) || structMarkerSet.Has(markers.KubebuilderAtLeastOneOfMarker)) {
++		minProperties = ptr.To(1)
+ 	}
+ 
+-	var completeStructValidation = true
+-	if minProperties == nil && nonOmittedFields == 0 {
+-		// If the struct has no non-omitted fields, then the zero value of the struct is `{}`.
+-		// This generally means that the validation is incomplete as the difference between omitting the field and not omitting is not clear.
+-		completeStructValidation = false
+-	}
++	zeroValueValid := minProperties == nil || *minProperties <= nonOmittedFields
++	// If the struct has no non-omitted fields and no min-properties constraint, then the zero value
++	// is `{}` and the validation is incomplete.
++	completeValidation := minProperties != nil || nonOmittedFields > 0
+ 
+-	return zeroValueValid, completeStructValidation
++	return zeroValueValid, completeValidation
+ }
+ 
+ // areStructFieldZeroValuesValid checks if all non-omitted fields within a struct accept their zero values.
+@@ -349,6 +495,113 @@ func GetTypedZeroValue(pass *analysis.Pass, expr ast.Expr) string {
+ 		return "[]"
+ 	case *ast.MapType:
+ 		return "{}"
++	case *ast.SelectorExpr:
++		return getSelectorExprZeroValue(pass, t)
++	default:
++		return ""
++	}
++}
++
++// getSelectorExprZeroValue returns the zero value for a qualified identifier (external package type).
++func getSelectorExprZeroValue(pass *analysis.Pass, selector *ast.SelectorExpr) string {
++	typeOf := pass.TypesInfo.TypeOf(selector)
++	if typeOf == nil {
++		return ""
++	}
++
++	underlying := typeOf.Underlying()
++
++	switch t := underlying.(type) {
++	case *types.Slice:
++		return "[]"
++	case *types.Map:
++		return "{}"
++	case *types.Struct:
++		return getExternalStructZeroValue(t)
++	case *types.Basic:
++		return getBasicTypeZeroValue(t)
++	default:
++		return ""
++	}
++}
++
++// getExternalStructZeroValue returns the zero value for an external struct type.
++// It constructs a json-like representation including only non-omitted fields.
++func getExternalStructZeroValue(structType *types.Struct) string {
++	value := "{"
++
++	for i := range structType.NumFields() {
++		f := structType.Field(i)
++
++		if !f.Exported() || f.Embedded() {
++			continue
++		}
++
++		tag := structType.Tag(i)
++		if isFieldOmittedByTag(tag) {
++			continue
++		}
++
++		jsonName := getJSONFieldName(tag, f.Name())
++		zeroVal := getTypesTypeZeroValue(f.Type())
++		value += fmt.Sprintf("%q: %s, ", jsonName, zeroVal)
++	}
++
++	value = strings.TrimSuffix(value, ", ")
++	value += "}"
++
++	return value
++}
++
++// getJSONFieldName extracts the JSON field name from a struct tag.
++// Falls back to the Go field name if no json tag is present.
++func getJSONFieldName(tag string, fieldName string) string {
++	jsonTag, ok := reflect.StructTag(tag).Lookup("json")
++	if !ok || jsonTag == "" {
++		return fieldName
++	}
++
++	parts := strings.Split(jsonTag, ",")
++	if parts[0] != "" {
++		return parts[0]
++	}
++
++	return fieldName
++}
++
++// getTypesTypeZeroValue returns the zero value string for a types.Type.
++func getTypesTypeZeroValue(t types.Type) string {
++	underlying := t.Underlying()
++
++	switch basicType := underlying.(type) {
++	case *types.Basic:
++		return getBasicTypeZeroValue(basicType)
++	case *types.Slice:
++		return "[]"
++	case *types.Map:
++		return "{}"
++	case *types.Struct:
++		return "{}"
++	case *types.Pointer:
++		return "null"
++	default:
++		return ""
++	}
++}
++
++// getBasicTypeZeroValue returns the zero value for a basic type.
++func getBasicTypeZeroValue(basicType *types.Basic) string {
++	//nolint:exhaustive // We only handle common basic types; other types fall through to default.
++	switch basicType.Kind() {
++	case types.String:
++		return `""`
++	case types.Bool:
++		return "false"
++	case types.Int, types.Int8, types.Int16, types.Int32, types.Int64,
++		types.Uint, types.Uint8, types.Uint16, types.Uint32, types.Uint64:
++		return "0"
++	case types.Float32, types.Float64:
++		return "0.0"
+ 	default:
+ 		return ""
+ 	}
+@@ -418,6 +671,48 @@ func GetTypedValidationHint(pass *analysis.Pass, expr ast.Expr) string {
+ 		return "min items"
+ 	case *ast.MapType:
+ 		return "min properties"
++	case *ast.SelectorExpr:
++		return getSelectorExprValidationHint(pass, t)
++	default:
++		return ""
++	}
++}
++
++// getSelectorExprValidationHint returns a validation hint for a qualified identifier (external package type).
++func getSelectorExprValidationHint(pass *analysis.Pass, selector *ast.SelectorExpr) string {
++	typeOf := pass.TypesInfo.TypeOf(selector)
++	if typeOf == nil {
++		return ""
++	}
++
++	underlying := typeOf.Underlying()
++
++	switch t := underlying.(type) {
++	case *types.Slice:
++		return "min items"
++	case *types.Map:
++		return "min properties"
++	case *types.Struct:
++		return "min properties/adding required fields"
++	case *types.Basic:
++		return getBasicTypeValidationHint(t)
++	default:
++		return ""
++	}
++}
++
++// getBasicTypeValidationHint returns a validation hint for a basic type.
++func getBasicTypeValidationHint(basicType *types.Basic) string {
++	//nolint:exhaustive // We only handle common basic types; other types fall through to default.
++	switch basicType.Kind() {
++	case types.String:
++		return "minimum length"
++	case types.Bool:
++		return ""
++	case types.Int, types.Int8, types.Int16, types.Int32, types.Int64,
++		types.Uint, types.Uint8, types.Uint16, types.Uint32, types.Uint64,
++		types.Float32, types.Float64:
++		return minMaxValidationHint
+ 	default:
+ 		return ""
+ 	}
+@@ -427,13 +722,13 @@ func GetTypedValidationHint(pass *analysis.Pass, expr ast.Expr) string {
+ func getIdentValidationHint(pass *analysis.Pass, ident *ast.Ident) string {
+ 	switch {
+ 	case isIntegerIdent(ident):
+-		return "minimum/maximum"
++		return minMaxValidationHint
+ 	case isStringIdent(ident):
+ 		return "minimum length"
+ 	case isBoolIdent(ident):
+ 		return ""
+ 	case isFloatIdent(ident):
+-		return "minimum/maximum"
++		return minMaxValidationHint
+ 	}
+ 
+ 	typeSpec, ok := LookupTypeSpec(pass, ident)
